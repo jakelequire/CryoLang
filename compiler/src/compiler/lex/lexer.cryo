@@ -353,6 +353,7 @@ private:
 
         while (!this.at_end() && this.peek() != quote) {
             if (this.peek() == '\\' && !this.at_end()) {
+                this.refuse_digit_after_nul();
                 this.advance(); // consume backslash
                 if (!this.at_end()) {
                     this.advance(); // consume escaped character
@@ -431,6 +432,9 @@ private:
             const c: char = this.peek();
 
             if (c == '\\') {
+                // A hole's own literals are lexed again with the hole and
+                // checked there.
+                if (depth == 0) { this.refuse_digit_after_nul(); }
                 this.advance(); // consume backslash
                 if (!this.at_end()) {
                     this.advance(); // consume escaped character
@@ -530,6 +534,14 @@ private:
 
         // Escape sequence
         if (this.peek() == '\\') {
+            if (this.refuse_digit_after_nul()) {
+                // Already reported: consume through the closing quote on this
+                // line so the digits are not also refused as a second
+                // character.
+                while (!this.at_end() && this.peek() != '\n' && this.peek() != '\'') { this.advance(); }
+                if (!this.at_end() && this.peek() == '\'') { this.advance(); }
+                return Token::new(TokenType::Unknown, "", start_line, start_col);
+            }
             this.advance(); // consume backslash
             if (!this.at_end()) {
                 const escape_char: char = this.peek();
@@ -1026,6 +1038,53 @@ private:
             this.current_location.line,
             this.current_location.column
         );
+    }
+
+    /// With `current` on a literal's backslash, refuse `\0` followed by a
+    /// digit and return true; return false for anything else.  The escape
+    /// pass reads `\0` as a NUL and each digit after it as its own
+    /// character, so `"\033"` is a NUL and then "33": a string that ends at
+    /// its second byte for anything reading it as C text, with nothing said.
+    /// The help names the byte the digits spell in octal, written as the hex
+    /// escape that means it.
+    refuse_digit_after_nul(&this) -> boolean {
+        if (this.peek_ahead(1) != '0' || !Lexer::is_digit(this.peek_ahead(2))) {
+            return false;
+        }
+        if (this.sink == null) { return true; }
+        // `\0` and up to two more digits: the escape as the writer meant it.
+        mut ndig: int = 1;
+        while (ndig < 3 && Lexer::is_digit(this.peek_ahead(1 + ndig))) { ndig += 1; }
+        mut val: i64 = 0;
+        mut octal: boolean = true;
+        for (mut k: int = 0; k < ndig; k++) {
+            const d: char = this.peek_ahead(1 + k);
+            if (d > '7') { octal = false; }
+            val = val * 8 + (d as i64 - '0' as i64);
+        }
+        const written: string = this.current.substr(0, (1 + ndig) as i64);
+        const span: SourceSpan = SourceSpan::new(
+            Text::new(this.path),
+            this.current_location.line as u32,
+            this.current_location.column as u32,
+            this.current_location.line as u32,
+            (this.current_location.column + 1 + ndig) as u32
+        );
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0013_DIGIT_AFTER_NUL_ESCAPE,
+            Text::new(fmt::format("`%s` is not an escape: `\\0` is a NUL byte, and the digits after it are separate characters", written)));
+        diag = diag.at(span);
+        if (octal && val <= 255) {
+            const hex: string = "0123456789abcdef";
+            const esc: string = "\\x" + hex.substr(val >> 4, 1) + hex.substr(val & 15, 1);
+            diag = diag.help(Text::new(fmt::format(
+                "Cryo has no octal escapes; write a byte by its hex value: `%s` is `%s`", written, esc)));
+        } else {
+            diag = diag.help(Text::new(
+                "Cryo has no octal escapes; write a byte by its hex value (`\\x1b` is ESC), or a NUL and then a digit as `\\x00` and the digit"));
+        }
+        this.sink.emit(diag);
+        return true;
     }
 
 private:

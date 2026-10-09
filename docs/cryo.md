@@ -168,7 +168,7 @@ Strings are enclosed in double quotes; characters in single quotes. Both share t
 '\x41'                     // hex byte: equivalent to 'A'
 ```
 
-**Escape sequences:** `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH` (hex byte). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented - see [section 22](#22-reserved-syntax).
+**Escape sequences:** `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH` (hex byte). There are no octal escapes: `\0` followed by a digit is refused (`E0013`), since `"\033"` would otherwise read as a NUL and then `33`; write the byte in hex (`"\x1b"`). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented - see [section 22](#22-reserved-syntax).
 
 #### f-strings (string interpolation)
 
@@ -1299,6 +1299,15 @@ function describe(s: Shape) -> void {
 In each arm, the variables are introduced for the payload of that variant. The compiler enforces that the count and types match the variant's declaration.
 
 If you don't need a payload, use `_`: `Option::Some(_) => { ... }`.
+
+The alternatives of an or-pattern bind **one** variable per name, whichever alternative matched, so every alternative must bind the same names, each at the same type and each written `mut` alike; otherwise the arm is refused (`E0407`):
+
+```cryo
+match (s) {
+    Shape::Circle(r) | Shape::Rectangle(r, _) => { r }   // one `r`, an f64 either way
+    Shape::Rectangle(w, h) | Shape::Circle(w) => { w }   // E0407: `h` is not bound in the second alternative
+}
+```
 
 ### 7.3 Range Patterns
 

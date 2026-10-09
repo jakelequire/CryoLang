@@ -644,8 +644,6 @@ SCANNED_ARRAYS = {
                                              "the vendored libraries a build used, by key: FLAGS"),
     "PhaseArtifacts.object_files": Scanned("compiler/artifacts.cryo", "string", DATA,
                                            "object FILE PATHS kept for the link"),
-    "QualifiedName.parts":        Scanned("compiler/resolver/qualified_name.cryo", "SymbolStr", DATA,
-                                          "the segments of ONE path, the string algebra a name is spelled with"),
     # -- the stores' own rows, scanned only in their own files --
     "GenericRegistry.entries":    Scanned("compiler/types/generic_registry.cryo", "TemplateEntry", TABLE,
                                           "the registry's template rows by name and module"),

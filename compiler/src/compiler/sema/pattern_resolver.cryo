@@ -55,6 +55,16 @@ import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ EnumType, EnumVariantInfo };
 import utils::text::{ Text };
 
+/// One name an alternative of a match arm binds, as the agreement check
+/// compares it with the arm's first alternative.
+type struct AltBinding {
+    sym:         SymbolID;
+    name:        SymbolStr;
+    ty:          TypeRef;
+    written_mut: boolean;
+    span:        SourceSpan;
+}
+
 type struct PatternResolver {
     arena:    TypeArena*;
     intern:   InternTable*;
@@ -110,6 +120,109 @@ type struct PatternResolver {
             if (pat.pattern_kind != PatternKind::Enum) { continue; }
             this.bind_enum_pattern(pat as EnumPatternNode*, subject_type, caller_backed);
         }
+        if (arm.patterns.length > 1 && !this.state.in_symbolic_check) {
+            this.check_alternatives_agree(arm);
+        }
+    }
+
+    /// Refuse an arm whose alternatives (`A(v) | B(v)`) do not bind the same
+    /// names with the same types, each written `mut` alike (E0407).  The
+    /// arm's body runs after whichever alternative matched, and the name
+    /// layer gives each name one binding across them, so a name another
+    /// alternative leaves unbound is read without ever being set, and a name
+    /// typed differently is read as a type its value may not have.
+    check_alternatives_agree(mut &this, arm: MatchArmNode*) -> void {
+        mut first: AltBinding[] = [];
+        if (arm.patterns[0] == null) { return; }
+        PatternResolver::collect_alt_bindings(arm.patterns[0], &first);
+        for (mut i: i64 = 1; i < arm.patterns.length; i++) {
+            const alt: PatternNode* = arm.patterns[i];
+            if (alt == null) { continue; }
+            mut here: AltBinding[] = [];
+            PatternResolver::collect_alt_bindings(alt, &here);
+            for (mut k: i64 = 0; k < here.length; k++) {
+                const b: AltBinding = here[k];
+                const f: i64 = PatternResolver::alt_binding_position(&first, b.sym);
+                if (f < 0) {
+                    this.report_alternatives(b.name, b.span,
+                        Text::new(fmt::format("`%s` is bound in this alternative but not in the arm's first",
+                            this.intern.resolve(b.name))),
+                        Text::new("bound only here"), arm.patterns[0].span,
+                        Text::new("the first alternative binds no such name"));
+                    continue;
+                }
+                const fb: AltBinding = first[f];
+                if (fb.ty.is_valid() && b.ty.is_valid() && !this.types.types_equivalent(fb.ty, b.ty)) {
+                    this.report_alternatives(b.name, b.span,
+                        Text::new(fmt::format("`%s` has type `%s` here but `%s` in the arm's first alternative",
+                            this.intern.resolve(b.name), this.types.type_display_name(b.ty),
+                            this.types.type_display_name(fb.ty))),
+                        Text::new(fmt::format("`%s` here", this.types.type_display_name(b.ty))),
+                        fb.span,
+                        Text::new(fmt::format("`%s` here", this.types.type_display_name(fb.ty))));
+                }
+                if (fb.written_mut != b.written_mut) {
+                    this.report_alternatives(b.name, b.span,
+                        Text::new(fmt::format("`%s` is written `mut` in one alternative of this arm and not in another",
+                            this.intern.resolve(b.name))),
+                        Text::new(if (b.written_mut) { "written `mut` here" } else { "written without `mut` here" }),
+                        fb.span,
+                        Text::new(if (fb.written_mut) { "written `mut` here" } else { "written without `mut` here" }));
+                }
+            }
+            for (mut k: i64 = 0; k < first.length; k++) {
+                if (PatternResolver::alt_binding_position(&here, first[k].sym) >= 0) { continue; }
+                this.report_alternatives(first[k].name, alt.span,
+                    Text::new(fmt::format("`%s` is not bound in this alternative",
+                        this.intern.resolve(first[k].name))),
+                    Text::new(fmt::format("binds no `%s`", this.intern.resolve(first[k].name))),
+                    first[k].span,
+                    Text::new("bound here, in the arm's first alternative"));
+            }
+        }
+    }
+
+    report_alternatives(mut &this, name: SymbolStr, at: SourceSpan, message: Text, label: Text,
+                        other: SourceSpan, other_label: Text) -> void {
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0407_INCONSISTENT_ALTERNATIVES, message);
+        diag = diag.at_with_label(at, label);
+        diag = diag.also_at(other, other_label);
+        diag = diag.with_note(Text::new(fmt::format(
+            "the arm's body runs whichever alternative matched, so every alternative binds `%s` alike: the same name, the same type, and `mut` written alike",
+            this.intern.resolve(name))));
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// The names `pat` binds, at any depth, in the order written.
+    static collect_alt_bindings(pat: PatternNode*, out: mut &AltBinding[]) -> void {
+        if (pat == null) { return; }
+        if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
+            out.push(AltBinding {
+                sym: pat.binding_sym, name: pat.binding_name, ty: pat.binding_type,
+                written_mut: false, span: pat.span,
+            });
+            return;
+        }
+        if (pat.pattern_kind != PatternKind::Enum) { return; }
+        const ep: EnumPatternNode* = pat as EnumPatternNode*;
+        for (mut j: i64 = 0; j < ep.elements.length; j++) {
+            const pb: PatternBinding* = ep.binding_at(j);
+            if (pb != null) {
+                out.push(AltBinding {
+                    sym: pb.sym_id, name: pb.name, ty: pb.resolved_type,
+                    written_mut: pb.written_mut, span: pb.span,
+                });
+                continue;
+            }
+            PatternResolver::collect_alt_bindings(ep.sub_at(j), out);
+        }
+    }
+
+    static alt_binding_position(list: &AltBinding[], sym: SymbolID) -> i64 {
+        for (mut i: i64 = 0; i < list.length; i++) {
+            if (list[i].sym.equals(sym)) { return i; }
+        }
+        return -1;
     }
 
     /// Bind a pattern's name `sym` to `ty`, the whole subject it matched.

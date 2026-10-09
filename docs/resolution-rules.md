@@ -116,6 +116,36 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-09
+
+188. **The comparison primitives (`SymbolStr::equals` and the like) carry
+     written reasons on their allows**: they are the comparison itself, and
+     whether a comparison is a lookup is judged where it is called.  There
+     is no door kind for them.
+
+189. **The scope table's own methods (`Scope::find`, `insert`,
+     `get_overloads` and the rest) are made private to the resolver's
+     module or modules first, and then carry written reasons.**  This is the
+     first step of rule three's structural check.
+
+190. **In `A(v) | B(v)` the two `v`s are one binding.**  The name layer
+     declares one binding per name across an arm's alternatives.
+
+191. **`QualifiedName::equals`, `starts_with` and `ends_with` are deleted**:
+     nothing calls them (ruling 185).
+
+192. **In a string or character literal, `\0` followed by a digit is a
+     compile error with a code of its own** (`"\033"` would otherwise be read
+     as a NUL and then the digits).  The help points to the hex escape
+     (`\x1b`).
+
+193. **`ModuleGraph::register_c_import_module` carries a written reason**:
+     the module graph creating the path of a module that only it makes.
+
+194. **An arm's alternatives must bind the same names, with the same types
+     and the same mutability**; otherwise the arm is refused, because its
+     body could read a name that the alternative which matched never set.
+
 ### 2026-10-08
 
 171. *(amended)* **The `Text` type is not deleted yet.**  Deleting it now
