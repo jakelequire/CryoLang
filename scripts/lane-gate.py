@@ -564,12 +564,6 @@ SCANNED_ARRAYS = {
                                              "a struct literal's written initializers by the field's leaf"),
     "DestructureDeclNode.bindings": Scanned("compiler/AST/declaration.cryo", "DestructureBinding", TABLE,
                                             "a destructure's bindings by the source field's leaf (which binding takes a field) or the local's"),
-    "ModuleInfo.written_imported": Scanned("compiler/module_graph.cryo", "SymbolStr", TABLE,
-                                           "a module's imported namespaces as the loader records them, deduplicated as each is recorded: module paths as text"),
-    "ModuleInfo.written_reexports": Scanned("compiler/module_graph.cryo", "SymbolStr", TABLE,
-                                            "a module's re-exported namespaces as the loader records them, deduplicated as each is recorded: module paths as text"),
-    "ModuleInfo.written_submodules": Scanned("compiler/module_graph.cryo", "SymbolStr", TABLE,
-                                             "a module's submodules as the loader records them, deduplicated as each is recorded: module paths as text"),
     "ModuleInfo.reexports":       Scanned("compiler/module_graph.cryo", "ModulePath", TABLE,
                                           "a module's re-exported modules, by identity"),
     # -- LOCAL tables: a local or parameter annotated as an array of records

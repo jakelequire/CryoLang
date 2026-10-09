@@ -33,46 +33,42 @@ as the facts record it.
 
 | class | functions |
 |---|---|
-| lookup | 43 |
+| lookup | 39 |
 | lookup-via-callee | 2 |
 | register | 1 |
 | carry | 3 |
-| total | 49 |
+| total | 45 |
 
-## lookup (43)
+## lookup (39)
 
 | site | function | parameter uses | callers |
 |---|---|---|---|
-| `src/compiler/AST/declaration.cryo:1266` | `lookup_method` | n:SymbolStr=[compare] | param=1 |
-| `src/compiler/AST/expression.cryo:963` | `add_capture` | name:SymbolStr=[compare,store:.push] | ast=3 |
+| `src/compiler/AST/declaration.cryo:1255` | `lookup_method` | n:SymbolStr=[compare] | param=1 |
+| `src/compiler/AST/expression.cryo:948` | `add_capture` | name:SymbolStr=[compare,store:.push] | ast=3 |
 | `src/compiler/AST/node_locator.cryo:923` | `method_by_name` | name:SymbolStr=[compare] | ast=2,param=3 |
 | `src/compiler/bindgen/importer.cryo:476` | `name_seen` | name:SymbolStr=[compare] | element=1,local=7,param=2 |
 | `src/compiler/bindgen/importer.cryo:485` | `find_struct` | name:SymbolStr=[compare] | call=1,local=1 |
 | `src/compiler/bindgen/importer.cryo:1854` | `find_function` | sym:SymbolStr=[compare] | local=1 |
-| `src/compiler/codegen/ops/declaration_emitter.cryo:804` | `find_vtable_slot_impl` | slot_name:SymbolStr=[compare] | field=1 |
-| `src/compiler/codegen/ops/declaration_emitter.cryo:873` | `vtable_slot_index` | method_name:SymbolStr=[compare] | ast=1 |
+| `src/compiler/codegen/ops/declaration_emitter.cryo:796` | `find_vtable_slot_impl` | slot_name:SymbolStr=[compare] | field=1 |
+| `src/compiler/codegen/ops/declaration_emitter.cryo:865` | `vtable_slot_index` | method_name:SymbolStr=[compare] | ast=1 |
 | `src/compiler/codegen/state/function_registry.cryo:52` | `get` | name:SymbolStr=[map-read] | call=1,local=2,param=1 |
 | `src/compiler/codegen/state/value_table.cryo:49` | `set_persistent` | name:SymbolStr=[ValueTable.set_raw,compare,store:.push] | param=1 |
 | `src/compiler/decl_index.cryo:520` | `register_signature` | leaf:SymbolStr=[DeclarationIndex.family_slot]; symbol:SymbolStr=[DeclarationIndex.file_entry,compare] | ast=1,local=2,param=1 |
 | `src/compiler/decl_index.cryo:827` | `note_extern_symbol` | sym:SymbolStr=[map-read,map-write]; key:SymbolStr=[store:new] | local=2 |
 | `src/compiler/decl_index.cryo:839` | `extern_symbol_conflict` | sym:SymbolStr=[map-read] | local=1 |
-| `src/compiler/module_graph.cryo:244` | `add_dependency` | dep:SymbolStr=[compare,store:.push] | call=1,field=1 |
-| `src/compiler/module_graph.cryo:258` | `add_imported_namespace` | ns:SymbolStr=[compare,store:.push] | call=2,field=6,local=2 |
-| `src/compiler/module_graph.cryo:268` | `add_reexport` | ns:SymbolStr=[compare,store:.push] | field=4,local=2 |
-| `src/compiler/module_graph.cryo:279` | `add_submodule` | ns:SymbolStr=[compare,store:.push] | call=1,field=1 |
-| `src/compiler/module_graph.cryo:530` | `register_c_import_module` | ns:SymbolStr=[of,map-read,map-write] | call=1 |
+| `src/compiler/module_graph.cryo:503` | `register_c_import_module` | ns:SymbolStr=[of,map-read,map-write] | call=1 |
 | `src/compiler/resolver/name_resolution.cryo:1707` | `reaching_import_for` | decl_ns:SymbolStr=[InternTable.resolve,path_precedes,compare] | identity=1 |
-| `src/compiler/resolver/qualified_name.cryo:169` | `equals` | other:QualifiedName=[compare] | - |
-| `src/compiler/resolver/qualified_name.cryo:184` | `starts_with` | prefix:QualifiedName=[compare] | - |
-| `src/compiler/resolver/qualified_name.cryo:200` | `ends_with` | suffix:QualifiedName=[compare] | - |
+| `src/compiler/resolver/qualified_name.cryo:126` | `equals` | other:QualifiedName=[compare] | - |
+| `src/compiler/resolver/qualified_name.cryo:141` | `starts_with` | prefix:QualifiedName=[compare] | - |
+| `src/compiler/resolver/qualified_name.cryo:157` | `ends_with` | suffix:QualifiedName=[compare] | - |
 | `src/compiler/resolver/resolver.cryo:788` | `exports_named` | name:SymbolStr=[compare] | ast=2,param=4 |
-| `src/compiler/resolver/scope.cryo:192` | `find` | name:SymbolStr=[hash_int,LOG_DEBUG,map-read] | identity=1,local=2,param=4 |
-| `src/compiler/resolver/scope.cryo:220` | `insert` | name:SymbolStr=[Scope.add_overload,map-read,pass:push_entry,pass:clear_ambiguity] | field=1,identity=1 |
-| `src/compiler/resolver/scope.cryo:266` | `insert_import` | name:SymbolStr=[map-read,pass:push_entry,store:.push] | local=1 |
-| `src/compiler/resolver/scope.cryo:312` | `clear_ambiguity` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/resolver/scope.cryo:332` | `is_ambiguous` | name:SymbolStr=[compare] | local=1,param=1 |
-| `src/compiler/resolver/scope.cryo:344` | `get_ambiguous_module_ids` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/resolver/scope.cryo:360` | `get_overloads` | name:SymbolStr=[compare,map-read] | field=1,local=1,param=2 |
+| `src/compiler/resolver/scope.cryo:188` | `find` | name:SymbolStr=[hash_int,LOG_DEBUG,map-read] | identity=1,local=2,param=4 |
+| `src/compiler/resolver/scope.cryo:216` | `insert` | name:SymbolStr=[Scope.add_overload,map-read,pass:push_entry,pass:clear_ambiguity] | field=1,identity=1 |
+| `src/compiler/resolver/scope.cryo:262` | `insert_import` | name:SymbolStr=[map-read,pass:push_entry,store:.push] | local=1 |
+| `src/compiler/resolver/scope.cryo:308` | `clear_ambiguity` | name:SymbolStr=[compare] | param=1 |
+| `src/compiler/resolver/scope.cryo:328` | `is_ambiguous` | name:SymbolStr=[compare] | local=1,param=1 |
+| `src/compiler/resolver/scope.cryo:340` | `get_ambiguous_module_ids` | name:SymbolStr=[compare] | param=1 |
+| `src/compiler/resolver/scope.cryo:356` | `get_overloads` | name:SymbolStr=[compare,map-read] | field=1,local=1,param=2 |
 | `src/compiler/resolver/symbol_str.cryo:41` | `equals` | other:SymbolStr=[compare] | ast=24,element=3,field=7,identity=5,literal=13,local=15,param=28 |
 | `src/compiler/sema/method_binding.cryo:172` | `resolve_method_return_via_template` | method_name:SymbolStr=[compare] | ast=1,param=1 |
 | `src/compiler/sema/method_binding.cryo:733` | `scan_param_bound_param_types` | method_name:SymbolStr=[compare] | param=2 |
@@ -83,9 +79,9 @@ as the facts record it.
 | `src/compiler/sema/method_binding.cryo:2113` | `resolve_trait_impl_method_return` | method_name:SymbolStr=[compare] | ast=1 |
 | `src/compiler/sema/symbolic_checker.cryo:291` | `symbolic_find_owner_method` | method_name:SymbolStr=[compare] | ast=1,param=1 |
 | `src/compiler/types/trait_checker.cryo:323` | `diagnose_method_bounds_failure` | method_name:SymbolStr=[compare] | ast=1 |
-| `src/compiler/types/user_defined.cryo:241` | `get_method` | name:SymbolStr=[compare] | ast=1,literal=2,param=2 |
-| `src/compiler/types/user_defined.cryo:368` | `get_method` | name:SymbolStr=[compare] | ast=1,param=2 |
-| `src/compiler/types/user_defined.cryo:501` | `get_method` | name:SymbolStr=[compare] | param=1 |
+| `src/compiler/types/user_defined.cryo:237` | `get_method` | name:SymbolStr=[compare] | ast=1,literal=2,param=2 |
+| `src/compiler/types/user_defined.cryo:358` | `get_method` | name:SymbolStr=[compare] | ast=1,param=2 |
+| `src/compiler/types/user_defined.cryo:491` | `get_method` | name:SymbolStr=[compare] | param=1 |
 
 ## lookup-via-callee (2)
 
@@ -98,7 +94,7 @@ as the facts record it.
 
 | site | function | parameter uses | callers |
 |---|---|---|---|
-| `src/compiler/resolver/scope.cryo:300` | `push_entry` | name:SymbolStr=[new,map-write] | param=2 |
+| `src/compiler/resolver/scope.cryo:296` | `push_entry` | name:SymbolStr=[new,map-write] | param=2 |
 
 ## carry (3)
 

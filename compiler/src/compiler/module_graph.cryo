@@ -213,46 +213,27 @@ type struct ModuleInfo {
         };
     }
 
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+    /// Record a dependency by the namespace it names.  An edge back to this
+    /// module is dropped when the edges are resolved (`resolve_edges`).
     add_dependency(mut &this, dep: SymbolStr) -> void {
-        // A module cannot depend on itself.  `import A::{ X };` records the
-        // parent path `A` as the dependency, so a file whose OWN namespace is
-        // `A` would otherwise gain an unsatisfiable self-edge and be reported
-        // as a cycle ("blocked by itself").  Drop it: the edge carries no
-        // ordering information, and the brace items are recorded separately as
-        // visibility edges.
-        if (dep.id == this.name.id) { return; }
         this.written_dependencies.push(dep);
     }
 
     /// Record a namespace this module can see without depending on it.
     /// See `imported_namespaces` for why this is not `add_dependency`.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     add_imported_namespace(mut &this, ns: SymbolStr) -> void {
-        for (mut i: i64 = 0; i < this.written_imported.length; i++) {
-            if (this.written_imported[i].id == ns.id) { return; }
-        }
         this.written_imported.push(ns);
     }
 
     /// Record an `export X;` target by its resolved namespace.
     /// See `reexports` for why this is not `add_dependency`.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     add_reexport(mut &this, ns: SymbolStr) -> void {
-        if (ns.id == this.name.id) { return; }
-        for (mut i: i64 = 0; i < this.written_reexports.length; i++) {
-            if (this.written_reexports[i].id == ns.id) { return; }
-        }
         this.written_reexports.push(ns);
     }
 
     /// Record a `public module X;` target by its resolved namespace.
     /// See `submodules` for why this grants nothing on its own.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     add_submodule(mut &this, ns: SymbolStr) -> void {
-        for (mut i: i64 = 0; i < this.written_submodules.length; i++) {
-            if (this.written_submodules[i].id == ns.id) { return; }
-        }
         this.written_submodules.push(ns);
     }
 
@@ -436,13 +417,19 @@ public:
     /// incomplete; any other edge carries no module to see.
     resolve_edges(mut &this) -> void {
         for (mut i: i64 = 0; i < this.modules.length; i++) {
+            // A module is no dependency of its own: `import A::{ X };` records
+            // the parent path `A`, so a file whose own namespace is `A` would
+            // gain an unsatisfiable self-edge and be reported as a cycle
+            // ("blocked by itself").  The edge orders nothing, and the brace
+            // items are recorded separately as visibility edges.  A module
+            // re-exporting itself is dropped for the same reason.
             mut unresolved: u32 = 0;
-            this.modules[i].dependencies = this.modules_of(&this.modules[i].written_dependencies, &unresolved);
+            this.modules[i].dependencies = this.modules_of(&this.modules[i].written_dependencies, i, false, &unresolved);
             this.modules[i].unresolved_dependencies = unresolved;
             mut ignored: u32 = 0;
-            this.modules[i].imported_namespaces = this.modules_of(&this.modules[i].written_imported, &ignored);
-            this.modules[i].submodules = this.modules_of(&this.modules[i].written_submodules, &ignored);
-            this.modules[i].reexports = this.modules_of(&this.modules[i].written_reexports, &ignored);
+            this.modules[i].imported_namespaces = this.modules_of(&this.modules[i].written_imported, -1, true, &ignored);
+            this.modules[i].submodules = this.modules_of(&this.modules[i].written_submodules, -1, true, &ignored);
+            this.modules[i].reexports = this.modules_of(&this.modules[i].written_reexports, i, true, &ignored);
             this.modules[i].written_dependencies = [];
             this.modules[i].written_imported = [];
             this.modules[i].written_submodules = [];
@@ -452,15 +439,29 @@ public:
 
     /// The modules a recorded list of namespaces names, in order; one the
     /// graph holds no module for is left out and counted in `*out_unresolved`.
-    modules_of(&this, written: &SymbolStr[], out_unresolved: u32*) -> ModulePath[] {
+    /// The module at index `except` (-1 for none) is left out, and with
+    /// `once` a module recorded twice appears once, where it was first
+    /// recorded - both judged by the module, after the namespace is resolved.
+    modules_of(&this, written: &SymbolStr[], except: i64, once: boolean, out_unresolved: u32*) -> ModulePath[] {
         mut out: ModulePath[] = [];
+        mut seen: i64[] = [];
         for (mut i: i64 = 0; i < written.length; i++) {
             const m: ModulePath = this.module_named(written[i]);
-            if (m.is_valid()) {
-                out.push(m);
-            } else {
+            if (!m.is_valid()) {
                 *out_unresolved = *out_unresolved + 1;
+                continue;
             }
+            const idx: i64 = this.find_module_index(m);
+            if (idx == except) { continue; }
+            if (once) {
+                mut dup: boolean = false;
+                for (mut k: i64 = 0; k < seen.length; k++) {
+                    if (seen[k] == idx) { dup = true; break; }
+                }
+                if (dup) { continue; }
+                seen.push(idx);
+            }
+            out.push(m);
         }
         return out;
     }
