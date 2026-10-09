@@ -353,7 +353,7 @@ private:
 
         while (!this.at_end() && this.peek() != quote) {
             if (this.peek() == '\\' && !this.at_end()) {
-                this.refuse_digit_after_nul();
+                this.refuse_bad_octal_escape();
                 this.advance(); // consume backslash
                 if (!this.at_end()) {
                     this.advance(); // consume escaped character
@@ -434,7 +434,7 @@ private:
             if (c == '\\') {
                 // A hole's own literals are lexed again with the hole and
                 // checked there.
-                if (depth == 0) { this.refuse_digit_after_nul(); }
+                if (depth == 0) { this.refuse_bad_octal_escape(); }
                 this.advance(); // consume backslash
                 if (!this.at_end()) {
                     this.advance(); // consume escaped character
@@ -534,9 +534,9 @@ private:
 
         // Escape sequence
         if (this.peek() == '\\') {
-            if (this.refuse_digit_after_nul()) {
+            if (this.refuse_bad_octal_escape()) {
                 // Already reported: consume through the closing quote on this
-                // line so the digits are not also refused as a second
+                // line so the rest is not also refused as a second
                 // character.
                 while (!this.at_end() && this.peek() != '\n' && this.peek() != '\'') { this.advance(); }
                 if (!this.at_end() && this.peek() == '\'') { this.advance(); }
@@ -551,6 +551,13 @@ private:
                 if (escape_char == 'x') {
                     mut i: int = 0;
                     while (i < 2 && !this.at_end() && Lexer::is_hex_digit(this.peek())) {
+                        this.advance();
+                        i++;
+                    }
+                } else if (escape_char >= '0' && escape_char <= '7') {
+                    // Octal escape: up to two more octal digits.
+                    mut i: int = 0;
+                    while (i < 2 && !this.at_end() && this.peek() >= '0' && this.peek() <= '7') {
                         this.advance();
                         i++;
                     }
@@ -1040,49 +1047,41 @@ private:
         );
     }
 
-    /// With `current` on a literal's backslash, refuse `\0` followed by a
-    /// digit and return true; return false for anything else.  The escape
-    /// pass reads `\0` as a NUL and each digit after it as its own
-    /// character, so `"\033"` is a NUL and then "33": a string that ends at
-    /// its second byte for anything reading it as C text, with nothing said.
-    /// The help names the byte the digits spell in octal, written as the hex
-    /// escape that means it.
-    refuse_digit_after_nul(&this) -> boolean {
-        if (this.peek_ahead(1) != '0' || !Lexer::is_digit(this.peek_ahead(2))) {
-            return false;
+    /// With `current` on a literal's backslash, refuse a malformed octal
+    /// escape and return true; return false for anything else.  An octal
+    /// escape is one to three digits `0`-`7` spelling one byte, so `\8` and
+    /// `\9` name no escape, and a value past `\377` names no byte.  Either
+    /// would otherwise reach the escape pass, which keeps an unknown escape's
+    /// two characters and keeps only the low byte of a large value.
+    refuse_bad_octal_escape(&this) -> boolean {
+        const first: char = this.peek_ahead(1);
+        mut ndig: i64 = 1;
+        mut message: string = "";
+        mut help: string = "";
+        if (first == '8' || first == '9') {
+            message = "is not an escape: an octal escape's digits are `0` to `7`";
+            help = "write the digit itself without a backslash, or a byte by its octal or hex value (`\\033` and `\\x1b` are both ESC)";
+        } else {
+            if (first < '0' || first > '7') { return false; }
+            const val: i64 = Lexer::octal_escape(this.current, 1, 4, &ndig);
+            if (val <= 255) { return false; }
+            message = "is out of range: an octal escape is one byte, `\\0` to `\\377`";
+            help = "write fewer digits; an escape ends after three, so `\\0123` is `\\012` and then `3`";
         }
         if (this.sink == null) { return true; }
-        // `\0` and up to two more digits: the escape as the writer meant it.
-        mut ndig: int = 1;
-        while (ndig < 3 && Lexer::is_digit(this.peek_ahead(1 + ndig))) { ndig += 1; }
-        mut val: i64 = 0;
-        mut octal: boolean = true;
-        for (mut k: int = 0; k < ndig; k++) {
-            const d: char = this.peek_ahead(1 + k);
-            if (d > '7') { octal = false; }
-            val = val * 8 + (d as i64 - '0' as i64);
-        }
-        const written: string = this.current.substr(0, (1 + ndig) as i64);
+        const written: string = this.current.substr(0, 1 + ndig);
         const span: SourceSpan = SourceSpan::new(
             Text::new(this.path),
             this.current_location.line as u32,
             this.current_location.column as u32,
             this.current_location.line as u32,
-            (this.current_location.column + 1 + ndig) as u32
+            (this.current_location.column + 1 + ndig as int) as u32
         );
         mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0013_DIGIT_AFTER_NUL_ESCAPE,
-            Text::new(fmt::format("`%s` is not an escape: `\\0` is a NUL byte, and the digits after it are separate characters", written)));
+            ErrorCode::E0013_BAD_OCTAL_ESCAPE,
+            Text::new(fmt::format("`%s` %s", written, message)));
         diag = diag.at(span);
-        if (octal && val <= 255) {
-            const hex: string = "0123456789abcdef";
-            const esc: string = "\\x" + hex.substr(val >> 4, 1) + hex.substr(val & 15, 1);
-            diag = diag.help(Text::new(fmt::format(
-                "Cryo has no octal escapes; write a byte by its hex value: `%s` is `%s`", written, esc)));
-        } else {
-            diag = diag.help(Text::new(
-                "Cryo has no octal escapes; write a byte by its hex value (`\\x1b` is ESC), or a NUL and then a digit as `\\x00` and the digit"));
-        }
+        diag = diag.help(Text::new(help));
         this.sink.emit(diag);
         return true;
     }
@@ -1161,6 +1160,17 @@ private:
 
             // We have a backslash; look at the next character
             const esc: char = *(raw + ri + 1) as char;
+
+            // `\` and one to three octal digits is the byte they spell:
+            // `\0` is NUL, `\033` is ESC.  A value past `\377` was refused
+            // where it was lexed.
+            if (esc >= '0' && esc <= '7') {
+                mut nd: i64 = 0;
+                const ov: i64 = Lexer::octal_escape(raw, ri + 1, len, &nd);
+                buf.push_byte(ov as u8);
+                ri += 1 + nd;
+                continue;
+            }
             ri += 2; // consume both backslash and escape char
 
             match (esc) {
@@ -1170,7 +1180,6 @@ private:
                 '\\' => { buf.push_byte('\\' as u8); }
                 '\'' => { buf.push_byte('\'' as u8); }
                 '"'  => { buf.push_byte('"' as u8); }
-                '0'  => { buf.push_byte('\0' as u8); }
                 'x'  => {
                     // Hex escape: \xHH (exactly up to 2 hex digits).  A
                     // `\x` with no following hex digit is malformed; emit
@@ -1242,6 +1251,24 @@ private:
         }
 
         return buf.into_raw();
+    }
+
+    /// The value of an octal escape's digits: up to three octal digits of
+    /// `text` from position `at` (below `len`), stopping at the first that
+    /// is not one, as C reads them.  Writes how many were read through
+    /// `digits` - 0 when `text[at]` is no octal digit.  The value can pass a
+    /// byte (`\777`); the lexer refuses that where it is written.
+    public static octal_escape(text: string, at: i64, len: i64, digits: i64*) -> i64 {
+        mut val: i64 = 0;
+        mut n: i64 = 0;
+        while (n < 3 && at + n < len) {
+            const d: char = *(text + at + n) as char;
+            if (d < '0' || d > '7') { break; }
+            val = val * 8 + (d as i64 - '0' as i64);
+            n += 1;
+        }
+        *digits = n;
+        return val;
     }
 
     /// Encode Unicode codepoint `cp` (assumed <= 0x10FFFF) as UTF-8, appending

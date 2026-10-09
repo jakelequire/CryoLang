@@ -168,7 +168,7 @@ Strings are enclosed in double quotes; characters in single quotes. Both share t
 '\x41'                     // hex byte: equivalent to 'A'
 ```
 
-**Escape sequences:** `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH` (hex byte). There are no octal escapes: `\0` followed by a digit is refused (`E0013`), since `"\033"` would otherwise read as a NUL and then `33`; write the byte in hex (`"\x1b"`). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented - see [section 22](#22-reserved-syntax).
+**Escape sequences:** `\n` `\t` `\r` `\\` `\'` `\"` `\xHH` (hex byte) and `\OOO` (octal byte). An octal escape is one to three digits `0`-`7`, read as C reads them: the escape ends after three digits or at the first character that is not one, so `\0` is NUL, `"\033[1m"` is ESC and then `[1m`, `\177` is 127, and `"\0123"` is `\012` (newline) and then `3`. `\8` and `\9`, and an octal value above `\377`, are refused (`E0013`). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented - see [section 22](#22-reserved-syntax).
 
 #### f-strings (string interpolation)
 

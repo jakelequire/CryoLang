@@ -194,6 +194,12 @@ yet is recorded with the change that builds it, not here.
      where `Option` of it was written), then the method-binding scans,
      then ruling 195's field-following lint.**
 
+203. **Octal escapes replace E0013's refusal (amends 192 and 201).**  In a
+     string or character literal, `\` and one to three octal digits is the
+     byte they spell, read as C reads it: at most three digits, ending at
+     the first non-octal character; `\033` is ESC, `\0` is NUL, `\177` is
+     127.  A value above `\377`, and `\8` or `\9`, is an error.
+
 ### 2026-10-08
 
 171. *(amended)* **The `Text` type is not deleted yet.**  Deleting it now
