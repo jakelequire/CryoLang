@@ -33,13 +33,13 @@ as the facts record it.
 
 | class | functions |
 |---|---|
-| lookup | 49 |
-| lookup-via-callee | 3 |
+| lookup | 43 |
+| lookup-via-callee | 2 |
 | register | 1 |
 | carry | 3 |
-| total | 56 |
+| total | 49 |
 
-## lookup (49)
+## lookup (43)
 
 | site | function | parameter uses | callers |
 |---|---|---|---|
@@ -53,7 +53,6 @@ as the facts record it.
 | `src/compiler/codegen/ops/declaration_emitter.cryo:873` | `vtable_slot_index` | method_name:SymbolStr=[compare] | ast=1 |
 | `src/compiler/codegen/state/function_registry.cryo:52` | `get` | name:SymbolStr=[map-read] | call=1,local=2,param=1 |
 | `src/compiler/codegen/state/value_table.cryo:49` | `set_persistent` | name:SymbolStr=[ValueTable.set_raw,compare,store:.push] | param=1 |
-| `src/compiler/const_table.cryo:572` | `variant_tag_of` | member:SymbolStr=[compare] | ast=1 |
 | `src/compiler/decl_index.cryo:520` | `register_signature` | leaf:SymbolStr=[DeclarationIndex.family_slot]; symbol:SymbolStr=[DeclarationIndex.file_entry,compare] | ast=1,local=2,param=1 |
 | `src/compiler/decl_index.cryo:827` | `note_extern_symbol` | sym:SymbolStr=[map-read,map-write]; key:SymbolStr=[store:new] | local=2 |
 | `src/compiler/decl_index.cryo:839` | `extern_symbol_conflict` | sym:SymbolStr=[map-read] | local=1 |
@@ -75,8 +74,6 @@ as the facts record it.
 | `src/compiler/resolver/scope.cryo:344` | `get_ambiguous_module_ids` | name:SymbolStr=[compare] | param=1 |
 | `src/compiler/resolver/scope.cryo:360` | `get_overloads` | name:SymbolStr=[compare,map-read] | field=1,local=1,param=2 |
 | `src/compiler/resolver/symbol_str.cryo:41` | `equals` | other:SymbolStr=[compare] | ast=24,element=3,field=7,identity=5,literal=13,local=15,param=28 |
-| `src/compiler/sema/diagnostics.cryo:294` | `find_shadowed_type_candidates` | simple_name:SymbolStr=[InternTable.resolve,compare]; member_name:SymbolStr=[door:EnumType.variant_index,pass:get_method,pass:get_method,pass:get_method] | ast=3,local=1 |
-| `src/compiler/sema/diagnostics.cryo:361` | `attach_shadow_import_suggestions` | candidates:SymbolStr[]=[InternTable.resolve,parent_of,format,compare] | ast=1,local=1 |
 | `src/compiler/sema/method_binding.cryo:172` | `resolve_method_return_via_template` | method_name:SymbolStr=[compare] | ast=1,param=1 |
 | `src/compiler/sema/method_binding.cryo:733` | `scan_param_bound_param_types` | method_name:SymbolStr=[compare] | param=2 |
 | `src/compiler/sema/method_binding.cryo:1004` | `projection_default_unavailable` | method_name:SymbolStr=[compare] | ast=1 |
@@ -85,21 +82,17 @@ as the facts record it.
 | `src/compiler/sema/method_binding.cryo:1288` | `find_generic_trait_default` | method_name:SymbolStr=[compare] | ast=1 |
 | `src/compiler/sema/method_binding.cryo:2113` | `resolve_trait_impl_method_return` | method_name:SymbolStr=[compare] | ast=1 |
 | `src/compiler/sema/symbolic_checker.cryo:291` | `symbolic_find_owner_method` | method_name:SymbolStr=[compare] | ast=1,param=1 |
-| `src/compiler/types/resolver.cryo:1449` | `resolve_primitive` | name:SymbolStr=[InternTable.resolve,LOG_DEBUG,door:ResBase.primitive_of_alias,match] | ast=3,local=2,param=1 |
 | `src/compiler/types/trait_checker.cryo:323` | `diagnose_method_bounds_failure` | method_name:SymbolStr=[compare] | ast=1 |
-| `src/compiler/types/user_defined.cryo:242` | `field_index` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/types/user_defined.cryo:252` | `get_method` | name:SymbolStr=[compare] | ast=1,literal=2,param=2 |
-| `src/compiler/types/user_defined.cryo:379` | `field_index` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/types/user_defined.cryo:389` | `get_method` | name:SymbolStr=[compare] | ast=1,param=2 |
-| `src/compiler/types/user_defined.cryo:522` | `get_method` | name:SymbolStr=[compare] | param=1 |
+| `src/compiler/types/user_defined.cryo:241` | `get_method` | name:SymbolStr=[compare] | ast=1,literal=2,param=2 |
+| `src/compiler/types/user_defined.cryo:368` | `get_method` | name:SymbolStr=[compare] | ast=1,param=2 |
+| `src/compiler/types/user_defined.cryo:501` | `get_method` | name:SymbolStr=[compare] | param=1 |
 
-## lookup-via-callee (3)
+## lookup-via-callee (2)
 
 | site | function | parameter uses | callers |
 |---|---|---|---|
 | `src/compiler/resolver/name_resolution.cryo:1753` | `refuse_unbound_type` | name:SymbolStr=[CompilationContext.modules_written_as,Diagnostic.did_you_mean,InternTable.resolve,NameResolver.type_declarers_of_leaf,parent_of,Resolver.contains_separator,format,pass:exports_named] | ast=4 |
 | `src/compiler/resolver/resolver.cryo:937` | `resolve_path` | segments:SymbolStr[]=[Resolver.lookup_prelude,pass:is_ambiguous,pass:find] | local=2 |
-| `src/compiler/types/checker.cryo:1053` | `check_field_access` | field_name:SymbolStr=[InternTable.resolve,format,LOG_DEBUG,pass:field_index,pass:field_index] | param=1 |
 
 ## register (1)
 

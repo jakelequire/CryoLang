@@ -87,12 +87,8 @@ CLASS_OF_METHOD = {
     # -- the member tables of the user-defined types: an array of records
     #    (`FieldInfo[]`, `MethodInfo[]`, `EnumVariantInfo[]`) with the name
     #    in each, searched by leaf off the type already in hand --
-    "StructType::field_index":
-        ("J", "member: a struct's field position by its leaf off the `StructType` in hand"),
     "StructType::get_method":
         ("J", "member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too"),
-    "ClassType::field_index":
-        ("J", "member: a class's field position by its leaf off the `ClassType` in hand"),
     "ClassType::get_method":
         ("J", "member: a class's method by its leaf off the `ClassType` in hand"),
     "EnumType::variant_index":

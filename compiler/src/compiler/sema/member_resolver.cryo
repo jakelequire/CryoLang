@@ -56,7 +56,7 @@ import compiler::sema::state::{ SemaState };
 import compiler::sema::symbolic_checker::{ SymbolicChecker };
 import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::checker::{ FieldLookup, TypeChecker, TypeCheckResult };
+import compiler::types::checker::{ TypeChecker, TypeCheckResult };
 import compiler::types::compound::{ FunctionType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ GenericParamType, InstantiatedType };
 import compiler::types::trait_checker::{ TraitChecker };
@@ -466,15 +466,74 @@ type struct MemberResolver {
                 && reg != null && reg.is_template(owner)) {
             return this.template_field(owner, recv, leaf);
         }
-        mut fl: FieldLookup = FieldLookup::none();
-        const r: TypeCheckResult = this.checker.check_field_access(owner, leaf, &fl);
-        if (!r.success) { return FieldAnswer::none(); }
+        // A concrete type's fields, read off its arena entry.  A pointer or
+        // reference still standing here is stepped through once more, and a
+        // resolved instantiation reached that way is resolved once more.
+        if (t.kind == TypeKind::Pointer) {
+            t = this.arena.lookup((t as PointerType*).pointee);
+        } else if (t.kind == TypeKind::Reference) {
+            t = this.arena.lookup((t as ReferenceType*).referent);
+        }
+        if (t == null) { return FieldAnswer::none(); }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inner: InstantiatedType* = t as InstantiatedType*;
+            if (inner.has_resolved_type()) {
+                t = this.arena.lookup(inner.resolved_type);
+                if (t == null) { return FieldAnswer::none(); }
+            }
+        }
+        if (t.kind == TypeKind::Struct) {
+            mut st: StructType* = t as StructType*;
+            for (mut i: i64 = 0; i < st.fields.length; i++) {
+                if (st.fields[i].name.equals(leaf)) {
+                    return this.field_answer(recv, &st.fields[i], t, 0, i);
+                }
+            }
+            return FieldAnswer::none();
+        }
+        // A class's own field wins over a base's of the same name: the chain
+        // is searched derived-first, `depth` steps up from the class.
+        if (t.kind == TypeKind::Class) {
+            mut current: ClassType* = t as ClassType*;
+            mut depth: i64 = 0;
+            while (current != null) {
+                for (mut i: i64 = 0; i < current.fields.length; i++) {
+                    if (current.fields[i].name.equals(leaf)) {
+                        return this.field_answer(recv, &current.fields[i], current as Type*, depth, i);
+                    }
+                }
+                mut parent: ClassType* = null;
+                if (current.has_base && current.base_class.is_valid()) {
+                    const parent_t: Type* = this.arena.lookup(current.base_class);
+                    if (parent_t != null && parent_t.kind == TypeKind::Class) {
+                        parent = parent_t as ClassType*;
+                    }
+                }
+                current = parent;
+                depth += 1;
+            }
+            return FieldAnswer::none();
+        }
+        // An array's `length` is an implicit `i64` field, at no position.
+        if (t.kind == TypeKind::Array && this.intern.resolve(leaf).eq("length")) {
+            return FieldAnswer {
+                ty:    this.types.subst_owner_params_from_receiver(recv, this.arena.get_i64()),
+                entry: null, owner: null, depth: -1, index: -1,
+            };
+        }
+        return FieldAnswer::none();
+    }
+
+    /// The answer for field `entry`, at `index` in the field list of `owner`,
+    /// `depth` steps up a class's base chain, seen through the receiver.
+    field_answer(&this, recv: TypeRef, entry: FieldInfo*, owner: Type*,
+                 depth: i64, index: i64) -> FieldAnswer {
         return FieldAnswer {
-            ty:    this.types.subst_owner_params_from_receiver(recv, r.result_type),
-            entry: fl.field,
-            owner: fl.owner,
-            depth: fl.depth,
-            index: fl.index,
+            ty:    this.types.subst_owner_params_from_receiver(recv, entry.field_type),
+            entry: entry,
+            owner: owner,
+            depth: depth,
+            index: index,
         };
     }
 
@@ -799,7 +858,7 @@ type struct MemberResolver {
     /// Emit E0353 when a private or protected field is reached from outside
     /// the module that may reach it (`member_reachable`).  A field is
     /// declared where its type is.  `field` and `declaring_t` are the entry
-    /// and the declaring type the caller's lookup found (`check_field_access`);
+    /// and the declaring type the caller's lookup found (`field_of`);
     /// `field_name` is the spelling, for the diagnostic alone.  Nothing here
     /// finds the field again.
     enforce_field_visibility(mut &this, field: FieldInfo*, declaring_t: Type*,

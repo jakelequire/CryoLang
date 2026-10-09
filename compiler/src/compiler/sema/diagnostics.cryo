@@ -288,14 +288,19 @@ type struct Diagnostics {
         return this.intern.intern(best);
     }
 
+    /// Door `suggestion`.  A refused member access is offered the import that
+    /// would have made its written type name the one meant: the types whose
+    /// last segment is that spelling and which own the member.  The answer is
+    /// each type's path as TEXT, for the diagnostic
+    /// (`attach_shadow_import_suggestions`), and reaches no lookup.
+    ///
     /// Other user-defined types whose simple-name matches `simple_name` and that
     /// own `member_name` (import-shadow detection); `resolved_type` is excluded.
     /// Capped at 4 candidates.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     find_shadowed_type_candidates(&this, simple_name: SymbolStr, member_name: SymbolStr,
-                                  resolved_type: TypeRef) -> SymbolStr[] {
+                                  resolved_type: TypeRef) -> string[] {
+        if (!simple_name.is_valid()) { return []; }
         mut results: SymbolStr[] = [];
-        if (!simple_name.is_valid()) { return results; }
         const needle: string = this.intern.resolve(simple_name);
         const filter_member: boolean = member_name.is_valid();
         const n: i64 = this.arena.type_count();
@@ -334,7 +339,11 @@ type struct Diagnostics {
             results.push(qname);
             if (results.length >= 4) { break; }
         }
-        return results;
+        mut shown: string[] = [];
+        for (mut i: i64 = 0; i < results.length; i++) {
+            shown.push(this.intern.resolve(results[i]));
+        }
+        return shown;
     }
 
     /// A zero-width span for inserting a new `import ...;` line (after the last
@@ -357,10 +366,10 @@ type struct Diagnostics {
     }
 
     /// Attach an "import the right type" note + quickfix for each shadowed
-    /// candidate (MachineApplicable for a single candidate, else MaybeIncorrect).
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+    /// candidate path `find_shadowed_type_candidates` answered with
+    /// (MachineApplicable for a single candidate, else MaybeIncorrect).
     attach_shadow_import_suggestions(&this, diag: Diagnostic, simple_name_str: string,
-                                     candidates: SymbolStr[]) -> Diagnostic {
+                                     candidates: string[]) -> Diagnostic {
         if (candidates.length == 0) { return diag; }
         mut out: Diagnostic = diag;
         const insert_span: SourceSpan = this.find_import_insertion_span();
@@ -370,7 +379,7 @@ type struct Diagnostics {
             Applicability::MaybeIncorrect
         };
         for (mut i: i64 = 0; i < candidates.length; i++) {
-            const cand_str: string = this.intern.resolve(candidates[i]);
+            const cand_str: string = candidates[i];
             out = out.with_note(Text::new(fmt::format("another `%s` exists: `%s`", simple_name_str, cand_str)));
             const import_path: string = QualifiedName::parent_of(cand_str);
             if (import_path == "") { continue; }
