@@ -268,13 +268,14 @@ BASE_FX.declare("compiler/sema/sema.cryo", "Sema",
                  ("types", "compiler::sema::type_utils::TypeUtils"),
                  ("scopes", "compiler::sema::scope_manager::ScopeManager")],
                 [M("walk", "read", [("name", SYM), ("t", TREF)])])
-STORE_FILES = set(BASE_FX.rels())
 
 # One stub per exclusion the gate lists, in the file the gate names, owning a
 # map: rule 1 requires every listed type to be in the tree with its map, so
-# the fixture cannot accept the gate's table without carrying it.
+# the fixture cannot accept the gate's table without carrying it.  A stub may
+# share its file with a fixture store (the resolver's rib sits beside the
+# resolver), never a name with a type already declared there.
 for _name, _ex in GATE_MOD.EXCLUDED.items():
-    assert _ex.defn not in STORE_FILES, "an exclusion shares a file with a fixture store: %s" % _ex.defn
+    assert BASE_FX.find(_name, _ex.defn) is None, "an exclusion twins a fixture type: %s in %s" % (_name, _ex.defn)
     BASE_FX.declare(_ex.defn, _name, [("table", MAP)])
 
 # One stub per ARRAY exclusion (rule 1b), each a candidate as the gate

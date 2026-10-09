@@ -26,7 +26,7 @@ import utils::logger;
 import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::resolution_map::{ ResolutionMap };
-import compiler::resolver::scope::{ Scope, ScopeID, ScopeKind };
+import compiler::resolver::scope::{ ScopeID, ScopeKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID, SymbolIds, SymbolKey };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -34,6 +34,285 @@ import compiler::module_graph::{ ModulePath };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 import utils::text::{ Text };
+
+/// One name bound directly in a scope, with the TIER it occupies.  A scope's
+/// bindings are ordered:
+///
+///     locals / generic params
+///       -> current-module items          (public AND private)
+///       -> imported modules' export sets
+///       -> prelude
+///
+/// and an inner tier shadows an outer one silently.  A flat
+/// `name -> SymbolID` map cannot express it -- a declaration and an import
+/// compete for one slot and the first writer wins -- so the tier travels
+/// WITH the entry.
+///
+/// It is a field rather than a parallel `boolean[]` deliberately: a parallel
+/// array holds its invariant only as long as every push site remembers to
+/// update both, and an insert path that forgets desyncs it silently, every
+/// index-based read after it returning a NEIGHBOUR's tier.
+///
+/// `Scope` holds SymbolIDs, not Symbols, and has no route back to the symbol
+/// arena, so it cannot recover `SymbolKind::Import` on its own; the tier is
+/// stated at insert time by which entry point was used.
+///
+/// The PRELUDE tier is not modelled here: it lives in the DeclarationIndex
+/// (`prelude_ns`, `is_prelude_ns`), so `is_import == false` means "not an
+/// import into this scope", not "tier 2 exclusively".
+type struct ScopeEntry {
+    name:      SymbolStr;
+    sym:       SymbolID;
+    /// false = declared by this scope's own module (tier 2, or a local/param
+    ///         in a Function/Block scope); true = brought in by an `import`
+    ///         (tier 3).
+    is_import: boolean;
+
+    static new(name: SymbolStr, sym: SymbolID, is_import: boolean) -> ScopeEntry {
+        return ScopeEntry { name: name, sym: sym, is_import: is_import };
+    }
+}
+
+/// A scope of the tree the resolver walks: a rib, holding the bindings
+/// written directly in it by the name each was written under.
+///
+/// Its names are private to this module.  The scope doors and the
+/// resolver's own walks are the only readers of a rib by name; any other
+/// module reaches a scope's bindings by identity (`binding_count`,
+/// `binding_at`) or asks the resolver, so a lookup of a rib by name written
+/// anywhere else is refused as a private access.
+type struct Scope {
+public:
+    id:              ScopeID;
+    kind:            ScopeKind;
+    parent_id:       ScopeID;
+    owner_name:      string;
+    span:            SourceSpan;
+    child_scope_ids: ScopeID[];
+
+    static new(id: ScopeID, kind: ScopeKind, parent: ScopeID,
+               owner: string, span: SourceSpan) -> Scope {
+        return Scope {
+            id:                 id,
+            kind:               kind,
+            parent_id:          parent,
+            owner_name:         owner,
+            span:               span,
+            child_scope_ids:    [],
+            symbols:            [],
+            symbol_index:       HashMap::<u32, i64>::new(),
+            overloads:          [],
+            meetings:           [],
+            ambig_name_ids:     [],
+            ambig_module_a:     [],
+            ambig_module_b:     [],
+            ambig_ns:           [],
+        };
+    }
+
+    /// How many names the scope binds directly.
+    binding_count(&this) -> i64 {
+        return this.symbols.length;
+    }
+
+    /// The binding the scope's `i`th name holds, in insertion order.
+    binding_at(&this, i: i64) -> SymbolID {
+        return this.symbols[i].sym;
+    }
+
+    /// Register a child scope.
+    add_child(mut &this, child: ScopeID) -> void {
+        this.child_scope_ids.push(child);
+    }
+
+private:
+    // One entry per name bound directly in this scope, in insertion order.
+    symbols:         ScopeEntry[];
+
+    // Fast lookup index: SymbolStr.id -> index in symbols[]
+    ![allow(lookup_by_spelling, reason = "a scope rib: a scope binds the names written in it, and the bare-identifier door asks it by name")]
+    symbol_index:    HashMap<u32, i64>;
+
+    // Overloaded names: flat array of (name_key, SymbolID) pairs.
+    overloads:       Pair<u32, SymbolID>[];
+
+    // Every binding added under a name the scope already bound: `.first`
+    // the binding the name held, `.second` the one added.  The scope keeps
+    // one of the two (or both, as overloads); the name layer reads these to
+    // refuse a declaration beside an import of its name.
+    meetings:        Pair<SymbolID, SymbolID>[];
+
+    // Ambiguous imports: the names imported from two different modules,
+    // which a bare use must refuse.  A tie is within one namespace: a type
+    // and a function of one leaf never tie.
+    ambig_name_ids:   u32[];      // SymbolStr.id of ambiguous names
+    ambig_module_a:   u32[];      // SymbolStr.id of first module's path
+    ambig_module_b:   u32[];      // SymbolStr.id of conflicting module's path
+    ambig_ns:         Namespace[];
+
+    /// The binding this scope alone holds under `name`, or invalid.
+    ![allow(lookup_by_spelling, reason = "the rib's own storage, private to the resolver's module: the scope doors and the resolver's walks are its only callers")]
+    find(&this, name: SymbolStr) -> SymbolID {
+        return match (this.symbol_index.get(&name.id)) {
+            Option::Some(idx) => { this.symbols[idx].sym }
+            Option::None      => { SymbolID::invalid() }
+        };
+    }
+
+    /// Insert a DECLARATION into this scope (tier 2, or a local/param).
+    ///
+    /// If the name already exists and allows_overload is true, adds to the
+    /// overload set instead.  Returns false if the name is a duplicate
+    /// declaration and overloading is not allowed.
+    ///
+    /// A declaration arriving over an IMPORT takes the slot: the inner tier
+    /// shadows the outer one, whichever line of the file came first.
+    ![allow(lookup_by_spelling, reason = "the rib's own storage, private to the resolver's module: the scope doors and the resolver's walks are its only callers")]
+    insert(mut &this, name: SymbolStr, sym_id: SymbolID, allows_overload: boolean) -> boolean {
+        const existing: Option<i64> = this.symbol_index.get(&name.id);
+        if (existing.is_some()) {
+            const idx: i64 = existing.unwrap();
+            this.meetings.push(Pair::<SymbolID, SymbolID>::new(this.symbols[idx].sym, sym_id));
+            if (this.symbols[idx].is_import) {
+                // Tier 2 over tier 3.  The displaced import is dropped rather
+                // than demoted into the overload set: the inner tier SHADOWS
+                // the outer one, so the import is reachable only by a
+                // qualified path from here on.  Dropping it is also what
+                // makes the two source orders agree -- declaration-first
+                // already produced exactly this set, because `insert_import`
+                // never added itself as an overload.
+                this.symbols[idx].sym = sym_id;
+                this.symbols[idx].is_import = false;
+                // Any ambiguity recorded for this name was import-vs-import.
+                // A declaration shadows every import of the name, so the
+                // ambiguity is no longer reachable and must not be reported:
+                // ambiguity is confined to WITHIN a tier.
+                this.clear_ambiguity(name);
+                return true;
+            }
+            if (allows_overload) {
+                this.add_overload(name, sym_id);
+                return true;
+            }
+            return false;
+        }
+
+        this.push_entry(name, sym_id, false);
+        return true;
+    }
+
+    /// Insert an IMPORT symbol (tier 3).
+    ///
+    /// If this scope's own module already DECLARES the name, the import is
+    /// shadowed and skipped silently -- explicitly not a diagnostic.  If the
+    /// name already exists as an import from a DIFFERENT module, mark it
+    /// ambiguous (the user must qualify); from the SAME module (re-import),
+    /// skip silently.  module_a_id and module_b_id are SymbolStr IDs; `ns`
+    /// is the namespace the two imports tie in.
+    ![allow(lookup_by_spelling, reason = "the rib's own storage, private to the resolver's module: the scope doors and the resolver's walks are its only callers")]
+    insert_import(mut &this, name: SymbolStr, sym_id: SymbolID,
+                  new_module_id: u32, existing_module_id: u32, ns: Namespace) -> boolean {
+        const existing: Option<i64> = this.symbol_index.get(&name.id);
+        if (existing.is_some()) {
+            const idx: i64 = existing.unwrap();
+            this.meetings.push(Pair::<SymbolID, SymbolID>::new(this.symbols[idx].sym, sym_id));
+            // A declaration owns the slot; the import is shadowed.  The two
+            // are in different tiers, so they never compete as ambiguous.
+            if (!this.symbols[idx].is_import) {
+                return true;
+            }
+            if (new_module_id == existing_module_id) {
+                return true;
+            }
+            // Different module: mark as ambiguous, keep the first import so
+            // lookups still find SOMETHING, but the ambiguity tells the
+            // resolver to emit an error.
+            this.ambig_name_ids.push(name.id);
+            this.ambig_module_a.push(existing_module_id);
+            this.ambig_module_b.push(new_module_id);
+            this.ambig_ns.push(ns);
+            return true;
+        }
+        this.push_entry(name, sym_id, true);
+        return true;
+    }
+
+    /// Append a fresh binding and index it.  The ONLY place a `ScopeEntry` is
+    /// created, so the tier and the index can never disagree with the array.
+    ![allow(lookup_by_spelling, reason = "the rib's own storage, private to the resolver's module: the scope doors and the resolver's walks are its only callers")]
+    push_entry(mut &this, name: SymbolStr, sym_id: SymbolID,
+               is_import: boolean) -> void {
+        const idx: i64 = this.symbols.length;
+        this.symbols.push(ScopeEntry::new(name, sym_id, is_import));
+        this.symbol_index.insert(name.id, idx);
+    }
+
+    /// Drop every ambiguity record for `name`: a declaration took the
+    /// name's slot, and both imports the record was between are shadowed.
+    ![allow(lookup_by_spelling, reason = "the rib's own storage, private to the resolver's module: the scope doors and the resolver's walks are its only callers")]
+    clear_ambiguity(mut &this, name: SymbolStr) -> void {
+        mut keep_names: u32[] = [];
+        mut keep_a:     u32[] = [];
+        mut keep_b:     u32[] = [];
+        mut keep_ns:    Namespace[] = [];
+        for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
+            if (this.ambig_name_ids[i] == name.id) { continue; }
+            keep_names.push(this.ambig_name_ids[i]);
+            keep_a.push(this.ambig_module_a[i]);
+            keep_b.push(this.ambig_module_b[i]);
+            keep_ns.push(this.ambig_ns[i]);
+        }
+        this.ambig_name_ids = keep_names;
+        this.ambig_module_a = keep_a;
+        this.ambig_module_b = keep_b;
+        this.ambig_ns = keep_ns;
+    }
+
+    /// Whether `name` is ambiguous in `ns` (imported from two modules).
+    ![allow(lookup_by_spelling, reason = "the rib's own storage, private to the resolver's module: the scope doors and the resolver's walks are its only callers")]
+    is_ambiguous(&this, name: SymbolStr, ns: Namespace) -> boolean {
+        for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
+            if (this.ambig_name_ids[i] == name.id && this.ambig_ns[i] == ns) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The two conflicting modules' SymbolStr IDs for an ambiguous name, or
+    /// none when it is not ambiguous.
+    ![allow(lookup_by_spelling, reason = "the rib's own storage, private to the resolver's module: the scope doors and the resolver's walks are its only callers")]
+    get_ambiguous_module_ids(&this, name: SymbolStr, ns: Namespace) -> u32[] {
+        for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
+            if (this.ambig_name_ids[i] == name.id && this.ambig_ns[i] == ns) {
+                return [this.ambig_module_a[i], this.ambig_module_b[i]];
+            }
+        }
+        return [];
+    }
+
+    /// Add a symbol to the overload set for the given name.
+    add_overload(mut &this, name: SymbolStr, sym_id: SymbolID) -> void {
+        this.overloads.push(Pair::<u32, SymbolID>::new(name.id, sym_id));
+    }
+
+    /// Every binding the scope holds under `name`: the primary one, then
+    /// the overloads.
+    ![allow(lookup_by_spelling, reason = "the rib's own storage, private to the resolver's module: the scope doors and the resolver's walks are its only callers")]
+    get_overloads(&this, name: SymbolStr) -> SymbolID[] {
+        mut result: SymbolID[] = [];
+        const opt: Option<i64> = this.symbol_index.get(&name.id);
+        if (opt.is_some()) {
+            result.push(this.symbols[opt.unwrap()].sym);
+        }
+        for (mut i: i64 = 0; i < this.overloads.length; i++) {
+            if (this.overloads[i].first == name.id) {
+                result.push(this.overloads[i].second);
+            }
+        }
+        return result;
+    }
+}
 
 type struct Resolver {
     /// The compilation's definitions, for a definition's path.  Borrowed;
@@ -823,6 +1102,15 @@ type struct Resolver {
             out.push(all[i]);
         }
         return out;
+    }
+
+    /// The binding module `m`'s own scope holds under `name` - declared or
+    /// imported, public or private - or invalid.  Neither the rib chain nor
+    /// the module's exports are consulted.
+    module_binding(&this, m: ModulePath, name: SymbolStr) -> SymbolID {
+        const sid: u64 = this.find_module_scope(m);
+        if (sid == 0) { return SymbolID::invalid(); }
+        return this.get_scope(ScopeID { id: sid }).find(name);
     }
 
     /// Get a symbol by its SymbolID, one this resolver's allocator made.

@@ -73,6 +73,17 @@ checked, nor one whose declaration allows `lookup_by_spelling` with a
 reason; the rule-4 check skips the same bodies.  The check reaches one
 function: a spelling handed on is looked up, and refused, in the callee.
 
+Rule three is also held by visibility, one store at a time: a store's name
+fields are `private` to the module whose file holds the store and its
+door, so a lookup written by hand anywhere else is refused as a private
+access (E0353), and every other reader asks for the name as text to print
+or reads the store by identity.  Locked so far:
+
+| store | file | its door(s) | readers outside |
+|---|---|---|---|
+| the scope ribs (`Scope`, `ScopeEntry`) | `compiler/src/compiler/resolver/resolver.cryo` | `scope-value`; `scope-type` asks through the resolver | by identity: `Scope::binding_count`, `binding_at`; a module's own binding by leaf: `Resolver::module_binding` |
+| an enum type's variants (`EnumVariantInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-variant` (`EnumType::variant_index`) | text for a message: `EnumVariantInfo::display_name` |
+
 `scripts/resolution-doors.py` (run by `make check-fast`) refuses the tree
 when this table and the doc-comment markers in `compiler/src` disagree in
 either direction: a marker whose door is not listed here, or a row here whose

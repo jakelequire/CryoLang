@@ -353,7 +353,7 @@ class Excluded(object):
 EXCLUDED = {
     "InternTable":       Excluded("compiler/resolver/intern_table.cryo",
                                   "the string<->SymbolStr boundary itself: holds strings, not declarations"),
-    "Scope":             Excluded("compiler/resolver/scope.cryo",
+    "Scope":             Excluded("compiler/resolver/resolver.cryo",
                                   "the resolver's rib; reached through Resolver, whose asks from outside its pass are REENTRY"),
     "ResolutionMap":     Excluded("compiler/resolver/resolution_map.cryo",
                                   "the resolver's answers keyed by SOURCE POSITION (ResolutionMap::make_key(span))"),
@@ -597,9 +597,9 @@ SCANNED_ARRAYS = {
     # -- ribs, texts and file paths the compiler reports scanned whose element
     #    is a pair or an interned id, which the owners' placement never
     #    listed as arrays of names --
-    "Scope.ambig_name_ids":       Scanned("compiler/resolver/scope.cryo", "SymbolStr", DATA,
+    "Scope.ambig_name_ids":       Scanned("compiler/resolver/resolver.cryo", "SymbolStr", DATA,
                                           "the resolver's rib: the ids of the names one scope binds ambiguously"),
-    "Scope.overloads":            Scanned("compiler/resolver/scope.cryo", "Pair", DATA,
+    "Scope.overloads":            Scanned("compiler/resolver/resolver.cryo", "Pair", DATA,
                                           "the resolver's rib: one scope's overloaded bindings by name id"),
     "ValueTable.persistent_keys": Scanned("compiler/codegen/state/value_table.cryo", "SymbolStr", DATA,
                                           "codegen's own rib: the bindings whose values persist across a scope, by name id"),
