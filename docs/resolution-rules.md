@@ -83,6 +83,9 @@ or reads the store by identity.  Locked so far:
 |---|---|---|---|
 | the scope ribs (`Scope`, `ScopeEntry`) | `compiler/src/compiler/resolver/resolver.cryo` | `scope-value`; `scope-type` asks through the resolver | by identity: `Scope::binding_count`, `binding_at`; a module's own binding by leaf: `Resolver::module_binding` |
 | an enum type's variants (`EnumVariantInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-variant` (`EnumType::variant_index`) | text for a message: `EnumVariantInfo::display_name` |
+| the declaration index's families and module globals (`overload_index`, `func_type_refs`, `refused_methods`, `overload_func_family`, `overload_func_mangled`, `module_global_leaves`, `module_global_extern_syms`, `extern_symbol_first`, `module_imports`, `family_slot`) | `compiler/src/compiler/decl_index.cryo` | `member-function`, `member-global` | none |
+| the interner (`strings`, `lookup`) | `compiler/src/compiler/resolver/intern_table.cryo` | `intern` | `resolve`, `shown` |
+| the template registry's names (`TemplateEntry.name`) | `compiler/src/compiler/types/generic_registry.cryo` | none: the registry is asked by definition | text for a message: `TemplateEntry::display_name`; a mangled name is spelled from `leaf_name`, a `DeclName` |
 
 `scripts/resolution-doors.py` (run by `make check-fast`) refuses the tree
 when this table and the doc-comment markers in `compiler/src` disagree in
@@ -156,6 +159,31 @@ yet is recorded with the change that builds it, not here.
 194. **An arm's alternatives must bind the same names, with the same types
      and the same mutability**; otherwise the arm is refused, because its
      body could read a name that the alternative which matched never set.
+
+195. **Rule three for names on syntax nodes and type objects is held by the
+     spelling lint (E0157), which follows a spelling read off a FIELD** -
+     `decls[i].name.equals(&node.name)` - as it follows a parameter today.
+     The compiler's own tables still follow ruling 150: private name
+     fields, the door in the store's file.  No non-comparable getter type
+     is built.
+
+196. **The list of valid doors moves into the compiler**, as a fixed table
+     of door ids, so a `/// Door` marker naming an unknown door is refused
+     there before the Python that checks it today is deleted.
+
+197. **verify's census and examples scripts stay** until verify itself
+     shrinks at the very end.
+
+198. **Ruling 109's last clause (refuse an allow on a function that takes no
+     spelling) is superseded by ruling 179** - the lint refuses only real
+     lookups - and is not built.
+
+199. **The type-name door (`NameResolver::type_spelling_res`) is split** into
+     a scope-side door beside the rib and a name-layer caller.
+
+200. **A duplicate-declaration check - two declared names compared with
+     each other - is not a rule-three lookup.**  Each carries a written
+     reason.
 
 ### 2026-10-08
 

@@ -33,27 +33,23 @@ as the facts record it.
 
 | class | functions |
 |---|---|
-| lookup | 26 |
+| lookup | 22 |
 | lookup-via-callee | 1 |
 | carry | 1 |
-| total | 28 |
+| total | 24 |
 
-## lookup (26)
+## lookup (22)
 
 | site | function | parameter uses | callers |
 |---|---|---|---|
 | `src/compiler/AST/declaration.cryo:1255` | `lookup_method` | n:SymbolStr=[compare] | param=1 |
 | `src/compiler/AST/expression.cryo:948` | `add_capture` | name:SymbolStr=[compare,store:.push] | ast=3 |
 | `src/compiler/AST/node_locator.cryo:923` | `method_by_name` | name:SymbolStr=[compare] | ast=2,param=3 |
-| `src/compiler/bindgen/importer.cryo:476` | `name_seen` | name:SymbolStr=[compare] | element=1,local=7,param=2 |
 | `src/compiler/bindgen/importer.cryo:485` | `find_struct` | name:SymbolStr=[compare] | call=1,local=1 |
 | `src/compiler/bindgen/importer.cryo:1854` | `find_function` | sym:SymbolStr=[compare] | local=1 |
 | `src/compiler/codegen/ops/declaration_emitter.cryo:796` | `find_vtable_slot_impl` | slot_name:SymbolStr=[compare] | field=1 |
 | `src/compiler/codegen/ops/declaration_emitter.cryo:865` | `vtable_slot_index` | method_name:SymbolStr=[compare] | ast=1 |
 | `src/compiler/codegen/state/value_table.cryo:49` | `set_persistent` | name:SymbolStr=[ValueTable.set_raw,compare,store:.push] | param=1 |
-| `src/compiler/decl_index.cryo:520` | `register_signature` | leaf:SymbolStr=[DeclarationIndex.family_slot]; symbol:SymbolStr=[DeclarationIndex.file_entry,compare] | ast=1,local=2,param=1 |
-| `src/compiler/decl_index.cryo:827` | `note_extern_symbol` | sym:SymbolStr=[map-read,map-write]; key:SymbolStr=[store:new] | local=2 |
-| `src/compiler/decl_index.cryo:839` | `extern_symbol_conflict` | sym:SymbolStr=[map-read] | local=1 |
 | `src/compiler/resolver/name_resolution.cryo:1701` | `reaching_import_for` | decl_ns:SymbolStr=[InternTable.resolve,path_precedes,compare] | identity=1 |
 | `src/compiler/resolver/resolver.cryo:1067` | `exports_named` | name:SymbolStr=[compare] | ast=2,param=4 |
 | `src/compiler/sema/method_binding.cryo:172` | `resolve_method_return_via_template` | method_name:SymbolStr=[compare] | ast=1,param=1 |
