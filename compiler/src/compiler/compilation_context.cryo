@@ -40,7 +40,7 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::renderer::{ DiagRenderer, RenderConfig };
 import compiler::diag::severity::{ Severity };
 import compiler::diag::sink::{ DiagnosticSink };
-import compiler::module_graph::{ ModuleGraph, ModuleInfo };
+import compiler::module_graph::{ ModuleGraph, ModuleInfo, ModuleSpellingMatch };
 import compiler::project_config::{ ProjectConfig };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::qualified_name::{ QualifiedName };
@@ -238,27 +238,6 @@ public:
             HeapBackend::Libc   => { false }
         };
     }
-}
-
-/// What one file can see under a module spelling.
-///
-/// `visible` and `matched` are kept apart because they answer different
-/// questions: nothing carries this spelling at all, versus something does and
-/// the writer cannot reach it.  Collapsing them would report the second as the
-/// first, which is the difference between "no such name" and "add an import".
-type struct ModuleSpellingMatch {
-    /// The single visible module, when `visible == 1`.
-    found:   ModulePath;
-    /// That module as a definition, when `visible == 1`.
-    found_def: DefId;
-    /// A second visible module, for naming the ambiguity.
-    other:   ModulePath;
-    /// Any module carrying the spelling, reachable or not.
-    any:     ModulePath;
-    /// How many carry it AND are reachable from the writing file.
-    visible: i64;
-    /// How many carry it at all.
-    matched: i64;
 }
 
 type struct CompilationContext {
@@ -472,106 +451,28 @@ public:
         return this.unit_module.is_valid();
     }
 
-    /// The unit's module path as text, for display and for keys spelled
-    /// with it.
+    /// The unit's module path as text, for display.
     namespace_display(&this) -> string {
-        return this.intern_table.resolve(this.unit_module.as_sym());
+        return this.intern_table.shown(this.unit_module.decl_name());
     }
 
-    /// Which modules a spelling names, as one file can see them.
-    ///
-    /// Asked of a whole scope segment to decide what that segment names, of a
-    /// segment's PREFIX to walk a module-rooted path, and by the type layer to
-    /// say WHY a qualified annotation resolved to nothing; one implementation
-    /// because all of those are the same question about the same relation,
-    /// and two copies of a reachability rule are two rules as soon as either
-    /// is edited.
-    ///
-    /// With a `root`, the spelling continues a path that already named that
-    /// module - `J::Inner` once `J` named `Json` - and names a module whose
-    /// path is the root's followed by the spelling.  What the path reached
-    /// the root through makes it reachable, so such a module is visible.
-    ![allow(lookup_by_spelling, reason = "the module-path relation: a written path matched against the namespaces the modules declare, among the modules the file can see; it needs the import table, which the module graph does not hold")]
+    /// Which modules a spelling names, as one file can see them: the module
+    /// graph's answer (`ModuleGraph::modules_written_as`), the one relation
+    /// a scope segment, a segment's prefix and the type layer's account of
+    /// a qualified annotation that named nothing all ask.
     modules_written_as(&this, spelling: string,
                        use_module: ModulePath, root: ModulePath) -> ModuleSpellingMatch {
-        mut r: ModuleSpellingMatch = ModuleSpellingMatch {
-            found:   ModulePath::none(),
-            found_def: DefId::invalid(),
-            other:   ModulePath::none(),
-            any:     ModulePath::none(),
-            visible: 0,
-            matched: 0,
-        };
-        if (this.module_graph == null || this.decl_index == null) { return r; }
-        const rooted: boolean = root.is_valid();
-        const rooted_length: u64 =
-            if (rooted) { this.intern_table.resolve(root.as_sym()).length() + 2 + spelling.length() } else { 0 };
-        // A spelling of more than one segment may continue a path from a
-        // module this file imports: `Toml::Sub` with `import A::Toml;` names
-        // `A::Toml::Sub`, whose head is the import's binding.  Such a module
-        // is reachable through the import, as the same path through an alias
-        // is.  The imported modules the head can name are gathered in the
-        // same walk, and the candidates are judged once it has seen them all.
-        const head: string = QualifiedName::head_of(spelling);
-        const continues: boolean = !rooted && head.length() < spelling.length();
-        const tail_length: u64 = spelling.length() - head.length();
-        mut heads: ModulePath[] = [];
-        mut head_lengths: u64[] = [];
-        mut cands: ModulePath[] = [];
-        mut cand_defs: DefId[] = [];
-        mut cand_lengths: u64[] = [];
-        mut cand_reach: boolean[] = [];
-        const count: i64 = this.module_graph.module_count() as i64;
-        for (mut i: i64 = 0; i < count; i++) {
-            const cand: ModuleInfo* = this.module_graph.get_module(i);
-            const cand_ns: SymbolStr = cand.namespace_path().as_sym();
-            if (!cand_ns.is_valid()) { continue; }
-            const cand_str: string = this.intern_table.resolve(cand_ns);
-            const names_head: boolean = continues && Resolver::ns_written_as(cand_str, head);
-            const names_spelling: boolean = Resolver::ns_written_as(cand_str, spelling)
-                && !(rooted && (cand_str.length() != rooted_length
-                                || !cand.path().is_within(root, this.intern_table)));
-            if (!names_head && !names_spelling) { continue; }
-            const imported: boolean = this.decl_index.ns_imports(use_module, cand.path());
-            if (names_head && imported) {
-                heads.push(cand.path());
-                head_lengths.push(cand_str.length());
-            }
-            if (!names_spelling) { continue; }
-            r.matched = r.matched + 1;
-            if (r.matched == 1) { r.any = cand.path(); }
-            // The same reachability relation same-leaf resolution uses: the
-            // module's own namespace, anything it imports (the registered set
-            // is already closed over re-exports), or the prelude.
-            //
-            // `cand_str.eq(spelling)` is the fully-qualified spelling: a package
-            // root is addressable without an import, so a path that names a
-            // module's WHOLE namespace needs nothing brought into scope.  Only
-            // the whole one - an abbreviation like `core::option` is a proper
-            // suffix, its first segment is an interior segment binding nothing,
-            // and it stays unreachable here.
-            const reachable: boolean = rooted
-                || cand.path().equals(use_module)
-                || cand_str.eq(spelling)
-                || this.decl_index.is_prelude_ns(cand.path())
-                || imported;
-            cands.push(cand.path());
-            cand_defs.push(cand.def);
-            cand_lengths.push(cand_str.length());
-            cand_reach.push(reachable);
+        if (this.module_graph == null) {
+            return ModuleSpellingMatch {
+                found:   ModulePath::none(),
+                found_def: DefId::invalid(),
+                other:   ModulePath::none(),
+                any:     ModulePath::none(),
+                visible: 0,
+                matched: 0,
+            };
         }
-        for (mut c: i64 = 0; c < cands.length; c++) {
-            mut reachable: boolean = cand_reach[c];
-            for (mut h: i64 = 0; !reachable && h < heads.length; h++) {
-                reachable = head_lengths[h] + tail_length == cand_lengths[c]
-                    && cands[c].is_within(heads[h], this.intern_table);
-            }
-            if (!reachable) { continue; }
-            r.visible = r.visible + 1;
-            if (r.visible == 1) { r.found = cands[c]; r.found_def = cand_defs[c]; }
-            if (r.visible == 2) { r.other = cands[c]; }
-        }
-        return r;
+        return this.module_graph.modules_written_as(spelling, use_module, root, this.intern_table);
     }
 
     /// Stand in module `m` (sema, walking a specialization placed from
@@ -603,9 +504,7 @@ public:
         if (!this.unit_module.is_valid()) {
             return sym;
         }
-        const ns: string = this.intern_table.resolve(this.unit_module.as_sym());
-        const bare: string = this.intern_table.resolve(sym);
-        return this.intern_table.intern(ns + "::" + bare);
+        return this.unit_module.qualified(sym, this.intern_table);
     }
 
     /// The qualifier the span's OWN module would mint - the module that WROTE
@@ -633,9 +532,7 @@ public:
         }
         const home: ModulePath = this.module_of_file(span_file);
         if (!home.is_valid()) { return this.qualify_symbol_sym(sym); }
-        const ns: string   = this.intern_table.resolve(home.as_sym());
-        const bare: string = this.intern_table.resolve(sym);
-        return this.intern_table.intern(ns + "::" + bare);
+        return home.qualified(sym, this.intern_table);
     }
 
     /// The key a TYPE DECLARATION is registered under, from what the node
@@ -817,9 +714,7 @@ public:
     /// tests the namespace first; a declaration without one is keyed by
     /// `decl_type_key` / `decl_global_key`.
     qualify_binding_sym(mut &this, sym: SymbolStr, binding_namespace: ModulePath) -> SymbolStr {
-        const ns: string = this.intern_table.resolve(binding_namespace.as_sym());
-        const bare: string = this.intern_table.resolve(sym);
-        return this.intern_table.intern(ns + "::" + bare);
+        return binding_namespace.qualified(sym, this.intern_table);
     }
 
     /// Install the scope walk's outermost tier, the prelude modules.  Called
@@ -937,7 +832,6 @@ public:
         this.source_file = info.file_path;
 
         // Set namespace from module info
-        const ns_str: string = this.intern_table.resolve(info.namespace_path().as_sym());
         this.unit_module = if (info.declares_namespace()) { info.path() } else { ModulePath::none() };
 
         // NOTE: AST swap is handled by the orchestrator (compile_project) because
@@ -951,7 +845,7 @@ public:
         if (this.options.verbose) {
             LOG_DEBUG(LogComponent::General,
                 "[CompilationContext] switch_to_module(%lld) -> '%s' ns='%s'",
-                index, info.file_path, ns_str);
+                index, info.file_path, this.intern_table.shown(info.namespace_path().decl_name()));
         }
     }
 }

@@ -164,8 +164,6 @@ CLASS_OF_METHOD = {
         ("J", "member: whether a method's written signature was refused, by its leaf off the owner `TypeRef` in hand; the store is keyed by the owner's arena id and the leaf"),
     "DeclarationIndex::is_prelude_ns":
         ("J", "module: a namespace asked whether it is the prelude's; a module's identity is its path"),
-    "DeclarationIndex::ns_imports":
-        ("J", "module: two namespaces asked whether one imports the other; module identities"),
     "DeclarationIndex::extern_symbol_conflict":
         ("J", "extern: a C symbol by its link name, the only identity a C symbol has"),
     # -- the funnel --
@@ -197,6 +195,14 @@ CLASS_OF_METHOD = {
         ("J", "module: a module's source file by the module's identity (`ModulePath`), which only the graph mints"),
     "ModuleGraph::module_named":
         ("J", "module: the door from a namespace's text - an import's path, an export's item, a namespace another store recorded - to a module; it answers only a module the graph registered, so it can name a real module and never forge one. Ruled against as a door callable from anywhere: each site goes as the namespace it reads is stored as an identity"),
+    "ModuleGraph::imports":
+        ("J", "module: two namespaces asked whether one imports the other; module identities"),
+    "ModuleGraph::modules_written_as":
+        ("J", "module: a path written in a body, to the modules it names among those the writing file can see - the `module-by-path` door `modules_in_view` behind a name for the one kind of text it takes"),
+    "ModuleGraph::module_under":
+        ("J", "module: the module nested in a module, by that module's identity and a leaf - `module_named` on the module's canonical name for the leaf, behind a name for that question"),
+    "ModuleGraph::modules_abbreviated_by":
+        ("J", "hint: the modules an unknown import path abbreviates, named in an E0502's help; the spelling is the question"),
     "ModuleGraph::module_of_written_path":
         ("J", "module: an import or export path as written in source, to the module the graph registered under it - `module_named` behind a name for the one kind of text it takes, the door itself being private to the graph"),
     "ModuleGraph::module_beside_item":

@@ -33,7 +33,8 @@ import compiler::ast::{
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context;
-import compiler::compilation_context::{ CompilationContext, CRecordRef, ModuleSpellingMatch };
+import compiler::compilation_context::{ CompilationContext, CRecordRef };
+import compiler::module_graph::{ ModuleSpellingMatch };
 import compiler::module_graph;
 import compiler::module_graph::{ ModuleGraph, ModuleInfo };
 import utils::logger;
@@ -780,7 +781,6 @@ public:
         if (this.ctx == null || this.ctx.module_graph == null) { return; }
         const unit: ModulePath = this.resolver.current_module_path();
         if (!unit.is_valid()) { return; }
-        const ns_str: string = this.resolver.intern_table.resolve(unit.as_sym());
         const scope: Scope* = this.resolver.get_scope(this.resolver.current_scope);
         if (scope == null) { return; }
         for (mut i: i64 = 0; i < scope.binding_count(); i++) {
@@ -800,8 +800,8 @@ public:
             if (!clash.is_valid()) {
                 // `namespace A;` declaring `type N` beside a module `A::N`:
                 // the two canonical names are one name.
-                const canonical: ModulePath = this.ctx.module_graph.module_beside_item(
-                    ns_str, name_str, this.resolver.intern_table);
+                const canonical: ModulePath = this.ctx.module_graph.module_under(
+                    unit, s.name, this.resolver.intern_table);
                 const canonical_idx: i64 = this.ctx.module_graph.find_module_index(canonical);
                 if (canonical_idx >= 0
                         && !(aliased.visible == 1
@@ -813,7 +813,7 @@ public:
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0205_REDEFINED_SYMBOL,
                 Text::new(fmt::format("the name `%s` is already declared in this scope: `%s` is a module",
-                    name_str, this.resolver.intern_table.resolve(clash.as_sym()))));
+                    name_str, this.resolver.intern_table.shown(clash.decl_name()))));
             if (aliased.visible == 1) {
                 d = d.at_with_label(s.declaring_span, Text::new("a module imported under another module's name"));
                 d = d.with_note(
@@ -1724,22 +1724,21 @@ public:
     /// order - never on discovery order: a suggestion that varied with
     /// directory enumeration would be a binding that varies with it, moved
     /// somewhere harder to see.
-    ![allow(lookup_by_spelling, reason = "a diagnostic's suggestion: the module path a declaration's namespace is reached through, compared by module identity, returned as text that flows only into the message")]
-    reaching_import_for(&this, decl_ns: SymbolStr) -> string {
-        mut best: string = this.resolver.intern_table.resolve(decl_ns);
+    reaching_import_for(&this, decl_module: ModulePath) -> string {
+        mut best: string = this.resolver.intern_table.shown(decl_module.decl_name());
         const graph: ModuleGraph* = this.ctx.module_graph;
         const count: i64 = graph.module_count() as i64;
         for (mut m: i64 = 0; m < count; m++) {
             const cand: ModuleInfo* = graph.get_module(m);
             if (cand.reexports.length == 0) { continue; }
-            if (cand.path().as_sym().id == decl_ns.id) { continue; }
+            if (cand.path().equals(decl_module)) { continue; }
             const via: ModulePath[] = graph.reexport_closure(cand.path());
             mut reaches: boolean = false;
             for (mut i: i64 = 0; i < via.length; i++) {
-                if (via[i].as_sym().id == decl_ns.id) { reaches = true; }
+                if (via[i].equals(decl_module)) { reaches = true; }
             }
             if (!reaches) { continue; }
-            const cand_str: string = this.resolver.intern_table.resolve(cand.path().as_sym());
+            const cand_str: string = this.resolver.intern_table.shown(cand.path().decl_name());
             const cand_len: i64 = cand_str.length() as i64;
             const best_len: i64 = best.length() as i64;
             if (cand_len < best_len) { best = cand_str; continue; }
@@ -1785,7 +1784,7 @@ public:
                     Text::new(fmt::format("`%s` names more than one module in scope", prefix)));
                 d = d.at_with_label(span, Text::new("ambiguous module path"));
                 d = d.with_note(Text::new(fmt::format("it could be `%s` or `%s`",
-                    intern.resolve(mods.found.as_sym()), intern.resolve(mods.other.as_sym()))));
+                    intern.shown(mods.found.decl_name()), intern.shown(mods.other.decl_name()))));
                 d = d.with_note(Text::new("write the path out in full to say which one is meant"));
                 this.ctx.emit_diagnostic(d);
                 return true;
@@ -1794,7 +1793,7 @@ public:
                 // A module carries the spelling and the writer cannot reach
                 // it: the name exists, so this is E0240's story and not "no
                 // such name", as the scope lane says of the same prefix.
-                const owner: string = intern.resolve(mods.any.as_sym());
+                const owner: string = intern.shown(mods.any.decl_name());
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
                     Text::new(fmt::format("`%s` is not reachable from this module", prefix)));
@@ -1833,11 +1832,10 @@ public:
             // means the module is imported but the leaf is not bound bare,
             // which is the not-found below.
             const owner_path: ModulePath = owners[0];
-            const owner_ns: SymbolStr = owner_path.as_sym();
-            const owner: string = intern.resolve(owner_ns);
+            const owner: string = intern.shown(owner_path.decl_name());
             const reach: boolean = owner_path.equals(use_module)
                 || this.ctx.decl_index.is_prelude_ns(owner_path)
-                || this.ctx.decl_index.ns_imports(use_module, owner_path);
+                || this.ctx.module_graph.imports(use_module, owner_path);
             const is_public: boolean = this.resolver.exports_named(owner_path, name).length > 0;
             if (!reach || !is_public) {
                 mut d: Diagnostic = Diagnostic::error(
@@ -1851,7 +1849,7 @@ public:
                 d = d.with_note(Text::new(fmt::format("`%s` is declared in `%s`", written, owner)));
                 if (is_public) {
                     d = d.with_note(Text::new(fmt::format("add `import %s;` to bring it into scope",
-                        this.reaching_import_for(owner_ns))));
+                        this.reaching_import_for(owner_path))));
                 } else {
                     // A private declaration is outside its module's export
                     // set, so no import reaches it and no re-export widens it.
@@ -1931,10 +1929,10 @@ public:
             const bound: Symbol = this.resolver.get_symbol(sym_id);
             if (bound.kind == SymbolKind::Import
                     && this.resolver.is_ambiguous(node.name, Namespace::Value)) {
-                const mods: SymbolStr[] = this.resolver.get_ambiguous_modules(node.name, Namespace::Value);
+                const mods: ModulePath[] = this.resolver.get_ambiguous_modules(node.name, Namespace::Value);
                 const leaf: string = this.resolver.intern_table.resolve(node.name);
-                const a: string = if (mods.length > 0) { this.resolver.intern_table.resolve(mods[0]) } else { "" };
-                const b: string = if (mods.length > 1) { this.resolver.intern_table.resolve(mods[1]) } else { "" };
+                const a: string = if (mods.length > 0) { this.resolver.intern_table.shown(mods[0].decl_name()) } else { "" };
+                const b: string = if (mods.length > 1) { this.resolver.intern_table.shown(mods[1].decl_name()) } else { "" };
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0154_AMBIGUOUS_CALL,
                     Text::new(fmt::format("`%s` is ambiguous: it is imported from both `%s` and `%s`",
@@ -2092,7 +2090,7 @@ public:
         const hidden: SymbolID = this.private_in(head.found, leaf_sym, Namespace::Type);
         if (!hidden.is_valid()) { return ResSlot::Pending; }
         const hs: Symbol = this.resolver.get_symbol(hidden);
-        const owner: string = this.resolver.intern_table.resolve(head.found.as_sym());
+        const owner: string = this.resolver.intern_table.shown(head.found.decl_name());
         if (hs.kind == SymbolKind::Type || hs.kind == SymbolKind::TypeAlias) {
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0503_PRIVATE_SYMBOL_ACCESS,
@@ -2104,7 +2102,7 @@ public:
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0353_PRIVATE_ACCESS,
                 Text::new(fmt::format("`%s::%s` is private and cannot be named from `%s`",
-                    owner, leaf, this.resolver.intern_table.resolve(use_module.as_sym()))));
+                    owner, leaf, this.resolver.intern_table.shown(use_module.decl_name()))));
             d = d.at_with_label(span, Text::new("private declaration named by this path"));
             this.ctx.emit_diagnostic(d);
         }
@@ -2298,8 +2296,8 @@ public:
             // Two modules the writer can see, both spelled this way: the
             // spelling does not name one of them.  Never picked, because
             // picking is the defect.
-            const a: string = this.resolver.intern_table.resolve(found.as_sym());
-            const b: string = this.resolver.intern_table.resolve(other.as_sym());
+            const a: string = this.resolver.intern_table.shown(found.decl_name());
+            const b: string = this.resolver.intern_table.shown(other.decl_name());
             if (!binds_in_scope) {
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0154_AMBIGUOUS_CALL,
@@ -2322,7 +2320,7 @@ public:
             // A module carries this spelling and the writer cannot reach it.
             // The name exists, so this is E0240's story and not "no such name"
             // (E0203) nor "reachable but private" (E0353).
-            const owner: string = this.resolver.intern_table.resolve(any.as_sym());
+            const owner: string = this.resolver.intern_table.shown(any.decl_name());
             if (!binds_in_scope) {
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
@@ -2749,11 +2747,11 @@ public:
             Res::Def(_) => { return ResSlot::Answered(r); }
             _           => { }
         }
-        const mods: SymbolStr[] = this.resolver.ambiguous_modules_from(scope, name, Namespace::Type);
+        const mods: ModulePath[] = this.resolver.ambiguous_modules_from(scope, name, Namespace::Type);
         if (mods.length < 2) { return ResSlot::Pending; }
         const leaf: string = this.resolver.intern_table.resolve(name);
-        const a: string = this.resolver.intern_table.resolve(mods[0]);
-        const b: string = this.resolver.intern_table.resolve(mods[1]);
+        const a: string = this.resolver.intern_table.shown(mods[0].decl_name());
+        const b: string = this.resolver.intern_table.shown(mods[1].decl_name());
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0154_AMBIGUOUS_CALL,
             Text::new(fmt::format("`%s` is ambiguous: it is imported from both `%s` and `%s`",
@@ -3478,20 +3476,19 @@ public:
             return out;
         }
         const via: ModulePath[] = this.ctx.module_graph.reexport_closure(m);
-        mut seen: SymbolStr[] = [];
+        mut seen: DefId[] = [];
         for (mut i: i64 = 0; i < via.length; i++) {
             const cand: SymbolID = this.resolver.export_in(via[i], name, ns);
             if (!cand.is_valid()) { continue; }
             const cs: Symbol = this.resolver.get_symbol(cand);
-            const q: SymbolStr = this.resolver.qualified_name_of(&cs);
             mut dup: boolean = false;
             for (mut k: i64 = 0; k < seen.length; k++) {
-                if (seen[k].equals(q)) { dup = true; }
+                if (seen[k].equals(cs.def)) { dup = true; }
             }
             // Same declaration reached by a second route is one item, not
             // two candidates.
             if (dup) { continue; }
-            seen.push(q);
+            seen.push(cs.def);
             out.push(cand);
         }
         return out;
@@ -3549,7 +3546,7 @@ public:
         const prefix: string = resolved_module + "::";
         const graph: ModuleGraph* = this.ctx.module_graph;
         for (mut mi: u32 = 0; mi < graph.modules.length; mi++) {
-            const cand: string = this.resolver.intern_table.resolve(graph.modules[mi].path().as_sym());
+            const cand: string = this.resolver.intern_table.shown(graph.modules[mi].path().decl_name());
             if (!cand.starts_with(prefix)) { continue; }
             const rest: string = cand.substring(prefix.length() as u32, (cand.length() - prefix.length()) as u32);
             if (rest.contains("::")) { continue; }
@@ -3597,23 +3594,18 @@ public:
     /// as the fix, because that is the mistake the shape comes from - the
     /// path a QUALIFIER may abbreviate to is written where the whole name
     /// is required.
-    ![allow(lookup_by_spelling, reason = "a diagnostic's help: the modules an unknown import path abbreviates, named in message text only")]
     refuse_unknown_module_import(&this, node: ImportDeclNode*, module_path: string) -> void {
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0502_INVALID_IMPORT,
             Text::new(fmt::format("`%s` is not a module's name", module_path)));
         d = d.at_with_label(node.span, Text::new("no module is registered under this name"));
-        const graph: ModuleGraph* = this.ctx.module_graph;
+        const abbreviated: ModulePath[] = this.ctx.module_graph.modules_abbreviated_by(module_path, this.resolver.intern_table);
         mut named: string = "";
-        mut count: i64 = 0;
-        for (mut mi: u32 = 0; mi < graph.modules.length; mi++) {
-            const cand: string = this.resolver.intern_table.resolve(graph.modules[mi].namespace_path().as_sym());
-            if (cand.length() == 0 || !Resolver::ns_written_as(cand, module_path)) { continue; }
-            if (count > 0) { named = named + ", "; }
-            named = named + "`" + cand + "`";
-            count = count + 1;
+        for (mut k: i64 = 0; k < abbreviated.length; k++) {
+            if (k > 0) { named = named + ", "; }
+            named = named + "`" + this.resolver.intern_table.shown(abbreviated[k].decl_name()) + "`";
         }
-        if (count > 0) {
+        if (abbreviated.length > 0) {
             d = d.help(Text::new(fmt::format("an import names a module whole; the name this path abbreviates is %s", named)));
         }
         this.ctx.emit_diagnostic(d);

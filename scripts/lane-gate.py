@@ -554,6 +554,8 @@ SCANNED_ARRAYS = {
                                             "a destructure's bindings by the source field's leaf (which binding takes a field) or the local's"),
     "ModuleInfo.reexports":       Scanned("compiler/module_graph.cryo", "ModulePath", TABLE,
                                           "a module's re-exported modules, by identity"),
+    "ModuleInfo.visible":         Scanned("compiler/module_graph.cryo", "ModulePath", TABLE,
+                                          "the modules a module can see through its imports, by identity"),
     # -- LOCAL tables: a local or parameter annotated as an array of records
     #    and scanned; the owner is out of view, the element says what it is --
     "local.MethodNode":           Scanned(None, "MethodNode", TABLE,

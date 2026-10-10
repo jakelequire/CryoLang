@@ -752,7 +752,7 @@ type struct CompilerInstance {
                 // Borrow the stored ModuleInfo; a value copy would shallow-alias
                 // its owning arrays and double-free them at scope exit.
                 const info: ModuleInfo* = &ctx.module_graph.modules[mod_idx];
-                const ns: string = intern.resolve(info.namespace_path().as_sym());
+                const ns: string = intern.shown(info.namespace_path().decl_name());
                 ctx.artifacts.ast = ASTOutput {
                     root: ast,
                     namespace_name: ns,
@@ -1394,14 +1394,11 @@ type struct CompilerInstance {
             }
         }
 
-        // Feed per-module import lists into the DeclarationIndex, which answers
-        // whether a use site's module reaches another (`ns_imports`).  Keyed on namespace (ModuleInfo.name == namespace_name
-        // == the declared namespace; dependencies are also namespace names).
-        // decl_index stores these as resolved SymbolStr ids rather than reaching
-        // a ModuleGraph* back-pointer: Cryo forbids the resulting import cycle
-        // (module_graph.cryo already imports DeclIndex).  Done once here, after
-        // discovery, where every module's namespace + dependency edges are known
-        // and before any pass calls the resolver.
+        // Give each module the list of modules it can see through its imports,
+        // which answers whether a use site's module reaches another
+        // (`ModuleGraph::imports`).  Done once here, after discovery, where
+        // every module's namespace and dependency edges are known and before
+        // any pass calls the resolver.
         // Prelude re-export set, DERIVED from `stdlib/prelude.cryo`'s
         // `public module` declarations rather than transcribed into a constant.
         // The loader records each declaration's resolved namespace on the
@@ -1412,16 +1409,7 @@ type struct CompilerInstance {
         // drift from the file it mirrors, and under `--no-std` it now comes out
         // EMPTY - the old constant registered 12 std namespaces as "prelude"
         // even when no prelude was loaded.
-        mut prelude_set: ModulePath[] = [];
-        const prelude_idx: i64 = ctx.module_graph.find_module_index(
-            ctx.module_graph.lang_module(LangModule::Prelude, ctx.intern_table));
-        if (prelude_idx >= 0) {
-            const pm: ModuleInfo* = &ctx.module_graph.modules[prelude_idx];
-            for (mut psi: i64 = 0; psi < pm.submodules.length; psi++) {
-                prelude_set.push(pm.submodules[psi]);
-            }
-        }
-        ctx.decl_index.register_prelude_namespaces(prelude_set);
+        ctx.decl_index.register_prelude_namespaces(ctx.module_graph.prelude_set(ctx.intern_table));
         // Modules carrying at least one `export`.  Collected once so the
         // closure below scans only re-exporters instead of the whole graph per
         // visible namespace; on a program that writes no `export` this list is
@@ -1436,10 +1424,8 @@ type struct CompilerInstance {
             const imi_info: ModuleInfo* = &ctx.module_graph.modules[imi];
             // What a module can SEE is its dependency edges PLUS the brace-list
             // items, which are deliberately not dependencies (they would create
-            // false cycles in `compute_order`).  Passing only `dependencies`
-            // made `ns_imports` answer "not imported" for 68% of the
-            // visibility questions it was asked - see docs/name-resolution.md
-            // §8.1.
+            // false cycles in `compute_order`); with only `dependencies`, a
+            // module would not reach what its brace items name.
             mut imi_visible: ModulePath[] = [];
             for (mut di: i64 = 0; di < imi_info.dependencies.length; di++) {
                 imi_visible.push(imi_info.dependencies[di]);
@@ -1477,8 +1463,7 @@ type struct CompilerInstance {
                     }
                 }
             }
-            ctx.decl_index.register_module_imports(
-                imi_info.path(), &imi_visible);
+            ctx.module_graph.set_visible_modules(imi as i64, imi_visible);
         }
 
         // Experimental gate: consuming a C++ vendor library (binding_source
@@ -1537,7 +1522,7 @@ type struct CompilerInstance {
             for (mut ui: i64 = 0; ui < unplaced.length; ui++) {
                 const uinfo: ModuleInfo* =
                     &ctx.module_graph.modules[unplaced[ui]];
-                const uname: string = ctx.intern_table.resolve(uinfo.path().as_sym());
+                const uname: string = ctx.intern_table.shown(uinfo.path().decl_name());
                 if (cyc.length() > 0) { cyc = cyc + ", "; }
                 cyc = cyc + uname;
             }
@@ -1563,7 +1548,7 @@ type struct CompilerInstance {
         for (mut i: u32 = 0; i < n; i++) {
             const info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
             cdebug(Text::new("  [%u] %s (%s)\n"), i,
-                ctx.intern_table.resolve(info.path().as_sym()), info.file_path);
+                ctx.intern_table.shown(info.path().decl_name()), info.file_path);
         }
 
         // Incremental whole-build fingerprint + short-circuit.
@@ -1603,7 +1588,7 @@ type struct CompilerInstance {
             for (mut i: u32 = 0; i < n; i++) {
                 const minfo: ModuleInfo* = &ctx.module_graph.modules[order[i]];
                 mod_entries.push(build_manifest::ModuleEntry {
-                    namespace_name: ctx.intern_table.resolve(minfo.path().as_sym()),
+                    namespace_name: ctx.intern_table.shown(minfo.path().decl_name()),
                     source_path:    minfo.file_path,
                     origin_subdir:  ModuleInfo::origin_subdir(minfo.origin, minfo.origin_name),
                     origin_kind:    ModuleInfo::origin_kind_label(minfo.origin),
@@ -1819,7 +1804,7 @@ type struct CompilerInstance {
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                 pm_src_h.push(compiler::build_manifest::Manifest::module_source_hash(
-                    ctx.intern_table.resolve(mi.path().as_sym()),
+                    ctx.intern_table.shown(mi.path().decl_name()),
                     ModuleInfo::origin_subdir(mi.origin, mi.origin_name),
                     mi.file_path));
             }
@@ -1911,7 +1896,7 @@ type struct CompilerInstance {
             }
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
-                const ns: string = ctx.intern_table.resolve(mi.path().as_sym());
+                const ns: string = ctx.intern_table.shown(mi.path().decl_name());
                 mut k: Fnv128Hasher = Fnv128Hasher::new();
                 k.fold(pm_tool_fp);
                 if (pm_owns_spec[m as i64]) {
@@ -1953,7 +1938,7 @@ type struct CompilerInstance {
                     const objp: string = fmt::format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
                             Text::new(ModuleInfo::origin_subdir(mi.origin, mi.origin_name))),
-                        compiler::build_manifest::Manifest::path_module(ctx.intern_table.resolve(mi.path().as_sym())));
+                        compiler::build_manifest::Manifest::path_module(ctx.intern_table.shown(mi.path().decl_name())));
                     if (metadata::exists(Path::from(objp))) {
                         pm_cached[m as i64] = true;
                     }
@@ -2228,7 +2213,7 @@ type struct CompilerInstance {
                     break;
                 }
                 const _mi: ModuleInfo* = &ctx.module_graph.modules[order[i]];
-                const _mn: string = ctx.intern_table.resolve(_mi.path().as_sym());
+                const _mn: string = ctx.intern_table.shown(_mi.path().decl_name());
                 cdebug(Text::new("[Compiler] Codegen: module %u/%u (%s)\n"), i, n, _mn);
                 // Cached module: reuse the on-disk object instead of
                 // regenerating IR + emitting it.  Recorded at this topo
@@ -2288,7 +2273,7 @@ type struct CompilerInstance {
                 }
 
                 const mod_info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
-                const mod_name: string = ctx.intern_table.resolve(mod_info.path().as_sym());
+                const mod_name: string = ctx.intern_table.shown(mod_info.path().decl_name());
 
                 // Invariant guard (gated by CRYO_CTX_AUDIT): every module must be
                 // self-contained in its own context for the zero-copy threaded
@@ -3665,7 +3650,7 @@ type struct CompilerInstance {
         const mi: u32 = order[pos as i64];
         if (mi as i64 >= ctx.module_graph.modules.length) { return "<unknown>"; }
         const info: ModuleInfo* = &ctx.module_graph.modules[mi as i64];
-        return ctx.intern_table.resolve(info.path().as_sym());
+        return ctx.intern_table.shown(info.path().decl_name());
     }
 
     /// `nthreads <= 1` (or a single job) runs the batch inline via

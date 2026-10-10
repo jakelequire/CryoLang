@@ -47,7 +47,7 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::qualified_name::{ QualifiedName };
-import compiler::module_graph::{ ModulePath };
+import compiler::module_graph::{ ModulePath, RecordedEdge };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 import utils::text::{ Text };
@@ -79,8 +79,8 @@ private:
     // inside an import cycle the target is mid-load and `find_module_by_path`
     // cannot see it yet.  The dependency edge then silently degraded to the
     // raw import path (`collections::str` instead of `std::collections::str`),
-    // and `ns_imports` answered "not imported" ever after for a module that
-    // plainly imports it.  This map is what makes the edge resolvable while
+    // and the module's import list would not reach a module it plainly
+    // imports.  This map is what makes the edge resolvable while
     // the target is still on the loading stack.
     ![allow(lookup_by_spelling, reason = "module discovery maps a written namespace to its file before any module exists to be its identity")]
     scanned_ns: HashMap<string, string>;
@@ -729,15 +729,14 @@ public:
             // topological sort can find the module by its registered name.
             const dep_idx: i64 = graph.find_module_by_path(resolved);
             if (dep_idx >= 0) {
-                info.add_dependency(graph.modules[dep_idx].path().as_sym());
+                info.add_dependency(RecordedEdge::to(graph.modules[dep_idx].path()));
             } else {
                 // Not in the graph yet.  Inside an import cycle that is
                 // NORMAL, not an anomaly: the target is on the loading stack
                 // and is only added to the graph when its own discovery
                 // finishes.  Its namespace is already known, so take it from
                 // `scanned_ns` rather than degrading the edge to the written
-                // import path - which is what made `ns_imports` answer "not
-                // imported" for 59% of the visibility-gate blast radius.
+                // import path, which names no module.
                 const scanned: string =
                     match (this.scanned_ns.get(&resolved.to_ascii_lower())) {
                         Option::Some(ns) => { ns }
@@ -752,11 +751,11 @@ public:
                     // The same rule the loader already applies to `public
                     // module` and to brace-list items: what a module can SEE
                     // is not what must be COMPILED FIRST.
-                    info.add_imported_namespace(intern.intern(scanned));
+                    info.add_imported_namespace(RecordedEdge::written_as(intern.intern(scanned)));
                 } else {
                     // Genuinely unknown: keep the written path so the edge is
                     // not lost outright.
-                    info.add_dependency(intern.intern(import_path));
+                    info.add_dependency(RecordedEdge::written_as(intern.intern(import_path)));
                 }
             }
         }
@@ -785,7 +784,7 @@ public:
                 item_files[ii] = item_resolved;
                 const by_path: i64 = graph.find_module_by_path(item_resolved);
                 if (by_path >= 0) {
-                    info.add_imported_namespace(graph.modules[by_path].path().as_sym());
+                    info.add_imported_namespace(RecordedEdge::to(graph.modules[by_path].path()));
                     continue;
                 }
                 // Mid-load inside a cycle - same case as the dependency edge
@@ -793,7 +792,7 @@ public:
                 // is not written yet.
                 match (this.scanned_ns.get(&item_resolved.to_ascii_lower())) {
                     Option::Some(ns) => {
-                        info.add_imported_namespace(intern.intern(ns));
+                        info.add_imported_namespace(RecordedEdge::written_as(intern.intern(ns)));
                         continue;
                     }
                     Option::None => { }
@@ -806,7 +805,7 @@ public:
             const item_idx: i64 = graph.find_module_index(graph.module_of_written_path(item_sym));
             if (item_idx >= 0) {
                 item_files[ii] = graph.modules[item_idx].file_path;
-                info.add_imported_namespace(graph.modules[item_idx].path().as_sym());
+                info.add_imported_namespace(RecordedEdge::to(graph.modules[item_idx].path()));
                 continue;
             }
             // Otherwise the item names a TYPE rather than a submodule, which
@@ -870,8 +869,8 @@ public:
                 }
                 const exp_idx: i64 = graph.find_module_by_path(exp_resolved);
                 if (exp_idx >= 0) {
-                    if (!braced) { info.add_reexport(graph.modules[exp_idx].path().as_sym()); }
-                    info.add_imported_namespace(graph.modules[exp_idx].path().as_sym());
+                    if (!braced) { info.add_reexport(RecordedEdge::to(graph.modules[exp_idx].path())); }
+                    info.add_imported_namespace(RecordedEdge::to(graph.modules[exp_idx].path()));
                     continue;
                 }
                 // Mid-load inside a cycle: the graph entry is not written yet,
@@ -879,8 +878,8 @@ public:
                 match (this.scanned_ns.get(&exp_resolved.to_ascii_lower())) {
                     Option::Some(ns) => {
                         const ns_sym: SymbolStr = intern.intern(ns);
-                        if (!braced) { info.add_reexport(ns_sym); }
-                        info.add_imported_namespace(ns_sym);
+                        if (!braced) { info.add_reexport(RecordedEdge::written_as(ns_sym)); }
+                        info.add_imported_namespace(RecordedEdge::written_as(ns_sym));
                         continue;
                     }
                     Option::None => { }
@@ -891,8 +890,8 @@ public:
             const exp_sym: SymbolStr = intern.intern(exp_path);
             const exp_gidx: i64 = graph.find_module_index(graph.module_of_written_path(exp_sym));
             if (exp_gidx >= 0) {
-                if (!braced) { info.add_reexport(graph.modules[exp_gidx].path().as_sym()); }
-                info.add_imported_namespace(graph.modules[exp_gidx].path().as_sym());
+                if (!braced) { info.add_reexport(RecordedEdge::to(graph.modules[exp_gidx].path())); }
+                info.add_imported_namespace(RecordedEdge::to(graph.modules[exp_gidx].path()));
                 continue;
             }
             // An `export` naming no module at all is E0500, the same as an
@@ -931,15 +930,15 @@ public:
                 }
                 const eby_path: i64 = graph.find_module_by_path(eitem_resolved);
                 if (eby_path >= 0) {
-                    info.add_reexport(graph.modules[eby_path].path().as_sym());
-                    info.add_imported_namespace(graph.modules[eby_path].path().as_sym());
+                    info.add_reexport(RecordedEdge::to(graph.modules[eby_path].path()));
+                    info.add_imported_namespace(RecordedEdge::to(graph.modules[eby_path].path()));
                     continue;
                 }
                 match (this.scanned_ns.get(&eitem_resolved.to_ascii_lower())) {
                     Option::Some(ns) => {
                         const ens: SymbolStr = intern.intern(ns);
-                        info.add_reexport(ens);
-                        info.add_imported_namespace(ens);
+                        info.add_reexport(RecordedEdge::written_as(ens));
+                        info.add_imported_namespace(RecordedEdge::written_as(ens));
                         continue;
                     }
                     Option::None => { }
@@ -948,8 +947,8 @@ public:
             const eitem_sym: SymbolStr = intern.intern(eitem_path);
             const eitem_idx: i64 = graph.find_module_index(graph.module_of_written_path(eitem_sym));
             if (eitem_idx >= 0) {
-                info.add_reexport(graph.modules[eitem_idx].path().as_sym());
-                info.add_imported_namespace(graph.modules[eitem_idx].path().as_sym());
+                info.add_reexport(RecordedEdge::to(graph.modules[eitem_idx].path()));
+                info.add_imported_namespace(RecordedEdge::to(graph.modules[eitem_idx].path()));
             }
             // Otherwise the item names a declaration inside the path, which is
             // reached through the path's own edge, recorded above.
@@ -979,12 +978,12 @@ public:
                 // set to be hand-transcribed into a constant in `decl_index`.
                 const sub_idx: i64 = graph.find_module_by_path(sub_resolved);
                 if (sub_idx >= 0) {
-                    info.add_submodule(graph.modules[sub_idx].path().as_sym());
+                    info.add_submodule(RecordedEdge::to(graph.modules[sub_idx].path()));
                 } else {
                     // Mid-load (cycle): the graph entry is not written yet, but
                     // the namespace is known.  Same case as the import edge.
                     match (this.scanned_ns.get(&sub_resolved.to_ascii_lower())) {
-                        Option::Some(ns) => { info.add_submodule(intern.intern(ns)); }
+                        Option::Some(ns) => { info.add_submodule(RecordedEdge::written_as(intern.intern(ns))); }
                         Option::None     => { }
                     }
                 }
@@ -1588,8 +1587,7 @@ type struct ModuleScanResult {
     /// constrains build order, and adding one per brace item reintroduces
     /// exactly the false cycles the submodule loop below avoids
     /// (`AST -> Specializer -> Types -> AST`).  What a module can SEE and what
-    /// must be BUILT FIRST are different relations; conflating them is why
-    /// `ns_imports` reported 68% of its visibility answers wrong.
+    /// must be BUILT FIRST are different relations.
     import_items:    string[];
     import_item_count: i64;
     /// Paths in the file's body whose head is a name an import binds - an

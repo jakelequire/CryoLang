@@ -101,11 +101,11 @@ or reads the store by identity.  Locked so far:
 |---|---|---|---|
 | the scope ribs (`Scope`, `ScopeEntry`) | `compiler/src/compiler/resolver/resolver.cryo` | `scope-value`, `scope-type` | by identity: `Scope::binding_count`, `binding_at`; a module's own binding by leaf: `Resolver::module_binding` |
 | an enum type's variants (`EnumVariantInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-variant` (`EnumType::variant_index`) | text for a message: `EnumVariantInfo::display_name` |
-| the declaration index's families and module globals (`overload_index`, `func_type_refs`, `refused_methods`, `overload_func_family`, `overload_func_mangled`, `module_global_leaves`, `module_global_extern_syms`, `extern_symbol_first`, `module_imports`, `family_slot`) | `compiler/src/compiler/decl_index.cryo` | `member-function`, `member-global` | none |
+| the declaration index's families and module globals (`overload_index`, `func_type_refs`, `refused_methods`, `overload_func_family`, `overload_func_mangled`, `module_global_leaves`, `module_global_extern_syms`, `extern_symbol_first`, `family_slot`) | `compiler/src/compiler/decl_index.cryo` | `member-function`, `member-global` | none |
 | the interner (`strings`, `lookup`) | `compiler/src/compiler/resolver/intern_table.cryo` | `intern` | `resolve`, `shown` |
 | a struct's or class's fields (`FieldInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-field` (`StructType::field_position`, `ClassType::own_field_position`; `MemberResolver::field_of` asks them) | by position; the name sealed for a message or a synthesized node: `FieldInfo::decl_name` |
 | the loader's namespace maps (`ModuleLoader.scanned_ns`, `ns_map`) | `compiler/src/compiler/module_loader.cryo` | `loader-path` | none |
-| the module graph's names (`ModuleInfo.name`, `namespace_name`; `ModuleGraph.name_index`, `module_defs`, `def_list`, `def_paths`) | `compiler/src/compiler/module_graph.cryo` | `module-by-path` | by identity: `ModuleInfo::path`, `namespace_path`, `declares_namespace`; text for a message or a written path list through `ModulePath::as_sym` - which `CompilationContext::modules_written_as` still matches written paths against, outside the graph |
+| the module graph's names (`ModuleInfo.name`, `namespace_name`; `ModuleGraph.name_index`, `module_defs`, `def_list`, `def_paths`) and each module's import list (`ModuleInfo.visible`) | `compiler/src/compiler/module_graph.cryo` | `module-by-path` | by identity: `ModuleInfo::path`, `namespace_path`, `declares_namespace`, `ModuleGraph::imports`; a body path's modules through `ModuleGraph::modules_written_as`; text for a message, a mangled symbol or a manifest entry through `ModulePath::decl_name`; a declaration's canonical name, `module::leaf`, composed by `ModulePath::qualified` and nowhere else |
 | the template registry's names (`TemplateEntry.name`) | `compiler/src/compiler/types/generic_registry.cryo` | none: the registry is asked by definition | text for a message: `TemplateEntry::display_name`; a mangled name is spelled from `leaf_name`, a `DeclName` |
 
 `scripts/resolution-doors.py` (run by `make check-fast`) refuses the tree
@@ -130,6 +130,7 @@ function carries no marker.
 | `trait-method` | `GenericRegistry::trait_item_slot` | `compiler/src/compiler/types/generic_registry.cryo` | member: a trait's declared method, by trait identity and leaf, to its position in the trait |
 | `assoc-type` | `TraitDeclNode::assoc_type_index` | `compiler/src/compiler/AST/declaration.cryo` | member: a trait's associated type, by the trait's declaration and leaf, to its position among the trait's associated types |
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
+| `module-by-path` | `ModuleGraph::modules_in_view` | `compiler/src/compiler/module_graph.cryo` | a path written in a body to the modules it names, among those the writing file can see: its own, the ones it imports, the prelude, or a package root written whole |
 | `loader-path` | `ModuleLoader::binding_of` | `compiler/src/compiler/module_loader.cryo` | a body path's head to the import of the file that binds it |
 | `loader-path` | `ModuleLoader::sub_module_file` | `compiler/src/compiler/module_loader.cryo` | a path's continuation past an import binding to the file of the sub-module it names |
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
@@ -170,6 +171,35 @@ yet is recorded with the change that builds it, not here.
 213. **`TraitDeclNode::lookup_method`, which only the editor calls, stays
      in the compiler with a written reason** until the editor's own
      migration after the merge.
+
+214. **`member-export` stays a door kind of its own** (a module's public
+     declarations, by the module and leaf, read off its export list).
+
+215. **The module graph holds each file's import list, so the question
+     "which modules does this written path name, as this file sees them"
+     (`modules_written_as`) is the graph's to answer through its
+     `module-by-path` door,** not a match of written paths against module
+     text outside the graph.
+
+216. **An expression made only of literals that would silently narrow
+     where it is stored - a constant's or a variable's initializer, an
+     assignment (`const c: u8 = 200 + 100;`, which wraps to 44) - is
+     refused,** with the "would silently truncate" wording a call's
+     argument already gets.
+
+217. **A type declared after a function of the same name in one module
+     must not go missing from that module's scope while its export list
+     holds it.**  A defect: measured, then fixed.
+
+218. **The two refusals' wordings stand:** a `reason` opening `pending:`
+     on a compiler allow, and "`<id>` is not a door".
+
+219. **The Python gates (`lane-gate.py`, `spelling-flow.py`) are not
+     taught anything new** - a module path's comparison counted as an
+     identity's, or any other refinement: they are to be removed.  Where
+     the compiler's own check and a Python list disagree only because of
+     what the Python cannot see, that is recorded, not fixed in the
+     Python.
 
 ### 2026-10-09
 

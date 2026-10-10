@@ -22,6 +22,8 @@ import std::core::hash::{ Hash, Hasher };
 import std::core::cmp::{ Eq };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name::{ DeclName };
+import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::res;
@@ -92,10 +94,82 @@ public:
         return ModuleKey { id: this.sym.id as u64 };
     }
 
-    /// The path as interned text, for a store keyed by it and for display.
-    as_sym(&this) -> SymbolStr {
-        return this.sym;
+    /// The path as the module's name: text to show in a message or spell a
+    /// symbol or a manifest entry with, never a key a lookup is asked by.
+    decl_name(&this) -> DeclName {
+        return DeclName::of(this.sym);
     }
+
+    /// The canonical name of the declaration `leaf` in this module,
+    /// `module::leaf`, interned: the name a declaration is registered and
+    /// mangled under.  Composed here and nowhere else, so every registration
+    /// and every reader of one declaration agree on what it is called.
+    qualified(&this, leaf: SymbolStr, intern: InternTable*) -> SymbolStr {
+        return intern.intern(intern.resolve(this.sym) + "::" + intern.resolve(leaf));
+    }
+
+    /// The symbol a specialization of the module-level function `leaf` is
+    /// based on when its leaf alone would collide with another module's:
+    /// the path with each `::` folded to `_`, then the leaf
+    /// (`std_net_ws_frame_read_frame`).  Spelled here, beside `qualified`,
+    /// for the reason that one is.
+    folded(&this, leaf: SymbolStr, intern: InternTable*) -> SymbolStr {
+        const path: string = intern.resolve(this.sym);
+        const n: i64 = path.length() as i64;
+        mut out: string = "";
+        for (mut ci: i64 = 0; ci < n; ci += 1) {
+            if (path[ci] == ':') {
+                const flen: i64 = out.length() as i64;
+                if (flen > 0 && out[flen - 1] != '_') { out += "_"; }
+            } else {
+                out += path.substr(ci, 1);
+            }
+        }
+        return intern.intern(out + "_" + intern.resolve(leaf));
+    }
+}
+
+/// One edge the loader records, by the module it names when the graph
+/// already holds it, or by the namespace written when the target is still
+/// being loaded (an import inside a cycle).  `ModuleGraph::resolve_edges`
+/// turns a written one into its module once discovery has finished.
+type struct RecordedEdge {
+private:
+    target:  ModulePath;
+    written: SymbolStr;
+
+public:
+    /// An edge to a module the graph holds.
+    static to(m: ModulePath) -> RecordedEdge {
+        return RecordedEdge { target: m, written: SymbolStr::empty() };
+    }
+
+    /// An edge to the namespace `ns` as written, for a module the graph may
+    /// not hold yet.
+    static written_as(ns: SymbolStr) -> RecordedEdge {
+        return RecordedEdge { target: ModulePath::none(), written: ns };
+    }
+}
+
+/// What one file can see under a module spelling.
+///
+/// `visible` and `matched` are kept apart because they answer different
+/// questions: nothing carries this spelling at all, versus something does and
+/// the writer cannot reach it.  Collapsing them would report the second as the
+/// first, which is the difference between "no such name" and "add an import".
+type struct ModuleSpellingMatch {
+    /// The single visible module, when `visible == 1`.
+    found:   ModulePath;
+    /// That module as a definition, when `visible == 1`.
+    found_def: DefId;
+    /// A second visible module, for naming the ambiguity.
+    other:   ModulePath;
+    /// Any module carrying the spelling, reachable or not.
+    any:     ModulePath;
+    /// How many carry it AND are reachable from the writing file.
+    visible: i64;
+    /// How many carry it at all.
+    matched: i64;
 }
 
 /// The key of a table keyed by modules.  Made only by
@@ -137,8 +211,8 @@ public:
     /// Deliberately NOT dependencies.  `compute_order()` walks `dependencies`,
     /// and adding an edge per brace item recreates the false cycles the module
     /// loader avoids for `public module` declarations.  Visibility and build
-    /// order are different relations; only `register_module_imports` consumes
-    /// this, to answer "does this module import that namespace?".
+    /// order are different relations; only `visible` is built from this, to
+    /// answer "does this module import that namespace?".
     imported_namespaces: ModulePath[];
 
     /// Modules this module declares with `public module X;`.
@@ -174,10 +248,15 @@ public:
     /// edge cannot be a module when it is recorded.  `ModuleGraph::
     /// resolve_edges` turns them into the lists above once discovery has
     /// finished, and empties them.
-    written_dependencies: SymbolStr[];
-    written_imported:     SymbolStr[];
-    written_submodules:   SymbolStr[];
-    written_reexports:    SymbolStr[];
+    written_dependencies: RecordedEdge[];
+    written_imported:     RecordedEdge[];
+    written_submodules:   RecordedEdge[];
+    written_reexports:    RecordedEdge[];
+    /// Every module this module can see through its imports: its
+    /// dependencies and brace items, closed over re-exports.  Set once
+    /// discovery has finished (`ModuleGraph::set_visible_modules`); the
+    /// relation a written module path is judged reachable by.
+    visible:              ModulePath[];
     /// Recorded dependencies the graph holds no module for.  A dependency
     /// closure that met one is incomplete (`compute_import_closure`).
     unresolved_dependencies: u32;
@@ -208,6 +287,7 @@ public:
             written_imported:     [],
             written_submodules:   [],
             written_reexports:    [],
+            visible:              [],
             unresolved_dependencies: 0,
             origin:             ModuleOrigin::Local,
             origin_name:        "",
@@ -261,25 +341,25 @@ public:
 
     /// Record a dependency by the namespace it names.  An edge back to this
     /// module is dropped when the edges are resolved (`resolve_edges`).
-    add_dependency(mut &this, dep: SymbolStr) -> void {
+    add_dependency(mut &this, dep: RecordedEdge) -> void {
         this.written_dependencies.push(dep);
     }
 
     /// Record a namespace this module can see without depending on it.
     /// See `imported_namespaces` for why this is not `add_dependency`.
-    add_imported_namespace(mut &this, ns: SymbolStr) -> void {
+    add_imported_namespace(mut &this, ns: RecordedEdge) -> void {
         this.written_imported.push(ns);
     }
 
     /// Record an `export X;` target by its resolved namespace.
     /// See `reexports` for why this is not `add_dependency`.
-    add_reexport(mut &this, ns: SymbolStr) -> void {
+    add_reexport(mut &this, ns: RecordedEdge) -> void {
         this.written_reexports.push(ns);
     }
 
     /// Record a `public module X;` target by its resolved namespace.
     /// See `submodules` for why this grants nothing on its own.
-    add_submodule(mut &this, ns: SymbolStr) -> void {
+    add_submodule(mut &this, ns: RecordedEdge) -> void {
         this.written_submodules.push(ns);
     }
 
@@ -308,20 +388,19 @@ type struct ModuleGraph {
 private:
     // Module name -> index lookup (SymbolStr.id -> module index)
     ![allow(lookup_by_spelling, reason = "the `module-by-path` door's own table: a written module path to its module")]
-    name_index: HashMap<u32, u32>;
+    name_index: HashMap<ModuleKey, u32>;
 
-    /// Every module's definition, by the module's path (`SymbolStr.id`):
+    /// Every module's definition, by the module's path:
     /// each module of this graph as it is added, and each module a C import
     /// declares (`extern module cit := "C" { .. }`), which is a module the
     /// name layer makes and no file holds.  The one table a declaration's
     /// parent module is asked of.
-    ![allow(lookup_by_spelling, reason = "keyed by a module's path, which only the module graph makes and which names exactly one module")]
-    module_defs: HashMap<u32, DefId>;
+    module_defs: HashMap<ModuleKey, DefId>;
     /// The same entries in the order they were made, for the reverse
     /// question - which module a definition is (`declaring_module`).  A
     /// list, because a `DefId` cannot key a map.
     def_list:  DefId[];
-    def_paths: SymbolStr[];
+    def_paths: ModulePath[];
 
 public:
     // Saved resolver scope per module: raw pointer to avoid array[i]=x codegen bug
@@ -350,8 +429,8 @@ public:
             module_ast_buf:   ast_buf,
             module_ast_cap:   initial_cap,
             module_sources:   [],
-            name_index:       HashMap::<u32, u32>::new(),
-            module_defs:      HashMap::<u32, DefId>::new(),
+            name_index:       HashMap::<ModuleKey, u32>::new(),
+            module_defs:      HashMap::<ModuleKey, DefId>::new(),
             def_list:         [],
             def_paths:        [],
             uses_fstring:     false,
@@ -362,7 +441,7 @@ public:
     ![allow(lookup_by_spelling, reason = "registers a module: its path is the module's identity, and keys the graph's index the module-by-path door reads")]
     add_module(mut &this, info: ModuleInfo) -> void {
         const idx: u32 = this.modules.length as u32;
-        this.name_index.insert(info.name.id, idx);
+        this.name_index.insert(ModulePath::of(info.name).table_key(), idx);
         // Read the (Copy) file_path before `info` is moved into `this.modules`.
         this.module_sources.push(info.file_path);
         this.modules.push(info);
@@ -373,9 +452,9 @@ public:
         if (ns.is_valid()) {
             this.modules[idx as i64].def = this.defs.register(
                 DefId::invalid(), ns, DefKind::Module, SourceSpan::none());
-            this.module_defs.insert(ns.id, this.modules[idx as i64].def);
+            this.module_defs.insert(ModulePath::of(ns).table_key(), this.modules[idx as i64].def);
             this.def_list.push(this.modules[idx as i64].def);
-            this.def_paths.push(ns);
+            this.def_paths.push(ModulePath::of(ns));
         }
 
         // If we exceed pre-allocated capacity, grow the raw buffers.
@@ -424,8 +503,9 @@ private:
     /// otherwise.  It cannot answer a module that does not exist.
     module_named(&this, ns: SymbolStr) -> ModulePath {
         if (!ns.is_valid()) { return ModulePath::none(); }
-        if (this.name_index.contains_key(&ns.id) || this.module_defs.contains_key(&ns.id)) {
-            return ModulePath::of(ns);
+        const m: ModulePath = ModulePath::of(ns);
+        if (this.name_index.contains_key(&m.table_key()) || this.module_defs.contains_key(&m.table_key())) {
+            return m;
         }
         return ModulePath::none();
     }
@@ -438,6 +518,14 @@ public:
     ![allow(lookup_by_spelling, reason = "an import or export path is a module written as text in source, and nothing has bound it yet: this is where it becomes the module")]
     module_of_written_path(&this, written: SymbolStr) -> ModulePath {
         return this.module_named(written);
+    }
+
+    /// The module nested in `m` under `leaf` - `<m>::<leaf>` - when the
+    /// graph holds one; none otherwise.  A declaration of `leaf` in `m`
+    /// shares that module's canonical name.
+    module_under(&this, m: ModulePath, leaf: SymbolStr, intern: InternTable*) -> ModulePath {
+        if (!m.is_valid() || intern == null) { return ModulePath::none(); }
+        return this.module_named(m.qualified(leaf, intern));
     }
 
     /// The module `<parent>::<leaf>` when a written module path and an item
@@ -459,6 +547,168 @@ public:
         return this.module_named(intern.intern(m.path()));
     }
 
+    /// The modules reachable without an import: the ones `std::prelude`
+    /// declares with `public module`, as the loader recorded them.  Empty
+    /// when the graph holds no prelude (`no_std`).
+    prelude_set(&this, intern: InternTable*) -> ModulePath[] {
+        mut out: ModulePath[] = [];
+        const idx: i64 = this.find_module_index(this.lang_module(LangModule::Prelude, intern));
+        if (idx < 0) { return out; }
+        for (mut i: i64 = 0; i < this.modules[idx].submodules.length; i++) {
+            out.push(this.modules[idx].submodules[i]);
+        }
+        return out;
+    }
+
+    /// Record what the module at `idx` can see through its imports.
+    set_visible_modules(mut &this, idx: i64, visible: ModulePath[]) -> void {
+        this.modules[idx].visible = visible;
+    }
+
+    /// Whether the module `use_module` can see `target` through its imports.
+    imports(&this, use_module: ModulePath, target: ModulePath) -> boolean {
+        const idx: i64 = this.find_module_index(use_module);
+        if (idx < 0) { return false; }
+        for (mut k: i64 = 0; k < this.modules[idx].visible.length; k++) {
+            if (this.modules[idx].visible[k].equals(target)) { return true; }
+        }
+        return false;
+    }
+
+    /// Which modules a path written in a body names, as the file of
+    /// `use_module` can see them: asked of a whole scope segment, of a
+    /// segment's prefix, and by the type layer to say why a qualified
+    /// annotation named nothing.  With a `root`, the spelling continues a
+    /// path that already named that module (`J::Inner` once `J` named
+    /// `Json`).
+    ![allow(lookup_by_spelling, reason = "a module path written in a body is a module written as text, and nothing has bound it yet: this is where it becomes the module")]
+    modules_written_as(&this, spelling: string, use_module: ModulePath, root: ModulePath,
+                       intern: InternTable*) -> ModuleSpellingMatch {
+        return this.modules_in_view(spelling, use_module, root, intern);
+    }
+
+    /// Every module, in the graph's order, whose declared namespace the
+    /// written path `written` abbreviates: for a diagnostic's help naming
+    /// the module an unknown import path was meant to be.
+    ![allow(lookup_by_spelling, reason = "a diagnostic's help: the modules an unknown import path abbreviates, named in message text only")]
+    modules_abbreviated_by(&this, written: string, intern: InternTable*) -> ModulePath[] {
+        mut out: ModulePath[] = [];
+        if (intern == null) { return out; }
+        for (mut i: i64 = 0; i < this.modules.length; i++) {
+            const ns: SymbolStr = this.modules[i].namespace_name;
+            if (!ns.is_valid()) { continue; }
+            if (ModuleGraph::ns_written_as(intern.resolve(ns), written)) { out.push(ModulePath::of(ns)); }
+        }
+        return out;
+    }
+
+private:
+    /// Door `module-by-path`.  A path written in a body, matched against
+    /// the namespaces the modules declare, among the modules the writing
+    /// file can see - its own, the ones it imports, the prelude, or a
+    /// package root written whole.  Every candidate is judged here, so
+    /// "nothing carries this spelling" and "something does, out of reach"
+    /// are told apart (`matched` beside `visible`).
+    ///
+    /// A spelling of more than one segment may continue a path from a
+    /// module this file imports: `Toml::Sub` with `import A::Toml;` names
+    /// `A::Toml::Sub`, whose head is the import's binding.  Such a module is
+    /// reachable through the import, as the same path through an alias is.
+    /// The imported modules the head can name are gathered in the same walk,
+    /// and the candidates are judged once it has seen them all.
+    ///
+    /// A path that names a module's whole namespace needs no import: a
+    /// package root is addressable as written.  Only the whole one - an
+    /// abbreviation like `core::option` is a proper suffix whose first
+    /// segment binds nothing, and stays unreachable.
+    modules_in_view(&this, spelling: string, use_module: ModulePath, root: ModulePath,
+                    intern: InternTable*) -> ModuleSpellingMatch {
+        mut r: ModuleSpellingMatch = ModuleSpellingMatch {
+            found:   ModulePath::none(),
+            found_def: DefId::invalid(),
+            other:   ModulePath::none(),
+            any:     ModulePath::none(),
+            visible: 0,
+            matched: 0,
+        };
+        if (intern == null) { return r; }
+        const prelude: ModulePath[] = this.prelude_set(intern);
+        const rooted: boolean = root.is_valid();
+        const rooted_length: u64 =
+            if (rooted) { intern.resolve(root.sym).length() + 2 + spelling.length() } else { 0 };
+        const head: string = QualifiedName::head_of(spelling);
+        const continues: boolean = !rooted && head.length() < spelling.length();
+        const tail_length: u64 = spelling.length() - head.length();
+        mut heads: ModulePath[] = [];
+        mut head_lengths: u64[] = [];
+        mut cands: ModulePath[] = [];
+        mut cand_defs: DefId[] = [];
+        mut cand_lengths: u64[] = [];
+        mut cand_reach: boolean[] = [];
+        for (mut i: i64 = 0; i < this.modules.length; i++) {
+            const cand_ns: SymbolStr = this.modules[i].namespace_name;
+            if (!cand_ns.is_valid()) { continue; }
+            const cand_path: ModulePath = this.modules[i].path();
+            const cand_str: string = intern.resolve(cand_ns);
+            const names_head: boolean = continues && ModuleGraph::ns_written_as(cand_str, head);
+            const names_spelling: boolean = ModuleGraph::ns_written_as(cand_str, spelling)
+                && !(rooted && (cand_str.length() != rooted_length
+                                || !cand_path.is_within(root, intern)));
+            if (!names_head && !names_spelling) { continue; }
+            const imported: boolean = this.imports(use_module, cand_path);
+            if (names_head && imported) {
+                heads.push(cand_path);
+                head_lengths.push(cand_str.length());
+            }
+            if (!names_spelling) { continue; }
+            r.matched = r.matched + 1;
+            if (r.matched == 1) { r.any = cand_path; }
+            mut in_prelude: boolean = false;
+            for (mut p: i64 = 0; p < prelude.length; p++) {
+                if (prelude[p].equals(cand_path)) { in_prelude = true; }
+            }
+            const reachable: boolean = rooted
+                || cand_path.equals(use_module)
+                || cand_str.eq(spelling)
+                || in_prelude
+                || imported;
+            cands.push(cand_path);
+            cand_defs.push(this.modules[i].def);
+            cand_lengths.push(cand_str.length());
+            cand_reach.push(reachable);
+        }
+        for (mut c: i64 = 0; c < cands.length; c++) {
+            mut reachable: boolean = cand_reach[c];
+            for (mut h: i64 = 0; !reachable && h < heads.length; h++) {
+                reachable = head_lengths[h] + tail_length == cand_lengths[c]
+                    && cands[c].is_within(heads[h], intern);
+            }
+            if (!reachable) { continue; }
+            r.visible = r.visible + 1;
+            if (r.visible == 1) { r.found = cands[c]; r.found_def = cand_defs[c]; }
+            if (r.visible == 2) { r.other = cands[c]; }
+        }
+        return r;
+    }
+
+    /// Whether `written` names the namespace `mod_str` as one file may write
+    /// it: the whole namespace, or a suffix of it that starts on a segment
+    /// boundary, so `ture` does not name `std::future`.  Only leading
+    /// segments may be left off: whether `future` names `std::future` from
+    /// here is a scope question, while a path that drops trailing segments
+    /// would name a module that declares nothing it names.
+    static ns_written_as(mod_str: string, written: string) -> boolean {
+        const ml: i64 = mod_str.length() as i64;
+        const pl: i64 = written.length() as i64;
+        if (pl == 0 || pl > ml) { return false; }
+        // Only one alignment can be a suffix, so this is a single check rather
+        // than a scan.
+        const i: i64 = ml - pl;
+        if (!mod_str.substring(i as u32, pl as u32).eq(written)) { return false; }
+        return i == 0 || (i >= 2 && mod_str[i - 1] == ':' && mod_str[i - 2] == ':');
+    }
+
+public:
     /// Turn every module's recorded edges into the modules they name, once,
     /// when discovery has finished and the graph holds every module an edge
     /// can name.  A recorded namespace the graph holds no module for names
@@ -491,11 +741,12 @@ public:
     /// The module at index `except` (-1 for none) is left out, and with
     /// `once` a module recorded twice appears once, where it was first
     /// recorded - both judged by the module, after the namespace is resolved.
-    modules_of(&this, written: &SymbolStr[], except: i64, once: boolean, out_unresolved: u32*) -> ModulePath[] {
+    modules_of(&this, written: &RecordedEdge[], except: i64, once: boolean, out_unresolved: u32*) -> ModulePath[] {
         mut out: ModulePath[] = [];
         mut seen: i64[] = [];
         for (mut i: i64 = 0; i < written.length; i++) {
-            const m: ModulePath = this.module_named(written[i]);
+            const m: ModulePath =
+                if (written[i].target.is_valid()) { written[i].target } else { this.module_named(written[i].written) };
             if (!m.is_valid()) {
                 *out_unresolved = *out_unresolved + 1;
                 continue;
@@ -526,8 +777,7 @@ public:
 
     /// Find a module's index by its path.  Returns -1 if not found.
     find_module_index(&this, name: ModulePath) -> i64 {
-        const key: u32 = name.as_sym().id;
-        return match (this.name_index.get(&key)) {
+        return match (this.name_index.get(&name.table_key())) {
             Option::Some(val) => { val as i64 }
             Option::None      => { -1 }
         };
@@ -536,7 +786,7 @@ public:
     /// The definition the module at path `m` is, or an invalid id when no
     /// module has that path.
     module_def(&this, m: ModulePath) -> DefId {
-        return match (this.module_defs.get(&m.as_sym().id)) {
+        return match (this.module_defs.get(&m.table_key())) {
             Option::Some(d) => { d }
             Option::None    => { DefId::invalid() }
         };
@@ -552,10 +802,11 @@ public:
     ![allow(lookup_by_spelling, reason = "the module graph creating the path of a module that only it makes: a C import's module exists nowhere else to be asked")]
     register_c_import_module(mut &this, ns: SymbolStr) -> ModulePath {
         if (!ns.is_valid()) { return ModulePath::none(); }
-        if (!this.module_defs.contains_key(&ns.id)) {
-            this.module_defs.insert(ns.id, DefId::invalid());
+        const m: ModulePath = ModulePath::of(ns);
+        if (!this.module_defs.contains_key(&m.table_key())) {
+            this.module_defs.insert(m.table_key(), DefId::invalid());
         }
-        return ModulePath::of(ns);
+        return m;
     }
 
     /// Bind the C import module `m` to `def`, the binding the name layer
@@ -564,9 +815,9 @@ public:
     ![allow(lookup_by_spelling, reason = "the module graph binding the path of a module that only it makes: a C import's module path is its identity")]
     bind_c_import_module(mut &this, m: ModulePath, def: DefId) -> void {
         if (!m.is_valid()) { return; }
-        this.module_defs.insert(m.sym.id, def);
+        this.module_defs.insert(m.table_key(), def);
         this.def_list.push(def);
-        this.def_paths.push(m.sym);
+        this.def_paths.push(m);
     }
 
     /// The module the definition `d` IS: its path when `d` is a module the
@@ -575,7 +826,7 @@ public:
     module_of_def(&this, d: DefId) -> ModulePath {
         if (!d.is_valid()) { return ModulePath::none(); }
         for (mut i: i64 = 0; i < this.def_list.length; i++) {
-            if (this.def_list[i].equals(d)) { return ModulePath::of(this.def_paths[i]); }
+            if (this.def_list[i].equals(d)) { return this.def_paths[i]; }
         }
         return ModulePath::none();
     }
@@ -590,7 +841,7 @@ public:
         const m: DefId = this.defs.module_of(d);
         if (!m.is_valid()) { return ModulePath::none(); }
         for (mut i: i64 = 0; i < this.def_list.length; i++) {
-            if (this.def_list[i].equals(m)) { return ModulePath::of(this.def_paths[i]); }
+            if (this.def_list[i].equals(m)) { return this.def_paths[i]; }
         }
         return ModulePath::none();
     }

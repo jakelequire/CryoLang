@@ -125,6 +125,7 @@ public:
     equals(&this, other: OverloadId) -> boolean {
         return this.pos == other.pos && this.table == other.table;
     }
+
 }
 
 /// The key a family is stored under: the owner's definition and the member
@@ -351,10 +352,6 @@ public:
     // module_graph.cryo already imports this module, so a back-pointer here
     // would be a compile-time module cycle.
 
-    // A module -> the modules it can see through its imports.  Populated once
-    // per module by the orchestrator (instance.cryo) after module discovery.
-private:
-    module_imports:      HashMap<ModuleKey, ModulePath[]>;public:
 
     // The modules `std::prelude` re-exports (those whose public types - Rc,
     // Box, Option, Range, ... - are auto-in-scope in every module).  A LOCAL
@@ -413,7 +410,7 @@ public:
             overload_func_intrinsic: [],
             overload_index:     HashMap::<FamilySlot, u32[]>::new(),
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
-            module_imports:     HashMap::<ModuleKey, ModulePath[]>::new(),            prelude_modules:    [],
+            prelude_modules:    [],
             refused_methods:    HashMap::<FamilySlot, boolean>::new(),
             overload_tag:       g_overload_index_tags,
         };
@@ -1504,17 +1501,6 @@ public:
 
     // --- Import-scoped resolution: population + query -----------------------
 
-    /// Record the modules module `m` can see through its imports, for later
-    /// use-site scoping.  Called once per module by the orchestrator after
-    /// module discovery.
-    register_module_imports(mut &this, m: ModulePath, imports: &ModulePath[]) -> void {
-        mut seen: ModulePath[] = [];
-        for (mut i: i64 = 0; i < imports.length; i++) {
-            seen.push(imports[i]);
-        }
-        this.module_imports.insert(m.table_key(), seen);
-    }
-
     /// Record the namespaces re-exported by `std::prelude` (deduped).  A local
     /// same-leaf as any type in these namespaces is a hard conflict.
     ///
@@ -1524,10 +1510,9 @@ public:
     ///
     /// The list is DERIVED from `stdlib/prelude.cryo`'s `public module`
     /// declarations by the caller (`instance.cryo`), which reads them off the
-    /// module graph.  It arrives as a parameter for the same reason
-    /// `register_module_imports` does: `module_graph.cryo` already imports this
-    /// module, so reaching a `ModuleGraph*` back the other way is a cycle Cryo
-    /// forbids.
+    /// module graph.  It arrives as a parameter because `module_graph.cryo`
+    /// already imports this module, so reaching a `ModuleGraph*` back the
+    /// other way is a cycle Cryo forbids.
     register_prelude_namespaces(mut &this, prelude: ModulePath[]) -> void {
         for (mut i: i64 = 0; i < prelude.length; i++) {
             mut seen: boolean = false;
@@ -1605,21 +1590,6 @@ public:
     is_prelude_ns(&this, ns: ModulePath) -> boolean {
         for (mut i: i64 = 0; i < this.prelude_modules.length; i++) {
             if (this.prelude_modules[i].equals(ns)) { return true; }
-        }
-        return false;
-    }
-
-    /// Whether the module `use_site_ns` imports (depends on) `target_ns`.
-    ns_imports(&this, use_site_ns: ModulePath, target_ns: ModulePath) -> boolean {
-        match (this.module_imports.get_ref(&use_site_ns.table_key())) {
-            Option::Some(seen) => {
-                mut k: i64 = 0;
-                while (k < (*seen).length) {
-                    if ((*seen)[k].equals(target_ns)) { return true; }
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
         }
         return false;
     }
