@@ -21,9 +21,10 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::compound;
 import compiler::lex;
 import compiler::ast;
-import compiler::ast::{ LiteralKind };
+import compiler::ast::{ LiteralKind, NodeKind };
+import compiler::ast::node::{ ASTNode };
 import compiler::ast::expression;
-import compiler::ast::expression::{ ExpressionNode, LiteralNode };
+import compiler::ast::expression::{ BinaryExprNode, ExpressionNode, LiteralNode, UnaryExprNode };
 import compiler::diag;
 import compiler::diag::{ ErrorCode };
 import compiler::compilation_context;
@@ -33,7 +34,7 @@ import compiler::sema::state::{ SemaState };
 import compiler::sema::helpers;
 import compiler::sema::helpers::{
     int_literal_exceeds, is_numeric_literal_expr, sema_default_int_type,
-    sema_int_unsigned_bound, sema_numeric_suffix_type
+    sema_int_unsigned_bound, sema_numeric_suffix_type, try_fold_const_i64
 };
 import std::fmt;
 import compiler::diag::diagnostic;
@@ -283,6 +284,42 @@ type struct LiteralResolver {
         const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
         if (max_mag == 0) { return false; }
         return !int_literal_exceeds(Text::new(lit.value), max_mag);
+    }
+
+    /// Whether a constant integer expression (`8 * 10000 + 64 * 100`) keeps
+    /// its value at `target`'s width: every sub-expression folds to a value
+    /// `target` holds, so computing it at that width gives what computing it
+    /// at the default width would.  Such an expression adopts the parameter's
+    /// type as a single literal that fits does; one that does not stays at
+    /// its default width and meets the parameter's narrowing check.
+    const_expr_fits_target(&this, expr: ExpressionNode*, target: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(target);
+        if (t == null || t.kind != TypeKind::Int) { return false; }
+        return LiteralResolver::const_expr_fits_int(expr, t as IntType*);
+    }
+
+    static const_expr_fits_int(expr: ExpressionNode*, it: IntType*) -> boolean {
+        if (expr == null) { return false; }
+        mut v: i64 = 0;
+        if (!try_fold_const_i64(expr, &v)) { return false; }
+        const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
+        if (max_mag == 0) { return false; }
+        if (it.int_kind.is_signed()) {
+            const hi: i64 = (max_mag / 2) as i64;
+            if (v > hi || v < -hi - 1) { return false; }
+        } else {
+            if (v < 0 || (v as u64) > max_mag) { return false; }
+        }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::UnaryExpression) {
+            return LiteralResolver::const_expr_fits_int((expr as UnaryExprNode*).operand, it);
+        }
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            return LiteralResolver::const_expr_fits_int(b.left, it)
+                && LiteralResolver::const_expr_fits_int(b.right, it);
+        }
+        return true;
     }
 
     /// True when `ty` resolves to a signed integer type.  Decides whether a
