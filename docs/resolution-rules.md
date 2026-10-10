@@ -73,6 +73,16 @@ checked, nor one whose declaration allows `lookup_by_spelling` with a
 reason; the rule-4 check skips the same bodies.  The check reaches one
 function: a spelling handed on is looked up, and refused, in the callee.
 
+The same check follows a spelling read off a field - a declaration's, a
+syntax node's or a table row's name (`decls[i].name.equals(node.name)`) -
+in every body, handed a spelling or not, and refuses it at a hash table's
+key, a `match`'s subject, a boolean call handed it with other text, and an
+`==` or `!=` whose other side is a spelling too (against a number it is a
+validity test).  The diagnostic names the function and the site: "`f`
+looks up a spelling read off a field".  A comparison that is no lookup -
+a duplicate-declaration check, a comparison primitive, a convention such
+as a leading `_` - says why on its allow.
+
 Rule three is also held by visibility, one store at a time: a store's name
 fields are `private` to the module whose file holds the store and its
 door, so a lookup written by hand anywhere else is refused as a private
@@ -217,6 +227,19 @@ yet is recorded with the change that builds it, not here.
 207. **E0013's octal-escape wording is accepted**: "`\8` is not an
      escape: an octal escape's digits are `0` to `7`" and "`\400` is out
      of range: an octal escape is one byte, `\0` to `\377`".
+
+208. **The program's entry point is recorded once by the name layer, as
+     an identity.**  The places that compared a function's name with
+     `"main"` compare its definition with that identity instead.  There is
+     no door for it and no written reasons.
+
+209. **E0358's help for a type parameter's unmet bound is accepted**:
+     "add `T: Copy` to the bounds in scope here".
+
+210. **An expression made only of integer literals (`8 * 10000 + 64 *
+     100`) is converted to the parameter's type the same way a single
+     literal is**: `take_u32(5)` compiles, and so does
+     `take_u32(8 * 10000 + 64 * 100)`.
 
 ### 2026-10-08
 

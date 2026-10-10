@@ -459,11 +459,10 @@ type struct DeclarationEmitter {
         const mangled_sym: SymbolStr = this.free_function_symbol(node);
         // The C ABI entry point must be named `main` verbatim; the C
         // runtime's _start references the unmangled symbol.  Override the
-        // mangled name for any free function whose source-level name is
-        // `main` so the linker can find it.
-        const main_sym: SymbolStr = intern.intern("main");
+        // mangled name for the program's entry point - the function the name
+        // layer recorded as it (`ctx.entry_fn`) - so the linker can find it.
         mut fn_name: string = intern.resolve(mangled_sym);
-        const is_program_main: boolean = node.name.equals(main_sym);
+        const is_program_main: boolean = node.def.is_valid() && node.def.equals(this.ctx.entry_fn);
         // Under `--panic=unwind` the user's `main` runs under an internal symbol
         // and a synthesized `main` wrapper (emitted just after this declaration)
         // invokes it inside a catch-all landing pad: an otherwise-uncaught panic
@@ -734,6 +733,7 @@ type struct DeclarationEmitter {
     /// existing slot at vtable-emission time.  The returned list is in
     /// root -> leaf declaration order, so every subclass's vtable extends
     /// the base's layout with its own additions.
+    ![allow(lookup_by_spelling, reason = "a duplicate-declaration check: a virtual method declared again down the base chain with the same name and parameters is the slot it already has")]
     collect_vtable_slots(mut &this, cls: ClassType*) -> VTableSlot[] {
         const arena: TypeArena* = this.get_arena();
 
@@ -1704,8 +1704,6 @@ type struct DeclarationEmitter {
     }
 
     codegen_function_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
-        const ctx_ptr: CompilationContext* = this.ctx;
-        const intern: InternTable* = ctx_ptr.intern_table;
         const arena: TypeArena* = this.get_arena();
 
         // The body attaches to the function `declare_function` made for THIS
@@ -1839,12 +1837,10 @@ type struct DeclarationEmitter {
         // main's LLVM signature to `i32 (i32, ptr)`; the user's source has
         // no parameters, so we read the synthetic params via LLVMGetParam
         // and forward them through the regular function-resolution path.
-        // `intern` is already bound at the top of this function.
         // Suppressed under `no_runtime`: main's signature was NOT widened
         // (no argc/argv/envp), so there are no synthetic params to publish,
         // and `std::env` is not linked in a freestanding build.
-        const main_sym: SymbolStr = intern.intern("main");
-        if (node.name.equals(main_sym) && CodegenUtil::fixed_param_count(node) == 0
+        if (node.def.is_valid() && node.def.equals(this.ctx.entry_fn) && CodegenUtil::fixed_param_count(node) == 0
             && !this.ctx.options.freestanding()) {
             this.emit_set_args_call(fn_val);
             this.emit_set_env_call(fn_val);

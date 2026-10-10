@@ -558,8 +558,6 @@ SCANNED_ARRAYS = {
                                           "an enum declaration's variants by leaf off the node in hand"),
     "LambdaExprNode.captured_names": Scanned("compiler/AST/expression.cryo", "SymbolStr", TABLE,
                                              "the lambda's captured names, asked whether one is captured (its own accessor's body)"),
-    "StructLiteralNode.field_inits": Scanned("compiler/AST/expression.cryo", "FieldInit", TABLE,
-                                             "a struct literal's written initializers by the field's leaf"),
     "DestructureDeclNode.bindings": Scanned("compiler/AST/declaration.cryo", "DestructureBinding", TABLE,
                                             "a destructure's bindings by the source field's leaf (which binding takes a field) or the local's"),
     "ModuleInfo.reexports":       Scanned("compiler/module_graph.cryo", "ModulePath", TABLE,

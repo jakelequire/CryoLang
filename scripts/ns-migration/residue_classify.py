@@ -137,10 +137,10 @@ CLASS_OF_METHOD = {
         ("J", "module: a module's re-exported namespaces, module identities by path, scanned inline"),
     "EnumDeclNode::variants[]":
         ("J", "member: an enum declaration's variant by its leaf off the node in hand, scanned inline"),
-    "StructLiteralNode::field_inits[]":
-        ("J", "member: a struct literal's written initializer by the field's leaf, scanned inline"),
     "DestructureDeclNode::bindings[]":
         ("J", "member: a destructure's written binding by the source field's leaf (which binding takes a field), scanned inline"),
+    "FunctionDeclNode::parameters[]":
+        ("J", "member: the resolver's duplicate-parameter check, a parameter by leaf inside the function being bound"),
     "LambdaExprNode::captured_names[]":
         ("J", "member: the lambda's captured names, asked whether one is captured (own file only)"),
     # -- local tables: the owner out of view, the element says what it is --
@@ -186,6 +186,8 @@ CLASS_OF_METHOD = {
         ("J", "member: a method's leaf inside the trait whose identity a bound stamped on the call, asked once where the call is written, for the position that maps it to an implementation's method with no name after that"),
     "GenericRegistry::trait_method_by_leaf":
         ("J", "member: a method's leaf inside the trait an impl block or a bound names by identity, through `trait_item_slot`, to the trait's declaration of it"),
+    "GenericRegistry::names_lang_method":
+        ("J", "lang: whether a written method leaf names the method a language item claimed (`Drop::drop`, `Future::poll`), through `trait_item_slot` in the claiming trait, compared by position"),
     "GenericRegistry::impl_method_by_leaf":
         ("J", "member: a method's leaf inside the trait an impl block implements, through `trait_item_slot`, to the block's method at that position"),
     "GenericRegistry::impl_methods_at_leaf":
@@ -211,6 +213,8 @@ CLASS_OF_METHOD = {
         ("N", "the module a source FILE declares, by its FILE PATH"),
     "ModuleGraph::find_module_by_path":
         ("N", "a module by its FILE PATH"),
+    "ModuleGraph::paths_equal_ignore_case":
+        ("N", "two FILE PATHS compared: the file a module was loaded from against the compilation's entry file"),
     "Resolver::find_module_scope":
         ("J", "module: a module's scope by its namespace path, to stand in it while a template is instantiated"),
 }
@@ -244,12 +248,8 @@ SITE_OVERRIDES = {
         EXTERN_LINK_NAME,
     ("compiler/bindgen/importer.cryo", "ExternBlockNode::functions[]", "param:sym"):
         EXTERN_LINK_NAME,
-    ("compiler/resolver/name_resolution.cryo", "FunctionDeclNode::parameters[]", "field:compiler::resolver::symbol_str::SymbolStr.id<-field:compiler::ast::declaration::VarDeclNode*.name<-local:param@1=element@1:field:compiler::ast::declaration::FunctionDeclNode*.parameters<-param:node"):
-        ("J", "member: the resolver's duplicate-parameter check, a parameter by leaf inside the function being bound"),
     ("compiler/AST/dumper.cryo", "DestructureDeclNode::bindings[]", "field:compiler::resolver::symbol_str::SymbolStr.id<-field:compiler::ast::declaration::DestructureBinding.local_name<-local:b@1=element@1:field:compiler::ast::declaration::DestructureDeclNode*.bindings<-param:node"):
         ("N", "a display: the binding's own two names compared to print `x` rather than `x: x`"),
-    ("compiler/resolver/name_resolution.cryo", "DestructureDeclNode::bindings[]", "field:compiler::resolver::symbol_str::SymbolStr.id<-field:compiler::ast::declaration::DestructureBinding.local_name<-local:b@1=element@1:field:compiler::ast::declaration::DestructureDeclNode*.bindings<-param:node"):
-        ("J", "member: the resolver's duplicate-binding check, a binding by its local's leaf inside the destructure being bound"),
 }
 
 CLASSES = "JLNSBCFW"

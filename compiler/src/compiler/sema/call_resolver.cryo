@@ -721,7 +721,7 @@ type struct CallResolver {
         if (call.arguments.length != 0) { return false; }
         if (call.callee == null || call.callee.kind != NodeKind::MemberAccess) { return false; }
         const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
-        return ma.member.equals(this.intern.intern("drop"));
+        return this.ctx.get_generic_registry().names_lang_method(ma.member, LangItem::DropDrop);
     }
 
     /// A method call whose receiver is a type parameter its bounds did not
@@ -4954,7 +4954,7 @@ type struct CallResolver {
             return field_ret;
         }
 
-        if (member.member.equals(this.intern.intern("drop"))
+        if (this.ctx.get_generic_registry().names_lang_method(member.member, LangItem::DropDrop)
                 && OwnershipQuery::is_copy(this.arena, this.ctx.get_generic_registry(), this.intern, lookup_ref)) {
             member.set_resolved_type(this.arena.get_void());
             return this.arena.get_void();
@@ -5012,7 +5012,6 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
         if (this.try_diagnose_method_bound_failure(obj_type, member)) { return TypeRef::invalid(); }
-        if (this.try_diagnose_forin_noncopy(obj_type, member, primary_span)) { return TypeRef::invalid(); }
 
         // The method is declared and its signature was refused where it was
         // written; it registered none, and the call reports nothing more.
@@ -5182,59 +5181,6 @@ type struct CallResolver {
                 return;
             }
         }
-    }
-
-    /// E0358: for-in over a non-Copy collection (Copy-gated `iter`).
-    try_diagnose_forin_noncopy(mut &this, obj_type: TypeRef, member: MemberAccessNode*,
-                               primary_span: SourceSpan) -> boolean {
-        const is_next: boolean = member.member.equals(this.intern.intern("next"));
-        const is_iter: boolean = member.member.equals(this.intern.intern("iter"));
-        if (!is_next && !is_iter) { return false; }
-        const reg: GenericRegistry* = this.ctx.get_generic_registry();
-        if (reg == null) { return false; }
-        mut t: Type* = this.arena.lookup(obj_type);
-        mut depth: i32 = 0;
-        while (t != null && depth < 5) {
-            if (t.kind == TypeKind::InstantiatedType) { break; }
-            if (t.kind == TypeKind::Reference) { t = this.arena.lookup((t as ReferenceType*).referent); }
-            else if (t.kind == TypeKind::Pointer) { t = this.arena.lookup((t as PointerType*).pointee); }
-            else { break; }
-            depth += 1;
-        }
-        if (t == null || t.kind != TypeKind::InstantiatedType) { return false; }
-        const inst: InstantiatedType* = t as InstantiatedType*;
-        const tmpl: TemplateEntry* = reg.template_of_type(inst.generic_base);
-        if (tmpl == null || tmpl.ast_node == null) { return false; }
-        if (tmpl.param_names.length != inst.type_args.length) { return false; }
-        const iter_fn: FunctionDeclNode* = this.find_template_method(tmpl.ast_node, this.intern.intern("iter"));
-        if (iter_fn == null || iter_fn.trait_bounds.length == 0) { return false; }
-        for (mut bi: i64 = 0; bi < iter_fn.trait_bounds.length; bi++) {
-            const bound: &TraitBound = &iter_fn.trait_bounds[bi];
-            mut concrete: TypeRef = TypeRef::invalid();
-            for (mut pi: i64 = 0; pi < tmpl.param_syms.length; pi++) {
-                if (tmpl.param_syms[pi].equals(bound.subject_sym)) { concrete = inst.type_args[pi]; break; }
-            }
-            if (!concrete.is_valid()) { continue; }
-            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
-                const tref: &TraitRef = &bound.trait_refs[ri];
-                if (tref.path.length == 0) { continue; }
-                if (!tref.definition().equals(reg.wellknown(LangItem::Copy))) { continue; }
-                if (OwnershipQuery::is_copy(this.arena, reg, this.intern, concrete)) { continue; }
-                const coll_str: string = this.types.type_display_name(obj_type);
-                const elem_str: string = this.types.type_display_name(concrete);
-                mut d: Diagnostic = Diagnostic::error(
-                    ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
-                    Text::new(fmt::format("cannot iterate `%s` with `for-in`: its element type `%s` is not `Copy`", coll_str, elem_str)));
-                d = d.at(primary_span);
-                d = d.with_note(Text::new("`for (x in xs)` lowers to `xs.iter()`, but `iter` is gated `where T: Copy` because it yields elements by value"));
-                d = d.help(Text::new(fmt::format(
-                    "iterate by index and borrow each element in place instead, e.g. `for (mut i: u64 = 0; i < xs.length(); i++) { const x: %s* = ... xs.get_ref(i); }`",
-                    elem_str)));
-                this.ctx.emit_diagnostic(d);
-                return true;
-            }
-        }
-        return false;
     }
 
 

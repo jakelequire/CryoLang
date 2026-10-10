@@ -120,8 +120,6 @@ public:
     /// The owner's symbol, for the resolution map: the impl head's binding.
     /// Invalid in a type declaration's own body, which holds none.
     this_owner_sym:  SymbolID;
-    /// The keyword `This` as a path segment spells it.
-    this_type_spelling: SymbolStr;
     /// Each projection written on a type parameter (`I::Item`) in the
     /// module being walked, checked against the parameter's bounds once the
     /// walk has recorded every bound (`check_param_projections`): a
@@ -147,7 +145,6 @@ public:
         this.this_owner        = ResBase::Def(DefId::invalid());
         this.this_owner_decl   = null;
         this.this_owner_sym    = SymbolID::invalid();
-        this.this_type_spelling = resolver.intern_table.intern("This");
     }
 
     /// The parameters `This` is written with in the body of `decl`: an
@@ -173,7 +170,7 @@ public:
     /// is never written into the path to be looked up a second time.  True
     /// when it stamped.
     stamp_this_scope(mut &this, node: ScopeResolutionNode*) -> boolean {
-        if (!node.scope_name.equals(this.this_type_spelling)) { return false; }
+        if (!node.scope_is_this_type) { return false; }
         if (this.this_owner_decl == null || this.this_trait.is_valid()) { return false; }
         if (node.scope_generic_args.length > 0) { return false; }
         const params: GenericParamNode*[] = NameResolver::this_owner_params_of(this.this_owner_decl);
@@ -832,6 +829,24 @@ public:
     }
 
 
+    /// Whether parameter `i` repeats the name of an earlier parameter.
+    ![allow(lookup_by_spelling, reason = "a duplicate-declaration check: two parameters of one function declared under one name")]
+    static repeats_parameter(node: FunctionDeclNode*, i: int) -> boolean {
+        for (mut j: int = 0; j < i; j++) {
+            if (node.parameters[j].name.id == node.parameters[i].name.id) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether binding `i` of a destructuring repeats an earlier binding's local name.
+    ![allow(lookup_by_spelling, reason = "a duplicate-declaration check: two locals of one destructuring declared under one name")]
+    static repeats_binding(node: DestructureDeclNode*, i: i64) -> boolean {
+        for (mut j: i64 = 0; j < i; j++) {
+            if (node.bindings[j].local_name.id == node.bindings[i].local_name.id) { return true; }
+        }
+        return false;
+    }
+
     // -- Declarations --
     override visit(node: FunctionDeclNode*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] visit(FunctionDecl) name='%s' generics=%d",
@@ -851,15 +866,12 @@ public:
             // Scan only prior parameters (rather than `current_scope_has`) so a
             // value parameter sharing a generic param's name is not falsely
             // flagged.
-            for (mut j: int = 0; j < i; j++) {
-                if (node.parameters[j].name.id == param.name.id) {
-                    this.ctx.emit_error_at(
-                        ErrorCode::E0205_REDEFINED_SYMBOL,
-                        Text::new(fmt::format("the parameter `%s` is already declared in this function",
-                            this.resolver.intern_table.resolve(param.name))),
-                        param.span);
-                    break;
-                }
+            if (NameResolver::repeats_parameter(node, i)) {
+                this.ctx.emit_error_at(
+                    ErrorCode::E0205_REDEFINED_SYMBOL,
+                    Text::new(fmt::format("the parameter `%s` is already declared in this function",
+                        this.resolver.intern_table.resolve(param.name))),
+                    param.span);
             }
             // The receiver binds as `this` whatever its written form: `&this`
             // is a spelling no use can write, and every use of `this` in the
@@ -1345,15 +1357,12 @@ public:
             const b: DestructureBinding = node.bindings[i];
             // Reject two bindings that introduce the same local name (E0205):
             // `const {x, x} = ...` would otherwise drop the duplicate silently.
-            for (mut j: i64 = 0; j < i; j++) {
-                if (node.bindings[j].local_name.id == b.local_name.id) {
-                    this.ctx.emit_error_at(
-                        ErrorCode::E0205_REDEFINED_SYMBOL,
-                        Text::new(fmt::format("the name `%s` is bound more than once in this destructuring",
-                            this.resolver.intern_table.resolve(b.local_name))),
-                        b.name_span);
-                    break;
-                }
+            if (NameResolver::repeats_binding(node, i)) {
+                this.ctx.emit_error_at(
+                    ErrorCode::E0205_REDEFINED_SYMBOL,
+                    Text::new(fmt::format("the name `%s` is bound more than once in this destructuring",
+                        this.resolver.intern_table.resolve(b.local_name))),
+                    b.name_span);
             }
             const sym_id: SymbolID = this.resolver.declare_variable(
                 b.local_name, b.name_span, b.is_mutable, false);
@@ -3519,6 +3528,7 @@ public:
     /// public exports, the public exports of its re-export closure, and its
     /// sub-modules.  The set an `import M::{ name }` entry is answered from,
     /// in the order the three rungs ask.
+    ![allow(lookup_by_spelling, reason = "a diagnostic's offer: what a module offers to a braced import, listed by leaf; the result flows only into message text")]
     offered_leaves(&this, m: ModulePath, resolved_module: string) -> string[] {
         mut out: string[] = [];
         const own: SymbolID[] = this.resolver.get_exports(m);
@@ -3589,6 +3599,7 @@ public:
     /// as the fix, because that is the mistake the shape comes from - the
     /// path a QUALIFIER may abbreviate to is written where the whole name
     /// is required.
+    ![allow(lookup_by_spelling, reason = "a diagnostic's help: the modules an unknown import path abbreviates, named in message text only")]
     refuse_unknown_module_import(&this, node: ImportDeclNode*, module_path: string) -> void {
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0502_INVALID_IMPORT,
@@ -3964,9 +3975,25 @@ type struct NameDeclarationPass {
 
         const visitor: NameResolver = NameResolver(ctx.resolver, ctx);
         visitor.forward_declare(root);
+        NameDeclarationPass::record_entry_fn(ctx);
         NameDeclarationPass::settle_c_refs(ctx);
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+
+    /// Record the program's entry point when the module just declared is the
+    /// entry file's: its own module-level binding `main`, when that names a
+    /// function.  Every later question "is this the entry point" is asked
+    /// of this identity.
+    static record_entry_fn(ctx: CompilationContext*) -> void {
+        if (!ModuleGraph::paths_equal_ignore_case(ctx.source_file, ctx.entry_file)) { return; }
+        const m: ModulePath = ctx.current_module();
+        if (!m.is_valid()) { return; }
+        const sid: SymbolID = ctx.resolver.module_binding(m, ctx.intern_table.intern("main"));
+        if (!sid.is_valid()) { return; }
+        const sym: Symbol = ctx.resolver.get_symbol(sid);
+        if (sym.kind != SymbolKind::Function) { return; }
+        ctx.entry_fn = sym.def;
     }
 
     /// Answer each reference a C import made to one of its own records,

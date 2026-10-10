@@ -4881,14 +4881,32 @@ type struct AsyncLower {
         }
     }
 
+    /// Whether `scope` is the language's `Poll` variant `leaf`: typed with the
+    /// `Poll` declaration, and pinned to the ordinal the variant door gives
+    /// `leaf` there.  The lowering pins every variant path it builds.
+    is_poll_variant(&this, scope: ScopeResolutionNode*, leaf: string) -> boolean {
+        const poll_def: DefId = this.ctx.generic_registry.wellknown(LangItem::Poll);
+        const ty: TypeRef = scope.resolved_type;
+        if (!poll_def.is_valid() || !ty.is_valid()) { return false; }
+        const d: DefId = this.ctx.decl_index.def_of(ty, this.ctx.type_arena);
+        if (!d.equals(poll_def)) { return false; }
+        const t: Type* = this.arena.lookup(this.ctx.decl_index.type_of_def(d));
+        if (t == null || t.kind != TypeKind::Enum) { return false; }
+        const want: i64 = (t as EnumType*).variant_index(this.intern.intern(leaf));
+        return match (scope.resolved_member) {
+            MemberPin::Variant(vi) => { want >= 0 && vi == want }
+            _                      => { false }
+        };
+    }
+
     /// True for the suspend statement the await lowering emits: `return
     /// Poll::Pending`. A user `return` was already rewritten to `Poll::Ready`,
-    /// so the member name alone tells them apart.
+    /// so the variant alone tells them apart.
     is_pending_return(&this, s: StatementNode*) -> boolean {
         if (s == null || s.kind != NodeKind::ReturnStatement) { return false; }
         const e: ExpressionNode* = (s as ReturnStmtNode*).expression;
         if (e == null || (e as ASTNode*).kind != NodeKind::ScopeResolution) { return false; }
-        return (e as ScopeResolutionNode*).member_name.equals(this.intern.intern("Pending"));
+        return this.is_poll_variant(e as ScopeResolutionNode*, "Pending");
     }
 
     /// The `Poll::Ready(<value>)` call a completion return carries - the shape
@@ -4899,9 +4917,7 @@ type struct AsyncLower {
         if (e == null || (e as ASTNode*).kind != NodeKind::CallExpression) { return null; }
         const callee: ExpressionNode* = (e as CallExprNode*).callee;
         if (callee == null || (callee as ASTNode*).kind != NodeKind::ScopeResolution) { return null; }
-        if (!(callee as ScopeResolutionNode*).member_name.equals(this.intern.intern("Ready"))) {
-            return null;
-        }
+        if (!this.is_poll_variant(callee as ScopeResolutionNode*, "Ready")) { return null; }
         return e as CallExprNode*;
     }
 
@@ -7072,8 +7088,7 @@ type struct AsyncLower {
     /// to `main`. False (nothing rewritten) when `node` is not an `async main`.
     desugar_async_main(mut &this, node: FunctionDeclNode*) -> boolean {
         if (node == null || node.body == null || !node.is_async) { return false; }
-        const main_sym: SymbolStr = this.intern.intern("main");
-        if (!node.name.equals(main_sym)) { return false; }
+        if (!node.def.is_valid() || !node.def.equals(this.ctx.entry_fn)) { return false; }
 
         // Without `std::future` the module has no future types at all, and
         // `declare` reports that with the message naming the missing import; bow
@@ -7117,6 +7132,7 @@ type struct AsyncLower {
         const span: SourceSpan = node.span;
         const inner_sym: SymbolStr = this.intern.intern("main$async");
         const ex_sym: SymbolStr = this.intern.intern("ex");
+        const main_sym: SymbolStr = node.name;
         node.set_name(inner_sym);
         // The renamed body is a declaration the lowering makes: registered
         // here, and the call the wrapper builds to it names this id.  The

@@ -1540,6 +1540,7 @@ public:
             }
             const field_type: TypeRef = fields_ptr[positions[i]].field_type;
             b.resolved_type = field_type;
+            b.field_index = positions[i];
             node.bindings[i] = b;
             this.scopes.declare(b.sym_id, field_type, b.is_mutable);
         }
@@ -1637,6 +1638,7 @@ public:
                 ty = this.member.field_of(node.resolved_type, b.source_field).ty;
             }
             if (ty.is_valid()) { node.bindings[i].resolved_type = ty; }
+            if (positions.length > i) { node.bindings[i].field_index = positions[i]; }
             if (!ty.is_valid()) { ty = this.arena.get_void(); }
             this.scopes.declare(b.sym_id, ty, b.is_mutable);
         }
@@ -3146,7 +3148,7 @@ public:
         // happens to share the leaf is not it.
         const future_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Future);
         if (!future_id.is_valid() || !func.origin_trait.equals(future_id)) { return TypeRef::invalid(); }
-        if (!func.name.equals(this.intern.intern("poll"))) { return TypeRef::invalid(); }
+        if (!this.ctx.generic_registry.names_lang_method(func.name, LangItem::FuturePoll)) { return TypeRef::invalid(); }
         // Read the Output off `Poll::Ready`'s payload rather than the return
         // type's generic argument: once monomorphization has specialized it,
         // `Poll<Output>` is a plain enum with no instantiation left to peel.
@@ -3156,13 +3158,10 @@ public:
         const e: Type* = this.types.unwrap_to_enum(func.resolved_return_type);
         if (e == null || e.kind != TypeKind::Enum) { return TypeRef::invalid(); }
         const et: EnumType* = e as EnumType*;
-        mut decl: EnumType* = et;
-        if (et.generic_base.is_valid()) {
-            const base: Type* = this.arena.lookup(et.generic_base);
-            if (base != null && base.kind == TypeKind::Enum) { decl = base as EnumType*; }
+        const poll_def: DefId = this.ctx.generic_registry.wellknown(LangItem::Poll);
+        if (!poll_def.is_valid() || !this.enum_decl_def(func.resolved_return_type).equals(poll_def)) {
+            return TypeRef::invalid();
         }
-        const poll_id: SymbolStr = this.async_lower.poll_identity();
-        if (!poll_id.is_valid() || !decl.qualified_name.equals(poll_id)) { return TypeRef::invalid(); }
         const ready: i64 = et.variant_index(this.intern.intern("Ready"));
         if (ready < 0 || et.variants[ready].payload_types.length != 1) { return TypeRef::invalid(); }
         return et.variants[ready].payload_types[0];
@@ -3176,22 +3175,30 @@ public:
     /// template, resolved (a specialized enum carries its `generic_base`) or
     /// not.
     enum_try_shape(&this, ty: TypeRef) -> i32 {
-        mut e: Type* = this.types.unwrap_to_enum(ty);
-        if (e == null) {
-            const inst: InstantiatedType* = this.types.peel_to_instantiation(ty);
-            if (inst != null && !inst.has_resolved_type()) { e = this.types.unwrap_to_enum(inst.generic_base); }
-        }
-        if (e == null || e.kind != TypeKind::Enum) { return 0; }
-        mut et: EnumType* = e as EnumType*;
-        if (et.generic_base.is_valid()) {
-            const base: Type* = this.arena.lookup(et.generic_base);
-            if (base != null && base.kind == TypeKind::Enum) { et = base as EnumType*; }
-        }
+        const d: DefId = this.enum_decl_def(ty);
+        if (!d.is_valid()) { return 0; }
         const result_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Result);
-        if (result_id.is_valid() && et.qualified_name.equals(this.ctx.defs.path_of(result_id).spelling())) { return 1; }
+        if (result_id.is_valid() && d.equals(result_id)) { return 1; }
         const option_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Option);
-        if (option_id.is_valid() && et.qualified_name.equals(this.ctx.defs.path_of(option_id).spelling())) { return 2; }
+        if (option_id.is_valid() && d.equals(option_id)) { return 2; }
         return 0;
+    }
+
+    /// The declaration of the enum `ty` is, through references, pointers and
+    /// an instantiation: a specialization answers as its template.  Invalid
+    /// when `ty` is no enum.
+    enum_decl_def(&this, ty: TypeRef) -> DefId {
+        if (!ty.is_valid()) { return DefId::invalid(); }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return DefId::invalid(); }
+        if (t.kind == TypeKind::Reference) { return this.enum_decl_def((t as ReferenceType*).referent); }
+        if (t.kind == TypeKind::Pointer) { return this.enum_decl_def((t as PointerType*).pointee); }
+        if (t.kind == TypeKind::InstantiatedType) {
+            return this.enum_decl_def((t as InstantiatedType*).generic_base);
+        }
+        if (t.kind != TypeKind::Enum) { return DefId::invalid(); }
+        const base: TypeRef = (t as EnumType*).generic_base;
+        return this.ctx.decl_index.def_of(if (base.is_valid()) { base } else { ty }, this.ctx.type_arena);
     }
 
     /// `ret_ty` is the ENCLOSING FUNCTION's return type, not the operand's: the
@@ -3554,7 +3561,12 @@ public:
                     const decl_name: SymbolStr = fields_ptr[k].name;
                     mut covered: boolean = false;
                     for (mut fi: i64 = 0; fi < lit.field_inits.length; fi++) {
-                        if (lit.field_inits[fi].field_name.id == decl_name.id) { covered = true; break; }
+                        // Pinned above to the type's own field `k`.
+                        const own_k: boolean = match (lit.field_inits[fi].pin) {
+                            MemberPin::Field(d, ix) => { d == 0 && ix == k }
+                            _                       => { false }
+                        };
+                        if (own_k) { covered = true; break; }
                     }
                     if (covered) { continue; }
                     // A literal sets every field, the ones it leaves to their

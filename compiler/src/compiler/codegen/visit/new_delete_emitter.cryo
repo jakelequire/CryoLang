@@ -53,7 +53,8 @@ import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
-import compiler::resolver::res::{ FamilyOwner };
+import compiler::resolver::res::{ DefId, FamilyOwner };
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType };
 import compiler::types::generic_registry::{ GenericRegistry };
@@ -99,17 +100,17 @@ type struct NewDeleteEmitter {
     // `ASTNode` qualified name is unique to the compiler's own source, so
     // routing only ever fires when the compiler compiles itself - user
     // programs that `new` their own classes are unaffected.
-    derives_from_astnode(mut &this, t: Type*) -> boolean {
-        if (t == null) { return false; }
-        const intern: InternTable* = this.cg.get_intern();
-        const astnode_sym: SymbolStr = intern.intern("compiler::ast::node::ASTNode");
-        mut cur: Type* = t;
+    derives_from_astnode(mut &this, ty: TypeRef) -> boolean {
+        const astnode: DefId = this.cg.ctx.generic_registry.wellknown(LangItem::AstNode);
+        if (!astnode.is_valid()) { return false; }
+        mut cur: TypeRef = ty;
         loop {
-            if (cur == null || cur.kind != TypeKind::Class) { return false; }
-            const ct: ClassType* = cur as ClassType*;
-            if (ct.qualified_name.equals(astnode_sym)) { return true; }
+            const t: Type* = this.cg.arena_type(cur);
+            if (t == null || t.kind != TypeKind::Class) { return false; }
+            if (this.cg.ctx.decl_index.def_of(cur, this.cg.ctx.type_arena).equals(astnode)) { return true; }
+            const ct: ClassType* = t as ClassType*;
             if (!ct.has_base) { return false; }
-            cur = this.cg.arena_type(ct.base_class);
+            cur = ct.base_class;
         }
     }
 
@@ -208,7 +209,7 @@ type struct NewDeleteEmitter {
         // to the process-global arena; everything else shares the canonical
         // GlobalAlloc via the shared funnel. The bitcast / vtable seed / struct
         // init / ctor call below are byte-identical regardless of storage.
-        const is_ast: boolean = this.derives_from_astnode(t);
+        const is_ast: boolean = this.derives_from_astnode(type_ref);
         mut align: u64 = 16;
         if (t.kind == TypeKind::Class) {
             const ct_a: ClassType* = t as ClassType*;
@@ -405,7 +406,7 @@ type struct NewDeleteEmitter {
         // AST-node element blocks route to the arena (parity with emit_new;
         // AST collections are dynamic `T[]`, not `new T[n]`, so this is
         // expected never to fire). Array allocations use a fixed 16 alignment.
-        const is_ast: boolean = this.derives_from_astnode(elem_t);
+        const is_ast: boolean = this.derives_from_astnode(elem_ref);
         const raw_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
             is_ast, total, 16, Text::new("new.arr"), node.span, Text::new("'new T[n]'"));
         if (!raw_ptr.is_valid()) {
@@ -470,9 +471,8 @@ type struct NewDeleteEmitter {
         // operand once for its side effects, then no-op, exactly preserving
         // today's behavior (AST nodes are never individually freed).  There are
         // no `delete` sites on AST nodes in-tree today; this guard is defensive.
-        if (pointee.is_valid() && arena_ptr != null) {
-            const pointee_t: Type* = arena_ptr.lookup(pointee);
-            if (this.derives_from_astnode(pointee_t)) {
+        if (pointee.is_valid()) {
+            if (this.derives_from_astnode(pointee)) {
                 const _p: LValue = this.dispatch.codegen_rvalue(visitor, node.operand);
                 this.state.last_value = LValue::null();
                 this.state.last_is_lvalue = false;
