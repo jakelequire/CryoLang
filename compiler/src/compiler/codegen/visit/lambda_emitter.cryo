@@ -43,6 +43,8 @@ import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res;
+import compiler::resolver::res::{ Res };
 import compiler::types::resolver::{ ResolutionContext };
 import compiler::types::type_ref::{ TypeRef };
 import utils::text::{ Text };
@@ -217,7 +219,7 @@ type struct LambdaEmitter {
             const alloca: LValue = this.cg.flow.create_entry_alloca(fn_val, Text::new(param_name), p_ty);
             const arg:    LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, pi) };
             this.cg.builder.build_store(arg, alloca);
-            this.cg.values.set(param.name, alloca);
+            this.cg.values.set(param.sym_id, alloca);
         }
 
         // Generate the body.  Inline the small generate_block / accept loop
@@ -282,8 +284,8 @@ type struct LambdaEmitter {
     /// initialised from the corresponding captured local in scope.  Built
     /// as a transient `StructLiteralNode` so the normal struct-literal
     /// codegen path handles the alloca + GEP-store sequence; we just
-    /// supply identifier-node initialisers whose lookups land on
-    /// `cg.values.get(<cap_name>)` for the outer function's allocas.
+    /// supply identifier-node initialisers, each stamped with its capture's
+    /// binding, whose lookups land on the outer function's allocas.
     ///
     /// No anonymous function is emitted from this site: the lambda's body
     /// lives on the synthesised `<closure_struct>::__call__` method,
@@ -309,6 +311,7 @@ type struct LambdaEmitter {
             const cap_name: SymbolStr = node.captured_names[i];
             const cap_ty:   TypeRef   = node.captured_types[i];
             mut ident: IdentifierNode* = new IdentifierNode(cap_name, node.span);
+            ident.set_res(Res::Local(node.captured_syms[i]));
             ident.set_resolved_type(cap_ty);
             // The closure struct's fields ARE the captures, in this order
             // (`LambdaSynth::synthesize_closure_struct`), so the field this

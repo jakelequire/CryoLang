@@ -108,6 +108,25 @@ import compiler::sema::sema::{ SemaVisitor };
 import utils::text::{ Text };
 
 
+/// A local this pass writes a reference to: the binding it denotes and the
+/// spelling the synthesized node shows.  Every identifier the pass builds is
+/// stamped with the binding, as the name layer stamps a written one, because
+/// codegen finds a local's storage by its binding: one function may declare
+/// a spelling more than once, each declaration with storage of its own.
+type struct PassLocal {
+    name:    SymbolStr;
+    binding: SymbolID;
+
+    static none() -> PassLocal {
+        return PassLocal { name: SymbolStr::empty(), binding: SymbolID::invalid() };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.binding.is_valid();
+    }
+}
+
+
 type struct DropInserter {
     ctx:      CompilationContext*;
     arena:    TypeArena*;
@@ -158,16 +177,16 @@ type struct DropInserter {
     /// `binding_syms` is the key; `binding_names` is the spelling the
     /// synthesized `<name>.drop()` is written with, and is never searched.
     scope_start_idx: i64[];
-    binding_syms:    u64[];
+    binding_syms:    SymbolID[];
     binding_names:   u32[];
     binding_types:   TypeRef[];
     binding_spans:   SourceSpan[];
 
-    /// Init-flag name id per live binding, parallel to `binding_names`.
-    /// `0` (the reserved invalid SymbolStr id) means the binding is NOT
+    /// Init flag per live binding, parallel to `binding_names`.  An invalid
+    /// one means the binding is NOT
     /// conditionally-initialized: it had an initializer, is Copy, or is
     /// otherwise unconditionally live, so its scope-exit drop runs
-    /// unconditionally.  A nonzero id names a synthesized
+    /// unconditionally.  A valid one is a synthesized
     /// `mut <name>__initflag<seq>: boolean = false;` local hoisted at the
     /// binding's declaration; every assignment `<name> = ...` sets it true,
     /// and the scope-exit drop is wrapped in `if (<flag>) { ... }` so it
@@ -180,7 +199,7 @@ type struct DropInserter {
     /// event that sets it is an assignment (a write), not a move-out.  This
     /// array is truncated in lock-step with `binding_*` on scope pop, so the
     /// mapping is naturally scoped (innermost shadow wins on a reverse scan).
-    binding_initflags: u32[];
+    binding_initflags: PassLocal[];
 
     /// Bindings disqualified from init-flag tracking in the current function:
     /// locals whose storage may be initialized through a taken address
@@ -217,7 +236,7 @@ type struct DropInserter {
     mem_pstart: i64[];
     mem_plen:   i64[];
     mem_type:   TypeRef[];
-    mem_flag:   u32[];
+    mem_flag:   PassLocal[];
     mem_proj_kind: u8[];
     mem_proj_key:  u32[];
 
@@ -274,14 +293,14 @@ type struct DropInserter {
     link_payload: u64[];
     link_subject: u64[];
 
-    /// Conditional-move drop flag name id per live binding, parallel to
+    /// Conditional-move drop flag per live binding, parallel to
     /// `binding_names` (exactly like `binding_initflags`).  A binding moved on
     /// some control-flow paths but not others gets a synthesized
     /// `mut <name>__dropflag<seq>: boolean = false;` hoisted before the
     /// branching statement, plus a `<flag> = true;` appended to every moving
     /// arm.  At scope exit the binding's drop is wrapped in `if (!<flag>) {...}`
     /// so it runs on the not-moved path and is skipped on the moved path - the
-    /// canonical "drop flag" technique.  `0` (the reserved invalid SymbolStr id)
+    /// canonical "drop flag" technique.  An invalid one
     /// means the binding has no drop flag and its scope-exit drop is governed by
     /// the static moved-set instead.
     ///
@@ -295,7 +314,7 @@ type struct DropInserter {
     /// this routine rather than exotic: its state blocks all live in one lowered
     /// `poll`, and every state that takes a carried value across a suspend
     /// declares it under the same name.
-    binding_dropflags: u32[];
+    binding_dropflags: PassLocal[];
 
     /// Monotonic counter for naming synthesized drop-flag locals (avoid
     /// clashing with anything the user wrote or with other synthetic
@@ -347,9 +366,9 @@ type struct DropInserter {
     /// expression never matches the node the statement is checking, so it is
     /// skipped rather than mis-attributed.
     pend_assign_node:  ExpressionNode*;
-    /// Flag id gating the release, or 0 when the destination is definitely
-    /// live and the release is unconditional.
-    pend_assign_guard: u32;
+    /// Flag gating the release, or an invalid one when the destination is
+    /// definitely live and the release is unconditional.
+    pend_assign_guard: PassLocal;
     /// The guard is the destination's move flag, which is set where the
     /// value was moved OUT, so the release runs where it is clear; an init
     /// flag is set where the value was written, so its release runs where
@@ -359,7 +378,7 @@ type struct DropInserter {
     /// The destination place, kept as base binding + projection chain so the
     /// copy is rebuilt from types this pass derived rather than from the
     /// source node's annotations.
-    pend_assign_base:    u32;
+    pend_assign_base:    PassLocal;
     pend_assign_base_ty: TypeRef;
     pend_assign_kind:    u8[];
     pend_assign_key:     u32[];
@@ -431,10 +450,10 @@ type struct DropInserter {
             pw_whole:        [],
             binding_definit: [],
             pend_assign_node:  null,
-            pend_assign_guard: 0,
+            pend_assign_guard: PassLocal::none(),
             pend_assign_guard_moved: false,
             pend_assign_ty:    TypeRef::invalid(),
-            pend_assign_base:    0,
+            pend_assign_base:    PassLocal::none(),
             pend_assign_base_ty: TypeRef::invalid(),
             pend_assign_kind:    [],
             pend_assign_key:     [],
@@ -560,16 +579,16 @@ type struct DropInserter {
         }
         this.types_keys.push(sym.key());
         this.types_refs.push(ty);
-        this.binding_syms.push(sym.key());
+        this.binding_syms.push(sym);
         this.binding_names.push(name.id);
         this.binding_types.push(ty);
         this.binding_spans.push(span);
         // No init flag by default; a conditionally-initialized droppable
         // local upgrades this slot via attach_init_flag right after this call.
-        this.binding_initflags.push(0 as u32);
+        this.binding_initflags.push(PassLocal::none());
         // No drop flag by default; a branch-join that finds this binding moved
         // on some paths only upgrades the slot via register_drop_flag.
-        this.binding_dropflags.push(0 as u32);
+        this.binding_dropflags.push(PassLocal::none());
         this.binding_definit.push(if (definit) { 1 as u8 } else { 0 as u8 });
     }
 
@@ -657,7 +676,7 @@ type struct DropInserter {
     sym_is_live(&this, sym: SymbolID) -> boolean {
         if (!sym.is_valid()) { return false; }
         for (mut i: i64 = 0; i < this.binding_syms.length; i++) {
-            if (this.binding_syms[i] == sym.key()) { return true; }
+            if (this.binding_syms[i].key() == sym.key()) { return true; }
         }
         return false;
     }
@@ -763,18 +782,48 @@ type struct DropInserter {
     slot_of(&this, key: u64) -> i64 {
         if (key == 0) { return -1; }
         for (mut i: i64 = this.binding_syms.length - 1; i >= 0; i--) {
-            if (this.binding_syms[i] == key) { return i; }
+            if (this.binding_syms[i].key() == key) { return i; }
         }
         return -1;
     }
 
-    /// The spelling a live binding was declared with - what a synthesized
-    /// `<name>.drop()` is written with and what a diagnostic prints.  Empty for
-    /// a key that names no live binding.
+    /// The spelling a live binding was declared with - what a diagnostic
+    /// prints and a flag's name is built from.  Empty for a key that names no
+    /// live binding.
     spelling_of(&this, key: u64) -> SymbolStr {
         const slot: i64 = this.slot_of(key);
         if (slot < 0) { return SymbolStr::empty(); }
         return SymbolStr::from_id(this.binding_names[slot]);
+    }
+
+    /// The binding in `slot`, as a synthesized `<name>.drop()` refers to it.
+    local_at(&this, slot: i64) -> PassLocal {
+        return PassLocal {
+            name:    SymbolStr::from_id(this.binding_names[slot]),
+            binding: this.binding_syms[slot],
+        };
+    }
+
+    /// The live binding `key` names, or an invalid one.
+    local_of(&this, key: u64) -> PassLocal {
+        const slot: i64 = this.slot_of(key);
+        if (slot < 0) { return PassLocal::none(); }
+        return this.local_at(slot);
+    }
+
+    /// A local this pass declares itself (a flag, a hidden temporary): its
+    /// binding comes from the allocator, minted with its name, and its
+    /// declaration and every reference share it.
+    mint_local(mut &this, name: SymbolStr) -> PassLocal {
+        return PassLocal { name: name, binding: this.resolver.alloc_synthetic_binding() };
+    }
+
+    /// A reference to `l`, stamped with its binding.
+    local_ident(&this, l: PassLocal, ty: TypeRef, span: SourceSpan) -> IdentifierNode* {
+        mut ident: IdentifierNode* = new IdentifierNode(l.name, span);
+        ident.set_res(Res::Local(l.binding));
+        ident.set_resolved_type(ty);
+        return ident;
     }
 
     // ---- diagnostics -----------------------------------------------------
@@ -894,15 +943,15 @@ type struct DropInserter {
             if (p.name.is_valid() && p.sym_id.is_valid()
                     && this.type_needs_drop(p.resolved_type)
                     && this.param_drop_well_formed(p.resolved_type)) {
-                this.binding_syms.push(p.sym_id.key());
+                this.binding_syms.push(p.sym_id);
                 this.binding_names.push(p.name.id);
                 this.binding_types.push(p.resolved_type);
                 this.binding_spans.push(p.span);
                 // A by-value param is initialized by the caller's move-in, so
                 // it is unconditionally live - no init flag (keep the parallel
                 // arrays in lock-step; register_binding is bypassed here).
-                this.binding_initflags.push(0 as u32);
-                this.binding_dropflags.push(0 as u32);
+                this.binding_initflags.push(PassLocal::none());
+                this.binding_dropflags.push(PassLocal::none());
                 // The caller's move-in made it live before the body runs.
                 this.binding_definit.push(1 as u8);
             }
@@ -1132,7 +1181,7 @@ type struct DropInserter {
                     // `<x> = ...` where x is a conditionally-initialized
                     // droppable place: record that this path initialized it, so
                     // the scope-exit `if (<flag>) drop()` observes the write.
-                    const iflag: SymbolStr =
+                    const iflag: PassLocal =
                         this.init_flag_for_assignment_target(e.expression);
                     if (iflag.is_valid()) {
                         out.push(this.make_drop_flag_set(iflag, stmt.span));
@@ -1145,7 +1194,7 @@ type struct DropInserter {
             }
             NodeKind::DeclarationStatement => {
                 const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-                mut init_flag: SymbolStr = SymbolStr::empty();
+                mut init_flag: PassLocal = PassLocal::none();
                 mut flag_decls: StatementNode*[] = [];
                 const decl_snap: i64 = this.snapshot_moves();
                 this.stmt_writes_flags = true;
@@ -1603,7 +1652,7 @@ type struct DropInserter {
         // moved.
         mut outer_syms: u64[] = [];
         for (mut i: i64 = 0; i < this.binding_syms.length; i++) {
-            outer_syms.push(this.binding_syms[i]);
+            outer_syms.push(this.binding_syms[i].key());
         }
 
         mut all_keys:    u64[] = [];
@@ -1785,7 +1834,7 @@ type struct DropInserter {
             // already-flagged subject would otherwise leave the flag stale and
             // double-free. Set it on each consuming arm. (No-op when the subject
             // has no flag - the common, unconditional case is unaffected.)
-            const subj_flag: SymbolStr = this.get_drop_flag(subj_sym.key());
+            const subj_flag: PassLocal = this.get_drop_flag(subj_sym.key());
             if (subj_flag.is_valid()) {
                 for (mut c: i64 = 0; c < consumed_arm_idx.length; c++) {
                     const ai: i64 = consumed_arm_idx[c];
@@ -1999,9 +2048,9 @@ type struct DropInserter {
                             branch_is_then: boolean, splice: boolean) -> void {
         // Already has a flag? Idempotent re-use - just splice the
         // flag-set into this branch.
-        mut flag: SymbolStr = this.get_drop_flag(binding);
+        mut flag: PassLocal = this.get_drop_flag(binding);
         if (!flag.is_valid()) {
-            flag = this.fresh_drop_flag_name(binding);
+            flag = this.fresh_drop_flag(binding);
             // Hoist `mut <flag>: boolean = false;` before the if-stmt.
             // The binding span is the best anchor for diagnostics on the
             // synthesized local; fall back to it.span if unavailable.
@@ -2036,9 +2085,9 @@ type struct DropInserter {
                                 arm_move_gov: &boolean[],
                                 arm_move_starts: &i64[],
                                 key: u64) -> void {
-        mut flag: SymbolStr = this.get_drop_flag(key);
+        mut flag: PassLocal = this.get_drop_flag(key);
         if (!flag.is_valid()) {
-            flag = this.fresh_drop_flag_name(key);
+            flag = this.fresh_drop_flag(key);
             const decl_span: SourceSpan = this.binding_span_for(key, m.span);
             out.push(this.make_drop_flag_decl(flag, decl_span));
             this.register_drop_flag(key, flag);
@@ -2126,7 +2175,7 @@ type struct DropInserter {
         const line_u: u32 = if (line > 0) { line as u32 } else { 0 };
         mut span: SourceSpan = SourceSpan::new(Text::new(this.ctx.source_file), line_u, 1, line_u, 1);
         for (mut bi: i64 = 0; bi < this.binding_syms.length; bi++) {
-            if (this.binding_syms[bi] == key && this.binding_spans[bi].has_location()) {
+            if (this.binding_syms[bi].key() == key && this.binding_spans[bi].has_location()) {
                 span = this.binding_spans[bi];
                 break;
             }
@@ -2218,10 +2267,10 @@ type struct DropInserter {
             if (key == 0) { continue; }
             const ty:  TypeRef   = this.lookup_type_key(key);
             if (!this.type_needs_drop(ty)) { continue; }
-            const name: SymbolStr = this.spelling_of(key);
-            if (!name.is_valid()) { continue; }
+            const local: PassLocal = this.local_of(key);
+            if (!local.is_valid()) { continue; }
             const span: SourceSpan = this.binding_span_for(key);
-            const stmt: StatementNode* = this.make_drop_call(name, ty, span);
+            const stmt: StatementNode* = this.make_drop_call(local, ty, span);
             if (stmt != null) { out.push(stmt); }
         }
     }
@@ -2421,7 +2470,7 @@ type struct DropInserter {
     /// `name.drop()` for partially-moved bindings.  Mirrors codegen's
     /// `emit_field_drops`, but emitted as AST so it lowers through the normal
     /// `.drop()` path.
-    append_partial_drops(mut &this, out: StatementNode*[]*, name: SymbolStr,
+    append_partial_drops(mut &this, out: StatementNode*[]*, name: PassLocal,
                          ty: TypeRef, key: u64, span: SourceSpan) -> void {
         const t: Type* = this.aggregate_type_of(ty);
         if (t == null) {
@@ -2457,11 +2506,10 @@ type struct DropInserter {
     /// MemberAccess(Ident, field), "drop"))).  Same shape as make_drop_call
     /// but with an intervening field projection; all nodes carry resolved
     /// types (codegen won't re-run type resolution).
-    make_field_drop_call(mut &this, name: SymbolStr, ty: TypeRef,
+    make_field_drop_call(mut &this, name: PassLocal, ty: TypeRef,
                          field_name: SymbolStr, field_index: i64, field_ty: TypeRef,
                          span: SourceSpan) -> StatementNode* {
-        const ident: IdentifierNode* = new IdentifierNode(name, span);
-        ident.set_resolved_type(ty);
+        const ident: IdentifierNode* = this.local_ident(name, ty, span);
         const field_access: MemberAccessNode* = new MemberAccessNode(
             ident as ExpressionNode*, field_name, span, span);
         field_access.set_resolved_type(field_ty);
@@ -2478,11 +2526,11 @@ type struct DropInserter {
     }
 
     maybe_append_drop(mut &this, out: StatementNode*[]*, idx: i64) -> void {
-        const key:  u64       = this.binding_syms[idx];
+        const key:  u64       = this.binding_syms[idx].key();
         const ty:   TypeRef   = this.binding_types[idx];
         const span: SourceSpan = this.binding_spans[idx];
         if (!this.type_needs_drop(ty)) { return; }
-        const sym: SymbolStr = SymbolStr::from_id(this.binding_names[idx]);
+        const sym: PassLocal = this.local_at(idx);
         // Member-governed binding: it never becomes live all at once, so there
         // is no whole value to drop - only the members that were written.  A
         // monolithic drop here would expand through glue over every member,
@@ -2493,7 +2541,7 @@ type struct DropInserter {
             mut mcore: StatementNode*[] = [];
             this.append_member_drops(&mcore, idx);
             if (mcore.length == 0) { return; }
-            const mflag: SymbolStr = SymbolStr::from_id(this.binding_dropflags[idx]);
+            const mflag: PassLocal = this.binding_dropflags[idx];
             if (mflag.is_valid()) {
                 // Conditionally moved out as a whole on some path: the members
                 // survive only where the move did not happen.
@@ -2521,7 +2569,7 @@ type struct DropInserter {
         // function may declare this name several times (an `async` poll takes
         // a carried value under one name in every state that needs it), and
         // each declaration's storage must be governed by its own flag.
-        const flag: SymbolStr = SymbolStr::from_id(this.binding_dropflags[idx]);
+        const flag: PassLocal = this.binding_dropflags[idx];
         if (flag.is_valid()) {
             const cstmt: StatementNode* = this.make_conditional_drop_call(
                 sym, ty, flag, span);
@@ -2544,9 +2592,8 @@ type struct DropInserter {
         // only on paths that assigned the storage.  Nesting with a move flag
         // yields `if (init) { if (!moved) drop(); }` == drop if initialized
         // and not moved.  LLVM folds an always-true flag away.
-        const iflag_id: u32 = this.binding_initflags[idx];
-        if (iflag_id != (0 as u32)) {
-            const iflag: SymbolStr = SymbolStr::from_id(iflag_id);
+        const iflag: PassLocal = this.binding_initflags[idx];
+        if (iflag.is_valid()) {
             out.push(this.wrap_in_init_guard(iflag, core, span));
             this.inserted += 1;
         } else {
@@ -2603,8 +2650,8 @@ type struct DropInserter {
         // the flag yet, and is known here to have taken the value.  A member
         // destination, or a binding that is also conditionally initialized,
         // is not described by the one flag, and declines.
-        const move_flag: u32 = this.binding_dropflags[slot];
-        if (move_flag != (0 as u32)) {
+        const move_flag: PassLocal = this.binding_dropflags[slot];
+        if (move_flag.is_valid()) {
             if (kind.length != 0 || this.slot_has_members(slot)) { return; }
             if (this.binding_definit[slot] != (1 as u8)) { return; }
             if (this.moved_since(this.stmt_move_snap, root.key())) { return; }
@@ -2615,15 +2662,15 @@ type struct DropInserter {
         if (this.is_moved(root)) { return; }
 
         const root_live:  boolean = this.binding_definit[slot] == (1 as u8);
-        const root_flag:  u32     = this.binding_initflags[slot];
-        mut guard: u32 = 0;
+        const root_flag:  PassLocal = this.binding_initflags[slot];
+        mut guard: PassLocal = PassLocal::none();
 
         if (kind.length == 0) {
             // Whole-binding destination.
             if (this.slot_has_members(slot)) { return; }
             if (root_live) {
-                guard = 0;
-            } else if (root_flag != (0 as u32)) {
+                guard = PassLocal::none();
+            } else if (root_flag.is_valid()) {
                 guard = root_flag;
             } else {
                 return;                 // address escaped; liveness unknown
@@ -2641,8 +2688,8 @@ type struct DropInserter {
                 // different granularity than this write.
                 return;
             } else if (root_live) {
-                guard = 0;              // parent live as a whole, so is this
-            } else if (root_flag != (0 as u32)) {
+                guard = PassLocal::none();  // parent live as a whole, so is this
+            } else if (root_flag.is_valid()) {
                 guard = root_flag;
             } else {
                 return;
@@ -2653,12 +2700,12 @@ type struct DropInserter {
 
     /// Stash the release `record_assign_drop` decided on for the enclosing
     /// expression statement to emit.
-    pend_assign(mut &this, b: BinaryExprNode*, slot: i64, guard: u32,
+    pend_assign(mut &this, b: BinaryExprNode*, slot: i64, guard: PassLocal,
                 place_ty: TypeRef, kind: u8[], key: u32[]) -> void {
         this.pend_assign_node  = b as ExpressionNode*;
         this.pend_assign_guard = guard;
         this.pend_assign_ty    = place_ty;
-        this.pend_assign_base    = this.binding_names[slot];
+        this.pend_assign_base    = this.local_at(slot);
         this.pend_assign_base_ty = this.binding_types[slot];
         this.pend_assign_kind    = kind;
         this.pend_assign_key     = key;
@@ -2698,23 +2745,23 @@ type struct DropInserter {
             }
             if (seen) { continue; }
             written.push(k);
-            const flag: SymbolStr = this.get_drop_flag(k);
+            const flag: PassLocal = this.get_drop_flag(k);
             if (flag.is_valid()) { out.push(this.make_drop_flag_write(flag, true, span)); }
         }
-        const target: SymbolStr = this.move_flag_for_assignment_target(expr);
+        const target: PassLocal = this.move_flag_for_assignment_target(expr);
         if (target.is_valid()) { out.push(this.make_drop_flag_write(target, false, span)); }
     }
 
     /// The move flag of the binding a plain `<ident> = ...` assigns as a
-    /// whole, or an invalid SymbolStr.  A member assignment leaves the
-    /// binding's whole-value state as it was.
-    move_flag_for_assignment_target(&this, expr: ExpressionNode*) -> SymbolStr {
-        if (expr == null || expr.kind != NodeKind::BinaryExpression) { return SymbolStr::empty(); }
+    /// whole, or an invalid one.  A member assignment leaves the binding's
+    /// whole-value state as it was.
+    move_flag_for_assignment_target(&this, expr: ExpressionNode*) -> PassLocal {
+        if (expr == null || expr.kind != NodeKind::BinaryExpression) { return PassLocal::none(); }
         const b: BinaryExprNode* = expr as BinaryExprNode*;
-        if (b.op.kind != TokenType::Equal || b.left == null) { return SymbolStr::empty(); }
-        if (b.left.kind != NodeKind::Identifier) { return SymbolStr::empty(); }
+        if (b.op.kind != TokenType::Equal || b.left == null) { return PassLocal::none(); }
+        if (b.left.kind != NodeKind::Identifier) { return PassLocal::none(); }
         const sym: SymbolID = (b.left as IdentifierNode*).res.local_sym();
-        if (!sym.is_valid()) { return SymbolStr::empty(); }
+        if (!sym.is_valid()) { return PassLocal::none(); }
         return this.get_drop_flag(sym.key());
     }
 
@@ -2738,16 +2785,16 @@ type struct DropInserter {
         const span: SourceSpan = stmt.span;
         const ty: TypeRef = this.pend_assign_ty;
         const place: ExpressionNode* = this.build_place_expr(
-            SymbolStr::from_id(this.pend_assign_base), this.pend_assign_base_ty,
+            this.pend_assign_base, this.pend_assign_base_ty,
             &this.pend_assign_kind, &this.pend_assign_key,
             0, this.pend_assign_kind.length, span);
         if (place == null) { out.push(stmt); return; }
-        const name: SymbolStr = this.intern.intern(
-            fmt::format("__assign_old%lld", this.assign_seq));
+        const old: PassLocal = this.mint_local(this.intern.intern(
+            fmt::format("__assign_old%lld", this.assign_seq)));
         this.assign_seq = this.assign_seq + 1;
 
-        const vd: VarDeclNode* = new VarDeclNode(name, span);
-        vd.set_sym_id(this.resolver.alloc_synthetic_binding());
+        const vd: VarDeclNode* = new VarDeclNode(old.name, span);
+        vd.set_sym_id(old.binding);
         vd.set_resolved_type(ty);
         vd.set_initializer(place);
         const ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
@@ -2755,14 +2802,14 @@ type struct DropInserter {
 
         out.push(stmt);
 
-        const drop_stmt: StatementNode* = this.make_drop_call(name, ty, span);
+        const drop_stmt: StatementNode* = this.make_drop_call(old, ty, span);
         if (drop_stmt == null) { return; }
-        if (this.pend_assign_guard == (0 as u32)) {
+        if (!this.pend_assign_guard.is_valid()) {
             out.push(drop_stmt);
         } else {
             mut core: StatementNode*[] = [];
             core.push(drop_stmt);
-            const guard: SymbolStr = SymbolStr::from_id(this.pend_assign_guard);
+            const guard: PassLocal = this.pend_assign_guard;
             if (this.pend_assign_guard_moved) {
                 out.push(this.wrap_in_move_guard(guard, core, span));
             } else {
@@ -2794,7 +2841,7 @@ type struct DropInserter {
     ///     const __drop_tmpN: T = <expr>;
     ///     __drop_tmpN.drop();
     /// This reuses the ordinary local-var codegen (which keys the alloca by
-    /// name and stores the rvalue) and the standard synthesized drop call, so
+    /// binding and stores the rvalue) and the standard synthesized drop call, so
     /// no codegen change is needed. The hidden local is NOT registered as a
     /// scope binding, so the scope-exit pass won't drop it a second time; the
     /// drop fires at statement end, matching where most systems languages
@@ -2802,16 +2849,16 @@ type struct DropInserter {
     emit_discarded_temp_drop(mut &this, expr: ExpressionNode*,
                               out: StatementNode*[]*, span: SourceSpan) -> void {
         const ty: TypeRef = expr.resolved_type;
-        const name: SymbolStr = this.intern.intern(
-            fmt::format("__drop_tmp%d", this.discard_seq));
+        const tmp: PassLocal = this.mint_local(this.intern.intern(
+            fmt::format("__drop_tmp%d", this.discard_seq)));
         this.discard_seq = this.discard_seq + 1;
-        const vd: VarDeclNode* = new VarDeclNode(name, span);
-        vd.set_sym_id(this.resolver.alloc_synthetic_binding());
+        const vd: VarDeclNode* = new VarDeclNode(tmp.name, span);
+        vd.set_sym_id(tmp.binding);
         vd.set_resolved_type(ty);
         vd.set_initializer(expr);
         const ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
         out.push(ds as StatementNode*);
-        const drop_stmt: StatementNode* = this.make_drop_call(name, ty, span);
+        const drop_stmt: StatementNode* = this.make_drop_call(tmp, ty, span);
         if (drop_stmt != null) {
             out.push(drop_stmt);
             this.inserted += 1;
@@ -2872,11 +2919,11 @@ type struct DropInserter {
     }
 
     /// Look up the drop-flag local synthesized for the live declaration
-    /// `binding` names, or return an invalid SymbolStr if there is none.
-    get_drop_flag(&this, binding: u64) -> SymbolStr {
+    /// `binding` names, or an invalid one if there is none.
+    get_drop_flag(&this, binding: u64) -> PassLocal {
         const idx: i64 = this.slot_of(binding);
-        if (idx < 0) { return SymbolStr::empty(); }
-        return SymbolStr::from_id(this.binding_dropflags[idx]);
+        if (idx < 0) { return PassLocal::none(); }
+        return this.binding_dropflags[idx];
     }
 
     /// Record `flag` as the drop flag of the live declaration `binding` names.
@@ -2884,22 +2931,22 @@ type struct DropInserter {
     /// branches that each conditionally move the same binding keep sharing
     /// one flag (they share the storage too).  A DIFFERENT declaration of the
     /// same spelling owns a different slot and so gets its own flag.
-    register_drop_flag(mut &this, binding: u64, flag: SymbolStr) -> void {
+    register_drop_flag(mut &this, binding: u64, flag: PassLocal) -> void {
         if (!flag.is_valid()) { return; }
         const idx: i64 = this.slot_of(binding);
         if (idx < 0) { return; }
-        if (this.binding_dropflags[idx] != (0 as u32)) { return; }
-        this.binding_dropflags[idx] = flag.id;
+        if (this.binding_dropflags[idx].is_valid()) { return; }
+        this.binding_dropflags[idx] = flag;
     }
 
     /// Build `mut <flag>: boolean = false;` as a DeclStmt.  The boolean
     /// type is looked up via the type arena's primitive bool registry.
-    make_drop_flag_decl(mut &this, flag_name: SymbolStr,
+    make_drop_flag_decl(mut &this, flag: PassLocal,
                          span: SourceSpan) -> StatementNode* {
         const lit: LiteralNode* = new LiteralNode("false", LiteralKind::Boolean, span);
         lit.set_resolved_type(this.arena.get_bool());
-        const vd: VarDeclNode* = new VarDeclNode(flag_name, span);
-        vd.set_sym_id(this.resolver.alloc_synthetic_binding());
+        const vd: VarDeclNode* = new VarDeclNode(flag.name, span);
+        vd.set_sym_id(flag.binding);
         vd.set_resolved_type(this.arena.get_bool());
         vd.set_mutable(true);
         vd.set_drop_flag(true);
@@ -2909,18 +2956,17 @@ type struct DropInserter {
     }
 
     /// Build `<flag> = true;`.
-    make_drop_flag_set(mut &this, flag_name: SymbolStr,
+    make_drop_flag_set(mut &this, flag: PassLocal,
                         span: SourceSpan) -> StatementNode* {
-        return this.make_drop_flag_write(flag_name, true, span);
+        return this.make_drop_flag_write(flag, true, span);
     }
 
     /// Build `<flag> = <value>;` as an ExprStmt wrapping a BinaryExpr with
     /// the bare `=` token.  Drop-flag locals are always `mut` (see
     /// `make_drop_flag_decl`), so this is a legal assignment target.
-    make_drop_flag_write(mut &this, flag_name: SymbolStr, value: boolean,
+    make_drop_flag_write(mut &this, flag: PassLocal, value: boolean,
                          span: SourceSpan) -> StatementNode* {
-        const lhs: IdentifierNode* = new IdentifierNode(flag_name, span);
-        lhs.set_resolved_type(this.arena.get_bool());
+        const lhs: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const text: string = if (value) { "true" } else { "false" };
         const rhs: LiteralNode* = new LiteralNode(text, LiteralKind::Boolean, span);
         rhs.set_resolved_type(this.arena.get_bool());
@@ -2937,12 +2983,11 @@ type struct DropInserter {
     /// then-branch is a 1-statement block holding the drop call;
     /// else_stmt stays null.  Used by `maybe_append_drop` when the
     /// binding has a registered drop flag (conditional move).
-    make_conditional_drop_call(mut &this, binding: SymbolStr, ty: TypeRef,
-                                 flag: SymbolStr,
+    make_conditional_drop_call(mut &this, binding: PassLocal, ty: TypeRef,
+                                 flag: PassLocal,
                                  span: SourceSpan) -> StatementNode* {
         // Condition: `!<flag>`
-        const flag_ident: IdentifierNode* = new IdentifierNode(flag, span);
-        flag_ident.set_resolved_type(this.arena.get_bool());
+        const flag_ident: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const not_tok: Token = Token::new(TokenType::Exclaim, "!",
             span.start_line as int, span.start_col as int);
         const cond: UnaryExprNode* = new UnaryExprNode(
@@ -2966,10 +3011,10 @@ type struct DropInserter {
     /// re-wrapped) branch body so the caller can update the if/match
     /// node's pointer.
     splice_flag_set_into_branch(mut &this, branch: StatementNode*,
-                                 flag_name: SymbolStr,
+                                 flag: PassLocal,
                                  span: SourceSpan) -> StatementNode* {
         if (branch == null) { return branch; }
-        const set_stmt: StatementNode* = this.make_drop_flag_set(flag_name, span);
+        const set_stmt: StatementNode* = this.make_drop_flag_set(flag, span);
         if (branch.kind == NodeKind::BlockStatement) {
             const blk: BlockStmtNode* = branch as BlockStmtNode*;
             blk.statements.push(set_stmt);
@@ -2990,10 +3035,10 @@ type struct DropInserter {
     /// flag merely records that the matched subject is consumed on this arm's
     /// path, independent of where in the arm the consumption textually occurs.
     splice_flag_set_at_front(mut &this, branch: StatementNode*,
-                             flag_name: SymbolStr,
+                             flag: PassLocal,
                              span: SourceSpan) -> StatementNode* {
         if (branch == null) { return branch; }
-        const set_stmt: StatementNode* = this.make_drop_flag_set(flag_name, span);
+        const set_stmt: StatementNode* = this.make_drop_flag_set(flag, span);
         if (branch.kind == NodeKind::BlockStatement) {
             const blk: BlockStmtNode* = branch as BlockStmtNode*;
             blk.statements.insert(0, set_stmt);
@@ -3006,27 +3051,25 @@ type struct DropInserter {
         return blk as StatementNode*;
     }
 
-    /// Allocate a fresh drop-flag name for `binding`.  Format
-    /// `<name>__dropflag<seq>` keeps the binding visible in IR dumps
-    /// (helpful when debugging) and the monotonic seq ensures uniqueness
-    /// even if the same binding gains multiple flags from nested
-    /// branches (which shouldn't happen with the idempotent
-    /// register_drop_flag, but is cheap insurance).
-    fresh_drop_flag_name(mut &this, binding: u64) -> SymbolStr {
+    /// Allocate a fresh drop flag for `binding`, with a binding of its own.
+    /// The name `<name>__dropflag<seq>` keeps the binding visible in IR
+    /// dumps; the seq keeps two flags of one spelling apart there.
+    fresh_drop_flag(mut &this, binding: u64) -> PassLocal {
         const base: string = this.intern.resolve(this.spelling_of(binding));
         const named: string = fmt::format("%s__dropflag%lld", base, this.flag_seq);
         this.flag_seq = this.flag_seq + 1;
-        return this.intern.intern(named);
+        return this.mint_local(this.intern.intern(named));
     }
 
     // ---- init-flag tracking (inverse-polarity mirror of drop flags) ------
 
-    /// Allocate a fresh init-flag name for `binding` (`<name>__initflag<seq>`).
-    fresh_init_flag_name(mut &this, binding: SymbolStr) -> SymbolStr {
+    /// Allocate a fresh init flag for `binding` (`<name>__initflag<seq>`),
+    /// with a binding of its own.
+    fresh_init_flag(mut &this, binding: SymbolStr) -> PassLocal {
         const base: string = this.intern.resolve(binding);
         const named: string = fmt::format("%s__initflag%lld", base, this.initflag_seq);
         this.initflag_seq = this.initflag_seq + 1;
-        return this.intern.intern(named);
+        return this.mint_local(this.intern.intern(named));
     }
 
     /// Attach an init flag to the binding just registered as the tail entry of
@@ -3036,26 +3079,26 @@ type struct DropInserter {
     /// flag's `mut <flag>: boolean = false;` declaration is emitted by the
     /// caller (which holds the enclosing statement buffer).
     attach_init_flag(mut &this, name: SymbolStr, sym: SymbolID,
-                     span: SourceSpan) -> SymbolStr {
+                     span: SourceSpan) -> PassLocal {
         const n: i64 = this.binding_initflags.length;
-        if (n == 0) { return SymbolStr::empty(); }
+        if (n == 0) { return PassLocal::none(); }
         // The caller invokes this immediately after register_binding pushed the
         // local as the tail entry.  If that push didn't happen (no identity),
         // the tail is some other binding - never stamp its flag.
-        if (!sym.is_valid() || this.binding_syms[n - 1] != sym.key()) {
-            return SymbolStr::empty();
+        if (!sym.is_valid() || this.binding_syms[n - 1].key() != sym.key()) {
+            return PassLocal::none();
         }
         // Element/field/address-initialized locals can't be tracked by a
         // whole-binding-assignment flag; leave their drop unconditional.
-        if (this.is_init_disqualified(sym)) { return SymbolStr::empty(); }
+        if (this.is_init_disqualified(sym)) { return PassLocal::none(); }
         // Written member-wise, but `attach_member_flags` declined it (a type
         // with its own destructor, an unprojectable member).  A whole-binding
         // flag would never be set - no whole-binding write exists - so the
         // value would silently never be released.  Keep the unconditional
         // drop, which is what such a local got before members were tracked.
-        if (this.has_init_places(sym)) { return SymbolStr::empty(); }
-        const flag: SymbolStr = this.fresh_init_flag_name(name);
-        this.binding_initflags[n - 1] = flag.id;
+        if (this.has_init_places(sym)) { return PassLocal::none(); }
+        const flag: PassLocal = this.fresh_init_flag(name);
+        this.binding_initflags[n - 1] = flag;
         return flag;
     }
 
@@ -3078,7 +3121,7 @@ type struct DropInserter {
     attach_member_flags(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef,
                         span: SourceSpan, out: StatementNode*[]*) -> boolean {
         const slot: i64 = this.binding_syms.length - 1;
-        if (!sym.is_valid() || slot < 0 || this.binding_syms[slot] != sym.key()) {
+        if (!sym.is_valid() || slot < 0 || this.binding_syms[slot].key() != sym.key()) {
             return false;
         }
         if (this.is_whole_assigned(sym))    { return false; }
@@ -3106,13 +3149,13 @@ type struct DropInserter {
             // A member that owns nothing needs no flag and no drop; skip it
             // without giving up on the local's other members.
             if (!this.type_needs_drop(mty)) { continue; }
-            const flag: SymbolStr = this.fresh_member_flag_name(name, pstart, plen);
+            const flag: PassLocal = this.fresh_member_flag(name, pstart, plen);
             out.push(this.make_drop_flag_decl(flag, span));
             this.mem_slot.push(slot);
             this.mem_pstart.push(this.mem_proj_kind.length);
             this.mem_plen.push(plen);
             this.mem_type.push(mty);
-            this.mem_flag.push(flag.id);
+            this.mem_flag.push(flag);
             for (mut k: i64 = 0; k < plen; k++) {
                 this.mem_proj_kind.push(this.pw_proj_kind[pstart + k]);
                 this.mem_proj_key.push(this.pw_proj_key[pstart + k]);
@@ -3123,9 +3166,10 @@ type struct DropInserter {
     }
 
     /// Name a member's flag after the path it governs (`p__a__initflag3`), so
-    /// an IR dump names the member rather than only the local.
-    fresh_member_flag_name(mut &this, binding: SymbolStr,
-                           pstart: i64, plen: i64) -> SymbolStr {
+    /// an IR dump names the member rather than only the local.  The flag gets
+    /// a binding of its own.
+    fresh_member_flag(mut &this, binding: SymbolStr,
+                      pstart: i64, plen: i64) -> PassLocal {
         mut named: string = this.intern.resolve(binding);
         for (mut k: i64 = 0; k < plen; k++) {
             if (this.pw_proj_kind[pstart + k] == (0 as u8)) {
@@ -3137,7 +3181,7 @@ type struct DropInserter {
         }
         named = fmt::format("%s__initflag%lld", named, this.initflag_seq);
         this.initflag_seq = this.initflag_seq + 1;
-        return this.intern.intern(named);
+        return this.mint_local(this.intern.intern(named));
     }
 
     /// Index of the member entry describing `expr`, or -1.  Matches the
@@ -3184,11 +3228,10 @@ type struct DropInserter {
     /// Always fresh nodes, never the original place: one AST node reached from
     /// two statements is emitted twice by codegen, which for an indexed place
     /// would evaluate the index twice.
-    build_place_expr(mut &this, base: SymbolStr, base_ty: TypeRef,
+    build_place_expr(mut &this, base: PassLocal, base_ty: TypeRef,
                      kind: &u8[], key: &u32[], start: i64, len: i64,
                      span: SourceSpan) -> ExpressionNode* {
-        const ident: IdentifierNode* = new IdentifierNode(base, span);
-        ident.set_resolved_type(base_ty);
+        const ident: IdentifierNode* = this.local_ident(base, base_ty, span);
         mut cur: ExpressionNode* = ident as ExpressionNode*;
         mut cur_ty: TypeRef = base_ty;
         for (mut k: i64 = 0; k < len; k++) {
@@ -3220,7 +3263,7 @@ type struct DropInserter {
     }
 
     /// Build `<base><chain>.drop();` for member entry `idx`.
-    make_member_drop_call(mut &this, base: SymbolStr, base_ty: TypeRef,
+    make_member_drop_call(mut &this, base: PassLocal, base_ty: TypeRef,
                           idx: i64, span: SourceSpan) -> StatementNode* {
         const place: ExpressionNode* = this.build_place_expr(
             base, base_ty, &this.mem_proj_kind, &this.mem_proj_key,
@@ -3240,14 +3283,14 @@ type struct DropInserter {
     /// skipped for the same reason `append_partial_drops` skips them: the
     /// source no longer owns that storage.
     append_member_drops(mut &this, out: StatementNode*[]*, slot: i64) -> void {
-        const base:    SymbolStr  = SymbolStr::from_id(this.binding_names[slot]);
+        const base:    PassLocal  = this.local_at(slot);
         const base_ty: TypeRef    = this.binding_types[slot];
         const span:    SourceSpan = this.binding_spans[slot];
         for (mut i: i64 = this.mem_slot.length - 1; i >= 0; i--) {
             if (this.mem_slot[i] != slot) { continue; }
             if (this.mem_plen[i] == 1 &&
                 this.mem_proj_kind[this.mem_pstart[i]] == (0 as u8) &&
-                this.pm_has(this.binding_syms[slot],
+                this.pm_has(this.binding_syms[slot].key(),
                             this.mem_proj_key[this.mem_pstart[i]])) {
                 continue;
             }
@@ -3256,8 +3299,7 @@ type struct DropInserter {
             if (drop_stmt == null) { continue; }
             mut core: StatementNode*[] = [];
             core.push(drop_stmt);
-            out.push(this.wrap_in_init_guard(
-                SymbolStr::from_id(this.mem_flag[i]), core, span));
+            out.push(this.wrap_in_init_guard(this.mem_flag[i], core, span));
             this.inserted += 1;
         }
     }
@@ -3773,44 +3815,41 @@ type struct DropInserter {
         this.pw_plen   = keep_plen;
     }
 
-    /// The init flag for the live binding `sym` names, or an invalid SymbolStr
-    /// if that binding has none (unconditionally initialized, Copy, or no such
+    /// The init flag for the live binding `sym` names, or an invalid one if
+    /// that binding has none (unconditionally initialized, Copy, or no such
     /// binding).
-    get_init_flag_for(&this, sym: SymbolID) -> SymbolStr {
+    get_init_flag_for(&this, sym: SymbolID) -> PassLocal {
         const i: i64 = this.slot_of(sym.key());
-        if (i < 0) { return SymbolStr::empty(); }
-        const fid: u32 = this.binding_initflags[i];
-        if (fid == (0 as u32)) { return SymbolStr::empty(); }
-        return SymbolStr::from_id(fid);
+        if (i < 0) { return PassLocal::none(); }
+        return this.binding_initflags[i];
     }
 
     /// If `expr` is a plain assignment whose target is a conditionally-
     /// initialized droppable place, return the flag that records the write:
     /// the local's own init flag for `<ident> = ...`, or the member's flag for
     /// a tracked `<ident>.f = ...` / `<ident>[k] = ...`.  Otherwise an invalid
-    /// SymbolStr.  Compound assigns (`+=`, ...) read the target first, so they
+    /// one.  Compound assigns (`+=`, ...) read the target first, so they
     /// can't be the initializing write.
-    init_flag_for_assignment_target(&this, expr: ExpressionNode*) -> SymbolStr {
-        if (expr == null) { return SymbolStr::empty(); }
-        if (expr.kind != NodeKind::BinaryExpression) { return SymbolStr::empty(); }
+    init_flag_for_assignment_target(&this, expr: ExpressionNode*) -> PassLocal {
+        if (expr == null) { return PassLocal::none(); }
+        if (expr.kind != NodeKind::BinaryExpression) { return PassLocal::none(); }
         const b: BinaryExprNode* = expr as BinaryExprNode*;
-        if (b.op.kind != TokenType::Equal) { return SymbolStr::empty(); }
-        if (b.left == null) { return SymbolStr::empty(); }
+        if (b.op.kind != TokenType::Equal) { return PassLocal::none(); }
+        if (b.left == null) { return PassLocal::none(); }
         if (b.left.kind == NodeKind::Identifier) {
             return this.get_init_flag_for((b.left as IdentifierNode*).res.local_sym());
         }
         const midx: i64 = this.member_slot_for_place(b.left);
-        if (midx < 0) { return SymbolStr::empty(); }
-        return SymbolStr::from_id(this.mem_flag[midx]);
+        if (midx < 0) { return PassLocal::none(); }
+        return this.mem_flag[midx];
     }
 
     /// Wrap the cleanup statements `core` in `if (<flag>) { core... }` so they
     /// run only where the binding was initialized.  Guard polarity is the
     /// inverse of `make_conditional_drop_call` (`if (flag)`, not `if (!flag)`).
-    wrap_in_init_guard(mut &this, flag: SymbolStr, core: &StatementNode*[],
+    wrap_in_init_guard(mut &this, flag: PassLocal, core: &StatementNode*[],
                         span: SourceSpan) -> StatementNode* {
-        const flag_ident: IdentifierNode* = new IdentifierNode(flag, span);
-        flag_ident.set_resolved_type(this.arena.get_bool());
+        const flag_ident: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const body: BlockStmtNode* = new BlockStmtNode(span);
         for (mut i: i64 = 0; i < core.length; i++) {
             body.statements.push(core[i]);
@@ -3845,10 +3884,9 @@ type struct DropInserter {
     /// binding was not moved out.  Negative-polarity twin of
     /// `wrap_in_init_guard`; `make_conditional_drop_call` is the single-drop
     /// special case of this shape.
-    wrap_in_move_guard(mut &this, flag: SymbolStr, core: &StatementNode*[],
+    wrap_in_move_guard(mut &this, flag: PassLocal, core: &StatementNode*[],
                        span: SourceSpan) -> StatementNode* {
-        const flag_ident: IdentifierNode* = new IdentifierNode(flag, span);
-        flag_ident.set_resolved_type(this.arena.get_bool());
+        const flag_ident: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const not_tok: Token = Token::new(TokenType::Exclaim, "!",
             span.start_line as int, span.start_col as int);
         const cond: UnaryExprNode* = new UnaryExprNode(
@@ -3963,10 +4001,9 @@ type struct DropInserter {
     /// after this pass and won't re-run type resolution, so an
     /// unresolved `binding.drop()` would lower to `<unknown>.drop()`
     /// and fail E0156 method lookup.
-    make_drop_call(mut &this, name: SymbolStr, ty: TypeRef,
+    make_drop_call(mut &this, name: PassLocal, ty: TypeRef,
                     span: SourceSpan) -> StatementNode* {
-        const ident: IdentifierNode* = new IdentifierNode(name, span);
-        ident.set_resolved_type(ty);
+        const ident: IdentifierNode* = this.local_ident(name, ty, span);
         const member: MemberAccessNode* = new MemberAccessNode(
             ident as ExpressionNode*, this.drop_sym, span, span);
         const call: CallExprNode* = new CallExprNode(member as ExpressionNode*, span);

@@ -66,6 +66,8 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::res;
 import compiler::resolver::res::{ FamilyOwner };
 import compiler::types::arena::{ TypeArena };
@@ -90,11 +92,11 @@ type struct ExprOps {
     diag:        DiagSink*;
     ctx:         CompilationContext*;
 
-    /// Active variadic-arg name (SymbolStr.id).  Set by the function
-    /// prologue when entering a variadic body so that `codegen_return`
-    /// can emit `@llvm.va_end` before every `ret`.  0 means the current
+    /// The active vararg bucket's binding.  Set by the function prologue
+    /// when entering a variadic body so that `codegen_return` can emit
+    /// `@llvm.va_end` before every `ret`.  Invalid when the current
     /// function is not variadic.
-    current_variadic_arg_id: u32;
+    variadic_args: SymbolID;
 
     /// Transient `invoke` swap state, armed by CallEmitter around a single
     /// `codegen_call` when the current frame has live droppable locals under
@@ -145,7 +147,7 @@ type struct ExprOps {
             intrinsics:  null,
             diag:        null,
             ctx:         null,
-            current_variadic_arg_id: 0,
+            variadic_args: SymbolID::invalid(),
             invoke_active: false,
             invoke_normal: LBasicBlock::null(),
             invoke_lpad:   LBasicBlock::null(),
@@ -519,7 +521,7 @@ type struct ExprOps {
     /// function are unexpectedly null (both indicate a codegen-ordering
     /// bug, so we point the user at the declaration that tripped the
     /// check).
-    codegen_local_var(mut &this, name: SymbolStr,
+    codegen_local_var(mut &this, name: SymbolStr, sym: SymbolID,
                       ty: TypeRef, init_val: LValue,
                       has_init: boolean,
                       site_span: SourceSpan,
@@ -588,9 +590,9 @@ type struct ExprOps {
         // reads the flag can execute in an enclosing scope, after the block
         // that declared it has popped (the alloca itself is function-scoped).
         if (persistent_name) {
-            this.values.set_persistent(name, alloca);
+            this.values.set_persistent(sym, alloca);
         } else {
-            this.values.set(name, alloca);
+            this.values.set(sym, alloca);
         }
     }
 
@@ -2516,9 +2518,10 @@ type struct ExprOps {
     /// every variadic read lands one indirection off - on Win64 only, silently,
     /// with an exit code of 0.  The `vprintf`/`vfprintf` intrinsic lowerings
     /// bypass this by consulting the seam themselves.
-    emit_va_start_for_variadic(mut &this, fn_val: LValue, args_name: SymbolStr) -> void {
-        if (!args_name.is_valid()) {
-            this.current_variadic_arg_id = 0;
+    emit_va_start_for_variadic(mut &this, fn_val: LValue, args_name: SymbolStr,
+                               args_sym: SymbolID) -> void {
+        if (!args_sym.is_valid()) {
+            this.variadic_args = SymbolID::invalid();
             return;
         }
         const va_list_ty: LType = this.abi.va_list_alloca_type();
@@ -2530,16 +2533,16 @@ type struct ExprOps {
         sargs.push(Pair::<LValue, TypeRef>::new(va_list_alloca, TypeRef::invalid()));
         mut _result: LValue = LValue::null();
         _result = this.codegen_call(va_start_fn, va_start_ty, sargs, Text::new(""));
-        this.values.set(args_name, va_list_alloca);
-        this.current_variadic_arg_id = args_name.id;
+        this.values.set(args_sym, va_list_alloca);
+        this.variadic_args = args_sym;
     }
 
-    /// Emit va_end on the va_list alloca bound to `args_name`, if that
-    /// binding exists.  Called immediately before every terminating
+    /// Emit va_end on the va_list alloca bound to the active vararg bucket,
+    /// if there is one.  Called immediately before every terminating
     /// return so the va_list is properly cleaned up on every exit path.
-    emit_va_end_if_variadic(mut &this, args_name: SymbolStr) -> void {
-        if (!args_name.is_valid()) { return; }
-        const va_list_alloca: LValue = this.values.get(args_name);
+    emit_va_end_if_variadic(mut &this) -> void {
+        if (!this.variadic_args.is_valid()) { return; }
+        const va_list_alloca: LValue = this.values.get(this.variadic_args);
         if (!va_list_alloca.is_valid()) { return; }
         const va_end_fn: LValue = this.declare_va_end();
         const va_end_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(va_end_fn.raw) };
@@ -2547,14 +2550,6 @@ type struct ExprOps {
         args.push(Pair::<LValue, TypeRef>::new(va_list_alloca, TypeRef::invalid()));
         mut _result: LValue = LValue::null();
         _result = this.codegen_call(va_end_fn, va_end_ty, args, Text::new(""));
-    }
-
-    /// Look up the active variadic arg's SymbolStr from `this`.  Returns
-    /// an empty SymbolStr if the current function is not variadic.
-    current_variadic_arg(mut &this) -> SymbolStr {
-        const id: u32 = this.current_variadic_arg_id;
-        if (id == 0) { return SymbolStr::empty(); }
-        return SymbolStr::from_id(id);
     }
 
 
@@ -2595,7 +2590,7 @@ type struct ExprOps {
                                 sret_pointee, val, Text::new("sret.load"));
                         }
                         this.builder.build_store(store_val, sret_ptr);
-                        this.emit_va_end_if_variadic(this.current_variadic_arg());
+                        this.emit_va_end_if_variadic();
                         this.builder.build_ret_void();
                         return;
                     }
@@ -2604,7 +2599,7 @@ type struct ExprOps {
                     if (LType::kind_of(fn_ty_raw) == LTypeKind::Function) {
                         const ret_ty_raw: void* = llvm::LLVMGetReturnType(fn_ty_raw);
                         if (LType::kind_of(ret_ty_raw) == LTypeKind::Void) {
-                            this.emit_va_end_if_variadic(this.current_variadic_arg());
+                            this.emit_va_end_if_variadic();
                             this.builder.build_ret_void();
                             return;
                         }
@@ -2639,7 +2634,7 @@ type struct ExprOps {
                                 const ret_lty: LType = LType { raw: ret_ty_raw };
                                 const coerced_v: LValue = this.builder.build_load(
                                     ret_lty, slot, Text::new("ret.coerce.val"));
-                                this.emit_va_end_if_variadic(this.current_variadic_arg());
+                                this.emit_va_end_if_variadic();
                                 this.builder.build_ret(coerced_v);
                                 return;
                             }
@@ -2652,10 +2647,10 @@ type struct ExprOps {
             // (stdlib uses this in `align_up`/`align_down`) and narrower
             // integer returns.
             const coerced: LValue = this.coerce_return_value(val, src_ty);
-            this.emit_va_end_if_variadic(this.current_variadic_arg());
+            this.emit_va_end_if_variadic();
             this.builder.build_ret(coerced);
         } else if (!has_value) {
-            this.emit_va_end_if_variadic(this.current_variadic_arg());
+            this.emit_va_end_if_variadic();
             this.builder.build_ret_void();
         }
         // If has_value but val is null, expression codegen failed.

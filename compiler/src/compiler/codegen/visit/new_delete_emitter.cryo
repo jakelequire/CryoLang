@@ -52,8 +52,10 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, FamilyOwner };
+import compiler::resolver::res::{ DefId, FamilyOwner, Res };
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType };
@@ -515,10 +517,12 @@ type struct NewDeleteEmitter {
             const slot: LValue = this.cg.flow.temp_slot(slot_ty, Text::new("delete.recv"));
             this.cg.builder.build_store(ptr, slot);
             const recv_sym: SymbolStr = intern_ptr.intern("$delete.recv");
-            this.cg.values.set_raw(recv_sym.id, slot.raw);
+            const recv_bind: SymbolID = this.cg.ctx.resolver.alloc_synthetic_binding();
+            this.cg.values.bind_transient(recv_bind, slot);
 
             const drop_sym: SymbolStr = intern_ptr.intern("drop");
             mut recv: IdentifierNode* = new IdentifierNode(recv_sym, node.span);
+            recv.set_res(Res::Local(recv_bind));
             recv.set_resolved_type(node.operand.resolved_type);
             mut member: MemberAccessNode* = new MemberAccessNode(
                 recv as ExpressionNode*, drop_sym, node.span, node.span);
@@ -530,7 +534,7 @@ type struct NewDeleteEmitter {
                 call as ExpressionNode*, node.span);
             stmt.accept(visitor);
 
-            this.cg.values.remove_raw(recv_sym.id);
+            this.cg.values.remove(recv_bind);
         }
 
         // Free through the canonical `GlobalAlloc` (via `free`):

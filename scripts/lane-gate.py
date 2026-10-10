@@ -587,8 +587,6 @@ SCANNED_ARRAYS = {
                                           "the resolver's rib: the ids of the names one scope binds ambiguously"),
     "Scope.overloads":            Scanned("compiler/resolver/resolver.cryo", "Pair", DATA,
                                           "the resolver's rib: one scope's overloaded bindings by name id"),
-    "ValueTable.persistent_keys": Scanned("compiler/codegen/state/value_table.cryo", "SymbolStr", DATA,
-                                          "codegen's own rib: the bindings whose values persist across a scope, by name id"),
     "StringCache.entries":        Scanned("compiler/codegen/state/string_cache.cryo", "Pair", DATA,
                                           "codegen's string constants by their TEXT"),
     "ModuleLoader.loading":       Scanned("compiler/module_loader.cryo", "Pair", DATA,

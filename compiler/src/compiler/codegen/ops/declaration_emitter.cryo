@@ -72,6 +72,8 @@ import compiler::codegen::util::{ CodegenUtil, VTableSlot };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ FunctionType };
@@ -1774,7 +1776,7 @@ type struct DeclarationEmitter {
                 const arg: LValue = LValue {
                     raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx),
                 };
-                this.values.set(param.name, arg);
+                this.values.set(param.sym_id, arg);
                 llvm_idx += 1;
                 continue;
             }
@@ -1810,7 +1812,7 @@ type struct DeclarationEmitter {
                     i8_ty, alloca, idx_buf, 1, Text::new("param.hi.ptr"));
                 libc::free(idx_buf);
                 this.builder.build_store(hi_arg, hi_ptr);
-                this.values.set(param.name, alloca);
+                this.values.set(param.sym_id, alloca);
                 llvm_idx += 2;
                 continue;
             }
@@ -1820,7 +1822,7 @@ type struct DeclarationEmitter {
                 raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx),
             };
             this.builder.build_store(arg, alloca);
-            this.values.set(param.name, alloca);
+            this.values.set(param.sym_id, alloca);
             llvm_idx += 1;
         }
 
@@ -1829,7 +1831,12 @@ type struct DeclarationEmitter {
         // a v* variant (vsprintf, vfprintf, etc.).  Without this the `args`
         // identifier has no LLVM value and every forwarding call codegens
         // with a null operand.
-        this.expr_ops.emit_va_start_for_variadic(fn_val, CodegenUtil::variadic_param_name(node));
+        const va_param: VarDeclNode* = CodegenUtil::variadic_param(node);
+        if (va_param != null) {
+            this.expr_ops.emit_va_start_for_variadic(fn_val, va_param.name, va_param.sym_id);
+        } else {
+            this.expr_ops.emit_va_start_for_variadic(fn_val, SymbolStr::empty(), SymbolID::invalid());
+        }
 
         // Program-main prologue: publish argc/argv to the standard library
         // before the user's body runs, so `std::env::args()` returns the
@@ -2006,10 +2013,10 @@ type struct DeclarationEmitter {
                 is_never = t != null && t.kind == TypeKind::Never;
             }
             if (is_void) {
-                this.expr_ops.emit_va_end_if_variadic(CodegenUtil::variadic_param_name(node));
+                this.expr_ops.emit_va_end_if_variadic();
                 this.builder.build_ret_void();
             } else if (is_never) {
-                this.expr_ops.emit_va_end_if_variadic(CodegenUtil::variadic_param_name(node));
+                this.expr_ops.emit_va_end_if_variadic();
                 this.builder.build_unreachable();
             }
             // Other non-void: intentionally leave unterminated. The caller
@@ -2114,7 +2121,7 @@ type struct DeclarationEmitter {
         //   `this`               : semantically a by-value T
         //   `this: T*`           : a user-typed receiver
         // The LLVM parameter layout depends on which case we're in; matches the
-        // logic in declare_method so named_values and LLVM params line up.
+        // logic in declare_method so the value table and LLVM params line up.
         mut explicit_ref_idx: i64 = -1;    // parameters[i] is "&this"
         mut explicit_val_idx: i64 = -1;    // parameters[i] is bare "this" (by-value self)
         mut explicit_typed_idx: i64 = -1;  // parameters[i] is "this: T*" (user-typed self)
@@ -2151,7 +2158,16 @@ type struct DeclarationEmitter {
                 return LValue::null();
             }
 
-            const this_sym: SymbolStr = this.intern_str("this");
+            // The receiver's binding is its parameter's, which every use of
+            // `this` in the body is stamped with.
+            mut recv_idx: i64 = explicit_ref_idx;
+            if (recv_idx < 0) { recv_idx = explicit_val_idx; }
+            if (recv_idx < 0) { recv_idx = explicit_typed_idx; }
+            const this_bind: SymbolID = if (recv_idx >= 0) {
+                func.parameters[recv_idx].sym_id
+            } else {
+                SymbolID::invalid()
+            };
             // LLVM index for the receiver is `sret_off` (0 normally, 1 when sret).
             const arg0: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, sret_off) };
 
@@ -2182,7 +2198,7 @@ type struct DeclarationEmitter {
                 if (recv_byval_pointee.is_valid()) {
                     // byval: the LLVM param IS a pointer to the receiver struct;
                     // bind it directly (copy semantics already handled by the ABI).
-                    this.values.set(this_sym, arg0);
+                    this.values.set(this_bind, arg0);
                     recv_slots = 1;
                 } else {
                     const recv_plan: ParamPlan = this.abi.classify_param(target_ref);
@@ -2204,13 +2220,13 @@ type struct DeclarationEmitter {
                             i8_ty, slot, idx_buf, 1, Text::new("this.hi.ptr"));
                         libc::free(idx_buf);
                         this.builder.build_store(hi_arg, hi_ptr);
-                        this.values.set(this_sym, slot);
+                        this.values.set(this_bind, slot);
                         recv_slots = 2;
                     } else {
                         const slot: LValue = this.flow.create_entry_alloca(
                             fn_val, Text::new("this"), target_mapped);
                         this.builder.build_store(arg0, slot);
-                        this.values.set(this_sym, slot);
+                        this.values.set(this_bind, slot);
                         recv_slots = 1;
                     }
                 }
@@ -2218,11 +2234,11 @@ type struct DeclarationEmitter {
                 // User-typed `this: T*`: LLVM param 0 is whatever the
                 // annotation resolves to (typically a ptr).  Bind `this`
                 // directly to that value, same as the `&this` path.
-                this.values.set(this_sym, arg0);
+                this.values.set(this_bind, arg0);
             } else {
                 // `&this`: LLVM param 0 is already a ptr.
-                // Store the raw pointer directly in named_values (no alloca).
-                this.values.set(this_sym, arg0);
+                // Store the raw pointer directly in the value table (no alloca).
+                this.values.set(this_bind, arg0);
             }
 
             param_idx = recv_slots + sret_off;
@@ -2259,7 +2275,7 @@ type struct DeclarationEmitter {
                 this.abi.byval_pointee_of_param(fn_val, param_idx);
             if (byval_pointee_m.is_valid()) {
                 const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };
-                this.values.set(param.name, arg);
+                this.values.set(param.sym_id, arg);
                 param_idx += 1;
                 continue;
             }
@@ -2288,7 +2304,7 @@ type struct DeclarationEmitter {
                     i8_ty, alloca, idx_buf, 1, Text::new("param.hi.ptr"));
                 libc::free(idx_buf);
                 this.builder.build_store(hi_arg, hi_ptr);
-                this.values.set(param.name, alloca);
+                this.values.set(param.sym_id, alloca);
                 param_idx += 2;
                 continue;
             }
@@ -2296,7 +2312,7 @@ type struct DeclarationEmitter {
             const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };
             const alloca: LValue = this.flow.create_entry_alloca(fn_val, Text::new(param_name), param_ty);
             this.builder.build_store(arg, alloca);
-            this.values.set(param.name, alloca);
+            this.values.set(param.sym_id, alloca);
             param_idx += 1;
         }
 

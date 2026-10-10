@@ -65,8 +65,10 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::res;
-import compiler::resolver::res::{ FamilyOwner, ResSlot };
+import compiler::resolver::res::{ FamilyOwner, Res, ResSlot };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
     ArrayType, FunctionType, PointerType, ReferenceType, TupleType
@@ -375,9 +377,9 @@ type struct CallEmitter {
                 }
             }
 
-            // 4. Function-typed parameter: look in named_values (local scope).
-            //    If the identifier refers to a parameter of function type,
-            //    it will be stored as an alloca in named_values.  Load the
+            // 4. Function-typed parameter: look in the value table, by the
+            //    binding the identifier is stamped with.  A parameter of
+            //    function type is stored there as an alloca.  Load the
             //    function pointer and call through it.
             //    We must handle the call here because the loaded value is an
             //    instruction, not a GlobalValue; LLVMGlobalGetValueType
@@ -385,7 +387,7 @@ type struct CallEmitter {
             //    A module's global of function type is called the same way,
             //    through its storage, which the stamp names.
             if (!callee_val.is_valid()) {
-                mut local: LValue = this.cg.values.get(id.name);
+                mut local: LValue = this.cg.values.get(id.res.local_sym());
                 if (!local.is_valid()) {
                     match (id.res) {
                         ResSlot::Answered(r) => {
@@ -976,8 +978,10 @@ type struct CallEmitter {
         const intern: InternTable* = this.cg.get_intern();
         const nm: SymbolStr = intern.intern(fmt::format("__argtemp_%d", this.glue_seq));
         this.glue_seq = this.glue_seq + 1;
-        this.cg.values.set(nm, slot);
+        const nm_sym: SymbolID = this.cg.ctx.resolver.alloc_synthetic_binding();
+        this.cg.values.set(nm_sym, slot);
         mut id_node: IdentifierNode* = new IdentifierNode(nm, span);
+        id_node.set_res(Res::Local(nm_sym));
         id_node.set_resolved_type(ty);
         const drop_sym: SymbolStr = intern.intern("drop");
         mut da: MemberAccessNode* = new MemberAccessNode(
@@ -1577,8 +1581,10 @@ type struct CallEmitter {
                     const nm: SymbolStr = intern.intern(
                         fmt::format("__glue_payload_%d", this.glue_seq));
                     this.glue_seq = this.glue_seq + 1;
-                    this.cg.values.set(nm, field_ptr);
+                    const nm_sym: SymbolID = this.cg.ctx.resolver.alloc_synthetic_binding();
+                    this.cg.values.set(nm_sym, field_ptr);
                     mut id_node: IdentifierNode* = new IdentifierNode(nm, receiver.span);
+                    id_node.set_res(Res::Local(nm_sym));
                     id_node.set_resolved_type(pt);
                     mut da: MemberAccessNode* = new MemberAccessNode(
                         id_node as ExpressionNode*, drop_sym, receiver.span, receiver.span);
