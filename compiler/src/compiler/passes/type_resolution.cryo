@@ -1005,6 +1005,41 @@ type struct TypeResolutionPasses {
         if (stmt == null) { return; }
         const arena: TypeArena* = ctx.type_arena;
 
+        // A generic type's own methods, under the template.
+        if (is_source_decl) {
+            match (stmt.kind) {
+                NodeKind::StructDeclaration => {
+                    const node: StructDeclNode* = stmt as StructDeclNode*;
+                    if (ctx.generic_registry.template_of(node.def) != null) {
+                        ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
+                    }
+                }
+                NodeKind::UnionDeclaration => {
+                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
+                    if (ctx.generic_registry.template_of(node.def) != null) {
+                        ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
+                    }
+                }
+                NodeKind::ClassDeclaration => {
+                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                    if (ctx.generic_registry.template_of(node.def) != null) {
+                        ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
+                    }
+                }
+                NodeKind::ImplementationBlock => {
+                    const node: ImplBlockNode* = stmt as ImplBlockNode*;
+                    const owner: DefId = match (node.res) {
+                        ResSlot::Answered(r) => { r.def_id() }
+                        _                    => { DefId::invalid() }
+                    };
+                    if (owner.is_valid() && ctx.generic_registry.template_of(owner) != null) {
+                        ctx.decl_index.register_template_methods(owner, &node.methods, arena);
+                    }
+                }
+                _ => { }
+            }
+        }
+
         match (stmt.kind) {
             NodeKind::StructDeclaration => {
                 const node: StructDeclNode* = stmt as StructDeclNode*;
@@ -1689,10 +1724,12 @@ type struct TypeResolutionPasses {
             // minted again from the leaf.
             if (tfunc.async_fut_slot != slot) { continue; }
             // The impl overrides it with its own `async` method...
+            // (its position among the trait's methods, by the trait-method door)
+            const item: i64 = ctx.generic_registry.trait_item_slot(trait_decl.def, tfunc.name);
             for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
                 const m: MethodNode* = impl_node.methods[mi];
                 if (m == null || m.func == null) { continue; }
-                if (m.func.name.equals(tfunc.name) && m.func.is_async) { return true; }
+                if (item >= 0 && ctx.generic_registry.trait_item_slot(trait_decl.def, m.func.name) == item && m.func.is_async) { return true; }
             }
             // ...or inherits the trait's default body, which
             // `synthesize_default_trait_methods` clones in as an `async` method.

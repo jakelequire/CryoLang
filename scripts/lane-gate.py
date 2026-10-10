@@ -541,8 +541,6 @@ SCANNED_ARRAYS = {
                                           "a trait's associated types by leaf off the trait node in hand (the `assoc-type` door's body)"),
     "TraitDeclNode.methods":      Scanned("compiler/AST/declaration.cryo", "FunctionDeclNode", TABLE,
                                           "a trait's methods by leaf off the trait node in hand"),
-    "ImplBlockNode.methods":      Scanned("compiler/AST/declaration.cryo", "MethodNode", TABLE,
-                                          "an impl's methods by leaf off the impl node in hand"),
     "StructDeclNode.fields":      Scanned("compiler/AST/declaration.cryo", "FieldDeclNode", TABLE,
                                           "a struct declaration's fields by leaf off the node in hand"),
     "UnionDeclNode.fields":       Scanned("compiler/AST/declaration.cryo", "FieldDeclNode", TABLE,
@@ -570,8 +568,6 @@ SCANNED_ARRAYS = {
     #    and scanned; the owner is out of view, the element says what it is --
     "local.MethodNode":           Scanned(None, "MethodNode", TABLE,
                                           "an impl's or a declaration's methods, held in a local, by leaf"),
-    "local.MethodInfo":           Scanned(None, "MethodInfo", TABLE,
-                                          "an arena type's methods, held in a local, by leaf"),
     "local.FieldInfo":            Scanned(None, "FieldInfo", TABLE,
                                           "a struct's or class's fields, held by reference in a local, by leaf"),
     "local.GenericParamNode":     Scanned(None, "GenericParamNode", TABLE,

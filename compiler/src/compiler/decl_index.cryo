@@ -456,12 +456,15 @@ public:
     /// `Def`'s own, a `Type`'s the definition it was registered as - so a
     /// caller hands over the owner it holds and never composes a key.  Keyed
     /// by the definition's slot, one above it so the root (no definition)
-    /// keeps its own: two owners written under one path are two owners.  0,
-    /// which no family is stored under, for a type this index never
-    /// registered: it owns no family here.
+    /// keeps its own: two owners written under one path are two owners.  A
+    /// template's own families carry the top bit of the definition's half,
+    /// so they never meet the definition's `Def` families.  0, which no
+    /// family is stored under, for a type this index never registered: it
+    /// owns no family here.
 private:
     ![allow(lookup_by_spelling, reason = "a family is a member leaf asked of an owner identity, the member-function door's own key")]
     family_slot(&this, owner: FamilyOwner, leaf: SymbolStr) -> FamilySlot {
+        mut template: boolean = false;
         const d: DefId = match (owner) {
             FamilyOwner::Def(od) => { od }
             FamilyOwner::Type(t) => {
@@ -469,8 +472,14 @@ private:
                 if (!td.is_valid()) { return FamilySlot::none(); }
                 td
             }
+            FamilyOwner::Template(td) => {
+                if (!td.is_valid()) { return FamilySlot::none(); }
+                template = true;
+                td
+            }
         };
-        const at: u64 = if (d.is_valid()) { (this.defs.slot(d) as u64) + 1 } else { 0 };
+        mut at: u64 = if (d.is_valid()) { (this.defs.slot(d) as u64) + 1 } else { 0 };
+        if (template) { at = at | 2147483648; }
         return FamilySlot { packed: (at << 32) | (leaf.id as u64) };
     }
 
@@ -481,7 +490,7 @@ public:
     /// diagnostic that spells the family.  Never a key.
     family_owner_path(&this, owner: FamilyOwner) -> DeclName {
         return match (owner) {
-            FamilyOwner::Def(d)  => { this.defs.path_of(d) }
+            FamilyOwner::Def(d) | FamilyOwner::Template(d) => { this.defs.path_of(d) }
             FamilyOwner::Type(t) => { this.defs.path_of(this.registered_def(t)) }
         };
     }
@@ -1187,6 +1196,77 @@ public:
         }
     }
 
+    /// Register a generic type's own methods - written in its declaration or
+    /// in an implement block for it - in families owned by the template's
+    /// definition `template`, so the member-function door answers a member
+    /// asked of the template: inside the generic body, where the receiver is
+    /// the body's own unminted instantiation.  An instance's methods are
+    /// registered on the instance when it is minted; these entries are the
+    /// declarations, with their signatures in the template's parameters, no
+    /// linker symbol, and no definition kept for them, so nothing emits or
+    /// calls them.  Two methods of one signature (an inherent method and a
+    /// trait's, or two traits') are two entries: an entry is its method, and
+    /// registering a method again answers the entry it already has.
+    register_template_methods(mut &this, template: DefId, methods: &MethodNode*[],
+                              arena: TypeArena*) -> void {
+        if (!template.is_valid()) { return; }
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+            const func: FunctionDeclNode* = method.func;
+            if (DeclarationIndex::signature_is_refused(func)) { continue; }
+            const slot: FamilySlot = this.family_slot(FamilyOwner::Template(template), func.name);
+            if (slot.is_none()) { continue; }
+            mut registered: boolean = false;
+            match (this.overload_index.get_ref(&slot)) {
+                Option::Some(positions) => {
+                    for (mut k: i64 = 0; k < (*positions).length; k++) {
+                        if (this.overload_func_decl[(*positions)[k] as i64] == method as ASTNode*) { registered = true; }
+                    }
+                }
+                Option::None => { }
+            }
+            if (registered) { continue; }
+            mut param_types: TypeRef[] = [];
+            for (mut p: i64 = 0; p < func.parameters.length; p++) {
+                const param: VarDeclNode* = func.parameters[p];
+                if (param != null && param.resolved_type.is_valid()) { param_types.push(param.resolved_type); }
+            }
+            const func_type_ref: TypeRef = if (func.resolved_return_type.is_valid()) {
+                arena.get_function(func.resolved_return_type, param_types, func.is_variadic)
+            } else {
+                TypeRef::invalid()
+            };
+            const id: OverloadId = this.file_entry(slot, func_type_ref, func.resolved_return_type,
+                SymbolStr::empty(), func.origin_trait,
+                if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*);
+            const positions: u32[]* = this.overload_index.get_or_insert(slot, []);
+            (*positions).push(this.slot_of(id) as u32);
+        }
+    }
+
+    /// Whether `m` is one of `set`, by identity.
+    static holds_method(set: &MethodNode*[], m: MethodNode*) -> boolean {
+        if (m == null) { return false; }
+        for (mut i: i64 = 0; i < set.length; i++) {
+            if (set[i] == m) { return true; }
+        }
+        return false;
+    }
+
+    /// The methods of the family `(owner, leaf)`, in registration order: the
+    /// member-function door's entries, each read back as the method it was
+    /// registered for.  An entry registered for a free function is not one.
+    methods_named(&this, owner: FamilyOwner, leaf: SymbolStr) -> MethodNode*[] {
+        const entries: OverloadId[] = this.lookup_family_entries(owner, leaf);
+        mut out: MethodNode*[] = [];
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const m: MethodNode* = this.entry_method(entries[i]);
+            if (m != null) { out.push(m); }
+        }
+        return out;
+    }
+
 
     // Lookups (called by Sema and future passes)
 
@@ -1265,6 +1345,24 @@ public:
                 }
             }
             _ => { node.spec_owner }
+        };
+    }
+
+    /// The owner implement block `node` is for: the definition its head
+    /// names, a type's or a primitive's (a template's, whose methods are kept
+    /// under `FamilyOwner::Template` of it, is the caller's to tell apart),
+    /// or, for a specialization's clone, which names none, the instantiation
+    /// it was placed on.
+    impl_family_owner(&this, node: ImplBlockNode*) -> FamilyOwner {
+        return match (node.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(q)    => { FamilyOwner::Def(q) }
+                    Res::PrimTy(n) => { FamilyOwner::Def(this.defs.primitive(n)) }
+                    _              => { FamilyOwner::Def(DefId::invalid()) }
+                }
+            }
+            _ => { FamilyOwner::Type(node.spec_owner) }
         };
     }
 

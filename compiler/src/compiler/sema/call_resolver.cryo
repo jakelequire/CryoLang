@@ -425,23 +425,24 @@ type struct CallResolver {
         if (base_t == null) { return []; }
 
         mut found: MethodInfo*[] = [];
+        const named: MethodNode*[] = this.ctx.decl_index.methods_named(FamilyOwner::Type(base_ref), member.member);
         if (base_t.kind == TypeKind::Class) {
             const ct: ClassType* = base_t as ClassType*;
             for (mut i: i64 = 0; i < ct.methods.length; i++) {
                 const m: MethodInfo* = &ct.methods[i];
-                if (m.name.equals(member.member) && m.param_types.length == arg_count) { found.push(m); }
+                if (DeclarationIndex::holds_method(&named, m.ast_node as MethodNode*) && m.param_types.length == arg_count) { found.push(m); }
             }
         } else if (base_t.kind == TypeKind::Struct) {
             const st: StructType* = base_t as StructType*;
             for (mut i: i64 = 0; i < st.methods.length; i++) {
                 const m: MethodInfo* = &st.methods[i];
-                if (m.name.equals(member.member) && m.param_types.length == arg_count) { found.push(m); }
+                if (DeclarationIndex::holds_method(&named, m.ast_node as MethodNode*) && m.param_types.length == arg_count) { found.push(m); }
             }
         } else if (base_t.kind == TypeKind::Enum) {
             const et: EnumType* = base_t as EnumType*;
             for (mut i: i64 = 0; i < et.methods.length; i++) {
                 const m: MethodInfo* = &et.methods[i];
-                if (m.name.equals(member.member) && m.param_types.length == arg_count) { found.push(m); }
+                if (DeclarationIndex::holds_method(&named, m.ast_node as MethodNode*) && m.param_types.length == arg_count) { found.push(m); }
             }
         } else if (base_t.kind == TypeKind::GenericParam) {
             // A parameter bounded by a WHERE clause rather than inline stays a
@@ -2866,11 +2867,13 @@ type struct CallResolver {
             if (pass == 2 && found) { break; }
             mut walk: ClassType* = start_cls;
             mut cur: &MethodInfo[] = methods_ref;
+            mut cur_owner: TypeRef = base_ref;
             mut depth: i32 = 0;
             while (depth < 16) {
+                const named: MethodNode*[] = this.ctx.decl_index.methods_named(FamilyOwner::Type(cur_owner), member.member);
                 for (mut mi: i64 = 0; mi < cur.length; mi++) {
                     const m: &MethodInfo = &cur[mi];
-                    if (!m.name.equals(member.member)) { continue; }
+                    if (!DeclarationIndex::holds_method(&named, m.ast_node as MethodNode*)) { continue; }
                     const m_origin: DefId = this.method_origin_trait(m);
                     if (pass == 1 && m_origin.is_valid()) { continue; }
                     if (pass == 2 && !m_origin.is_valid()) { continue; }
@@ -2914,6 +2917,7 @@ type struct CallResolver {
                 if (!walk.has_base || !walk.base_class.is_valid()) { break; }
                 const parent_t: Type* = this.arena.lookup(walk.base_class);
                 if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+                cur_owner = walk.base_class;
                 walk = parent_t as ClassType*;
                 cur = &walk.methods;
                 depth += 1;
@@ -2932,11 +2936,12 @@ type struct CallResolver {
                 for (mut ti: i64 = 0; ti < blocks.length; ti++) {
                     if (ambiguous || trait_ambiguous) { break; }
                     const block: ImplBlockNode* = blocks[ti];
+                    const block_named: MethodNode*[] = this.block_methods_named(block, member.member);
                     for (mut bmi: i64 = 0; bmi < block.methods.length; bmi++) {
                         const mn: MethodNode* = block.methods[bmi];
                         if (mn == null || mn.func == null) { continue; }
                         const fn_node: FunctionDeclNode* = mn.func;
-                        if (!fn_node.name.equals(member.member)) { continue; }
+                        if (!DeclarationIndex::holds_method(&block_named, mn)) { continue; }
                         if (fn_node.is_variadic) { variadic_ok = true; continue; }
                         mut tparams: TypeRef[] = [];
                         for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
@@ -4270,7 +4275,7 @@ type struct CallResolver {
         // which of the two it is asked for, so the order two `implement`
         // blocks were written in does not decide which body a call runs.
         mut own_tier: i32 = 0;
-        const own: MethodInfo* = this.pick_own_method(call, member, start_cls, methods_ref,
+        const own: MethodInfo* = this.pick_own_method(call, member, base_ref, start_cls, methods_ref,
                                    arg_types, only_trait, from_trait, generic, &own_tier);
         if (own != null) {
             this.choose_method(own.ast_node as MethodNode*, own_tier, own, sel, null);
@@ -4311,7 +4316,7 @@ type struct CallResolver {
     /// a trait impl delivers, or the inherent ones.  With `only_trait`, only
     /// that trait's methods are candidates; `generic` takes the generic
     /// methods, the others otherwise.  Writes the tier it bound at.
-    pick_own_method(mut &this, call: CallExprNode*, member: MemberAccessNode*,
+    pick_own_method(mut &this, call: CallExprNode*, member: MemberAccessNode*, owner: TypeRef,
                     start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
                     arg_types: &TypeRef[], only_trait: DefId, from_trait: boolean, generic: boolean,
                     out_tier: i32*) -> MethodInfo* {
@@ -4320,10 +4325,12 @@ type struct CallResolver {
             mut walk: ClassType* = start_cls;
             mut depth: i32 = 0;
             mut cur_methods: Slice<MethodInfo> = methods_ref;
+            mut cur_owner: TypeRef = owner;
             while (depth < 16) {
+                const named: MethodNode*[] = this.ctx.decl_index.methods_named(FamilyOwner::Type(cur_owner), member.member);
                 for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
                     const m: MethodInfo* = cur_methods.get_ref(mi).unwrap();
-                    if (!m.name.equals(member.member)) { continue; }
+                    if (!DeclarationIndex::holds_method(&named, m.ast_node as MethodNode*)) { continue; }
                     if (this.method_origin_trait(m).is_valid() != from_trait) { continue; }
                     if (only_trait.is_valid() && !this.method_provided_by(m.ast_node as MethodNode*, only_trait)) { continue; }
                     const mfn: FunctionDeclNode* = if (m.ast_node != null) { (m.ast_node as MethodNode*).func } else { null };
@@ -4337,6 +4344,7 @@ type struct CallResolver {
                 if (!walk.has_base || !walk.base_class.is_valid()) { break; }
                 const parent_t: Type* = this.arena.lookup(walk.base_class);
                 if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+                cur_owner = walk.base_class;
                 walk = parent_t as ClassType*;
                 cur_methods = walk.methods.as_slice();
                 depth += 1;
@@ -4369,14 +4377,15 @@ type struct CallResolver {
             const args: TypeRef[] = this.inst_args(sel.owner_inst);
             mut view: TypeSubstitution = TypeSubstitution::from_params(&tmpl.param_types, &args);
             const decl: ASTNode* = tmpl.ast_node;
+            const named: MethodNode*[] = this.ctx.decl_index.methods_named(FamilyOwner::Template(tmpl.def), member.member);
             if (decl != null && decl.kind == NodeKind::StructDeclaration) {
-                if (this.bind_on_methods(visitor, call, member, &(decl as StructDeclNode*).methods,
+                if (this.bind_on_methods(visitor, call, member, &(decl as StructDeclNode*).methods, &named,
                         arg_types, generic, sel, &view)) { return true; }
             } else if (decl != null && decl.kind == NodeKind::UnionDeclaration) {
-                if (this.bind_on_methods(visitor, call, member, &(decl as UnionDeclNode*).methods,
+                if (this.bind_on_methods(visitor, call, member, &(decl as UnionDeclNode*).methods, &named,
                         arg_types, generic, sel, &view)) { return true; }
             } else if (decl != null && decl.kind == NodeKind::ClassDeclaration) {
-                if (this.bind_on_methods(visitor, call, member, &(decl as ClassDeclNode*).methods,
+                if (this.bind_on_methods(visitor, call, member, &(decl as ClassDeclNode*).methods, &named,
                         arg_types, generic, sel, &view)) { return true; }
             }
             for (mut bi: i64 = 0; bi < tmpl.impl_blocks.length; bi++) {
@@ -4405,13 +4414,28 @@ type struct CallResolver {
                        block: ImplBlockNode*, arg_types: &TypeRef[],
                        generic: boolean, sel: Selection*) -> boolean {
         if (block == null) { return false; }
+        const named: MethodNode*[] = this.block_methods_named(block, member.member);
         if (!sel.owner_inst.is_valid()) {
-            return this.bind_on_methods(visitor, call, member, &block.methods, arg_types,
+            return this.bind_on_methods(visitor, call, member, &block.methods, &named, arg_types,
                                         generic, sel, null);
         }
         mut view: TypeSubstitution = this.impl_view(block, sel.owner_inst);
-        return this.bind_on_methods(visitor, call, member, &block.methods, arg_types,
+        return this.bind_on_methods(visitor, call, member, &block.methods, &named, arg_types,
                                     generic, sel, &view);
+    }
+
+    /// The methods implement block `block` holds under `leaf`: a trait
+    /// implementation's by the trait-method door, from the trait's method of
+    /// that leaf; an inherent block's by the member-function door, asked of
+    /// the owner whose families keep them.
+    block_methods_named(&this, block: ImplBlockNode*, leaf: SymbolStr) -> MethodNode*[] {
+        if (block.is_trait_impl()) { return this.ctx.generic_registry.impl_methods_at_leaf(block, leaf); }
+        const owner: FamilyOwner = match (this.ctx.decl_index.impl_family_owner(block)) {
+            FamilyOwner::Def(d)      => { this.ctx.generic_registry.methods_owner_of(d) }
+            FamilyOwner::Type(t)     => { FamilyOwner::Type(t) }
+            FamilyOwner::Template(d) => { FamilyOwner::Template(d) }
+        };
+        return this.ctx.decl_index.methods_named(owner, leaf);
     }
 
     /// Bind the parameters an impl introduces only in its where-clause from
@@ -4468,7 +4492,7 @@ type struct CallResolver {
     /// when not null, is how the receiver sees the parameters the list is
     /// written in.  Returns true when the call was bound.
     bind_on_methods(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
-                    methods: &MethodNode*[], arg_types: &TypeRef[],
+                    methods: &MethodNode*[], named: &MethodNode*[], arg_types: &TypeRef[],
                     generic: boolean, sel: Selection*, view: TypeSubstitution*) -> boolean {
         // A self-returning default (an iterator adapter's `take`) is a
         // template the block carries until a concrete sibling is minted;
@@ -4476,7 +4500,7 @@ type struct CallResolver {
         mut has_concrete_sibling: boolean = false;
         for (mut ci: i64 = 0; ci < methods.length; ci++) {
             const cm: MethodNode* = methods[ci];
-            if (cm != null && cm.func != null && cm.func.name.equals(member.member)
+            if (cm != null && cm.func != null && DeclarationIndex::holds_method(named, cm)
                     && !cm.func.is_self_returning_default) {
                 has_concrete_sibling = true;
                 break;
@@ -4499,7 +4523,7 @@ type struct CallResolver {
                 const mn: MethodNode* = methods[mi];
                 if (mn == null || mn.func == null) { continue; }
                 const fn_node: FunctionDeclNode* = mn.func;
-                if (!fn_node.name.equals(member.member)) { continue; }
+                if (!DeclarationIndex::holds_method(named, mn)) { continue; }
                 if (fn_node.is_self_returning_default && has_concrete_sibling) { continue; }
                 if ((fn_node.generic_params.length > 0) != generic) { continue; }
                 if (where_asked && !this.trait_checker().method_bounds_satisfied(fn_node, view)) { continue; }
@@ -6257,6 +6281,7 @@ type struct CallResolver {
         const owner_t: TypeRef = match (owner) {
             FamilyOwner::Type(t) => { t }
             FamilyOwner::Def(d)  => { this.ctx.decl_index.type_of_def(d) }
+            FamilyOwner::Template(_) => { TypeRef::invalid() }
         };
         const at: SourceSpan = if (path != null) { path.span } else { call.span };
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0154_AMBIGUOUS_CALL,
@@ -6300,6 +6325,7 @@ type struct CallResolver {
         const owner_t: TypeRef = match (owner) {
             FamilyOwner::Type(t) => { t }
             FamilyOwner::Def(_)  => { TypeRef::invalid() }
+            FamilyOwner::Template(_) => { TypeRef::invalid() }
         };
         this.report_trait_method_tie(path.span, path.member_name, owner_t,
             &traits, &spans, args_text, call != null, inh_func);
@@ -6802,10 +6828,11 @@ type struct CallResolver {
 
         mut matched: MethodNode* = null;
         mut found_count: i64 = 0;
+        const named: MethodNode*[] = this.ctx.decl_index.methods_named(FamilyOwner::Template(tmpl.def), scope.member_name);
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null || !m.is_static) { continue; }
-            if (!m.func.name.equals(scope.member_name)) { continue; }
+            if (!DeclarationIndex::holds_method(&named, m)) { continue; }
             // A non-generic static method with this name is handled by the existing
             // owner-only path; defer to it rather than risk a wrong interception.
             if (m.func.generic_params.length == 0) { return TypeRef::invalid(); }
@@ -7013,10 +7040,11 @@ type struct CallResolver {
         mut found_count: i64 = 0;
         mut abstract_ret: TypeRef = TypeRef::invalid();
         mut matched: MethodNode* = null;
+        const named: MethodNode*[] = this.ctx.decl_index.methods_named(FamilyOwner::Template(tmpl.def), scope.member_name);
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null || !m.is_static) { continue; }
-            if (!m.func.name.equals(scope.member_name)) { continue; }
+            if (!DeclarationIndex::holds_method(&named, m)) { continue; }
             if (m.func.generic_params.length > 0) { return TypeRef::invalid(); }
             found_count += 1;
             abstract_ret = m.func.resolved_return_type;
@@ -8150,12 +8178,15 @@ type struct CallResolver {
         }
         if (!type_ref.is_valid()) { return; }
         mut t: Type* = this.arena.lookup(type_ref);
+        mut owner_ref: TypeRef = type_ref;
         if (t != null && t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t as InstantiatedType*;
             if (!inst.has_resolved_type()) { return; }
+            owner_ref = inst.resolved_type;
             t = this.arena.lookup(inst.resolved_type);
         }
         if (t == null) { return; }
+        const named: MethodNode*[] = this.ctx.decl_index.methods_named(FamilyOwner::Type(owner_ref), scope.member_name);
         mut methods: MethodInfo[] = [];
         match (t.kind) {
             TypeKind::Struct => { methods = (t as StructType*).methods; }
@@ -8173,7 +8204,7 @@ type struct CallResolver {
         for (mut mi: i64 = 0; mi < methods.length; mi++) {
             const m: &MethodInfo = &methods[mi];
             if (!m.is_static) { continue; }
-            if (!m.name.equals(scope.member_name)) { continue; }
+            if (!DeclarationIndex::holds_method(&named, m.ast_node as MethodNode*)) { continue; }
             if (this.method_type_is_variadic(m.function_type)) { variadic_ok = true; continue; }
             name_seen  += 1;
             uniq_arity  = this.diag.note_arity(uniq_arity, m.param_types.length);
@@ -8192,7 +8223,7 @@ type struct CallResolver {
             for (mut mi: i64 = 0; mi < methods.length; mi++) {
                 const m: &MethodInfo = &methods[mi];
                 if (!m.is_static) { continue; }
-                if (!m.name.equals(scope.member_name)) { continue; }
+                if (!DeclarationIndex::holds_method(&named, m.ast_node as MethodNode*)) { continue; }
                 if (this.method_type_is_variadic(m.function_type)) { continue; }
                 if (m.param_types.length != argc) { continue; }
                 if (this.args_fit_params_loosely(call, m.param_types.as_slice())) {

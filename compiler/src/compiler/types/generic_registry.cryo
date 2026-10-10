@@ -28,7 +28,7 @@ import compiler::resolver::decl_name::{ DeclName };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, DefKey, DefTable };
+import compiler::resolver::res::{ DefId, DefKey, DefTable, FamilyOwner };
 import std::core::hash::{ Hash, Hasher };
 import std::core::cmp::{ Eq };
 import compiler::resolver::res::{ Res };
@@ -1295,6 +1295,24 @@ type struct GenericRegistry {
         return this.trait_item_method(block, slot);
     }
 
+    /// Every method trait implementation `block` holds for the trait's
+    /// method under `leaf`, in the block's order: each of its methods the
+    /// trait-method door places at that method's position - a method
+    /// written for it, the copy of its default, and the copies the
+    /// monomorphizer appends.  Empty when the trait declares no such method.
+    impl_methods_at_leaf(&this, block: ImplBlockNode*, leaf: SymbolStr) -> MethodNode*[] {
+        mut out: MethodNode*[] = [];
+        if (block == null || !block.is_trait_impl()) { return out; }
+        const slot: i64 = this.trait_item_slot(block.trait_def, leaf);
+        if (slot < 0) { return out; }
+        for (mut mi: i64 = 0; mi < block.methods.length; mi++) {
+            const m: MethodNode* = block.methods[mi];
+            if (m == null || m.func == null) { continue; }
+            if (this.trait_item_slot(block.trait_def, m.func.name) == slot) { out.push(m); }
+        }
+        return out;
+    }
+
     /// The return the trait `trait_def` declares for its `slot`-th method
     /// (`trait_item_slot`), or invalid when there is no such method or its
     /// return was never resolved.  Asked by identity and position.
@@ -1474,6 +1492,13 @@ type struct GenericRegistry {
             return this.inherent_owner_nodes[opt.unwrap()];
         }
         return null;
+    }
+
+    /// The owner type definition `def`'s own methods are registered under:
+    /// the template itself for a template, the definition otherwise.
+    methods_owner_of(&this, def: DefId) -> FamilyOwner {
+        if (this.template_of(def) != null) { return FamilyOwner::Template(def); }
+        return FamilyOwner::Def(def);
     }
 
     /// The template a definition IS, or null when that definition is not a

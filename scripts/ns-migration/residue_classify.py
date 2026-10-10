@@ -121,8 +121,6 @@ CLASS_OF_METHOD = {
         ("J", "member: the trait's own associated type by its leaf off the trait node in hand, scanned inline"),
     "TraitDeclNode::methods[]":
         ("J", "member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf)"),
-    "ImplBlockNode::methods[]":
-        ("J", "member: the impl's own method by its leaf off the impl node in hand, scanned inline"),
     "StructDeclNode::fields[]":
         ("J", "member: a struct declaration's field by its leaf off the node in hand, scanned inline"),
     "UnionDeclNode::fields[]":
@@ -148,8 +146,6 @@ CLASS_OF_METHOD = {
     # -- local tables: the owner out of view, the element says what it is --
     "local::MethodNode[]":
         ("J", "member: an impl's or a declaration's methods held in a local, by leaf"),
-    "local::MethodInfo[]":
-        ("J", "member: an arena type's methods held in a local, by leaf"),
     "local::FieldInfo[]":
         ("J", "member: a struct's or class's fields held by reference in a local, by leaf"),
     # RULED (Jake, 2026-09-22): this site stays in the population, read as a
@@ -166,6 +162,8 @@ CLASS_OF_METHOD = {
         ("J", "member: a global's leaf inside the module the qualifier's stamp names (a `DefId`), the member-global door"),
     "DeclarationIndex::lookup_family_entries":
         ("J", "member: an overload family's leaf asked inside the owner the caller holds by identity - a module's or a type's definition, or a type's arena id (`FamilyOwner`); the store is keyed by that owner's path and the leaf (`family_slot`), as a definition is its parent and its leaf. Overloading is kept, so a family is the SET one owner declares under one written leaf, and the leaf is the question asked, not a stand-in for an identity - Rust's resolver keys the same set by parent module, ident and namespace"),
+    "DeclarationIndex::methods_named":
+        ("J", "member: an overload family's methods, asked as `lookup_family_entries` is"),
     "DeclarationIndex::lookup_func_type_overloads":
         ("J", "member: an overload family's signatures, asked as `lookup_family_entries` is"),
     "DeclarationIndex::lookup_func_type":
@@ -190,6 +188,8 @@ CLASS_OF_METHOD = {
         ("J", "member: a method's leaf inside the trait an impl block or a bound names by identity, through `trait_item_slot`, to the trait's declaration of it"),
     "GenericRegistry::impl_method_by_leaf":
         ("J", "member: a method's leaf inside the trait an impl block implements, through `trait_item_slot`, to the block's method at that position"),
+    "GenericRegistry::impl_methods_at_leaf":
+        ("J", "member: a method's leaf inside the trait an impl block implements, through `trait_item_slot`, to every method of the block at that position"),
     "GenericRegistry::find_trait_defining_method":
         ("J", "hint: the did-you-mean asks which trait declares a method of this leaf; the spelling is the question"),
     # -- the module graph and the resolver's module scopes --

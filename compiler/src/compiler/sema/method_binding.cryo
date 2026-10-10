@@ -50,6 +50,8 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::decl_name::{ DeclName };
 import compiler::resolver::res::{ DefId };
+import compiler::decl_index;
+import compiler::decl_index::{ DeclarationIndex };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::sema::helpers::{ sema_expr_has_numeric_suffix };
@@ -1175,27 +1177,32 @@ type struct MethodBinding {
         const empty_params: GenericParamNode*[] = [];
         mut owner_methods: &MethodNode*[] = &empty_methods;
         mut owner_params:  &GenericParamNode*[] = &empty_params;
+        mut owner_def: DefId = DefId::invalid();
         if (owner_ast.kind == NodeKind::StructDeclaration) {
             const sn: StructDeclNode* = owner_ast as StructDeclNode*;
             owner_methods = &sn.methods;
             owner_params  = &sn.generic_params;
+            owner_def     = sn.def;
         } else if (owner_ast.kind == NodeKind::UnionDeclaration) {
             const un: UnionDeclNode* = owner_ast as UnionDeclNode*;
             owner_methods = &un.methods;
             owner_params  = &un.generic_params;
+            owner_def     = un.def;
         } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
             const cn: ClassDeclNode* = owner_ast as ClassDeclNode*;
             owner_methods = &cn.methods;
             owner_params  = &cn.generic_params;
+            owner_def     = cn.def;
         } else {
             return fallback;
         }
 
         mut found: MethodNode* = null;
+        const named: MethodNode*[] = this.ctx.decl_index.methods_named(this.ctx.generic_registry.methods_owner_of(owner_def), member.member);
         for (mut k: i64 = 0; k < owner_methods.length; k++) {
             const m: MethodNode* = owner_methods[k];
             if (m == null || m.func == null) { continue; }
-            if (!m.func.name.equals(member.member)) { continue; }
+            if (!DeclarationIndex::holds_method(&named, m)) { continue; }
             if (m.func.generic_params.length != member.generic_args.length) { continue; }
             found = m;
             break;
@@ -1372,10 +1379,11 @@ type struct MethodBinding {
         for (mut i: i64 = 0; i < bound_leaves.length && found == null; i++) {
             const td: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(bound_leaves[i]);
             if (td == null) { continue; }
+            const slot: i64 = this.ctx.generic_registry.trait_item_slot(bound_leaves[i], member.member);
             for (mut k: i64 = 0; k < td.methods.length; k++) {
                 const f: FunctionDeclNode* = td.methods[k];
                 if (f == null) { continue; }
-                if (!f.name.equals(member.member)) { continue; }
+                if (!(slot >= 0 && this.ctx.generic_registry.trait_item_slot(bound_leaves[i], f.name) == slot)) { continue; }
                 if (f.generic_params.length == 0) { continue; }
                 found = f;
                 break;
