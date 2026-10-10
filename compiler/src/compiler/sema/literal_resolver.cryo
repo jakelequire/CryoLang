@@ -33,7 +33,7 @@ import compiler::sema::state;
 import compiler::sema::state::{ SemaState };
 import compiler::sema::helpers;
 import compiler::sema::helpers::{
-    int_literal_exceeds, is_numeric_literal_expr, sema_default_int_type,
+    int_literal_exceeds, is_constant_numeric_expr, is_numeric_literal_expr, sema_default_int_type,
     sema_int_unsigned_bound, sema_numeric_suffix_type, try_fold_const_i64
 };
 import std::fmt;
@@ -296,6 +296,39 @@ type struct LiteralResolver {
         const t: Type* = this.arena.lookup(target);
         if (t == null || t.kind != TypeKind::Int) { return false; }
         return LiteralResolver::const_expr_fits_int(expr, t as IntType*);
+    }
+
+    /// Refuse an expression made only of literals (`200 + 100`, `-200`)
+    /// stored where an integer of type `target` is - a declaration's
+    /// initializer, an assignment's value - when `target` does not hold its
+    /// value: computed at `target`'s width it would silently become another
+    /// number.  A value is held as a single literal is: up to the width's
+    /// unsigned maximum (a bit pattern), or down to a signed type's minimum.
+    /// A single literal is bounded where it is typed; true when refused.
+    refuse_narrowing_constant(&this, expr: ExpressionNode*, target: TypeRef) -> boolean {
+        if (expr == null || !target.is_valid()) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind != NodeKind::BinaryExpression && node.kind != NodeKind::UnaryExpression) { return false; }
+        if (!is_constant_numeric_expr(expr)) { return false; }
+        const t: Type* = this.arena.lookup(target);
+        if (t == null || t.kind != TypeKind::Int) { return false; }
+        const it: IntType* = t as IntType*;
+        const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
+        if (max_mag == 0) { return false; }
+        mut v: i64 = 0;
+        if (!try_fold_const_i64(expr, &v)) { return false; }
+        const held: boolean = if (v >= 0) {
+            (v as u64) <= max_mag
+        } else {
+            it.int_kind.is_signed() && v >= -((max_mag / 2) as i64) - 1
+        };
+        if (held) { return false; }
+        this.ctx.emit_error_at(
+            ErrorCode::E0010_NUMBER_TOO_LARGE,
+            Text::new(fmt::format("this value is %lld, which `%s` does not hold: it narrows the value and would silently truncate; add an explicit `as` cast",
+                v, it.int_kind.to_string())),
+            expr.span);
+        return true;
     }
 
     static const_expr_fits_int(expr: ExpressionNode*, it: IntType*) -> boolean {

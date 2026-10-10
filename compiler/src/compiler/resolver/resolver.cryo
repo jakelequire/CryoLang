@@ -67,9 +67,11 @@ type struct ScopeEntry {
     ///         in a Function/Block scope); true = brought in by an `import`
     ///         (tier 3).
     is_import: boolean;
+    /// Whether the binding is in the type namespace.
+    in_type_ns: boolean;
 
-    static new(name: SymbolStr, sym: SymbolID, is_import: boolean) -> ScopeEntry {
-        return ScopeEntry { name: name, sym: sym, is_import: is_import };
+    static new(name: SymbolStr, sym: SymbolID, is_import: boolean, in_type_ns: boolean) -> ScopeEntry {
+        return ScopeEntry { name: name, sym: sym, is_import: is_import, in_type_ns: in_type_ns };
     }
 }
 
@@ -102,6 +104,7 @@ public:
             symbols:            [],
             symbol_index:       HashMap::<u32, i64>::new(),
             overloads:          [],
+            overload_in_type_ns: [],
             meetings:           [],
             ambig_name_ids:     [],
             ambig_module_a:     [],
@@ -133,8 +136,10 @@ private:
     ![allow(lookup_by_spelling, reason = "a scope rib: a scope binds the names written in it, and the bare-identifier door asks it by name")]
     symbol_index:    HashMap<u32, i64>;
 
-    // Overloaded names: flat array of (name_key, SymbolID) pairs.
+    // Overloaded names: flat array of (name_key, SymbolID) pairs, and
+    // beside each whether that binding is in the type namespace.
     overloads:       Pair<u32, SymbolID>[];
+    overload_in_type_ns: boolean[];
 
     // Every binding added under a name the scope already bound: `.first`
     // the binding the name held, `.second` the one added.  The scope keeps
@@ -162,13 +167,18 @@ private:
     /// Insert a DECLARATION into this scope (tier 2, or a local/param).
     ///
     /// If the name already exists and allows_overload is true, adds to the
-    /// overload set instead.  Returns false if the name is a duplicate
-    /// declaration and overloading is not allowed.
+    /// overload set instead.  A type and a function of one name are bound in
+    /// two namespaces, so neither displaces the other: the one declared
+    /// second joins the overload set too, whichever came first, and a
+    /// lookup chooses between them by namespace.  Returns false if the name
+    /// is a duplicate declaration in its namespace and overloading is not
+    /// allowed.
     ///
     /// A declaration arriving over an IMPORT takes the slot: the inner tier
     /// shadows the outer one, whichever line of the file came first.
     ![allow(lookup_by_spelling, reason = "the rib's own storage, private to the resolver's module: the scope doors and the resolver's walks are its only callers")]
-    insert(mut &this, name: SymbolStr, sym_id: SymbolID, allows_overload: boolean) -> boolean {
+    insert(mut &this, name: SymbolStr, sym_id: SymbolID, allows_overload: boolean,
+           in_type_ns: boolean) -> boolean {
         const existing: Option<i64> = this.symbol_index.get(&name.id);
         if (existing.is_some()) {
             const idx: i64 = existing.unwrap();
@@ -183,6 +193,7 @@ private:
                 // never added itself as an overload.
                 this.symbols[idx].sym = sym_id;
                 this.symbols[idx].is_import = false;
+                this.symbols[idx].in_type_ns = in_type_ns;
                 // Any ambiguity recorded for this name was import-vs-import.
                 // A declaration shadows every import of the name, so the
                 // ambiguity is no longer reachable and must not be reported:
@@ -190,15 +201,31 @@ private:
                 this.clear_ambiguity(name);
                 return true;
             }
-            if (allows_overload) {
-                this.add_overload(name, sym_id);
+            if (allows_overload || !this.binds_in(name, in_type_ns)) {
+                this.add_overload(name, sym_id, in_type_ns);
                 return true;
             }
             return false;
         }
 
-        this.push_entry(name, sym_id, false);
+        this.push_entry(name, sym_id, false, in_type_ns);
         return true;
+    }
+
+    /// Whether a binding this scope holds under `name` is in the type
+    /// namespace (`in_type_ns`) or in the value namespace (not).
+    ![allow(lookup_by_spelling, reason = "the rib's own storage, private to the resolver's module: the scope doors and the resolver's walks are its only callers")]
+    binds_in(&this, name: SymbolStr, in_type_ns: boolean) -> boolean {
+        match (this.symbol_index.get(&name.id)) {
+            Option::Some(idx) => {
+                if (this.symbols[idx].in_type_ns == in_type_ns) { return true; }
+            }
+            Option::None => { }
+        }
+        for (mut i: i64 = 0; i < this.overloads.length; i++) {
+            if (this.overloads[i].first == name.id && this.overload_in_type_ns[i] == in_type_ns) { return true; }
+        }
+        return false;
     }
 
     /// Insert an IMPORT symbol (tier 3).
@@ -232,7 +259,7 @@ private:
             this.ambig_ns.push(ns);
             return true;
         }
-        this.push_entry(name, sym_id, true);
+        this.push_entry(name, sym_id, true, ns == Namespace::Type);
         return true;
     }
 
@@ -240,9 +267,9 @@ private:
     /// created, so the tier and the index can never disagree with the array.
     ![allow(lookup_by_spelling, reason = "the rib's own storage, private to the resolver's module: the scope doors and the resolver's walks are its only callers")]
     push_entry(mut &this, name: SymbolStr, sym_id: SymbolID,
-               is_import: boolean) -> void {
+               is_import: boolean, in_type_ns: boolean) -> void {
         const idx: i64 = this.symbols.length;
-        this.symbols.push(ScopeEntry::new(name, sym_id, is_import));
+        this.symbols.push(ScopeEntry::new(name, sym_id, is_import, in_type_ns));
         this.symbol_index.insert(name.id, idx);
     }
 
@@ -291,8 +318,9 @@ private:
     }
 
     /// Add a symbol to the overload set for the given name.
-    add_overload(mut &this, name: SymbolStr, sym_id: SymbolID) -> void {
+    add_overload(mut &this, name: SymbolStr, sym_id: SymbolID, in_type_ns: boolean) -> void {
         this.overloads.push(Pair::<u32, SymbolID>::new(name.id, sym_id));
+        this.overload_in_type_ns.push(in_type_ns);
     }
 
     /// Every binding the scope holds under `name`: the primary one, then
@@ -587,7 +615,7 @@ type struct Resolver {
         // Insert into current scope (O(1) direct index)
         const allows_overload: boolean = sym.kind.allows_overload();
         const inserted: boolean = this.scopes[this.current_scope.id - 1]
-            .insert(sym.name, id, allows_overload);
+            .insert(sym.name, id, allows_overload, Namespace::Type.accepts(sym.kind));
 
         if (!inserted) {
             LOG_DEBUG(LogComponent::Resolver,
@@ -678,7 +706,7 @@ type struct Resolver {
             if (ex.kind == SymbolKind::Import && existing_module.equals(new_module)) {
                 const bound: SymbolID = this.binding_to(&all, target);
                 if (!bound.is_valid()) {
-                    this.scopes[this.current_scope.id - 1].add_overload(name, id);
+                    this.scopes[this.current_scope.id - 1].add_overload(name, id, this.namespace_of(target) == Namespace::Type);
                 }
                 if (explicit) {
                     this.explicit_imports.insert(if (bound.is_valid()) { bound.table_key() } else { id.table_key() }, true);
@@ -690,7 +718,7 @@ type struct Resolver {
             // name, not a rival for it: a lookup chooses between them by
             // namespace, as it does for one module's type and function.
             if (ex.kind == SymbolKind::Import && !rival.is_valid()) {
-                this.scopes[this.current_scope.id - 1].add_overload(name, id);
+                this.scopes[this.current_scope.id - 1].add_overload(name, id, this.namespace_of(target) == Namespace::Type);
                 if (explicit) { this.explicit_imports.insert(id.table_key(), true); }
                 return SymbolID::invalid();
             }
@@ -920,7 +948,36 @@ type struct Resolver {
     /// alias - then the prelude's one answer.  What the binding is decides
     /// what the path means, so the caller reads its kind.
     type_binding(&this, name: SymbolStr, start: ScopeID) -> SymbolID {
-        return this.lookup(name, start);
+        mut scope_id: ScopeID = start;
+        while (scope_id.is_valid()) {
+            const scope: Scope* = this.get_scope(scope_id);
+            const found: SymbolID = this.rib_binding(scope, name, Namespace::Type);
+            if (found.is_valid()) {
+                return found;
+            }
+            scope_id = scope.parent_id;
+        }
+        const any_ns: Option<Namespace> = Option::None;
+        return this.lookup_prelude(name, any_ns);
+    }
+
+    /// The binding the rib `scope` holds under `name` for a question asked
+    /// in `ns`: its first binding, unless that one is a declaration of the
+    /// other namespace and a second binding of the name is in `ns` - a type
+    /// declared after a function of its leaf, or a function after a type.
+    /// Invalid when the rib binds nothing under `name`.  Only the scope
+    /// doors ask it.
+    rib_binding(&this, scope: Scope*, name: SymbolStr, ns: Namespace) -> SymbolID {
+        const found: SymbolID = scope.find(name);
+        if (!found.is_valid()) { return found; }
+        const first: Symbol = this.get_symbol(found);
+        if (first.kind == SymbolKind::Import || ns.accepts(first.kind)) { return found; }
+        const all: SymbolID[] = scope.get_overloads(name);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            const s: Symbol = this.get_symbol(all[i]);
+            if (s.kind != SymbolKind::Import && ns.accepts(s.kind)) { return all[i]; }
+        }
+        return found;
     }
 
     /// Door `scope-value`.  A bare identifier in value position is written
@@ -1179,7 +1236,7 @@ type struct Resolver {
         mut scope_id: ScopeID = scope;
         while (scope_id.is_valid()) {
             const sc: Scope* = this.get_scope(scope_id);
-            const found: SymbolID = sc.find(name);
+            const found: SymbolID = this.rib_binding(sc, name, ns);
             if (found.is_valid()) {
                 const sym: Symbol = this.get_symbol(found);
                 if (ns.accepts(sym.kind)) {
@@ -1330,7 +1387,7 @@ type struct Resolver {
         const sym: Symbol = Symbol::namespace_sym(
             id, name, this.global_scope, SourceSpan::none(), m);
         this.admit(sym);
-        this.scopes[g].insert(name, id, false);
+        this.scopes[g].insert(name, id, false, true);
     }
 
     /// Resume a scope captured earlier, under `name` as the current module.

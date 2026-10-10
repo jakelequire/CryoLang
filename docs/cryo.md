@@ -154,6 +154,14 @@ Integer literals support four bases. Underscores are visual separators that the 
 
 **Type suffixes:** `u8` `u16` `u32` `u64` `u128` `i8` `i16` `i32` `i64` `i128` `usize` `isize` `f32` `f64`
 
+A literal stored where an integer of a written type is - a constant's or a variable's initializer, an assignment's value, a call's argument - takes that type, and must hold its value there.  So must an expression made only of literals: its value is what the arithmetic gives, and a type that does not hold it is refused (`E0010`) rather than wrapped.  A value is held up to the type's unsigned maximum (a bit pattern) and, for a signed type, down to its minimum.
+
+```cryo
+const a: u8 = 100 + 100;   // 200: held
+const b: u8 = 200 + 100;   // error: 300 does not fit `u8`, and would silently truncate
+const c: i8 = 0 - 128;     // -128: held
+```
+
 > **Trap.** Integer literals exceeding `i64::MAX` (e.g. `0xFFFF_FFFF_FFFF_FFFF`) wrap to negative when used inline against a `u64` operand. Hoist the literal into a `const u64 NAME = ...` binding to compare correctly.
 
 #### String and Character Literals
