@@ -38,7 +38,6 @@ import compiler::ast::{
     declaration, expression, LiteralKind, MemberPin, NamedAnnotation, node,
     NodeKind, statement, TraitBound, TraitRef, TypeAnnotation, visitor
 };
-import compiler::ast::node_locator;
 import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, renderer, source_span, suggestion };
 import compiler::diag::renderer::{ DiagRenderer };
@@ -71,7 +70,6 @@ import compiler::ast::expression::{
 import compiler::ast::node::{ ASTNode };
 import compiler::lex::{ TokenType };
 import compiler::ast::visitor::{ ASTVisitor };
-import compiler::ast::node_locator::{ NodeLocator };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
@@ -4711,21 +4709,21 @@ type struct CallResolver {
         return false;
     }
 
-    /// Find an inherent method named `name` on a generic template's AST.
-    find_template_method(&this, ast_node: ASTNode*, name: SymbolStr) -> FunctionDeclNode* {
+    /// The first method a generic template's declaration writes that is one
+    /// of `named`, the member-function door's answer for the leaf asked.
+    template_method_held(&this, ast_node: ASTNode*, named: &MethodNode*[]) -> FunctionDeclNode* {
         if (ast_node == null) { return null; }
+        const no_methods: MethodNode*[] = [];
+        mut methods: &MethodNode*[] = &no_methods;
         if (ast_node.kind == NodeKind::StructDeclaration) {
-            const d: StructDeclNode* = ast_node as StructDeclNode*;
-            const m: MethodNode* = NodeLocator::method_by_name(&d.methods, name);
-            if (m != null) { return m.func; }
+            methods = &(ast_node as StructDeclNode*).methods;
         } else if (ast_node.kind == NodeKind::UnionDeclaration) {
-            const d: UnionDeclNode* = ast_node as UnionDeclNode*;
-            const m: MethodNode* = NodeLocator::method_by_name(&d.methods, name);
-            if (m != null) { return m.func; }
+            methods = &(ast_node as UnionDeclNode*).methods;
         } else if (ast_node.kind == NodeKind::ClassDeclaration) {
-            const d: ClassDeclNode* = ast_node as ClassDeclNode*;
-            const m: MethodNode* = NodeLocator::method_by_name(&d.methods, name);
-            if (m != null) { return m.func; }
+            methods = &(ast_node as ClassDeclNode*).methods;
+        }
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            if (DeclarationIndex::holds_method(named, methods[i])) { return methods[i].func; }
         }
         return null;
     }
@@ -5084,7 +5082,8 @@ type struct CallResolver {
         const tmpl: TemplateEntry* = reg.template_of_type(inst.generic_base);
         if (tmpl == null || tmpl.ast_node == null) { return false; }
         if (tmpl.param_names.length != inst.type_args.length) { return false; }
-        const func: FunctionDeclNode* = this.find_template_method(tmpl.ast_node, member.member);
+        const named: MethodNode*[] = this.ctx.decl_index.methods_named(FamilyOwner::Template(tmpl.def), member.member);
+        const func: FunctionDeclNode* = this.template_method_held(tmpl.ast_node, &named);
         if (func == null || func.trait_bounds.length == 0) { return false; }
         for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
             const bound: &TraitBound = &func.trait_bounds[bi];

@@ -507,9 +507,9 @@ class Scanned(object):
 
 
 # Every array the tree scans inline, placed.  A scan is the door's body
-# written at the caller: `StructType::get_method` is `for (i) if
-# (this.methods[i].name.equals(name))`, and a caller that writes that loop
-# over `st.methods` itself has read the same table by the same key with no
+# written at the caller: `StructType::field_position` is `for (i) if
+# (this.fields[i].name.equals(leaf))`, and a caller that writes that loop
+# over `st.fields` itself has read the same table by the same key with no
 # method call for rule 2 to see.  The rule reads the compiler's facts
 # (`facts_scans`): a comparison of keys one of whose operands is read off an
 # element the innermost loop reads, however many locals and members it
@@ -523,18 +523,12 @@ SCANNED_ARRAYS = {
     #    re-wrote a door's loop with a predicate of their own --
     "StructType.fields":       Scanned("compiler/types/user_defined.cryo", "FieldInfo", TABLE,
                                        "a struct's fields by leaf off the `StructType` in hand"),
-    "StructType.methods":      Scanned("compiler/types/user_defined.cryo", "MethodInfo", TABLE,
-                                       "a struct's methods by leaf off the `StructType` in hand"),
     "ClassType.fields":        Scanned("compiler/types/user_defined.cryo", "FieldInfo", TABLE,
                                        "a class's fields by leaf off the `ClassType` in hand"),
     "ClassType.methods":       Scanned("compiler/types/user_defined.cryo", "MethodInfo", TABLE,
                                        "a class's methods by leaf off the `ClassType` in hand"),
     "EnumType.variants":       Scanned("compiler/types/user_defined.cryo", "EnumVariantInfo", TABLE,
                                        "an enum's variants by leaf off the `EnumType` in hand"),
-    "EnumType.methods":        Scanned("compiler/types/user_defined.cryo", "MethodInfo", TABLE,
-                                       "an enum's methods by leaf off the `EnumType` in hand"),
-    "TraitType.required_methods": Scanned("compiler/types/user_defined.cryo", "MethodInfo", TABLE,
-                                          "a trait's required methods by leaf off the `TraitType` in hand"),
     # -- the declarations' own member arrays, read by leaf from other files:
     #    the same table as the arena's, on the AST side --
     "TraitDeclNode.assoc_types":  Scanned("compiler/AST/declaration.cryo", "AssocTypeDeclNode", TABLE,
@@ -564,6 +558,8 @@ SCANNED_ARRAYS = {
     #    and scanned; the owner is out of view, the element says what it is --
     "local.MethodNode":           Scanned(None, "MethodNode", TABLE,
                                           "an impl's or a declaration's methods, held in a local, by leaf"),
+    "local.MethodInfo":           Scanned(None, "MethodInfo", TABLE,
+                                          "a type's method records, held in a local, by leaf (the import-shadow suggestion door's body)"),
     "local.GenericParamNode":     Scanned(None, "GenericParamNode", TABLE,
                                           "a declaration's written generic parameters, held in a local, by leaf"),
     "local.VTableSlot":           Scanned(None, "VTableSlot", TABLE,

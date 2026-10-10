@@ -87,14 +87,8 @@ CLASS_OF_METHOD = {
     # -- the member tables of the user-defined types: an array of records
     #    (`FieldInfo[]`, `MethodInfo[]`, `EnumVariantInfo[]`) with the name
     #    in each, searched by leaf off the type already in hand --
-    "StructType::get_method":
-        ("J", "member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too"),
-    "ClassType::get_method":
-        ("J", "member: a class's method by its leaf off the `ClassType` in hand"),
     "EnumType::variant_index":
         ("J", "member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen"),
-    "EnumType::get_method":
-        ("J", "member: an enum's method by its leaf off the `EnumType` in hand"),
     "TraitDeclNode::assoc_type_index":
         ("J", "member: the `assoc-type` door - the trait's own associated type's position by its leaf, asked from the trait node in hand where a projection or a binding is written; every later reader asks by the position"),
     "TraitDeclNode::lookup_method":
@@ -105,18 +99,12 @@ CLASS_OF_METHOD = {
     #    stays a scan and stays a row --
     "StructType::fields[]":
         ("J", "member: a struct's field by its leaf off the `StructType` in hand, scanned inline"),
-    "StructType::methods[]":
-        ("J", "member: a struct's method by its leaf off the `StructType` in hand, scanned inline with an arity predicate"),
     "ClassType::fields[]":
         ("J", "member: a class's field by its leaf off the `ClassType` in hand, scanned inline"),
     "ClassType::methods[]":
         ("J", "member: a class's method by its leaf off the `ClassType` in hand, scanned inline (the vtable's slot walk; an arity predicate)"),
     "EnumType::variants[]":
         ("J", "member: an enum's variant by its leaf off the `EnumType` in hand, scanned inline"),
-    "EnumType::methods[]":
-        ("J", "member: an enum's method by its leaf off the `EnumType` in hand, scanned inline with an arity predicate"),
-    "TraitType::required_methods[]":
-        ("J", "member: a trait's required method by its leaf off the `TraitType` in hand, scanned inline"),
     "TraitDeclNode::assoc_types[]":
         ("J", "member: the trait's own associated type by its leaf off the trait node in hand, scanned inline"),
     "TraitDeclNode::methods[]":
@@ -148,6 +136,8 @@ CLASS_OF_METHOD = {
     # -- local tables: the owner out of view, the element says what it is --
     "local::MethodNode[]":
         ("J", "member: an impl's or a declaration's methods held in a local, by leaf"),
+    "local::MethodInfo[]":
+        ("J", "member: a type's method records held in a local, by leaf - the import-shadow suggestion door's body, whose answer is message text"),
     # RULED (Jake, 2026-09-22): this site stays in the population, read as a
     # rule 1c scan.  The review board read it as a text boundary outside D32;
     # outside the population does not mean clean, it means UNWATCHED - a J row
@@ -164,6 +154,8 @@ CLASS_OF_METHOD = {
         ("J", "member: an overload family's leaf asked inside the owner the caller holds by identity - a module's or a type's definition, or a type's arena id (`FamilyOwner`); the store is keyed by that owner's path and the leaf (`family_slot`), as a definition is its parent and its leaf. Overloading is kept, so a family is the SET one owner declares under one written leaf, and the leaf is the question asked, not a stand-in for an identity - Rust's resolver keys the same set by parent module, ident and namespace"),
     "DeclarationIndex::methods_named":
         ("J", "member: an overload family's methods, asked as `lookup_family_entries` is"),
+    "DeclarationIndex::type_method":
+        ("J", "member: a type's method record for an overload family, asked as `lookup_family_entries` is and matched to the type's records by declaration"),
     "DeclarationIndex::lookup_func_type_overloads":
         ("J", "member: an overload family's signatures, asked as `lookup_family_entries` is"),
     "DeclarationIndex::lookup_func_type":
@@ -236,9 +228,9 @@ SITE_OVERRIDES = {
     # the program wrote: the protocols' own variant and method names.
     ("compiler/sema/sema.cryo", "EnumType::variant_index", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"Ready"'):
         ("J", "lang: `Poll::Ready`, the variant the async protocol names, inside the enum a synthesized `poll` returns - the enum matched to the language's `Poll` by the identity its declaration claimed before the variant is read"),
-    ("compiler/sema/lambda_synth.cryo", "StructType::get_method", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"__call__"'):
+    ("compiler/sema/lambda_synth.cryo", "DeclarationIndex::type_method", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"__call__"'):
         ("J", "lang: the call protocol's `__call__`, the method leaf the language fixes for a callable struct"),
-    ("compiler/types/checker.cryo", "StructType::get_method", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"__call__"'):
+    ("compiler/types/checker.cryo", "DeclarationIndex::type_method", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"__call__"'):
         ("J", "lang: the call protocol's `__call__` (the argument continues on the next line), asked when a struct converts to a function type"),
     # The inline scans whose key is not the table's usual one.
     # RULED (Jake, 2026-09-22): these two sites stay in the population, read as

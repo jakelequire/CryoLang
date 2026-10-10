@@ -929,16 +929,6 @@ type struct Resolver {
         return this.lookup(name, start);
     }
 
-    /// Door `scope-type`.  A written type name's leaf in a MODULE's own
-    /// scope - that module's declarations, its imports, then the prelude -
-    /// in the type namespace: the answer for a name written in that
-    /// module's file once no rib inside it binds the name.
-    type_binding_in_module(&this, name: SymbolStr, module_scope: ScopeID) -> Res {
-        mut segs: SymbolStr[] = [];
-        segs.push(name);
-        return this.resolve_path(&segs, Namespace::Type, module_scope);
-    }
-
     /// Door `scope-value`.  A bare identifier in value position is written
     /// as text and nothing but the ribs of its writer can say what it binds,
     /// so this is where that text becomes a binding - once, for the node
@@ -1082,10 +1072,14 @@ type struct Resolver {
         return SymbolID::invalid();
     }
 
+    /// Door `member-export`.  A path's segment after a module, or a leaf
+    /// asked of the prelude's modules, is written as text, and the module's
+    /// export list - not its scope, which keeps one of a type and a function
+    /// sharing a leaf - is what says which declarations it offers under it.
+    ///
     /// Every public declaration module `m` exports under `name`, in
     /// declaration order: a type and a function may share a leaf, and a
     /// reader that wants one of them chooses by kind.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     exports_named(&this, m: ModulePath, name: SymbolStr) -> SymbolID[] {
         mut out: SymbolID[] = [];
         const mod_key: u64 = m.as_sym().id as u64;
@@ -1224,42 +1218,23 @@ type struct Resolver {
             this.intern_table.resolve(sym.source_module.as_sym()) + "::" + this.intern_table.resolve(sym.name));
     }
 
-    /// THE path-resolution entry point (§5.2).
+    /// Door `scope-type`.  A written type name's leaf, in the type
+    /// namespace, walking outward from `scope` - a module's own scope, or
+    /// the scope enclosing a class whose base it names - then the prelude.
+    /// The answer for a name written there once nothing nearer binds it.
     ///
-    /// `ns` is a parameter rather than a separate function per kind, and that is
-    /// the whole point: every per-kind lookup in this compiler re-derived the
-    /// scope and import rules for itself, so they drifted, and the cascade grew
-    /// in whichever lane was cheapest to extend next.  A namespace is a filter
-    /// over `SymbolKind` - which those lookups already hardcoded - so making it
-    /// an argument costs nothing and makes "resolve `Foo`" a question with one
-    /// answer instead of a guess about which index to consult.
-    ///
-    /// `scope` is explicit, with no ambient-cursor default.  The largest
-    /// answering step this cascade ever had existed solely to correct a cursor
-    /// pointing at the wrong module; given the writer's scope there is nothing
-    /// for such a step to correct.
-    ///
-    /// §5.1's rule decides the shape: only the FIRST segment resolves in scope,
-    /// and everything after it is resolved within whatever that named.  So a
-    /// multi-segment path whose head names a type is finished by the type layer,
-    /// which is what `TypeRelative` claims.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    resolve_path(&this, segments: &SymbolStr[], ns: Namespace,
-                 scope: ScopeID) -> Res {
-        if (segments.length == 0) { return Res::Err; }
+    /// `scope` is explicit, with no ambient-cursor default: given the
+    /// writer's scope there is no cursor pointing at the wrong module to
+    /// correct.
+    type_res_in_scope(&this, name: SymbolStr, scope: ScopeID) -> Res {
+        const ns: Namespace = Namespace::Type;
 
-        // How many segments the head does NOT account for.  The head is
-        // resolved here and nothing after it is, so this is a statement about
-        // this walk rather than an estimate.
-        const head: SymbolStr = segments[0];
-        const trailing: u32 = (segments.length - 1) as u32;
-
-        // The head, in scope.  Walking outward is the rib chain: an inner tier
-        // shadows the outer one, and the first acceptable binding wins.
+        // Walking outward is the rib chain: an inner tier shadows the outer
+        // one, and the first acceptable binding wins.
         mut scope_id: ScopeID = scope;
         while (scope_id.is_valid()) {
             const sc: Scope* = this.get_scope(scope_id);
-            const found: SymbolID = sc.find(head);
+            const found: SymbolID = sc.find(name);
             if (found.is_valid()) {
                 const sym: Symbol = this.get_symbol(found);
                 if (ns.accepts(sym.kind)) {
@@ -1268,9 +1243,9 @@ type struct Resolver {
                     // tier).  The rib keeps the first so a lookup lands
                     // somewhere; the record of the second is what says the
                     // first was never the answer.  The rib DID bind the
-                    // head - to nothing - so the walk stops here rather than
+                    // name - to nothing - so the walk stops here rather than
                     // letting an outer tier answer a name this one holds.
-                    if (sym.kind == SymbolKind::Import && sc.is_ambiguous(head, ns)) {
+                    if (sym.kind == SymbolKind::Import && sc.is_ambiguous(name, ns)) {
                         return Res::Err;
                     }
                     // An import names the declaration it binds in `ns`.  One
@@ -1279,9 +1254,9 @@ type struct Resolver {
                     const target: SymbolID = this.import_target(&sym, ns);
                     if (target.is_valid()) {
                         const tsym: Symbol = this.get_symbol(target);
-                        return this.res_for_head(&tsym, trailing);
+                        return this.res_for_binding(&tsym);
                     }
-                    return this.res_for_head(&sym, trailing);
+                    return this.res_for_binding(&sym);
                 }
             }
             scope_id = sc.parent_id;
@@ -1299,15 +1274,15 @@ type struct Resolver {
         // asked in one namespace is answerable by whatever kind a prelude
         // module happens to export under the name.
         const asked: Option<Namespace> = Option::Some(ns);
-        const pre: SymbolID = this.lookup_prelude(head, asked);
+        const pre: SymbolID = this.lookup_prelude(name, asked);
         if (pre.is_valid()) {
             const psym: Symbol = this.get_symbol(pre);
             if (ns.accepts(psym.kind)) {
-                return this.res_for_head(&psym, trailing);
+                return this.res_for_binding(&psym);
             }
         }
 
-        // No rib bound the head, the prelude included.  Reported as `Err`
+        // No rib bound the name, the prelude included.  Reported as `Err`
         // WITHOUT a diagnostic only because every caller today projects this
         // back into its own not-found path and diagnoses there; the moment a
         // caller reads the `Res` directly, the diagnostic belongs here, since
@@ -1316,31 +1291,17 @@ type struct Resolver {
         return Res::Err;
     }
 
-    /// The answer a resolved head produces, given how many segments follow it.
-    ///
-    /// Every tier of `resolve_path` builds its result here.  A tier that
-    /// constructs its own is free to disagree with the others about what a
-    /// generic parameter or a trailing segment means, and nothing downstream
-    /// can tell which tier replied.
-    res_for_head(&this, sym: &Symbol, trailing: u32) -> Res {
-        // A refused import bound the head to nothing, and the import's own
+    /// The answer a binding `type_res_in_scope` found produces.  Every tier
+    /// of its walk builds its result here, so no tier can disagree with
+    /// another about what a generic parameter means.
+    res_for_binding(&this, sym: &Symbol) -> Res {
+        // A refused import bound the name to nothing, and the import's own
         // diagnostic is the report; nothing rooted in it is answered.
         if (sym.kind == SymbolKind::Refused) { return Res::Err; }
         // A parameter names ITSELF.  Substitution happens strictly below this,
         // in the type layer, which is what lets a `Res` be copied verbatim by
         // `ASTCloner`.
-        if (sym.kind == SymbolKind::GenericParam) {
-            if (trailing > 0) {
-                return Res::TypeRelative(
-                    ResBase::GenericParam(sym.id), trailing);
-            }
-            return Res::GenericParam(sym.id);
-        }
-        // The remainder is rooted in what the head named; a type owner needs a
-        // receiver type, so it is not finishable here.
-        if (trailing > 0) {
-            return Res::TypeRelative(ResBase::Def(sym.def), trailing);
-        }
+        if (sym.kind == SymbolKind::GenericParam) { return Res::GenericParam(sym.id); }
         return Res::Def(sym.def);
     }
 

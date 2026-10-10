@@ -110,8 +110,9 @@ function carries no marker.
 |---|---|---|---|
 | `scope-value` | `Resolver::lookup_value` | `compiler/src/compiler/resolver/resolver.cryo` | bare identifier to its binding, value namespace |
 | `scope-type` | `Resolver::type_binding` | `compiler/src/compiler/resolver/resolver.cryo` | written type name, or a type path's first segment, to its binding in the writer's ribs; the name layer's `NameResolver::type_spelling_res` asks it and reads the binding's kind |
-| `scope-type` | `Resolver::type_binding_in_module` | `compiler/src/compiler/resolver/resolver.cryo` | written type name's leaf in a module's own scope, type namespace |
+| `scope-type` | `Resolver::type_res_in_scope` | `compiler/src/compiler/resolver/resolver.cryo` | written type name's leaf, type namespace, walking outward from an explicit scope: a module's own scope, or the scope enclosing a class whose base it names |
 | `member-function` | `DeclarationIndex::lookup_family_entries` | `compiler/src/compiler/decl_index.cryo` | member: a function or method family, by owner and leaf; a generic type's own methods under the template itself (`FamilyOwner::Template`) |
+| `member-export` | `Resolver::exports_named` | `compiler/src/compiler/resolver/resolver.cryo` | member: a module's public declarations, by the module and leaf, read off its export list |
 | `member-global` | `DeclarationIndex::global_in_module` | `compiler/src/compiler/decl_index.cryo` | member: a module's global, by the module and leaf |
 | `member-field` | `MemberResolver::field_of` | `compiler/src/compiler/sema/member_resolver.cryo` | member: a field, by owner type and leaf |
 | `member-field` | `StructType::field_position` | `compiler/src/compiler/types/user_defined.cryo` | member: a field of a struct in hand, by leaf, to its position among the struct's fields |
@@ -145,6 +146,22 @@ caller of a door, or an identity lookup.
 Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
+
+### 2026-10-10
+
+211. **Before `docs/name-resolution.md` is deleted, its decisions D1-D77
+     and its open-issues list fold into this appendix, and the plans for
+     after the merge go into a new `docs/roadmap.md`.**  A cleanup of its
+     own, after the code work.
+
+212. **Codegen's table of local values is keyed by each local's binding
+     identity, not by its name (rule two).**  Registering a drop flag that
+     outlives its block (`ValueTable::set_persistent`) then needs no
+     allow.
+
+213. **`TraitDeclNode::lookup_method`, which only the editor calls, stays
+     in the compiler with a written reason** until the editor's own
+     migration after the merge.
 
 ### 2026-10-09
 

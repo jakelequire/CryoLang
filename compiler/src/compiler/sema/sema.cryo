@@ -251,7 +251,7 @@ public:
 
     SemaVisitor(arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*) : BaseASTVisitor() {
         this.arena    = arena;
-        this.checker  = TypeChecker::new(arena);
+        this.checker  = TypeChecker::new(arena, ctx.decl_index);
         this.intern   = intern;
         this.ctx      = ctx;
         this.this_sym = intern.intern("this");
@@ -3673,9 +3673,17 @@ public:
         if (!ty.is_valid()) { return null; }
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return null; }
-        if (t.kind == TypeKind::Struct) { return (t as StructType*).get_method(scope.member_name); }
-        if (t.kind == TypeKind::Class)  { return (t as ClassType*).get_method(scope.member_name); }
-        return null;
+        if (t.kind != TypeKind::Struct && t.kind != TypeKind::Class) { return null; }
+        return this.ctx.decl_index.type_method(ty, scope.member_name, this.arena);
+    }
+
+    /// Whether `ty::member` names a method of a struct or class whose
+    /// signature the name layer refused.
+    scope_method_refused(mut &this, ty: TypeRef, scope: ScopeResolutionNode*) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || (t.kind != TypeKind::Struct && t.kind != TypeKind::Class)) { return false; }
+        return this.calls.scope_callee_signature_refused(scope, false);
     }
 
     /// The function type of a STATIC method named `ty::member`, or invalid when
@@ -3727,12 +3735,12 @@ public:
         // that way arrived as a struct value with no signature to check against,
         // and the address codegen emitted for it was never the one sema had
         // described.
+        // A method whose signature the name layer refused is no answer of
+        // the member-function door; the index holds the refusal, and a value
+        // taken from it reports nothing more.
+        if (this.scope_method_refused(found, scope)) { return TypeRef::invalid(); }
         const static_ft: TypeRef = this.scope_static_method_type(found, scope);
         if (static_ft.is_valid()) {
-            // The owner's method table holds every declared method, a
-            // refused signature's included, as `() -> ?`; the index holds
-            // the refusal, and a value taken from it reports nothing more.
-            if (this.calls.scope_callee_signature_refused(scope, false)) { return TypeRef::invalid(); }
             return this.calls.pin_scope_value_static_method(scope, found, static_ft);
         }
         // A method WITH a receiver, named by path, is a function value taking
@@ -3744,7 +3752,6 @@ public:
         const recv_m: MethodInfo* = this.scope_method(found, scope);
         const recv_ft: TypeRef = this.scope_receiver_method_type(recv_m);
         if (recv_ft.is_valid()) {
-            if (this.calls.scope_callee_signature_refused(scope, false)) { return TypeRef::invalid(); }
             return this.calls.pin_scope_value_static_method(scope, found, recv_ft);
         }
         // A generic owner's method is one instance's method.

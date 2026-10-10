@@ -67,6 +67,7 @@ import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::decl_name::{ DeclName };
 import compiler::resolver::resolver::{ Resolver, Scope };
 import compiler::resolver::scope::{ ScopeID, ScopeKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind, SymbolVisibility };
@@ -1024,10 +1025,8 @@ public:
         // class with no base at all, so letting it through silently drops
         // every member the class was written to inherit.
         if (node.has_base_class()) {
-            mut segs: SymbolStr[] = [];
-            segs.push(node.base_class);
-            const r: Res = this.resolver.resolve_path(
-                &segs, Namespace::Type, this.resolver.current_scope);
+            const r: Res = this.resolver.type_res_in_scope(
+                node.base_class, this.resolver.current_scope);
             match (r) {
                 Res::Def(_) => { node.set_base_res(r); }
                 _           => {
@@ -1637,8 +1636,8 @@ public:
     /// `module_declarers_of_leaf` answers a function's owners.  `owners`
     /// receives each declarer's module, index for index: the loop holds it,
     /// and a module re-derived from the canonical name's text is a guess.
-    type_declarers_of_leaf(&this, name: SymbolStr, owners: ModulePath[]*) -> SymbolStr[] {
-        mut out: SymbolStr[] = [];
+    type_declarers_of_leaf(&this, name: SymbolStr, owners: ModulePath[]*) -> DeclName[] {
+        mut out: DeclName[] = [];
         if (this.ctx.module_graph == null) { return out; }
         const count: i64 = this.ctx.module_graph.module_count() as i64;
         for (mut m: i64 = 0; m < count; m++) {
@@ -1647,10 +1646,28 @@ public:
             if (!found.is_valid()) { continue; }
             const s: Symbol = this.resolver.get_symbol(found);
             if (s.kind != SymbolKind::Type && s.kind != SymbolKind::TypeAlias) { continue; }
-            out.push(this.resolver.qualified_name_of(&s));
+            out.push(this.resolver.defs.path_of(s.def));
             owners.push(info.path());
         }
         return out;
+    }
+
+    /// The did-you-mean pool for a type name nothing binds: the visible type
+    /// names, less the name a type alias is DEFINING.  That name cannot be
+    /// the fix for a name inside its own definition - accepting it yields
+    /// `type Foo = Foo;`, and the suggestion is machine-applicable - so it is
+    /// dropped and a genuine second-best name is still offered.
+    ![allow(lookup_by_spelling, reason = "a suggestion's candidates are message text: one spelled as the alias being defined would name that alias, so it is not offered; nothing is looked up")]
+    type_name_candidates(&this) -> string[] {
+        mut cands: string[] = [];
+        const visible: string[] = this.visible_type_names();
+        if (!this.defining_type.is_valid()) { return visible; }
+        const defining: string = this.resolver.intern_table.resolve(this.defining_type);
+        for (mut i: i64 = 0; i < visible.length; i++) {
+            if (visible[i].eq(defining)) { continue; }
+            cands.push(visible[i]);
+        }
+        return cands;
     }
 
     /// The type names the writer can see by a bare spelling: the primitives,
@@ -1753,7 +1770,6 @@ public:
     /// spelling reported what it could - a private declaration named by a
     /// path, a leaf a facade offers twice - before returning here, so those
     /// never arrive.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     refuse_unbound_type(&this, name: SymbolStr, span: SourceSpan) -> boolean {
         const use_module: ModulePath = this.ctx.module_of_file(span.file);
         if (!use_module.is_valid()) { return false; }
@@ -1796,7 +1812,7 @@ public:
         }
 
         mut owners: ModulePath[] = [];
-        const declarers: SymbolStr[] = this.type_declarers_of_leaf(name, &owners);
+        const declarers: DeclName[] = this.type_declarers_of_leaf(name, &owners);
         if (declarers.length >= 2) {
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0155_AMBIGUOUS_BARE_NAME,
@@ -1804,7 +1820,7 @@ public:
                     written)));
             d = d.at_with_label(span, Text::new("ambiguous type name"));
             d = d.with_note(Text::new(fmt::format("`%s` and `%s` both declare it",
-                intern.resolve(declarers[0]), intern.resolve(declarers[1]))));
+                intern.shown(declarers[0]), intern.shown(declarers[1]))));
             d = d.with_note(
                 Text::new("write the qualifier, or import the module you mean; a bare name resolves in scope and nothing here binds it"));
             this.ctx.emit_diagnostic(d);
@@ -1849,18 +1865,7 @@ public:
         mut d: Diagnostic = Diagnostic::error(this.not_found_code(),
             Text::new(fmt::format("cannot find %s `%s` in this scope", this.noun(), written)));
         d = d.at_with_label(span, Text::new("not found in this scope"));
-        // The name a type alias is DEFINING cannot be the fix for a name
-        // inside its own definition: accepting it yields `type Foo = Foo;`,
-        // and the suggestion is machine-applicable.  Dropped from the
-        // candidates, so a genuine second-best name is still offered.
-        mut cands: string[] = [];
-        const visible: string[] = this.visible_type_names();
-        for (mut i: i64 = 0; i < visible.length; i++) {
-            if (this.defining_type.is_valid()
-                    && visible[i].eq(intern.resolve(this.defining_type))) { continue; }
-            cands.push(visible[i]);
-        }
-        d = d.did_you_mean(written, cands, this.noun(), span);
+        d = d.did_you_mean(written, this.type_name_candidates(), this.noun(), span);
         this.ctx.emit_diagnostic(d);
         return true;
     }
@@ -2732,14 +2737,14 @@ public:
     ///
     /// A leaf two imports of that scope tie for is refused HERE, where the
     /// name is written (E0154, as the identifier lane refuses it), and
-    /// stamped `Err` so the type layer stays silent about it: `resolve_path`
+    /// stamped `Err` so the type layer stays silent about it: the scope door
     /// answered nothing for it, and the not-found the type layer would
     /// report is false - the name is found twice.  The tie is asked of the
     /// scope the name was written in, never of the cursor.
     leaf_in_module_scope(&this, module_scope: u64, name: SymbolStr,
                          span: SourceSpan) -> ResSlot {
         const scope: ScopeID = ScopeID { id: module_scope };
-        const r: Res = this.resolver.type_binding_in_module(name, scope);
+        const r: Res = this.resolver.type_res_in_scope(name, scope);
         match (r) {
             Res::Def(_) => { return ResSlot::Answered(r); }
             _           => { }
