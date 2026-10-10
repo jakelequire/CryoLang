@@ -12,7 +12,7 @@
 /// initializer or an assignment to it was identity text, or when it is
 /// computed from identity text: concatenated, formatted, cast, indexed, a
 /// field read off it, or the result of a call that is handed it (as an
-/// argument or as the receiver) and returns something that can carry text.
+/// argument or as the receiver) and returns text.
 /// Identity text is refused where it is:
 ///
 ///   * an argument of a door - a function whose doc comment carries a door
@@ -23,10 +23,18 @@
 /// Nor is the body of a declaration that says why it may, with
 /// `![allow(lookup_by_spelling, reason = "...")]` - the marker the spelling
 /// lint reads, and the one a function that mangles a definition's path into
-/// its link symbol carries.  The check reaches as far as one function: identity text handed to a
-/// parameter of type `string` or `SymbolStr` and looked up by the callee,
-/// or returned as one, is not followed.  It runs over the compiler's own
-/// modules, the only ones a `DeclName` is declared in.
+/// its link symbol carries.  It refuses, too, identity text compared with
+/// other text (`==`, `!=`).
+///
+/// Text that leaves the function - handed to another function's parameter
+/// or receiver, or returned - is followed there: each function records
+/// where its parameters, its receiver and its answer go, and once every
+/// module is checked the lookups that text read off a definition reaches
+/// through any chain of calls are refused (`IdentityFlow`).  A door's or an
+/// allowed body is not followed into: what it is handed is its own to
+/// judge.  Text stored into a field and read back elsewhere is not
+/// followed.  It runs over the compiler's own modules, the only ones a
+/// `DeclName` is declared in.
 namespace compiler::sema::identity_text;
 
 import compiler::ast;
@@ -35,11 +43,22 @@ import compiler::ast::node::{ ASTNode };
 import compiler::ast::declaration::{ FunctionDeclNode, MethodNode, VarDeclNode };
 import compiler::ast::expression::{
     ArrayAccessNode, BinaryExprNode, CallExprNode, CastExprNode, ExpressionNode, IdentifierNode,
-    IfExprNode, MemberAccessNode, TernaryExprNode, UnaryExprNode
+    IfExprNode, LiteralNode, MemberAccessNode, TernaryExprNode, UnaryExprNode
 };
+import compiler::ast::{ LiteralKind };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
-import compiler::decl_index::{ OverloadId };
+import compiler::decl_index::{ OverloadId, OverloadKey };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::lex::{ TokenType };
+import compiler::resolver::symbol_id::{ SymbolKey };
+import compiler::sema::identity_flow::{ FlowFinding, FlowNode, FlowSink };
+import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
+import std::collections::hashset;
+import std::collections::hashset::{ HashSet };
+import std::core::option;
+import std::core::option::{ Option };
 import compiler::diag;
 import compiler::diag::{ ErrorCode };
 import compiler::diag::diagnostic::{ Diagnostic };
@@ -93,25 +112,49 @@ implement struct IdentityTextCheck {
         return DirectiveProcessingPasses::carries_identity_text(ctx, ty);
     }
 
-    /// Whether a value of type `ty` can carry text: anything but a scalar.
-    static can_carry_text(ctx: CompilationContext*, ty: TypeRef) -> boolean {
-        if (!ty.is_valid()) { return false; }
-        const t: Type* = ctx.type_arena.lookup(ty);
-        if (t == null) { return false; }
-        return match (t.kind) {
-            TypeKind::Bool  => { false }
-            TypeKind::Int   => { false }
-            TypeKind::Float => { false }
-            TypeKind::Char  => { false }
-            TypeKind::Void  => { false }
-            TypeKind::Unit  => { false }
-            _               => { true }
-        };
+    /// Start checking `func`'s body: each parameter of a text type, the
+    /// receiver included, carries whatever its callers hand it, which is
+    /// known only once every caller is checked - so each is a node of the
+    /// flow between functions (`IdentityFlow`).  A door's or an allowed
+    /// body records nothing.
+    static enter(ctx: CompilationContext*, state: SemaState*, func: FunctionDeclNode*) -> void {
+        state.identity_locals = HashSet::<SymbolKey>::new();
+        state.flow_locals = HashMap::<SymbolKey, FlowNode[]>::new();
+        state.identity_entry = OverloadId::invalid();
+        state.identity_exempt = state.identity_text_on && IdentityTextCheck::function_is_exempt(ctx, func);
+        if (!state.identity_text_on || state.identity_exempt || func == null) { return; }
+        if (!func.overload_entry.is_valid()) { return; }
+        state.identity_entry = func.overload_entry;
+        const key: OverloadKey = func.overload_entry.table_key();
+        mut position: i64 = 0;
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const p: VarDeclNode* = func.parameters[i];
+            if (p == null) { continue; }
+            const node: FlowNode = if (p.is_receiver()) { FlowNode::receiver(key) } else { FlowNode::argument(key, position) };
+            if (!p.is_receiver()) { position = position + 1; }
+            if (!p.sym_id.is_valid() || !IdentityTextCheck::is_text(ctx, p.resolved_type)) { continue; }
+            if (IdentityTextCheck::is_identity_text_type(ctx, p.resolved_type)) { continue; }
+            state.flow_locals.insert(p.sym_id.table_key(), [node]);
+        }
+    }
+
+    /// Whether the function being checked records its flows.
+    static flowing(state: SemaState*) -> boolean {
+        return state.identity_text_on && !state.identity_exempt && state.identity_entry.is_valid();
     }
 
     /// Whether `e` is identity text, as the header says.
     static is_identity_text(ctx: CompilationContext*, state: SemaState*, e: ExpressionNode*,
                             depth: i32) -> boolean {
+        mut nodes: FlowNode[] = [];
+        return IdentityTextCheck::taint(ctx, state, e, depth, &nodes);
+    }
+
+    /// Whether `e` is identity text, as the header says; each flow node
+    /// whose text `e` may hold - a parameter or receiver of the function
+    /// being checked, or the answer of a call - is added to `nodes`.
+    static taint(ctx: CompilationContext*, state: SemaState*, e: ExpressionNode*,
+                 depth: i32, nodes: FlowNode[]*) -> boolean {
         if (e == null || depth > IDENTITY_TEXT_DEPTH) { return false; }
         if (e.resolved_type.is_valid() && IdentityTextCheck::is_identity_text_type(ctx, e.resolved_type)) {
             return true;
@@ -122,62 +165,86 @@ implement struct IdentityTextCheck {
             match (ident.res) {
                 ResSlot::Answered(r) => {
                     match (r) {
-                        Res::Local(sym) => { return state.identity_locals.contains(&sym.table_key()); }
-                        _               => { return false; }
+                        Res::Local(sym) => {
+                            match (state.flow_locals.get_ref(&sym.table_key())) {
+                                Option::Some(held) => {
+                                    for (mut k: i64 = 0; k < (*held).length; k++) {
+                                        IdentityTextCheck::add_node(nodes, (*held)[k]);
+                                    }
+                                }
+                                Option::None => { }
+                            }
+                            return state.identity_locals.contains(&sym.table_key());
+                        }
+                        _ => { return false; }
                     }
                 }
                 _ => { return false; }
             }
         }
-        if (!IdentityTextCheck::can_carry_text(ctx, e.resolved_type)) { return false; }
+        if (!IdentityTextCheck::is_text(ctx, e.resolved_type)) { return false; }
         if (n.kind == NodeKind::BinaryExpression) {
             const b: BinaryExprNode* = e as BinaryExprNode*;
-            return IdentityTextCheck::is_identity_text(ctx, state, b.left, depth + 1)
-                || IdentityTextCheck::is_identity_text(ctx, state, b.right, depth + 1);
+            const l: boolean = IdentityTextCheck::taint(ctx, state, b.left, depth + 1, nodes);
+            const r: boolean = IdentityTextCheck::taint(ctx, state, b.right, depth + 1, nodes);
+            return l || r;
         }
         if (n.kind == NodeKind::UnaryExpression) {
-            return IdentityTextCheck::is_identity_text(ctx, state, (e as UnaryExprNode*).operand, depth + 1);
+            return IdentityTextCheck::taint(ctx, state, (e as UnaryExprNode*).operand, depth + 1, nodes);
         }
         if (n.kind == NodeKind::CastExpression) {
-            return IdentityTextCheck::is_identity_text(ctx, state, (e as CastExprNode*).expression, depth + 1);
+            return IdentityTextCheck::taint(ctx, state, (e as CastExprNode*).expression, depth + 1, nodes);
         }
         if (n.kind == NodeKind::ArrayAccess) {
-            return IdentityTextCheck::is_identity_text(ctx, state, (e as ArrayAccessNode*).array, depth + 1);
+            return IdentityTextCheck::taint(ctx, state, (e as ArrayAccessNode*).array, depth + 1, nodes);
         }
         if (n.kind == NodeKind::TernaryExpression) {
             const t: TernaryExprNode* = e as TernaryExprNode*;
-            return IdentityTextCheck::is_identity_text(ctx, state, t.true_expr, depth + 1)
-                || IdentityTextCheck::is_identity_text(ctx, state, t.false_expr, depth + 1);
+            const a: boolean = IdentityTextCheck::taint(ctx, state, t.true_expr, depth + 1, nodes);
+            const c: boolean = IdentityTextCheck::taint(ctx, state, t.false_expr, depth + 1, nodes);
+            return a || c;
         }
         if (n.kind == NodeKind::IfExpression) {
             const ie: IfExprNode* = e as IfExprNode*;
-            return IdentityTextCheck::is_identity_text(ctx, state, ie.then_expr, depth + 1)
-                || IdentityTextCheck::is_identity_text(ctx, state, ie.else_expr, depth + 1);
+            const a: boolean = IdentityTextCheck::taint(ctx, state, ie.then_expr, depth + 1, nodes);
+            const c: boolean = IdentityTextCheck::taint(ctx, state, ie.else_expr, depth + 1, nodes);
+            return a || c;
         }
         if (n.kind == NodeKind::MemberAccess) {
-            return IdentityTextCheck::is_identity_text(ctx, state, (e as MemberAccessNode*).object, depth + 1);
+            return IdentityTextCheck::taint(ctx, state, (e as MemberAccessNode*).object, depth + 1, nodes);
         }
         if (n.kind == NodeKind::CallExpression) {
             const call: CallExprNode* = e as CallExprNode*;
+            // The call's own answer, whatever it is handed.
+            const entry: OverloadId = CallFacts::callee_entry(ctx, call).entry;
+            if (entry.is_valid()) { IdentityTextCheck::add_node(nodes, FlowNode::returned(entry.table_key())); }
+            mut held: boolean = false;
             const cn: ASTNode* = call.callee as ASTNode*;
             if (cn != null && cn.kind == NodeKind::MemberAccess
-                    && IdentityTextCheck::is_identity_text(ctx, state, (call.callee as MemberAccessNode*).object, depth + 1)) {
-                return true;
+                    && IdentityTextCheck::taint(ctx, state, (call.callee as MemberAccessNode*).object, depth + 1, nodes)) {
+                held = true;
             }
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                if (IdentityTextCheck::is_identity_text(ctx, state, call.arguments[i], depth + 1)) { return true; }
+                if (IdentityTextCheck::taint(ctx, state, call.arguments[i], depth + 1, nodes)) { held = true; }
             }
+            return held;
         }
         return false;
     }
 
+    /// Add `node` to `nodes` unless it is there.
+    static add_node(nodes: FlowNode[]*, node: FlowNode) -> void {
+        for (mut i: i64 = 0; i < (*nodes).length; i++) {
+            if ((*nodes)[i].equals(&node)) { return; }
+        }
+        (*nodes).push(node);
+    }
+
     /// Record the local `var_node` declares as identity text when its
-    /// initializer is.
+    /// initializer is, and as holding the flow nodes its initializer holds.
     static note_local(ctx: CompilationContext*, state: SemaState*, var_node: VarDeclNode*) -> void {
         if (!state.identity_text_on || var_node == null || !var_node.sym_id.is_valid()) { return; }
-        if (IdentityTextCheck::is_identity_text(ctx, state, var_node.initializer, 0)) {
-            state.identity_locals.insert(var_node.sym_id.table_key());
-        }
+        IdentityTextCheck::note_write(ctx, state, var_node.sym_id.table_key(), var_node.initializer);
     }
 
     /// Record the local an assignment writes as identity text when the
@@ -187,16 +254,88 @@ implement struct IdentityTextCheck {
         if (!state.identity_text_on || bin == null || !bin.op.kind.is_assignment_op()) { return; }
         const ln: ASTNode* = bin.left as ASTNode*;
         if (ln == null || ln.kind != NodeKind::Identifier) { return; }
-        if (!IdentityTextCheck::is_identity_text(ctx, state, bin.right, 0)) { return; }
         match ((bin.left as IdentifierNode*).res) {
             ResSlot::Answered(r) => {
                 match (r) {
-                    Res::Local(sym) => { state.identity_locals.insert(sym.table_key()); }
+                    Res::Local(sym) => { IdentityTextCheck::note_write(ctx, state, sym.table_key(), bin.right); }
                     _               => { }
                 }
             }
             _ => { }
         }
+    }
+
+    /// The local `key` is written `value`.
+    static note_write(ctx: CompilationContext*, state: SemaState*, key: SymbolKey, value: ExpressionNode*) -> void {
+        mut nodes: FlowNode[] = [];
+        if (IdentityTextCheck::taint(ctx, state, value, 0, &nodes)) { state.identity_locals.insert(key); }
+        if (nodes.length == 0 || !IdentityTextCheck::flowing(state)) { return; }
+        const held: FlowNode[]* = state.flow_locals.get_or_insert(key, []);
+        for (mut i: i64 = 0; i < nodes.length; i++) { IdentityTextCheck::add_node(held, nodes[i]); }
+    }
+
+    /// The function being checked answers `value`.  What it answers from
+    /// its own parameters is not recorded: a caller takes the answer of a
+    /// call to hold what it handed the call, so the text a caller hands
+    /// comes back to that caller and no other.
+    static check_return(ctx: CompilationContext*, state: SemaState*, value: ExpressionNode*) -> void {
+        if (!IdentityTextCheck::flowing(state) || value == null || state.in_lambda_depth > 0) { return; }
+        const own: OverloadKey = state.identity_entry.table_key();
+        const answer: FlowNode = FlowNode::returned(own);
+        mut nodes: FlowNode[] = [];
+        if (IdentityTextCheck::taint(ctx, state, value, 0, &nodes)) {
+            ctx.identity_flow.seed(answer, value.span);
+        }
+        for (mut i: i64 = 0; i < nodes.length; i++) {
+            if (nodes[i].is_input_of(own)) { continue; }
+            ctx.identity_flow.flow(nodes[i], answer);
+        }
+    }
+
+    /// Refuse identity text compared with other text (`==`, `!=`): the
+    /// comparison asks which definition the text names, which the
+    /// identity it was read from answers.
+    static check_compare(ctx: CompilationContext*, state: SemaState*, bin: BinaryExprNode*) -> void {
+        if (!state.identity_text_on || state.identity_exempt || bin == null) { return; }
+        if (bin.op.kind != TokenType::EqualEqual && bin.op.kind != TokenType::ExclaimEqual) { return; }
+        if (!IdentityTextCheck::is_text(ctx, bin.left.resolved_type) || !IdentityTextCheck::is_text(ctx, bin.right.resolved_type)) {
+            return;
+        }
+        if (IdentityTextCheck::is_empty_text(bin.left) || IdentityTextCheck::is_empty_text(bin.right)) { return; }
+        IdentityTextCheck::sink_or_refuse(ctx, state, bin.left, (bin as ASTNode*).span, "==", Text::new("operand of a comparison"));
+        IdentityTextCheck::sink_or_refuse(ctx, state, bin.right, (bin as ASTNode*).span, "==", Text::new("operand of a comparison"));
+    }
+
+    /// Whether `e` is the empty string literal: a comparison with it asks
+    /// whether there is any text, not which.
+    static is_empty_text(e: ExpressionNode*) -> boolean {
+        if (e == null || (e as ASTNode*).kind != NodeKind::Literal) { return false; }
+        const lit: LiteralNode* = e as LiteralNode*;
+        return lit.literal_kind == LiteralKind::String && lit.value.length() == 0;
+    }
+
+    /// Whether a value of type `ty` is text: a `string` or one of the
+    /// compiler's spelling or identity-text types, directly or through a
+    /// reference, a pointer or an array.  A message's `Text` is not: text
+    /// put into a message is shown.
+    static is_text(ctx: CompilationContext*, ty: TypeRef) -> boolean {
+        mut cur: TypeRef = ty;
+        for (mut depth: i32 = 0; depth < 8; depth++) {
+            if (!cur.is_valid()) { return false; }
+            const t: Type* = ctx.type_arena.lookup(cur);
+            if (t == null) { return false; }
+            match (t.kind) {
+                TypeKind::Reference => { cur = (t as ReferenceType*).referent; }
+                TypeKind::Pointer   => { cur = (t as PointerType*).pointee; }
+                TypeKind::Array     => { cur = (t as ArrayType*).element; }
+                TypeKind::String    => { return true; }
+                _                   => {
+                    return DirectiveProcessingPasses::spelling_type_of(ctx, cur).length() > 0
+                        || IdentityTextCheck::is_identity_text_type(ctx, cur);
+                }
+            }
+        }
+        return false;
     }
 
     /// Whether `call` asks a hash table by a key: a method of `HashMap` or
@@ -221,33 +360,94 @@ implement struct IdentityTextCheck {
     }
 
     /// E0157 at each argument of `call` that is identity text, when the
-    /// call is a door's or a hash table's.
+    /// call is a door's or a hash table's; text that may come from a
+    /// parameter or another call's answer is recorded as a sink of that
+    /// node.  Any other call is a flow: what each argument and the receiver
+    /// may hold goes on to the callee's matching node.
     static check_call(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*) -> void {
         if (!state.identity_text_on || state.identity_exempt || call == null) { return; }
         const entry: OverloadId = CallFacts::callee_entry(ctx, call).entry;
         if (DirectiveProcessingPasses::is_door(ctx.decl_index.entry_decl(entry))) {
+            const callee: string = IdentityTextCheck::callee_shown(ctx, call);
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                IdentityTextCheck::refuse_if_identity_text(ctx, state, call, call.arguments[i], Text::new("argument of a door"));
+                IdentityTextCheck::sink_or_refuse(ctx, state, call.arguments[i], call.arguments[i].span, callee,
+                    Text::new("argument of a door"));
             }
             return;
         }
         if (IdentityTextCheck::is_table_call(ctx, call)) {
-            IdentityTextCheck::refuse_if_identity_text(ctx, state, call, call.arguments[0], Text::new("key of a hash table"));
+            IdentityTextCheck::sink_or_refuse(ctx, state, call.arguments[0], call.arguments[0].span,
+                IdentityTextCheck::callee_shown(ctx, call), Text::new("key of a hash table"));
+            return;
+        }
+        if (!entry.is_valid()) { return; }
+        const key: OverloadKey = entry.table_key();
+        const cn: ASTNode* = call.callee as ASTNode*;
+        if (cn != null && cn.kind == NodeKind::MemberAccess) {
+            IdentityTextCheck::flow_into(ctx, state, (call.callee as MemberAccessNode*).object, FlowNode::receiver(key));
+        }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            IdentityTextCheck::flow_into(ctx, state, call.arguments[i], FlowNode::argument(key, i));
         }
     }
 
-    static refuse_if_identity_text(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*,
-                                   arg: ExpressionNode*, asked: Text) -> void {
-        if (!IdentityTextCheck::is_identity_text(ctx, state, arg, 0)) { return; }
+    /// What `value` may hold goes on to `to`; identity text in it enters
+    /// there.
+    static flow_into(ctx: CompilationContext*, state: SemaState*, value: ExpressionNode*, to: FlowNode) -> void {
+        if (value == null) { return; }
+        mut nodes: FlowNode[] = [];
+        if (IdentityTextCheck::taint(ctx, state, value, 0, &nodes)) { ctx.identity_flow.seed(to, value.span); }
+        if (!IdentityTextCheck::flowing(state)) { return; }
+        for (mut i: i64 = 0; i < nodes.length; i++) { ctx.identity_flow.flow(nodes[i], to); }
+    }
+
+    /// The call's callee as written, for a message.
+    static callee_shown(ctx: CompilationContext*, call: CallExprNode*) -> string {
         mut callee: string = CallFacts::callee_spelled(ctx, call);
         if (callee.starts_with(".")) { callee = callee.substr(1, callee.length() as i64 - 1); }
+        return callee;
+    }
+
+    /// `arg` is looked up at `site` by `callee`: E0157 when it is identity
+    /// text; a sink of each flow node it may hold otherwise.
+    static sink_or_refuse(ctx: CompilationContext*, state: SemaState*, arg: ExpressionNode*, site: SourceSpan,
+                          callee: string, asked: Text) -> void {
+        if (arg == null) { return; }
+        mut nodes: FlowNode[] = [];
+        if (IdentityTextCheck::taint(ctx, state, arg, 0, &nodes)) {
+            IdentityTextCheck::refuse(ctx, callee, site, asked, SourceSpan::none());
+            return;
+        }
+        if (!IdentityTextCheck::flowing(state)) { return; }
+        for (mut i: i64 = 0; i < nodes.length; i++) {
+            ctx.identity_flow.sink(nodes[i], FlowSink { span: site, callee: callee, asked: asked.as_string() });
+        }
+    }
+
+    /// E0157 at `site`: identity text is looked up by `callee`.  `entered`,
+    /// when it names a place, is where the text left the function that read
+    /// it off a definition.
+    static refuse(ctx: CompilationContext*, callee: string, site: SourceSpan, asked: Text, entered: SourceSpan) -> void {
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0157_LOOKUP_BY_SPELLING, Text::new(fmt::format(
             "`%s` is handed text read off a definition, which is shown and never looked up by",
             callee)));
-        diag = diag.at_with_label(arg.span, Text::new(fmt::format(
+        diag = diag.at_with_label(site, Text::new(fmt::format(
             "computed from a `DeclName`, and the %s", asked.as_string())));
+        if (entered.file.length() > 0) {
+            diag = diag.also_at(entered, Text::new("the definition's text leaves the function that read it here"));
+        }
         diag = diag.help(Text::new(
             "ask with the identity the text was read from: its `DefId`, or the `TypeRef` it declares"));
         ctx.emit_diagnostic(diag);
+    }
+
+    /// Once every module is checked: E0157 at each lookup that text read off
+    /// a definition reaches through other functions.
+    static report_flows(ctx: CompilationContext*) -> void {
+        const found: FlowFinding[] = ctx.identity_flow.findings();
+        for (mut i: i64 = 0; i < found.length; i++) {
+            IdentityTextCheck::refuse(ctx, found[i].sink.callee, found[i].sink.span,
+                Text::new(found[i].sink.asked), found[i].entered);
+        }
     }
 }

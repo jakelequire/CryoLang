@@ -155,8 +155,7 @@ type struct SpecializationPasses {
                     // `Layout::array<T>`) need their own template entries;
                     // run_template_registration would otherwise miss them.
                     if (!node.is_generic()) {
-                        const owner_key: SymbolStr = ctx.defs.path_of(node.def).spelling();
-                        SpecializationPasses::register_static_method_templates(owner_key, node.methods,
+                        SpecializationPasses::register_static_method_templates(node.methods,
                             registry, arena, ctx);
                         // Generic INSTANCE methods on non-generic structs
                         // (e.g. `Response::write_to<W>`) dispatch via receiver
@@ -177,8 +176,7 @@ type struct SpecializationPasses {
                             stmt, NodeKind::UnionDeclaration, node.def, registry, arena, ctx);
                     }
                     if (!node.is_generic()) {
-                        const owner_key: SymbolStr = ctx.defs.path_of(node.def).spelling();
-                        SpecializationPasses::register_static_method_templates(owner_key, node.methods,
+                        SpecializationPasses::register_static_method_templates(node.methods,
                             registry, arena, ctx);
                         SpecializationPasses::register_inherent_owner(
                             ctx.decl_index.type_of_decl(node.def, Text::new("specialization/inherent owner")), stmt, registry);
@@ -198,8 +196,7 @@ type struct SpecializationPasses {
                             stmt, NodeKind::ClassDeclaration, node.def, registry, arena, ctx);
                     }
                     if (!node.is_generic()) {
-                        const owner_key: SymbolStr = ctx.defs.path_of(node.def).spelling();
-                        SpecializationPasses::register_static_method_templates(owner_key, node.methods,
+                        SpecializationPasses::register_static_method_templates(node.methods,
                             registry, arena, ctx);
                         SpecializationPasses::register_inherent_owner(
                             ctx.decl_index.type_of_decl(node.def, Text::new("specialization/inherent owner")), stmt, registry);
@@ -849,14 +846,11 @@ type struct SpecializationPasses {
     /// `try_infer_method_call` / `specialize_method`, which dispatches by
     /// receiver type rather than scope-qualified name.
     ///
-    /// Owner-qualified key (`<owner_key>::<method>`) avoids collisions when
-    /// two types in the same namespace each declare a static method with the
-    /// same bare name.  `owner_key` is the owner's registered key - a
-    /// declaration's stamp, an impl head's `target_key` - never the spelling
-    /// qualified by the file the methods were written in, which names the
-    /// owner only when that file declares it.
-    static register_static_method_templates(owner_key: SymbolStr,
-                                              methods: &MethodNode*[],
+    /// Each is registered under its own definition's path (`<owner>::<method>`),
+    /// which keeps apart two types' static methods of one bare name: the
+    /// method's definition has the owner it is declared on as its parent,
+    /// whichever file the methods were written in.
+    static register_static_method_templates(methods: &MethodNode*[],
                                               registry: GenericRegistry*,
                                               arena: TypeArena*,
                                               ctx: CompilationContext*) -> void {
@@ -872,8 +866,7 @@ type struct SpecializationPasses {
             if (!m.is_static) { continue; }
             if (!m.func.is_generic()) { continue; }
 
-            const qualified_sym: SymbolStr = GenericRegistry::member_template_key(
-                ctx.intern_table, owner_key, m.func.name);
+            const qualified_sym: SymbolStr = ctx.defs.path_of(m.func.def).spelling();
 
             const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
                 m.func.generic_params, arena);
@@ -930,7 +923,6 @@ type struct SpecializationPasses {
         // module declares the type; every trait implemented for another
         // module's type (`Display for Option<T>` in `fmt::display`) keyed a
         // name no template carries and was attached to none.
-        const qualified_sym: SymbolStr = node.target_key(ctx.type_arena);
         if (registry.template_of(node.target_def()) != null) {
             registry.register_impl_block(node.target_def(), node);
         } else if (!node.is_trait_impl()) {
@@ -953,7 +945,7 @@ type struct SpecializationPasses {
             const arena: TypeArena* = ctx.type_arena;
             if (arena != null) {
                 SpecializationPasses::register_static_method_templates(
-                    qualified_sym, node.methods, registry, arena, ctx);
+                    node.methods, registry, arena, ctx);
             }
         }
 

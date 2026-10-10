@@ -1,0 +1,165 @@
+/// The identity-text flow between functions.
+///
+/// `IdentityTextCheck` follows text read off a definition through the
+/// function that reads it.  Text also leaves a function - handed to another
+/// one's parameter, or returned - and is looked up there.  Each checked
+/// function therefore records, as it is checked, where its parameters and
+/// its answer go: into another function's parameter or answer (a flow), or
+/// to a lookup (a sink: a door's argument, a hash table's key, a
+/// comparison).  It records too where text read off a definition enters
+/// such a node (a seed).  Once every module is checked, the sinks a seed
+/// reaches are the lookups that text reaches, however many functions it
+/// passed through on the way; the order the functions were checked in does
+/// not matter.
+namespace compiler::sema::identity_flow;
+
+import compiler::decl_index::{ OverloadKey };
+import compiler::diag::source_span::{ SourceSpan };
+import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
+import std::core::hash::{ Hash, Hasher };
+import std::core::cmp::{ Eq };
+import std::core::option;
+import std::core::option::{ Option };
+
+/// The slot of a method's receiver.
+const FLOW_RECEIVER: i64 = -1;
+/// The slot of a function's answer.
+const FLOW_RETURNED: i64 = -2;
+
+/// Where text can go between functions: one of a function's arguments, by
+/// position among those a call writes, its receiver, or its answer.
+type struct FlowNode {
+private:
+    entry: OverloadKey;
+    slot: i64;
+
+public:
+    static argument(entry: OverloadKey, position: i64) -> FlowNode {
+        return FlowNode { entry: entry, slot: position };
+    }
+
+    static receiver(entry: OverloadKey) -> FlowNode {
+        return FlowNode { entry: entry, slot: FLOW_RECEIVER };
+    }
+
+    static returned(entry: OverloadKey) -> FlowNode {
+        return FlowNode { entry: entry, slot: FLOW_RETURNED };
+    }
+
+    /// Whether this is one of `entry`'s parameters or its receiver.
+    is_input_of(&this, entry: OverloadKey) -> boolean {
+        return this.entry.equals(&entry) && this.slot != FLOW_RETURNED;
+    }
+}
+
+implement trait Hash for struct FlowNode {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.entry.hash(hasher);
+        this.slot.hash(hasher);
+    }
+}
+
+implement trait Eq for struct FlowNode {
+    equals(&this, other: &FlowNode) -> boolean {
+        return this.entry.equals(&other.entry) && this.slot == other.slot;
+    }
+}
+
+/// A lookup text reaching a node is looked up by: where, what is asked
+/// (the door or the table method, as written), and how.
+type struct FlowSink {
+    span:   SourceSpan;
+    callee: string;
+    asked:  string;
+}
+
+/// A lookup text read off a definition reaches, and where that text left
+/// the function that read it.
+type struct FlowFinding {
+    sink:    FlowSink;
+    entered: SourceSpan;
+}
+
+type struct IdentityFlow {
+private:
+    edges: HashMap<FlowNode, FlowNode[]>;
+    sinks: HashMap<FlowNode, FlowSink[]>;
+    seeds: FlowNode[];
+    seed_spans: SourceSpan[];
+
+public:
+    static new() -> IdentityFlow {
+        return IdentityFlow {
+            edges: HashMap::<FlowNode, FlowNode[]>::new(),
+            sinks: HashMap::<FlowNode, FlowSink[]>::new(),
+            seeds: [],
+            seed_spans: [],
+        };
+    }
+
+    /// Text at `from` goes on to `to`.
+    flow(mut &this, from: FlowNode, to: FlowNode) -> void {
+        if (from.equals(&to)) { return; }
+        const outs: FlowNode[]* = this.edges.get_or_insert(from, []);
+        for (mut i: i64 = 0; i < (*outs).length; i++) {
+            if ((*outs)[i].equals(&to)) { return; }
+        }
+        (*outs).push(to);
+    }
+
+    /// Text at `at` is looked up by `sink`.
+    sink(mut &this, at: FlowNode, sink: FlowSink) -> void {
+        const list: FlowSink[]* = this.sinks.get_or_insert(at, []);
+        (*list).push(sink);
+    }
+
+    /// Text read off a definition goes to `at`, leaving its function at
+    /// `span`.
+    seed(mut &this, at: FlowNode, span: SourceSpan) -> void {
+        this.seeds.push(at);
+        this.seed_spans.push(span);
+    }
+
+    /// Every sink a seed reaches, once each, with where the first seed to
+    /// reach it entered.
+    findings(&this) -> FlowFinding[] {
+        mut out: FlowFinding[] = [];
+        mut reached: HashMap<FlowNode, i64> = HashMap::<FlowNode, i64>::new();
+        mut work: FlowNode[] = [];
+        mut work_seed: i64[] = [];
+        for (mut s: i64 = 0; s < this.seeds.length; s++) {
+            if (reached.contains_key(&this.seeds[s])) { continue; }
+            reached.insert(this.seeds[s], s);
+            work.push(this.seeds[s]);
+            work_seed.push(s);
+        }
+        mut wi: i64 = 0;
+        while (wi < work.length) {
+            const node: FlowNode = work[wi];
+            const from_seed: i64 = work_seed[wi];
+            wi = wi + 1;
+            match (this.sinks.get_ref(&node)) {
+                Option::Some(list) => {
+                    for (mut k: i64 = 0; k < (*list).length; k++) {
+                        out.push(FlowFinding { sink: (*list)[k], entered: this.seed_spans[from_seed] });
+                    }
+                }
+                Option::None => { }
+            }
+            match (this.edges.get_ref(&node)) {
+                Option::Some(outs) => {
+                    for (mut k: i64 = 0; k < (*outs).length; k++) {
+                        const next: FlowNode = (*outs)[k];
+                        if (reached.contains_key(&next)) { continue; }
+                        reached.insert(next, from_seed);
+                        work.push(next);
+                        work_seed.push(from_seed);
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        return out;
+    }
+}

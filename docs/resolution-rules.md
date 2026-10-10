@@ -37,10 +37,17 @@ path or leaf is read as a `DeclName`, whose text comes back only through
 `DeclName::spelling` (for a node synthesized to carry the name).  Sema
 follows text computed from a `DeclName` through the function that reads it -
 concatenated, formatted, held in a local - and refuses it where it becomes a
-door's argument or a hash table's key (E0157).  A door's own body is not
-checked, nor a declaration allowed `lookup_by_spelling` with a reason.  Text
-handed on to another function as a `string` or `SymbolStr`, or returned as
-one, is not followed.
+door's argument, a hash table's key, or an operand of `==` or `!=` beside
+other text (E0157); a comparison with the empty string asks whether there
+is any text, and is no lookup.  Text that leaves the function is followed
+too: each function records where its text-typed parameters, its receiver
+and its answer go - into another function's, or to a lookup - and once
+every module is checked, a lookup that text read off a definition reaches
+through any chain of calls is refused there, naming where the text left
+the function that read it.  A value that is not text (a message's `Text`,
+a struct) ends the flow, and so does text stored into a field.  A door's
+own body is not checked, nor a declaration allowed `lookup_by_spelling`
+with a reason: what either is handed is its own to judge.
 
 ## The doors
 
@@ -67,10 +74,13 @@ The compiler reads the same marker, and checks rule three over every
 function handed a spelling (a parameter of type `SymbolStr` or
 `QualifiedName`).  Sema follows each such parameter through the body - into
 locals, through `&`, `*` and casts, element and text-member reads, a
-`SymbolStr`'s number, concatenation, conditionals, and the text a non-door
-call returns when handed it - and refuses it (E0157) where it is looked up:
-a hash table's key, an operand of `==` or `!=`, a boolean call that is an
-operation of text or is handed it as plain text, or a `match`'s subject.
+`SymbolStr`'s number and a number computed from it by arithmetic (a key
+packed as `(owner << 32) | name.id`), concatenation, conditionals, and the
+text a non-door call returns when handed it - and refuses it (E0157) where
+it is looked up: a hash table's key, an operand of `==` or `!=`, a call
+answering a `boolean` or an `Option` that is an operation of text or is
+handed it as plain text (an equality, a prefix test, `names.index_of(&name)`),
+or a `match`'s subject.
 A function that only carries the spelling - stores it, returns it, hands it
 to another function or to a door - needs nothing.  A door's body is not
 checked, nor one whose declaration allows `lookup_by_spelling` with a
@@ -84,9 +94,10 @@ function: a spelling handed on is looked up, and refused, in the callee.
 The same check follows a spelling read off a field - a declaration's, a
 syntax node's or a table row's name (`decls[i].name.equals(node.name)`) -
 in every body, handed a spelling or not, and refuses it at a hash table's
-key, a `match`'s subject, a boolean call handed it with other text, and an
-`==` or `!=` whose other side is a spelling too (against a number it is a
-validity test).  The diagnostic names the function and the site: "`f`
+key, a `match`'s subject, a call answering a `boolean` or an `Option`
+handed it with other text, and an `==` or `!=` whose other side is a
+spelling or other text - a literal, a string held in a local (against a
+number or the empty string it is a validity test).  The diagnostic names the function and the site: "`f`
 looks up a spelling read off a field".  A comparison that is no lookup -
 a duplicate-declaration check, a comparison primitive, a convention such
 as a leading `_` - says why on its allow.

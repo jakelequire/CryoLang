@@ -14,16 +14,18 @@
 /// read through `&`, `*` or a cast, an element or a text member read off it,
 /// concatenated, chosen by a conditional, or the text a call other than a
 /// door's returns when it is handed it.  A `SymbolStr`'s number is its
-/// spelling, so a number read off one (`name.id`) holds it too; any other
-/// number - a length, a depth - does not.  The spelling is looked up where
-/// it is:
+/// spelling, so a number read off one (`name.id`) holds it too, and so does
+/// a number computed from that one by arithmetic - a key packed from it
+/// (`(owner << 32) | name.id`); any other number - a length, a depth -
+/// does not.  The spelling is looked up where it is:
 ///
 ///   * the key handed to a hash table (`HashMap` or `HashSet`);
 ///   * an operand of `==` or `!=`;
-///   * handed to a call that answers a `boolean` and is handed text besides
-///     it, when the call is an operation of text (its receiver is text) or
-///     is handed the spelling as plain text: an equality, a prefix test, a
-///     search of an array of names;
+///   * handed to a call that answers a `boolean` or an `Option` and is
+///     handed text besides it, when the call is an operation of text (its
+///     receiver is text) or is handed the spelling as plain text: an
+///     equality, a prefix test, a search of an array of names
+///     (`names.index_of(&name)`);
 ///   * the subject of a `match`.
 ///
 /// The check reaches as far as one function.  A spelling handed to another
@@ -47,7 +49,8 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::lex::{ TokenType };
 import compiler::passes::directive_processing::{ CompilerText, DirectiveProcessingPasses };
-import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::resolver::res::{ DefId, Res, ResSlot };
 import compiler::resolver::symbol_id::{ SymbolKey };
 import compiler::sema::call_facts::{ CallFacts };
 import compiler::sema::identity_text::{ IdentityTextCheck };
@@ -57,6 +60,7 @@ import compiler::types::{ TypeKind };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
+import compiler::types::generic_registry::{ GenericRegistry };
 import std::collections::hashmap;
 import std::collections::hashmap::{ HashMap };
 import std::core::option;
@@ -119,6 +123,13 @@ implement struct SpellingLookupCheck {
             }
         }
         return false;
+    }
+
+    /// Whether a value of type `ty` is an integer.
+    static is_number(ctx: CompilationContext*, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = ctx.type_arena.lookup(ty);
+        return t != null && t.kind == TypeKind::Int;
     }
 
     /// Whether a value of type `ty` is a `SymbolStr`, directly or through a
@@ -186,6 +197,18 @@ implement struct SpellingLookupCheck {
             }
             return -1;
         }
+        if (n.kind == NodeKind::BinaryExpression && SpellingLookupCheck::packs(e as BinaryExprNode*)) {
+            const pb: BinaryExprNode* = e as BinaryExprNode*;
+            const pl: i64 = SpellingLookupCheck::origin(ctx, state, pb.left, depth + 1);
+            if (pl >= 0) { return pl; }
+            return SpellingLookupCheck::origin(ctx, state, pb.right, depth + 1);
+        }
+        if (n.kind == NodeKind::ArrayAccess && SpellingLookupCheck::is_number(ctx, e.resolved_type)) {
+            // A number read out of an array that holds a spelling's number -
+            // one pushed into a local array - holds it.  A character of a
+            // spelling's text does not.
+            return SpellingLookupCheck::origin(ctx, state, (e as ArrayAccessNode*).array, depth + 1);
+        }
         if (!SpellingLookupCheck::is_text(ctx, e.resolved_type)) { return -1; }
         if (n.kind == NodeKind::ArrayAccess) {
             return SpellingLookupCheck::origin(ctx, state, (e as ArrayAccessNode*).array, depth + 1);
@@ -222,6 +245,36 @@ implement struct SpellingLookupCheck {
         return -1;
     }
 
+    /// Whether `bin` computes a number from its operands' numbers: a key
+    /// packed from a spelling's number keeps the spelling.
+    static packs(bin: BinaryExprNode*) -> boolean {
+        return match (bin.op.kind) {
+            TokenType::LessLess       => { true }
+            TokenType::GreaterGreater => { true }
+            TokenType::Pipe           => { true }
+            TokenType::Amp            => { true }
+            TokenType::Caret          => { true }
+            TokenType::Plus           => { true }
+            TokenType::Minus          => { true }
+            TokenType::Star           => { true }
+            _                         => { false }
+        };
+    }
+
+    /// Whether a call answering `ty` asks a question of what it is handed:
+    /// a `boolean`, or an `Option` - the answer of a search.
+    static answers_question(ctx: CompilationContext*, ty: TypeRef) -> boolean {
+        const t: Type* = ctx.type_arena.lookup(ty);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::Bool) { return true; }
+        const base_ty: TypeRef = ctx.type_arena.inst_generic_base(ty);
+        if (!base_ty.is_valid()) { return false; }
+        const base: DefId = ctx.decl_index.registered_def(base_ty);
+        const reg: GenericRegistry* = ctx.get_generic_registry();
+        if (!base.is_valid() || reg == null) { return false; }
+        return base.equals(reg.wellknown(LangItem::Option));
+    }
+
     /// The receiver `call` is made on, or null for a call that names no
     /// receiver.
     static receiver_of(call: CallExprNode*) -> ExpressionNode* {
@@ -253,12 +306,17 @@ implement struct SpellingLookupCheck {
             const lo: i64 = SpellingLookupCheck::origin(ctx, state, bin.left, 0);
             const ro: i64 = SpellingLookupCheck::origin(ctx, state, bin.right, 0);
             // A parameter's spelling compared with anything is looked up; a
-            // field's, only when compared with another spelling - against a
-            // number it is a validity test.
+            // field's, when compared with another spelling or with text - a
+            // literal, a string held in a local.  Against a number or the
+            // empty string it is a validity test.
             mut o: i64 = -1;
             if (lo >= 0 && lo != SPELLING_FIELD) { o = lo; }
             else if (ro >= 0 && ro != SPELLING_FIELD) { o = ro; }
             else if (lo >= 0 && ro >= 0) { o = SPELLING_FIELD; }
+            else if (lo >= 0 && SpellingLookupCheck::is_text(ctx, bin.right.resolved_type)
+                     && !IdentityTextCheck::is_empty_text(bin.right)) { o = SPELLING_FIELD; }
+            else if (ro >= 0 && SpellingLookupCheck::is_text(ctx, bin.left.resolved_type)
+                     && !IdentityTextCheck::is_empty_text(bin.left)) { o = SPELLING_FIELD; }
             if (o >= 0) { SpellingLookupCheck::refuse(ctx, state, o, (bin as ASTNode*).span, Text::new("compared")); }
             return;
         }
@@ -279,7 +337,8 @@ implement struct SpellingLookupCheck {
     }
 
     /// Refuse a parameter's spelling handed to a hash table as its key, or
-    /// to a call answering a `boolean` that is handed text besides it - an
+    /// to a call answering a `boolean` or an `Option` that is handed text
+    /// besides it - an
     /// operation of the text itself (its receiver is text), or one handed the
     /// spelling as plain text.  A spelling handed as a spelling to some other
     /// function is that function's to look up.  A door's call is what a
@@ -287,6 +346,7 @@ implement struct SpellingLookupCheck {
     static check_call(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*, ty: TypeRef) -> void {
         if (!state.spelling_on || call == null) { return; }
         if (SpellingLookupCheck::calls_door(ctx, call)) { return; }
+        SpellingLookupCheck::note_array_write(ctx, state, call);
         if (IdentityTextCheck::is_table_call(ctx, call)) {
             const k: i64 = SpellingLookupCheck::origin(ctx, state, call.arguments[0], 0);
             if (k >= 0) {
@@ -294,8 +354,7 @@ implement struct SpellingLookupCheck {
             }
             return;
         }
-        const t: Type* = ctx.type_arena.lookup(ty);
-        if (t == null || t.kind != TypeKind::Bool) { return; }
+        if (!SpellingLookupCheck::answers_question(ctx, ty)) { return; }
         mut operands: ExpressionNode*[] = [];
         const recv: ExpressionNode* = SpellingLookupCheck::receiver_of(call);
         if (recv != null) { operands.push(recv); }
@@ -317,6 +376,35 @@ implement struct SpellingLookupCheck {
                     }
                 }
             }
+        }
+    }
+
+    /// Record a local array as holding a spelling when a call made on it -
+    /// a push, an insert - is handed one: its elements are read back and
+    /// compared later (`seen[k] == f.name.id`).  A local once holding it
+    /// stays so.
+    static note_array_write(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*) -> void {
+        const recv: ExpressionNode* = SpellingLookupCheck::receiver_of(call);
+        if (recv == null || (recv as ASTNode*).kind != NodeKind::Identifier) { return; }
+        const rt: Type* = ctx.type_arena.lookup(recv.resolved_type);
+        if (rt == null || rt.kind != TypeKind::Array) { return; }
+        mut o: i64 = -1;
+        for (mut i: i64 = 0; i < call.arguments.length && o < 0; i++) {
+            o = SpellingLookupCheck::origin(ctx, state, call.arguments[i], 0);
+        }
+        if (o < 0) { return; }
+        match ((recv as IdentifierNode*).res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Local(sym) => {
+                        if (!state.spelling_locals.contains_key(&sym.table_key())) {
+                            state.spelling_locals.insert(sym.table_key(), o);
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
         }
     }
 

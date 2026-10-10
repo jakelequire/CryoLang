@@ -1,0 +1,131 @@
+/// A spelling is looked up wherever it reaches a lookup, in whatever form
+/// it travels: as text held in a local string, searched for in an array of
+/// names with `index_of`, packed into a number that keys a table, or kept
+/// in a local array and read back.  Each is refused (E0157).  An emptiness
+/// test, a validity test against a number, a spelling's number used to
+/// count, and a spelling carried into a value are not lookups.  The spelling types are known to the compiler
+/// by the qualified names its own declarations give them, so this program
+/// declares a `SymbolStr` at that name.
+namespace compiler::resolver::symbol_str;
+
+import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
+import std::core::option;
+import std::core::option::{ Option };
+
+type struct SymbolStr {
+    id: u32;
+}
+
+implement trait Eq for struct SymbolStr {
+    ![allow(lookup_by_spelling, reason = "the comparison primitive of the spelling type")]
+    equals(&this, other: &SymbolStr) -> boolean {
+        return this.id == other.id;
+    }
+}
+
+type struct Node {
+    name: SymbolStr;
+}
+
+type struct Table {
+    texts: string[];
+}
+
+implement struct Table {
+    text_of(&this, s: SymbolStr) -> string {
+        return this.texts[s.id as i64];
+    }
+}
+
+/// A field's spelling, as text in a local, compared with a literal.
+function field_text_literal(t: &Table, node: &Node) -> i32 {
+    const s: string = t.text_of(node.name);
+    if (s == "main") { return 1; }
+    return 0;
+}
+
+/// A field's spelling assigned to a local later, compared with a string
+/// handed in.
+function field_text_assigned(t: &Table, node: &Node, want: string) -> i32 {
+    mut s: string = "";
+    s = t.text_of(node.name);
+    if (s == want) { return 1; }
+    return 0;
+}
+
+/// A spelling searched for in an array of names.
+function search_param(names: &SymbolStr[], name: SymbolStr) -> i32 {
+    return match (names.index_of(&name)) {
+        Option::Some(i) => { i as i32 }
+        Option::None    => { -1 }
+    };
+}
+
+/// A field's spelling searched for in an array of names.
+function search_field(names: &SymbolStr[], node: &Node) -> i32 {
+    return match (names.index_of(&node.name)) {
+        Option::Some(i) => { i as i32 }
+        Option::None    => { -1 }
+    };
+}
+
+/// A spelling's number packed into a table's key.
+function packed_param(table: &HashMap<u64, i32>, owner: u32, name: SymbolStr) -> i32 {
+    const k: u64 = ((owner as u64) << 32) | (name.id as u64);
+    return match (table.get(&k)) {
+        Option::Some(n) => { n }
+        Option::None    => { 0 }
+    };
+}
+
+/// A field's spelling's number packed into a table's key, inline.
+function packed_field(table: &HashMap<u64, i32>, owner: u32, node: &Node) -> i32 {
+    return match (table.get(&(((owner as u64) << 32) | (node.name.id as u64)))) {
+        Option::Some(n) => { n }
+        Option::None    => { 0 }
+    };
+}
+
+/// Whether there is any text: not a lookup.
+function is_unnamed(t: &Table, node: &Node) -> i32 {
+    const s: string = t.text_of(node.name);
+    if (s == "") { return 1; }
+    if (node.name.id == 0) { return 1; }
+    return 0;
+}
+
+/// A spelling's number used to count: not a lookup.
+function counted(names: &SymbolStr[], name: SymbolStr) -> i32 {
+    const total: i64 = names.length + 1;
+    return (total as i32) + (name.id as i32) * 0;
+}
+
+/// Carried into a value: not a lookup.
+function carried(name: SymbolStr) -> Node {
+    return Node { name: name };
+}
+
+/// A spelling's number kept in a local array, read back and compared with
+/// another's.
+function kept_then_compared(node: &Node, other: &Node) -> i32 {
+    mut seen: u32[] = [];
+    seen.push(node.name.id);
+    if (seen[0] == other.name.id) { return 1; }
+    return 0;
+}
+
+function main() -> i32 {
+    const s: SymbolStr = SymbolStr { id: 0 };
+    const node: Node = carried(s);
+    mut texts: string[] = [];
+    texts.push("main");
+    const t: Table = Table { texts: texts };
+    mut wide: HashMap<u64, i32> = HashMap::<u64, i32>::new();
+    mut names: SymbolStr[] = [];
+    names.push(s);
+    return field_text_literal(&t, &node) + field_text_assigned(&t, &node, "x")
+        + search_param(&names, s) + search_field(&names, &node)
+        + packed_param(&wide, 1, s) + packed_field(&wide, 1, &node)
+        + is_unnamed(&t, &node) + counted(&names, s) + kept_then_compared(&node, &node);
+}

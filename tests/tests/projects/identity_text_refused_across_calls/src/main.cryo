@@ -1,0 +1,101 @@
+/// A module of the compiler's own: text read off a definition, a
+/// `DeclName`, is shown and never looked up by - however many functions it
+/// passes through first.  Handed to a helper's parameter that reaches a
+/// door, answered by a method that read it off its receiver's field, or
+/// compared with other text, it is refused where it is looked up, with the
+/// place it left the function that read it.  Shown in a message, put into
+/// a value that is not text, compared for emptiness, or a helper's own
+/// plain text handed to a door, it is not.
+namespace compiler::resolver::decl_name;
+
+import std::collections::hashmap::{ HashMap };
+import std::fmt;
+
+type struct DeclName {
+private:
+    text: string;
+public:
+    static of(s: string) -> DeclName { return DeclName { text: s }; }
+    shown(&this) -> string { return this.text; }
+}
+
+type struct Names {
+    count: i32;
+}
+
+/// A message: a value that holds text and is not text.
+type struct Message {
+    body: string;
+    static new(s: string) -> Message { return Message { body: s }; }
+}
+
+implement struct Names {
+    /// Door `intern`.  Text becomes a name here.
+    intern(mut &this, text: string) -> i32 {
+        this.count = this.count + 1;
+        return text.length() as i32;
+    }
+}
+
+/// A helper whose parameter reaches a door.
+function key_into_door(names: mut &Names, key: string) -> i32 {
+    return names.intern(key + "::x");
+}
+
+/// Identity text handed to that helper.
+function through_parameter(names: mut &Names, name: DeclName) -> i32 {
+    return key_into_door(names, name.shown());
+}
+
+type struct Entry {
+    name: DeclName;
+}
+
+implement struct Entry {
+    /// Answers its definition's text.
+    label(&this) -> string {
+        return this.name.shown();
+    }
+}
+
+/// A method's answer, read off its receiver's field, handed to a door.
+function through_answer(names: mut &Names, e: &Entry) -> i32 {
+    return names.intern(e.label());
+}
+
+/// The same answer, through a local, as a hash table's key.
+function answer_as_key(e: &Entry) -> i32 {
+    mut seen: HashMap<string, i32> = HashMap::<string, i32>::new();
+    const k: string = e.label();
+    seen.insert(k, 1);
+    return seen.length() as i32;
+}
+
+/// Identity text compared with other text.
+function compared(name: DeclName, other: string) -> i32 {
+    if (name.shown() == other) { return 1; }
+    return 0;
+}
+
+/// A helper's own plain text: not identity text.
+function plain() -> string {
+    return "a::b";
+}
+
+/// Shown in a message, put into a `Message`, tested for emptiness; the
+/// door asked by plain text.  Accepted.
+function shown_only(names: mut &Names, e: &Entry) -> i32 {
+    const message: string = fmt::format("`%s` is declared here", e.label());
+    const t: Message = Message::new(e.label());
+    mut n: i32 = names.intern(plain()) + key_into_door(names, "lit");
+    if (e.label() == "") { n = n + 1; }
+    return n + message.length() as i32 + t.body.length() as i32;
+}
+
+function main() -> i32 {
+    mut names: Names = Names { count: 0 };
+    const d: DeclName = DeclName::of("a::b");
+    const e: Entry = Entry { name: d };
+    return through_parameter(&names, d) + through_answer(&names, &e) + answer_as_key(&e)
+        + compared(d, "a::b") + shown_only(&names, &e);
+}

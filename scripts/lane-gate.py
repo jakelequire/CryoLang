@@ -365,6 +365,8 @@ EXCLUDED = {
                                   "spec bookkeeping keyed by a mangled symbol, a stamp derivation"),
     "SemaState":         Excluded("compiler/sema/state.cryo",
                                   "sema's own rib of locals by binding name, and a closure-spec key built from a DefId"),
+    "IdentityFlow":      Excluded("compiler/sema/identity_flow.cryo",
+                                  "the identity-text check's flow between functions, keyed by an overload entry and a parameter slot"),
     "MoveChecker":       Excluded("compiler/passes/move_check.cryo",
                                   "the pass's own rib of locals by binding name"),
     "DeadCodeChecker":   Excluded("compiler/passes/dead_code.cryo",
