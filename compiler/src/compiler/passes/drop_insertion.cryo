@@ -2314,6 +2314,19 @@ type struct DropInserter {
         return false;
     }
 
+    /// Whether field `i` of the aggregate `agg` is in `binding_id`'s moved
+    /// set: a moved member is recorded as it was written, and the
+    /// member-field door places it among `agg`'s own fields.
+    pm_moved_field(&this, binding_id: u64, agg: Type*, i: i64) -> boolean {
+        for (mut j: i64 = 0; j < this.pm_binding.length; j++) {
+            if (this.pm_binding[j] == binding_id
+                    && DropInserter::own_field_position(agg, SymbolStr::from_id(this.pm_field[j])) == i) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     pm_has_binding(&this, binding_id: u64) -> boolean {
         for (mut i: i64 = 0; i < this.pm_binding.length; i++) {
             if (this.pm_binding[i] == binding_id) { return true; }
@@ -2432,9 +2445,9 @@ type struct DropInserter {
                 continue;
             }
             // Moved out: the source no longer owns it - do NOT drop.
-            if (this.pm_has(key, f.name.id)) { continue; }
+            if (this.pm_moved_field(key, t, i)) { continue; }
             const drop_stmt: StatementNode* = this.make_field_drop_call(
-                name, ty, f.name, i, f.field_type, span);
+                name, ty, f.decl_name().spelling(), i, f.field_type, span);
             out.push(drop_stmt);
             this.inserted += 1;
         }
@@ -3649,13 +3662,19 @@ type struct DropInserter {
         } else {
             &(agg as ClassType*).fields
         };
-        for (mut i: i64 = 0; i < fields.length; i++) {
-            if (fields[i].name.id == key) {
-                *out_index = i;
-                return fields[i].field_type;
-            }
-        }
-        return TypeRef::invalid();
+        const i: i64 = DropInserter::own_field_position(agg, SymbolStr::from_id(key));
+        if (i < 0) { return TypeRef::invalid(); }
+        *out_index = i;
+        return fields[i].field_type;
+    }
+
+    /// The position of the member written `leaf` among the aggregate `agg`'s
+    /// own fields, as the member-field door places it; -1 for none.
+    static own_field_position(agg: Type*, leaf: SymbolStr) -> i64 {
+        if (agg == null) { return -1; }
+        if (agg.kind == TypeKind::Struct) { return (agg as StructType*).field_position(leaf); }
+        if (agg.kind == TypeKind::Class) { return (agg as ClassType*).own_field_position(leaf); }
+        return -1;
     }
 
     /// Note that the binding `id` names is written as a whole somewhere in

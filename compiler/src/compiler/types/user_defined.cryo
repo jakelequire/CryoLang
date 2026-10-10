@@ -16,6 +16,8 @@ import compiler::ast::expression::{ ExpressionNode };
 import compiler::types::type_base;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name;
+import compiler::resolver::decl_name::{ DeclName };
 import compiler::types::type_base::{ Type };
 import compiler::module_graph;
 import compiler::module_graph::{ ModulePath };
@@ -24,7 +26,9 @@ import compiler::module_graph::{ ModulePath };
 // FieldInfo: Metadata for a struct/class field
 
 type struct FieldInfo {
+private:
     name:       SymbolStr;
+public:
     field_type: TypeRef;
     offset:     u64;
     is_public:  boolean;
@@ -55,6 +59,14 @@ type struct FieldInfo {
 
     has_default(&this) -> boolean { return this.default_value != null; }
     set_default_value(v: ExpressionNode*) -> void { this.default_value = v; }
+
+    /// The field's declared name, sealed: printed with `InternTable::shown`,
+    /// or carried by a node synthesized for this field (`spelling`) beside
+    /// the position it is pinned to.  Never a key: a field is found by the
+    /// `member-field` door.
+    decl_name(&this) -> DeclName {
+        return DeclName::of(this.name);
+    }
 }
 
 
@@ -250,6 +262,16 @@ public:
         this.methods.push(method);
     }
 
+    /// Door `member-field`.  A field written as a leaf on a struct in hand:
+    /// its position among the struct's fields, or -1.  The owner is known,
+    /// so the leaf is asked inside it, here beside the field list.
+    field_position(&this, leaf: SymbolStr) -> i64 {
+        for (mut i: i64 = 0; i < this.fields.length; i++) {
+            if (this.fields[i].name.equals(leaf)) { return i; }
+        }
+        return -1;
+    }
+
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     get_method(name: SymbolStr) -> MethodInfo* {
         for (mut i: i64 = 0; i < this.methods.length; i++) {
@@ -369,7 +391,17 @@ public:
         if (is_virtual || is_override) {
             this.has_virtual_methods = true;
         }
-    } 
+    }
+
+    /// Door `member-field`.  A field written as a leaf on a class in hand:
+    /// its position among the class's OWN fields, or -1.  A base's fields
+    /// are its own class's to answer; the caller walks the chain.
+    own_field_position(&this, leaf: SymbolStr) -> i64 {
+        for (mut i: i64 = 0; i < this.fields.length; i++) {
+            if (this.fields[i].name.equals(leaf)) { return i; }
+        }
+        return -1;
+    }
 
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     get_method(name: SymbolStr) -> MethodInfo* {

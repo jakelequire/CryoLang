@@ -139,6 +139,10 @@ CLASS_OF_METHOD = {
         ("J", "member: an enum declaration's variant by its leaf off the node in hand, scanned inline"),
     "DestructureDeclNode::bindings[]":
         ("J", "member: a destructure's written binding by the source field's leaf (which binding takes a field), scanned inline"),
+    "StructType::field_position":
+        ("J", "member: the member-field door - a field's leaf inside the struct in hand, to its position"),
+    "ClassType::own_field_position":
+        ("J", "member: the member-field door - a field's leaf inside the class in hand, to its position among the class's own fields"),
     "FunctionDeclNode::parameters[]":
         ("J", "member: the resolver's duplicate-parameter check, a parameter by leaf inside the function being bound"),
     "LambdaExprNode::captured_names[]":
@@ -146,8 +150,6 @@ CLASS_OF_METHOD = {
     # -- local tables: the owner out of view, the element says what it is --
     "local::MethodNode[]":
         ("J", "member: an impl's or a declaration's methods held in a local, by leaf"),
-    "local::FieldInfo[]":
-        ("J", "member: a struct's or class's fields held by reference in a local, by leaf"),
     # RULED (Jake, 2026-09-22): this site stays in the population, read as a
     # rule 1c scan.  The review board read it as a text boundary outside D32;
     # outside the population does not mean clean, it means UNWATCHED - a J row

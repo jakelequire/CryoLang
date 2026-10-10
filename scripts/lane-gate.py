@@ -566,8 +566,6 @@ SCANNED_ARRAYS = {
     #    and scanned; the owner is out of view, the element says what it is --
     "local.MethodNode":           Scanned(None, "MethodNode", TABLE,
                                           "an impl's or a declaration's methods, held in a local, by leaf"),
-    "local.FieldInfo":            Scanned(None, "FieldInfo", TABLE,
-                                          "a struct's or class's fields, held by reference in a local, by leaf"),
     "local.GenericParamNode":     Scanned(None, "GenericParamNode", TABLE,
                                           "a declaration's written generic parameters, held in a local, by leaf"),
     "local.VTableSlot":           Scanned(None, "VTableSlot", TABLE,
