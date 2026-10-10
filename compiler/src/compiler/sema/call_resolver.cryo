@@ -1136,7 +1136,7 @@ type struct CallResolver {
                 }
             }
             if (inferred_generic_ret.is_valid()) {
-                this.check_free_call_projection_args(visitor, call, ident);
+                this.check_generic_free_call_args(visitor, call, ident);
                 return inferred_generic_ret;
             }
             if (call.generic_args.length > 0) {
@@ -1180,6 +1180,7 @@ type struct CallResolver {
                 Text::new("passing a capturing closure as a method-call argument"));
             const selected: Selection = this.resolve_method_overload(visitor, call, callee as MemberAccessNode*);
             this.check_method_call_arg_types(visitor, call, callee as MemberAccessNode*, selected.chosen);
+            this.check_symbolic_method_bounds(callee as MemberAccessNode*, selected.chosen);
             const args_refused: boolean = this.ctx.diagnostics.errors_since(arg_snap) > 0;
             const mret: TypeRef = this.resolve_method_call(visitor, callee as MemberAccessNode*, call,
                                                            selected, args_refused);
@@ -2636,6 +2637,15 @@ type struct CallResolver {
         }
     }
 
+    /// Whether an argument's type, or its parameter's, names a type a
+    /// mismatch can be judged against: one type, or in a generic body a type
+    /// whose only unsettled parts are the body's own parameters.  A generic
+    /// body is checked once and its copies are not, so a pair skipped here
+    /// is never checked.
+    arg_side_judgeable(&this, ty: TypeRef) -> boolean {
+        return this.types.arg_type_names_one_type(ty) || this.symbolic.symbolic_params_settle(ty);
+    }
+
     /// Per-argument type checking for a 1:1 arg/param list.  Flags only hard
     /// category mismatches / lossy narrowing / same-width sign reinterpret;
     /// synthesizes implicit conversions where registered.
@@ -2646,25 +2656,16 @@ type struct CallResolver {
             if (i >= args.length) { break; }
             const arg: ExpressionNode* = args[i];
             if (arg == null) { continue; }
-            const arg_ty:   TypeRef = arg.resolved_type;
-            const param_ty: TypeRef = param_types.get(i as u64).unwrap();
+            // Inside a `static match (T)` arm, `T` reads as the arm's type on
+            // both sides, a field typed `T` (`&this.value`) as surely as a local.
+            const arg_ty:   TypeRef = this.symbolic.symbolic_narrowed(arg.resolved_type);
+            const param_ty: TypeRef = this.symbolic.symbolic_narrowed(param_types.get(i as u64).unwrap());
             // In a generic body a value of a type parameter is that parameter
             // and nothing else: whatever an instantiation binds it to, it is
             // not the concrete type a parameter declares (`x: T` passed for
-            // an `f64`).  A `static match` arm naming a type has narrowed
-            // the parameter to it before this.
-            if (this.state.in_symbolic_check && this.types.arg_type_names_one_type(param_ty)) {
-                const at: Type* = this.arena.lookup(arg_ty);
-                if (at != null && at.kind == TypeKind::GenericParam) {
-                    this.diag.emit_type_mismatch_with_value(
-                        ErrorCode::E0214_ARGUMENT_MISMATCH, arg.span, param_ty, arg_ty,
-                        Text::new(fmt::format("argument %lld doesn't match the parameter's declared type", i + 1)),
-                        SourceSpan::none(), arg);
-                    continue;
-                }
-            }
-            if (!this.types.arg_type_names_one_type(arg_ty))   { continue; }
-            if (!this.types.arg_type_names_one_type(param_ty)) { continue; }
+            // an `f64`).
+            if (!this.arg_side_judgeable(arg_ty))   { continue; }
+            if (!this.arg_side_judgeable(param_ty)) { continue; }
             const compat: TypeCompatibility = this.checker.check_compatibility(arg_ty, param_ty);
             if (compat == TypeCompatibility::Incompatible) {
                 if (this.types.indirection_compatible(arg_ty, param_ty)) { continue; }
@@ -2797,8 +2798,11 @@ type struct CallResolver {
                 const inst: InstantiatedType* = base_t as InstantiatedType*;
                 if (!inst.has_resolved_type()) {
                     // Not minted yet: the selection tried its template's
-                    // methods; a call it bound is checked where it is minted.
-                    if (chosen_method == null && !this.types.contains_generic_param(base_ref)) {
+                    // methods; a call it bound is checked where it is minted,
+                    // unless the receiver is a generic body's own
+                    // instantiation (`Array<T>`), whose copies are not checked.
+                    if (this.symbolic.symbolic_params_settle(base_ref)
+                            || (chosen_method == null && !this.types.contains_generic_param(base_ref))) {
                         this.check_args_on_template(visitor, call, member, base_ref);
                     }
                     return;
@@ -4104,46 +4108,51 @@ type struct CallResolver {
         return full.apply(ty, this.arena);
     }
 
-    /// `params` with each one that holds a projection (`d: I::Item`) seen
-    /// through `subst`, when that settles it: the type the impl binds for
-    /// the base `subst` gives (`i32` for `I` bound to `Count`) is what an
-    /// argument is judged against.  A parameter with no projection, or one
-    /// `subst` leaves open, is as given.  `decl` is the parameters as
-    /// written, index-aligned with `params`.
+    /// `params` as the call's type arguments `subst` instantiates them: what
+    /// an argument is judged against.  A parameter that holds a projection
+    /// (`d: I::Item`) is seen through `subst` from `decl`, its form as
+    /// written, so the type the impl binds for the base `subst` gives (`i32`
+    /// for `I` bound to `Count`) is reached; any other has `subst` applied.
+    /// One `subst` leaves open - a projection still unreduced, or a type
+    /// parameter that is neither bound nor the generic body's own - is as
+    /// given.  `decl` is index-aligned with `params`.
     params_seen_through(mut &this, subst: TypeSubstitution*, decl: &TypeRef[],
                         params: &TypeRef[]) -> TypeRef[] {
         mut out: TypeRef[] = [];
         for (mut i: i64 = 0; i < params.length; i++) {
-            if (i >= decl.length || !this.types.contains_unresolved_projection(decl[i])) {
+            if (i >= decl.length) {
                 out.push(params[i]);
                 continue;
             }
-            const seen: TypeRef = this.seen_through(subst, decl[i]);
-            const open: boolean = !seen.is_valid() || this.types.contains_generic_param(seen)
-                || this.types.contains_unresolved_projection(seen);
+            const seen: TypeRef = if (this.types.contains_unresolved_projection(decl[i])) {
+                this.seen_through(subst, decl[i])
+            } else {
+                subst.apply(params[i], this.arena)
+            };
+            const open: boolean = !seen.is_valid() || this.types.contains_unresolved_projection(seen)
+                || (this.types.contains_generic_param(seen) && !this.symbolic.symbolic_params_settle(seen));
             out.push(if (open) { params[i] } else { seen });
         }
         return out;
     }
 
-    /// A generic free call's arguments bound to parameters that hold a
-    /// projection, checked against what the call's type arguments make of
-    /// those parameters.  Its other arguments decided the type arguments,
-    /// and a conflict among them is the inference's to report.
-    check_free_call_projection_args(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
-                                    ident: IdentifierNode*) -> void {
+    /// A generic free call's arguments, checked against its parameters as
+    /// the call's type arguments instantiate them.  Written type arguments
+    /// (`id::<i32>(x)`) are decided by nothing the arguments say, and
+    /// inferred ones by a unification that skips what it cannot bind, so
+    /// either way an argument can still disagree with its parameter.
+    check_generic_free_call_args(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
+                                 ident: IdentifierNode*) -> void {
         const entry: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
         if (entry == null) { return; }
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
         if (tmpl == null || tmpl.parameters.length != call.arguments.length) { return; }
         mut decl: TypeRef[] = [];
-        mut unchecked: TypeRef[] = [];
         for (mut i: i64 = 0; i < tmpl.parameters.length; i++) {
             const p: VarDeclNode* = tmpl.parameters[i];
             decl.push(if (p != null) { p.resolved_type } else { TypeRef::invalid() });
-            unchecked.push(TypeRef::invalid());
         }
-        const params: TypeRef[] = this.free_call_params(entry, call, &decl, &unchecked);
+        const params: TypeRef[] = this.free_call_params(entry, call, &decl, &decl);
         this.check_args_against_params(visitor, &call.arguments, params.as_slice());
     }
 
@@ -5059,28 +5068,91 @@ type struct CallResolver {
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: &TraitRef = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
-                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
                 if (this.trait_checker().type_implements_trait(concrete, tref.definition(), 0)) { continue; }
-                const method_str: string = this.intern.resolve(member.member);
-                const trait_str:  string = this.intern.resolve(trait_name);
-                const param_str:  string = this.intern.resolve(bound.type_parameter);
-                const conc_str:   string = this.types.type_display_name(concrete);
-                const primary: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
-                mut d: Diagnostic = Diagnostic::error(
-                    ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
-                    Text::new(fmt::format("the trait bound `%s: %s` is not satisfied", conc_str, trait_str)));
-                d = d.at(primary);
-                d = d.with_note(Text::new(fmt::format("method `%s` requires `%s: %s`", method_str, param_str, trait_str)));
-                if (tref.definition().equals(this.ctx.generic_registry.wellknown(LangItem::Copy))) {
-                    d = d.help(Text::new(fmt::format(
-                        "`%s` owns resources, so it isn't `Copy`, and `%s` is only available when `%s` is",
-                        conc_str, method_str, param_str)));
-                }
-                this.ctx.emit_diagnostic(d);
+                this.emit_method_bound_unmet(member, bound, tref, concrete);
                 return true;
             }
         }
         return false;
+    }
+
+    /// E0358 at `member`: its method requires `bound`'s subject to have the
+    /// trait `tref`, and `concrete`, the subject as the receiver binds it,
+    /// does not.
+    emit_method_bound_unmet(mut &this, member: MemberAccessNode*, bound: &TraitBound, tref: &TraitRef,
+                            concrete: TypeRef) -> void {
+        const method_str: string = this.intern.resolve(member.member);
+        const trait_str:  string = this.intern.resolve(tref.path[tref.path.length - 1]);
+        const param_str:  string = this.intern.resolve(bound.type_parameter);
+        const conc_str:   string = this.types.type_display_name(concrete);
+        const primary: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+            Text::new(fmt::format("the trait bound `%s: %s` is not satisfied", conc_str, trait_str)));
+        d = d.at(primary);
+        d = d.with_note(Text::new(fmt::format("method `%s` requires `%s: %s`", method_str, param_str, trait_str)));
+        const ct: Type* = this.arena.lookup(concrete);
+        if (ct != null && ct.kind == TypeKind::GenericParam) {
+            d = d.help(Text::new(fmt::format("add `%s: %s` to the bounds in scope here", conc_str, trait_str)));
+        } else if (tref.definition().equals(this.ctx.generic_registry.wellknown(LangItem::Copy))) {
+            d = d.help(Text::new(fmt::format(
+                "`%s` owns resources, so it isn't `Copy`, and `%s` is only available when `%s` is",
+                conc_str, method_str, param_str)));
+        }
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// In a generic body, the `where` bounds of the method `chosen` that a
+    /// call on the body's own instantiation of its owner (`xs.get(0)` on an
+    /// `Array<T>`) leaves to the receiver's type arguments: each must hold of
+    /// the argument there, a parameter of the body by the bounds in scope.
+    /// The body's copies are not checked, so a bound unmet here is never
+    /// reported, and a copy calls a method its element type does not offer.
+    check_symbolic_method_bounds(mut &this, member: MemberAccessNode*, chosen: MethodNode*) -> void {
+        if (!this.state.in_symbolic_check || chosen == null || chosen.func == null) { return; }
+        const func: FunctionDeclNode* = chosen.func;
+        if (func.trait_bounds.length == 0 || member.object == null) { return; }
+        mut t: Type* = this.arena.lookup(member.object.resolved_type);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            if (t.kind == TypeKind::Reference) { t = this.arena.lookup((t as ReferenceType*).referent); }
+            else if (t.kind == TypeKind::Pointer) { t = this.arena.lookup((t as PointerType*).pointee); }
+            else { break; }
+            depth += 1;
+        }
+        if (t == null || t.kind != TypeKind::InstantiatedType) { return; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        if (inst.has_resolved_type()) { return; }
+        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(inst.generic_base);
+        if (tmpl == null || tmpl.param_syms.length != inst.type_args.length) { return; }
+        for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
+            const bound: &TraitBound = &func.trait_bounds[bi];
+            mut arg: TypeRef = TypeRef::invalid();
+            for (mut pi: i64 = 0; pi < tmpl.param_syms.length; pi++) {
+                if (tmpl.param_syms[pi].equals(bound.subject_sym)) { arg = inst.type_args[pi]; break; }
+            }
+            if (!arg.is_valid()) { continue; }
+            const at: Type* = this.arena.lookup(arg);
+            const param: GenericParamType* = if (at != null && at.kind == TypeKind::GenericParam) {
+                at as GenericParamType*
+            } else {
+                null
+            };
+            if (param != null && !this.symbolic.symbolic_param_in_scope(param.param_sym)) { continue; }
+            if (param == null && !this.types.arg_type_names_one_type(arg)) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: &TraitRef = &bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const holds: boolean = if (param != null) {
+                    this.binding.param_bounded_by(param, tref.definition())
+                } else {
+                    this.trait_checker().type_implements_trait(arg, tref.definition(), 0)
+                };
+                if (holds) { continue; }
+                this.emit_method_bound_unmet(member, bound, tref, arg);
+                return;
+            }
+        }
     }
 
     /// E0358: for-in over a non-Copy collection (Copy-gated `iter`).

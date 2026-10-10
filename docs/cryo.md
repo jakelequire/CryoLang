@@ -1965,12 +1965,20 @@ implement struct Cell<T, A> {
 
 A user trait that is merely *named* `Add` does not license `+`; the bound must name the language's trait (`std::core::ops::Add`, in the prelude).
 
-Inside the body, a parameter is **one type**: a binding, a `return`, an assignment or a branch that expects `T` takes a value of type `T` and nothing else, whatever `T` is later instantiated with. `Array::get` answers `Option<T>`, so it is matched or unwrapped before it is used as a `T`. Inside a `static match (T)` arm, `T` is the arm's type, and that includes the declared return type:
+Inside the body, a parameter is **one type**: a binding, a `return`, an assignment, a branch or a call's argument that expects `T` takes a value of type `T` and nothing else, whatever `T` is later instantiated with. `Array::get` answers `Option<T>`, so it is matched or unwrapped before it is used as a `T`. A method whose own `where` clause constrains the owner's parameter (`get` requires `T: Copy`) is callable on the body's `Array<T>` only when the body's bounds give `T` that trait. Inside a `static match (T)` arm, `T` is the arm's type, and that includes the declared return type and a field declared `T`:
 
 ```cryo
 function first<T>(xs: &Array<T>) -> T where T: Copy {
     const v: T = xs.get(0);           // error[E0200]: expected `T`, found `Option<T>`
     return v;
+}
+
+function push_first<T>(xs: mut &Array<T>) -> void where T: Copy {
+    xs.push(xs.get(0));               // error[E0214]: expected `T`, found `Option<T>`
+}
+
+function first_of<T>(xs: &Array<T>) -> Option<T> where T: Clone {
+    return xs.get(0);                 // error[E0358]: the trait bound `T: Copy` is not satisfied
 }
 
 function halve<T>(x: T) -> T {

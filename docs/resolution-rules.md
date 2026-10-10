@@ -200,6 +200,24 @@ yet is recorded with the change that builds it, not here.
      the first non-octal character; `\033` is ESC, `\0` is NUL, `\177` is
      127.  A value above `\377`, and `\8` or `\9`, is an error.
 
+204. **A generic type's own methods are registered with the
+     member-function door under the template itself**, so the door
+     answers a lookup made inside the generic body (`b.map::<i64>(g)` on
+     a `Box<T>`).  There is no second door over a declaration's method
+     list.
+
+205. **The four editor sites the field-following lint flags (`this`
+     keyword checks) are fixed when the lint lands**, although the editor
+     is otherwise left until after the merge.
+
+206. **E0157's wording for a spelling read off a field is accepted**:
+     "`f` looks up a spelling read off a field", with the help "ask a
+     door, or say why this is no lookup".
+
+207. **E0013's octal-escape wording is accepted**: "`\8` is not an
+     escape: an octal escape's digits are `0` to `7`" and "`\400` is out
+     of range: an octal escape is one byte, `\0` to `\377`".
+
 ### 2026-10-08
 
 171. *(amended)* **The `Text` type is not deleted yet.**  Deleting it now
