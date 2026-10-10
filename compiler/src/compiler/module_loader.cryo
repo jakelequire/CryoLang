@@ -223,9 +223,9 @@ public:
         // to extract its namespace.  This builds the ns_map (namespace -> path)
         // so that resolve_import_path can resolve any import with a simple
         // HashMap lookup, regardless of directory casing.
-        this.scan_all_project_files(this.entry_dir, debug);
+        this.scan_all_project_files(intern, this.entry_dir, debug);
         if (!this.no_std && this.stdlib_root.length() > 0) {
-            this.scan_all_project_files(this.stdlib_root, debug);
+            this.scan_all_project_files(intern, this.stdlib_root, debug);
         }
         // include_paths from cryoconfig: each is resolved relative to
         // project_root.  HashMap.insert is last-wins, so re-scanning a
@@ -241,7 +241,7 @@ public:
             if (debug) {
                 cdebug(Text::new("[ModuleLoader] Scanning extra root: %s\n"), root);
             }
-            this.scan_all_project_files(root, debug);
+            this.scan_all_project_files(intern, root, debug);
         }
 
         if (debug) {
@@ -311,7 +311,7 @@ public:
 
     /// Recursively walk a directory, lex every .cryo file to extract its
     /// namespace declaration, and register namespace -> file_path in ns_map.
-    scan_all_project_files(mut &this, dir: string, debug: boolean) -> void {
+    scan_all_project_files(mut &this, intern: InternTable*, dir: string, debug: boolean) -> void {
         mut rd: ReadDir = match (dir::read_dir(Path::from(dir))) {
             Result::Ok(r)  => { r }
             Result::Err(_) => { return; }
@@ -330,7 +330,7 @@ public:
                         // namespaces into this project's resolution map.
                         if (!name.eq("projects")) {
                             // Recurse into subdirectory.
-                            this.scan_all_project_files(full_path, debug);
+                            this.scan_all_project_files(intern, full_path, debug);
                         }
                     } else {
                         // Regular file; check for .cryo extension.
@@ -338,7 +338,7 @@ public:
                         if (name_len > 5) {
                             const ext: string = name + ((name_len - 5) as i64);
                             if (ext.eq(".cryo")) {
-                                this.scan_file_namespace(full_path);
+                                this.scan_file_namespace(intern, full_path);
                             }
                         }
                     }
@@ -352,7 +352,8 @@ public:
 
     /// Lex a single .cryo file, extract the namespace declaration,
     /// and register it in ns_map.
-    scan_file_namespace(mut &this, file_path: string) -> void {
+    ![allow(lookup_by_spelling, reason = "records the namespace a file declares, as written, in the map the `loader-path` doors read; it is the store's one writer and looks nothing up")]
+    scan_file_namespace(mut &this, intern: InternTable*, file_path: string) -> void {
         // Skip the on-disk existence check when the file is the LSP
         // override target; `file_for` will hand the lexer the editor
         // buffer regardless of what's on disk (file may be unsaved).
@@ -368,16 +369,34 @@ public:
 
         // Extract just the namespace; scan_tokens gives us everything
         // but we only need the namespace name.
-        const scan: ModuleScanResult = ModuleLoader::scan_tokens(tokens);
-        if (scan.namespace_name.length() > 0) {
-            this.ns_map.insert(scan.namespace_name, file_path);
+        const scan: ModuleScanResult = ModuleLoader::scan_tokens(intern, tokens);
+        if (scan.namespace_name.is_valid()) {
+            this.ns_map.insert(intern.resolve(scan.namespace_name), file_path);
         }
     }
 
 
-    /// Resolve an import path (e.g., "BattleTest" or "compiler::ast")
-    /// to a filesystem path.  Returns "" if not found.
-    resolve_import_path(&this, import_path: string) -> string {
+    /// Door `loader-path`.  A module path written in an `import`, an
+    /// `export` or a `public module` names a file, and discovery has to find
+    /// it before any module exists to be its identity: the written path is
+    /// matched against the namespaces the project's files declare, then
+    /// looked for on disk, here and nowhere else.
+    ///
+    /// The file the written module path `written` names (e.g. "BattleTest"
+    /// or "compiler::ast"): a vendored library's bindings, a file declaring
+    /// that namespace, or a file at that path under the project root, the
+    /// entry point's directory, the standard library, and last `from_dir`,
+    /// the directory of the file that wrote it ("" asks none).  "" when
+    /// none is found.
+    resolve_import_path(&this, intern: InternTable*, written: SymbolStr, from_dir: string) -> string {
+        const found: string = this.resolve_written_path(intern.resolve(written));
+        if (found.length() > 0 || from_dir.length() == 0) { return found; }
+        return this.search_location(from_dir, ModuleLoader::replace_separator(intern.resolve(written)));
+    }
+
+    /// `resolve_import_path`'s search before the writing file's directory.
+    ![allow(lookup_by_spelling, reason = "the body of the `loader-path` door `resolve_import_path`, handed the written path's text by it alone")]
+    resolve_written_path(&this, import_path: string) -> string {
         // Vendor libraries: `import vendor::Name` resolves through the vendor
         // registry to the bindings generated for the active target triple,
         // never the project tree or stdlib.  Handled before any filesystem
@@ -473,6 +492,7 @@ public:
     /// library's native link metadata is merged later (`merge_vendor_links`).
     /// Dedups by registry key.  No-op for non-vendor paths or unregistered
     /// libraries.  Called from the discovery loop (which holds `mut &this`).
+    ![allow(lookup_by_spelling, reason = "a `vendor::` import names a vendored library by the name the build's vendor registry is configured under, a key of the build's configuration and no declaration")]
     note_vendor_import(mut &this, import_path: string) -> void {
         if (!ModuleLoader::is_vendor_path(import_path)) { return; }
         const lib: string = import_path + 8;
@@ -619,7 +639,7 @@ public:
         const tokens: Token[] = lexer.lex();
 
         // Extract namespace and imports from token stream
-        const scan: ModuleScanResult = ModuleLoader::scan_tokens(tokens);
+        const scan: ModuleScanResult = ModuleLoader::scan_tokens(intern, tokens);
 
         // Note if this module uses an f-string so the orchestrator can
         // force-discover the f-string runtime (std::fmt::interp) on demand.
@@ -629,16 +649,16 @@ public:
 
         if (debug) {
             cdebug(Text::new("[ModuleLoader]   namespace: '%s', imports: %d\n"),
-                scan.namespace_name, scan.import_count);
+                intern.resolve(scan.namespace_name), scan.import_count);
         }
 
         // Create ModuleInfo (store original path so the lexer can open the file)
-        const mod_name_str: string = if (scan.namespace_name.length() > 0) {
+        const mod_name: SymbolStr = if (scan.namespace_name.is_valid()) {
             scan.namespace_name
         } else {
-            ModuleLoader::extract_module_name(file_path)
+            intern.intern(ModuleLoader::extract_module_name(file_path))
         };
-        const mod_name: SymbolStr = intern.intern(mod_name_str);
+        const mod_name_str: string = intern.resolve(mod_name);
         mut info: ModuleInfo = ModuleInfo::with_namespace(
             mod_name, file_path, mod_name);
 
@@ -668,15 +688,13 @@ public:
         mut item_files: string[] = [];
         for (mut fi: i64 = 0; fi < scan.import_item_count; fi++) { item_files.push(""); }
         for (mut i: i64 = 0; i < scan.import_count; i++) {
-            const import_path: string = scan.import_paths[i];
+            const import_sym: SymbolStr = scan.import_paths[i];
+            const import_path: string = intern.resolve(import_sym);
 
-            // Resolve to filesystem path.  First try global resolution, then
-            // fall back to searching relative to the declaring file's directory
-            // (handles bare `public module X;` declarations in _module.cryo).
-            mut resolved: string = this.resolve_import_path(import_path);
-            if (resolved.length() == 0) {
-                resolved = this.search_location(file_dir, ModuleLoader::replace_separator(import_path));
-            }
+            // Resolve to filesystem path, last relative to the declaring
+            // file's directory (bare `public module X;` declarations in
+            // _module.cryo).
+            mut resolved: string = this.resolve_import_path(intern, import_sym, file_dir);
             if (debug) {
                 cdebug(Text::new("[ModuleLoader]   import '%s' -> '%s'\n"), import_path, resolved);
             }
@@ -687,8 +705,7 @@ public:
                 // import path doesn't map cleanly to the filesystem due to
                 // mixed-case directories (e.g., `compiler/AST/node.cryo`
                 // where `AST` is uppercase but `compiler` is lowercase).
-                const already_name: SymbolStr = intern.intern(import_path);
-                const already_idx: i64 = graph.find_module_index(graph.module_of_written_path(already_name));
+                const already_idx: i64 = graph.find_module_index(graph.module_of_written_path(import_sym));
                 if (already_idx >= 0) {
                     // Module already in graph: use its recorded file path
                     resolved = graph.modules[already_idx].file_path;
@@ -771,12 +788,9 @@ public:
         // `import A::{ B };` would silently compile without B while
         // `import A::B;` compiled with it - two spellings, two meanings.
         for (mut ii: i64 = 0; ii < scan.import_item_count; ii++) {
-            const item_path: string = scan.import_items[ii];
-            mut item_resolved: string = this.resolve_import_path(item_path);
-            if (item_resolved.length() == 0) {
-                item_resolved = this.search_location(
-                    file_dir, ModuleLoader::replace_separator(item_path));
-            }
+            const item_sym: SymbolStr = scan.import_items[ii];
+            const item_path: string = intern.resolve(item_sym);
+            const item_resolved: string = this.resolve_import_path(intern, item_sym, file_dir);
             if (item_resolved.length() > 0) {
                 if (!this.discover_module(intern, graph, sink, item_resolved, debug)) {
                     success = false;
@@ -801,7 +815,6 @@ public:
             // Not a file on disk: it may already be in the graph under the
             // written path (fully-qualified spellings, the common case in the
             // compiler and stdlib).
-            const item_sym: SymbolStr = intern.intern(item_path);
             const item_idx: i64 = graph.find_module_index(graph.module_of_written_path(item_sym));
             if (item_idx >= 0) {
                 item_files[ii] = graph.modules[item_idx].file_path;
@@ -826,10 +839,10 @@ public:
             const owner_file: string =
                 if (scan.path_imports[bp] >= 0) { import_files[scan.path_imports[bp]] } else { item_files[scan.path_items[bp]] };
             if (owner_file.length() == 0) { continue; }
-            const sub_file: string = this.sub_module_file(owner_file, scan.path_rests[bp]);
+            const sub_file: string = this.sub_module_file(intern, owner_file, scan.path_rests[bp]);
             if (sub_file.length() == 0) { continue; }
             if (debug) {
-                cdebug(Text::new("[ModuleLoader]   path '%s' -> '%s'\n"), scan.path_rests[bp], sub_file);
+                cdebug(Text::new("[ModuleLoader]   path '%s' -> '%s'\n"), intern.resolve(scan.path_rests[bp]), sub_file);
             }
             if (!this.discover_module(intern, graph, sink, sub_file, debug)) {
                 success = false;
@@ -854,12 +867,9 @@ public:
         // `export_items`, the way the import-item loop does.
         for (mut ei: i64 = 0; ei < scan.export_count; ei++) {
             const braced: boolean = scan.export_braced[ei];
-            const exp_path: string = scan.export_paths[ei];
-            mut exp_resolved: string = this.resolve_import_path(exp_path);
-            if (exp_resolved.length() == 0) {
-                exp_resolved = this.search_location(
-                    file_dir, ModuleLoader::replace_separator(exp_path));
-            }
+            const exp_sym: SymbolStr = scan.export_paths[ei];
+            const exp_path: string = intern.resolve(exp_sym);
+            const exp_resolved: string = this.resolve_import_path(intern, exp_sym, file_dir);
             if (debug) {
                 cdebug(Text::new("[ModuleLoader]   export '%s' -> '%s'\n"), exp_path, exp_resolved);
             }
@@ -887,7 +897,6 @@ public:
             }
             // Not a file on disk: it may already be in the graph under the
             // written path (a fully-qualified spelling).
-            const exp_sym: SymbolStr = intern.intern(exp_path);
             const exp_gidx: i64 = graph.find_module_index(graph.module_of_written_path(exp_sym));
             if (exp_gidx >= 0) {
                 if (!braced) { info.add_reexport(RecordedEdge::to(graph.modules[exp_gidx].path())); }
@@ -918,12 +927,8 @@ public:
         // Brace-list `export` items that name a SUBMODULE rather than a name
         // inside the path, mirroring the import-item loop above.
         for (mut eii: i64 = 0; eii < scan.export_item_count; eii++) {
-            const eitem_path: string = scan.export_items[eii];
-            mut eitem_resolved: string = this.resolve_import_path(eitem_path);
-            if (eitem_resolved.length() == 0) {
-                eitem_resolved = this.search_location(
-                    file_dir, ModuleLoader::replace_separator(eitem_path));
-            }
+            const eitem_sym: SymbolStr = scan.export_items[eii];
+            const eitem_resolved: string = this.resolve_import_path(intern, eitem_sym, file_dir);
             if (eitem_resolved.length() > 0) {
                 if (!this.discover_module(intern, graph, sink, eitem_resolved, debug)) {
                     success = false;
@@ -944,7 +949,6 @@ public:
                     Option::None => { }
                 }
             }
-            const eitem_sym: SymbolStr = intern.intern(eitem_path);
             const eitem_idx: i64 = graph.find_module_index(graph.module_of_written_path(eitem_sym));
             if (eitem_idx >= 0) {
                 info.add_reexport(RecordedEdge::to(graph.modules[eitem_idx].path()));
@@ -960,13 +964,10 @@ public:
         // need its children compiled first.  Treating these as dependencies
         // creates false cycles (e.g., AST -> Specializer -> Types -> AST).
         for (mut s: i64 = 0; s < scan.submodule_count; s++) {
-            const sub_path: string = scan.submodule_paths[s];
-            mut sub_resolved: string = this.resolve_import_path(sub_path);
-            if (sub_resolved.length() == 0) {
-                sub_resolved = this.search_location(file_dir, ModuleLoader::replace_separator(sub_path));
-            }
+            const sub_sym: SymbolStr = scan.submodule_paths[s];
+            const sub_resolved: string = this.resolve_import_path(intern, sub_sym, file_dir);
             if (debug) {
-                cdebug(Text::new("[ModuleLoader]   submodule '%s' -> '%s'\n"), sub_path, sub_resolved);
+                cdebug(Text::new("[ModuleLoader]   submodule '%s' -> '%s'\n"), intern.resolve(sub_sym), sub_resolved);
             }
             if (sub_resolved.length() > 0) {
                 if (!this.discover_module(intern, graph, sink, sub_resolved, debug)) {
@@ -1069,7 +1070,7 @@ public:
     /// Scan a token stream for `namespace` and `import` declarations.
     /// Does NOT build an AST; just extracts the module-level metadata
     /// needed for dependency discovery.
-    static scan_tokens(tokens: Token[]) -> ModuleScanResult {
+    static scan_tokens(intern: InternTable*, tokens: Token[]) -> ModuleScanResult {
         mut ns: string = "";
         mut imports: string[] = [];
         mut import_spans: SourceSpan[] = [];
@@ -1344,26 +1345,33 @@ public:
         const export_count_val:      i64 = exports.length;
         const export_item_count_val: i64 = export_items.length;
         return ModuleScanResult {
-            namespace_name:    ns,
-            import_paths:      imports,
+            namespace_name:    if (ns.length() > 0) { intern.intern(ns) } else { SymbolStr::empty() },
+            import_paths:      ModuleLoader::spelled(intern, &imports),
             import_spans:      import_spans,
             import_entry_items: import_entry_items,
             import_count:      import_count_val,
-            import_items:      import_items,
+            import_items:      ModuleLoader::spelled(intern, &import_items),
             import_item_count: import_item_count_val,
             path_imports:      path_imports,
             path_items:        path_items,
-            path_rests:        path_rests,
-            export_paths:      exports,
+            path_rests:        ModuleLoader::spelled(intern, &path_rests),
+            export_paths:      ModuleLoader::spelled(intern, &exports),
             export_spans:      export_spans,
             export_braced:     export_braced,
             export_count:      export_count_val,
-            export_items:      export_items,
+            export_items:      ModuleLoader::spelled(intern, &export_items),
             export_item_count: export_item_count_val,
-            submodule_paths:   submodules,
+            submodule_paths:   ModuleLoader::spelled(intern, &submodules),
             submodule_count:   submodule_count_val,
             uses_fstring:      uses_fstring_val,
         };
+    }
+
+    /// Each of the written paths `texts`, as the spelling it is.
+    static spelled(intern: InternTable*, texts: &string[]) -> SymbolStr[] {
+        mut out: SymbolStr[] = [];
+        for (mut k: i64 = 0; k < texts.length; k++) { out.push(intern.intern(texts[k])); }
+        return out;
     }
 
     /// Door `loader-path`.  A path in a file's body is headed by a name one
@@ -1391,10 +1399,10 @@ public:
     /// The file declaring the namespace `rest` (`Inner`, `Inner::Deeper`)
     /// continues the namespace `owner_file` declares into; "" when the owner
     /// has not been scanned or no file declares that namespace.
-    sub_module_file(&this, owner_file: string, rest: string) -> string {
+    sub_module_file(&this, intern: InternTable*, owner_file: string, rest: SymbolStr) -> string {
         match (this.scanned_ns.get(&owner_file.to_ascii_lower())) {
             Option::Some(owner_ns) => {
-                match (this.ns_map.get(&fmt::format("%s::%s", owner_ns, rest))) {
+                match (this.ns_map.get(&fmt::format("%s::%s", owner_ns, intern.resolve(rest)))) {
                     Option::Some(sub_file) => { return sub_file; }
                     Option::None => { return ""; }
                 }
@@ -1569,10 +1577,12 @@ public:
 
 
 /// Result of scanning a file's tokens for namespace and import declarations.
-/// This avoids needing a full parse during discovery.
+/// This avoids needing a full parse during discovery.  Every path is a
+/// spelling as written, so it reaches a lookup only through a door: a
+/// `loader-path` door turns it into the file of the module it names.
 type struct ModuleScanResult {
-    namespace_name:  string;
-    import_paths:    string[];    // real `import` statements (create dependency edges)
+    namespace_name:  SymbolStr;
+    import_paths:    SymbolStr[]; // real `import` statements (create dependency edges)
     import_spans:    SourceSpan[]; // span of each import path, parallel to import_paths (file unset; caller fills)
     /// Parallel to `import_paths`: for `import A::B as C;`, whose import path
     /// is `A`, the position in `import_items` of the entry `A::B`; -1 for
@@ -1588,7 +1598,7 @@ type struct ModuleScanResult {
     /// exactly the false cycles the submodule loop below avoids
     /// (`AST -> Specializer -> Types -> AST`).  What a module can SEE and what
     /// must be BUILT FIRST are different relations.
-    import_items:    string[];
+    import_items:    SymbolStr[];
     import_item_count: i64;
     /// Paths in the file's body whose head is a name an import binds - an
     /// import's last segment or alias, or a brace entry's: the
@@ -1597,20 +1607,20 @@ type struct ModuleScanResult {
     /// Parallel.
     path_imports:    i64[];
     path_items:      i64[];
-    path_rests:      string[];
+    path_rests:      SymbolStr[];
     /// `export` statements: the ModulePath each one names, and (for the brace
     /// form) each item expanded to a full path, exactly as the import lists
     /// above.  Held apart from them because the two produce different edges -
     /// an import constrains build order, an export never does.
-    export_paths:    string[];
+    export_paths:    SymbolStr[];
     export_spans:    SourceSpan[];
     /// Whether each export is the brace form, `export M::{ a }`, which
     /// offers the entries it lists and nothing else of `M`.
     export_braced:   boolean[];
     export_count:    i64;
-    export_items:    string[];
+    export_items:    SymbolStr[];
     export_item_count: i64;
-    submodule_paths: string[];    // `public module` declarations (discover only, no dep edge)
+    submodule_paths: SymbolStr[]; // `public module` declarations (discover only, no dep edge)
     submodule_count: i64;
     uses_fstring:    boolean;     // file contains at least one f-string (`f"..."`)
 }

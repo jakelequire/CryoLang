@@ -69,9 +69,12 @@ The ruled kinds of door: the bare-identifier scope lookup and its
 type-namespace twin; one door per member kind, each taking an owner identity
 plus a leaf name; module-by-path (private to the module graph, which offers
 its callers methods each named for the one kind of text it turns into a
-module); the loader's path door, which matches a body path's head against
-the file's imports and its continuation against the namespaces files
-declare, before any module exists; the fixed
+module); the loader's path door, which turns a module path written in an
+`import`, `export` or `public module` into the file it names, and matches a
+body path's head against the file's imports and its continuation against
+the namespaces files declare, before any module exists - discovery's
+written paths are spellings (`SymbolStr`), and what the door answers is a
+file, whose path keys discovery's own sets; the fixed
 primitive and language-item table; the interner; and diagnostic suggestions,
 whose result may flow only into message text.
 
@@ -156,6 +159,7 @@ function carries no marker.
 | `assoc-type` | `TraitDeclNode::assoc_type_index` | `compiler/src/compiler/AST/declaration.cryo` | member: a trait's associated type, by the trait's declaration and leaf, to its position among the trait's associated types |
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
 | `module-by-path` | `ModuleGraph::modules_in_view` | `compiler/src/compiler/module_graph.cryo` | a path written in a body to the modules it names, among those the writing file can see: its own, the ones it imports, the prelude, or a package root written whole |
+| `loader-path` | `ModuleLoader::resolve_import_path` | `compiler/src/compiler/module_loader.cryo` | a module path written in an `import`, an `export` or a `public module` to the file of the module it names: a vendored library, a file declaring the namespace, or a file at the path on disk |
 | `loader-path` | `ModuleLoader::binding_of` | `compiler/src/compiler/module_loader.cryo` | a body path's head to the import of the file that binds it |
 | `loader-path` | `ModuleLoader::sub_module_file` | `compiler/src/compiler/module_loader.cryo` | a path's continuation past an import binding to the file of the sub-module it names |
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
