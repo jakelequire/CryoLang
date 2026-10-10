@@ -705,6 +705,18 @@ type struct PassRegistry {
 
     // Type Declaration Pass
 
+    /// Whether a type named `leaf` under the parent at slot `at` was seen
+    /// before among one module's `seen`; it is recorded when it was not.
+    ![allow(lookup_by_spelling, reason = "a duplicate-declaration check: two types under one parent sharing a spelling is the error it reports, and nothing is looked up by it")]
+    static type_repeats(seen: u64[]*, at: u64, leaf: SymbolStr) -> boolean {
+        const key: u64 = (at << 32) | (leaf.id as u64);
+        for (mut k: i64 = 0; k < (*seen).length; k++) {
+            if ((*seen)[k] == key) { return true; }
+        }
+        (*seen).push(key);
+        return false;
+    }
+
     /// Walks top-level declarations to create Type objects in the arena.
     /// This pass bridges the gap between name resolution and type resolution:
     /// after this pass, every declared struct/enum/class/trait has a TypeRef.
@@ -770,19 +782,11 @@ type struct PassRegistry {
             if (!def.is_valid()) { continue; }
             const parent: DefId = ctx.defs.parent_of(def);
             const at: i64 = if (parent.is_valid()) { ctx.defs.slot(parent) + 1 } else { 0 };
-            const at_bits: u64 = at as u64;
-            const key: u64 = (at_bits << 32) | (leaf.id as u64);
-            mut dup: boolean = false;
-            for (mut k: i64 = 0; k < seen_types.length; k++) {
-                if (seen_types[k] == key) { dup = true; break; }
-            }
-            if (dup) {
+            if (PassRegistry::type_repeats(&seen_types, at as u64, leaf)) {
                 ctx.emit_error_at(ErrorCode::E0207_REDEFINED_TYPE,
                     Text::new(fmt::format("type `%s` is defined multiple times",
                         ctx.intern_table.shown(ctx.defs.path_of(def)))),
                     tspan);
-            } else {
-                seen_types.push(key);
             }
         }
 

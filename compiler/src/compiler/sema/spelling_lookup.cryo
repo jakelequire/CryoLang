@@ -28,8 +28,16 @@
 ///     (`names.index_of(&name)`);
 ///   * the subject of a `match`.
 ///
+/// A local array that a comparison reads before a spelling is written into
+/// it - later in the body, which the next iteration of a loop reads back -
+/// holds it at that comparison too.
+///
 /// The check reaches as far as one function.  A spelling handed to another
-/// function is that function's to look up, and the refusal is there.
+/// function as a spelling is that function's to look up, and the refusal is
+/// there.  One handed on as plain text - a `string` - is a seed of the flow
+/// between functions (`IdentityFlow`): once every module is checked, a
+/// lookup other than a door's that it reaches, however many functions it
+/// passes through, is refused where it is.
 namespace compiler::sema::spelling_lookup;
 
 import compiler::ast;
@@ -54,7 +62,8 @@ import compiler::resolver::res::{ DefId, Res, ResSlot };
 import compiler::resolver::symbol_id::{ SymbolKey };
 import compiler::sema::call_facts::{ CallFacts };
 import compiler::sema::identity_text::{ IdentityTextCheck };
-import compiler::sema::state::{ SemaState };
+import compiler::sema::identity_flow::{ FlowFinding, FlowNode };
+import compiler::sema::state::{ SemaState, SpellingPending };
 import compiler::types;
 import compiler::types::{ TypeKind };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
@@ -85,6 +94,7 @@ implement struct SpellingLookupCheck {
         state.spelling_locals = HashMap::<SymbolKey, i64>::new();
         state.spelling_refused = [];
         state.spelling_field_refused = false;
+        state.spelling_pending = HashMap::<SymbolKey, SpellingPending[]>::new();
         if (func == null || func.is_synth_default) { return; }
         if (IdentityTextCheck::function_is_exempt(ctx, func)) { return; }
         // A spelling read off a field is followed in every body.
@@ -317,7 +327,12 @@ implement struct SpellingLookupCheck {
                      && !IdentityTextCheck::is_empty_text(bin.right)) { o = SPELLING_FIELD; }
             else if (ro >= 0 && SpellingLookupCheck::is_text(ctx, bin.left.resolved_type)
                      && !IdentityTextCheck::is_empty_text(bin.left)) { o = SPELLING_FIELD; }
-            if (o >= 0) { SpellingLookupCheck::refuse(ctx, state, o, (bin as ASTNode*).span, Text::new("compared")); }
+            if (o >= 0) {
+                SpellingLookupCheck::refuse(ctx, state, o, (bin as ASTNode*).span, Text::new("compared"));
+                return;
+            }
+            SpellingLookupCheck::pend(ctx, state, bin.right, lo, (bin as ASTNode*).span);
+            SpellingLookupCheck::pend(ctx, state, bin.left, ro, (bin as ASTNode*).span);
             return;
         }
         if (!bin.op.kind.is_assignment_op()) { return; }
@@ -354,6 +369,7 @@ implement struct SpellingLookupCheck {
             }
             return;
         }
+        SpellingLookupCheck::seed_text_arguments(ctx, state, call);
         if (!SpellingLookupCheck::answers_question(ctx, ty)) { return; }
         mut operands: ExpressionNode*[] = [];
         const recv: ExpressionNode* = SpellingLookupCheck::receiver_of(call);
@@ -399,12 +415,108 @@ implement struct SpellingLookupCheck {
                     Res::Local(sym) => {
                         if (!state.spelling_locals.contains_key(&sym.table_key())) {
                             state.spelling_locals.insert(sym.table_key(), o);
+                            SpellingLookupCheck::settle(ctx, state, sym.table_key(), o);
                         }
                     }
                     _ => { }
                 }
             }
             _ => { }
+        }
+    }
+
+    /// A spelling handed to `call` as plain text - a `string`, not a
+    /// spelling type - goes on to the callee's parameter, which no check
+    /// of the callee's own follows: a seed of the flow between functions,
+    /// looked up wherever that parameter reaches a lookup other than a
+    /// door's.
+    static seed_text_arguments(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*) -> void {
+        if (!state.identity_text_on || state.identity_exempt) { return; }
+        const entry: OverloadId = CallFacts::callee_entry(ctx, call).entry;
+        if (!entry.is_valid()) { return; }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const a: ExpressionNode* = call.arguments[i];
+            if (a == null || !SpellingLookupCheck::is_text(ctx, a.resolved_type)
+                    || DirectiveProcessingPasses::spelling_type_of(ctx, a.resolved_type).length() > 0) {
+                continue;
+            }
+            if (SpellingLookupCheck::origin(ctx, state, a, 0) < 0) { continue; }
+            ctx.identity_flow.seed_spelling(FlowNode::argument(entry.table_key(), i), a.span);
+        }
+    }
+
+    /// The local array `e` reads - `e` itself, or an element read off it -
+    /// when no spelling has been written into it yet.
+    static unmarked_array(ctx: CompilationContext*, state: SemaState*, e: ExpressionNode*) -> Option<SymbolKey> {
+        mut cur: ExpressionNode* = e;
+        for (mut depth: i32 = 0; depth < 4 && cur != null; depth++) {
+            const n: ASTNode* = cur as ASTNode*;
+            if (n.kind == NodeKind::UnaryExpression) { cur = (cur as UnaryExprNode*).operand; continue; }
+            if (n.kind == NodeKind::CastExpression) { cur = (cur as CastExprNode*).expression; continue; }
+            if (n.kind == NodeKind::ArrayAccess) { cur = (cur as ArrayAccessNode*).array; continue; }
+            break;
+        }
+        if (cur == null || (cur as ASTNode*).kind != NodeKind::Identifier) { return Option::None; }
+        const t: Type* = ctx.type_arena.lookup(cur.resolved_type);
+        if (t == null || t.kind != TypeKind::Array) { return Option::None; }
+        match ((cur as IdentifierNode*).res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Local(sym) => {
+                        if (state.spelling_locals.contains_key(&sym.table_key())) { return Option::None; }
+                        return Option::Some(sym.table_key());
+                    }
+                    _ => { return Option::None; }
+                }
+            }
+            _ => { return Option::None; }
+        }
+    }
+
+    /// A comparison at `site` of a spelling (from `other`) with what `e`
+    /// reads off a local array no spelling has been written into yet: a
+    /// lookup if one is written later in the body, which a later iteration
+    /// of a loop reads back.
+    static pend(ctx: CompilationContext*, state: SemaState*, e: ExpressionNode*, other: i64, site: SourceSpan) -> void {
+        if (other < 0) { return; }
+        match (SpellingLookupCheck::unmarked_array(ctx, state, e)) {
+            Option::Some(key) => {
+                const list: SpellingPending[]* = state.spelling_pending.get_or_insert(key, []);
+                (*list).push(SpellingPending { origin: other, site: site });
+            }
+            Option::None => { }
+        }
+    }
+
+    /// A spelling from `origin` is written into the local array `key`:
+    /// each comparison that read the array earlier is refused.
+    static settle(ctx: CompilationContext*, state: SemaState*, key: SymbolKey, origin: i64) -> void {
+        mut found: SpellingPending[] = [];
+        match (state.spelling_pending.get_ref(&key)) {
+            Option::Some(list) => {
+                for (mut i: i64 = 0; i < (*list).length; i++) { found.push((*list)[i]); }
+            }
+            Option::None => { }
+        }
+        for (mut i: i64 = 0; i < found.length; i++) {
+            const o: i64 = if (origin != SPELLING_FIELD) { origin } else { found[i].origin };
+            SpellingLookupCheck::refuse(ctx, state, o, found[i].site, Text::new("compared"));
+        }
+    }
+
+    /// Once every module is checked: E0157 at each lookup a spelling handed
+    /// on as plain text reaches through other functions.
+    static report_flows(ctx: CompilationContext*) -> void {
+        const found: FlowFinding[] = ctx.identity_flow.spelling_findings();
+        for (mut i: i64 = 0; i < found.length; i++) {
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0157_LOOKUP_BY_SPELLING, Text::new(fmt::format(
+                "`%s` looks up a spelling it is handed as plain text", found[i].sink.within)));
+            diag = diag.at_with_label(found[i].sink.span, Text::new(fmt::format(
+                "looked up here, outside a door: the %s", found[i].sink.asked)));
+            diag = diag.also_at(found[i].entered, Text::new("the spelling leaves the function that holds it here, as text"));
+            diag = diag.help(Text::new(
+                "hand the spelling to a door, or say why this is no lookup: `![allow(lookup_by_spelling, reason = \"...\")]` on the declaration"));
+            ctx.emit_diagnostic(diag);
         }
     }
 

@@ -37,9 +37,14 @@ path or leaf is read as a `DeclName`, whose text comes back only through
 `DeclName::spelling` (for a node synthesized to carry the name).  Sema
 follows text computed from a `DeclName` through the function that reads it -
 concatenated, formatted, held in a local - and refuses it where it becomes a
-door's argument, a hash table's key, or an operand of `==` or `!=` beside
-other text (E0157); a comparison with the empty string asks whether there
-is any text, and is no lookup.  Text that leaves the function is followed
+door's argument, a hash table's key, an operand of `==` or `!=` beside
+other text, one of the texts handed to a call answering a `boolean`
+(`a.equals(b)`, `s.starts_with(p)`), or a `match`'s subject (E0157); a
+comparison with the empty string asks whether there is any text, and is no
+lookup.  A named type's display (`TypeArena::format_display`) is its
+declaration's `DeclName` shown, and a function's linker symbol
+(`DeclarationIndex::entry_symbol`) is a `DeclName`, so the text either
+yields is followed the same way.  Text that leaves the function is followed
 too: each function records where its text-typed parameters, its receiver
 and its answer go - into another function's, or to a lookup - and once
 every module is checked, a lookup that text read off a definition reaches
@@ -90,6 +95,15 @@ modules the reason says why the spelling is no lookup: a reason opening
 the reason (E0157).  The editor's pending allows stay until its own
 migration.  The check reaches one
 function: a spelling handed on is looked up, and refused, in the callee.
+A spelling handed on as plain text - a `string` parameter, which the
+callee's own check does not follow - is followed through the flow between
+functions the rule-four check records, through any chain of calls, and
+refused where it reaches a hash table's key, a comparison or a `match`'s
+subject ("`f` looks up a spelling it is handed as plain text"), naming
+where it left the function that held it; a door's argument is where a
+spelling belongs, and is not refused.  A local array that a comparison
+reads before a spelling is written into it, later in the body - which the
+next iteration of a loop reads back - is refused at that comparison.
 
 The same check follows a spelling read off a field - a declaration's, a
 syntax node's or a table row's name (`decls[i].name.equals(node.name)`) -
@@ -147,7 +161,9 @@ function carries no marker.
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
 | `primitive` | `ResBase::primitive_of_alias` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: alias keywords |
 | `primitive` | `ResBase::primitive_position` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: a primitive's position, which its definition is kept under |
+| `primitive` | `SourceLoc::of_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed table of source-location pseudo-constants (`FILE`, `LINE`), declared nowhere |
 | `lang-item` | `GenericRegistry::claim_wellknown` | `compiler/src/compiler/types/generic_registry.cryo` | the fixed language-item table |
+| `lang-item` | `IntrinsicKind::from_name` | `compiler/src/compiler/intrinsic_kind.cryo` | the fixed intrinsic table: an `intrinsic function` declaration's name to the operation it lowers as |
 | `intern` | `InternTable::intern` | `compiler/src/compiler/resolver/intern_table.cryo` | text to `SymbolStr` |
 | `suggestion` | `find_best_candidate` | `compiler/src/compiler/diag/edit_distance.cryo` | "did you mean": result flows only into message text |
 | `suggestion` | `Diagnostics::find_shadowed_type_candidates` | `compiler/src/compiler/sema/diagnostics.cryo` | "import the type you meant": the paths, as text, of the types whose last segment is a refused access's type spelling and which own its member; result flows only into message text |
@@ -211,6 +227,32 @@ yet is recorded with the change that builds it, not here.
      the compiler's own check and a Python list disagree only because of
      what the Python cannot see, that is recorded, not fixed in the
      Python.
+
+220. **The refusal of a literal-only value its integer type does not hold
+     is E0010,** the code a single out-of-range literal in the same place
+     already gets.
+
+221. **The wordings stand:** the narrowing refusal's "this value is 300,
+     which `u8` does not hold: it narrows the value and would silently
+     truncate; add an explicit `as` cast", and the identity-text
+     refusals' "`==` is handed text read off a definition, which is shown
+     and never looked up by", its label "computed from a `DeclName`, and
+     the operand of a comparison", and the note "the definition's text
+     leaves the function that read it here".
+
+222. **Every lookup the Python spelling-flow list sees that the
+     compiler's own checks do not is brought under the checks, module
+     discovery included:** text derived from a definition that is not
+     typed `DeclName` (a type's display name, a link symbol), discovery's
+     matching of written module paths and file paths as plain strings, a
+     written name handed as plain text to a fixed table, and a duplicate
+     check that records a spelling after the comparison that reads it.
+     Each real site found is routed through a door or an identity, or
+     says why it is no lookup.
+
+223. **A generic's compiled copies are registered and found by the
+     template's identity and their type arguments** (rule four), not by a
+     key spelled from the template's name.
 
 ### 2026-10-09
 

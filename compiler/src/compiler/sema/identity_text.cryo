@@ -24,7 +24,8 @@
 /// `![allow(lookup_by_spelling, reason = "...")]` - the marker the spelling
 /// lint reads, and the one a function that mangles a definition's path into
 /// its link symbol carries.  It refuses, too, identity text compared with
-/// other text (`==`, `!=`).
+/// other text (`==`, `!=`, or a call answering a `boolean` handed more than
+/// one text), and identity text as a `match`'s subject.
 ///
 /// Text that leaves the function - handed to another function's parameter
 /// or receiver, or returned - is followed there: each function records
@@ -302,8 +303,16 @@ implement struct IdentityTextCheck {
             return;
         }
         if (IdentityTextCheck::is_empty_text(bin.left) || IdentityTextCheck::is_empty_text(bin.right)) { return; }
-        IdentityTextCheck::sink_or_refuse(ctx, state, bin.left, (bin as ASTNode*).span, "==", Text::new("operand of a comparison"));
-        IdentityTextCheck::sink_or_refuse(ctx, state, bin.right, (bin as ASTNode*).span, "==", Text::new("operand of a comparison"));
+        IdentityTextCheck::sink_or_refuse(ctx, state, bin.left, (bin as ASTNode*).span, "==", Text::new("operand of a comparison"), false);
+        IdentityTextCheck::sink_or_refuse(ctx, state, bin.right, (bin as ASTNode*).span, "==", Text::new("operand of a comparison"), false);
+    }
+
+    /// Refuse identity text as a `match`'s subject: the arms ask which
+    /// definition the text names.
+    static check_match(ctx: CompilationContext*, state: SemaState*, subject: ExpressionNode*) -> void {
+        if (!state.identity_text_on || state.identity_exempt || subject == null) { return; }
+        if (!IdentityTextCheck::is_text(ctx, subject.resolved_type)) { return; }
+        IdentityTextCheck::sink_or_refuse(ctx, state, subject, subject.span, "match", Text::new("subject of a `match`"), false);
     }
 
     /// Whether `e` is the empty string literal: a comparison with it asks
@@ -364,20 +373,21 @@ implement struct IdentityTextCheck {
     /// parameter or another call's answer is recorded as a sink of that
     /// node.  Any other call is a flow: what each argument and the receiver
     /// may hold goes on to the callee's matching node.
-    static check_call(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*) -> void {
+    static check_call(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*, ty: TypeRef) -> void {
         if (!state.identity_text_on || state.identity_exempt || call == null) { return; }
+        IdentityTextCheck::check_text_question(ctx, state, call, ty);
         const entry: OverloadId = CallFacts::callee_entry(ctx, call).entry;
         if (DirectiveProcessingPasses::is_door(ctx.decl_index.entry_decl(entry))) {
             const callee: string = IdentityTextCheck::callee_shown(ctx, call);
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
                 IdentityTextCheck::sink_or_refuse(ctx, state, call.arguments[i], call.arguments[i].span, callee,
-                    Text::new("argument of a door"));
+                    Text::new("argument of a door"), true);
             }
             return;
         }
         if (IdentityTextCheck::is_table_call(ctx, call)) {
             IdentityTextCheck::sink_or_refuse(ctx, state, call.arguments[0], call.arguments[0].span,
-                IdentityTextCheck::callee_shown(ctx, call), Text::new("key of a hash table"));
+                IdentityTextCheck::callee_shown(ctx, call), Text::new("key of a hash table"), false);
             return;
         }
         if (!entry.is_valid()) { return; }
@@ -388,6 +398,32 @@ implement struct IdentityTextCheck {
         }
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
             IdentityTextCheck::flow_into(ctx, state, call.arguments[i], FlowNode::argument(key, i));
+        }
+    }
+
+    /// A call answering a `boolean` that is handed more than one text -
+    /// receiver and arguments - compares them (`a.equals(b)`,
+    /// `s.starts_with(p)`): each is looked up as a comparison's operand.
+    static check_text_question(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*, ty: TypeRef) -> void {
+        const t: Type* = ctx.type_arena.lookup(ty);
+        if (t == null || t.kind != TypeKind::Bool) { return; }
+        mut operands: ExpressionNode*[] = [];
+        const cn: ASTNode* = call.callee as ASTNode*;
+        if (cn != null && cn.kind == NodeKind::MemberAccess) {
+            const recv: ExpressionNode* = (call.callee as MemberAccessNode*).object;
+            if (recv != null && IdentityTextCheck::is_text(ctx, recv.resolved_type)) { operands.push(recv); }
+        }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const a: ExpressionNode* = call.arguments[i];
+            if (a != null && IdentityTextCheck::is_text(ctx, a.resolved_type) && !IdentityTextCheck::is_empty_text(a)) {
+                operands.push(a);
+            }
+        }
+        if (operands.length < 2) { return; }
+        const callee: string = IdentityTextCheck::callee_shown(ctx, call);
+        for (mut i: i64 = 0; i < operands.length; i++) {
+            IdentityTextCheck::sink_or_refuse(ctx, state, operands[i], (call as ASTNode*).span, callee,
+                Text::new("operand of a comparison"), false);
         }
     }
 
@@ -408,10 +444,11 @@ implement struct IdentityTextCheck {
         return callee;
     }
 
-    /// `arg` is looked up at `site` by `callee`: E0157 when it is identity
-    /// text; a sink of each flow node it may hold otherwise.
+    /// `arg` is looked up at `site` by `callee`, a door's when `of_door`
+    /// says: E0157 when it is identity text; a sink of each flow node it may
+    /// hold otherwise.
     static sink_or_refuse(ctx: CompilationContext*, state: SemaState*, arg: ExpressionNode*, site: SourceSpan,
-                          callee: string, asked: Text) -> void {
+                          callee: string, asked: Text, of_door: boolean) -> void {
         if (arg == null) { return; }
         mut nodes: FlowNode[] = [];
         if (IdentityTextCheck::taint(ctx, state, arg, 0, &nodes)) {
@@ -419,8 +456,12 @@ implement struct IdentityTextCheck {
             return;
         }
         if (!IdentityTextCheck::flowing(state)) { return; }
+        const f: FunctionDeclNode* = state.current_func;
+        const within: string = if (f != null) { ctx.intern_table.resolve(f.name) } else { "" };
         for (mut i: i64 = 0; i < nodes.length; i++) {
-            ctx.identity_flow.sink(nodes[i], FlowSink { span: site, callee: callee, asked: asked.as_string() });
+            ctx.identity_flow.sink(nodes[i], FlowSink {
+                span: site, callee: callee, asked: asked.as_string(), within: within, of_door: of_door
+            });
         }
     }
 

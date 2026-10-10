@@ -1176,6 +1176,7 @@ public:
     override visit(mut &this, node: MatchStmtNode*) -> void {
         const subject_type: TypeRef = this.resolve_expr(node.subject);
         this.record_match_facts(node.subject, &node.arms, (node as ASTNode*).span);
+        IdentityTextCheck::check_match(this.ctx, &this.state, node.subject);
         SpellingLookupCheck::check_match(this.ctx, &this.state, node.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
@@ -1524,7 +1525,7 @@ public:
         if (ty.kind == TypeKind::Struct) { fields_ptr = &(ty as StructType*).fields; got_fields = true; }
         else if (ty.kind == TypeKind::Class) { fields_ptr = &(ty as ClassType*).fields; got_fields = true; }
         if (!got_fields) {
-            const ty_name: string = this.intern.resolve(this.intern.intern(this.arena.format_display(ty)));
+            const ty_name: string = this.arena.format_display(ty);
             this.ctx.emit_error_at(ErrorCode::E0361_DESTRUCTURE_NON_STRUCT,
                 Text::new(fmt::format("cannot destructure non-struct type '%s'", ty_name)), node.span);
             this.register_destructure_locals_void(node);
@@ -1534,7 +1535,7 @@ public:
         mut names: SymbolStr[] = [];
         for (mut k: i64 = 0; k < fields_ptr.length; k++) { names.push(fields_ptr[k].decl_name().spelling()); }
         const positions: i64[] = this.check_destructure_shape(node, &names,
-            this.intern.resolve(this.intern.intern(this.arena.format_display(ty))));
+            this.arena.format_display(ty));
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             mut b: DestructureBinding = node.bindings[i];
             if (positions[i] < 0) {
@@ -1691,7 +1692,7 @@ public:
     /// every build, a module reused from the incremental cache included.
     resolve_call_recorded(mut &this, call: CallExprNode*) -> TypeRef {
         const t: TypeRef = this.calls.resolve_call(this, call);
-        IdentityTextCheck::check_call(this.ctx, &this.state, call);
+        IdentityTextCheck::check_call(this.ctx, &this.state, call, t);
         SpellingLookupCheck::check_call(this.ctx, &this.state, call, t);
         if (this.ctx.options.emit_facts) {
             const known: boolean = this.state.facts_call == call;
@@ -2939,6 +2940,7 @@ public:
     resolve_match_expr(mut &this, match_expr: MatchExprNode*) -> TypeRef {
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
         this.record_match_facts(match_expr.subject, &match_expr.arms, (match_expr as ASTNode*).span);
+        IdentityTextCheck::check_match(this.ctx, &this.state, match_expr.subject);
         SpellingLookupCheck::check_match(this.ctx, &this.state, match_expr.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(match_expr.subject);
         this.patterns.check_duplicate_default_arm(match_expr.arms);
@@ -3545,7 +3547,7 @@ public:
         }
         if (is_union_lit) {
             if (lit.field_inits.length != 1) {
-                const un_name: string = this.intern.resolve(this.intern.intern(this.arena.format_display(struct_t)));
+                const un_name: string = this.arena.format_display(struct_t);
                 mut udiag: Diagnostic = Diagnostic::error(ErrorCode::E0363_UNION_LITERAL_ARITY,
                     Text::new(fmt::format("union literal of `%s` must initialize exactly one field, found %lld",
                         un_name, lit.field_inits.length)));
@@ -3598,7 +3600,7 @@ public:
                         if (i == 0) { names_str = fmt::format("`%s`", nm); } else { names_str = fmt::format("%s, `%s`", names_str, nm); }
                     }
                     if (missing_names.length > cap) { names_str = fmt::format("%s, and %lld more", names_str, missing_names.length - cap); }
-                    const ty_name: string = this.intern.resolve(this.intern.intern(this.arena.format_display(struct_t)));
+                    const ty_name: string = this.arena.format_display(struct_t);
                     mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0355_MISSING_FIELD_INIT,
                         Text::new(fmt::format("missing field%s %s in initializer of `%s`",
                             if (missing_names.length == 1) { "" } else { "s" }, names_str, ty_name)));
@@ -4128,17 +4130,13 @@ public:
         match (t.kind) {
             TypeKind::Pointer  => { return "null"; }
             TypeKind::Optional => { return "Option::None"; }
+            TypeKind::Bool     => { return "false"; }
+            TypeKind::String   => { return "\"\""; }
+            TypeKind::Float    => { return "0.0"; }
+            TypeKind::Int      => { return "0"; }
             _ => {}
         }
-        const name: string = this.types.type_display_name(ret_ty);
-        if (name.eq("boolean") || name.eq("bool")) { return "false"; }
-        if (name.eq("string")) { return "\"\""; }
-        if (name.eq("f32") || name.eq("f64")) { return "0.0"; }
-        if (name.eq("i8")  || name.eq("i16") || name.eq("i32") || name.eq("i64")
-         || name.eq("i128") || name.eq("u8")  || name.eq("u16")
-         || name.eq("u32") || name.eq("u64") || name.eq("u128")
-         || name.eq("isize") || name.eq("usize")) { return "0"; }
-        return fmt::format("<%s>", name);
+        return fmt::format("<%s>", this.types.type_display_name(ret_ty));
     }
 
     return_type_requires_return(&this, ret: TypeRef) -> boolean {

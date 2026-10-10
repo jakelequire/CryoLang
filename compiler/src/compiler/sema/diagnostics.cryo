@@ -45,7 +45,7 @@ import compiler::diag::suggestion::{ Applicability, Suggestion };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::sema::helpers::{ is_numeric_type_name, lexeme_looks_like_number };
+import compiler::sema::helpers::{ lexeme_looks_like_number };
 import compiler::sema::state::{ SemaState };
 import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
@@ -54,7 +54,6 @@ import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ ClassType, EnumType, MethodInfo, StructType };
 import utils::text::{ Text };
-import utils::keyword::{ Keyword };
 
 type struct Diagnostics {
     arena:  TypeArena*;
@@ -159,8 +158,15 @@ type struct Diagnostics {
             diag = diag.with_note(context_msg);
         }
         diag = this.attach_type_coercion_suggestion(diag, span,
-            expected_name, found_name, value_expr);
+            expected, found, expected_name, value_expr);
         this.ctx.emit_diagnostic(diag);
+    }
+
+    /// The kind of type `ty`, or `Void` when it names none.
+    kind_or_void(&this, ty: TypeRef) -> TypeKind {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return TypeKind::Void; }
+        return t.kind;
     }
 
     /// Attach a literal-aware quickfix when the (expected, found, value) triple
@@ -168,17 +174,18 @@ type struct Diagnostics {
     /// literal (wrap in quotes), numeric<-numeric-looking string (drop quotes).
     /// All MachineApplicable; returns the diagnostic unchanged when none fit.
     attach_type_coercion_suggestion(&this, diag: Diagnostic, span: SourceSpan,
-                                    expected_name: string, found_name: string,
+                                    expected: TypeRef, found: TypeRef, expected_name: string,
                                     value_expr: ExpressionNode*) -> Diagnostic {
         if (value_expr == null || !span.has_location()) { return diag; }
         const node: ASTNode* = value_expr as ASTNode*;
         if (node.kind != NodeKind::Literal) { return diag; }
 
         const lit: LiteralNode* = value_expr as LiteralNode*;
-        const want_bool: boolean = expected_name.eq("boolean")
-                                || expected_name.eq("bool");
-        const want_string:  boolean = expected_name.eq("string");
-        const found_string: boolean = found_name.eq("string");
+        const want_kind: TypeKind = this.kind_or_void(expected);
+        const want_bool: boolean = want_kind == TypeKind::Bool;
+        const want_string:  boolean = want_kind == TypeKind::String;
+        const want_number:  boolean = want_kind == TypeKind::Int || want_kind == TypeKind::Float;
+        const found_string: boolean = this.kind_or_void(found) == TypeKind::String;
 
         if (want_bool && lit.literal_kind == LiteralKind::String) {
             if (lit.value.eq("true")) {
@@ -208,7 +215,7 @@ type struct Diagnostics {
                 Text::new("wrap the literal in quotes to make it a string")));
         }
         if (found_string && !want_bool && !want_string
-            && is_numeric_type_name(Keyword::new(expected_name))
+            && want_number
             && lexeme_looks_like_number(Text::new(lit.value))) {
             return diag.suggest(Suggestion::machine_applicable(
                 span, Text::new(lit.value),

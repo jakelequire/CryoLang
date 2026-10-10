@@ -3,11 +3,11 @@
 /// Routes codegen diagnostics through the shared `DiagnosticSink` on
 /// `CompilationContext`, and owns the set of "stripped" functions -
 /// those whose body codegen failed and had to be reverted to a declare.
-/// The post-codegen cascade-strip pass reads `stripped_names()` to find
-/// callers that need stripping too, so the LLVM module doesn't ship a
-/// half-built define that fails verification.
+/// The post-codegen cascade-strip pass asks `is_stripped` to find callers
+/// that need stripping too, so the LLVM module doesn't ship a half-built
+/// define that fails verification.
 ///
-/// Owns `stripped_func_names`.  Borrows `ctx: CompilationContext*` for
+/// Owns `stripped_funcs`.  Borrows `ctx: CompilationContext*` for
 /// diagnostic routing (one back-pointer).
 
 namespace compiler::codegen::state::diag_sink;
@@ -25,32 +25,30 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::diag::source_span::{ SourceSpan };
 import utils::text::{ Text };
-import compiler::resolver::mangled_name::{ MangledName };
 
 
 type struct DiagSink {
     ctx: CompilationContext*;
 
-    /// Mangled LLVM names of functions whose body was attempted-but-stripped
-    /// in this module.  Used by the post-codegen cascade-strip pass to
-    /// identify same-module declare-only callees and strip their callers
-    /// too, so an `Array<T>::quicksort` body that calls a stripped
-    /// `partition` doesn't emit a dangling extern at link time.
-    /// Cross-module externs are NOT in this set, so they're unaffected.
-    stripped_func_names: string[];
+    /// The LLVM functions of this module whose body was attempted and
+    /// stripped.  Used by the post-codegen cascade-strip pass to identify
+    /// same-module declare-only callees and strip their callers too, so an
+    /// `Array<T>::quicksort` body that calls a stripped `partition` doesn't
+    /// emit a dangling extern at link time.  Cross-module externs are NOT
+    /// in this set, so they're unaffected.
+    stripped_funcs: void*[];
 
     static new(ctx: CompilationContext*) -> DiagSink {
         return DiagSink {
-            ctx:                 ctx,
-            stripped_func_names: [],
+            ctx:            ctx,
+            stripped_funcs: [],
         };
     }
 
-    /// Check whether a function's mangled LLVM name has been stripped in
-    /// this module.
-    is_stripped(&this, name: MangledName) -> boolean {
-        for (mut i: i64 = 0; i < this.stripped_func_names.length; i++) {
-            if (this.stripped_func_names[i] == name.as_string()) {
+    /// Whether the LLVM function `fn_val` has been stripped in this module.
+    is_stripped(&this, fn_val: void*) -> boolean {
+        for (mut i: i64 = 0; i < this.stripped_funcs.length; i++) {
+            if (this.stripped_funcs[i] == fn_val) {
                 return true;
             }
         }
@@ -89,14 +87,11 @@ type struct DiagSink {
     /// Strip all basic blocks from a function, reverting it to a declare.
     /// Used when body generation fails: better a clean declare than a
     /// half-built define that fails LLVM verification.  Also records the
-    /// function's mangled LLVM name so the post-codegen cascade pass can
-    /// strip callers in the same module.
+    /// function so the post-codegen cascade pass can strip callers in the
+    /// same module.
     strip_function_body(mut &this, fn_val: LValue) -> void {
         if (!fn_val.is_valid()) { return; }
-        const fn_name: string = llvm::LLVMGetValueName(fn_val.raw) as string;
-        if (fn_name != null) {
-            this.stripped_func_names.push(fn_name);
-        }
+        this.stripped_funcs.push(fn_val.raw);
         mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
         while (bb != null) {
             const next: void* = llvm::LLVMGetNextBasicBlock(bb);

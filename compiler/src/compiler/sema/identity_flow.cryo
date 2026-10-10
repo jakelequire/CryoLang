@@ -11,6 +11,10 @@
 /// reaches are the lookups that text reaches, however many functions it
 /// passed through on the way; the order the functions were checked in does
 /// not matter.
+///
+/// The same flow carries a spelling handed on as plain text
+/// (`SpellingLookupCheck`): its seeds are kept apart, and reach every
+/// lookup but a door's argument, which is where a spelling belongs.
 namespace compiler::sema::identity_flow;
 
 import compiler::decl_index::{ OverloadKey };
@@ -67,11 +71,15 @@ implement trait Eq for struct FlowNode {
 }
 
 /// A lookup text reaching a node is looked up by: where, what is asked
-/// (the door or the table method, as written), and how.
+/// (the door or the table method, as written), how, and in which function.
+/// A door's argument is a lookup of identity text only: a spelling is what
+/// a door is handed.
 type struct FlowSink {
-    span:   SourceSpan;
-    callee: string;
-    asked:  string;
+    span:    SourceSpan;
+    callee:  string;
+    asked:   string;
+    within:  string;
+    of_door: boolean;
 }
 
 /// A lookup text read off a definition reaches, and where that text left
@@ -87,6 +95,8 @@ private:
     sinks: HashMap<FlowNode, FlowSink[]>;
     seeds: FlowNode[];
     seed_spans: SourceSpan[];
+    spelling_seeds: FlowNode[];
+    spelling_seed_spans: SourceSpan[];
 
 public:
     static new() -> IdentityFlow {
@@ -95,6 +105,8 @@ public:
             sinks: HashMap::<FlowNode, FlowSink[]>::new(),
             seeds: [],
             seed_spans: [],
+            spelling_seeds: [],
+            spelling_seed_spans: [],
         };
     }
 
@@ -121,17 +133,36 @@ public:
         this.seed_spans.push(span);
     }
 
-    /// Every sink a seed reaches, once each, with where the first seed to
-    /// reach it entered.
+    /// A spelling handed on as plain text goes to `at`, leaving its
+    /// function at `span`.
+    seed_spelling(mut &this, at: FlowNode, span: SourceSpan) -> void {
+        this.spelling_seeds.push(at);
+        this.spelling_seed_spans.push(span);
+    }
+
+    /// Every sink text read off a definition reaches, once each, with where
+    /// the first seed to reach it entered.
     findings(&this) -> FlowFinding[] {
+        return this.reach(&this.seeds, &this.seed_spans, true);
+    }
+
+    /// Every lookup other than a door's that a spelling handed on as plain
+    /// text reaches, once each, with where the first seed to reach it
+    /// entered.
+    spelling_findings(&this) -> FlowFinding[] {
+        return this.reach(&this.spelling_seeds, &this.spelling_seed_spans, false);
+    }
+
+    /// Every sink `seeds` reach, a door's argument only when `doors` says.
+    reach(&this, seeds: &FlowNode[], seed_spans: &SourceSpan[], doors: boolean) -> FlowFinding[] {
         mut out: FlowFinding[] = [];
         mut reached: HashMap<FlowNode, i64> = HashMap::<FlowNode, i64>::new();
         mut work: FlowNode[] = [];
         mut work_seed: i64[] = [];
-        for (mut s: i64 = 0; s < this.seeds.length; s++) {
-            if (reached.contains_key(&this.seeds[s])) { continue; }
-            reached.insert(this.seeds[s], s);
-            work.push(this.seeds[s]);
+        for (mut s: i64 = 0; s < seeds.length; s++) {
+            if (reached.contains_key(&seeds[s])) { continue; }
+            reached.insert(seeds[s], s);
+            work.push(seeds[s]);
             work_seed.push(s);
         }
         mut wi: i64 = 0;
@@ -142,7 +173,8 @@ public:
             match (this.sinks.get_ref(&node)) {
                 Option::Some(list) => {
                     for (mut k: i64 = 0; k < (*list).length; k++) {
-                        out.push(FlowFinding { sink: (*list)[k], entered: this.seed_spans[from_seed] });
+                        if ((*list)[k].of_door && !doors) { continue; }
+                        out.push(FlowFinding { sink: (*list)[k], entered: seed_spans[from_seed] });
                     }
                 }
                 Option::None => { }

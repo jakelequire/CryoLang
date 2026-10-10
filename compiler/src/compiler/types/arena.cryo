@@ -992,17 +992,18 @@ public:
     /// this MUST be instantiated lazily at call sites, never eagerly, exactly
     /// like a self-returning trait-default combinator.
     ///
-    /// The owner is identified by its DEFINITION (not a `TypeRef`): the owner handle the
-    /// caller has at signature-resolution time is often an invalid `TypeRef`
-    /// for `implement` blocks (the receiver is back-filled later), so an
-    /// identity check would silently never match.
+    /// The owner is the type its definition registered (`owner`), the base
+    /// every instantiation of it names: the owner handle the caller has at
+    /// signature-resolution time is often an invalid `TypeRef` for
+    /// `implement` blocks (the receiver is back-filled later), so it is
+    /// asked of the definition.
     ///
     /// NOT matched (these are finite, so they stay eager):
     ///   - `Option<T>`   bare param arg  -> same level, no growth
     ///   - `Option<i32*>` concrete arg   -> no param, materialized once
     ///   - `&Option<T>` (`&this`)        -> peels to the bare-param owner
     ///   - `Foo<T>` for a different base than the owner
-    is_self_growing_instantiation(&this, ty: TypeRef, owner: DefId) -> boolean {
+    is_self_growing_instantiation(&this, ty: TypeRef, owner: TypeRef) -> boolean {
         if (!ty.is_valid() || !owner.is_valid()) { return false; }
         const t: Type* = this.lookup(ty);
         if (t == null) { return false; }
@@ -1021,10 +1022,7 @@ public:
         }
         if (t.kind != TypeKind::InstantiatedType) { return false; }
         const inst: InstantiatedType* = t as InstantiatedType*;
-        // Same generic base as the owner, matched by qualified name.
-        const bn: SymbolStr = this.get_qualified_name(inst.generic_base);
-        const same_base: boolean = bn.is_valid() && bn.equals(this.defs.path_of(owner).spelling());
-        if (!same_base) {
+        if (!inst.generic_base.equals(owner)) {
             // Different base: the owner base may be nested deeper
             // (e.g. `Pair<i32, Option<T*>>` on owner `Option`).
             for (mut i: i64 = 0; i < inst.type_args.length; i++) {
@@ -1220,11 +1218,51 @@ public:
                 return this.resolve_display_name(proj.base) + "::"
                     + this.intern_table.resolve(proj.member);
             }
+            TypeKind::Struct | TypeKind::Class | TypeKind::Enum | TypeKind::Trait
+            | TypeKind::TypeAlias | TypeKind::FunctionTemplate => {
+                const custom: string = this.custom_display_of(ty);
+                if (custom.length() > 0) { return custom; }
+                return this.intern_table.shown(this.declared_name(ty));
+            }
             _ => { }
         }
 
-        // Primitives, user-defined types (Struct, Class, Enum, Trait)
+        // Primitives
         return ty.display_name();
+    }
+
+    /// The name an annotation synthesized for `ty` prints as: its display,
+    /// interned.
+    ![allow(lookup_by_spelling, reason = "the printed label of a synthesized annotation: a named one carries the TypeRef, which resolution answers by before it reads the label, and a primitive's label is its spelling in the language's fixed primitive table")]
+    display_label(&this, ty: TypeRef) -> SymbolStr {
+        return this.intern_table.intern(this.resolve_display_name(ty));
+    }
+
+    /// The name a struct, class, enum, trait, alias or function template is
+    /// declared under, read off the type: text to show, never a key.  The
+    /// name of nothing for any other kind.
+    declared_name(&this, ty: Type*) -> DeclName {
+        return match (ty.kind) {
+            TypeKind::Struct           => { DeclName::of((ty as StructType*).qualified_name) }
+            TypeKind::Class            => { DeclName::of((ty as ClassType*).qualified_name) }
+            TypeKind::Enum             => { DeclName::of((ty as EnumType*).qualified_name) }
+            TypeKind::Trait            => { DeclName::of((ty as TraitType*).qualified_name) }
+            TypeKind::TypeAlias        => { DeclName::of((ty as TypeAliasType*).alias_name) }
+            TypeKind::FunctionTemplate => { DeclName::of((ty as FunctionTemplateType*).qualified_name) }
+            _                          => { DeclName::empty() }
+        };
+    }
+
+    /// The display a specialization of a generic struct, class or enum is
+    /// given in place of its declared name (`Vec<i32>`), or "" when it has
+    /// none.
+    custom_display_of(&this, ty: Type*) -> string {
+        return match (ty.kind) {
+            TypeKind::Struct => { (ty as StructType*).custom_display }
+            TypeKind::Class  => { (ty as ClassType*).custom_display }
+            TypeKind::Enum   => { (ty as EnumType*).custom_display }
+            _                => { "" }
+        };
     }
 
     /// Same as `resolve_display_name` but strips namespace prefixes

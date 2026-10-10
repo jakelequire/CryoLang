@@ -413,8 +413,6 @@ EXCLUDED_ARRAYS = {
                                    "one CLI command's declared arguments: FLAGS by the spelling typed"),
     "CompilationContext": Excluded("compiler/compilation_context.cryo",
                                    "the facts lines it records, TEXTS; the stores the context carries by pointer are placed on their own"),
-    "DiagSink":           Excluded("compiler/codegen/state/diag_sink.cryo",
-                                   "codegen's record of the functions whose bodies it stripped, by the LINKER SYMBOL it minted (utils/diag_sink.cryo declares an unrelated type of the same name with no array)"),
     "Diagnostic":         Excluded("compiler/diag/diagnostic.cryo",
                                    "a diagnostic's labels, children and suggestions: TEXTS"),
     "DropInserter":       Excluded("compiler/passes/drop_insertion.cryo",
@@ -599,8 +597,6 @@ SCANNED_ARRAYS = {
                                           "the command line's options by the flag typed, and their values: TEXTS"),
     # -- the ribs, texts, file paths and C spellings rule 1b already placed
     #    on their owners, scanned inline --
-    "DiagSink.stripped_func_names": Scanned("compiler/codegen/state/diag_sink.cryo", "string", DATA,
-                                            "the functions whose bodies codegen stripped, by the LINKER SYMBOL it minted"),
     "DiagnosticSink.vendor_files": Scanned("compiler/diag/sink.cryo", "string", DATA,
                                            "the vendored files whose diagnostics are demoted: FILE PATHS"),
     "Importer.ec_names":          Scanned("compiler/bindgen/importer.cryo", "SymbolStr", DATA,

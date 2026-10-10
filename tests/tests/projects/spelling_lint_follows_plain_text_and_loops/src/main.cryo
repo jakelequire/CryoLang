@@ -1,0 +1,123 @@
+/// A spelling is looked up wherever it reaches a lookup, however it gets
+/// there: handed on as plain text to a helper that matches it against a
+/// fixed table or compares it - directly or through another helper - or
+/// kept in a local array that a comparison earlier in a loop reads on the
+/// next iteration.  Each is refused (E0157), at the lookup, naming where
+/// the spelling left the function that held it.  A door handed the text,
+/// a helper handed literal text, a helper that only measures the text, and
+/// an array that never holds a spelling are not lookups.  The spelling
+/// types are known to the compiler by the qualified names its own
+/// declarations give them, so this program declares a `SymbolStr` at that
+/// name.
+namespace compiler::resolver::symbol_str;
+
+type struct SymbolStr {
+    id: u32;
+}
+
+type struct Node {
+    name: SymbolStr;
+}
+
+type struct Table {
+    texts: string[];
+}
+
+implement struct Table {
+    text_of(&this, s: SymbolStr) -> string {
+        return this.texts[s.id as i64];
+    }
+}
+
+/// A fixed table, matched by text.
+function fixed_kind(text: string) -> i32 {
+    return match (text) {
+        "alpha" => { 1 }
+        "beta"  => { 2 }
+        _       => { 0 }
+    };
+}
+
+/// Text compared with a literal.
+function is_entry(text: string) -> boolean {
+    return text == "main";
+}
+
+/// Text compared with other text.
+function is_start(text: string, other: string) -> boolean {
+    return text == other;
+}
+
+/// Text handed on to a helper that compares it, with other text, to a
+/// call answering a `boolean`: compared here too.
+function relay(text: string) -> boolean {
+    return is_start(text + "", "start");
+}
+
+/// Door `primitive`.  A fixed table a spelling may be matched against.
+function fixed_door(text: string) -> i32 {
+    return match (text) {
+        "i32" => { 4 }
+        _     => { 0 }
+    };
+}
+
+/// Only measures the text.
+function width(text: string) -> i64 {
+    return text.length() as i64;
+}
+
+/// A field's spelling, as text, matched by a fixed table in a helper.
+function kind_of(t: &Table, node: &Node) -> i32 {
+    return fixed_kind(t.text_of(node.name));
+}
+
+/// A parameter's spelling, as text, compared in a helper.
+function names_entry(t: &Table, name: SymbolStr) -> boolean {
+    return is_entry(t.text_of(name));
+}
+
+/// A field's spelling, as text, through two helpers.
+function relayed(t: &Table, node: &Node) -> boolean {
+    return relay(t.text_of(node.name));
+}
+
+/// A duplicate check that writes each spelling's number after the
+/// comparison that reads it: the next iteration reads it back.
+function duplicates(nodes: &Node[]) -> i32 {
+    mut seen: u32[] = [];
+    mut dups: i32 = 0;
+    for (mut i: i64 = 0; i < nodes.length; i++) {
+        mut dup: boolean = false;
+        for (mut k: i64 = 0; k < seen.length; k++) {
+            if (seen[k] == nodes[i].name.id) { dup = true; }
+        }
+        if (dup) { dups = dups + 1; } else { seen.push(nodes[i].name.id); }
+    }
+    return dups;
+}
+
+/// A door handed the text, a helper handed literal text, a helper that
+/// only measures it, and an array that never holds a spelling.  Accepted.
+function accepted(t: &Table, nodes: &Node[]) -> i64 {
+    mut n: i64 = fixed_door(t.text_of(nodes[0].name)) as i64;
+    n = n + fixed_kind("alpha") as i64;
+    n = n + width(t.text_of(nodes[0].name));
+    mut lengths: u32[] = [];
+    for (mut i: i64 = 0; i < nodes.length; i++) {
+        for (mut k: i64 = 0; k < lengths.length; k++) {
+            if (lengths[k] == nodes[i].name.id) { n = n + 1; }
+        }
+        lengths.push(i as u32);
+    }
+    return n;
+}
+
+function main() -> i32 {
+    const t: Table = Table { texts: ["main", "alpha"] };
+    const nodes: Node[] = [Node { name: SymbolStr { id: 0 } }, Node { name: SymbolStr { id: 1 } }];
+    mut n: i32 = kind_of(&t, &nodes[1]) + duplicates(&nodes) + accepted(&t, &nodes) as i32;
+    if (names_entry(&t, SymbolStr { id: 0 })) { n = n + 1; }
+    if (relayed(&t, &nodes[0])) { n = n + 1; }
+    return n;
+}
