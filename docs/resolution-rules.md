@@ -48,6 +48,10 @@ A door is the one function where a spelling may become a binding, for one
 kind of question. Each carries a doc comment beginning ``/// Door `<id>`.``
 followed by the reason it is allowed to take text; the comment sits on the
 declaration so the reason cannot be removed without touching the code.
+The ids are a fixed table in the compiler
+(`DirectiveProcessingPasses::door_ids`, the doors listed below), and in
+the compiler's own modules a marker naming any other id is refused where
+it is written (E0157), so a misspelt marker exempts nothing.
 
 The ruled kinds of door: the bare-identifier scope lookup and its
 type-namespace twin; one door per member kind, each taking an owner identity
@@ -70,7 +74,11 @@ operation of text or is handed it as plain text, or a `match`'s subject.
 A function that only carries the spelling - stores it, returns it, hands it
 to another function or to a door - needs nothing.  A door's body is not
 checked, nor one whose declaration allows `lookup_by_spelling` with a
-reason; the rule-4 check skips the same bodies.  The check reaches one
+reason; the rule-4 check skips the same bodies.  In the compiler's own
+modules the reason says why the spelling is no lookup: a reason opening
+`pending:`, the placeholder that says none is written yet, is refused at
+the reason (E0157).  The editor's pending allows stay until its own
+migration.  The check reaches one
 function: a spelling handed on is looked up, and refused, in the callee.
 
 The same check follows a spelling read off a field - a declaration's, a

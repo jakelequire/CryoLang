@@ -98,6 +98,11 @@ const LOOKUP_BY_SPELLING: string = "lookup_by_spelling";
 /// marker's own text is the reason it takes one.
 const DOOR_MARKER: string = "/// Door `";
 
+/// How an allow of `lookup_by_spelling` reads when it says no reason yet.
+/// The compiler's own modules may not carry one: an allow there says why
+/// the spelling is no lookup.
+const PENDING_REASON: string = "pending:";
+
 /// The compiler's own text types, listed by the qualified names their
 /// declarations give them: two spellings, which the spelling-lookup check
 /// follows from a parameter, and a definition's name read off it, which the
@@ -755,6 +760,8 @@ type struct DirectiveProcessingPasses {
                 mut names_spelling_lint: boolean = false;
                 mut lint_names: i64 = 0;
                 mut reasons: i64 = 0;
+                mut placeholder_span: SourceSpan = SourceSpan::none();
+                mut placeholder: boolean = false;
                 mut bad_args: i64 = 0;
                 for (mut i: i64 = 0; i < argc; i++) {
                     const a: DirectiveArg = dir.args[i];
@@ -772,6 +779,9 @@ type struct DirectiveProcessingPasses {
                             DirectiveProcessingPasses::emit_bad_arg(ctx, a.span, Text::new(fmt::format(
                                 "directive `![%s]`: `reason` is empty; say why the lint does not apply here",
                                 name)));
+                        } else if (a.str_value.trim().starts_with(PENDING_REASON)) {
+                            placeholder = true;
+                            placeholder_span = a.span;
                         }
                     } else if (a.kind == DirectiveArgKind::KeyValue) {
                         bad_args += 1;
@@ -808,6 +818,15 @@ type struct DirectiveProcessingPasses {
                 if (reasons == 0 && bad_args == 0) {
                     DirectiveProcessingPasses::emit_bad_arg(ctx, dir.span, Text::new(
                         "`![allow(lookup_by_spelling)]` needs a reason: write `reason = \"...\"` saying why this takes a spelling rather than an identity"));
+                }
+                // A placeholder lowers the lint without saying why; in the
+                // compiler's own modules every allow says why.
+                if (placeholder && DirectiveProcessingPasses::in_store_root(ctx)) {
+                    mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0157_LOOKUP_BY_SPELLING, Text::new(
+                        "`reason` says no reason is written yet: an allow of `lookup_by_spelling` in the compiler says why this is no lookup"));
+                    diag = diag.at(placeholder_span);
+                    diag = diag.help(Text::new("ask a door, or say why this is no lookup"));
+                    ctx.emit_diagnostic(diag);
                 }
             }
 
@@ -1498,6 +1517,41 @@ type struct DirectiveProcessingPasses {
         return (decl as DeclarationNode*).documentation.starts_with(DOOR_MARKER);
     }
 
+    /// The doors, by the id a marker names: the only kinds of question a
+    /// spelling may become a binding for.  A marker naming anything else is
+    /// refused, so a misspelt marker cannot exempt a body from the lint.
+    static door_ids() -> string[] {
+        return [
+            "scope-value", "scope-type",
+            "member-function", "member-export", "member-global", "member-field",
+            "member-variant", "trait-method", "assoc-type",
+            "module-by-path", "loader-path",
+            "primitive", "lang-item", "intern", "suggestion",
+        ];
+    }
+
+    /// E0157 at `decl` when its doc comment opens with the door marker and
+    /// the id it names is not one of `door_ids`.
+    static check_door_marker(ctx: CompilationContext*, decl: DeclarationNode*) -> void {
+        if (decl == null) { return; }
+        const doc: string = decl.documentation;
+        if (!doc.starts_with(DOOR_MARKER)) { return; }
+        const ids: string[] = DirectiveProcessingPasses::door_ids();
+        for (mut i: i64 = 0; i < ids.length; i++) {
+            if (doc.starts_with(DOOR_MARKER + ids[i] + "`")) { return; }
+        }
+        const start: i64 = DOOR_MARKER.length() as i64;
+        const rest: string = doc.substr(start, (doc.length() as i64) - start);
+        const end: i64 = rest.find("`");
+        const written: string = if (end < 0) { rest } else { rest.substr(0, end) };
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0157_LOOKUP_BY_SPELLING, Text::new(fmt::format(
+            "`%s` is not a door: a `/// Door` marker names one of the compiler's doors", written)));
+        diag = diag.at(decl.span);
+        diag = diag.help(Text::new(
+            "the doors are `scope-value`, `scope-type`, `member-function`, `member-export`, `member-global`, `member-field`, `member-variant`, `trait-method`, `assoc-type`, `module-by-path`, `loader-path`, `primitive`, `lang-item`, `intern` and `suggestion`"));
+        ctx.emit_diagnostic(diag);
+    }
+
     /// The root namespace whose modules keep the compiler's declaration
     /// stores: the one the spelling types above are declared under.  A store
     /// is a table the compiler answers names from, so the key lint covers
@@ -1656,6 +1710,11 @@ type struct DirectiveProcessingPasses {
             // whose own attached_directives are empty but whose method
             // members carry their own (e.g. `![sink]`).
 
+            const store_root: boolean = DirectiveProcessingPasses::in_store_root(ctx);
+            if (store_root && decl.kind == NodeKind::FunctionDeclaration) {
+                DirectiveProcessingPasses::check_door_marker(ctx, decl);
+            }
+
             for (mut j: i64 = 0; j < ad_count; j++) {
                 const d: DirectiveNode* = decl.attached_directives[j];
                 if (d == null) { continue; }
@@ -1735,6 +1794,9 @@ type struct DirectiveProcessingPasses {
             for (mut mi: i64 = 0; mi < method_list.length; mi++) {
                 const m: MethodNode* = method_list[mi];
                 if (m == null) { continue; }
+                if (store_root) {
+                    DirectiveProcessingPasses::check_door_marker(ctx, m as DeclarationNode*);
+                }
                 const m_count: i64 = m.attached_directives.length;
                 if (m_count == 0) { continue; }
                 for (mut mj: i64 = 0; mj < m_count; mj++) {
