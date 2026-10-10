@@ -36,7 +36,7 @@ import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::decl_name::{ DeclName };
 import compiler::module_graph;
-import compiler::module_graph::{ ModulePath };
+import compiler::module_graph::{ ModuleKey, ModulePath };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ FunctionType };
 import compiler::types::substitution::{ TypeSubstitution };
@@ -351,13 +351,10 @@ public:
     // module_graph.cryo already imports this module, so a back-pointer here
     // would be a compile-time module cycle.
 
-    // A module's path id -> the path ids of the modules it can see through its
-    // imports.  Populated once per module by the orchestrator (instance.cryo)
-    // after module discovery.
+    // A module -> the modules it can see through its imports.  Populated once
+    // per module by the orchestrator (instance.cryo) after module discovery.
 private:
-    ![allow(lookup_by_spelling, reason = "keyed by a module's path, which only the module graph makes and which names exactly one module")]
-    module_imports:      HashMap<u32, u32[]>;
-public:
+    module_imports:      HashMap<ModuleKey, ModulePath[]>;public:
 
     // The modules `std::prelude` re-exports (those whose public types - Rc,
     // Box, Option, Range, ... - are auto-in-scope in every module).  A LOCAL
@@ -416,8 +413,7 @@ public:
             overload_func_intrinsic: [],
             overload_index:     HashMap::<FamilySlot, u32[]>::new(),
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
-            module_imports:     HashMap::<u32, u32[]>::new(),
-            prelude_modules:    [],
+            module_imports:     HashMap::<ModuleKey, ModulePath[]>::new(),            prelude_modules:    [],
             refused_methods:    HashMap::<FamilySlot, boolean>::new(),
             overload_tag:       g_overload_index_tags,
         };
@@ -1512,11 +1508,11 @@ public:
     /// use-site scoping.  Called once per module by the orchestrator after
     /// module discovery.
     register_module_imports(mut &this, m: ModulePath, imports: &ModulePath[]) -> void {
-        mut ids: u32[] = [];
+        mut seen: ModulePath[] = [];
         for (mut i: i64 = 0; i < imports.length; i++) {
-            ids.push(imports[i].as_sym().id);
+            seen.push(imports[i]);
         }
-        this.module_imports.insert(m.as_sym().id, ids);
+        this.module_imports.insert(m.table_key(), seen);
     }
 
     /// Record the namespaces re-exported by `std::prelude` (deduped).  A local
@@ -1615,11 +1611,11 @@ public:
 
     /// Whether the module `use_site_ns` imports (depends on) `target_ns`.
     ns_imports(&this, use_site_ns: ModulePath, target_ns: ModulePath) -> boolean {
-        match (this.module_imports.get_ref(&use_site_ns.as_sym().id)) {
-            Option::Some(ids) => {
+        match (this.module_imports.get_ref(&use_site_ns.table_key())) {
+            Option::Some(seen) => {
                 mut k: i64 = 0;
-                while (k < (*ids).length) {
-                    if ((*ids)[k] == target_ns.as_sym().id) { return true; }
+                while (k < (*seen).length) {
+                    if ((*seen)[k].equals(target_ns)) { return true; }
                     k = k + 1;
                 }
             }

@@ -633,6 +633,8 @@ SCANNED_ARRAYS = {
                                           "the registry's template rows by name and module"),
     "GenericRegistry.trait_heads": Scanned("compiler/types/generic_registry.cryo", "TraitImplHead", IDENTITY,
                                            "the registry's trait-impl heads by target type and trait identity"),
+    "Resolver.exports":           Scanned("compiler/resolver/resolver.cryo", "Pair", TABLE,
+                                          "a module's exported declarations by the module and their leaf: the member-export door's store, scanned in its own file"),
     "ModuleGraph.modules":        Scanned("compiler/module_graph.cryo", "ModuleInfo", TABLE,
                                           "the graph's modules by namespace"),
     "DeclarationIndex.module_global_leaves": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,

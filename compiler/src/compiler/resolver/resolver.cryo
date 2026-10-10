@@ -30,7 +30,7 @@ import compiler::resolver::scope::{ ScopeID, ScopeKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID, SymbolIds, SymbolKey };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::module_graph::{ ModulePath };
+import compiler::module_graph::{ ModuleKey, ModulePath };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 import utils::text::{ Text };
@@ -337,12 +337,12 @@ type struct Resolver {
     // Resolution map
     resolution_map:     ResolutionMap;
 
-    // Cross-module exports: Pair<SymbolID, u64>[] avoids T[][] codegen
+    // Cross-module exports: Pair<SymbolID, ModulePath>[] avoids T[][] codegen
     // paths.  SymbolID[][] and HashMap<K, SymbolID[]>
     // mishandle T[] as a generic type argument (inner array descriptor
     // corrupted on store/load).  Pair<A,B>[] sidesteps generic-over-array
     // codegen entirely.
-    exports:              Pair<SymbolID, u64>[];  // .first = exported symbol, .second = module key (SymbolStr.id)
+    exports:              Pair<SymbolID, ModulePath>[];  // .first = exported symbol, .second = the module exporting it
 
 
     // Current context
@@ -369,7 +369,7 @@ type struct Resolver {
     // (~3% frontend self-time combined).  One entry per module, never several:
     // the scope is built on first ask and reused, so there is no candidate set
     // to choose between.
-    /// The one scope a module owns, by its interned name.
+    /// The one scope a module owns, by the module's identity.
     ///
     /// A module scope is not a rib.  A rib - a function body, a block, a
     /// generic parameter list - is pushed on entry and popped on exit, and a
@@ -379,9 +379,7 @@ type struct Resolver {
     /// entering a module fourteen times produce fourteen scopes, only the
     /// third of them populated, and a save/restore mechanism necessary to
     /// paper over it.
-    ![allow(lookup_by_spelling, reason = "keyed by a module's path, which only the module graph makes and which names exactly one module")]
-    module_scopes: HashMap<u32, u64>;
-
+    module_scopes: HashMap<ModuleKey, u64>;
     /// The traits a `where` clause bounds each type parameter by: `.first`
     /// the parameter's symbol, `.second` the trait's definition.  `S::Item`
     /// is `Item` of whichever of these traits declares it; a trait the
@@ -422,8 +420,7 @@ type struct Resolver {
             exports:              [],
             current_module:       ModulePath::none(),
             prelude_modules:      [],
-            module_scopes:        HashMap::<u32, u64>::new(),
-            param_bounds:         [],
+            module_scopes:        HashMap::<ModuleKey, u64>::new(),            param_bounds:         [],
             import_targets:       HashMap::<SymbolKey, SymbolID>::new(),
             explicit_imports:     HashMap::<SymbolKey, boolean>::new(),
         };
@@ -1037,15 +1034,14 @@ type struct Resolver {
 
     /// Register a symbol as exported from the current module.
     export_symbol(mut &this, sym_id: SymbolID) -> void {
-        this.exports.push(Pair::<SymbolID, u64>::new(sym_id, this.current_module.as_sym().id as u64));
+        this.exports.push(Pair::<SymbolID, ModulePath>::new(sym_id, this.current_module));
     }
 
     /// Get all exported symbols from a module.
     get_exports(&this, m: ModulePath) -> SymbolID[] {
-        const mod_key: u64 = m.as_sym().id as u64;
         mut result: SymbolID[] = [];
         for (mut i: i64 = 0; i < this.exports.length; i++) {
-            if (this.exports[i].second == mod_key) {
+            if (this.exports[i].second.equals(m)) {
                 result.push(this.exports[i].first);
             }
         }
@@ -1082,9 +1078,8 @@ type struct Resolver {
     /// reader that wants one of them chooses by kind.
     exports_named(&this, m: ModulePath, name: SymbolStr) -> SymbolID[] {
         mut out: SymbolID[] = [];
-        const mod_key: u64 = m.as_sym().id as u64;
         for (mut i: i64 = 0; i < this.exports.length; i++) {
-            if (this.exports[i].second == mod_key) {
+            if (this.exports[i].second.equals(m)) {
                 const sym: Symbol = this.get_symbol(this.exports[i].first);
                 if (sym.name.equals(name) && sym.visibility.is_public()) {
                     out.push(this.declaration_of(this.exports[i].first));
@@ -1349,7 +1344,7 @@ type struct Resolver {
     /// The module's `Symbol` is declared with it, so the identity and the
     /// bindings it owns are created together.
     module_scope_of(mut &this, name: ModulePath) -> u64 {
-        const oid: u32 = name.as_sym().id;
+        const oid: ModuleKey = name.table_key();
         match (this.module_scopes.get(&oid)) {
             Option::Some(sid) => { return sid; }
             Option::None      => { }
@@ -1423,7 +1418,7 @@ type struct Resolver {
     /// there is nothing to choose between.
     find_module_scope(&this, module_name: ModulePath) -> u64 {
         if (!module_name.is_valid()) { return 0; }
-        const oid: u32 = module_name.as_sym().id;
+        const oid: ModuleKey = module_name.table_key();
         return match (this.module_scopes.get(&oid)) {
             Option::Some(sid) => { sid }
             Option::None      => { 0 }
