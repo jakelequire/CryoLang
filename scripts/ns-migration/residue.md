@@ -96,7 +96,7 @@ is one the language fixes (`__call__`, `Ready`, `Ok`/`Err`, `Some`/`None`).
 ## The table
 
 <!-- residue-table:begin -->
-Population **209** - J 135 · L 52 · N 22 · S 0 · B 0 · C 0 · F 0 · W 0
+Population **208** - J 134 · L 52 · N 22 · S 0 · B 0 · C 0 · F 0 · W 0
 
 | site | read | key's provenance | class | reason |
 |---|---|---|---|---|
@@ -225,7 +225,6 @@ Population **209** - J 135 · L 52 · N 22 · S 0 · B 0 · C 0 · F 0 · W 0
 | `compiler/types/resolver.cryo:420` | `TraitDeclNode::assoc_type_index` | `field:compiler::ast::ProjectionAnnotation*.member<-param:proj` | J | member: the `assoc-type` door - the trait's own associated type's position by its leaf, asked from the trait node in hand where a projection or a binding is written; every later reader asks by the position |
 | `compiler/types/resolver.cryo:468` | `TraitDeclNode::assoc_type_index` | `param:member` | J | member: the `assoc-type` door - the trait's own associated type's position by its leaf, asked from the trait node in hand where a projection or a binding is written; every later reader asks by the position |
 | `compiler/types/resolver.cryo:741` | `TraitDeclNode::assoc_type_index` | `param:member` | J | member: the `assoc-type` door - the trait's own associated type's position by its leaf, asked from the trait node in hand where a projection or a binding is written; every later reader asks by the position |
-| `compiler/types/generic_registry.cryo:1470` | `TraitDeclNode::lookup_method` | `param:method_name` | J | member: the trait's own method by its leaf, asked from the trait node in hand |
 | `compiler/types/generic_registry.cryo:1276` | `TraitDeclNode::methods[]` | `param:leaf` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
 | `compiler/sema/method_binding.cryo:757` | `TraitType::required_methods[]` | `param:method_name` | J | member: a trait's required method by its leaf off the `TraitType` in hand, scanned inline |
 | `compiler/sema/call_resolver.cryo:359` | `TypeUtils::lookup_func_type_exact` | `field:compiler::ast::expression::ScopeResolutionNode*.member_name<-local:sr@0=param:callee` | J | member: the funnel's door onto `DeclarationIndex::lookup_func_type`, an overload family by its owner and leaf |

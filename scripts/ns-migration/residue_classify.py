@@ -145,8 +145,6 @@ CLASS_OF_METHOD = {
         ("J", "member: the member-field door - a field's leaf inside the class in hand, to its position among the class's own fields"),
     "FunctionDeclNode::parameters[]":
         ("J", "member: the resolver's duplicate-parameter check, a parameter by leaf inside the function being bound"),
-    "LambdaExprNode::captured_names[]":
-        ("J", "member: the lambda's captured names, asked whether one is captured (own file only)"),
     # -- local tables: the owner out of view, the element says what it is --
     "local::MethodNode[]":
         ("J", "member: an impl's or a declaration's methods held in a local, by leaf"),
