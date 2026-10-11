@@ -167,6 +167,7 @@ function carries no marker.
 | `primitive` | `ResBase::primitive_position` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: a primitive's position, which its definition is kept under |
 | `primitive` | `SourceLoc::of_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed table of source-location pseudo-constants (`FILE`, `LINE`), declared nowhere |
 | `lang-item` | `GenericRegistry::claim_wellknown` | `compiler/src/compiler/types/generic_registry.cryo` | the fixed language-item table |
+| `lang-item` | `LangModule::is_written` | `compiler/src/compiler/resolver/lang_item.cryo` | the fixed table of modules the compiler imports on a program's behalf: whether an import's written path names one (the prelude a file already globs) |
 | `lang-item` | `IntrinsicKind::from_name` | `compiler/src/compiler/intrinsic_kind.cryo` | the fixed intrinsic table: an `intrinsic function` declaration's name to the operation it lowers as |
 | `intern` | `InternTable::intern` | `compiler/src/compiler/resolver/intern_table.cryo` | text to `SymbolStr` |
 | `suggestion` | `find_best_candidate` | `compiler/src/compiler/diag/edit_distance.cryo` | "did you mean": result flows only into message text |

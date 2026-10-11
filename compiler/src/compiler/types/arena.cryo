@@ -840,7 +840,7 @@ public:
     /// returned unchanged.  Returns `wrapper_ref` (now denoting the concrete).
     swap_wrapper_to_concrete(mut &this, wrapper_ref: TypeRef, qualified_spec: SymbolStr,
                              declared_in: ModulePath, kind: TypeKind, is_union: boolean,
-                             display: string) -> TypeRef {
+                             display: DeclName) -> TypeRef {
         const w_index: i64 = this.refs.slot_of(wrapper_ref);
         if (w_index < 0 || w_index >= this.types.length) { return wrapper_ref; }
         const w_id: u64 = wrapper_ref.key();
@@ -861,18 +861,18 @@ public:
         mut concrete: Type* = null;
         if (kind == TypeKind::Enum) {
             mut et: EnumType* = new EnumType(w_id, qualified_spec, declared_in, this.intern_table);
-            if (display.length() > 0) { et.set_display_name(display); }
+            if (display.is_valid()) { et.set_display_name(display); }
             et.set_generic_origin(w_base, &w_inst.type_args);
             concrete = et as Type*;
         } else if (kind == TypeKind::Class) {
             mut ct: ClassType* = new ClassType(w_id, qualified_spec, declared_in, this.intern_table);
-            if (display.length() > 0) { ct.set_display_name(display); }
+            if (display.is_valid()) { ct.set_display_name(display); }
             ct.set_generic_origin(w_base, &w_inst.type_args);
             concrete = ct as Type*;
         } else {
             mut st: StructType* = new StructType(w_id, qualified_spec, declared_in, this.intern_table);
             if (is_union) { st.set_union(true); }
-            if (display.length() > 0) { st.set_display_name(display); }
+            if (display.is_valid()) { st.set_display_name(display); }
             st.set_generic_origin(w_base, &w_inst.type_args);
             concrete = st as Type*;
         }
@@ -1220,8 +1220,8 @@ public:
             }
             TypeKind::Struct | TypeKind::Class | TypeKind::Enum | TypeKind::Trait
             | TypeKind::TypeAlias | TypeKind::FunctionTemplate => {
-                const custom: string = this.custom_display_of(ty);
-                if (custom.length() > 0) { return custom; }
+                const custom: DeclName = this.custom_display_of(ty);
+                if (custom.is_valid()) { return this.intern_table.shown(custom); }
                 return this.intern_table.shown(this.declared_name(ty));
             }
             _ => { }
@@ -1254,15 +1254,23 @@ public:
     }
 
     /// The display a specialization of a generic struct, class or enum is
-    /// given in place of its declared name (`Vec<i32>`), or "" when it has
-    /// none.
-    custom_display_of(&this, ty: Type*) -> string {
+    /// given in place of its declared name (`Vec<i32>`), or the name of
+    /// nothing when it has none.
+    custom_display_of(&this, ty: Type*) -> DeclName {
         return match (ty.kind) {
             TypeKind::Struct => { (ty as StructType*).custom_display }
             TypeKind::Class  => { (ty as ClassType*).custom_display }
             TypeKind::Enum   => { (ty as EnumType*).custom_display }
-            _                => { "" }
+            _                => { DeclName::empty() }
         };
+    }
+
+    /// The display an instantiation is given (`Vec<i32>`): its template's
+    /// and arguments' declared names, composed by `format_display` and
+    /// sealed as the name the specialization is shown by.
+    ![allow(lookup_by_spelling, reason = "seals a specialization's display, composed from the declared names of its template and arguments, as the DeclName it is shown by; it looks nothing up")]
+    display_of_instantiation(&this, inst: Type*) -> DeclName {
+        return DeclName::of(this.intern_table.intern(this.format_display(inst)));
     }
 
     /// Same as `resolve_display_name` but strips namespace prefixes
@@ -1693,9 +1701,16 @@ public:
         const t: Type* = this.lookup(ty);
         if (t == null) { return SymbolStr::empty(); }
         const k: TypeKind = t.kind;
-        if (k == TypeKind::Int || k == TypeKind::Float || k == TypeKind::Bool ||
-            k == TypeKind::Char || k == TypeKind::String) {
-            return intern.intern(t.display_name());
+        // A primitive's spelling, asked of its own kind: through `Type*` the
+        // call would answer for every kind, a specialization's display among
+        // them.
+        match (k) {
+            TypeKind::Int    => { return intern.intern((t as IntType*).display_name()); }
+            TypeKind::Float  => { return intern.intern((t as FloatType*).display_name()); }
+            TypeKind::Bool   => { return intern.intern((t as BoolType*).display_name()); }
+            TypeKind::Char   => { return intern.intern((t as CharType*).display_name()); }
+            TypeKind::String => { return intern.intern((t as StringType*).display_name()); }
+            _                => { }
         }
         // Unit hashes under "()" so `implement trait Drop for ()` round-trips
         // through the registry.  Void has no value-level uses outside return

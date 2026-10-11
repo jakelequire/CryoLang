@@ -1056,22 +1056,19 @@ type struct IntrinsicEmitter {
 
     /// Get-or-declare one of the runtime's check handlers. Every one takes the
     /// `SourceLoc*` first and returns void (declared `-> never` on the runtime
-    /// side; the caller emits the `unreachable`).
-    get_or_decl_check_handler(mut &this, name: MangledName, extra: i64) -> LValue {
+    /// side; the caller emits the `unreachable`).  The rest of its parameters
+    /// have the types of `operands`, which the caller has already widened to
+    /// the handler's declared types (`lang_items.def`): an overflow's `op` is
+    /// a u32, every other operand a u64.
+    get_or_decl_check_handler(mut &this, name: MangledName, operands: &LValue[]) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function(name);
         if (fn.is_valid()) { return fn; }
-        const count: i64 = 1 + extra;
+        const count: i64 = 1 + operands.length;
         const param_buf: void* = libc::malloc((count * 8) as u64);
         const slots: void** = param_buf as void**;
         slots[0] = LType::pointer_to(LType::i8()).raw;
-        // `op` is the only u32 operand and it is always the FIRST extra; the
-        // rest are u64. Matches the `lang_items.def` signatures exactly.
         for (mut i: i64 = 1; i < count; i++) {
-            if (name.as_string() == "__cryo_panic_overflow" && i == 1) {
-                slots[i] = LType::i32().raw;
-            } else {
-                slots[i] = LType::i64().raw;
-            }
+            slots[i] = operands[i - 1].type_of().raw;
         }
         const fty: LType = LType::function_type(LType::void_type(), param_buf,
                                                 count as u32, false);
@@ -1085,7 +1082,7 @@ type struct IntrinsicEmitter {
     /// keep its previous behaviour rather than emit a call to nothing.
     emit_check_handler_call(mut &this, name: MangledName, span: SourceSpan,
                             operands: &LValue[]) -> boolean {
-        const fn: LValue = this.get_or_decl_check_handler(name, operands.length);
+        const fn: LValue = this.get_or_decl_check_handler(name, operands);
         if (!fn.is_valid()) { return false; }
         const loc: LValue = this.emit_source_loc_ptr(span);
 

@@ -599,25 +599,24 @@ type struct TypeResolver {
         }
     }
 
-    /// The identity a written annotation's head names, off its stamp: a
-    /// declared type's canonical name, a primitive's spelling; empty for a
-    /// type parameter or an unstamped head, which name no registered type.
-    ann_head_key(&this, ann: TypeAnnotation*) -> SymbolStr {
-        if (ann == null) { return SymbolStr::empty(); }
+    /// The declaration a written annotation's head names, off its stamp;
+    /// invalid for a primitive, a type parameter or an unstamped head, none
+    /// of which is a template.
+    ann_head_def(&this, ann: TypeAnnotation*) -> DefId {
+        if (ann == null) { return DefId::invalid(); }
         return match (*ann) {
             TypeAnnotation::Named(n) => {
                 match (n.res) {
                     ResSlot::Answered(r) => {
                         match (r) {
-                            Res::Def(d)    => { this.arena.defs.path_of(d).spelling() }
-                            Res::PrimTy(p) => { p }
-                            _              => { SymbolStr::empty() }
+                            Res::Def(d) => { d }
+                            _           => { DefId::invalid() }
                         }
                     }
-                    _ => { SymbolStr::empty() }
+                    _ => { DefId::invalid() }
                 }
             }
-            _ => { SymbolStr::empty() }
+            _ => { DefId::invalid() }
         };
     }
 
@@ -1047,14 +1046,16 @@ type struct TypeResolver {
             TypeAnnotation::Generic(g) => {
                 if (g.base == null) { return; }
                 // The written base and the projected type destructure against
-                // each other only when they are ONE template: the base's stamp
-                // beside the type's template key, never a leaf beside a leaf,
-                // which would pair a bound written against one module's
-                // `Result<T, E>` with another module's.
-                const want: SymbolStr = this.ann_head_key(g.base);
+                // each other only when they are ONE template: the definition
+                // the base's stamp names beside the one the type instantiates,
+                // never their names, which would pair a bound written against
+                // one module's `Result<T, E>` with another module's.
+                if (this.decl_index == null) { return; }
+                const want: DefId = this.ann_head_def(g.base);
                 if (!want.is_valid()) { return; }
-                const got: SymbolStr = this.arena.template_key_of(actual, this.intern_table);
-                if (!got.is_valid() || !got.equals(want)) { return; }
+                const base_ty: TypeRef = this.arena.inst_generic_base(actual);
+                if (!base_ty.is_valid()) { return; }
+                if (!this.decl_index.def_of(base_ty, this.arena).equals(want)) { return; }
                 if (this.arena.inst_type_arg_count(actual) != g.args.length) { return; }
                 for (mut i: i64 = 0; i < g.args.length; i++) {
                     this.bind_where_arg_params_from(g.args[i], param_syms,
