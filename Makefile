@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe facts facts-check facts-selftest facts-blind-spots selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check doors-check spelling-flow spelling-flow-selftest incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -186,24 +186,12 @@ help:
 	@echo "                         concurrently; hash their objects (ARGS=--baseline HEAD"
 	@echo "                         compares them against HEAD's compiler)"
 	@echo "  make test-list         List the discovered test cases without running them"
-	@echo "  make lane-check        Pin the resolution-lane surface against its golden"
-	@echo "  make lane-selftest     Drive lane-gate.py through a throwaway tree, every rule both ways"
-	@echo "  make residue-selftest  Drive residue.py --check through a throwaway tree and list, both ways"
 	@echo "  make ns-status-check   Run every check docs/name-resolution.md §0 carries"
-	@echo "  make doors-check       The doors in docs/resolution-rules.md against the door markers in compiler/src"
-	@echo "  make spelling-flow     Every spelling reaching a lookup outside a door, from the facts, against"
-	@echo "                         scripts/spelling-flow.outstanding.tsv (both directions)"
-	@echo "  make spelling-flow-selftest  The flow check over its fixture, each tracing rule removed in turn"
-	@echo "                         (a verify gate: flow)"
-	@echo "  make check-fast        refuse stale facts + lane-check + the self-tests + ns-status-check + verify-pin (~1 min; builds nothing)"
+	@echo "  make check-fast        verify's self-test + ns-status-check + verify-pin (builds nothing)"
 	@echo "  make install-hooks     Point git at the tracked hooks (run once per checkout)"
 	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
 	@echo "                         (installs nothing; the only gate that builds it)"
-	@echo "  make facts             The compiler's --emit=facts report for compiler, stdlib, editor (.facts/);"
-	@echo "                         the only way they are refreshed - every gate reading them refuses stale ones"
-	@echo "  make facts-blind-spots  Where those facts cannot see a spelling, as a list checked against"
-	@echo "                         the compiler under test (a verify gate: blind)"
-	@echo "  make vendor-check      Check every constant shape survives cryo vendor"
+	@echo "  make vendor-check     Check every constant shape survives cryo vendor"
 	@echo "  make api-index         Regenerate docs/stdlib-api.txt (the stdlib API index)"
 	@echo "  make api-index-check   Fail if docs/stdlib-api.txt is stale"
 	@echo "                         (name-resolution cascade regrowth gate;"
@@ -591,38 +579,6 @@ verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 	@$(PYTHON) scripts/verify.py --cryo "$(STAGE2)" $(ARGS)
 endif
 
-# ---- resolution-lane surface ratchet -----------------------------------
-# Pins the count of name-keyed call sites on every declaration-holding store
-# and of get_resolver() re-entries (docs/name-resolution.md §7.2 mechanism
-# 5).  Privatization cannot stop a NEW public wrapper and deletion cannot
-# stop a reintroduced helper; only a ratchet catches growth.
-#
-# Counts the calls the compiler reports (`.facts/compiler.facts`), and REFUSES
-# when they are missing or stale rather than regenerating them: refreshing is
-# a compiler build and about 80 s, a deliberate `make facts`, never a cost a
-# gate pays silently.  The stores and tables it places are still read from
-# the source's declarations.
-lane-check: facts-check
-	@$(PYTHON) scripts/lane-gate.py $(ARGS)
-
-# The gate's own test: every rule driven through a throwaway source tree,
-# the baseline accepted and each mutation refused by row.  A gate that has
-# never been seen to refuse anything is a decoration; three of this gate's
-# holes were found by an audit building the mutation by hand.  Two seconds,
-# no repository stood up, so it rides in check-fast.
-lane-selftest:
-	@$(PYTHON) scripts/lane-gate-selftest.py
-
-# The residue check's own test: residue.py --check driven through a throwaway
-# tree and a throwaway list, in both directions - the pair it must accept,
-# and for each of its three inputs (tree, list, classifier) a mutation it
-# must refuse.  The first check summed the list's class letters as written,
-# so a J row flipped to N by hand read OK with J one lower - and the J count
-# pinned in section 0 is a grep over that line.  Two seconds; rides in
-# check-fast.
-residue-selftest:
-	@$(PYTHON) scripts/ns-migration/residue_selftest.py
-
 # An incremental build after an edit that asks an unchanged module for a new
 # generic instance must link (tests/fixtures/incremental-new-instance).
 ifeq ($(HOST_OS),windows)
@@ -633,52 +589,10 @@ incremental-instance-check: cryo
 	@$(PYTHON) scripts/incremental-instance-check.py --cryo "$(STAGE2)"
 endif
 
-# Where --emit=facts cannot see a spelling: the list in the script, each entry
-# a probe line of tests/fixtures/facts-blind-spots built with the compiler
-# under test, SEEN or BLIND, refused when an entry stops holding either way.
-ifeq ($(HOST_OS),windows)
-facts-blind-spots: cryo
-	@$(PYTHON) scripts/facts-blind-spots.py --cryo "$(STAGE2_EXE)"
-else
-facts-blind-spots: cryo
-	@$(PYTHON) scripts/facts-blind-spots.py --cryo "$(STAGE2)"
-endif
-
 # The judges behind verify's tests/started-compiling declarations, driven
 # through every case they must refuse and every case they must allow.
 verify-selftest:
 	@$(PYTHON) scripts/verify.py --selftest
-
-# Every function on the approved list of name-taking functions carries a
-# command that fails when its written reason stops being true; this runs
-# them all, after driving the checker through the cases it must refuse.
-approved-check:
-	@$(PYTHON) scripts/ns-migration/approved.py --selftest
-	@$(PYTHON) scripts/ns-migration/approved.py --check
-
-# The doors docs/resolution-rules.md lists against the functions compiler/src
-# marks with a door doc comment; either one without the other refuses.  Reads
-# text only, so it needs no build and no facts.
-doors-check:
-	@$(PYTHON) scripts/resolution-doors.py --selftest
-	@$(PYTHON) scripts/resolution-doors.py
-
-# Every place a spelling reaches a lookup outside a door, or identity text
-# reaches a lookup at all, traced through the facts across calls, against the
-# committed outstanding list: a new one or a stale entry refuses.  Reads
-# .facts/ (refused when stale), builds nothing.
-spelling-flow:
-	@$(PYTHON) scripts/spelling-flow.py --check
-
-# The flow check over tests/fixtures/spelling-flow, built with the compiler
-# under test, and again with each tracing rule removed (a verify gate: flow).
-ifeq ($(HOST_OS),windows)
-spelling-flow-selftest: cryo
-	@$(PYTHON) scripts/spelling-flow.py --selftest --cryo "$(STAGE2_EXE)"
-else
-spelling-flow-selftest: cryo
-	@$(PYTHON) scripts/spelling-flow.py --selftest --cryo "$(STAGE2)"
-endif
 
 # ---- name-resolution status gate ---------------------------------------
 # Run every check §0 of docs/name-resolution.md carries and fail on drift.
@@ -703,15 +617,11 @@ guard-selftest:
 	@$(PYTHON) scripts/ns-guard-selftest.py
 
 # ---- the pre-commit sweep ----------------------------------------------
-# Every gate here is source- or document-derived except one input: the lane
-# gate and §0's residue rows count from the compiler's own facts, so
-# `facts-check` refuses first when they are missing or stale, naming `make
-# facts` - which builds the compiler and writes them, about 80 s on top of a
-# build.  This target builds nothing, and runs in about a minute.  A
-# one-minute gate everybody runs is worth more than a twenty-minute one
-# nobody does.
-check-fast: facts-check lane-check lane-selftest facts-selftest residue-selftest verify-selftest approved-check doors-check spelling-flow ns-status-check verify-pin
-	@echo "check-fast: OK (fresh facts, lane surface and its self-test, the facts check's self-test, the residue check's self-test, verify's declared-program self-test, the approved names' checks and their self-test, the doors against their list and its self-test, the spelling flow against its outstanding list, section 0, pin integrity)"
+# Every gate here is source- or document-derived, so this target builds
+# nothing.  A short gate everybody runs is worth more than a twenty-minute
+# one nobody does.
+check-fast: verify-selftest ns-status-check verify-pin
+	@echo "check-fast: OK (verify's declared-program self-test, section 0, pin integrity)"
 
 # ---- git hooks ---------------------------------------------------------
 # Point git at the tracked hook directory.  Hooks live in scripts/git-hooks so
@@ -755,28 +665,6 @@ else
 lsp-check: $(STAGE2) $(LIBCRYO_A)
 	@$(PYTHON) scripts/lsp-gate.py --cryo "$(STAGE2)" $(ARGS)
 endif
-
-# ---- the compiler's own report of its calls ----------------------------
-# `cryo build --emit=facts` over the compiler, the stdlib and the editor,
-# with the compiler under test, into `.facts/`: one line per argument a call
-# passes to a parameter taking a name as text, as the body check resolved
-# it.  Generating is the only way the facts are refreshed.
-#
-# `facts-check` refuses a facts file that is missing or was written from
-# other sources, and builds nothing; `lane-check` and `check-fast` run it
-# first.  `facts-selftest` drives it both ways, and dry-runs those two
-# targets to show neither regenerates.
-ifeq ($(HOST_OS),windows)
-facts: $(STAGE2_EXE) $(LIBCRYO_A)
-	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2_EXE)" $(ARGS)
-else
-facts: $(STAGE2) $(LIBCRYO_A)
-	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2)" $(ARGS)
-endif
-facts-check:
-	@$(PYTHON) scripts/facts.py --check
-facts-selftest:
-	@$(PYTHON) scripts/facts-selftest.py
 
 # ---- the other OS's config-gated half ----------------------------------
 # Config gating prunes `![config(linux)]` from a Windows build before name

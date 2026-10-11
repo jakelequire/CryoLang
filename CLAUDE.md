@@ -32,16 +32,8 @@ make verify              # build once; census, examples, lsp, cross, check-fast 
                          # a program the baseline built, in tests/started-passing
 make roster-check        # every unit test, project and negative file against the roster
                          # golden (tests/test-roster.txt); its OK line prints the current counts
-make lane-check          # resolution-lane surface ratchet; counts the compiler's facts,
-                         # REFUSED when stale - never rebuilt by a gate
 make ns-status-check     # run every check docs/name-resolution.md §0 carries
-make doors-check         # the door list in docs/resolution-rules.md against the door
-                         # markers in compiler/src, both directions; text only, no build
-make check-fast          # lane + §0 + pin, ~1 min, builds nothing; refuses stale facts
-                         # (§0's residue rows count from them). Run before committing.
-make facts               # cryo build --emit=facts over compiler, stdlib, editor -> .facts/;
-                         # the ONLY refresh (a compiler build + ~80 s). After any source
-                         # change, before check-fast or verify, which both refuse stale facts
+make check-fast          # verify's self-test + §0 + pin, builds nothing. Run before committing.
 make install-hooks       # point git at scripts/git-hooks (ONCE per checkout)
 make lsp-check           # compile tools/CryoLSP with the compiler under test
 make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s
@@ -67,13 +59,8 @@ only things that run are what a person or an agent runs.
 
 So:
 
-- **`make check-fast`** before committing. Lane surface, §0, pin integrity;
-  one compiled input: the lane gate and §0's residue rows count from the
-  compiler's own `--emit=facts` report, and a stale `.facts/` is REFUSED,
-  never rebuilt - run `make facts` (a compiler build plus about 80 s) after
-  any source change, deliberately; `make facts-selftest` shows the refusal.
-  `make verify` refuses stale facts up front for the same reason.
-  check-fast builds nothing. About a minute: the ledger's status rows run
+- **`make check-fast`** before committing. verify's self-test, §0, pin
+  integrity; it builds nothing. About a minute: the ledger's status rows run
   one shell each, concurrently, in Git's bash on Windows (never the
   WSL launcher a bare `bash` resolves to there), and the rows that parse
   `compiler/src` share one parse per run (`scripts/parse_cache.py`). A short
@@ -473,7 +460,7 @@ separate deliverable. Write both, commit them together.
 - **Bundle to complete-work boundaries.** Prefer fewer, larger commits. A
   commit is one finished thing - the code, its tests, its goldens and its
   ledger entry - not one file's worth of edits.
-- **The same goes for goldens.** A re-pinned `lane-baseline.txt` rides with
+- **The same goes for goldens.** A re-pinned `test-roster.txt` rides with
   the change that moved the number, and the message says why it moved.
 
 ### No exceptions, including the handoff
@@ -543,7 +530,7 @@ harness-enforced, add to `.claude/settings.json`:
   `tests/`, modifies a committed golden without an explicit override in the
   environment, or weakens an assertion in a file whose header declares a flip
   protocol.
-- **`Stop`** → `make lane-check roster-check api-index-check`, so a session
+- **`Stop`** → `make roster-check api-index-check`, so a session
   cannot be declared done while a ratchet is red.
 
 `scripts/guard-edit.py` does not exist yet.

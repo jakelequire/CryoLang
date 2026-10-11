@@ -1,9 +1,8 @@
 """A parse shared by the checks of one `ns-status-check` run.
 
-About thirty section-0 rows each run a script that parses the whole of
-`compiler/src` the same way (`lane-gate.py --row KIND`, `residue.py
---check`, ...), and each parse takes ~10 s.  `memo` computes such a parse
-once per run and hands every later caller the same answer.
+A section-0 row may run a script that parses the whole of `compiler/src`,
+and each parse takes ~10 s.  `memo` computes such a parse once per run and
+hands every later caller the same answer.
 
 It is inert unless `CRYO_PARSE_CACHE` names a directory, which
 `ns-status-check.py` creates for its own run and deletes afterwards, so no

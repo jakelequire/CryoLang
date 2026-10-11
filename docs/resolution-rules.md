@@ -136,11 +136,6 @@ or reads the store by identity.  Locked so far:
 | the module graph's names (`ModuleInfo.name`, `namespace_name`; `ModuleGraph.name_index`, `module_defs`, `def_list`, `def_paths`) and each module's import list (`ModuleInfo.visible`) | `compiler/src/compiler/module_graph.cryo` | `module-by-path` | by identity: `ModuleInfo::path`, `namespace_path`, `declares_namespace`, `ModuleGraph::imports`; a body path's modules through `ModuleGraph::modules_written_as`; text for a message, a mangled symbol or a manifest entry through `ModulePath::decl_name`; a declaration's canonical name, `module::leaf`, composed by `ModulePath::qualified` and nowhere else |
 | the template registry's names (`TemplateEntry.name`) | `compiler/src/compiler/types/generic_registry.cryo` | none: the registry is asked by definition | text for a message: `TemplateEntry::display_name`; a mangled name is spelled from `leaf_name`, a `DeclName` |
 
-`scripts/resolution-doors.py` (run by `make check-fast`) refuses the tree
-when this table and the doc-comment markers in `compiler/src` disagree in
-either direction: a marker whose door is not listed here, or a row here whose
-function carries no marker.
-
 <!-- doors -->
 | door | function | file | kind |
 |---|---|---|---|

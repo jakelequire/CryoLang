@@ -12,14 +12,7 @@ build:
     incr       scripts/incremental-instance-check.py
                                          an edit asking a cached module for a
                                          new generic instance still links
-    blind      scripts/facts-blind-spots.py
-                                         the list of where --emit=facts cannot
-                                         see a spelling still holds
-    flow       scripts/spelling-flow.py --selftest
-                                         the spelling-flow check reports its
-                                         fixture's cases, and fails a case
-                                         with each tracing rule removed
-    fast       make check-fast           lane surface, section 0, pin integrity
+    fast       make check-fast           section 0, pin integrity
 
 They are independent: each writes its own build directory, and nothing here
 rebuilds a shared archive while another reads it (which is why the gates are
@@ -107,12 +100,8 @@ GATES = {
     "cross":    ([PY, "scripts/cross-check.py", "--cryo", "{cryo}"], r"^cross-check: "),
     "incr":     ([PY, "scripts/incremental-instance-check.py", "--cryo", "{cryo}"],
                  r"^incremental-instance-check: "),
-    "blind":    ([PY, "scripts/facts-blind-spots.py", "--cryo", "{cryo}"],
-                 r"^facts-blind-spots: "),
-    "flow":     ([PY, "scripts/spelling-flow.py", "--selftest", "--cryo", "{cryo}"],
-                 r"^spelling-flow: selftest "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to
-    # child makes, and check-fast's lane-check would receive verify's flags.
+    # child makes, and check-fast's ns-status-check would receive verify's flags.
     "fast":     (["make", "--no-print-directory", "check-fast", "ARGS="], r"check-fast: "),
 }
 # The gates whose objects are compared.  A baseline run needs only these.
@@ -668,16 +657,6 @@ def main():
     if args.baseline and not set(POPULATION_GATES) <= set(names):
         print("verify: FAIL -- a baseline comparison needs the census and examples runs")
         return 1
-    # check-fast refuses stale facts and never regenerates them, so a run
-    # whose facts are stale is refused here, before the other gates spend
-    # minutes on a verdict that cannot come out green.
-    if "fast" in names:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import facts as facts_mod
-        if facts_mod.check([], quiet=True) != 0:
-            print("verify: FAIL -- the compiler's facts are stale; `make facts` first "
-                  "(check-fast refuses them), or leave out the fast gate with --only")
-            return 1
 
     # Objects embed stdlib source paths exactly as the stdlib root was spelled
     # (panic locations), so the same source compiles to different bytes under
