@@ -5300,14 +5300,10 @@ type struct CallResolver {
             const fn_ret: TypeRef = this.try_resolve_module_function(scope, call);
             if (fn_ret.is_valid()) { return fn_ret; }
         } else {
-            mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
-            if (scope.scope_generic_args.length > 0) {
-                const spec_sym: SymbolStr = this.resolve_generic_scope_name(
-                    scope.scope_name, scope.scope_generic_args, scope.span,
-                    this.lookup_scope_template(
-                        scope.require_scope_res(Text::new("scope-call spec name"))));
-                if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
-            }
+            // A segment written with arguments (`Wrap::<i32>::make()`) is
+            // asked as the instantiation they make of its template, by that
+            // pair (`scope_owner_type`); no name is minted for it.
+            const lookup_sym: SymbolStr = this.scope_owner_key(scope);
             const owner_ty: TypeRef = this.scope_owner_type(scope);
             const method_ret: TypeRef = this.try_resolve_static_method(scope, lookup_sym, owner_ty, call, claimed);
             if (method_ret.is_valid() || *claimed) { return method_ret; }
@@ -7709,77 +7705,22 @@ type struct CallResolver {
         return this.lookup_scope_template(slot.require(Text::new("call_resolver:explicit-generic callee")));
     }
 
-    /// `use_span` is the span of the syntax that named the SCOPE - always a
-    /// call/scope/identifier/literal node at the use site. It is a required
-    /// parameter because every caller has such a node in hand and a defaulted
-    /// one would silently reintroduce the scope-less context.
-    ///
-    /// It is the fallback home, not the home. `generic_args` is not uniformly
-    /// caller-written: `default_expansion` splices a CLONE of the template's own
-    /// default annotation into this list, and the clone keeps the template's
-    /// span. Resolving that clone against the scope's module binds
-    /// `String<A = GlobalAlloc>`'s default in whichever module happened to name
-    /// `String`, so one declaration's default means different things per caller -
-    /// and it names a module those callers neither write nor import. Each
-    /// argument therefore resolves in the module that WROTE IT, which its own
-    /// span already records; the scope's module answers only when an argument
-    /// carries no file of its own.
-    /// `tmpl` is the template `base_name` names, looked up by the CALLER from
-    /// its own node's stamp.  It arrives as the template rather than as a name
-    /// to look up because only the caller knows which node wrote the name: a
-    /// function template's own spec base is not what the surrounding scope
-    /// segment named, and a caller already holding the template has no
-    /// question left to ask.  Null when the name is not a template's, which is
-    /// not a failure - the spec name is still built, with no defaults to
-    /// expand.
-    ///
-    /// When the template is known, the specialization's base is ITS
-    /// `spec_base_name` - the base the specializer registers the
-    /// instantiation under - and not the spelling.  A specialization has one
-    /// identity however its template was written: `HashMap<i64,i64>` and
-    /// `hashmap::HashMap<i64,i64>` are the same registration, and a base
-    /// taken from the spelling names it only when the spelling is the bare
-    /// leaf.  `base_name` is the base only for a name no template answers.
-    resolve_generic_scope_name(&this, base_name: SymbolStr, generic_args: &TypeAnnotation*[],
-                               use_span: SourceSpan, tmpl: TemplateEntry*) -> SymbolStr {
-        const base: SymbolStr = if (tmpl != null) { tmpl.spec_base_name(this.intern) } else { base_name };
-        mut res_ctx: ResolutionContext = ResolutionContext::new("");
-        this.symbolic.symbolic_bind_params(&res_ctx);
-        mut arg_refs: TypeRef[] = [];
-        for (mut i: i64 = 0; i < generic_args.length; i++) {
-            const arg_ref: TypeRef = this.ctx.type_resolver.resolve(generic_args[i], &res_ctx);
-            if (!arg_ref.is_valid()) { return SymbolStr::empty(); }
-            arg_refs.push(arg_ref);
-        }
-        if (tmpl != null && arg_refs.length < tmpl.param_count) {
-            arg_refs = this.ctx.type_resolver.expand_default_type_args(tmpl, arg_refs, &res_ctx);
-        }
-        const base_qname: QualifiedName = QualifiedName::from_symbol(base);
-        const spec: SymbolStr =
-            MangledName::specialized_identifier(this.intern, this.arena, base_qname, arg_refs);
-        // A TYPE's specialization is registered under the template's module,
-        // and that registration is what every consumer of this name looks up
-        // - a method, an overload set, the type itself.  A FUNCTION template's
-        // specialization is a different registry, keyed by the bare identifier
-        // mono pins, and stays as minted.
-        if (tmpl != null && tmpl.node_kind != NodeKind::FunctionDeclaration) {
-            return tmpl.spec_qualified_name(this.intern, spec);
-        }
-        return spec;
-    }
-
     /// The TYPE a generic scope denotes, from the pair rather than from a name:
     /// a base the caller read off its node's stamp, plus the arguments written
-    /// at the use site.
+    /// at the use site.  `(base, args)` IS an instantiation's identity, and the
+    /// arena keys its canonical slot on exactly that, so no name is minted for
+    /// it: a static call through the segment (`Wrap::<i32>::make()`) asks this
+    /// instance's family.
     ///
-    /// The sibling of `resolve_generic_scope_name` above, and deliberately the
-    /// same shape - same per-argument homing, same default expansion - because
-    /// the two answer ONE question and a second answering path that computed
-    /// arguments differently would resolve to a different slot for the same
-    /// source text.  This one stops before the string: `(base, args)` IS an
-    /// instantiation's identity, and the arena keys its canonical slot on
-    /// exactly that, so a name minted here would only have to be decoded again
-    /// by a lookup that has strictly less to go on.
+    /// `use_span` is the span of the syntax that named the SCOPE - always a
+    /// call/scope/identifier/literal node at the use site.  It is the fallback
+    /// home, not the home: `default_expansion` splices a CLONE of the
+    /// template's own default annotation into the argument list, and the clone
+    /// keeps the template's span.  Resolving that clone against the scope's
+    /// module would bind `String<A = GlobalAlloc>`'s default in whichever
+    /// module happened to name `String`.  Each argument therefore resolves in
+    /// the module that WROTE IT, which its own span records; the scope's
+    /// module answers only when an argument carries no file of its own.
     ///
     /// Invalid when the base names no template, which is the caller's signal
     /// that its node asks about something other than an instantiation - never a
@@ -7959,7 +7900,7 @@ type struct CallResolver {
             Res::Def(_) => { names_module = true; }
             _           => { }
         }
-        mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
+        const lookup_sym: SymbolStr = this.scope_owner_key(scope);
         mut callee: DefId = DefId::invalid();
         mut overloads: TypeRef[] = [];
         if (names_module) {
@@ -7970,13 +7911,6 @@ type struct CallResolver {
                 overloads.push(this.ctx.decl_index.entry_signature(family[i]));
             }
         } else {
-            if (scope.scope_generic_args.length > 0) {
-                const spec_sym: SymbolStr = this.resolve_generic_scope_name(
-                    scope.scope_name, scope.scope_generic_args, scope.span,
-                    this.lookup_scope_template(
-                        scope.require_scope_res(Text::new("scope-call spec name"))));
-                if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
-            }
             const owner_ty: TypeRef = this.scope_owner_type(scope);
             if (this.scope_is_generic_template(owner_ty, scope.member_name)) {
                 this.check_template_static_args(visitor, scope, call);

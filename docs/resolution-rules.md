@@ -258,6 +258,23 @@ yet is recorded with the change that builds it, not here.
      template's identity and their type arguments** (rule four), not by a
      key spelled from the template's name.
 
+224. **The wordings of the plain-text spelling refusal stand:** "`f` looks
+     up a spelling it is handed as plain text", its label "looked up here,
+     outside a door: the operand of a comparison" (or "the subject of a
+     `match`", "the key of a hash table"), the note "the spelling leaves
+     the function that holds it here, as text", and the identity-text
+     refusal's "the subject of a `match`".
+
+225. **A fixed table the language declares nowhere reuses an existing
+     door id rather than getting a kind of its own:** the intrinsic table
+     (`IntrinsicKind::from_name`) is a `lang-item` door, and the
+     source-location pseudo-constants `FILE` and `LINE`
+     (`SourceLoc::of_spelling`) are a `primitive` door.
+
+226. **The Python spelling-flow list is deleted once ruling 223 has
+     landed.**  The deletion itself belongs to the cleanup that removes
+     the Python gates, not to the change that lands ruling 223.
+
 ### 2026-10-09
 
 188. **The comparison primitives (`SymbolStr::equals` and the like) carry
