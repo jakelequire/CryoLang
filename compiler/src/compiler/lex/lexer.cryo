@@ -1206,37 +1206,16 @@ private:
                     }
                 }
                 'u'  => {
-                    // Unicode escape: \u{HEX} - parse the brace-delimited
-                    // codepoint and emit its UTF-8 encoding.  Malformed
-                    // forms (missing `{`, no digits, codepoint out of the
-                    // Unicode range) are preserved literally so a downstream
-                    // pass reports them rather than this silently dropping
-                    // bytes.
-                    if (ri < len && *(raw + ri) as char == '{') {
-                        ri += 1; // consume '{'
-                        mut cp: i64 = 0;
-                        mut ndig: int = 0;
-                        while (ri < len && Lexer::is_hex_digit(*(raw + ri))) {
-                            const d: char = *(raw + ri) as char;
-                            mut dv: i64 = 0;
-                            if (d >= '0' && d <= '9')      { dv = d as i64 - '0' as i64; }
-                            else if (d >= 'a' && d <= 'f') { dv = d as i64 - 'a' as i64 + 10; }
-                            else if (d >= 'A' && d <= 'F') { dv = d as i64 - 'A' as i64 + 10; }
-                            cp = cp * 16 + dv;
-                            ri += 1;
-                            ndig += 1;
-                        }
-                        const closed: boolean = ri < len && *(raw + ri) as char == '}';
-                        if (closed) { ri += 1; } // consume '}'
-                        if (ndig > 0 && closed && cp <= 0x10FFFF) {
-                            Lexer::encode_utf8(&buf, cp);
-                        } else {
-                            // Malformed: preserve the `\u` we consumed; the
-                            // brace/digit bytes were already copied past or
-                            // will be re-scanned as ordinary characters.
-                            buf.push_byte('\\' as u8);
-                            buf.push_byte('u' as u8);
-                        }
+                    // Unicode escape: \u{HEX} - the brace-delimited codepoint,
+                    // emitted as its UTF-8 encoding.  Malformed forms
+                    // (missing `{`, no digits, codepoint out of the Unicode
+                    // range) keep the `\u` so a downstream pass reports
+                    // them rather than this silently dropping bytes.
+                    mut spanned: i64 = 0;
+                    const cp: i64 = Lexer::unicode_escape(raw, ri, len, &spanned);
+                    ri += spanned;
+                    if (cp >= 0) {
+                        Lexer::encode_utf8(&buf, cp);
                     } else {
                         buf.push_byte('\\' as u8);
                         buf.push_byte('u' as u8);
@@ -1269,6 +1248,85 @@ private:
         }
         *digits = n;
         return val;
+    }
+
+    /// The codepoint of a `\u{HEX}` escape whose `{` would be at `at` in
+    /// `text` (below `len`), or -1 when it is malformed: no `{`, no hex
+    /// digit, no closing `}`, or past U+10FFFF.  Writes through `spanned`
+    /// how many characters from `at` the escape's body takes - the `{`, the
+    /// digits and the `}` that are there, malformed or not.
+    public static unicode_escape(text: string, at: i64, len: i64, spanned: i64*) -> i64 {
+        *spanned = 0;
+        if (at >= len || *(text + at) as char != '{') { return -1; }
+        mut i: i64 = at + 1;
+        mut cp: i64 = 0;
+        mut ndig: i64 = 0;
+        while (i < len && Lexer::is_hex_digit(*(text + i))) {
+            const d: char = *(text + i) as char;
+            mut dv: i64 = 0;
+            if (d >= '0' && d <= '9')      { dv = d as i64 - '0' as i64; }
+            else if (d >= 'a' && d <= 'f') { dv = d as i64 - 'a' as i64 + 10; }
+            else if (d >= 'A' && d <= 'F') { dv = d as i64 - 'A' as i64 + 10; }
+            cp = cp * 16 + dv;
+            i += 1;
+            ndig += 1;
+        }
+        const closed: boolean = i < len && *(text + i) as char == '}';
+        if (closed) { i += 1; }
+        *spanned = i - at;
+        if (ndig > 0 && closed && cp <= 0x10FFFF) { return cp; }
+        return -1;
+    }
+
+    /// The value of a character literal from its text between the quotes,
+    /// as the lexer hands it over (`'\n'` arrives as backslash and `n`): its
+    /// one character, or the codepoint or byte its escape spells.  The one
+    /// decoder of a character literal, for its value and for a pattern's
+    /// bound alike.
+    public static char_literal_value(text: string) -> i64 {
+        if (text == null) { return 0; }
+        const len: i64 = text.length() as i64;
+        if (len == 0) { return 0; }
+        if (len < 2 || text[0] != '\\') { return text[0] as i64; }
+        const esc: char = text[1];
+        if (esc >= '0' && esc <= '7') {
+            mut nd: i64 = 0;
+            return Lexer::octal_escape(text, 1, len, &nd);
+        }
+        match (esc) {
+            'n'  => { return 10; }
+            't'  => { return 9; }
+            'r'  => { return 13; }
+            '\\' => { return 92; }
+            '\'' => { return 39; }
+            '"'  => { return 34; }
+            'a'  => { return 7; }
+            'b'  => { return 8; }
+            'f'  => { return 12; }
+            'v'  => { return 11; }
+            'x'  => {
+                // `\xHH`: two hex digits.  A short `\x` (len < 4) is
+                // malformed; it falls through to the bare-escape default.
+                if (len >= 4) {
+                    return Lexer::hex_value(text[2]) * 16 + Lexer::hex_value(text[3]);
+                }
+            }
+            'u'  => {
+                mut spanned: i64 = 0;
+                const cp: i64 = Lexer::unicode_escape(text, 2, len, &spanned);
+                if (cp >= 0) { return cp; }
+            }
+            _ => { }
+        }
+        return esc as i64;
+    }
+
+    /// A hex digit's value, 0 for any other character.
+    static hex_value(d: char) -> i64 {
+        if (d >= '0' && d <= '9') { return d as i64 - '0' as i64; }
+        if (d >= 'a' && d <= 'f') { return d as i64 - 'a' as i64 + 10; }
+        if (d >= 'A' && d <= 'F') { return d as i64 - 'A' as i64 + 10; }
+        return 0;
     }
 
     /// Encode Unicode codepoint `cp` (assumed <= 0x10FFFF) as UTF-8, appending
