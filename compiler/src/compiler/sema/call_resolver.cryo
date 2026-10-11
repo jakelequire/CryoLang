@@ -3564,30 +3564,30 @@ type struct CallResolver {
         if (base_t == null) { return Selection::none(); }
         mut methods_ref: Slice<MethodInfo> = Slice::<MethodInfo>::from_raw(null, 0);
         mut start_cls: ClassType* = null;
-        mut owner_str: string = "";
+        // A declared owner has a path; a primitive is declared nowhere and
+        // is an owner by its kind.
+        mut has_owner: boolean = false;
         match (base_t.kind) {
             TypeKind::Class => {
                 start_cls = base_t as ClassType*;
                 methods_ref = start_cls.methods.as_slice();
-                owner_str = this.intern.resolve(start_cls.qualified_name);
+                has_owner = start_cls.qualified_name.is_valid();
             }
             TypeKind::Struct => {
                 methods_ref = (base_t as StructType*).methods.as_slice();
-                owner_str = this.intern.resolve((base_t as StructType*).qualified_name);
+                has_owner = (base_t as StructType*).qualified_name.is_valid();
             }
             TypeKind::Enum => {
                 methods_ref = (base_t as EnumType*).methods.as_slice();
-                owner_str = this.intern.resolve((base_t as EnumType*).qualified_name);
+                has_owner = (base_t as EnumType*).qualified_name.is_valid();
             }
             TypeKind::Int | TypeKind::Float | TypeKind::Bool
             | TypeKind::Char | TypeKind::String | TypeKind::Unit => {
-                // A primitive has no qualified name; its spelling is its
-                // whole identity, and the key its impl blocks register under.
-                owner_str = base_t.display_name();
+                has_owner = true;
             }
             _ => { return Selection::none(); }
         }
-        if (owner_str.length() == 0) { return Selection::none(); }
+        if (!has_owner) { return Selection::none(); }
 
         mut arg_types: TypeRef[] = [];
         for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
@@ -5056,13 +5056,10 @@ type struct CallResolver {
                 }
             }
         }
-        const resolved_qname: SymbolStr = this.arena.get_qualified_name(lookup_ref);
-        if (resolved_qname.is_valid()) {
-            const resolved_qname_str: string = this.intern.resolve(resolved_qname);
-            const simple: string = QualifiedName::leaf_of(resolved_qname_str);
+        if (this.arena.get_qualified_name(lookup_ref).is_valid()) {
+            const simple: string = QualifiedName::leaf_of(this.intern.shown(this.arena.get_qualified_name(lookup_ref)));
             if (simple != "") {
-                const simple_sym: SymbolStr = this.intern.intern(simple);
-                const shadows: string[] = this.diag.find_shadowed_type_candidates(simple_sym, member.member, lookup_ref);
+                const shadows: string[] = this.diag.find_shadowed_type_candidates(SymbolStr::empty(), member.member, lookup_ref);
                 if (shadows.length > 0) {
                     diag = this.diag.attach_shadow_import_suggestions(diag, simple, shadows);
                 } else {

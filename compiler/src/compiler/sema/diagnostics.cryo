@@ -45,6 +45,7 @@ import compiler::diag::suggestion::{ Applicability, Suggestion };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name::{ DeclName };
 import compiler::sema::helpers::{ lexeme_looks_like_number };
 import compiler::sema::state::{ SemaState };
 import compiler::sema::type_utils::{ TypeUtils };
@@ -301,21 +302,27 @@ type struct Diagnostics {
     /// each type's path as TEXT, for the diagnostic
     /// (`attach_shadow_import_suggestions`), and reaches no lookup.
     ///
-    /// Other user-defined types whose simple-name matches `simple_name` and that
-    /// own `member_name` (import-shadow detection); `resolved_type` is excluded.
+    /// Other user-defined types whose simple-name matches `simple_name` - the
+    /// written type spelling, or with none the last segment of
+    /// `resolved_type`'s own path - and that own `member_name`
+    /// (import-shadow detection); `resolved_type` is excluded.
     /// Capped at 4 candidates.
     find_shadowed_type_candidates(&this, simple_name: SymbolStr, member_name: SymbolStr,
                                   resolved_type: TypeRef) -> string[] {
-        if (!simple_name.is_valid()) { return []; }
-        mut results: SymbolStr[] = [];
-        const needle: string = this.intern.resolve(simple_name);
+        const needle: string = if (simple_name.is_valid()) {
+            this.intern.resolve(simple_name)
+        } else {
+            QualifiedName::leaf_of(this.intern.shown(this.arena.get_qualified_name(resolved_type)))
+        };
+        if (needle == "") { return []; }
+        mut results: string[] = [];
         const filter_member: boolean = member_name.is_valid();
         const n: i64 = this.arena.type_count();
         for (mut i: i64 = 0; i < n; i++) {
             const t: Type* = this.arena.types[i];
             if (t == null) { continue; }
             if (resolved_type.is_valid() && t.id == resolved_type.key()) { continue; }
-            mut qname: SymbolStr = SymbolStr::empty();
+            mut qname: DeclName = DeclName::empty();
             mut has_member: boolean = !filter_member;
             const no_methods: MethodInfo[] = [];
             mut methods: &MethodInfo[] = &no_methods;
@@ -339,22 +346,18 @@ type struct Diagnostics {
                 if (methods[k].name.equals(member_name)) { has_member = true; }
             }
             if (!qname.is_valid() || !has_member) { continue; }
-            const qstr: string = this.intern.resolve(qname);
+            const qstr: string = this.intern.shown(qname);
             const leaf: string = QualifiedName::leaf_of(qstr);
             if (leaf != needle) { continue; }
             mut dup: boolean = false;
             for (mut j: i64 = 0; j < results.length; j++) {
-                if (results[j].equals(qname)) { dup = true; break; }
+                if (results[j] == qstr) { dup = true; break; }
             }
             if (dup) { continue; }
-            results.push(qname);
+            results.push(qstr);
             if (results.length >= 4) { break; }
         }
-        mut shown: string[] = [];
-        for (mut i: i64 = 0; i < results.length; i++) {
-            shown.push(this.intern.resolve(results[i]));
-        }
-        return shown;
+        return results;
     }
 
     /// A zero-width span for inserting a new `import ...;` line (after the last

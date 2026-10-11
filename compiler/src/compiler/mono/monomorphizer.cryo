@@ -57,7 +57,7 @@ import compiler::mono::type_populator::{ MonoTypePopulator };
 import compiler::resolver::decl_name::{ DeclName };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, DefKind };
+import compiler::resolver::res::{ DefId, DefKind, DefTable };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::module_graph;
@@ -404,7 +404,7 @@ type struct Monomorphizer {
                           entry: TemplateEntry*) -> boolean {
         // Validate arg count
         if (request.type_args.length != entry.param_count) {
-            const qn_str: string = this.intern_table.resolve(entry.qualified_name);
+            const qn_str: string = this.intern_table.shown(entry.qualified_name);
             this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 Text::new(fmt::format("arg count mismatch for %s: expected %lld, got %lld",
                         qn_str, entry.param_count, request.type_args.length))));
@@ -417,9 +417,9 @@ type struct Monomorphizer {
         for (mut i: i64 = 0; i < request.type_args.length; i++) {
             const arg_t: Type* = this.arena.lookup(request.type_args[i]);
             if (arg_t != null) {
-                const qname: SymbolStr = this.arena.get_qualified_name(request.type_args[i]);
+                const qname: DeclName = this.arena.get_qualified_name(request.type_args[i]);
                 if (qname.is_valid()) {
-                    type_arg_displays.push(this.intern_table.resolve(qname));
+                    type_arg_displays.push(this.intern_table.shown(qname));
                 } else {
                     type_arg_displays.push(this.arena.format_display(arg_t));
                 }
@@ -437,7 +437,7 @@ type struct Monomorphizer {
             entry, request.type_args, request.generic_type, &this.trait_checker
         );
         if (!result.success) {
-            const qn_str: string = this.intern_table.resolve(entry.qualified_name);
+            const qn_str: string = this.intern_table.shown(entry.qualified_name);
             mut args_str: string = "";
             for (mut ai: i64 = 0; ai < type_arg_displays.length; ai++) {
                 if (ai > 0) { args_str = fmt::format("%s,%s", args_str, type_arg_displays[ai]); }
@@ -556,7 +556,7 @@ type struct Monomorphizer {
                 // file's other `intern_table.resolve` sites - formatter results
                 // live in a shared static buffer, so sibling display calls inside
                 // one `format()` can clobber each other.
-                const tmpl_name: string = this.intern_table.resolve(entry.qualified_name);
+                const tmpl_name: string = this.intern_table.shown(entry.qualified_name);
                 mut ice_args: string = "";
                 for (mut ii: i64 = 0; ii < type_arg_displays.length; ii++) {
                     if (ii > 0) { ice_args = fmt::format("%s, %s", ice_args, type_arg_displays[ii]); }
@@ -894,19 +894,16 @@ type struct Monomorphizer {
         return false;
     }
 
+    /// The path of a named template's specialization: its template's
+    /// module and the specialization's minted identifier, composed as every
+    /// declaration's path is (`ModulePath::qualified`); the identifier alone
+    /// for a template no module declares.  A generated template's copy is
+    /// spelled in the generated name space, as the template is.
     qualify_spec_name(&this, entry: TemplateEntry*, spec_name: string) -> SymbolStr {
-        const qualified_str: string = this.intern_table.resolve(entry.qualified_name);
-        const bare_str: string = this.intern_table.shown(entry.leaf_name());
-
-        const q_len: i64 = qualified_str.length() as i64;
-        const b_len: i64 = bare_str.length() as i64;
-        if (q_len <= b_len) {
-            return this.intern_table.intern(spec_name);
-        }
-
-        const prefix_len: i64 = q_len - b_len;
-        const prefix: string = qualified_str.substr(0, prefix_len);
-        return this.intern_table.intern(prefix + spec_name);
+        const leaf: SymbolStr = this.intern_table.intern(
+            DefTable::spelled_in(this.arena.defs.origin_of(entry.def), spec_name));
+        if (!entry.declared_in.is_valid()) { return leaf; }
+        return entry.declared_in.qualified(leaf, this.intern_table);
     }
 
 

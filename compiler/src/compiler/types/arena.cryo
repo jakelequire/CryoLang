@@ -1089,25 +1089,12 @@ public:
     /// inside the arena (where the Type subclass is directly available)
     /// sidesteps a codegen miscompile of cast-pointer field access at
     /// call sites.
-    get_qualified_name(&this, ty: TypeRef) -> SymbolStr {
+    get_qualified_name(&this, ty: TypeRef) -> DeclName {
         const t: Type* = this.lookup(ty);
-        if (t == null) { return SymbolStr::empty(); }
+        if (t == null) { return DeclName::empty(); }
         match (t.kind) {
-            TypeKind::Struct => {
-                const st: StructType* = t as StructType*;
-                return st.qualified_name;
-            }
-            TypeKind::Class => {
-                const ct: ClassType* = t as ClassType*;
-                return ct.qualified_name;
-            }
-            TypeKind::Enum => {
-                const et: EnumType* = t as EnumType*;
-                return et.qualified_name;
-            }
-            TypeKind::Trait => {
-                const tt: TraitType* = t as TraitType*;
-                return tt.qualified_name;
+            TypeKind::Struct | TypeKind::Class | TypeKind::Enum | TypeKind::Trait | TypeKind::TypeAlias => {
+                return this.declared_name(t);
             }
             TypeKind::InstantiatedType => {
                 const inst: InstantiatedType* = t as InstantiatedType*;
@@ -1115,13 +1102,9 @@ public:
                     return this.get_qualified_name(inst.resolved_type);
                 }
             }
-            TypeKind::TypeAlias => {
-                const alias: TypeAliasType* = t as TypeAliasType*;
-                return alias.alias_name;
-            }
             _ => { }
         }
-        return SymbolStr::empty();
+        return DeclName::empty();
     }
 
     /// Total number of types allocated.
@@ -1243,12 +1226,12 @@ public:
     /// name of nothing for any other kind.
     declared_name(&this, ty: Type*) -> DeclName {
         return match (ty.kind) {
-            TypeKind::Struct           => { DeclName::of((ty as StructType*).qualified_name) }
-            TypeKind::Class            => { DeclName::of((ty as ClassType*).qualified_name) }
-            TypeKind::Enum             => { DeclName::of((ty as EnumType*).qualified_name) }
-            TypeKind::Trait            => { DeclName::of((ty as TraitType*).qualified_name) }
+            TypeKind::Struct           => { (ty as StructType*).qualified_name }
+            TypeKind::Class            => { (ty as ClassType*).qualified_name }
+            TypeKind::Enum             => { (ty as EnumType*).qualified_name }
+            TypeKind::Trait            => { (ty as TraitType*).qualified_name }
             TypeKind::TypeAlias        => { DeclName::of((ty as TypeAliasType*).alias_name) }
-            TypeKind::FunctionTemplate => { DeclName::of((ty as FunctionTemplateType*).qualified_name) }
+            TypeKind::FunctionTemplate => { (ty as FunctionTemplateType*).qualified_name }
             _                          => { DeclName::empty() }
         };
     }
@@ -1457,7 +1440,7 @@ public:
     /// dump's column.  Empty when the kind carries no module.
     type_module_name(&this, ty: Type*) -> DeclName {
         if (ty.kind == TypeKind::FunctionTemplate) {
-            return DeclName::of((ty as FunctionTemplateType*).qualified_name);
+            return (ty as FunctionTemplateType*).qualified_name;
         }
         return this.declared_in(ty).decl_name();
     }
@@ -1687,39 +1670,36 @@ public:
     // chasing a separate wrapper node: they read the identity off the type
     // itself, so there is no side node a caller can forget to consult.
 
-    /// The name a trait impl for `ty` is registered under - the one key the
-    /// trait-impl table is asked by from a receiver, and the identity a
-    /// written bound's base is compared against.  A primitive's spelling
-    /// (`i32`, `string`, `()`), which is the only name a primitive has; the
-    /// TEMPLATE's qualified name for an instantiation, whether a pre-mono
-    /// `InstantiatedType` wrapper or a post-mono concrete carrying its own
-    /// base (`implement<T> trait Hash for String<T>` is keyed by `String`'s
-    /// name, whichever `String<A>` asks); a declared type's own qualified
-    /// name otherwise.  Empty for a type no trait can be implemented for by
-    /// name.  Never a leaf: two modules' same-leaf types are two keys.
-    template_key_of(&this, ty: TypeRef, intern: InternTable*) -> SymbolStr {
+    /// The fixed spelling a primitive is named by (`i32`, `string`), and
+    /// `()` for unit - the only name a primitive has, from the language's
+    /// table; empty for every other type.
+    primitive_key_of(&this, ty: TypeRef, intern: InternTable*) -> SymbolStr {
         const t: Type* = this.lookup(ty);
         if (t == null) { return SymbolStr::empty(); }
-        const k: TypeKind = t.kind;
         // A primitive's spelling, asked of its own kind: through `Type*` the
         // call would answer for every kind, a specialization's display among
         // them.
-        match (k) {
+        match (t.kind) {
             TypeKind::Int    => { return intern.intern((t as IntType*).display_name()); }
             TypeKind::Float  => { return intern.intern((t as FloatType*).display_name()); }
             TypeKind::Bool   => { return intern.intern((t as BoolType*).display_name()); }
             TypeKind::Char   => { return intern.intern((t as CharType*).display_name()); }
             TypeKind::String => { return intern.intern((t as StringType*).display_name()); }
+            TypeKind::Unit   => { return intern.intern("()"); }
             _                => { }
         }
-        // Unit hashes under "()" so `implement trait Drop for ()` round-trips
-        // through the registry.  Void has no value-level uses outside return
-        // types, so it stays empty.
-        if (k == TypeKind::Unit) { return intern.intern("()"); }
-        if (k == TypeKind::Void) { return SymbolStr::empty(); }
+        return SymbolStr::empty();
+    }
+
+    /// Whether a trait can be implemented for `ty`: a primitive or unit, a
+    /// declared struct, class, enum, trait or alias, or an instantiation of
+    /// one (pre-mono wrapper or post-mono concrete, asked through its
+    /// template).
+    carries_impl_key(&this, ty: TypeRef, intern: InternTable*) -> boolean {
+        if (this.primitive_key_of(ty, intern).is_valid()) { return true; }
         const inst_base: TypeRef = this.inst_generic_base(ty);
-        if (inst_base.is_valid()) { return this.template_key_of(inst_base, intern); }
-        return this.get_qualified_name(ty);
+        if (inst_base.is_valid()) { return this.carries_impl_key(inst_base, intern); }
+        return this.get_qualified_name(ty).is_valid();
     }
 
     /// The template `ty` is an instantiation of, or invalid when it is not one.

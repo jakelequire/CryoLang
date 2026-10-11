@@ -510,23 +510,25 @@ type struct OwnershipQuery {
     ///     same thread that acquired the lock, so a guard cannot
     ///     cross threads.
     ///
-    /// Keyed on the target's canonical identity (via `named_qualified_id`,
-    /// peeling an `InstantiatedType` to its template) against the identities
-    /// those declarations claimed, NOT the bare leaf: a USER type merely NAMED
+    /// Keyed on the target's definition (an `InstantiatedType` peeled to
+    /// its template) against the definitions those declarations claimed,
+    /// NOT the bare leaf: a USER type merely NAMED
     /// `Rc` must not be denied Send/Sync.  Conservative direction (a false
     /// deny is over-restrictive, not unsound), but keyed precisely so only the
     /// actual stdlib types are denied.
     static is_thread_safety_denied(arena: TypeArena*, registry: GenericRegistry*,
                                    intern: InternTable*, ty: TypeRef) -> boolean {
         if (arena == null || registry == null || intern == null) { return false; }
-        const qid: u64 = OwnershipQuery::named_qualified_id(arena, intern, ty);
-        if (qid == 0) { return false; }
+        const base: TypeRef = OwnershipQuery::inst_base_of(arena, ty);
+        const subject: TypeRef = if (base.is_valid()) { base } else { ty };
+        const def: DefId = registry.decls.def_of(subject, arena);
+        if (!def.is_valid()) { return false; }
         const denied: LangItem[] = [
             LangItem::Rc, LangItem::MutexGuard, LangItem::RwLockReadGuard, LangItem::RwLockWriteGuard,
         ];
         for (mut i: i64 = 0; i < denied.length; i++) {
             const id: DefId = registry.wellknown(denied[i]);
-            if (id.is_valid() && qid == arena.defs.path_of(id).spelling().id as u64) { return true; }
+            if (id.is_valid() && def.equals(id)) { return true; }
         }
         return false;
     }
@@ -691,23 +693,6 @@ type struct OwnershipQuery {
         return OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty);
     }
 
-    /// The target's canonical QUALIFIED-NAME identity for a NAMED aggregate
-    /// (struct/class/enum), peeling an `InstantiatedType` to its template via
-    /// `generic_base`.  Returns the interned qualified-name SymbolStr id (a
-    /// module-independent identity that distinguishes same-leaf types like a
-    /// local `Pair` vs stdlib `std::collections::pair::Pair`).  Returns 0 for
-    /// anything else (primitive, pointer, alias, tuple, unresolved) - those
-    /// never carry a user `Drop` we key precisely, and 0 tells the caller to use
-    /// the bare-name fallback.
-    ///
-    /// This keys on the interned qualified NAME rather than the arena TYPE id on
-    /// purpose: the same nominal type can be materialised under several arena
-    /// type ids across passes (a decl entry vs a field-type resolution vs a
-    /// monomorphized spec), so a type-id key registered in one pass MISSES when
-    /// the query in a later pass carries a different id for the same type - an
-    /// allocation-order-dependent false negative that silently drops a real
-    /// `Drop`.  The qualified name is canonical per nominal type, so the
-    /// registration side (type_resolution R1) and every lookup side agree.
     /// The template `ty` is an instantiation of, for BOTH a pre-mono wrapper and
     /// a post-mono concrete (which carries its own base), or invalid.
     ///
@@ -723,27 +708,6 @@ type struct OwnershipQuery {
         return arena.inst_generic_base(ty);
     }
 
-    static named_qualified_id(arena: TypeArena*, intern: InternTable*,
-                              ty: TypeRef) -> u64 {
-        if (arena == null || intern == null || !ty.is_valid()) { return 0; }
-        const t: Type* = arena.lookup(ty);
-        if (t == null) { return 0; }
-        const inst_base: TypeRef = OwnershipQuery::inst_base_of(arena, ty);
-        if (inst_base.is_valid()) {
-            return OwnershipQuery::named_qualified_id(arena, intern, inst_base);
-        }
-        if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class ||
-            t.kind == TypeKind::Enum) {
-            const qname: SymbolStr = OwnershipQuery::qualified_name_of(arena, ty);
-            if (!qname.is_valid()) { return 0; }
-            // The qualified-name SymbolStr id is canonical in the single shared
-            // intern table, so it is directly comparable across passes and
-            // between the registration and lookup sides (both reach here).
-            return qname.id as u64;
-        }
-        return 0;
-    }
-
     /// Whether an `implement trait Drop for <ty>` head is registered for `ty`:
     /// the language's `Drop`, by identity, selected for the type as any trait
     /// impl is.  Existence only - the head's where-clause is
@@ -753,31 +717,6 @@ type struct OwnershipQuery {
         if (arena == null || registry == null || intern == null) { return false; }
         const drop_id: DefId = registry.wellknown(LangItem::Drop);
         return registry.heads_for(drop_id, ty, intern).length > 0;
-    }
-
-    /// Get the qualified-name SymbolStr for a Type. Centralises the
-    /// per-kind field access.
-    static qualified_name_of(arena: TypeArena*, ty: TypeRef) -> SymbolStr {
-        const t: Type* = arena.lookup(ty);
-        if (t == null) { return SymbolStr::empty(); }
-        const k: TypeKind = t.kind;
-        if (k == TypeKind::Struct) {
-            const st: StructType* = t as StructType*;
-            return st.qualified_name;
-        }
-        if (k == TypeKind::Class) {
-            const ct: ClassType* = t as ClassType*;
-            return ct.qualified_name;
-        }
-        if (k == TypeKind::Enum) {
-            const et: EnumType* = t as EnumType*;
-            return et.qualified_name;
-        }
-        if (k == TypeKind::TypeAlias) {
-            const al: TypeAliasType* = t as TypeAliasType*;
-            return al.alias_name;
-        }
-        return arena.get_qualified_name(ty);
     }
 
     /// Does a call to `method` move the receiver out of the caller?
