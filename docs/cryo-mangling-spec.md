@@ -319,6 +319,7 @@ closure argument is specialized over the closure TYPE like any other argument:
 | `Dog::~Dog(&this)`                                  | `C$dt$3Dog-3Dog$F$s$Rv` |
 | `Vec3 + Vec3 -> Vec3` (operator)                    | `C$op$4Vec3-3add$F$s_N$L4Vec3$G$RN$L4Vec3$G` |
 | `impl Display for Dog { fmt(&this) -> void }`       | `C$tr$7Display$f3Dog-3fmt$F$s$Rv` |
+| `impl Conv<int> for S { conv(&this) -> int }`       | `C$tr$4Conv$Li$G$f1S-4conv$F$s$Ri` |
 | `extern "C" puts(string) -> int`                    | `puts` (unmangled) |
 
 ---

@@ -987,7 +987,7 @@ type struct MonoCallSpecializer {
         }
         if (ma != null && ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
             mut item_impl: ImplBlockNode* = null;
-            const item_m: MethodNode* = this.trait_item_on(ma, recv_type, &item_impl);
+            const item_m: MethodNode* = this.trait_item_on(call, ma, recv_type, &item_impl);
             if (item_m != null) {
                 this.bind_receiver_method(call, item_m, item_impl, null, recv_type, subst);
             }
@@ -1281,18 +1281,34 @@ type struct MonoCallSpecializer {
     /// The method a call a bound answered names on the receiver: the method
     /// the receiver's implementation of the bound's trait provides at the
     /// position the call recorded, with that implementation (`out_impl`).
-    /// Null when the receiver has no implementation of the trait, or
-    /// several - a trait implemented at several trait arguments, which only
-    /// the call's arguments tell apart.  A receiver that is a generic type's
-    /// specialization holds its implementations in the blocks placed under
-    /// it, where the instances its calls ask for are added and emitted;
-    /// any other receiver's are the registry's heads selected for it.
-    trait_item_on(&this, ma: MemberAccessNode*, recv_type: TypeRef, out_impl: ImplBlockNode**) -> MethodNode* {
+    /// A trait implemented at several trait arguments (`Conv<i32>` and
+    /// `Conv<i64>`) is answered by the one implementation whose head writes
+    /// the arguments the bound gave the call (`bound_trait_args`).  Null
+    /// when the receiver has no implementation of the trait, or several the
+    /// bound's arguments do not tell apart.  A receiver that is a generic
+    /// type's specialization holds its implementations in the blocks placed
+    /// under it, where the instances its calls ask for are added and
+    /// emitted; any other receiver's are the registry's heads selected for
+    /// it.
+    trait_item_on(&this, call: CallExprNode*, ma: MemberAccessNode*, recv_type: TypeRef,
+                  out_impl: ImplBlockNode**) -> MethodNode* {
         if (this.generic_registry == null) { return null; }
         const heads: ImplBlockNode*[] = this.trait_heads_on(ma.resolved_trait, recv_type);
-        if (heads.length != 1) { return null; }
-        const m: MethodNode* = this.generic_registry.trait_item_method(heads[0], ma.resolved_trait_slot);
-        if (m != null) { *out_impl = heads[0]; }
+        mut head: ImplBlockNode* = null;
+        if (heads.length == 1) {
+            head = heads[0];
+        } else if (call.bound_trait_args.length > 0) {
+            for (mut h: i64 = 0; h < heads.length; h++) {
+                if (!this.generic_registry.trait_args_unify(heads[h], &call.bound_trait_args, this.intern_table)) {
+                    continue;
+                }
+                if (head != null) { return null; }
+                head = heads[h];
+            }
+        }
+        if (head == null) { return null; }
+        const m: MethodNode* = this.generic_registry.trait_item_method(head, ma.resolved_trait_slot);
+        if (m != null) { *out_impl = head; }
         return m;
     }
 
@@ -1637,7 +1653,7 @@ type struct MonoCallSpecializer {
                 this.pin_plain(call, this.receiver_method_of(call.template_method, owner, &id_impl, &id_owner));
             } else {
                 mut item_impl: ImplBlockNode* = null;
-                this.pin_plain(call, this.trait_item_on(call.callee as MemberAccessNode*, owner, &item_impl));
+                this.pin_plain(call, this.trait_item_on(call, call.callee as MemberAccessNode*, owner, &item_impl));
             }
         }
         this.queued_binds = still;

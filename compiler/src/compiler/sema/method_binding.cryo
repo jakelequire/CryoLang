@@ -82,18 +82,40 @@ import utils::text::{ Text };
 type struct BoundDirection {
     trait_def: DefId;
     tied:      boolean;
+    /// The trait arguments the one bound naming `trait_def` writes; empty
+    /// when it writes none, or when the trait is noted more than once and
+    /// the arguments no longer say which of its implementations is meant.
+    args:      TypeRef[];
 
     static none() -> BoundDirection {
-        return BoundDirection { trait_def: DefId::invalid(), tied: false };
+        return BoundDirection { trait_def: DefId::invalid(), tied: false, args: [] };
     }
 
     note(mut &this, d: DefId) -> void {
+        this.note_with_args(d, []);
+    }
+
+    /// `note` for the trait a bound names itself, with the bound's trait
+    /// arguments.
+    note_with_args(mut &this, d: DefId, args: TypeRef[]) -> void {
         if (this.tied || !d.is_valid()) { return; }
-        if (!this.trait_def.is_valid()) { this.trait_def = d; return; }
+        if (!this.trait_def.is_valid()) {
+            this.trait_def = d;
+            this.args = args;
+            return;
+        }
+        this.args = [];
         if (!this.trait_def.equals(d)) {
             this.tied = true;
             this.trait_def = DefId::invalid();
         }
+    }
+
+    /// The trait arguments of the one bound that named the trait.
+    bound_args(&this) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        for (mut i: i64 = 0; i < this.args.length; i++) { out.push(this.args[i]); }
+        return out;
     }
 
     /// The one trait noted, or invalid when none was or two were.
@@ -590,7 +612,11 @@ type struct MethodBinding {
                     const asked: DefId = if (k == 0) { bound_def } else { chain[k] };
                     const ret: TypeRef = this.trait_declared_return(asked, method_name);
                     if (!ret.is_valid()) { continue; }
-                    dir.note(if (k == 0) { bound_def } else { chain[k] });
+                    if (k == 0 && tr != null) {
+                        dir.note_with_args(bound_def, this.bound_trait_arg_types(tr));
+                    } else {
+                        dir.note(if (k == 0) { bound_def } else { chain[k] });
+                    }
                     if (need_ret && !out.is_valid()) {
                         if (tr == null || k > 0) {
                             out = this.subst_this_in_trait_return(ret, recv);
@@ -828,6 +854,21 @@ type struct MethodBinding {
     /// (`generic_params.length + assoc_idx` - the same sugar
     /// `implement trait Iterator<i32>` uses), so the bound's own `type_args`
     /// supply both directly.
+    bound_trait_arg_types(mut &this, tr: TraitRef*) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(tr.definition());
+        if (tdecl == null || tdecl.generic_params.length == 0) { return out; }
+        if (tr.type_args.length < tdecl.generic_params.length) { return out; }
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        this.symbolic.symbolic_bind_params(&rc);
+        for (mut g: i64 = 0; g < tdecl.generic_params.length; g++) {
+            const arg: TypeRef = this.ctx.type_resolver.resolve(tr.type_args[g], &rc);
+            if (!arg.is_valid()) { return []; }
+            out.push(arg);
+        }
+        return out;
+    }
+
     subst_bound_trait_args(mut &this, ret: TypeRef, trait_leaf: SymbolStr,
                            tr: TraitRef*) -> TypeRef {
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(tr.definition());
