@@ -1,0 +1,58 @@
+diff --git a/compiler/src/compiler/sema/identity_text.cryo b/compiler/src/compiler/sema/identity_text.cryo
+index 638e8fb3..6e7cdf56 100644
+--- a/compiler/src/compiler/sema/identity_text.cryo
++++ b/compiler/src/compiler/sema/identity_text.cryo
+@@ -65,7 +65,7 @@ import compiler::diag::{ ErrorCode };
+ import compiler::diag::diagnostic::{ Diagnostic };
+ import compiler::passes::directive_processing::{ DirectiveProcessingPasses };
+ import compiler::resolver::lang_item::{ LangItem };
+-import compiler::resolver::res::{ DefId, Res, ResSlot };
++import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResSlot };
+ import compiler::resolver::symbol_id::{ SymbolID };
+ import compiler::sema::call_facts::{ CallFacts };
+ import compiler::sema::state::{ SemaState };
+@@ -76,6 +76,7 @@ import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
+ import compiler::types::generic::{ InstantiatedType };
+ import compiler::types::type_base::{ Type };
+ import compiler::types::type_ref::{ TypeRef };
++import compiler::types::user_defined::{ ClassType };
+ import compiler::types::generic_registry::{ GenericRegistry };
+ import std::fmt;
+ import utils::text::{ Text };
+@@ -137,6 +138,36 @@ implement struct IdentityTextCheck {
+             if (IdentityTextCheck::is_identity_text_type(ctx, p.resolved_type)) { continue; }
+             state.flow_locals.insert(p.sym_id.table_key(), [node]);
+         }
++        IdentityTextCheck::answer_overridden(ctx, state, func);
++    }
++
++    /// A method that overrides a base class's answers a call made through
++    /// the base (`t.display_name()` on a `Type*`), whose callee is the
++    /// base's method: what the override answers goes on to the answer of
++    /// each method of the same name in every class it derives from.
++    static answer_overridden(ctx: CompilationContext*, state: SemaState*, func: FunctionDeclNode*) -> void {
++        const decl: ASTNode* = ctx.decl_index.entry_decl(func.overload_entry);
++        if (decl == null || decl.kind != NodeKind::MethodDeclaration) { return; }
++        if (!(decl as MethodNode*).is_override) { return; }
++        const own: FlowNode = FlowNode::returned(func.overload_entry.table_key());
++        mut cur: TypeRef = state.this_type;
++        for (mut depth: i32 = 0; depth < 32; depth++) {
++            const t: Type* = ctx.type_arena.lookup(cur);
++            if (t == null) { return; }
++            match (t.kind) {
++                TypeKind::Reference => { cur = (t as ReferenceType*).referent; }
++                TypeKind::Pointer   => { cur = (t as PointerType*).pointee; }
++                TypeKind::Class     => {
++                    cur = (t as ClassType*).base_class;
++                    if (!cur.is_valid()) { return; }
++                    const based: OverloadId[] = ctx.decl_index.lookup_family_entries(FamilyOwner::Type(cur), func.name);
++                    for (mut i: i64 = 0; i < based.length; i++) {
++                        ctx.identity_flow.flow(own, FlowNode::returned(based[i].table_key()));
++                    }
++                }
++                _ => { return; }
++            }
++        }
+     }
+ 
+     /// Whether the function being checked records its flows.
