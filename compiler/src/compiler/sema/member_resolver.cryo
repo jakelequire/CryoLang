@@ -285,7 +285,6 @@ type struct MemberResolver {
     /// coerced (its abstract pointee has no field/method to bind pre-mono).
     try_deref_coercion(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*) -> TypeRef {
         if (member.object == null) { return TypeRef::invalid(); }
-        const deref_method: SymbolStr = this.intern.intern("deref");
         mut cur_obj: ExpressionNode* = member.object;
         mut cur_ty:  TypeRef         = member.object.resolved_type;
         mut guard: i32 = 0;
@@ -309,8 +308,8 @@ type struct MemberResolver {
                 this.ctx.generic_registry.wellknown(LangItem::Deref), base_ty, 0);
             if (impl_block == null) { return TypeRef::invalid(); }
             // Build `*(cur_obj.deref())` and resolve it to the pointee `Target`.
-            const member_acc: MemberAccessNode* =
-                new MemberAccessNode(cur_obj, deref_method, member.span, member.span);
+            const member_acc: MemberAccessNode* = this.lang_method_callee(cur_obj, LangItem::DerefDeref, member.span);
+            if (member_acc == null) { return TypeRef::invalid(); }
             mut call: CallExprNode* = new CallExprNode(member_acc as ExpressionNode*, member.span);
             const star_tok: Token = Token::new(TokenType::Star, "*",
                 member.span.start_line as int, member.span.start_col as int);
@@ -787,9 +786,8 @@ type struct MemberResolver {
     build_index_desugar(mut &this, visitor: ASTVisitor*, access: ArrayAccessNode*) -> ExpressionNode* {
         // The index expression is passed BY VALUE - the trait is
         // `index(&this, idx: Idx)`, not `&Idx` - so no synthetic `&`.
-        const index_method: SymbolStr = this.intern.intern("index");
-        const member: MemberAccessNode* =
-            new MemberAccessNode(access.array, index_method, access.span, access.span);
+        const member: MemberAccessNode* = this.lang_method_callee(access.array, LangItem::IndexIndex, access.span);
+        if (member == null) { return null; }
         mut call: CallExprNode* = new CallExprNode(member as ExpressionNode*, access.span);
         call.add_argument(access.index);
         const star_tok: Token = Token::new(TokenType::Star, "*",
@@ -800,6 +798,18 @@ type struct MemberResolver {
         const rty: TypeRef = this.dispatch.resolve_expr(visitor, de);
         if (!rty.is_valid()) { return null; }
         return de;
+    }
+
+    /// The callee `recv.m` of a desugar calling `item`, a trait's method
+    /// claimed as a language item, stamped with that trait and the
+    /// method's position in it as an operator's call is: the trait's
+    /// method answers it, and an inherent method of the same name cannot.
+    /// Null when no declaration in this program claimed `item`.
+    lang_method_callee(&this, recv: ExpressionNode*, item: LangItem, span: SourceSpan) -> MemberAccessNode* {
+        const d: DefId = this.ctx.generic_registry.wellknown(item);
+        if (!d.is_valid()) { return null; }
+        mut m: MemberAccessNode* = new MemberAccessNode(recv, this.ctx.defs.leaf_of(d).spelling(), span, span);
+        m.set_resolved_trait_item(this.ctx.defs.parent_of(d), this.ctx.generic_registry.trait_item_position(d));        return m;
     }
 
     /// When `[]` hits a user type lacking an `Index` impl, emit a diagnostic that

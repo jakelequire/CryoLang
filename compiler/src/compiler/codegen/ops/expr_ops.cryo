@@ -69,7 +69,7 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::res;
-import compiler::resolver::res::{ FamilyOwner };
+import compiler::decl_index::{ OverloadId };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
 import compiler::types::type_base::{ FloatType, IntType, Type };
@@ -1507,8 +1507,10 @@ type struct ExprOps {
 
     /// Generate IR for a binary expression.  Handles arithmetic,
     /// comparison, logical short-circuit, and assignment operators.
+    /// `append_entry` is the `append` a string `+` was bound to where it is
+    /// written (`BinaryExprNode::append_entry`).
     codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef, rhs_type: TypeRef,
-                   visitor: ASTVisitor*, div_sched: ASTNode*[]*, div_span: SourceSpan) -> LValue {
+                   append_entry: OverloadId, visitor: ASTVisitor*, div_sched: ASTNode*[]*, div_span: SourceSpan) -> LValue {
         mut out_value: LValue = LValue::null();
         if (!lhs_val.is_valid() || !rhs_val.is_valid()) {
             out_value = LValue::null();
@@ -1553,11 +1555,9 @@ type struct ExprOps {
                     libc::free(buf);
                     return out_value;
                 }
-                // string + string -> call `string::append`, the method the
-                // stdlib's `implement string` block provides; every module
-                // gets it via cross-module extern declarations.  A primitive
-                // is declared nowhere, so its methods register under its
-                // spelling and no module-qualified form of it.
+                // string + string -> call the stdlib's `append`, the method
+                // sema bound the `+` to where it is written; every module
+                // gets it via cross-module extern declarations.
                 //
                 // append's signature is `(&this, other: string) -> string`.
                 // By convention, `&this` on a primitive lowers to a
@@ -1571,10 +1571,11 @@ type struct ExprOps {
                 // pass that slot's address.  Without this, the callee
                 // derefs i8* expecting i8** and reads the first 8 bytes
                 // of string content as a "pointer", crashing in strlen.
-                const fn_val: LValue = this.resolver.resolve_family(
-                    FamilyOwner::Type(this.ctx.type_arena.get_string()),
-                    this.intern_str("append"), -1);
+                const fn_val: LValue = this.resolver.resolve_decl(append_entry);
                 if (!fn_val.is_valid()) {
+                    this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                        Text::new("codegen: a string `+` was not bound to the standard library's `append`"),
+                        div_span);
                     out_value = LValue::null();
                     return out_value;
                 }

@@ -38,7 +38,7 @@ import compiler::decl_index::{ DeclarationIndex, GlobalEntry };
 import compiler::types;
 import compiler::types::{ arena, compound, generic, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name, res };
-import compiler::resolver::res::{ DefId, FamilyOwner };
+import compiler::resolver::res::{ DefId };
 import compiler::decl_index::{ OverloadId };
 import std::fmt;
 import compiler::codegen::abi::{ AbiAttr, AbiClassifier, ArgClass, ParamPlan, SignaturePlan };
@@ -49,7 +49,6 @@ import compiler::codegen::type_map::{ TypeMapper };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::resolver::decl_name::{ DeclName };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
@@ -193,68 +192,6 @@ type struct SymbolResolver {
         const v: LValue = this.held_symbol(sym);
         if (v.is_valid()) { return v; }
         return this.declare_extern_function_as(di.entry_signature(id), sym);
-    }
-
-    /// A function by its FAMILY - the owner and leaf every signature of one
-    /// declaration is registered under - when the family names ONE
-    /// symbol, among its signatures of `arity` when one is given.  A
-    /// signature carrying a generic parameter is a template and names none;
-    /// two declarations under one leaf that are the same C symbol are one
-    /// function.  A family naming several symbols is not resolvable by
-    /// name: the arguments select among them, that selection is the front
-    /// end's pin, and a name reaching here for such a family is an internal
-    /// error, never a choice made here.
-    resolve_family(mut &this, owner: FamilyOwner, leaf: SymbolStr, arity: i64) -> LValue {
-        mut ft: TypeRef = TypeRef::invalid();
-        mut plural: boolean = false;
-        const sym: SymbolStr = this.family_answer(owner, leaf, arity, &ft, &plural);
-        if (plural) {
-            this.ctx.emit_error_at(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                Text::new(fmt::format("codegen: `%s` names several functions and the call was not pinned to one of them",
-                            this.family_text(owner, leaf))),
-                SourceSpan::none());
-            return LValue::null();
-        }
-        if (!sym.is_valid()) { return LValue::null(); }
-        const held: LValue = this.held_symbol(sym);
-        if (held.is_valid()) { return held; }
-        return this.declare_extern_function_as(ft, sym);
-    }
-
-    /// The family `(owner, leaf)` as a diagnostic spells it, `Owner::leaf`.
-    family_text(&this, owner: FamilyOwner, leaf: SymbolStr) -> string {
-        const intern: InternTable* = this.ctx.intern_table;
-        const path: DeclName = this.ctx.decl_index.family_owner_path(owner);
-        if (!path.is_valid()) { return intern.resolve(leaf); }
-        return fmt::format("%s::%s", intern.shown(path), intern.resolve(leaf));
-    }
-
-    /// The one symbol the family `(owner, leaf)` names among its signatures
-    /// of `arity` (any arity when negative), with that signature in
-    /// `*out_ft`; empty when it names none, and `*out_plural` set when it
-    /// names several.  A query: declares nothing, reports nothing.
-    family_answer(&this, owner: FamilyOwner, leaf: SymbolStr, arity: i64,
-                  out_ft: TypeRef*, out_plural: boolean*) -> SymbolStr {
-        const di: DeclarationIndex* = this.ctx.decl_index;
-        const arena: TypeArena* = this.ctx.type_arena;
-        const entries: OverloadId[] = di.lookup_family_entries(owner, leaf);
-        mut found: OverloadId = OverloadId::invalid();
-        for (mut i: i64 = 0; i < entries.length; i++) {
-            const ft: TypeRef = di.entry_signature(entries[i]);
-            const t: Type* = arena.lookup(ft);
-            if (t == null || t.kind != TypeKind::Function) { continue; }
-            const f: FunctionType* = t as FunctionType*;
-            if (arity >= 0 && f.param_types.length != arity) { continue; }
-            if (SymbolResolver::function_type_has_generic_params(arena, f)) { continue; }
-            if (!di.entry_symbol(entries[i]).is_valid()) { continue; }
-            if (found.is_valid() && !di.same_symbol(found, entries[i])) {
-                *out_plural = true;
-                return SymbolStr::empty();
-            }
-            found = entries[i];
-            *out_ft = ft;
-        }
-        return di.entry_symbol(found).spelling();
     }
 
     /// The constructor of the type definition `d` taking `arity` LLVM

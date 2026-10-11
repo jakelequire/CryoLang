@@ -51,7 +51,7 @@ import compiler::types::{
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name, resolver };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResSlot, SourceLoc };
-import compiler::decl_index::{ OverloadId };
+import compiler::decl_index::{ DeclarationIndex, OverloadId };
 import compiler::sema::{
     state, helpers, scope_manager, type_utils, literal_resolver, diagnostics,
     dispatch, symbolic_checker, method_binding, pattern_resolver,
@@ -2027,6 +2027,32 @@ public:
         return call as ExpressionNode*;
     }
 
+    /// Bind `bin`, a `+` whose left operand is a string, to the standard
+    /// library's `append(&this, other: string) -> string` on `string`,
+    /// where the `+` is written, so code generation calls the entry it is
+    /// handed.  The family is asked through the member-function door and
+    /// the entry chosen by its signature: a program's own `append` on
+    /// `string` taking anything else is another overload, and not it.
+    /// Nothing for any other operator or operand.
+    pin_string_append(mut &this, bin: BinaryExprNode*, op: TokenType, lhs: TypeRef) -> void {
+        if (op != TokenType::Plus) { return; }
+        const lt: Type* = this.arena.lookup(lhs);
+        if (lt == null || lt.kind != TypeKind::String) { return; }
+        const string_ty: TypeRef = this.arena.get_string();
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        const entries: OverloadId[] = di.lookup_family_entries(
+            FamilyOwner::Type(string_ty), this.intern.intern("append"));        for (mut i: i64 = 0; i < entries.length; i++) {
+            const sig: Type* = this.arena.lookup(di.entry_signature(entries[i]));
+            if (sig == null || sig.kind != TypeKind::Function) { continue; }
+            const ft: FunctionType* = sig as FunctionType*;
+            if (ft.param_types.length == 2 && ft.param_types[1].equals(string_ty)
+                    && ft.return_type.equals(string_ty)) {
+                bin.append_entry = entries[i];
+                return;
+            }
+        }
+    }
+
     /// The type a `for` scrutinee's `next` is called on: a pointer or
     /// reference auto-derefs to what it points at, and an instantiation to
     /// the type it resolved to.
@@ -2448,6 +2474,7 @@ public:
                             bin.left, lhs, bin.right, map, bin.op, bin.span, false);
                         if (de != null) { bin.desugared_call = de; }
                     }
+                    if (bin.desugared_call == null) { this.pin_string_append(bin, base_op, lhs); }
                 } else {
                     mut overloaded: boolean = false;
                     if (map.valid && bin.desugared_call == null) {
@@ -2577,6 +2604,7 @@ public:
                         bin.left, lhs, bin.right, map, bin.op, bin.span, succ_deref);
                     if (de != null) { bin.desugared_call = de; return de.resolved_type; }
                 }
+                this.pin_string_append(bin, bin.op.kind, lhs);
                 return result.result_type;
             }
             // Phase 1: `check_binary_op` rejected - a concrete user type with a

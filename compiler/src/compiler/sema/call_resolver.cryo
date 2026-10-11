@@ -1276,15 +1276,14 @@ type struct CallResolver {
     // string is a literal we can parse its `%` conversions at compile time
     // and warn on a category or count mismatch before it becomes UB.
 
-    /// Entry point: if `call` targets `printf`/`eprintf` with a string-literal
-    /// format, check its conversions against the variadic arguments.
+    /// Entry point: if `call` names a function whose format is checked
+    /// (`checks_format`) - by the declaration its callee is bound to,
+    /// whatever name it is written with - and its format is a string
+    /// literal, check the format's conversions against the variadic
+    /// arguments.
     check_printf_call(mut &this, call: CallExprNode*) -> void {
-        const leaf: SymbolStr = this.printf_callee_leaf(call.callee);
-        if (!leaf.is_valid()) { return; }
-        if (!(leaf.equals(this.intern.intern("printf"))
-              || leaf.equals(this.intern.intern("eprintf")))) {
-            return;
-        }
+        const callee: DefId = this.family_callee(call.callee);
+        if (!this.checks_format(callee)) { return; }
         if (call.arguments.length == 0) { return; }
         const fmt_arg: ExpressionNode* = call.arguments[0];
         if (fmt_arg == null) { return; }
@@ -1295,17 +1294,16 @@ type struct CallResolver {
         this.check_printf_directives(call, lit);
     }
 
-    /// The callee's leaf name, for a bare `printf(...)` (Identifier) or a
-    /// qualified `fmt::printf(...)` (ScopeResolution). Invalid otherwise.
-    printf_callee_leaf(&this, callee: ExpressionNode*) -> SymbolStr {
-        const node: ASTNode* = callee as ASTNode*;
-        if (node.kind == NodeKind::Identifier) {
-            return (callee as IdentifierNode*).name;
-        }
-        if (node.kind == NodeKind::ScopeResolution) {
-            return (callee as ScopeResolutionNode*).member_name;
-        }
-        return SymbolStr::empty();
+    /// Whether `callee` is a function whose calls have their format
+    /// checked: the standard library's `printf` and `eprintf`, and the C
+    /// `printf` its `libc` module declares - each by the definition that
+    /// claimed it.
+    checks_format(&this, callee: DefId) -> boolean {
+        if (!callee.is_valid()) { return false; }
+        const registry: GenericRegistry* = this.ctx.get_generic_registry();
+        return callee.equals(registry.wellknown(LangItem::Printf))
+            || callee.equals(registry.wellknown(LangItem::Eprintf))
+            || callee.equals(registry.wellknown(LangItem::LibcPrintf));
     }
 
     /// Walk the format string's `%` conversions, checking each against the
@@ -2865,9 +2863,13 @@ type struct CallResolver {
         // an ambiguity reported here; an inherent method beside a trait
         // method that also applies is one the selection reports
         // (`report_inherent_trait_tie`), and the arguments are checked
-        // against the inherent method.
+        // against the inherent method.  A call stamped with a trait (an
+        // operator's, a desugar's, a bound's) names that trait's method:
+        // its candidates are that trait's methods alone.
+        const want_trait: DefId = member.resolved_trait;
         for (mut pass: i32 = 1; pass <= 2; pass++) {
             if (pass == 2 && found) { break; }
+            if (pass == 1 && want_trait.is_valid()) { continue; }
             mut walk: ClassType* = start_cls;
             mut cur: &MethodInfo[] = methods_ref;
             mut cur_owner: TypeRef = base_ref;
@@ -2880,6 +2882,7 @@ type struct CallResolver {
                     const m_origin: DefId = this.method_origin_trait(m);
                     if (pass == 1 && m_origin.is_valid()) { continue; }
                     if (pass == 2 && !m_origin.is_valid()) { continue; }
+                    if (want_trait.is_valid() && !m_origin.equals(want_trait)) { continue; }
                     if (this.method_type_is_variadic(m.function_type)) { variadic_ok = true; continue; }
                     name_seen  += 1;
                     uniq_arity  = this.diag.note_arity(uniq_arity, m.param_types.length);
@@ -2939,6 +2942,7 @@ type struct CallResolver {
                 for (mut ti: i64 = 0; ti < blocks.length; ti++) {
                     if (ambiguous || trait_ambiguous) { break; }
                     const block: ImplBlockNode* = blocks[ti];
+                    if (want_trait.is_valid() && !block.trait_def.equals(want_trait)) { continue; }
                     const block_named: MethodNode*[] = this.block_methods_named(block, member.member);
                     for (mut bmi: i64 = 0; bmi < block.methods.length; bmi++) {
                         const mn: MethodNode* = block.methods[bmi];
