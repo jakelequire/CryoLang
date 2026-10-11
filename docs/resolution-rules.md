@@ -210,6 +210,16 @@ yet is recorded with the change that builds it, not here.
      as text - **and a final read-only audit passes.**
      (Dispatch, delegated)
 
+231. **Five defects the final audit found are fixed before any slice of
+     the cleanup ruling 227 names:** overloaded `async` functions all
+     calling one body; `a[i]` and a `Deref` field read finding their
+     method by name rather than through their trait; a string `+`
+     finding `append` by name in code generation; the `printf` format
+     check deciding by the name a call is written with; and the type
+     objects' path held as open text.  Sealing that path is the
+     structural replacement for the identity-text lint once the lint
+     is removed.  (Dispatch, delegated)
+
 ### 2026-10-10
 
 211. **Before `docs/name-resolution.md` is deleted, its decisions D1-D77

@@ -7228,10 +7228,10 @@ type struct AsyncLower {
             this.ctx.artifacts.ast.root.add_statement(wrapper as ASTNode*);
         }
         // The index still holds the pre-rewrite `main` — the async function's
-        // DECLARED signature, which no definition answers to any more. Dropping
+        // DECLARED signature, which no definition answers to any more. Retiring
         // it leaves the synthesized entry point the only `main` a caller or
         // codegen can resolve.
-        this.ctx.decl_index.reset_family_of_entry(node.overload_entry);
+        this.ctx.decl_index.retire_entry(node.overload_entry);
         TypeResolutionPasses::register_decl_in_index(wrapper as ASTNode*, this.ctx, true);
         return true;
     }
@@ -7560,13 +7560,14 @@ type struct AsyncLower {
             // A method's callers read the NODE, so the future type STAYS on it;
             // `begin_body_check` lends the declared type back for the body walk.
         } else {
-            // Drop the stale Output-return overload first so the struct-return
-            // signature is the sole overload at call sites.  The node itself
+            // Retire the stale Output-return entry first so only the
+            // struct-return signature answers for this declaration; its
+            // sibling overloads keep their own entries.  The node itself
             // carries the struct type only for the duration of the
             // registration, which reads it off the node; the DECLARED type
             // goes back afterwards, because the body is still typed and
             // `check_function_returns`-checked against it.
-            this.ctx.decl_index.reset_family_of_entry(node.overload_entry);
+            this.ctx.decl_index.retire_entry(node.overload_entry);
             TypeResolutionPasses::register_decl_in_index(node as ASTNode*, this.ctx, true);
             node.set_resolved_return_type(declared_ref);
         }
@@ -7632,22 +7633,30 @@ type struct AsyncLower {
     /// read). Both derive from the node's `resolved_return_type`, which the
     /// caller has set to the future type around this call.  The index keys
     /// both by the owner's registered type (`decl`): a generic owner's
-    /// instance (`ty`) is a type the index never saw.  The stale
-    /// Output-return overload is dropped first, or it stays resolvable
-    /// beside the new struct-return one.
+    /// instance (`ty`) is a type the index never saw.  The method's stale
+    /// Output-return entry is retired first, or it stays resolvable beside
+    /// the new struct-return one; its sibling overloads keep theirs.
     repoint_method(mut &this, owner: AsyncOwner*, node: FunctionDeclNode*) -> void {
         this.rebuild_method_info(owner.ty, owner.method, node);
 
         mut arr: MethodNode*[] = [owner.method];
-        this.ctx.decl_index.reset_family(FamilyOwner::Type(owner.decl), node.name);
+        this.ctx.decl_index.retire_entry(node.overload_entry);
         // A method written in an implement block returns a future generic
         // in the block's parameters; stored in the owner's, as the block's
         // other returns are.
         mut head: TypeSubstitution = TypeResolutionPasses::impl_params_to_owner(
             owner.impl_node, this.ctx, this.arena);
-        const trait_args: TypeRef[] = if (owner.impl_node == null) { [] } else { owner.impl_node.trait_arg_types };
-        this.ctx.decl_index.register_methods_through(
-            owner.decl, arr, &head, &trait_args, this.intern, this.arena, Text::new("async_lower/repoint method"));
+        // The block's trait arguments are lent, never copied: a by-value
+        // copy of the block's array shares its buffer and frees it twice.
+        if (owner.impl_node == null) {
+            const no_trait_args: TypeRef[] = [];
+            this.ctx.decl_index.register_methods_through(
+                owner.decl, arr, &head, &no_trait_args, this.intern, this.arena, Text::new("async_lower/repoint method"));
+        } else {
+            this.ctx.decl_index.register_methods_through(
+                owner.decl, arr, &head, &owner.impl_node.trait_arg_types, this.intern, this.arena,
+                Text::new("async_lower/repoint method"));
+        }
     }
 
     /// Append one field to the generated future's declaration.
@@ -7950,15 +7959,15 @@ type struct AsyncLower {
         // Re-register now that the node itself carries the struct return type and
         // its annotation. `declare` already pointed callers here, so this settles
         // the entry against the finished node rather than changing where calls
-        // resolve. Dropping the stale overloads first (bare + qualified) keeps the
-        // struct-return signature the sole one at call sites.
+        // resolve. Retiring the entry `declare` registered first keeps one
+        // entry for this declaration in its family.
         //
         // A METHOD needs none of this: `declare` registered its signature with
         // the future return type already, under keys that are stable across the
         // rewrite, and re-running the registration would only append a second
         // entry with the same mangled symbol.
         if (method == null) {
-            this.ctx.decl_index.reset_family_of_entry(node.overload_entry);
+            this.ctx.decl_index.retire_entry(node.overload_entry);
             TypeResolutionPasses::register_decl_in_index(node as ASTNode*, this.ctx, true);
         }
 

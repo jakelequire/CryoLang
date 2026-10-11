@@ -513,29 +513,27 @@ public:
         };
     }
 
-    /// Drop every overload position previously registered for the family
-    /// `(owner, leaf)` so the next registration is its sole signature.
-    /// Needed when a declaration's signature is rewritten mid-compile (an
-    /// `async function` becomes a constructor returning its Future struct):
-    /// the stale Output-return overload must not shadow the new struct-return
-    /// one at call sites, where overload resolution enumerates
-    /// `lookup_func_type_overloads`.
-    reset_family(mut &this, owner: FamilyOwner, leaf: SymbolStr) -> void {
-        const slot: FamilySlot = this.family_slot(owner, leaf);
-        if (slot.is_none()) { return; }
-        mut empty: u32[] = [];
-        this.overload_index.insert(slot, empty);
-    }
-
-    /// `reset_family` for the family entry `e` was registered in, read off
-    /// the entry: a declaration whose signature is rewritten names its own
-    /// family by the entry it was registered as.
-    reset_family_of_entry(mut &this, e: OverloadId) -> void {
+    /// Take entry `e` out of the family it was registered in, so a call can
+    /// no longer bind to it; the family's other overloads stay.  A
+    /// declaration whose signature is rewritten mid-compile (an `async`
+    /// function becomes a constructor returning its future) retires its
+    /// stale entry before registering the new one, or both stay resolvable.
+    retire_entry(mut &this, e: OverloadId) -> void {
         if (!e.is_valid()) { return; }
-        const slot: FamilySlot = this.overload_func_family[this.slot_of(e)];
+        const pos: u32 = this.slot_of(e) as u32;
+        const slot: FamilySlot = this.overload_func_family[pos as i64];
         if (slot.is_none()) { return; }
-        mut empty: u32[] = [];
-        this.overload_index.insert(slot, empty);
+        match (this.overload_index.get_ref(&slot)) {
+            Option::Some(positions) => {
+                for (mut k: i64 = 0; k < (*positions).length; k++) {
+                    if ((*positions)[k] == pos) {
+                        (*positions).remove(k as u64);
+                        return;
+                    }
+                }
+            }
+            Option::None => { }
+        }
     }
 
     /// Register one signature of a declaration: the entry in the family
