@@ -176,7 +176,24 @@ Strings are enclosed in double quotes; characters in single quotes. Both share t
 '\x41'                     // hex byte: equivalent to 'A'
 ```
 
-**Escape sequences:** `\n` `\t` `\r` `\\` `\'` `\"` `\xHH` (hex byte) and `\OOO` (octal byte). An octal escape is one to three digits `0`-`7`, read as C reads them: the escape ends after three digits or at the first character that is not one, so `\0` is NUL, `"\033[1m"` is ESC and then `[1m`, `\177` is 127, and `"\0123"` is `\012` (newline) and then `3`. `\8` and `\9`, and an octal value above `\377`, are refused (`E0013`). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented - see [section 22](#22-reserved-syntax).
+**Escape sequences:**
+
+| escape | value |
+|---|---|
+| `\n` `\t` `\r` | newline (10), tab (9), carriage return (13) |
+| `\a` `\b` `\f` `\v` | bell (7), backspace (8), form feed (12), vertical tab (11) |
+| `\\` `\'` `\"` | the backslash or quote itself |
+| `\xHH` | the byte one or two hex digits spell |
+| `\OOO` | the byte one to three octal digits spell |
+| `\u{H...}` | the Unicode code point one or more hex digits spell, up to `10FFFF` |
+
+An octal escape is one to three digits `0`-`7`, read as C reads them: the escape ends after three digits or at the first character that is not one, so `\0` is NUL, `"\033[1m"` is ESC and then `[1m`, `\177` is 127, and `"\0123"` is `\012` (newline) and then `3`. `\8` and `\9`, and an octal value above `\377`, are refused (`E0013`).
+
+In a string, `\u{...}` is the code point's UTF-8 bytes, so `"\u{e9}"` is the two bytes `C3 A9`; in a character it is the code point itself, so `'\u{42}'` is `'B'`. What a `char` holds for a code point above 255 depends on `char`'s width, which is not yet decided. A malformed `\u` (no braces, no digit, or past `10FFFF`), a `\x` with no hex digit, and an escape this table does not name (`\q`) are kept as written in a string; in a character, an escape the table does not name is the character after the backslash.
+
+A string literal keeps every byte it spells, a NUL among them: the constant the compiler emits for `"a\0b"` is `a`, NUL, `b` and the terminating NUL. A `string` is read up to its first NUL by what measures it, so `"a\0b".length()` is 1 while the bytes after the NUL are still there to be read through a pointer.
+
+Raw strings (`r"..."`) are reserved but not yet implemented - see [section 22](#22-reserved-syntax).
 
 #### f-strings (string interpolation)
 
@@ -3886,7 +3903,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Reserved                                      | Status                                                                                                                                                                                                                                                                                           |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Raw strings `r"..."`                          | Reserved. Will treat backslashes literally (no escape processing). Today an `r` prefix lexes as a separate identifier followed by an ordinary string literal.                                                                                                                                    |
-| Escapes `\a` `\b` `\f` `\v`                   | Reserved. The lexer does not yet recognise them; they pass through as a literal backslash plus the following character. The implemented escapes are `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH`.                                                                                                   |
 | `yield`                                       | Parser accepts a `yield` expression; no generator semantics exist. `async` / `await` are fully implemented - see [section 19](#19-asynchronous-programming).                                                                                                                                     |
 | Optional chaining `?.`                        | Token reserved; not consumed by the parser.                                                                                                                                                                                                                                                      |
 | Spread `...` in calls / literals              | The token exists for variadic parameter declarations only.                                                                                                                                                                                                                                       |

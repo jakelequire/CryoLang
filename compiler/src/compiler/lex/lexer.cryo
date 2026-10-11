@@ -389,7 +389,8 @@ private:
         const raw_len: u64 = (this.current as i64 - start as i64 - 1) as u64;
         const raw_text: string = start.substr(0, raw_len as i64);
 
-        const processed: string = Lexer::process_escape_sequences(Text::new(raw_text));
+        const processed: String = Lexer::process_escape_sequences(Text::new(raw_text));
+        const byte_length: i64 = processed.length() as i64;
 
         // Source extent covers both quotes plus every byte between
         // them (including escape digraphs, which the processed lexeme
@@ -397,9 +398,8 @@ private:
         // the math self-evident.
         const source_length: int = (raw_len + 2 as u64) as int;
 
-        return Token::new_with_extent(
-            TokenType::StringLiteral, processed,
-            start_line, start_col, source_length);
+        return Token::new_string(processed.into_raw(), byte_length,
+                                 start_line, start_col, source_length);
     }
 
     /// Lex an f-string `f"..."`.  The dispatcher consumed both the `f`
@@ -1131,21 +1131,20 @@ private:
     }
 
     /// Processes escape sequences in a string literal, converting backslash
-    /// sequences (e.g. \n, \t, \\) into their actual character values.
+    /// sequences (e.g. \n, \t, \\) into the bytes they spell.  Every byte is
+    /// kept, a NUL among them, so the answer's length - not the text's first
+    /// NUL - is where the literal ends.
     ///
     /// `public` overrides the `private:` run above it: the parser decodes
-    /// f-string and raw-literal segments with this, and the C importer decodes
-    /// `#define` string bodies, so this is the single decoder three modules
-    /// share rather than a lexer internal.
-    public static process_escape_sequences(raw_text: Text) -> string {
+    /// f-string segments with this, and the C importer decodes `#define`
+    /// string bodies, so this is the single decoder three modules share
+    /// rather than a lexer internal.
+    public static process_escape_sequences(raw_text: Text) -> String {
         const raw: string = raw_text.as_string();
         const len: i64 = raw.length() as i64;
-        if (len == 0) {
-            return raw;
-        }
 
-        // Build into an owned String; escapes only shrink, so with_capacity
-        // reserves enough that no reallocation occurs.
+        // Escapes only shrink, so with_capacity reserves enough that no
+        // reallocation occurs.
         mut buf: String = String::with_capacity((len + 1) as u64);
         mut ri: i64 = 0;  // read index
 
@@ -1158,78 +1157,75 @@ private:
                 continue;
             }
 
-            // We have a backslash; look at the next character
             const esc: char = *(raw + ri + 1) as char;
-
-            // `\` and one to three octal digits is the byte they spell:
-            // `\0` is NUL, `\033` is ESC.  A value past `\377` was refused
-            // where it was lexed.
-            if (esc >= '0' && esc <= '7') {
-                mut nd: i64 = 0;
-                const ov: i64 = Lexer::octal_escape(raw, ri + 1, len, &nd);
-                buf.push_byte(ov as u8);
-                ri += 1 + nd;
-                continue;
-            }
-            ri += 2; // consume both backslash and escape char
-
-            match (esc) {
-                'n'  => { buf.push_byte('\n' as u8); }
-                't'  => { buf.push_byte('\t' as u8); }
-                'r'  => { buf.push_byte('\r' as u8); }
-                '\\' => { buf.push_byte('\\' as u8); }
-                '\'' => { buf.push_byte('\'' as u8); }
-                '"'  => { buf.push_byte('"' as u8); }
-                'x'  => {
-                    // Hex escape: \xHH (exactly up to 2 hex digits).  A
-                    // `\x` with no following hex digit is malformed; emit
-                    // it literally rather than silently materialising a NUL
-                    // byte (writing `val == 0` would truncate the bogus
-                    // escape to `\0` and corrupt the string).
-                    mut val: i64 = 0;
-                    mut digits: int = 0;
-                    while (digits < 2 && ri < len && Lexer::is_hex_digit(*(raw + ri))) {
-                        const d: char = *(raw + ri) as char;
-                        mut dv: i64 = 0;
-                        if (d >= '0' && d <= '9')      { dv = d as i64 - '0' as i64; }
-                        else if (d >= 'a' && d <= 'f') { dv = d as i64 - 'a' as i64 + 10; }
-                        else if (d >= 'A' && d <= 'F') { dv = d as i64 - 'A' as i64 + 10; }
-                        val = val * 16 + dv;
-                        ri += 1;
-                        digits += 1;
-                    }
-                    if (digits == 0) {
-                        buf.push_byte('\\' as u8);
-                        buf.push_byte('x' as u8);
-                    } else {
-                        buf.push_byte(val as u8);
-                    }
-                }
-                'u'  => {
-                    // Unicode escape: \u{HEX} - the brace-delimited codepoint,
-                    // emitted as its UTF-8 encoding.  Malformed forms
-                    // (missing `{`, no digits, codepoint out of the Unicode
-                    // range) keep the `\u` so a downstream pass reports
-                    // them rather than this silently dropping bytes.
-                    mut spanned: i64 = 0;
-                    const cp: i64 = Lexer::unicode_escape(raw, ri, len, &spanned);
-                    ri += spanned;
-                    if (cp >= 0) {
-                        Lexer::encode_utf8(&buf, cp);
-                    } else {
-                        buf.push_byte('\\' as u8);
-                        buf.push_byte('u' as u8);
-                    }
-                }
-                _ => {
-                    // Unknown escape; preserve both characters
-                    buf.push_byte('\\' as u8);
-                    buf.push_byte(esc as u8);
-                }
+            mut spanned: i64 = 0;
+            const value: i64 = Lexer::escape_value(raw, ri, len, &spanned);
+            ri += spanned;
+            if (value < 0) {
+                // Malformed or unknown: kept as written, so a later pass
+                // reports it rather than this dropping bytes.
+                buf.push_byte('\\' as u8);
+                buf.push_byte(esc as u8);
+            } else if (esc == 'u') {
+                Lexer::encode_utf8(&buf, value);
+            } else {
+                buf.push_byte(value as u8);
             }
         }
 
-        return buf.into_raw();
+        return buf;
+    }
+
+    /// The value of the escape whose backslash is at `at` in `text` (below
+    /// `len`): the byte a named, hex or octal escape spells, or the code
+    /// point of a `\u{...}`.  -1 for an escape no rule names (`\q`), a `\x`
+    /// with no hex digit, or a malformed `\u`.  Writes through `spanned`
+    /// how many characters the escape takes, backslash included.  The one
+    /// escape decoder, for strings and characters alike.
+    public static escape_value(text: string, at: i64, len: i64, spanned: i64*) -> i64 {
+        *spanned = 2;
+        if (at + 1 >= len) { *spanned = 1; return -1; }
+        const esc: char = *(text + at + 1) as char;
+        // `\` and one to three octal digits is the byte they spell: `\0` is
+        // NUL, `\033` is ESC.  A value past `\377` was refused where it was
+        // lexed.
+        if (esc >= '0' && esc <= '7') {
+            mut nd: i64 = 0;
+            const ov: i64 = Lexer::octal_escape(text, at + 1, len, &nd);
+            *spanned = 1 + nd;
+            return ov;
+        }
+        match (esc) {
+            'n'  => { return 10; }
+            't'  => { return 9; }
+            'r'  => { return 13; }
+            'a'  => { return 7; }
+            'b'  => { return 8; }
+            'f'  => { return 12; }
+            'v'  => { return 11; }
+            '\\' => { return 92; }
+            '\'' => { return 39; }
+            '"'  => { return 34; }
+            'x'  => {
+                // One or two hex digits.  None is malformed, not a NUL.
+                mut val: i64 = 0;
+                mut digits: i64 = 0;
+                while (digits < 2 && at + 2 + digits < len && Lexer::is_hex_digit(*(text + at + 2 + digits))) {
+                    val = val * 16 + Lexer::hex_value(*(text + at + 2 + digits) as char);
+                    digits += 1;
+                }
+                *spanned = 2 + digits;
+                if (digits == 0) { return -1; }
+                return val;
+            }
+            'u'  => {
+                mut body: i64 = 0;
+                const cp: i64 = Lexer::unicode_escape(text, at + 2, len, &body);
+                *spanned = 2 + body;
+                return cp;
+            }
+            _ => { return -1; }
+        }
     }
 
     /// The value of an octal escape's digits: up to three octal digits of
@@ -1262,12 +1258,7 @@ private:
         mut cp: i64 = 0;
         mut ndig: i64 = 0;
         while (i < len && Lexer::is_hex_digit(*(text + i))) {
-            const d: char = *(text + i) as char;
-            mut dv: i64 = 0;
-            if (d >= '0' && d <= '9')      { dv = d as i64 - '0' as i64; }
-            else if (d >= 'a' && d <= 'f') { dv = d as i64 - 'a' as i64 + 10; }
-            else if (d >= 'A' && d <= 'F') { dv = d as i64 - 'A' as i64 + 10; }
-            cp = cp * 16 + dv;
+            cp = cp * 16 + Lexer::hex_value(*(text + i) as char);
             i += 1;
             ndig += 1;
         }
@@ -1280,45 +1271,19 @@ private:
 
     /// The value of a character literal from its text between the quotes,
     /// as the lexer hands it over (`'\n'` arrives as backslash and `n`): its
-    /// one character, or the codepoint or byte its escape spells.  The one
-    /// decoder of a character literal, for its value and for a pattern's
-    /// bound alike.
+    /// one character, or the codepoint or byte its escape spells, read by
+    /// the decoder strings use.  An escape that decoder does not name is the
+    /// character after the backslash.  The one decoder of a character
+    /// literal, for its value and for a pattern's bound alike.
     public static char_literal_value(text: string) -> i64 {
         if (text == null) { return 0; }
         const len: i64 = text.length() as i64;
         if (len == 0) { return 0; }
         if (len < 2 || text[0] != '\\') { return text[0] as i64; }
-        const esc: char = text[1];
-        if (esc >= '0' && esc <= '7') {
-            mut nd: i64 = 0;
-            return Lexer::octal_escape(text, 1, len, &nd);
-        }
-        match (esc) {
-            'n'  => { return 10; }
-            't'  => { return 9; }
-            'r'  => { return 13; }
-            '\\' => { return 92; }
-            '\'' => { return 39; }
-            '"'  => { return 34; }
-            'a'  => { return 7; }
-            'b'  => { return 8; }
-            'f'  => { return 12; }
-            'v'  => { return 11; }
-            'x'  => {
-                // `\xHH`: two hex digits.  A short `\x` (len < 4) is
-                // malformed; it falls through to the bare-escape default.
-                if (len >= 4) {
-                    return Lexer::hex_value(text[2]) * 16 + Lexer::hex_value(text[3]);
-                }
-            }
-            'u'  => {
-                mut spanned: i64 = 0;
-                const cp: i64 = Lexer::unicode_escape(text, 2, len, &spanned);
-                if (cp >= 0) { return cp; }
-            }
-            _ => { }
-        }
-        return esc as i64;
+        mut spanned: i64 = 0;
+        const value: i64 = Lexer::escape_value(text, 0, len, &spanned);
+        if (value >= 0) { return value; }
+        return text[1] as i64;
     }
 
     /// A hex digit's value, 0 for any other character.

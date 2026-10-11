@@ -15,21 +15,26 @@ import compiler::codegen::llvm_types::{ LLinkage, LModule, LType, LUnnamedAddr, 
 import std::collections::pair;
 import std::collections::pair::{ Pair };
 import std::fmt;
-import utils::text::{ Text };
+import std::ffi::libc;
 import compiler::resolver::mangled_name::{ MangledName };
 
 
 type struct StringCache {
     entries: Pair<string, void*>[];   // (text, LLVMValueRef)
+    /// Each entry's byte count, a NUL among them: two literals that agree up
+    /// to a NUL are two constants.
+    lengths: i64[];
 
     static new() -> StringCache {
-        return StringCache { entries: [] };
+        return StringCache { entries: [], lengths: [] };
     }
 
+    /// The constant global holding the first `length` bytes of `text`.
     ![allow(lookup_by_spelling, reason = "the string-constant cache, keyed by a literal's own bytes: a pattern's text is the constant, not a name")]
-    get_or_create(mut &this, text: string, llmodule: LModule*) -> LValue {
+    get_or_create(mut &this, text: string, length: i64, llmodule: LModule*) -> LValue {
         for (mut i: i64 = 0; i < this.entries.length; i++) {
-            if (this.entries[i].first == text) {
+            if (this.lengths[i] == length
+                    && libc::memcmp(this.entries[i].first as u8*, text as u8*, length as u64) == 0) {
                 return LValue { raw: this.entries[i].second };
             }
         }
@@ -45,7 +50,7 @@ type struct StringCache {
         // global-variable phase.  Under opaque pointers the global itself is
         // the `i8*`, so it is returned directly (the GEP to element 0 folds
         // away to the global anyway).
-        const arr: LValue = LType::const_string(Text::new(text));
+        const arr: LValue = LType::const_string(text, length);
         const global: LValue = llmodule.add_global(arr.type_of(), MangledName::new(name));
         global.set_initializer(arr);
         global.set_global_constant(true);
@@ -54,6 +59,7 @@ type struct StringCache {
         global.set_alignment(1);
 
         this.entries.push(Pair::new(text, global.raw));
+        this.lengths.push(length);
 
         return global;
     }
