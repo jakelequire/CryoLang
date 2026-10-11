@@ -64037,3 +64037,47 @@ skipped in a generic body, over the corpus: 500 entries)
   Every `DeclName` shares the gap; the check is due to be removed with
   the lint layer, so the type is what holds: the path offers no `id`,
   and reaching one takes the explicit `spelling()`.
+
+### 8.598 A character literal is decoded once, `\u{...}` included; both pins refreshed - 2026-10-11
+
+The decoder change landed without this entry (the edit writing it failed
+after the §0 rows had been written); the entry rides with the pin refresh
+that follows it, the next commit.
+
+## What changed
+
+* `'\u{42}'` was 117 at run time and `'\u{41}'..'\u{43}'` did not match
+  `'B'`: the lexer accepts a `\u{...}` escape in a character literal,
+  and the two decoders that turned its text into a value - code
+  generation's `CodegenUtil::decode_char_lexeme` (literals and literal
+  patterns) and sema's `sema_decode_range_bound` (a range's ordering
+  check) - had no arm for it and answered the `u`.  Both are replaced by
+  one, `Lexer::char_literal_value`, beside the lexer's other escape
+  readers; `decode_char_lexeme` is deleted and its callers (the C
+  importer's `#define` character constants among them) ask the lexer.
+* The `\u{...}` parsing is `Lexer::unicode_escape`, shared by the string
+  decoder (`process_escape_sequences`, which encodes the codepoint as
+  UTF-8) and the character decoder (which answers it), consuming what
+  the string decoder consumed before, malformed escapes included.
+* Not shared whole with the string decoder: the character decoder
+  answers `\a \b \f \v` (7, 8, 12, 11), which the string decoder and the
+  spec treat as reserved, so one decoder for both would change what
+  those character literals compile to.  Left as they were.
+* New project `char_unicode_escape_value`, declared in
+  `tests/started-passing`.
+* Both pins rebuilt from that commit, so the bootstrap compiler carries
+  8.595-8.598.
+
+## Proof
+
+* The new project exits 1 with the compiler before the change and 0
+  with it.  No other `.cryo` file in the tree writes a `\u{...}`
+  character literal (only comments), and three exercise the string
+  decoder's `\u{...}` (`stdlib/fmt/display.cryo`, the tests
+  `lexer_escapes` and `fmt_print_family`).
+* `make verify ARGS="--baseline HEAD --require-identical"`: the
+  baseline's census fails the declared project alone; of 8,522 test and
+  1,126 example objects (the declared project's 54 left out) none
+  moved; all gates OK.  Roster OK (merged); clean build 324 warnings,
+  the same set.  §0: projects 241 to 242, name-taking functions 600 to
+  602 (the two lexer readers).
