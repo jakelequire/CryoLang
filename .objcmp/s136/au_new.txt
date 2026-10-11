@@ -1,0 +1,56 @@
+    /// One written argument of a head against one argument of the subject.
+    /// A name stamped as a parameter of the head binds to anything; one
+    /// stamped as a declaration must name the definition the subject's
+    /// argument is (an instantiation's, its template's); one naming a
+    /// primitive must be that primitive, and a nested instantiation is
+    /// compared recursively.  A subject argument that is still
+    /// abstract (a type parameter of the enclosing template) cannot refute a
+    /// concrete one: the question is deferred to the concrete instantiation,
+    /// as a where-bound over an abstract argument is.  A written argument the
+    /// name layer did not stamp is recorded through `require` and refutes
+    /// nothing, so a head is never lost to a missing stamp.
+    ![allow(lookup_by_spelling, reason = "compares two primitive identities: a primitive's stamp and its keyword annotation both name it by its spelling in the fixed table, as a primitive type is registered; no table is asked")]
+    annotation_unifies(&this, ann: TypeAnnotation*, arg: TypeRef, intern: InternTable*) -> boolean {
+        if (ann == null) { return true; }
+        const at: Type* = this.arena.lookup(arg);
+        if (at != null && at.kind == TypeKind::GenericParam) {
+            return true;
+        }
+        match (*ann) {
+            TypeAnnotation::Named(n) => {
+                match (n.res.require(Text::new("generic_registry:impl head argument"))) {
+                    Res::GenericParam(_) => { return true; }
+                    Res::Def(d)          => { return d.equals(this.decls.def_of(arg, this.arena)); }
+                    Res::PrimTy(p)       => {
+                        const k: SymbolStr = this.arena.template_key_of(arg, intern);
+                        return k.is_valid() && k.equals(p);
+                    }
+                    _                    => { return true; }
+                }
+            }
+            TypeAnnotation::Primitive(p) => {
+                const k: SymbolStr = this.arena.template_key_of(arg, intern);
+                return k.is_valid() && k.equals(p.name);
+            }
+            TypeAnnotation::Generic(g) => {
+                if (!this.annotation_unifies(g.base, arg, intern)) { return false; }
+                const n: i64 = this.arena.inst_type_arg_count(arg);
+                if (n == 0) { return true; }
+                if (g.args.length != n) { return false; }
+                for (mut j: i64 = 0; j < n; j++) {
+                    if (!this.annotation_unifies(g.args[j], this.arena.inst_type_arg_at(arg, j), intern)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            TypeAnnotation::Pointer(pa) => {
+                if (at == null || at.kind != TypeKind::Pointer) { return false; }
+                return this.annotation_unifies(pa.inner, (at as PointerType*).pointee, intern);
+            }
+            TypeAnnotation::Reference(ra) => {
+                if (at == null || at.kind != TypeKind::Reference) { return false; }
+                return this.annotation_unifies(ra.inner, (at as ReferenceType*).referent, intern);
+            }
+            _ => { return true; }
+        }

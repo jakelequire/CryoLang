@@ -3,7 +3,7 @@
 Input for the final read-only audit of the name-resolution migration on
 `naming-impl`.  Measured on the tree of the commit carrying this file.
 The rules are `docs/resolution-rules.md`'s five; the door list and the
-rulings appendix (through 226) are in the same file.  Every pointer below is
+rulings appendix (through 230) are in the same file.  Every pointer below is
 a path in the tree; every number was taken from a run named beside it.
 
 ## Rule 1 - every written name is resolved once, where it is written
@@ -131,7 +131,10 @@ a path in the tree; every number was taken from a run named beside it.
   table's key, an operand of `==`/`!=` with other text, a text handed with
   other text to a call answering a `boolean`, or a `match`'s subject - in
   the function that reads it, or wherever it reaches through any chain of
-  calls.
+  calls.  What an override answers goes on to the answer of each
+  same-named method of every class it derives from (asked through the
+  `member-function` door), so a call made through the base class
+  (`t.display_name()` on a `Type*`) carries the override's text (8.593).
 * Text that comes back off identities is sealed at the source: a type's
   display (`TypeArena::format_display` shows the declaration's `DeclName`),
   a specialization's display (`custom_display` is a `DeclName`, 8.592), a
@@ -142,21 +145,18 @@ a path in the tree; every number was taken from a run named beside it.
 
 * `identity_text_refused_at_door`, `identity_text_refused_across_calls`,
   `identity_text_refused_as_match_or_question`,
-  `identity_text_refused_through_mangled_name` (`tests/tests/projects`).
+  `identity_text_refused_through_mangled_name`,
+  `identity_text_refused_through_an_override` (`tests/tests/projects`).
 
 **Knowingly out of scope / known holes**
 
-* **A call through a base class.**  `t.display_name()` on a `Type*` names
-  the base's method; what an override answers is not followed there.  A
-  fix exists (`.objcmp/s135/override-flow.patch`: link each override's
-  answer to the same-named base methods through the `member-function`
-  door).  It finds real sites - it found the where-arg binder's compare,
-  converted in 8.592 - but raises the lane gate's pinned `LOOKUP_OTHER`
-  count by its one door call, so it waits on a decision.
-* **`GenericRegistry::annotation_unifies`.**  Its allow's reason covers the
-  primitive arm; its `Res::Def` arm compares a definition's path text with
-  a template key.  The registry has no declaration index to compare
-  definitions with.  Found this session, not converted.
+* Known holes: none.  The two this file named are closed in 8.593: a call
+  through a base class now follows the override's answer (above), and
+  `GenericRegistry::annotation_unifies` matches a head's written argument
+  stamped as a declaration against the subject's argument by definition
+  (`DeclarationIndex::def_of`, the registry holding the index), not by the
+  definition's path text; its allow now covers only the primitive arms it
+  names.
 * Text stored into a field and read back elsewhere is not followed (the
   flow ends at a field write), by design.
 * The wording of a refused `MangledName` says "computed from a `DeclName`";
@@ -176,7 +176,7 @@ answers; no mechanical check.
 collisions, braced items, sub-modules, redeclaration), `trait_qualified_call_disambiguates`,
 `impl_qualified_*`, `overload_qualified_*`, `visibility_import_gate`,
 `unimported_module_path_refused`, `const_unimported_gate`,
-`default_expansion_by_stamp`, among the 236 projects; `make test-census`
+`default_expansion_by_stamp`, among the 237 projects; `make test-census`
 reconciles what ran against `tests/test-roster.txt`.
 
 **Knowingly out of scope**
@@ -205,7 +205,6 @@ Python gates, now that ruling 223 has landed.
 ## Gates at the commit carrying this file
 
 `make verify ARGS="--baseline HEAD --require-identical"` OK (8,305 test
-and 1,126 example objects, none moved, at 8.591 and 8.592); `make
-check-fast` OK; `make roster-check` OK (2,714 entries: 2,226 unit, 236
-project, 252 negative); clean build 324 warnings, the same set; pins
-refreshed so the bootstrap compiler runs these checks.
+and 1,126 example objects, none moved, at 8.591, 8.592 and 8.593); `make
+check-fast` OK; `make roster-check` OK (2,715 entries: 2,226 unit, 237
+project, 252 negative); clean build 324 warnings, the same set.

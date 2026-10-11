@@ -188,6 +188,28 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-11
+
+227. **The cleanup that removes the Python gates also removes
+     `--emit=facts`, the compiler-internal `![allow]`s and the internal
+     lint layer they serve.**  The structural locks stay: private fields,
+     typed keys and `DeclName`.  Recorded only; a later change plans and
+     does it.  (Dispatch, delegated)
+
+228. **The check that follows what an override answers to a call made
+     through the base lands, and the lane gate's pinned `LOOKUP_OTHER`
+     rises from 35 to 36 for its one `member-function` door call.**
+     (Dispatch, delegated)
+
+229. **`LangModule::is_written` keeps the `lang-item` door id,** as the
+     fixed tables ruling 225 names do.  (Dispatch, delegated)
+
+230. **Name resolution is called complete only after the two known holes
+     are closed** - what an override answers through the base, and
+     `GenericRegistry::annotation_unifies` comparing a definition's path
+     as text - **and a final read-only audit passes.**
+     (Dispatch, delegated)
+
 ### 2026-10-10
 
 211. **Before `docs/name-resolution.md` is deleted, its decisions D1-D77
