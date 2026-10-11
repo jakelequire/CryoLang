@@ -485,14 +485,12 @@ type struct CallResolver {
         // stamp that makes no type claim names a module, which owns no
         // variant; matching its spelling against the index answered the
         // primitive `f32` for the module `float`.
-        mut type_ref: TypeRef = this.types.scope_qualifier_type(scope);
-        // The variant's owner is the instantiation the node's own pair names.
-        // Invalid where the qualifier's stamp makes no type claim, which leaves
-        // whatever the lookups above found rather than retrying them.
-        const spec_ref: TypeRef = this.resolve_generic_scope_type(
-            this.types.scope_qualifier_type(scope), scope.scope_generic_args,
-            scope.span);
-        if (spec_ref.is_valid()) { type_ref = spec_ref; }
+        // Type arguments written on the qualifier (`Result::<i32, i32>::Ok`)
+        // name the instance the call constructs, which
+        // `try_resolve_type_or_variant` answers; the variant is the
+        // template's, at the same position in every instance, and an
+        // instance not yet minted has no variants to ask.
+        const type_ref: TypeRef = this.types.scope_qualifier_type(scope);
         if (!type_ref.is_valid()) { return []; }
         mut enum_t: Type* = this.arena.lookup(type_ref);
         if (enum_t == null) { return []; }
@@ -7376,12 +7374,17 @@ type struct CallResolver {
                                 owner_ty: TypeRef, call: CallExprNode*) -> TypeRef {
         const type_ref: TypeRef = owner_ty;
         if (!type_ref.is_valid()) { return TypeRef::invalid(); }
-        mut concrete_t: Type* = this.arena.lookup(type_ref);
-        if (concrete_t != null && concrete_t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = concrete_t as InstantiatedType*;
-            if (inst.has_resolved_type()) { concrete_t = this.arena.lookup(inst.resolved_type); }
+        // An instance - written on the owner (`Result::<i32, i32>::Ok(4)`)
+        // or substituted into a copy - is the answer; whether it is an enum
+        // is its template's question, since an instance not yet minted has
+        // no enum of its own.
+        const base: TypeRef = this.types.view_generic_base(type_ref);
+        const enum_t: Type* = this.arena.lookup(if (base.is_valid()) { base } else { type_ref });
+        if (enum_t == null || enum_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
+        if (base.is_valid()) {
+            scope.set_resolved_type(type_ref);
+            return type_ref;
         }
-        if (concrete_t == null || concrete_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
         // Type arguments written on the variant (`Result::Ok::<i32, i32>(4)`)
         // name the instantiation, as they do on a payload-less variant.
         if (scope.generic_args.length > 0) {
@@ -7403,9 +7406,41 @@ type struct CallResolver {
         if (promoted.equals(type_ref)) {
             const inferred: TypeRef = this.infer_variant_instantiation(type_ref, scope, call);
             if (inferred.is_valid()) { scope.set_resolved_type(inferred); return inferred; }
+            // Outside a template's body only an enclosing generic call can
+            // still bind the arguments (`retype_variant_arguments`); what
+            // none binds is refused when the module's walk ends.
+            if (!this.state.in_symbolic_check && this.ctx.generic_registry.is_template(type_ref)) {
+                this.state.unbound_variants.push(scope);
+            }
         }
         scope.set_resolved_type(promoted);
         return promoted;
+    }
+
+    /// E0307 at each recorded variant still typed as its generic enum: no
+    /// instance was named, and neither its arguments, the expected type nor
+    /// an enclosing call determined one, so the value has no layout.
+    refuse_unbound_variants(mut &this) -> void {
+        for (mut i: i64 = 0; i < this.state.unbound_variants.length; i++) {
+            const scope: ScopeResolutionNode* = this.state.unbound_variants[i];
+            if (this.ctx.generic_registry.is_template(scope.resolved_type)) {
+                this.emit_variant_cannot_infer(scope, scope.resolved_type);
+            }
+        }
+        this.state.unbound_variants.clear();
+    }
+
+    /// E0307 for a generic enum's variant constructed with no instance named
+    /// and none its arguments or the expected type determine.
+    emit_variant_cannot_infer(mut &this, scope: ScopeResolutionNode*, enum_ref: TypeRef) -> void {
+        const enum_str: string = this.types.type_display_name(enum_ref);
+        const member_str: string = this.intern.resolve(scope.member_name);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            Text::new(fmt::format("cannot infer the type arguments of `%s` for its variant `%s`", enum_str, member_str)));
+        d = d.at_with_label(scope.span, Text::new("generic, and nothing here says which instance this constructs"));
+        d = d.help(Text::new(fmt::format(
+            "write the type arguments, `%s::<...>::%s(...)`, or give the value an expected type", enum_str, member_str)));
+        this.ctx.emit_diagnostic(d);
     }
 
     /// Infer the concrete instantiation of a generic enum from an enum-variant

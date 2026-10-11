@@ -220,6 +220,48 @@ yet is recorded with the change that builds it, not here.
      structural replacement for the identity-text lint once the lint
      is removed.  (Dispatch, delegated)
 
+232. **An enum converts implicitly to `boolean` only when it is a simple
+     enum:** no payload on any variant and no type parameters.  A variant
+     whose type arguments cannot be inferred is refused in the type
+     check, not left for code generation.  (Jake)
+
+233. **A string literal keeps all its bytes and its length end to end,**
+     so `"a\0b"` is three bytes.  (Jake)
+
+234. **The link-symbol rename that puts a trait's arguments into its
+     methods' symbols stays.**  (Jake)
+
+235. **Name resolution is called complete** now that the final audit's
+     fixes and the type-path seal have landed.  (Jake)
+
+236. **The self-checks are deleted with the lint layer:** E0157 (its
+     number stays reserved), the typed-key lint, and the door-id and
+     store-key lints.  The E0900 stamp check is not a lint and stays
+     always on, with no flag.  The wording question about the refused
+     link-symbol message is moot.  (Jake)
+
+237. **AST classes are routed into their arena by a marker on the AST
+     base class,** not by the `compiler::` path, and no cryoconfig flag is
+     added.  After this nothing treats the `compiler::` namespace
+     specially.  (Jake)
+
+238. **The door doc-comment markers are deleted along with the
+     allows.**  (Jake)
+
+239. **The 15 test projects that exist only for the lints are deleted
+     along with the lints.**  (Jake)
+
+240. **`\a \b \f \v` are supported in string literals as well as
+     characters,** and the language spec documents them.  (Jake)
+
+241. **The language spec documents `\u{...}` escapes,** noting that what a
+     `char` holds above 255 depends on the open decision on `char`'s
+     width.  (Jake)
+
+Noted with no ruling: the identity-text check does not follow a number
+taken from `.spelling().id` used as a key.  It is left as it is, since the
+check is being deleted and the seals are what hold.  (Jake)
+
 ### 2026-10-10
 
 211. **Before `docs/name-resolution.md` is deleted, its decisions D1-D77

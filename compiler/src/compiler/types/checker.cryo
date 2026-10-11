@@ -23,8 +23,9 @@ import compiler::types::generic::{ InstantiatedType };
 import compiler::types::type_base::{ FloatType, IntType, Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, FieldInfo, MethodInfo, StructType, TypeAliasType
+    ClassType, EnumType, FieldInfo, MethodInfo, StructType, TypeAliasType
 };
+import compiler::types::generic_registry::{ GenericRegistry };
 import utils::text::{ Text };
 import compiler::decl_index;
 import compiler::decl_index::{ DeclarationIndex };
@@ -87,11 +88,14 @@ type struct TypeChecker {
     arena: TypeArena*;
     /// Where a struct's `__call__` is asked, by the member-function door.
     decl_index: DeclarationIndex*;
+    /// Whether an enum is a template's own type, for its truthiness.
+    generics: GenericRegistry*;
 
-    static new(arena: TypeArena*, decl_index: DeclarationIndex*) -> TypeChecker {
+    static new(arena: TypeArena*, decl_index: DeclarationIndex*, generics: GenericRegistry*) -> TypeChecker {
         return TypeChecker {
             arena: arena,
             decl_index: decl_index,
+            generics: generics,
         };
     }
 
@@ -409,17 +413,20 @@ type struct TypeChecker {
         // freeze a design decision that blocks any future borrow
         // checker; explicit `&value` is required.
 
-        // Bool coercion: integers, chars, pointers, enums -> boolean (implicit).
-        // Struct and Class are intentionally excluded: there is no
-        // defined truthiness for an arbitrary aggregate, so
+        // Bool coercion: integers, chars, pointers and simple enums -> boolean
+        // (implicit).  A simple enum's value is its discriminant; an enum
+        // with a payload or type parameters has none that stands for the
+        // value, so it has no truthiness, as a struct or class has none:
         // `if (some_struct)` must use an explicit field check.
         // Floats -> boolean require an explicit cast (prevents silent
         // `const z: boolean = 3.14;`).
         if (to_type.kind == TypeKind::Bool) {
             if (from_type.kind == TypeKind::Int ||
                 from_type.kind == TypeKind::Char ||
-                from_type.kind == TypeKind::Pointer ||
-                from_type.kind == TypeKind::Enum) {
+                from_type.kind == TypeKind::Pointer) {
+                return TypeCompatibility::ImplicitConvert;
+            }
+            if (from_type.kind == TypeKind::Enum && this.is_simple_nongeneric_enum(effective_from)) {
                 return TypeCompatibility::ImplicitConvert;
             }
             if (from_type.kind == TypeKind::Float) {
@@ -596,6 +603,16 @@ type struct TypeChecker {
         const fp: PointerType* = f as PointerType*;
         const tp: PointerType* = t as PointerType*;
         return fp.const_pointee && !tp.const_pointee && fp.pointee.equals(tp.pointee);
+    }
+
+    /// Whether `ty` is an enum with no payload on any variant and no type
+    /// parameters: neither a template's own type nor an instance of one.
+    is_simple_nongeneric_enum(&this, ty: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || t.kind != TypeKind::Enum) { return false; }
+        const et: EnumType* = t as EnumType*;
+        if (!et.is_simple_enum() || et.generic_base.is_valid()) { return false; }
+        return !this.generics.is_template(ty);
     }
 
     /// True when the type is one machine word holding an address: a raw
