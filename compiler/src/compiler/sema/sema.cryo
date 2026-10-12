@@ -1839,45 +1839,56 @@ public:
             _ => { }
         }
         if (func_ty.is_valid()) {
+            if (ident.resolved_callee.is_some()) {
+                this.calls.enforce_value_ref_visibility(def_id, ident.span);
+                return func_ty;
+            }
+            // A family holding a generic function: the overload the
+            // turbofish and the expected type choose.
+            mut refused: boolean = false;
+            const chosen: OverloadId = this.calls.value_family_entry(def_id, &ident.generic_args, name_str,
+                ident.span, ident as ExpressionNode*, &refused);
+            if (refused) { return TypeRef::invalid(); }
+            if (chosen.is_valid()) {
+                const decl: ASTNode* = this.ctx.decl_index.entry_decl(chosen);
+                def_id = (decl as FunctionDeclNode*).def;
+                func_ty = this.ctx.decl_index.entry_signature(chosen);
+            }
             this.calls.enforce_value_ref_visibility(def_id, ident.span);
             // A generic function as a value is one instance of it: the
             // template applied to the arguments the turbofish writes or the
             // expected function type binds.  Its type is the signature with
-            // those arguments, and they are kept on the node, from which
-            // monomorphization pins the instance.
+            // those arguments, and the template and arguments are kept on the
+            // node, from which monomorphization pins the instance.
             const tm: TemplateEntry* = this.ctx.generic_registry.template_of(def_id);
-            if (tm != null && tm.node_kind == NodeKind::FunctionDeclaration && !ident.resolved_callee.is_some()) {
+            if (tm != null && tm.node_kind == NodeKind::FunctionDeclaration) {
                 mut args: TypeRef[] = [];
                 const inst_ty: TypeRef = this.calls.generic_value_type(tm, &tm.param_types, func_ty, &ident.generic_args,
                     name_str, fmt::format("%s::<...>", name_str), ident.span, &args);
-                if (inst_ty.is_valid()) { ident.set_value_type_args(args); }
+                if (inst_ty.is_valid()) { ident.set_value_instance(tm.base_type, args); }
                 return inst_ty;
             }
-            // The pin, as the scope form's: the definition's family, its
-            // parent and its leaf.
-            if (!ident.resolved_callee.is_some() && !this.state.in_symbolic_check) {
-                mut is_tmpl: boolean = false;
-                if (tm != null && tm.node_kind == NodeKind::FunctionDeclaration) { is_tmpl = true; }
-                if (!is_tmpl) {
-                    // An overloaded function as a value is the overload the
-                    // expected function type selects, pinned by its entry.
-                    const family: OverloadId[] = this.calls.family_entries(def_id);
-                    mut refused: boolean = false;
-                    const picked: TypeRef = this.calls.value_overload_signature(&family, name_str,
-                        ident.span, ident as ExpressionNode*, &refused);
-                    if (refused) { return TypeRef::invalid(); }
-                    if (picked.is_valid()) {
-                        for (mut i: i64 = 0; i < family.length; i++) {
-                            if (this.ctx.decl_index.entry_signature(family[i]).equals(picked)) {
-                                ident.set_resolved_callee(CalleePin::Decl(family[i]));
-                                return picked;
-                            }
-                        }
+            if (this.state.in_symbolic_check) { return func_ty; }
+            if (chosen.is_valid()) {
+                ident.set_resolved_callee(CalleePin::Decl(chosen));
+                return func_ty;
+            }
+            // An overloaded function as a value is the overload the expected
+            // function type selects, pinned by its entry.
+            const family: OverloadId[] = this.calls.family_entries(def_id);
+            const picked: TypeRef = this.calls.value_overload_signature(&family, name_str,
+                ident.span, ident as ExpressionNode*, &refused);
+            if (refused) { return TypeRef::invalid(); }
+            if (picked.is_valid()) {
+                for (mut i: i64 = 0; i < family.length; i++) {
+                    if (this.ctx.decl_index.entry_signature(family[i]).equals(picked)) {
+                        ident.set_resolved_callee(CalleePin::Decl(family[i]));
+                        return picked;
                     }
-                    const sole: OverloadId = this.calls.sole_entry(&family);
-                    if (sole.is_valid()) { ident.set_resolved_callee(CalleePin::Decl(sole)); }
                 }
             }
+            const sole: OverloadId = this.calls.sole_entry(&family);
+            if (sole.is_valid()) { ident.set_resolved_callee(CalleePin::Decl(sole)); }
             return func_ty;
         }
         // Not a local, not a global, not a function.  A name no rib bound

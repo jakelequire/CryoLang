@@ -572,7 +572,7 @@ type struct MonoCallSpecializer {
             NodeKind::Identifier => {
                 // A bare identifier carrying turbofish args is a generic
                 // function-reference VALUE (`tramp<i32>` passed/cast/assigned).
-                this.specialize_fn_value_ref(expr as IdentifierNode*, res_ctx, subst);
+                this.specialize_fn_value_ref(expr as IdentifierNode*, subst);
             }
             NodeKind::ScopeResolution => {
                 this.specialize_path_fn_value(expr as ScopeResolutionNode*, subst);
@@ -762,27 +762,25 @@ type struct MonoCallSpecializer {
 
     /// A generic function used as a first-class value: pin the instance of
     /// it sema chose - the template applied to the type arguments sema kept
-    /// on the node (`value_type_args`), concretized by the active
-    /// specialization - and queue the instantiation.  No-op for an identifier
-    /// with none.
-    specialize_fn_value_ref(mut &this, ident: IdentifierNode*,
-                            res_ctx: ResolutionContext*,
-                            subst: TypeSubstitution*) -> void {
+    /// on the node (`value_template` applied to `value_type_args`),
+    /// concretized by the active specialization - and queue the
+    /// instantiation.  No-op for an identifier with none.
+    specialize_fn_value_ref(mut &this, ident: IdentifierNode*, subst: TypeSubstitution*) -> void {
         if (ident == null) { return; }
-        if (ident.value_type_args.length == 0) { return; }
-        if (ident.resolved_callee.is_some()) { return; }
+        if (ident.value_type_args.length == 0 || ident.resolved_callee.is_some()) { return; }
+        if (this.generic_registry == null) { return; }
         const inst: TypeRef = this.value_instance(
-            this.find_function_template_for_call(&ident.res), &ident.value_type_args, subst);
+            this.generic_registry.template_of_type(ident.value_template), &ident.value_type_args, subst);
         if (inst.is_valid()) { ident.set_resolved_callee(CalleePin::Instance(inst)); }
     }
 
     /// The path form of `specialize_fn_value_ref`: a module's generic
-    /// function taken as a value, `m::idf`, the template `member_def` names.
+    /// function taken as a value, `m::idf`.
     specialize_path_fn_value(mut &this, scope: ScopeResolutionNode*, subst: TypeSubstitution*) -> void {
         if (scope.value_type_args.length == 0 || scope.resolved_callee.is_some()) { return; }
-        if (this.generic_registry == null || !scope.member_def.is_valid()) { return; }
+        if (this.generic_registry == null) { return; }
         const inst: TypeRef = this.value_instance(
-            this.generic_registry.template_of(scope.member_def), &scope.value_type_args, subst);
+            this.generic_registry.template_of_type(scope.value_template), &scope.value_type_args, subst);
         if (inst.is_valid()) { scope.set_resolved_callee(CalleePin::Instance(inst)); }
     }
 
@@ -2604,26 +2602,6 @@ type struct MonoCallSpecializer {
         };
     }
 
-    /// The free-function template the identifier whose slot is `asker`
-    /// names: the declaration its stamp binds, when that is a generic
-    /// function; null for any other stamp, and for none.
-    find_function_template_for_call(mut &this, asker: ResSlot*) -> TemplateEntry* {
-        const registry: GenericRegistry* = this.generic_registry;
-        if (registry == null) { return null; }
-        if (asker != null && !asker.is_pending()) {
-            match (asker.require("find_function_template_for_call")) {
-                Res::Def(q) => {
-                    const via_res: TemplateEntry* = registry.template_of(q);
-                    if (via_res != null
-                            && via_res.node_kind == NodeKind::FunctionDeclaration) {
-                        return via_res;
-                    }
-                }
-                _ => { }
-            }
-        }
-        return null;
-    }
 
     // -- Where-clause bound checking at the call site --
 

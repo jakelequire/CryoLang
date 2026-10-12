@@ -3305,28 +3305,48 @@ type struct CallResolver {
     /// `Ns::Mod::f()` cannot disagree about which function they mean.  The
     /// value form is gated here because it reaches no other gate.
     lookup_scope_value_function(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
-        const callee: DefId = this.resolve_module_qualified_def(scope);
+        mut callee: DefId = this.resolve_module_qualified_def(scope);
         if (!callee.is_valid()) { return TypeRef::invalid(); }
-        const ft: TypeRef = this.ctx.decl_index.func_type_of_def(callee);
+        mut ft: TypeRef = this.ctx.decl_index.func_type_of_def(callee);
         if (!ft.is_valid()) { return TypeRef::invalid(); }
+        const shown: string = fmt::format("%s::%s",
+            this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name));
+        // A family holding a generic function: the overload the turbofish
+        // and the expected type choose.
+        mut chosen: OverloadId = OverloadId::invalid();
+        if (!scope.resolved_callee.is_some()) {
+            mut refused: boolean = false;
+            chosen = this.value_family_entry(callee, &scope.generic_args, shown, scope.span,
+                scope as ExpressionNode*, &refused);
+            if (refused) { return TypeRef::invalid(); }
+            if (chosen.is_valid()) {
+                callee = (this.ctx.decl_index.entry_decl(chosen) as FunctionDeclNode*).def;
+                ft = this.ctx.decl_index.entry_signature(chosen);
+            }
+        }
         this.enforce_callee_visibility(callee, this.call_use_site_module(scope.span),
             scope.span);
         // The pin is the entry the function's family is emitted as, read off
         // the definition, as the call form's is.  A function TEMPLATE's value
-        // is one instance of it, whose type arguments are kept on the node
-        // for monomorphization to pin.
+        // is one instance of it, whose template and type arguments are kept
+        // on the node for monomorphization to pin.
         const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of(callee);
         if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) {
             if (scope.resolved_callee.is_some()) { return ft; }
             mut args: TypeRef[] = [];
-            const shown: string = fmt::format("%s::%s",
-                this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name));
             const inst_ty: TypeRef = this.generic_value_type(tmpl, &tmpl.param_types, ft, &scope.generic_args,
                 shown, fmt::format("%s::<...>", shown), scope.span, &args);
-            if (inst_ty.is_valid()) { scope.value_type_args = args; }
+            if (inst_ty.is_valid()) {
+                scope.value_template = tmpl.base_type;
+                scope.value_type_args = args;
+            }
             return inst_ty;
         }
         if (!scope.resolved_callee.is_some()) {
+            if (chosen.is_valid()) {
+                scope.set_resolved_callee(CalleePin::Decl(chosen));
+                return ft;
+            }
             const family: OverloadId[] = this.family_entries(callee);
             const sole: OverloadId = this.sole_entry(&family);
             if (sole.is_valid()) { scope.set_resolved_callee(CalleePin::Decl(sole)); }
@@ -5681,6 +5701,16 @@ type struct CallResolver {
             }
             return TypeRef::invalid();
         }
+        this.report_ambiguous_value(entries, shown, span, value, first);
+        *refused = true;
+        return TypeRef::invalid();
+    }
+
+    /// E0154 for an overloaded function taken as a value that nothing
+    /// chooses among `entries`, each named, with a help line that types the
+    /// binding the value initializes with `example`.
+    report_ambiguous_value(mut &this, entries: &OverloadId[], shown: string, span: SourceSpan,
+                           value: ExpressionNode*, example: TypeRef) -> void {
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0154_AMBIGUOUS_CALL,
             fmt::format("`%s` is overloaded, and nothing here says which overload is meant", shown));
         d = d.at_with_label(span, fmt::format("%lld overloads", entries.length));
@@ -5696,10 +5726,117 @@ type struct CallResolver {
             "f"
         };
         d = d.help(fmt::format("give the variable a function type to pick one: `const %s: %s = %s;`",
-            binding, this.types.type_display_name(first), shown));
+            binding, this.types.type_display_name(example), shown));
         this.ctx.emit_diagnostic(d);
+    }
+
+    /// The overload of `def`'s family a function taken as a VALUE names, when
+    /// the family holds a generic function: the one entry whose value fits
+    /// the turbofish `written` and the expected type.  A generic overload
+    /// fits when every type parameter is bound - by `written`, its defaults,
+    /// or the expected function type unified with its signature - and the
+    /// signature with those arguments is the expected type, when there is
+    /// one.  A non-generic overload fits when nothing is written and its
+    /// signature is the expected type.  With neither a turbofish nor an
+    /// expected type nothing chooses.  More than one fit is refused as
+    /// ambiguous (E0154) and `refused` says so; invalid with no refusal when
+    /// the family is a single function or holds no generic one, and when
+    /// nothing fits - the declaration the name binds is then the value, and
+    /// the binding it flows into reports the mismatch.
+    value_family_entry(mut &this, def: DefId, written: &TypeAnnotation*[], shown: string,
+                       span: SourceSpan, value: ExpressionNode*, refused: mut &boolean) -> OverloadId {
+        const family: OverloadId[] = this.family_entries(def);
+        if (family.length < 2) { return OverloadId::invalid(); }
+        mut any_generic: boolean = false;
+        for (mut i: i64 = 0; i < family.length; i++) {
+            const d: ASTNode* = this.ctx.decl_index.entry_decl(family[i]);
+            if (d != null && d.kind == NodeKind::FunctionDeclaration
+                    && (d as FunctionDeclNode*).generic_params.length > 0) { any_generic = true; }
+        }
+        if (!any_generic) { return OverloadId::invalid(); }
+        mut expected: TypeRef = this.state.expected_type;
+        if (expected.is_valid()) {
+            const et: Type* = this.arena.lookup(expected);
+            if (et == null || et.kind != TypeKind::Function
+                    || (!this.state.in_symbolic_check && this.types.contains_generic_param(expected))) {
+                expected = TypeRef::invalid();
+            }
+        }
+        if (written.length == 0 && !expected.is_valid()) {
+            this.report_ambiguous_value(&family, shown, span, value,
+                this.ctx.decl_index.entry_signature(family[0]));
+            *refused = true;
+            return OverloadId::invalid();
+        }
+        // The written arguments are resolved once here, so an unknown type
+        // among them is reported once, by the value's own instance below.
+        if (written.length > 0) {
+            mut rc: ResolutionContext = ResolutionContext::new("");
+            this.symbolic.symbolic_bind_params(&rc);
+            for (mut i: i64 = 0; i < written.length; i++) {
+                if (!this.ctx.type_resolver.resolve(written[i], &rc).is_valid()) { return OverloadId::invalid(); }
+            }
+        }
+        mut fits: OverloadId[] = [];
+        mut example: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i < family.length; i++) {
+            const d: ASTNode* = this.ctx.decl_index.entry_decl(family[i]);
+            if (d == null || d.kind != NodeKind::FunctionDeclaration) { continue; }
+            const f: FunctionDeclNode* = d as FunctionDeclNode*;
+            const sig: TypeRef = this.ctx.decl_index.entry_signature(family[i]);
+            if (!sig.is_valid()) { continue; }
+            const tm: TemplateEntry* = this.ctx.generic_registry.template_of(f.def);
+            if (tm == null || tm.node_kind != NodeKind::FunctionDeclaration) {
+                if (written.length == 0 && expected.is_valid() && sig.equals(expected)) {
+                    fits.push(family[i]);
+                    example = sig;
+                }
+                continue;
+            }
+            const inst: TypeRef = this.generic_value_fit(tm, sig, written, expected, span);
+            if (inst.is_valid()) {
+                fits.push(family[i]);
+                example = inst;
+            }
+        }
+        if (fits.length == 1) { return fits[0]; }
+        if (fits.length == 0) { return OverloadId::invalid(); }
+        this.report_ambiguous_value(&fits, shown, span, value, example);
         *refused = true;
-        return TypeRef::invalid();
+        return OverloadId::invalid();
+    }
+
+    /// The type a generic function `entry` with signature `sig` takes as a
+    /// value under the turbofish `written` and the function type `expected`
+    /// (either may be absent), or invalid when a type parameter stays unbound,
+    /// the turbofish names more arguments than the function has, or the
+    /// result is not `expected`.  Reports nothing: it answers whether this
+    /// overload is the one meant.
+    generic_value_fit(mut &this, entry: TemplateEntry*, sig: TypeRef, written: &TypeAnnotation*[],
+                      expected: TypeRef, span: SourceSpan) -> TypeRef {
+        if (written.length > entry.param_types.length) { return TypeRef::invalid(); }
+        mut bindings: TypeRef[] = [];
+        mut pids: TypeRef[] = [];
+        for (mut i: i64 = 0; i < entry.param_types.length; i++) {
+            bindings.push(TypeRef::invalid());
+            pids.push(entry.param_types[i]);
+        }
+        if (written.length > 0) {
+            const named: TypeRef = this.resolve_generic_scope_type(entry.base_type, written, span);
+            if (!named.is_valid() || named.equals(entry.base_type)) { return TypeRef::invalid(); }
+            const resolved: TypeRef[] = this.types.view_type_args_copy(named);
+            for (mut i: i64 = 0; i < bindings.length && i < resolved.length; i++) { bindings[i] = resolved[i]; }
+        } else {
+            mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+            ictx.unify(sig, expected);
+            for (mut i: i64 = 0; i < bindings.length; i++) { bindings[i] = ictx.bindings[i]; }
+        }
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (!bindings[i].is_valid()) { return TypeRef::invalid(); }
+        }
+        const ty: TypeRef = this.subst_params(&entry.param_types, &bindings, sig);
+        if (expected.is_valid() && !ty.equals(expected)) { return TypeRef::invalid(); }
+        return ty;
     }
 
     /// The type of a generic function or a generic owner's method taken as a
