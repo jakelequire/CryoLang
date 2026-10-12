@@ -4088,10 +4088,31 @@ type struct NameResolutionPass {
                 if (gen != null || !next.is_valid()) { break; }
                 alias = NameResolutionPass::alias_decl(ctx, next);
             }
+            if (alias != null && alias.generic_params.length > 0) {
+                NameResolutionPass::refuse_generic_alias_path(ctx, node);
+                answer = Res::Err;
+            }
             node.scope_res.settle_alias(answer);
         }
         ctx.alias_paths.clear();
         ctx.alias_decls.clear();
+    }
+
+    /// E0233 at a path through a generic alias, `Stack::<i32>::new()` with
+    /// `type Stack<T> = Array<T>;`: the path would mean the target over the
+    /// alias's arguments, which nothing substitutes yet, so it is refused
+    /// where it is written rather than answered with the alias, which owns
+    /// no member.
+    static refuse_generic_alias_path(ctx: CompilationContext*, node: ScopeResolutionNode*) -> void {
+        const written: string = ctx.resolver.intern_table.resolve(node.scope_name);
+        const member: string = ctx.resolver.intern_table.resolve(node.member_name);
+        const span: SourceSpan = if (node.scope_span.has_location()) { node.scope_span } else { node.span };
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
+            fmt::format("cannot find `%s::%s`: `%s` is a generic type alias, and a path through one is not supported",
+                written, member, written));
+        d = d.at_with_label(span, "a generic alias used as a path");
+        d = d.help("write the path through the type the alias names, with its type arguments");
+        ctx.emit_diagnostic(d);
     }
 
     /// The alias declared as `d`, or null when `d` is not one.

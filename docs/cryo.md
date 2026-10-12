@@ -583,7 +583,7 @@ type StringResult<T> = Result<T, string>;
 type Callback        = (int) -> void;
 ```
 
-A path through an alias names what the same path through its target names, type arguments included: with `type PI = Pl<i32>;`, `PI::plain(8)` is `Pl::<i32>::plain(8)`, and with `type Hue = Color;`, `Hue::Green` is `Color::Green`. An alias of an alias is followed. An alias with parameters of its own (`StringResult<T>` above) and an alias of a type that is no named type (`Callback`) name no path.
+A path through an alias names what the same path through its target names, type arguments included: with `type PI = Pl<i32>;`, `PI::plain(8)` is `Pl::<i32>::plain(8)`, and with `type Hue = Color;`, `Hue::Green` is `Color::Green`. An alias of an alias is followed. An alias of a type that is no named type (`Callback`) names no path. A path through an alias with parameters of its own, `StringResult::<i32>::Ok(1)` or `StringResult::Ok(1)`, is refused where it is written (`E0233`); the path is written through the type the alias names. Such an alias is a type like any other.
 
 ### 2.9 Casting with `as`
 
@@ -596,6 +596,8 @@ const p: u8* = some_string as u8*; // pointer reinterpretation
 ```
 
 A cast to a struct, class, tuple or array **value** is a cast from a value of that same type, and nothing else: `p as Point` with `p` a pointer, or one aggregate cast to another, is refused (`E0208`). A class converts along its hierarchy by pointer - `dog_ptr as Animal*` - and `*p` reads the value a pointer points at.
+
+A struct, class, tuple or array value is not cast **to** a pointer or a scalar either (`E0208`): `av as void*` is refused for a class value `av`, whose address is written `&av` (and converted as `&av as void*`). Inside a method taking `&this`, `this` is that address already, so `this as void*` is allowed.
 
 ### 2.10 Optional Types (`T?`)
 

@@ -2793,9 +2793,14 @@ public:
             && !this.cast_operand_is_byref_receiver(cast.expression)
             && this.types.arg_type_is_concrete(from_ty) && this.types.arg_type_is_concrete(to_ty)
             && this.is_aggregate_scalar_cast(from_ty, to_ty)) {
-            this.ctx.emit_error_at(ErrorCode::E0208_INVALID_CAST,
-                "invalid cast between an aggregate type (struct/class/tuple/array) and a scalar or pointer: there is no valid representation for this conversion",
-                cast.span);
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0208_INVALID_CAST,
+                "invalid cast between an aggregate type (struct/class/tuple/array) and a scalar or pointer: there is no valid representation for this conversion");
+            d = d.at(cast.span);
+            if (this.diag.kind_or_void(this.cast_subject(from_ty)) == TypeKind::Class
+                    && this.diag.kind_or_void(to_ty) == TypeKind::Pointer) {
+                d = d.help("a class value's address is written `&value`, and `&value as T*` converts it");
+            }
+            this.ctx.emit_diagnostic(d);
         } else if (from_ty.is_valid() && to_ty.is_valid()
             && this.types.arg_type_is_concrete(from_ty) && this.types.arg_type_is_concrete(to_ty)
             && this.is_cast_into_other_aggregate(from_ty, to_ty)) {
@@ -2865,9 +2870,13 @@ public:
     }
 
     /// True when a cast crosses between a struct, tuple or array value and a
-    /// scalar/pointer type (no valid LLVM lowering).  A class value as the
-    /// operand is not refused here: a class local reaches the cast as the
-    /// address of its storage, so its cast to a pointer is that address.
+    /// scalar/pointer type (no valid LLVM lowering), or casts a class value
+    /// to one.  A class local reaches the cast as the address of its storage,
+    /// so `av as void*` would hand out that address under a cast that names
+    /// a conversion of the value; the address is written `&av`.  A
+    /// by-reference `this` is an address already and is not asked here
+    /// (`cast_operand_is_byref_receiver`).  A class as the TARGET is
+    /// `is_cast_into_other_aggregate`'s.
     is_aggregate_scalar_cast(&this, from: TypeRef, to: TypeRef) -> boolean {
         mut f: Type* = this.arena.lookup(from);
         mut t: Type* = this.arena.lookup(to);
@@ -2883,7 +2892,8 @@ public:
             t = this.arena.lookup(ti.resolved_type);
         }
         if (f == null || t == null) { return false; }
-        const f_agg: boolean = f.kind == TypeKind::Struct || f.kind == TypeKind::Tuple || f.kind == TypeKind::Array;
+        const f_agg: boolean = f.kind == TypeKind::Struct || f.kind == TypeKind::Class
+                            || f.kind == TypeKind::Tuple || f.kind == TypeKind::Array;
         const t_agg: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Tuple || t.kind == TypeKind::Array;
         const f_scl: boolean = f.kind == TypeKind::Int || f.kind == TypeKind::Float || f.kind == TypeKind::Bool
                             || f.kind == TypeKind::Char || f.kind == TypeKind::String || f.kind == TypeKind::Pointer

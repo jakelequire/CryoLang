@@ -108,6 +108,17 @@ language's features; each is a branch of its own after the merge.
 - **The `raw` subcommand builds a module graph** as `check` and `build` do
   (D60).
 
+## Paths through generic type aliases
+
+`type Stack<T> = Array<T>; Stack::<i32>::new()` names `Array::<i32>::new()`,
+and `Stack::new()` infers the alias's arguments as a path through the target
+does.  Refused today with `E0233` where the path is written (ruling 265: a
+generic alias used as a path is refused with a clear error until it is
+supported); a non-generic alias's path already names its target's members.
+
+Open: whether an alias that fixes some of its target's parameters
+(`type StrMap<V> = HashMap<string, V>`) infers only the alias's own.
+
 ## Open questions
 
 - **How wide a `char` is**, and so what a character literal holds above
