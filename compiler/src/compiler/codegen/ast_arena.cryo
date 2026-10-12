@@ -1,9 +1,9 @@
 /// AST Arena
 ///
 /// A process-global bump arena for the compiler's own AST nodes.  `ASTNode`
-/// carries `![arena(cryo_ast_arena_alloc)]`, so every `new T(...)` whose `T`
-/// derives from it calls `cryo_ast_arena_alloc` instead of `malloc`; the node's vtable seed and constructor run exactly
-/// as with `malloc`, only the storage comes from the arena.  The whole region is
+/// implements `Allocate` with `cryo_ast_arena_alloc`, so every `new T(...)`
+/// whose `T` derives from it takes its storage from the arena; the node's
+/// vtable seed and constructor run exactly as with `malloc`.  The whole region is
 /// reclaimed in O(blocks) at each target boundary via `cryo_ast_arena_reset`
 /// (called next to `reset_shared_type_cache` in `instance.cryo`).
 ///
@@ -20,8 +20,9 @@
 ///     (codegen/type_map.cryo).
 ///   - The arena holds ONLY target-scoped AST nodes (everything that is
 ///     leaked-until-exit today).  Nothing that must outlive a target may be
-///     arena-allocated.  `delete` of an arena node is lowered to a no-op
-///     (see `emit_delete`); `free()` on arena memory would corrupt the heap.
+///     arena-allocated.  `delete` of a node runs its `Drop`, if any, and
+///     then `Allocate::release`, which `ASTNode` leaves empty; `free()` on
+///     arena memory would corrupt the heap.
 ///   - Determinism: allocation order is deterministic and the compiler is
 ///     pointer-value-independent (self-host is byte-identical run to run),
 ///     so routing allocation through the arena cannot change emitted IR.
@@ -59,11 +60,9 @@ function get_ast_arena() -> Arena* {
     return g_ast_arena;
 }
 
-/// Allocate `size` bytes aligned to `align` from the AST arena.  Called by
-/// EMITTED code at every `new <ASTNode-derived>` site (resolved by qualified
-/// name through the normal cross-module function resolver, exactly like the
-/// constructor call a few lines below the malloc site in
-/// new_delete_emitter.cryo).  Returns uninitialised storage; the caller seeds
+/// Allocate `size` bytes aligned to `align` from the AST arena, for
+/// `ASTNode`'s `Allocate::allocate`, which every `new <ASTNode-derived>`
+/// calls.  Returns uninitialised storage; the caller seeds
 /// the vtable and runs the constructor.  Returns null on OOM, matching
 /// `malloc` so the existing downstream null-checks behave identically.
 public function cryo_ast_arena_alloc(size: u64, align: u64) -> void* {

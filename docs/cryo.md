@@ -2821,6 +2821,49 @@ const arr: int* = new int[100];
 
 `new T[n]` allocates room for `n` contiguous `T` and yields a `T*`. The memory is **uninitialized** and no constructors run - it is the typed equivalent of `malloc(n * sizeof(T))`. Free it with `free(arr as void*)`. For constructed, growable, bounds-checked storage prefer `Array<T>`.
 
+**Where `new` gets its memory (`Allocate`).** `new` and `delete` are sugar over the trait `std::core::ops::Allocate`, as `a[i]` is over `Index` and `*p` over `Deref`:
+
+```cryo
+type trait Allocate {
+    static allocate(size: u64, align: u64) -> void*;
+    static release(ptr: void*, align: u64) -> void { }
+}
+```
+
+`new T(...)` and `new T { ... }` of a struct or class that implements `Allocate` take their storage from `T::allocate(size, align)`, with `T`'s size and alignment; the vtable is then seeded and the constructor run as for any `new`. A class that does not implement it uses the implementation of its nearest base class that does, so one implementation on a base serves the whole hierarchy below it, and a subclass with its own replaces it for itself and the classes below. `new T[n]` of such an element type takes the block from the same `allocate`, with alignment 16. A type with no implementation anywhere uses the global allocator, unchanged.
+
+`delete p` runs the pointee's `Drop`, if it has one, and then hands `p` to the same implementation's `release` with the pointee type's alignment, instead of freeing it. `release` does nothing unless an implementation writes it, which is what an arena wants: its storage is reclaimed whole, never one object at a time. An allocator that does free single objects writes both methods.
+
+```cryo
+mut g_pool: u8[4096] = [0; 4096];
+mut g_used: u64 = 0;
+
+type class Node {
+public:
+    tag: i32;
+    Node(t: i32) { this.tag = t; }
+}
+
+implement trait Allocate for class Node {
+    static allocate(size: u64, align: u64) -> void* {
+        g_used = (g_used + align - 1) & ~(align - 1);
+        const p: void* = (&g_pool[g_used as i64]) as void*;
+        g_used = g_used + size;
+        return p;
+    }
+}
+
+type class Leaf : Node {
+public:
+    Leaf() : Node(2) { }
+}
+
+const n: Leaf* = new Leaf();   // from g_pool, through Node's implementation
+delete n;                      // Node's release: nothing
+```
+
+The compiler's own AST nodes are allocated this way: its base node class implements `Allocate` over the arena it reclaims at each target boundary. An implementation's methods are not yet checked against the trait's signatures: an `allocate` written with other parameters or another return type is refused only when code generation fails to verify the call, and one written with a receiver crashes the compiler.
+
 **Higher level (`Box<T>` and the collections).** Prefer `Box<T>` over raw `malloc` for owning a single heap value, and prefer `Array<T>` / `String` / `HashMap<K, V>` over manual allocation for collections. They handle reservation, growth, and cleanup, and they implement `Drop`.
 
 ### 15.3 Null
@@ -3117,7 +3160,6 @@ type struct AlignedData {
 | `![section("name")]`                                      | function / method                  | Place the emitted symbol in object-file section `name`.                                                                                                                                                                                                                                                                                                                                                                         |
 | `![naked]`                                                | function                           | Emit no prologue/epilogue (sets LLVM's `naked` attribute); the body must be a single `asm { … }` block that provides its own `ret`/`jmp`/exit. For a freestanding `_start` and other raw entry points. A non-`asm` body is an error (`E0151`).                                                                                                                                                                                  |
 | `![allow(name)]` / `![warn(name)]` / `![deny(name)]`      | any decl                           | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.* Each takes at most one `reason = "..."`, a non-empty string; a lint name is not checked, so an unknown one is accepted.                                                                                                                                                                                       |
-| `![arena(f)]`                                             | class                              | `new` of the class, and of every class deriving from it, allocates through `f`, called as `f(size: u64, align: u64) -> void*`; `delete` of one releases nothing (the arena reclaims its storage as a whole). `f` is a function name resolved where the class is written; anything else is `E0152`. The nearest base carrying one decides.                                                                                  |
 | `![derive(Trait, ...)]`                                   | struct / class / enum              | Intended to auto-derive one or more traits. *Parsed and validated; no trait is actually synthesized.* See [section 22](#22-reserved-syntax).                                                                                                                                                                                                                                                                                    |
 | `![sink]`                                                 | method                             | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics.                                                                                                                                                                                                                        |
 | `![implicit]`                                             | generic function / method          | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f::<T>(...)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
