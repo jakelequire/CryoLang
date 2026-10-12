@@ -795,8 +795,32 @@ type struct TypeResolutionRunner {
     resolve_method_signatures(&this, methods: &MethodNode*[],
                               res_ctx: ResolutionContext*,
                               owner_type: TypeRef,
-                              owner_def: DefId) -> void {
-        this.resolver.resolve_method_signatures(methods, res_ctx, owner_type, owner_def);
+                              owner_def: DefId,
+                              owner_args: &TypeRef[]) -> void {
+        this.resolver.resolve_method_signatures(methods, res_ctx, owner_type, owner_def, owner_args);
+    }
+
+    /// A generic declaration's own parameters, as `res_ctx` binds them: the
+    /// arguments its inline methods' `This` is the declaration over.
+    decl_owner_args(&this, generic_params: &GenericParamNode*[],
+                    res_ctx: ResolutionContext*) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        for (mut i: i64 = 0; i < generic_params.length; i++) {
+            const gp: GenericParamNode* = generic_params[i];
+            out.push(if (gp != null) { res_ctx.lookup_binding(gp.sym_id) } else { TypeRef::invalid() });
+        }
+        return out;
+    }
+
+    /// The type arguments an impl head writes after `for` (`<T>` in
+    /// `implement<T> trait Dup for Wrap<T>`): the arguments its methods'
+    /// `This` is the owner over.
+    impl_owner_args(&this, impl_node: ImplBlockNode*, res_ctx: ResolutionContext*) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        for (mut i: i64 = 0; i < impl_node.target_args.length; i++) {
+            out.push(this.resolver.resolve(impl_node.target_args[i], res_ctx));
+        }
+        return out;
     }
 
     /// Repair the signatures of a struct/union/class's *inline* methods during
@@ -810,10 +834,12 @@ type struct TypeResolutionRunner {
     /// runs.  Idempotent for already-resolved return/param types.
     resolve_inline_method_signatures(&this, owner: DefId,
                                      methods: &MethodNode*[],
+                                     generic_params: &GenericParamNode*[],
                                      res_ctx: ResolutionContext*) -> void {
         const owner_ty: TypeRef = this.ctx.decl_index.type_of_def(owner);
         if (owner_ty.is_invalid()) { return; }
-        this.resolver.resolve_method_signatures(methods, res_ctx, owner_ty, owner);
+        const args: TypeRef[] = this.decl_owner_args(generic_params, res_ctx);
+        this.resolver.resolve_method_signatures(methods, res_ctx, owner_ty, owner, &args);
     }
 
     /// Resolves all function signatures (FunctionDeclNode*[]) on a trait.
@@ -2657,7 +2683,8 @@ type struct TypeResolutionPasses {
                     mut struct_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
                     const struct_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/struct methods");
-                    runner.resolve_method_signatures(node.methods, &struct_ctx, struct_owner, node.def);
+                    const struct_args: TypeRef[] = runner.decl_owner_args(node.generic_params, &struct_ctx);
+                    runner.resolve_method_signatures(node.methods, &struct_ctx, struct_owner, node.def, &struct_args);
                     sig_count += node.methods.length;
                 }
                 NodeKind::UnionDeclaration => {
@@ -2665,7 +2692,8 @@ type struct TypeResolutionPasses {
                     mut union_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
                     const union_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/union methods");
-                    runner.resolve_method_signatures(node.methods, &union_ctx, union_owner, node.def);
+                    const union_args: TypeRef[] = runner.decl_owner_args(node.generic_params, &union_ctx);
+                    runner.resolve_method_signatures(node.methods, &union_ctx, union_owner, node.def, &union_args);
                     sig_count += node.methods.length;
                 }
                 NodeKind::ClassDeclaration => {
@@ -2673,7 +2701,8 @@ type struct TypeResolutionPasses {
                     mut class_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
                     const class_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/class methods");
-                    runner.resolve_method_signatures(node.methods, &class_ctx, class_owner, node.def);
+                    const class_args: TypeRef[] = runner.decl_owner_args(node.generic_params, &class_ctx);
+                    runner.resolve_method_signatures(node.methods, &class_ctx, class_owner, node.def, &class_args);
                     sig_count += node.methods.length;
                 }
                 NodeKind::TraitDeclaration => {
@@ -2787,8 +2816,9 @@ type struct TypeResolutionPasses {
                     // has no owner under that key, and its methods then
                     // resolve with no receiver type to back-fill and no
                     // `This` to bind.
+                    const impl_args: TypeRef[] = runner.impl_owner_args(node, &impl_ctx);
                     runner.resolve_method_signatures(node.methods, &impl_ctx,
-                        ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def());
+                        ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def(), &impl_args);
                     sig_count += node.methods.length;
                 }
                 NodeKind::ExternBlock => {
@@ -3078,7 +3108,7 @@ type struct TypeResolutionPasses {
                     // same repair here, or a consuming method (`fn m(mut this)`)
                     // reaches drop-insertion with an unresolved receiver and its
                     // by-value `this` is never dropped - a leak on every call.
-                    runner.resolve_inline_method_signatures(node.def, node.methods, &struct_ctx);
+                    runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &struct_ctx);
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::UnionDeclaration => {
@@ -3087,7 +3117,7 @@ type struct TypeResolutionPasses {
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_fields(node.fields, &union_ctx);
                     field_count += node.fields.length;
-                    runner.resolve_inline_method_signatures(node.def, node.methods, &union_ctx);
+                    runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &union_ctx);
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::ClassDeclaration => {
@@ -3096,7 +3126,7 @@ type struct TypeResolutionPasses {
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_fields(node.fields, &class_ctx);
                     field_count += node.fields.length;
-                    runner.resolve_inline_method_signatures(node.def, node.methods, &class_ctx);
+                    runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &class_ctx);
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::ImplementationBlock => {
@@ -3132,8 +3162,9 @@ type struct TypeResolutionPasses {
                     }
                     // The owner and its name off the stamp, as in the FuncSig
                     // phase above.
+                    const impl_args: TypeRef[] = runner.impl_owner_args(node, &impl_ctx);
                     runner.resolve_method_signatures(node.methods, &impl_ctx,
-                        ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def());
+                        ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def(), &impl_args);
                     runner.emit_method_signature_diagnostics(node.methods);
                     runner.check_impl_conformance(node, &impl_ctx);
                 }

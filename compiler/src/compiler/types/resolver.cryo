@@ -1274,13 +1274,13 @@ type struct TypeResolver {
     resolve_method_signatures(&this, methods: &MethodNode*[],
                               res_ctx: ResolutionContext*,
                               owner_type: TypeRef,
-                              owner_def: DefId) -> void {
-        // Bind `This` to the impl's owner type for the duration of method-
-        // signature resolution. `&This` annotations on parameters/returns
-        // resolve to `owner_type` here; the by-name back-fill at the bottom
-        // of this function still handles the implicit-typed `&this` receiver.
+                              owner_def: DefId,
+                              owner_args: &TypeRef[]) -> void {
+        // Bind `This` for the duration of method-signature resolution; the
+        // back-fill at the bottom of this function still types the
+        // implicit-typed `&this` receiver as `owner_type`.
         if (owner_type.is_valid()) {
-            res_ctx.set_this_type(owner_type);
+            res_ctx.set_this_type(this.owner_this_type(owner_type, owner_args, res_ctx));
         }
         cdebug("[ResMthSig] count=%lld owner_id=%d\n", methods.length, owner_type.key() as i32);
         for (mut i: i64 = 0; i < methods.length; i++) {
@@ -1408,6 +1408,33 @@ type struct TypeResolver {
             filled.push(def_type);
         }
         return filled;
+    }
+
+    /// What `This` names in a method of `owner_type`: the owner itself, or,
+    /// for a generic owner, the owner over `args` - the declaration's own
+    /// parameters, or the arguments an impl head writes after `for`.  That
+    /// is what the owner written out (`Wrap<T>`) resolves to, so a parameter
+    /// typed `&This` is seen through an instance's substitution as
+    /// `&Wrap<i32>`; the bare template has no arguments to substitute and
+    /// matches no instance.
+    owner_this_type(&this, owner_type: TypeRef, args: &TypeRef[],
+                    ctx: ResolutionContext*) -> TypeRef {
+        if (args.length == 0 || this.generic_registry == null) { return owner_type; }
+        const entry: TemplateEntry* = this.generic_registry.template_of_type(owner_type);
+        if (entry == null || entry.param_count <= 0) { return owner_type; }
+        mut filled: TypeRef[] = [];
+        for (mut i: i64 = 0; i < args.length; i++) {
+            if (!args[i].is_valid()) { return owner_type; }
+            filled.push(args[i]);
+        }
+        if (filled.length < entry.param_count) {
+            filled = this.expand_default_type_args(entry, filled, ctx);
+        }
+        if (filled.length != entry.param_count) { return owner_type; }
+        if (ctx.symbolic_no_demand) {
+            return this.arena.create_instantiation(owner_type, &filled);
+        }
+        return this.generic_registry.instantiate(owner_type, filled);
     }
 
     /// Resolve all function signatures (FunctionDeclNode*[]) on a trait.

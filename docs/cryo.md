@@ -2398,7 +2398,7 @@ implement enum Result<T, E> {
 
 `Result`'s parameters `<T, E>` are fixed by the type; `map` introduces an additional `<U>`.
 
-**Naming the enclosing type.** Inside an implement block or a type body, `This` is the enclosing type with its own parameters as arguments, so `This::of(..)` in `implement struct Pair<T>` means `Pair<T>::of(..)`. A generic type's bare name written there without arguments, `Pair::of(..)`, infers its arguments from the call:
+**Naming the enclosing type.** Inside an implement block or a type body, `This` is the enclosing type with its own parameters as arguments, so `This::of(..)` in `implement struct Pair<T>` means `Pair<T>::of(..)`, and a parameter typed `&This` there is `&Pair<T>`: on a `Pair<i32>` it takes a `&Pair<i32>`. A generic type's bare name written there without arguments, `Pair::of(..)`, infers its arguments from the call:
 
 ```cryo
 type struct Pair<T> { a: T; b: T; }
