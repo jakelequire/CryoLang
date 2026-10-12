@@ -1935,6 +1935,27 @@ implement trait Ord for i32 {
 
 You may implement a trait for any type a program can name, including primitive types.
 
+An implementation's methods are the trait's methods, each with the signature the trait declares, read with `This` as the type implemented for (written as `This`, or as the type itself over the head's own parameters, `Wrap<T>` in `implement<T> trait Tr for Wrap<T>`), the trait's parameters as the head's arguments, its associated types as the implementation binds them, and a method's own type parameters by position, whatever they are named. Every disagreement is refused at the method, or at the head for a missing one (`E0312`):
+
+- a method the trait declares without a body is missing; one the trait gives a body may be left out, and the trait's body is used;
+- a method the trait does not declare;
+- a static method written with a receiver, or the reverse;
+- a receiver of another form (`this`, `&this`, `mut &this`);
+- a different number of the method's own type parameters, or of its parameters;
+- a parameter of another type, or another return type.
+
+```cryo
+type trait Shape {
+    area(&this) -> i32;
+    scale(mut &this, k: i32) -> void;
+}
+
+implement trait Shape for struct Sq {
+    area(&this) -> i64 { ... }            // error[E0312]: `area` returns `i32` in trait `Shape`, but `i64` here
+    scale(&this, k: i32) -> void { ... }  // error[E0312]: `scale` takes `mut &this` in trait `Shape`, but `&this` here
+}
+```
+
 A trait has at most one implementation for any type, and that is decided by the heads alone. Two implementations of one trait whose heads unify - some type both would accept - are refused at the later one (`E0308`), whether the heads are identical, one generic and one concrete (`Show for Wrap<T>` beside `Show for Wrap<i32>`: a `Wrap<i32>` would select both), or told apart only by their `where` clauses (`Emit for Holder<T> where T: Alpha` beside `Emit for Holder<T> where T: Beta`: a bound narrows which types a head is for but nothing can prove two bounds disjoint). There is no specialisation and no selection by declaration order. Heads that no type satisfies together are distinct implementations: `Show for Pair<T, T>` beside `Show for Pair<i32, u8>`, or `From<i8> for u64` beside `From<u8> for u64`.
 
 ### 11.3 Trait Bounds with `where`
@@ -2903,7 +2924,7 @@ const n: Leaf* = new Leaf();   // from g_pool, through Node's implementation
 delete n;                      // Node's release: nothing
 ```
 
-The compiler's own AST nodes are allocated this way: its base node class implements `Allocate` over the arena it reclaims at each target boundary. An implementation's methods are not yet checked against the trait's signatures: an `allocate` written with other parameters or another return type is refused only when code generation fails to verify the call, and one written with a receiver crashes the compiler.
+The compiler's own AST nodes are allocated this way: its base node class implements `Allocate` over the arena it reclaims at each target boundary. A struct may implement `Allocate` too; with no inheritance, only its own `new` goes through it. An implementation is checked against the trait as any is ([section 11.2](#112-implementing-a-trait)): an `allocate` written with other parameters, another return type or a receiver is refused (`E0312`), and `release` may be left out, since its default does nothing.
 
 **Higher level (`Box<T>` and the collections).** Prefer `Box<T>` over raw `malloc` for owning a single heap value, and prefer `Array<T>` / `String` / `HashMap<K, V>` over manual allocation for collections. They handle reservation, growth, and cleanup, and they implement `Drop`.
 

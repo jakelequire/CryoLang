@@ -79,6 +79,10 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
@@ -110,6 +114,21 @@ const COH_ARRAY: u64      = 13;
 const COH_TUPLE: u64      = 14;
 const COH_THIS: u64       = 15;
 const COH_OTHER: u64      = 16;
+
+
+/// A trait's terms as one implementation of it reads them: `This` is
+/// `owner`, written either bare or over the head's own arguments
+/// (`self_args`); `subst` maps the trait's parameters (and a method's own)
+/// to the implementation's; `assoc[i]` is what the implementation binds the
+/// `i`-th associated type of `trait_ty` to, invalid where it binds none.
+type struct ImplTerms {
+    trait_ty:  TypeRef;
+    this_ph:   TypeRef;
+    owner:     TypeRef;
+    self_args: TypeRef[];
+    subst:     TypeSubstitution;
+    assoc:     TypeRef[];
+}
 
 
 // TypeResolutionRunner: holds shared resolution state for pass methods
@@ -318,6 +337,316 @@ type struct TypeResolutionRunner {
                     aname, trait_name),
                 span);
         }
+    }
+
+    /// An implementation's methods against its trait's (E0312): each method
+    /// the trait declares without a body is written, each method written is
+    /// one the trait declares, and each agrees with the trait's declaration -
+    /// static or with a receiver, the receiver's form, the number of its own
+    /// type parameters, each parameter's type and the return.  The trait's
+    /// signature is read in the implementation's terms: `This` is the type
+    /// implemented for, the trait's parameters are the head's arguments, its
+    /// associated types are the implementation's bindings, and the method's
+    /// own type parameters are the written method's, by position.  Run where
+    /// every signature is final, on the blocks the source wrote; the copies
+    /// of a trait's defaults agree by construction and are not compared.
+    check_impl_conformance(&this, impl_node: ImplBlockNode*, impl_ctx: ResolutionContext*) -> void {
+        if (impl_node == null || !impl_node.is_trait_impl()) { return; }
+        if (impl_node.spec_owner.is_valid()) { return; }
+        const trait_id: DefId = TypeAnnotation::trait_def(impl_node.trait_annotation);
+        if (!trait_id.is_valid()) { return; }
+        const decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_id);
+        if (decl == null) { return; }
+        const owner: TypeRef = this.ctx.decl_index.impl_owner(impl_node, "type_resolution/impl conformance");
+        if (!owner.is_valid()) { return; }
+        const intern: InternTable* = this.ctx.get_intern_table();
+        const trait_name: string = intern.resolve(
+            TypeResolutionPasses::extract_trait_leaf(impl_node.trait_annotation));
+        const head_span: SourceSpan = if (impl_node.target_type_span.has_location()) {
+            impl_node.target_type_span
+        } else {
+            impl_node.span
+        };
+
+        mut terms: ImplTerms = ImplTerms {
+            trait_ty:  this.ctx.decl_index.type_of_decl(trait_id, "type_resolution/impl conformance"),
+            this_ph:  this.arena.this_placeholder(this.ctx.intern("This")),
+            owner:     owner,
+            self_args: [],
+            subst:     TypeSubstitution::empty(),
+            assoc:     [],
+        };
+        for (mut ai: i64 = 0; ai < impl_node.target_args.length; ai++) {
+            terms.self_args.push(this.resolver.resolve(impl_node.target_args[ai], impl_ctx));
+        }
+        if (impl_node.trait_arg_types.length == decl.generic_params.length) {
+            for (mut gi: i64 = 0; gi < decl.generic_params.length; gi++) {
+                const gp: GenericParamNode* = decl.generic_params[gi];
+                if (gp == null) { continue; }
+                terms.subst.add(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64),
+                                impl_node.trait_arg_types[gi]);
+            }
+        }
+        for (mut si: i64 = 0; si < decl.assoc_types.length; si++) {
+            const bound: TypeAnnotation* = impl_node.assoc_binding_at(decl, si);
+            terms.assoc.push(if (bound != null) { this.resolver.resolve(bound, impl_ctx) } else { TypeRef::invalid() });
+        }
+
+        for (mut ti: i64 = 0; ti < decl.methods.length; ti++) {
+            const tm: FunctionDeclNode* = decl.methods[ti];
+            if (tm == null || tm.has_body()) { continue; }
+            if (this.ctx.generic_registry.writes_trait_item(impl_node, trait_id, ti)) { continue; }
+            this.report_conformance(head_span,
+                fmt::format("this implementation of trait `%s` is missing `%s`",
+                    trait_name, intern.resolve(tm.name)));
+        }
+
+        for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
+            const m: MethodNode* = impl_node.methods[mi];
+            if (m == null || m.func == null || m.func.is_synth_default || m.spec_of != null) { continue; }
+            const name: string = intern.resolve(m.func.name);
+            const slot: i64 = this.ctx.generic_registry.trait_item_slot(trait_id, m.func.name);
+            if (slot < 0) {
+                this.report_conformance(m.func.span,
+                    fmt::format("`%s` is not a method of trait `%s`", name, trait_name));
+                continue;
+            }
+            // A method's own parameters are mapped by position; each
+            // declaration's are distinct types, so one map serves every method.
+            const tm: FunctionDeclNode* = decl.methods[slot];
+            if (tm.generic_params.length == m.func.generic_params.length) {
+                for (mut gi: i64 = 0; gi < tm.generic_params.length; gi++) {
+                    const tg: GenericParamNode* = tm.generic_params[gi];
+                    const fg: GenericParamNode* = m.func.generic_params[gi];
+                    if (tg == null || fg == null) { continue; }
+                    terms.subst.add(this.arena.create_generic_param(tg.sym_id, tg.name, gi as u64),
+                                    this.arena.create_generic_param(fg.sym_id, fg.name, gi as u64));
+                }
+            }
+            this.check_method_conformance(tm, m, &terms, name, trait_name);
+        }
+    }
+
+    /// One written method `m` against the trait's declaration `tm` of it,
+    /// read in `terms` (above).
+    check_method_conformance(&this, tm: FunctionDeclNode*, m: MethodNode*, terms: &ImplTerms,
+                             name: string, trait_name: string) -> void {
+        const f: FunctionDeclNode* = m.func;
+        if (tm.is_static != m.is_static) {
+            const want: string = if (tm.is_static) { "is static" } else { "takes a receiver" };
+            const have: string = if (m.is_static) { "is static" } else { "takes a receiver" };
+            this.report_conformance(f.span,
+                fmt::format("`%s` %s in trait `%s`, but %s here", name, want, trait_name, have));
+            return;
+        }
+        if (tm.generic_params.length != f.generic_params.length) {
+            this.report_conformance(f.span,
+                fmt::format("`%s` has %lld type parameter(s) in trait `%s`, but %lld here",
+                    name, tm.generic_params.length, trait_name, f.generic_params.length));
+            return;
+        }
+
+        const trecv: VarDeclNode* = TypeResolutionRunner::receiver_of(tm);
+        const frecv: VarDeclNode* = TypeResolutionRunner::receiver_of(f);
+        if (trecv != null && frecv != null) {
+            const tform: string = TypeResolutionRunner::receiver_spelling(trecv);
+            const fform: string = TypeResolutionRunner::receiver_spelling(frecv);
+            if (!tform.equals(fform)) {
+                this.report_conformance(frecv.span,
+                    fmt::format("`%s` takes `%s` in trait `%s`, but `%s` here", name, tform, trait_name, fform));
+                return;
+            }
+        }
+
+        const tcount: i64 = TypeResolutionRunner::value_param_count(tm);
+        const fcount: i64 = TypeResolutionRunner::value_param_count(f);
+        if (tcount != fcount) {
+            this.report_conformance(f.span,
+                fmt::format("`%s` takes %lld parameter(s) in trait `%s`, but %lld here",
+                    name, tcount, trait_name, fcount));
+            return;
+        }
+        for (mut pi: i64 = 0; pi < tcount; pi++) {
+            const tp: VarDeclNode* = TypeResolutionRunner::value_param_at(tm, pi);
+            const fp: VarDeclNode* = TypeResolutionRunner::value_param_at(f, pi);
+            if (this.same_type(tp.resolved_type, fp.resolved_type, terms, true)) { continue; }
+            this.report_conformance(fp.span,
+                fmt::format("parameter %lld of `%s` is `%s` in trait `%s`, but `%s` here",
+                    pi + 1, name, this.shown_type(tp.resolved_type), trait_name,
+                    this.shown_type(fp.resolved_type)));
+        }
+        // An `async` method's return is its future, which the trait spells as
+        // a projection and the implementation's lowering builds later.
+        if (tm.is_async || f.is_async) {
+            if (tm.is_async != f.is_async) {
+                this.report_conformance(f.span,
+                        fmt::format("`%s` is %s in trait `%s`, but %s here", name,
+                        if (tm.is_async) { "async" } else { "not async" }, trait_name,
+                        if (f.is_async) { "async" } else { "not async" }));
+            }
+            return;
+        }
+        if (!this.same_type(tm.resolved_return_type, f.resolved_return_type, terms, true)) {
+            this.report_conformance(f.span,
+                fmt::format("`%s` returns `%s` in trait `%s`, but `%s` here",
+                    name, this.shown_type(tm.resolved_return_type), trait_name,
+                    this.shown_type(f.resolved_return_type)));
+        }
+    }
+
+    /// Whether the trait's type `t` is the implementation's `f` once the
+    /// trait's terms are read in the implementation's (`terms`), `t` taken
+    /// in the trait's terms while `trait_side` holds and in the
+    /// implementation's once a term has been replaced.  Walks the two side
+    /// by side and builds no type, so asking leaves the arena as it was.  An
+    /// unresolved side is not a disagreement: its own diagnostic is already
+    /// reported.
+    same_type(&this, t: TypeRef, f: TypeRef, terms: &ImplTerms, trait_side: boolean) -> boolean {
+        if (!t.is_valid() || !f.is_valid()) { return true; }
+        if (t.equals(f)) { return true; }
+        const tt: Type* = this.arena.lookup(t);
+        const ft: Type* = this.arena.lookup(f);
+        if (tt == null || ft == null) { return true; }
+        if (trait_side && t.equals(terms.this_ph)) { return this.is_self(f, terms); }
+        if (trait_side && tt.kind == TypeKind::GenericParam) {
+            const r: TypeRef = terms.subst.get(t);
+            return r.is_valid() && this.same_type(r, f, terms, false);
+        }
+        if (tt.kind == TypeKind::AssocProjection) {
+            const bound: TypeRef = this.bound_projection(tt as AssocProjectionType*, terms, trait_side);
+            if (bound.is_valid()) { return this.same_type(bound, f, terms, false); }
+        }
+        if (ft.kind == TypeKind::AssocProjection) {
+            const bound: TypeRef = this.bound_projection(ft as AssocProjectionType*, terms, false);
+            if (bound.is_valid()) { return this.same_type(t, bound, terms, trait_side); }
+        }
+        if (tt.kind != ft.kind) { return false; }
+        return match (tt.kind) {
+            TypeKind::Pointer => {
+                const a: PointerType* = tt as PointerType*;
+                const b: PointerType* = ft as PointerType*;
+                a.const_pointee == b.const_pointee && this.same_type(a.pointee, b.pointee, terms, trait_side)
+            }
+            TypeKind::Reference => {
+                const a: ReferenceType* = tt as ReferenceType*;
+                const b: ReferenceType* = ft as ReferenceType*;
+                a.mutability == b.mutability && this.same_type(a.referent, b.referent, terms, trait_side)
+            }
+            TypeKind::Array => {
+                const a: ArrayType* = tt as ArrayType*;
+                const b: ArrayType* = ft as ArrayType*;
+                a.size == b.size && this.same_type(a.element, b.element, terms, trait_side)
+            }
+            TypeKind::Optional => {
+                const a: OptionalType* = tt as OptionalType*;
+                const b: OptionalType* = ft as OptionalType*;
+                this.same_type(a.wrapped, b.wrapped, terms, trait_side)
+            }
+            TypeKind::Function => {
+                const a: FunctionType* = tt as FunctionType*;
+                const b: FunctionType* = ft as FunctionType*;
+                this.same_types(&a.param_types, &b.param_types, terms, trait_side)
+                    && this.same_type(a.return_type, b.return_type, terms, trait_side)
+            }
+            TypeKind::Tuple => {
+                const a: TupleType* = tt as TupleType*;
+                const b: TupleType* = ft as TupleType*;
+                this.same_types(&a.elements, &b.elements, terms, trait_side)
+            }
+            TypeKind::InstantiatedType => {
+                const a: InstantiatedType* = tt as InstantiatedType*;
+                const b: InstantiatedType* = ft as InstantiatedType*;
+                a.generic_base.equals(b.generic_base)
+                    && this.same_types(&a.type_args, &b.type_args, terms, trait_side)
+            }
+            _ => { false }
+        };
+    }
+
+    same_types(&this, a: &TypeRef[], b: &TypeRef[], terms: &ImplTerms, trait_side: boolean) -> boolean {
+        if (a.length != b.length) { return false; }
+        for (mut i: i64 = 0; i < a.length; i++) {
+            if (!this.same_type(a[i], b[i], terms, trait_side)) { return false; }
+        }
+        return true;
+    }
+
+    /// Whether `f` is the type implemented for: the owner as the head names
+    /// it, or the owner over the head's own arguments (`Wrap<T>` in
+    /// `implement<T> trait Tr for Wrap<T>`).
+    is_self(&this, f: TypeRef, terms: &ImplTerms) -> boolean {
+        if (f.equals(terms.owner)) { return true; }
+        const ft: Type* = this.arena.lookup(f);
+        if (ft == null || ft.kind != TypeKind::InstantiatedType) { return false; }
+        const inst: InstantiatedType* = ft as InstantiatedType*;
+        if (!inst.generic_base.equals(terms.owner)) { return false; }
+        if (inst.type_args.length != terms.self_args.length) { return false; }
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (!inst.type_args[i].equals(terms.self_args[i])) { return false; }
+        }
+        return true;
+    }
+
+    /// The type projection `p` names: the implementation's binding when its
+    /// base is the type implemented for, else the binding the base's own
+    /// implementation gives; invalid when neither answers.
+    bound_projection(&this, p: AssocProjectionType*, terms: &ImplTerms, trait_side: boolean) -> TypeRef {
+        mut base: TypeRef = p.base;
+        if (trait_side) {
+            if (base.equals(terms.this_ph)) { base = terms.owner; }
+            const mapped: TypeRef = terms.subst.get(base);
+            if (mapped.is_valid()) { base = mapped; }
+        }
+        if (p.owning_trait.equals(terms.trait_ty) && this.is_self(base, terms)) {
+            if (p.slot >= 0 && p.slot < terms.assoc.length) { return terms.assoc[p.slot]; }
+            return TypeRef::invalid();
+        }
+        return this.resolver.concrete_projection(if (this.is_self(base, terms)) { terms.owner } else { base },
+                                                 p.slot, p.owning_trait);
+    }
+
+    shown_type(&this, ty: TypeRef) -> string {
+        const t: Type* = this.arena.lookup(ty);
+        return if (t != null) { this.arena.format_display(t) } else { "?" };
+    }
+
+    static receiver_of(f: FunctionDeclNode*) -> VarDeclNode* {
+        for (mut i: i64 = 0; i < f.parameters.length; i++) {
+            const p: VarDeclNode* = f.parameters[i];
+            if (p != null && p.is_receiver()) { return p; }
+        }
+        return null;
+    }
+
+    static value_param_count(f: FunctionDeclNode*) -> i64 {
+        mut n: i64 = 0;
+        for (mut i: i64 = 0; i < f.parameters.length; i++) {
+            const p: VarDeclNode* = f.parameters[i];
+            if (p != null && !p.is_receiver()) { n += 1; }
+        }
+        return n;
+    }
+
+    /// The `k`-th parameter after the receiver.
+    static value_param_at(f: FunctionDeclNode*, k: i64) -> VarDeclNode* {
+        mut n: i64 = 0;
+        for (mut i: i64 = 0; i < f.parameters.length; i++) {
+            const p: VarDeclNode* = f.parameters[i];
+            if (p == null || p.is_receiver()) { continue; }
+            if (n == k) { return p; }
+            n += 1;
+        }
+        return null;
+    }
+
+    /// The receiver as written: `this`, `&this` or `mut &this`.
+    static receiver_spelling(p: VarDeclNode*) -> string {
+        if (p.is_value_receiver()) { return "this"; }
+        return if (p.is_mutable) { "mut &this" } else { "&this" };
+    }
+
+    report_conformance(&this, span: SourceSpan, msg: string) -> void {
+        this.ctx.emit_error_at(ErrorCode::E0312_TRAIT_IMPL_MISMATCH, msg, span);
     }
 
 
@@ -2806,6 +3135,7 @@ type struct TypeResolutionPasses {
                     runner.resolve_method_signatures(node.methods, &impl_ctx,
                         ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def());
                     runner.emit_method_signature_diagnostics(node.methods);
+                    runner.check_impl_conformance(node, &impl_ctx);
                 }
                 _ => {
                     // Enum variant associated types (now TypeAnnotation*) are resolved
