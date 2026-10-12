@@ -32,11 +32,6 @@
 ///                                 `not(<atom>)`.
 ///   ![allow(name)] / ![warn(name)] / ![deny(name)] : lint level; each
 ///                                 takes an optional `reason = "..."`
-///   ![allow(lookup_by_spelling, reason = "...")] : function / method: it
-///                                 looks up by a spelling it is handed; the
-///                                 reason says why (without it, a lookup
-///                                 outside a door is E0157, from sema's
-///                                 `SpellingLookupCheck`)
 ///   ![derive(Trait, ...)]     : struct/class/enum: traits to auto-derive
 ///
 /// Unknown directive names are accepted and recorded but otherwise inert.
@@ -55,12 +50,10 @@ import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
-import compiler::module_graph::{ ModulePath };
 import compiler::compile_mode;
 import compiler::compile_mode::{ CompileMode };
 import compiler::types;
 import compiler::types::{ arena, compound, type_base, type_ref, TypeKind, user_defined };
-import compiler::types::compound::{ ArrayType, ReferenceType };
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import utils::logger;
@@ -81,40 +74,8 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ ClassType, EnumType, StructType };
-import compiler::types::generic::{ InstantiatedType };
-import compiler::types::generic_registry::{ GenericRegistry };
-import compiler::resolver::res::{ DefId };
-import compiler::resolver::lang_item::{ LangItem };
 import utils::keyword::{ Keyword };
 import utils::text::{ Text };
-
-/// The lint that refuses a declaration taking one of the compiler's spelling
-/// types (`DirectiveProcessingPasses::spelling_type_of`) unless it is a door
-/// or an `![allow(lookup_by_spelling, reason = "...")]` on it says why.
-const LOOKUP_BY_SPELLING: string = "lookup_by_spelling";
-
-/// The door marker a doc comment opens with.  A door is the one function
-/// where a spelling becomes a binding for its kind of question, and the
-/// marker's own text is the reason it takes one.
-const DOOR_MARKER: string = "/// Door `";
-
-/// How an allow of `lookup_by_spelling` reads when it says no reason yet.
-/// The compiler's own modules may not carry one: an allow there says why
-/// the spelling is no lookup.
-const PENDING_REASON: string = "pending:";
-
-/// The compiler's own text types, listed by the qualified names their
-/// declarations give them: two spellings, which the spelling-lookup check
-/// follows from a parameter, and two kinds of text read off a definition,
-/// which the identity-text check follows: its name, and the link symbol
-/// mangled from it.
-type enum CompilerText {
-    Other;
-    Symbol;
-    Qualified;
-    Decl;
-    Mangled;
-}
 
 
 // DirectiveRecord: one observed directive
@@ -255,6 +216,9 @@ type struct DirectiveProcessingPasses {
             | "should_panic" | "config" | "deprecated" | "align"
             | "repr" | "link" | "symbol" | "target" | "allow" | "warn" | "deny"
             | "derive"
+            // `![arena(f)]`: on a class: `new` of it, and of every class
+            // deriving from it, allocates through the function `f`.
+            | "arena"
             // `![sink]`: marks a method as consuming its receiver.
             // Tells move-check / drop-insertion to treat the call as moving
             // the receiver, even when the receiver is syntactically `&this`
@@ -749,29 +713,20 @@ type struct DirectiveProcessingPasses {
             }
 
             // `![allow(lint, ..., reason = "...")]`: lint names, and at most
-            // one `reason`, a non-empty string literal.  `lookup_by_spelling`
-            // is denied unless allowed, and allowing it takes a reason and a
-            // function, method or field: a wider allow would cover
-            // declarations written after it, which never had a reason of
-            // their own.
+            // one `reason`, a non-empty string literal.  A lint name is not
+            // checked against any list, so an allow of a lint the compiler
+            // does not know is accepted and does nothing.
             "allow" | "warn" | "deny" => {
                 if (argc == 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
-                mut names_spelling_lint: boolean = false;
                 mut lint_names: i64 = 0;
                 mut reasons: i64 = 0;
-                mut placeholder_span: SourceSpan = SourceSpan::none();
-                mut placeholder: boolean = false;
-                mut bad_args: i64 = 0;
                 for (mut i: i64 = 0; i < argc; i++) {
                     const a: DirectiveArg = dir.args[i];
                     if (a.kind == DirectiveArgKind::Ident) {
                         lint_names += 1;
-                        if (a.name.eq(LOOKUP_BY_SPELLING)) {
-                            names_spelling_lint = true;
-                        }
                     } else if (a.kind == DirectiveArgKind::KeyValue && a.name.eq("reason")) {
                         reasons += 1;
                         if (a.value_kind != DirectiveArgKind::StringLit) {
@@ -781,17 +736,12 @@ type struct DirectiveProcessingPasses {
                             DirectiveProcessingPasses::emit_bad_arg(ctx, a.span, Text::new(fmt::format(
                                 "directive `![%s]`: `reason` is empty; say why the lint does not apply here",
                                 name)));
-                        } else if (a.str_value.trim().starts_with(PENDING_REASON)) {
-                            placeholder = true;
-                            placeholder_span = a.span;
                         }
                     } else if (a.kind == DirectiveArgKind::KeyValue) {
-                        bad_args += 1;
                         DirectiveProcessingPasses::emit_bad_arg(ctx, a.span, Text::new(fmt::format(
                             "directive `![%s]`: unknown key `%s` (the only key is `reason`)",
                             name, a.name)));
                     } else {
-                        bad_args += 1;
                         DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, i,
                             Text::new("a lint name or `reason = \"...\"`"));
                     }
@@ -804,32 +754,6 @@ type struct DirectiveProcessingPasses {
                     DirectiveProcessingPasses::emit_bad_arg(ctx, dir.span, Text::new(fmt::format(
                         "directive `![%s]` carries %lld reasons; write one", name, reasons)));
                 }
-                if (!names_spelling_lint) { return; }
-                if (name.eq("warn")) {
-                    DirectiveProcessingPasses::emit_bad_arg(ctx, dir.span, Text::new(
-                        "`lookup_by_spelling` has no warning level: it is denied, or allowed with a reason"));
-                    return;
-                }
-                if (!name.eq("allow")) { return; }
-                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method
-                        && target != DirectiveTarget::Field) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("function, method or field"), target);
-                }
-                // A misspelt key is already refused; saying the reason is also
-                // missing would report one mistake twice.
-                if (reasons == 0 && bad_args == 0) {
-                    DirectiveProcessingPasses::emit_bad_arg(ctx, dir.span, Text::new(
-                        "`![allow(lookup_by_spelling)]` needs a reason: write `reason = \"...\"` saying why this takes a spelling rather than an identity"));
-                }
-                // A placeholder lowers the lint without saying why; in the
-                // compiler's own modules every allow says why.
-                if (placeholder && DirectiveProcessingPasses::in_store_root(ctx)) {
-                    mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0157_LOOKUP_BY_SPELLING, Text::new(
-                        "`reason` says no reason is written yet: an allow of `lookup_by_spelling` in the compiler says why this is no lookup"));
-                    diag = diag.at(placeholder_span);
-                    diag = diag.help(Text::new("ask a door, or say why this is no lookup"));
-                    ctx.emit_diagnostic(diag);
-                }
             }
 
             // `![functions_only]`: zero args, extern-block target only.  Marks
@@ -841,6 +765,21 @@ type struct DirectiveProcessingPasses {
                 }
                 if (target != DirectiveTarget::Extern) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("extern module"), target);
+                }
+            }
+
+            // `![arena(f)]`: one identifier, the allocator function, which the
+            // name layer binds where the class is written; a class only.
+            "arena" => {
+                if (argc != 1) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
+                    return;
+                }
+                if (dir.args[0].kind != DirectiveArgKind::Ident) {
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 0, Text::new("a function name (identifier)"));
+                }
+                if (target != DirectiveTarget::Class) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("class"), target);
                 }
             }
 
@@ -930,7 +869,7 @@ type struct DirectiveProcessingPasses {
                     "should_panic", "config", "deprecated", "align",
                     "repr", "link", "symbol", "no_mangle", "weak", "naked", "section",
                     "target", "allow", "warn", "deny",
-                    "derive", "sink", "implicit", "functions_only",
+                    "derive", "arena", "sink", "implicit", "functions_only",
                     "windows", "linux", "macos", "unix", "not"
                 ];
                 const best: string = find_best_candidate(name, cands);
@@ -1441,208 +1380,6 @@ type struct DirectiveProcessingPasses {
     }
 
 
-    // The spelling types, and the store-key lint
-
-    /// The name of the spelling type a parameter of type `ty` carries - by
-    /// value, behind a reference, or as an array's element - or "" when it
-    /// carries none.  The spelling types are the compiler's own, listed here
-    /// by the qualified name their declarations give them, so a type not in
-    /// the list is never linted however it is used.
-    static spelling_type_of(ctx: CompilationContext*, ty: TypeRef) -> string {
-        return match (DirectiveProcessingPasses::compiler_text_of(ctx, ty)) {
-            CompilerText::Symbol    => { "SymbolStr" }
-            CompilerText::Qualified => { "QualifiedName" }
-            _                       => { "" }
-        };
-    }
-
-    /// Whether a value of type `ty` carries an identity-text type - a
-    /// definition's name read off it, or a link symbol mangled from one -
-    /// by value, behind a reference, or as an array's element.
-    static carries_identity_text(ctx: CompilationContext*, ty: TypeRef) -> boolean {
-        return match (DirectiveProcessingPasses::compiler_text_of(ctx, ty)) {
-            CompilerText::Decl    => { true }
-            CompilerText::Mangled => { true }
-            _                     => { false }
-        };
-    }
-
-    /// Which of the compiler's own text types a value of type `ty` carries,
-    /// by value, behind a reference, or as an array's element.
-    static compiler_text_of(ctx: CompilationContext*, ty: TypeRef) -> CompilerText {
-        mut cur: TypeRef = ty;
-        for (mut depth: i32 = 0; depth < 8; depth++) {
-            const t: Type* = ctx.type_arena.lookup(cur);
-            if (t == null) { return CompilerText::Other; }
-            match (t.kind) {
-                TypeKind::Reference => { cur = (t as ReferenceType*).referent; }
-                TypeKind::Array     => { cur = (t as ArrayType*).element; }
-                TypeKind::Struct    => {
-                    const d: DefId = ctx.decl_index.def_of(cur, ctx.type_arena);
-                    if (!d.is_valid()) { return CompilerText::Other; }
-                    if (d.equals(ctx.generic_registry.wellknown(LangItem::SymbolStr))) { return CompilerText::Symbol; }
-                    if (d.equals(ctx.generic_registry.wellknown(LangItem::QualifiedName))) { return CompilerText::Qualified; }
-                    if (d.equals(ctx.generic_registry.wellknown(LangItem::DeclName))) { return CompilerText::Decl; }
-                    if (d.equals(ctx.generic_registry.wellknown(LangItem::MangledName))) { return CompilerText::Mangled; }
-                    return CompilerText::Other;
-                }
-                _ => { return CompilerText::Other; }
-            }
-        }
-        return CompilerText::Other;
-    }
-
-    /// Whether `dirs` - one declaration's own directives - lower
-    /// `lookup_by_spelling`.  An allow whose reason is missing or empty, and a
-    /// `warn`, are E0152 where they are written and still count here, so one
-    /// mistake is one refusal.
-    static allows_spelling(dirs: &DirectiveNode*[]) -> boolean {
-        for (mut i: i64 = 0; i < dirs.length; i++) {
-            const d: DirectiveNode* = dirs[i];
-            if (d == null) { continue; }
-            if (!d.directive_kind.as_string().eq("allow") && !d.directive_kind.as_string().eq("warn")) { continue; }
-            for (mut j: i64 = 0; j < d.args.length; j++) {
-                const a: DirectiveArg = d.args[j];
-                if (a.kind == DirectiveArgKind::Ident && a.name.eq(LOOKUP_BY_SPELLING)) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    /// Whether `decl` is a door: its doc comment opens with the marker.  A
-    /// method's doc comment is on its method node, not on its function.
-    static is_door(decl: ASTNode*) -> boolean {
-        if (decl == null) { return false; }
-        if (decl.kind != NodeKind::FunctionDeclaration && decl.kind != NodeKind::MethodDeclaration) {
-            return false;
-        }
-        return (decl as DeclarationNode*).documentation.starts_with(DOOR_MARKER);
-    }
-
-    /// The doors, by the id a marker names: the only kinds of question a
-    /// spelling may become a binding for.  A marker naming anything else is
-    /// refused, so a misspelt marker cannot exempt a body from the lint.
-    static door_ids() -> string[] {
-        return [
-            "scope-value", "scope-type",
-            "member-function", "member-export", "member-global", "member-field",
-            "member-variant", "trait-method", "assoc-type",
-            "module-by-path", "loader-path",
-            "primitive", "lang-item", "intern", "suggestion",
-        ];
-    }
-
-    /// E0157 at `decl` when its doc comment opens with the door marker and
-    /// the id it names is not one of `door_ids`.
-    static check_door_marker(ctx: CompilationContext*, decl: DeclarationNode*) -> void {
-        if (decl == null) { return; }
-        const doc: string = decl.documentation;
-        if (!doc.starts_with(DOOR_MARKER)) { return; }
-        const ids: string[] = DirectiveProcessingPasses::door_ids();
-        for (mut i: i64 = 0; i < ids.length; i++) {
-            if (doc.starts_with(DOOR_MARKER + ids[i] + "`")) { return; }
-        }
-        const start: i64 = DOOR_MARKER.length() as i64;
-        const rest: string = doc.substr(start, (doc.length() as i64) - start);
-        const end: i64 = rest.find("`");
-        const written: string = if (end < 0) { rest } else { rest.substr(0, end) };
-        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0157_LOOKUP_BY_SPELLING, Text::new(fmt::format(
-            "`%s` is not a door: a `/// Door` marker names one of the compiler's doors", written)));
-        diag = diag.at(decl.span);
-        diag = diag.help(Text::new(
-            "the doors are `scope-value`, `scope-type`, `member-function`, `member-export`, `member-global`, `member-field`, `member-variant`, `trait-method`, `assoc-type`, `module-by-path`, `loader-path`, `primitive`, `lang-item`, `intern` and `suggestion`"));
-        ctx.emit_diagnostic(diag);
-    }
-
-    /// The root namespace whose modules keep the compiler's declaration
-    /// stores: the one the spelling types above are declared under.  A store
-    /// is a table the compiler answers names from, so the key lint covers
-    /// these modules and no program the compiler compiles.
-    static store_root() -> string {
-        return "compiler";
-    }
-
-    /// Whether the module this pass is linting is one of `store_root`'s.
-    ![allow(lookup_by_spelling, reason = "the checks' own scope: whether a module's path lies under the fixed root the compiler's modules are declared under; nothing is looked up by it")]
-    static in_store_root(ctx: CompilationContext*) -> boolean {
-        const m: ModulePath = ctx.current_module();
-        if (!m.is_valid()) { return false; }
-        const path: string = ctx.intern_table.shown(m.decl_name());
-        const root: string = DirectiveProcessingPasses::store_root();
-        return path.eq(root) || path.starts_with(root + "::");
-    }
-
-    /// The key of a field of type `ty`, spelled for a message, when `ty` is
-    /// a hash table (`HashMap` or `HashSet`) keyed by something other than
-    /// an identity: an integer, a `string`, or a spelling type.  "" for any
-    /// other field.  An identity reaches a table only through its key type
-    /// (`TypeKey`, `DefKey`, `SymbolKey`, a door's key), so a raw number in
-    /// the key position is one nothing stops a spelling's id from filling.
-    static raw_table_key_of(ctx: CompilationContext*, ty: TypeRef) -> string {
-        const t: Type* = ctx.type_arena.lookup(ty);
-        if (t == null || t.kind != TypeKind::InstantiatedType) { return ""; }
-        const inst: InstantiatedType* = t as InstantiatedType*;
-        if (inst.type_args.length == 0) { return ""; }
-        const base: DefId = ctx.decl_index.registered_def(inst.generic_base);
-        const reg: GenericRegistry* = ctx.get_generic_registry();
-        if (!base.is_valid() || reg == null) { return ""; }
-        if (!base.equals(reg.wellknown(LangItem::HashMap)) && !base.equals(reg.wellknown(LangItem::HashSet))) {
-            return "";
-        }
-        const key: TypeRef = inst.type_args[0];
-        const spelling: string = DirectiveProcessingPasses::spelling_type_of(ctx, key);
-        if (spelling.length() > 0) { return spelling; }
-        const kt: Type* = ctx.type_arena.lookup(key);
-        if (kt == null) { return ""; }
-        if (kt.kind == TypeKind::Int || kt.kind == TypeKind::String) {
-            return ctx.type_arena.resolve_display_name_short(key);
-        }
-        return "";
-    }
-
-    /// E0157 at every field of `fields` that keys a hash table by text or a
-    /// raw number, unless the field's own directives allow
-    /// `lookup_by_spelling`.
-    static lint_store_keys(ctx: CompilationContext*, owner: Text, fields: &FieldDeclNode*[]) -> void {
-        for (mut i: i64 = 0; i < fields.length; i++) {
-            const f: FieldDeclNode* = fields[i];
-            if (f == null || !f.resolved_type.is_valid()) { continue; }
-            if (DirectiveProcessingPasses::allows_spelling(&f.attached_directives)) { continue; }
-            const key: string = DirectiveProcessingPasses::raw_table_key_of(ctx, f.resolved_type);
-            if (key.length() == 0) { continue; }
-            const msg: string = fmt::format("`%s.%s` keys a table by `%s`, not by an identity",
-                owner.as_string(), ctx.intern_table.resolve(f.name), key);
-            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0157_LOOKUP_BY_SPELLING, Text::new(msg));
-            diag = diag.at(f.span);
-            diag = diag.help(Text::new(
-                "key it by the identity's own key (`TypeRef::table_key`, `DefTable::table_key`, `SymbolID::table_key`), or say why it cannot: `![allow(lookup_by_spelling, reason = \"...\")]` on the field"));
-            ctx.emit_diagnostic(diag);
-        }
-    }
-
-    /// Lint the fields of every type this module declares, when it is one of
-    /// the compiler's own.  A spelling a function is handed is checked where
-    /// it is looked up, by sema's `SpellingLookupCheck`.
-    static run_spelling_lint(ctx: CompilationContext*, root: ProgramNode*) -> void {
-        if (!DirectiveProcessingPasses::in_store_root(ctx)) { return; }
-        for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
-            if (stmt == null) { continue; }
-            if (stmt.kind == NodeKind::StructDeclaration) {
-                const sd: StructDeclNode* = stmt as StructDeclNode*;
-                DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(sd.name)), &sd.fields);
-            } else if (stmt.kind == NodeKind::UnionDeclaration) {
-                const ud: UnionDeclNode* = stmt as UnionDeclNode*;
-                DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(ud.name)), &ud.fields);
-            } else if (stmt.kind == NodeKind::ClassDeclaration) {
-                const cd: ClassDeclNode* = stmt as ClassDeclNode*;
-                DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(cd.name)), &cd.fields);
-            }
-        }
-    }
-
 
     // Pass entry point
 
@@ -1714,11 +1451,6 @@ type struct DirectiveProcessingPasses {
             // descent below still needs to run for struct/class/impl decls
             // whose own attached_directives are empty but whose method
             // members carry their own (e.g. `![sink]`).
-
-            const store_root: boolean = DirectiveProcessingPasses::in_store_root(ctx);
-            if (store_root && decl.kind == NodeKind::FunctionDeclaration) {
-                DirectiveProcessingPasses::check_door_marker(ctx, decl);
-            }
 
             for (mut j: i64 = 0; j < ad_count; j++) {
                 const d: DirectiveNode* = decl.attached_directives[j];
@@ -1799,9 +1531,6 @@ type struct DirectiveProcessingPasses {
             for (mut mi: i64 = 0; mi < method_list.length; mi++) {
                 const m: MethodNode* = method_list[mi];
                 if (m == null) { continue; }
-                if (store_root) {
-                    DirectiveProcessingPasses::check_door_marker(ctx, m as DeclarationNode*);
-                }
                 const m_count: i64 = m.attached_directives.length;
                 if (m_count == 0) { continue; }
                 for (mut mj: i64 = 0; mj < m_count; mj++) {
@@ -1828,8 +1557,8 @@ type struct DirectiveProcessingPasses {
                 }
             }
 
-            // Descend into the fields of structs, classes and unions: a field
-            // carries the allow the store-key lint reads.
+            // Descend into the fields of structs, classes and unions: a field's
+            // own directives are validated and recorded as a declaration's are.
             const empty_fields: FieldDeclNode*[] = [];
             mut field_list: &FieldDeclNode*[] = &empty_fields;
             if (decl.kind == NodeKind::StructDeclaration) {
@@ -1884,8 +1613,6 @@ type struct DirectiveProcessingPasses {
                 }
             }
         }
-
-        DirectiveProcessingPasses::run_spelling_lint(ctx, root);
 
         // Cross-cutting placement validation: enforce that `![config(testing)]`,
         // `![test]`, `![ignore]`, and `![should_panic]` only appear in files
@@ -2049,7 +1776,8 @@ type struct DirectiveProcessingPasses {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) { continue; }
                     if (!node.repr_c && !node.repr_packed
-                            && !node.repr_transparent && node.min_alignment == 0) {
+                            && !node.repr_transparent && node.min_alignment == 0
+                            && !node.arena_alloc.is_valid()) {
                         continue;
                     }
                     const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, Text::new("directive/class layout"));
@@ -2059,6 +1787,7 @@ type struct DirectiveProcessingPasses {
                     mut ct: ClassType* = ty as ClassType*;
                     ct.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
                     ct.set_min_alignment(node.min_alignment);
+                    ct.arena_alloc = node.arena_alloc;
                 }
                 NodeKind::EnumDeclaration => {
                     const node: EnumDeclNode* = stmt as EnumDeclNode*;

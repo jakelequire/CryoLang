@@ -31,39 +31,18 @@ const k: DefKind = defs.kind_of(node.def);
 const key: SymbolStr = intern(table.shown(defs.path_of(d)) + "::new");
 ```
 
-Rule four is checked by the compiler over its own modules.  A definition's
-path or leaf is read as a `DeclName`, whose text comes back only through
-`InternTable::shown` (for a message or a mangled symbol) and
-`DeclName::spelling` (for a node synthesized to carry the name).  Sema
-follows text computed from a `DeclName` through the function that reads it -
-concatenated, formatted, held in a local - and refuses it where it becomes a
-door's argument, a hash table's key, an operand of `==` or `!=` beside
-other text, one of the texts handed to a call answering a `boolean`
-(`a.equals(b)`, `s.starts_with(p)`), or a `match`'s subject (E0157); a
-comparison with the empty string asks whether there is any text, and is no
-lookup.  A named type's display (`TypeArena::format_display`) is its
-declaration's `DeclName` shown, and a function's linker symbol
-(`DeclarationIndex::entry_symbol`) is a `DeclName`, so the text either
-yields is followed the same way.  Text that leaves the function is followed
-too: each function records where its text-typed parameters, its receiver
-and its answer go - into another function's, or to a lookup - and once
-every module is checked, a lookup that text read off a definition reaches
-through any chain of calls is refused there, naming where the text left
-the function that read it.  A value that is not text (a message's `Text`,
-a struct) ends the flow, and so does text stored into a field.  A door's
-own body is not checked, nor a declaration allowed `lookup_by_spelling`
-with a reason: what either is handed is its own to judge.
+A definition's path or leaf is read as a `DeclName`, whose text comes back
+only through `InternTable::shown` (for a message or a mangled symbol) and
+`DeclName::spelling` (for a node synthesized to carry the name).  A named
+type's display (`TypeArena::format_display`) is its declaration's
+`DeclName` shown, and a function's linker symbol
+(`DeclarationIndex::entry_symbol`) is a `MangledName`.
 
 ## The doors
 
 A door is the one function where a spelling may become a binding, for one
-kind of question. Each carries a doc comment beginning ``/// Door `<id>`.``
-followed by the reason it is allowed to take text; the comment sits on the
-declaration so the reason cannot be removed without touching the code.
-The ids are a fixed table in the compiler
-(`DirectiveProcessingPasses::door_ids`, the doors listed below), and in
-the compiler's own modules a marker naming any other id is refused where
-it is written (E0157), so a misspelt marker exempts nothing.
+kind of question.  The doors are the functions the table below lists; the
+table is the normative list.
 
 The ruled kinds of door: the bare-identifier scope lookup and its
 type-namespace twin; one door per member kind, each taking an owner identity
@@ -78,46 +57,17 @@ file, whose path keys discovery's own sets; the fixed
 primitive and language-item table; the interner; and diagnostic suggestions,
 whose result may flow only into message text.
 
-The compiler reads the same marker, and checks rule three over every
-function handed a spelling (a parameter of type `SymbolStr` or
-`QualifiedName`).  Sema follows each such parameter through the body - into
-locals, through `&`, `*` and casts, element and text-member reads, a
-`SymbolStr`'s number and a number computed from it by arithmetic (a key
-packed as `(owner << 32) | name.id`), concatenation, conditionals, and the
-text a non-door call returns when handed it - and refuses it (E0157) where
-it is looked up: a hash table's key, an operand of `==` or `!=`, a call
-answering a `boolean` or an `Option` that is an operation of text or is
-handed it as plain text (an equality, a prefix test, `names.index_of(&name)`),
-or a `match`'s subject.
-A function that only carries the spelling - stores it, returns it, hands it
-to another function or to a door - needs nothing.  A door's body is not
-checked, nor one whose declaration allows `lookup_by_spelling` with a
-reason; the rule-4 check skips the same bodies.  In the compiler's own
-modules the reason says why the spelling is no lookup: a reason opening
-`pending:`, the placeholder that says none is written yet, is refused at
-the reason (E0157).  The editor's pending allows stay until its own
-migration.  The check reaches one
-function: a spelling handed on is looked up, and refused, in the callee.
-A spelling handed on as plain text - a `string` parameter, which the
-callee's own check does not follow - is followed through the flow between
-functions the rule-four check records, through any chain of calls, and
-refused where it reaches a hash table's key, a comparison or a `match`'s
-subject ("`f` looks up a spelling it is handed as plain text"), naming
-where it left the function that held it; a door's argument is where a
-spelling belongs, and is not refused.  A local array that a comparison
-reads before a spelling is written into it, later in the body - which the
-next iteration of a loop reads back - is refused at that comparison.
-
-The same check follows a spelling read off a field - a declaration's, a
-syntax node's or a table row's name (`decls[i].name.equals(node.name)`) -
-in every body, handed a spelling or not, and refuses it at a hash table's
-key, a `match`'s subject, a call answering a `boolean` or an `Option`
-handed it with other text, and an `==` or `!=` whose other side is a
-spelling or other text - a literal, a string held in a local (against a
-number or the empty string it is a validity test).  The diagnostic names the function and the site: "`f`
-looks up a spelling read off a field".  A comparison that is no lookup -
-a duplicate-declaration check, a comparison primitive, a convention such
-as a leading `_` - says why on its allow.
+No mechanical check enforces rules three and four.  They are held by
+structure: each store keeps its names in private fields reachable only
+through its door; tables are keyed by typed identities (`DefKey`,
+`TypeKey`, `SymbolKey`, `OverloadKey` and the rest), which a spelling's
+number cannot fill; a definition's name is a `DeclName` and a link symbol a
+`MangledName`, whose text comes back only through `InternTable::shown`;
+and the named types' paths are sealed the same way.  A new accessor that
+hands identity text out as a `SymbolStr`, or a table keyed by a raw number
+or text, is a change a reviewer has to refuse.  The `![allow(...)]`
+directives and door comments still written in the compiler say why a
+function was exempt from the check that was removed; they do nothing.
 
 Rule three is also held by visibility, one store at a time: a store's name
 fields are `private` to the module whose file holds the store and its

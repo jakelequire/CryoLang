@@ -56,7 +56,6 @@ import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, FamilyOwner, Res };
-import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType };
 import compiler::types::generic_registry::{ GenericRegistry };
@@ -92,26 +91,19 @@ type struct NewDeleteEmitter {
     }
 
     // Arena routing
-    //
-    // `new T(...)` whose `T` derives from `compiler::ast::node::ASTNode` is
-    // routed to the AST arena (compiler::codegen::ast_arena) instead of
-    // `malloc`, so the compiler's own parse trees + monomorphized clones can
-    // be reclaimed in bulk at each target boundary.  The class-base chain is
-    // tiny (e.g. `BinaryExprNode -> ExpressionNode -> ASTNode`) and this runs
-    // once per `new` site at compile time, so the walk is negligible.  The
-    // `ASTNode` qualified name is unique to the compiler's own source, so
-    // routing only ever fires when the compiler compiles itself - user
-    // programs that `new` their own classes are unaffected.
-    derives_from_astnode(mut &this, ty: TypeRef) -> boolean {
-        const astnode: DefId = this.cg.ctx.generic_registry.wellknown(LangItem::AstNode);
-        if (!astnode.is_valid()) { return false; }
+
+    /// The allocator `new` of class `ty` goes through: the `![arena(f)]` of
+    /// the class itself or of its nearest base carrying one, or an invalid
+    /// id when none does (the ordinary allocator).  A class's storage from
+    /// such an allocator is reclaimed with its arena, never one at a time.
+    arena_alloc_of(mut &this, ty: TypeRef) -> DefId {
         mut cur: TypeRef = ty;
         loop {
             const t: Type* = this.cg.arena_type(cur);
-            if (t == null || t.kind != TypeKind::Class) { return false; }
-            if (this.cg.ctx.decl_index.def_of(cur, this.cg.ctx.type_arena).equals(astnode)) { return true; }
+            if (t == null || t.kind != TypeKind::Class) { return DefId::invalid(); }
             const ct: ClassType* = t as ClassType*;
-            if (!ct.has_base) { return false; }
+            if (ct.arena_alloc.is_valid()) { return ct.arena_alloc; }
+            if (!ct.has_base) { return DefId::invalid(); }
             cur = ct.base_class;
         }
     }
@@ -207,18 +199,18 @@ type struct NewDeleteEmitter {
 
         const size_val: LValue = LType::const_int(LType::i64(), size, false);
 
-        // AST-node `new` (the compiler allocating its own parse trees) routes
-        // to the process-global arena; everything else shares the canonical
-        // GlobalAlloc via the shared funnel. The bitcast / vtable seed / struct
-        // init / ctor call below are byte-identical regardless of storage.
-        const is_ast: boolean = this.derives_from_astnode(type_ref);
+        // A class under an `![arena(f)]` allocates through `f`; everything
+        // else shares the canonical GlobalAlloc via the shared funnel. The
+        // bitcast / vtable seed / struct init / ctor call below are the same
+        // whichever allocator supplied the storage.
+        const arena_fn: DefId = this.arena_alloc_of(type_ref);
         mut align: u64 = 16;
         if (t.kind == TypeKind::Class) {
             const ct_a: ClassType* = t as ClassType*;
             if (ct_a.computed_align > 0) { align = ct_a.computed_align; }
         }
         const raw_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
-            is_ast, size_val, align, Text::new("newtmp"), node.span, Text::new("'new' expression"));
+            arena_fn, size_val, align, Text::new("newtmp"), node.span, Text::new("'new' expression"));
         if (!raw_ptr.is_valid()) {
             this.state.last_value = LValue::null();
             this.state.last_is_lvalue = false;
@@ -405,12 +397,12 @@ type struct NewDeleteEmitter {
         const total: LValue = this.cg.builder.build_mul(
             count_val, elem_size_val, Text::new("new.arr.bytes"));
 
-        // AST-node element blocks route to the arena (parity with emit_new;
-        // AST collections are dynamic `T[]`, not `new T[n]`, so this is
-        // expected never to fire). Array allocations use a fixed 16 alignment.
-        const is_ast: boolean = this.derives_from_astnode(elem_ref);
+        // An element class under an `![arena(f)]` allocates the block through
+        // `f`, as `new` of one does.  Array allocations use a fixed 16
+        // alignment.
+        const arena_fn: DefId = this.arena_alloc_of(elem_ref);
         const raw_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
-            is_ast, total, 16, Text::new("new.arr"), node.span, Text::new("'new T[n]'"));
+            arena_fn, total, 16, Text::new("new.arr"), node.span, Text::new("'new T[n]'"));
         if (!raw_ptr.is_valid()) {
             this.state.last_value = LValue::null();
             this.state.last_is_lvalue = false;
@@ -467,14 +459,12 @@ type struct NewDeleteEmitter {
             }
         }
 
-        // Arena node: storage came from the AST arena (bulk-reclaimed at the
-        // target boundary), so neither free() nor a synthesized drop() is valid
-        // here -- free() on arena memory would corrupt the heap.  Evaluate the
-        // operand once for its side effects, then no-op, exactly preserving
-        // today's behavior (AST nodes are never individually freed).  There are
-        // no `delete` sites on AST nodes in-tree today; this guard is defensive.
+        // A class under an `![arena(f)]`: its storage is reclaimed with the
+        // arena, so neither free() nor a synthesized drop() is valid here -
+        // free() on arena memory would corrupt the heap.  The operand is
+        // evaluated once for its side effects and nothing is released.
         if (pointee.is_valid()) {
-            if (this.derives_from_astnode(pointee)) {
+            if (this.arena_alloc_of(pointee).is_valid()) {
                 const _p: LValue = this.dispatch.codegen_rvalue(visitor, node.operand);
                 this.state.last_value = LValue::null();
                 this.state.last_is_lvalue = false;

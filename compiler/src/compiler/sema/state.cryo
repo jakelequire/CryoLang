@@ -32,7 +32,6 @@ import compiler::ast::declaration::{ FunctionDeclNode, GenericParamNode, ImplBlo
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefKey };
 import compiler::decl_index::{ OverloadId };
-import compiler::sema::identity_flow::{ FlowNode };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
 import std::collections::hashset;
@@ -77,15 +76,6 @@ type struct LocalBinding {
         return LocalBinding { sym: SymbolID::invalid(), ty: TypeRef::invalid(), is_mut: false,
                               kw_span: SourceSpan::none() };
     }
-}
-
-/// A comparison that read a local array before any spelling was written
-/// into it: the origin of the spelling on its other side, and where it is.
-/// A write later in the body - the next loop iteration reads it - makes the
-/// comparison a lookup.
-type struct SpellingPending {
-    origin: i64;
-    site:   SourceSpan;
 }
 
 type struct SemaState {
@@ -158,48 +148,6 @@ type struct SemaState {
     receiver_sym: SymbolID;
     // The function whose body is being checked; null outside one.
     current_func: FunctionDeclNode*;
-    // The last call whose arguments were classified, and the parameter types
-    // they were classified against - one per argument position, the receiver
-    // excluded, as sema itself aligned them.  Kept only under `--emit=facts`,
-    // where the call's record reads them once the call is resolved.
-    facts_call:   CallExprNode*;
-    facts_params: TypeRef[];
-    // Every local declared with an initializer, by its symbol's key, to its
-    // declaration; a record reads where a local's value came from here.
-    ![allow(lookup_by_spelling, reason = "the `--emit=facts` report's scratch, keyed by a binding's number; it is deleted with the report")]
-    facts_inits:  HashMap<u64, u64>;
-    // The loop depth each of those locals is declared at.
-    ![allow(lookup_by_spelling, reason = "the `--emit=facts` report's scratch, keyed by a binding's number; it is deleted with the report")]
-    facts_depths: HashMap<u64, u64>;
-
-    // -- The identity-text check (`IdentityTextCheck`) --
-    // Whether it runs over this module.
-    identity_text_on: boolean;
-    // Whether the function being checked is exempt from it: a door, or one
-    // whose declaration allows `lookup_by_spelling`.
-    identity_exempt: boolean;
-    // Every local whose value is text read off a definition.
-    identity_locals: HashSet<SymbolKey>;
-    // Every local or parameter whose value may come from a node of the flow
-    // between functions, to those nodes.
-    flow_locals: HashMap<SymbolKey, FlowNode[]>;
-    // The function being checked, when it records its flows.
-    identity_entry: OverloadId;
-
-    // -- The spelling-lookup check (`SpellingLookupCheck`) --
-    // Whether the function being checked has a spelling parameter it is not
-    // exempt for.
-    spelling_on: boolean;
-    // Every local holding one of those parameters' spelling, to the
-    // parameter's position.
-    spelling_locals: HashMap<SymbolKey, i64>;
-    // Per parameter position, whether it has been refused in this function.
-    spelling_refused: boolean[];
-    // Whether a spelling read off a field has been refused in this function.
-    spelling_field_refused: boolean;
-    // Each local array a comparison read before a spelling reached it, to
-    // those comparisons.
-    spelling_pending: HashMap<SymbolKey, SpellingPending[]>;
 
     // -- Closure-capture detection (mutated by LambdaSynth, read by resolve_identifier) --
     // `in_lambda_depth`: 0 outside any lambda, 1 inside the outermost, deeper
@@ -304,20 +252,6 @@ type struct SemaState {
             this_is_by_ref:  false,
             receiver_sym:    SymbolID::invalid(),
             current_func: null,
-            facts_call:   null,
-            facts_params: [],
-            facts_inits:  HashMap::<u64, u64>::new(),
-            facts_depths: HashMap::<u64, u64>::new(),
-            identity_text_on: false,
-            identity_exempt:  false,
-            identity_locals:  HashSet::<SymbolKey>::new(),
-            flow_locals:      HashMap::<SymbolKey, FlowNode[]>::new(),
-            identity_entry:   OverloadId::invalid(),
-            spelling_on:      false,
-            spelling_locals:  HashMap::<SymbolKey, i64>::new(),
-            spelling_refused: [],
-            spelling_field_refused: false,
-            spelling_pending: HashMap::<SymbolKey, SpellingPending[]>::new(),
             in_lambda_depth:    0,
             outer_bindings:      HashMap::<SymbolKey, TypeRef>::new(),
             current_lambda:      null,

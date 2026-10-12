@@ -55,7 +55,7 @@ import compiler::decl_index::{ DeclarationIndex, OverloadId };
 import compiler::sema::{
     state, helpers, scope_manager, type_utils, literal_resolver, diagnostics,
     dispatch, symbolic_checker, method_binding, pattern_resolver,
-    lambda_synth, async_lower, member_resolver, call_resolver, call_facts
+    lambda_synth, async_lower, member_resolver, call_resolver
 };
 import std::core::{ option, mem };
 import std::collections::hashmap;
@@ -105,9 +105,6 @@ import compiler::module_graph::{ ModulePath };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
 import compiler::sema::async_lower::{ AsyncLower, AsyncOwner };
-import compiler::sema::call_facts::{ CallFacts, FactsScope, LoopCounter };
-import compiler::sema::identity_text::{ IdentityTextCheck };
-import compiler::sema::spelling_lookup::{ SpellingLookupCheck };
 import compiler::sema::call_resolver::{ CallResolver };
 import compiler::sema::diagnostics::{ Diagnostics };
 import compiler::sema::dispatch::{ SemaDispatch };
@@ -343,7 +340,6 @@ public:
     // -- Top-level + statement recursion seams --
 
     override visit(mut &this, node: ProgramNode*) -> void {
-        this.state.identity_text_on = IdentityTextCheck::applies(this.ctx);
         this.declare_async_futures(node);
         this.type_unwritten_globals(node);
         this.state.unbound_variants.clear();
@@ -353,11 +349,6 @@ public:
             this.dispatch_top_level(stmt);
         }
         this.calls.refuse_unbound_variants();
-        // After the bodies: an `async function`'s declaration is its lowered
-        // one by now, the declaration that compiles.
-        if (this.ctx.options.emit_facts) {
-            CallFacts::record_declarations(this.ctx, this.arena, node);
-        }
     }
 
     /// Give every `async function` in the module its future type before any body
@@ -957,8 +948,6 @@ public:
         this.state.this_is_by_ref = false;
         this.state.receiver_sym = SymbolID::invalid();
         this.state.current_func = func;
-        IdentityTextCheck::enter(this.ctx, &this.state, func);
-        SpellingLookupCheck::enter(this.ctx, &this.state, func);
         this.state.in_lambda_depth     = 0;
         this.state.current_lambda      = null;
 
@@ -1016,7 +1005,6 @@ public:
             }
             const expr_type: TypeRef = this.resolve_expr(node.expression);
             this.state.expected_type = saved_expected;
-            IdentityTextCheck::check_return(this.ctx, &this.state, node.expression);
             if (expr_type.is_valid() && declared.is_valid()
                     && !this.symbolic.type_has_unresolved_projection(declared)
                     && !this.symbolic.type_has_unresolved_projection(expr_type)
@@ -1058,16 +1046,9 @@ public:
 
     override visit(mut &this, node: WhileStmtNode*) -> void {
         this.resolve_condition(node.condition);
-        mut counters: LoopCounter[] = [];
-        if (this.ctx.options.emit_facts) {
-            const stepped: u64[] = CallFacts::stepped_locals(null, node.body);
-            CallFacts::claim_counters(&this.state, node.condition, (this.state.loop_depth + 1) as u64,
-                                      &stepped, &counters);
-        }
         this.state.loop_depth += 1;
         this.dispatch_stmt(node.body);
         this.state.loop_depth -= 1;
-        CallFacts::release_counters(&this.state, &counters);
     }
 
     override visit(mut &this, node: DoWhileStmtNode*) -> void {
@@ -1108,33 +1089,9 @@ public:
         }
         if (node.condition != null) { this.resolve_condition(node.condition); }
         if (node.update != null)    { this.resolve_expr(node.update); }
-        // A counter the header declares belongs to the loop it drives, one
-        // deeper than the header: a record reads an element indexed by it as
-        // read by that loop.
-        if (this.ctx.options.emit_facts && node.init != null) {
-            mut counter: VarDeclNode* = null;
-            if (node.init.kind == NodeKind::VariableDeclaration) {
-                counter = node.init as VarDeclNode*;
-            } else if (node.init.kind == NodeKind::DeclarationStatement) {
-                const d: ASTNode* = (node.init as DeclStmtNode*).declaration;
-                if (d != null && d.kind == NodeKind::VariableDeclaration) { counter = d as VarDeclNode*; }
-            }
-            if (counter != null && counter.sym_id.is_valid()) {
-                this.state.facts_depths.insert(counter.sym_id.key(), (this.state.loop_depth + 1) as u64);
-            }
-        }
-        // A counter the header does not declare (`for (; i < n; i++)`) is
-        // claimed from the condition, as a `while`'s is.
-        mut counters: LoopCounter[] = [];
-        if (this.ctx.options.emit_facts) {
-            const stepped: u64[] = CallFacts::stepped_locals(node.update, node.body);
-            CallFacts::claim_counters(&this.state, node.condition, (this.state.loop_depth + 1) as u64,
-                                      &stepped, &counters);
-        }
         this.state.loop_depth += 1;
         this.dispatch_stmt(node.body);
         this.state.loop_depth -= 1;
-        CallFacts::release_counters(&this.state, &counters);
         this.scopes.restore_scope(save);
     }
 
@@ -1189,9 +1146,6 @@ public:
 
     override visit(mut &this, node: MatchStmtNode*) -> void {
         const subject_type: TypeRef = this.resolve_expr(node.subject);
-        this.record_match_facts(node.subject, &node.arms, (node as ASTNode*).span);
-        IdentityTextCheck::check_match(this.ctx, &this.state, node.subject);
-        SpellingLookupCheck::check_match(this.ctx, &this.state, node.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             const arm: MatchArmNode* = node.arms[i];
@@ -1288,11 +1242,6 @@ public:
     /// module-level form - they reach sema through different visitors and must
     /// not answer this differently.
     check_var_decl(mut &this, var_node: VarDeclNode*) -> void {
-        // A record naming this local reads where its value came from.
-        if (this.ctx.options.emit_facts && var_node.has_initializer() && var_node.sym_id.is_valid()) {
-            this.state.facts_inits.insert(var_node.sym_id.key(), var_node as u64);
-            this.state.facts_depths.insert(var_node.sym_id.key(), this.state.loop_depth as u64);
-        }
 
         // A type-less binding with no initializer has nothing to infer from.
         // With an initializer, the binding's type is inferred from it below
@@ -1466,8 +1415,6 @@ public:
                     }
                 }
             }
-            IdentityTextCheck::note_local(this.ctx, &this.state, var_node);
-            SpellingLookupCheck::note_local(this.ctx, &this.state, var_node);
         }
 
     }
@@ -1701,51 +1648,6 @@ public:
 
     // -- The authoritative expression dispatch --
 
-    /// Resolve a call, check what it is handed for identity text, and under
-    /// `--emit=facts` record what it bound.  The check walks every module on
-    /// every build, a module reused from the incremental cache included.
-    resolve_call_recorded(mut &this, call: CallExprNode*) -> TypeRef {
-        const t: TypeRef = this.calls.resolve_call(this, call);
-        IdentityTextCheck::check_call(this.ctx, &this.state, call, t);
-        SpellingLookupCheck::check_call(this.ctx, &this.state, call, t);
-        if (this.ctx.options.emit_facts) {
-            const known: boolean = this.state.facts_call == call;
-            CallFacts::record(&this.facts_scope(), call, &this.state.facts_params, known);
-        }
-        return t;
-    }
-
-    /// Resolve a binary expression, and under `--emit=facts` record it when
-    /// it compares keys or assigns a spelling to a local - the same
-    /// condition as a call's record.
-    resolve_binary_recorded(mut &this, bin: BinaryExprNode*) -> TypeRef {
-        const t: TypeRef = this.resolve_binary(bin);
-        IdentityTextCheck::note_assignment(this.ctx, &this.state, bin);
-        IdentityTextCheck::check_compare(this.ctx, &this.state, bin);
-        SpellingLookupCheck::check_binary(this.ctx, &this.state, bin);
-        if (this.ctx.options.emit_facts) {
-            CallFacts::record_compare(&this.facts_scope(), bin);
-            CallFacts::record_assign(&this.facts_scope(), bin);
-        }
-        return t;
-    }
-
-    /// Under `--emit=facts`, record a `match` whose subject is a spelling -
-    /// the same condition as a call's record.
-    record_match_facts(mut &this, subject: ExpressionNode*, arms: &MatchArmNode*[],
-                       span: SourceSpan) -> void {
-        if (this.ctx.options.emit_facts) {
-            CallFacts::record_match(&this.facts_scope(), subject, arms, span);
-        }
-    }
-
-    facts_scope(mut &this) -> FactsScope {
-        return FactsScope {
-            ctx: this.ctx, arena: this.arena, func: this.state.current_func,
-            state: &this.state,
-        };
-    }
-
     resolve_expr(mut &this, expr: ExpressionNode*) -> TypeRef {
         if (expr == null) { return TypeRef::invalid(); }
         if (expr.has_resolved_type()) {
@@ -1755,9 +1657,9 @@ public:
         const result: TypeRef = match (n.kind) {
             NodeKind::Literal           => { this.literals.resolve_literal(expr as LiteralNode*) }
             NodeKind::Identifier        => { this.resolve_identifier(expr as IdentifierNode*) }
-            NodeKind::BinaryExpression  => { this.resolve_binary_recorded(expr as BinaryExprNode*) }
+            NodeKind::BinaryExpression  => { this.resolve_binary(expr as BinaryExprNode*) }
             NodeKind::UnaryExpression   => { this.resolve_unary(expr as UnaryExprNode*) }
-            NodeKind::CallExpression    => { this.resolve_call_recorded(expr as CallExprNode*) }
+            NodeKind::CallExpression    => { this.calls.resolve_call(this, expr as CallExprNode*) }
             NodeKind::MemberAccess      => { this.member.resolve_member_access(this, expr as MemberAccessNode*) }
             NodeKind::ArrayAccess       => { this.member.resolve_array_access(this, expr as ArrayAccessNode*) }
             NodeKind::CastExpression    => { this.resolve_cast(expr as CastExprNode*) }
@@ -2993,9 +2895,6 @@ public:
 
     resolve_match_expr(mut &this, match_expr: MatchExprNode*) -> TypeRef {
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
-        this.record_match_facts(match_expr.subject, &match_expr.arms, (match_expr as ASTNode*).span);
-        IdentityTextCheck::check_match(this.ctx, &this.state, match_expr.subject);
-        SpellingLookupCheck::check_match(this.ctx, &this.state, match_expr.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(match_expr.subject);
         this.patterns.check_duplicate_default_arm(match_expr.arms);
         const outer_expected: TypeRef = this.state.expected_type;

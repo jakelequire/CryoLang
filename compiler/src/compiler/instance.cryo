@@ -73,9 +73,6 @@ import compiler::compile_mode::{ CompileMode };
 import compiler::diag::{ ErrorCode };
 import compiler::module_graph::{ ModuleInfo, ModuleOrigin };
 import compiler::module_loader::{ ModuleLoader };
-import compiler::sema::call_facts::{ CallFacts };
-import compiler::sema::identity_text::{ IdentityTextCheck };
-import compiler::sema::spelling_lookup::{ SpellingLookupCheck };
 import compiler::passes::pass_id::{ PassID, PassResult, Provision, ProvisionSet };
 import compiler::passes::pass_registry::{ PassRegistry };
 import compiler::passes::specialization::{ SpecializationPasses };
@@ -176,13 +173,6 @@ type struct CompilerConfig {
     /// keeps the fast dynamic link.  Linux host only for v1.  Consumed at link
     /// time in `CodegenPasses::run_linking`; does not affect emitted IR.
     release_static:      boolean;
-    /// `--emit=facts`: also write `<output_dir>/<name>.facts`, one line per
-    /// argument a call passes to a parameter that carries a spelling, as
-    /// body checking resolved it (`sema::call_facts`).  A side output of the
-    /// build it rides on: it changes no object, and it bypasses the
-    /// up-to-date short-circuit, which would otherwise skip the pass that
-    /// records.
-    emit_facts:          boolean;
     /// `--no-std`: build without the standard library (no prelude, no
     /// stdlib module discovery, no libcryo.a at link time).  For project
     /// builds this is OR'd with the cryoconfig `no_std` key (the flag can
@@ -236,7 +226,6 @@ type struct CompilerConfig {
             profile_override:    "",
             incremental:         true,
             release_static:      false,
-            emit_facts:          false,
             no_std:              false,
             no_runtime:          false,
             panic:               PanicStrategy::Unspecified,
@@ -263,7 +252,6 @@ type struct CompilerConfig {
             profile_override:    "",
             incremental:         true,
             release_static:      false,
-            emit_facts:          false,
             no_std:              false,
             no_runtime:          false,
             panic:               PanicStrategy::Unspecified,
@@ -1061,7 +1049,6 @@ type struct CompilerInstance {
         options.target_triple = LTargetMachine::resolve_effective_triple(
             Text::new(config.target_triple));
         options.static_link = this.config.release_static;
-        options.emit_facts = this.config.emit_facts;
         options.source_override = source_override;
 
         // An independent clone, so the local `config` stays usable below.
@@ -1634,8 +1621,7 @@ type struct CompilerInstance {
             const build_fp: u128 = manifest.compute_fingerprint(&mod_entries);
             build_fp_hex = compiler::build_manifest::Manifest::hex128(build_fp);
 
-            if (!this.config.emit_facts
-                    && manifest.is_up_to_date(Text::new(build_fp_hex), &manifest_artifacts)) {
+            if (manifest.is_up_to_date(Text::new(build_fp_hex), &manifest_artifacts)) {
                 // Nothing changed and the artifact still exists: skip
                 // frontend, codegen, and linking entirely.
                 const up_to_date_out: string = if (config.requires_entry_point()) {
@@ -1728,16 +1714,6 @@ type struct CompilerInstance {
         }
         if (!this.typecheck_bodies(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
-        }
-        // Every call a body makes is resolved now; what monomorphization and
-        // the check after it re-pin is the instantiations', not the source's.
-        if (this.config.emit_facts) {
-            const facts_path: string = fmt::format("%s/%s.facts",
-                ctx.project_config.output_dir, ctx.project_config.project_name);
-            if (!CallFacts::write(ctx, Text::new(facts_path))) {
-                fmt::eprintln(f"error: cannot write facts to {facts_path}");
-                return this.project_failure_release(ctx, ast_buf);
-            }
         }
         if (!this.monomorphize(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
@@ -3143,8 +3119,6 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        IdentityTextCheck::report_flows(ctx);
-        SpellingLookupCheck::report_flows(ctx);
         return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 

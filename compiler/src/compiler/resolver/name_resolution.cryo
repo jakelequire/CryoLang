@@ -56,7 +56,7 @@ import compiler::ast::expression::{
 };
 import compiler::ast::node::{ ASTNode, ProgramNode, StaticAssertItem };
 import compiler::ast::pattern::{
-    EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode
+    DirectiveArgKind, DirectiveNode, EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode
 };
 import compiler::ast::statement::{
     AsmBlockStmtNode, AsmOperand, BlockStmtNode, DeclStmtNode, DoWhileStmtNode,
@@ -1042,6 +1042,13 @@ public:
                 }
             }
         }
+        // An `![arena(f)]` allocator, also in the scope enclosing the class.
+        for (mut di: i64 = 0; di < node.attached_directives.length; di++) {
+            const dir: DirectiveNode* = node.attached_directives[di];
+            if (dir == null || !dir.directive_kind.as_string().eq("arena")) { continue; }
+            if (dir.args.length != 1 || dir.args[0].kind != DirectiveArgKind::Ident) { continue; }
+            this.bind_arena_alloc(node, dir);
+        }
 
         this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
 
@@ -1073,6 +1080,26 @@ public:
         }
 
         this.resolver.exit_scope();
+    }
+
+    /// Bind the allocator an `![arena(f)]` on `node` names: `f` is a bare
+    /// value name, asked where the class is written, and must be a function.
+    bind_arena_alloc(&this, node: ClassDeclNode*, dir: DirectiveNode*) -> void {
+        const written: string = dir.args[0].name;
+        const sym: SymbolID = this.resolver.value_target(this.resolver.lookup_value(
+            this.resolver.intern_table.intern(written), this.resolver.current_scope));
+        if (sym.is_valid()) {
+            const s: Symbol = this.resolver.get_symbol(sym);
+            if (s.kind == SymbolKind::Function) {
+                node.arena_alloc = s.def;
+                return;
+            }
+        }
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0152_DIRECTIVE_BAD_ARG,
+            Text::new(fmt::format("`![arena]` names `%s`, which is not a function in this scope", written)));
+        d = d.at_with_label(dir.args[0].span, Text::new("not a function in this scope"));
+        d = d.with_note(Text::new("the allocator is resolved in the scope the class is written in, and is called as `f(size: u64, align: u64) -> void*`"));
+        this.ctx.emit_diagnostic(d);
     }
 
     override visit(node: EnumDeclNode*) -> void {
