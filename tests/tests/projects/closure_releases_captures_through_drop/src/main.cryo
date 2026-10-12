@@ -1,0 +1,64 @@
+namespace ClosureReleasesCapturesThroughDrop;
+
+import std::core::drop;
+import std::core::drop::{ Drop };
+
+mut drops: i32 = 0;
+
+type struct Counted { v: i32; }
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { drops = drops + 1; }
+}
+
+function call_once(f: () -> i32) -> i32 { return f(); }
+
+function main() -> i32 {
+    // Released once, at scope exit.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 4 };
+        const f = move () -> i32 { return c.v; };
+        if (f() != 4) { return 1; }
+    }
+    if (drops != 1) { return 2; }
+
+    // Moved to another binding: released once, by the new owner.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 5 };
+        const f = move () -> i32 { return c.v; };
+        const g = f;
+        if (g() != 5) { return 3; }
+    }
+    if (drops != 1) { return 4; }
+
+    // Passed by value: released once, by the callee.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 6 };
+        const f = move () -> i32 { return c.v; };
+        if (call_once(f) != 6) { return 5; }
+    }
+    if (drops != 1) { return 6; }
+
+    // Two captures: each released once.
+    drops = 0;
+    {
+        const a: Counted = Counted { v: 1 };
+        const b: Counted = Counted { v: 2 };
+        const f = move () -> i32 { return a.v + b.v; };
+        if (f() != 3) { return 7; }
+    }
+    if (drops != 2) { return 8; }
+
+    // A written `f.drop()` is the closure's destructor: the capture is
+    // released, and not again at scope exit.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 7 };
+        mut f = move () -> i32 { return c.v; };
+        f.drop();
+    }
+    if (drops != 1) { return 9; }
+    return 0;
+}

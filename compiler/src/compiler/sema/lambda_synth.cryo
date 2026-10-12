@@ -2,8 +2,8 @@
 ///
 /// Lambda typing + closure lowering: resolving a lambda's param/return types and
 /// walking its body in a fresh per-function frame, recording captured names off
-/// the enclosing scope, synthesising a closure struct (+ `__call__`, + `drop` for
-/// non-Copy captures) for a capturing lambda, rewriting `f(args)` to
+/// the enclosing scope, synthesising a closure struct (+ `__call__`, + a `Drop`
+/// implementation for non-Copy captures) for a capturing lambda, rewriting `f(args)` to
 /// `f.__call__(args)` when `f` is a closure local, and the free-call
 /// closure-arg specialisation.
 ///
@@ -23,8 +23,8 @@ import compiler::types::{
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import compiler::ast;
 import compiler::ast::{
-    cloner, declaration, expression, MemberPin, node, NodeKind, statement, TypeAnnotation,
-    Visibility, visitor
+    cloner, declaration, expression, MemberPin, NamedAnnotation, node, NodeKind, statement,
+    TypeAnnotation, Visibility, visitor
 };
 import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
@@ -37,9 +37,11 @@ import std::collections::hashmap::{ HashMap, HashMapIter };
 import std::fmt;
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
-    DeclarationNode, FieldDeclNode, FunctionDeclNode, MethodNode, ReceiverForm,
+    DeclarationNode, FieldDeclNode, FunctionDeclNode, ImplBlockNode, MethodNode, ReceiverForm,
     StructDeclNode, VarDeclNode
 };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::ast::expression::{
     CalleePin,
     CallExprNode, ExpressionNode, IdentifierNode, LambdaExprNode, MemberAccessNode
@@ -303,7 +305,7 @@ type struct LambdaSynth {
         return recv;
     }
 
-    /// Synthesise the closure-struct + `__call__` (+ `drop` for non-Copy captures)
+    /// Synthesise the closure-struct + `__call__` (+ `Drop` for non-Copy captures)
     /// for a capturing lambda; returns the closure struct's TypeRef.
     synthesize_closure_struct(mut &this, lambda: LambdaExprNode*) -> TypeRef {
         const ctx_ptr: CompilationContext* = this.ctx;
@@ -413,39 +415,7 @@ type struct LambdaSynth {
         method.set_sink(false);
         struct_decl.add_method(method);
 
-        // 5b. Synthesize `drop` if any capture is non-Copy.
-        mut drop_method: MethodNode* = null;
-        const registry_ptr: GenericRegistry* = this.ctx.get_generic_registry();
-        mut has_noncopy_capture: boolean = false;
-        for (mut di: i64 = 0; di < lambda.captured_names.length; di++) {
-            if (!OwnershipQuery::is_copy(arena_ptr, registry_ptr, intern_ptr, lambda.captured_types[di])) {
-                has_noncopy_capture = true;
-                break;
-            }
-        }
-        if (has_noncopy_capture) {
-            const drop_name: SymbolStr = intern_ptr.intern("drop");
-            mut drop_fn: FunctionDeclNode* = new FunctionDeclNode(drop_name, span);
-            drop_fn.set_resolved_return_type(arena_ptr.get_void());
-            drop_fn.add_parameter(this.closure_receiver(struct_ref, span));
-
-            // The body is deliberately EMPTY: the captures are ordinary fields
-            // of the closure struct, and field glue releases them.  This is an
-            // inherent method, not a `Drop` implementation, so it is not the
-            // closure's destructor: releasing a closure is its captures' glue,
-            // and only a written `f.drop()` reaches this method.
-            mut drop_body: BlockStmtNode* = new BlockStmtNode(span);
-            drop_fn.set_body(drop_body);
-            drop_method = new MethodNode(drop_fn, span);
-            drop_fn.def = ctx_ptr.define_method(closure_def, drop_name, span,
-                drop_method as ASTNode*);
-            drop_method.set_visibility(Visibility::Public);
-            drop_method.set_static(false);
-            drop_method.set_sink(false);
-            struct_decl.add_method(drop_method);
-        }
-
-        // 6. Populate StructType.methods so overload resolution finds `__call__`/`drop`.
+        // 6. Populate StructType.methods so overload resolution finds `__call__`.
         if (struct_t != null && struct_t.kind == TypeKind::Struct) {
             const st: StructType* = struct_t as StructType*;
             mut method_param_types: TypeRef[] = [];
@@ -470,40 +440,79 @@ type struct LambdaSynth {
                 ast_node:      method as void*,
             };
             st.add_method(minfo);
-
-            if (drop_method != null) {
-                mut drop_param_types: TypeRef[] = [];
-                const drop_fn_ty: TypeRef = arena_ptr.get_function(
-                    arena_ptr.get_void(), drop_param_types, false);
-                const drop_minfo: MethodInfo = MethodInfo {
-                    name:          intern_ptr.intern("drop"),
-                    function_type: drop_fn_ty,
-                    is_public:     true,
-                    is_protected:  false,
-                    is_static:     false,
-                    is_virtual:    false,
-                    is_override:   false,
-                    param_types:   drop_param_types,
-                    ast_node:      drop_method as void*,
-                };
-                st.add_method(drop_minfo);
-            }
         }
 
         // 7. DeclarationIndex registration.
         struct_decl.def = closure_def;
         ctx_ptr.decl_index.register_type(closure_def, struct_ref, true);
         mut method_arr: MethodNode*[] = [method];
-        if (drop_method != null) { method_arr.push(drop_method); }
         ctx_ptr.decl_index.register_methods(
             struct_ref, method_arr, intern_ptr, arena_ptr, "closure/struct methods");
+        const drop_impl: ImplBlockNode* = this.closure_drop_impl(lambda, struct_decl, struct_ref, span);
 
         // 8. Inject into ProgramNode so subsequent passes walk it.
         if (ctx_ptr.artifacts.ast.root != null) {
             ctx_ptr.artifacts.ast.root.add_statement(struct_decl as ASTNode*);
+            if (drop_impl != null) {
+                ctx_ptr.artifacts.ast.root.add_statement(drop_impl as ASTNode*);
+            }
         }
 
         return struct_ref;
+    }
+
+    /// `implement trait Drop for struct <closure>`, for a closure that
+    /// captures a value that is not `Copy`; null when every capture is
+    /// `Copy`, so the closure is `Copy` too.  The destructor's body is
+    /// empty: the captures are the struct's fields, and they are released
+    /// after its `drop` runs, as any aggregate's are.  Being the closure's
+    /// destructor, it is what a written `f.drop()` and the scope-exit
+    /// release both reach.
+    closure_drop_impl(mut &this, lambda: LambdaExprNode*, struct_decl: StructDeclNode*,
+                      struct_ref: TypeRef, span: SourceSpan) -> ImplBlockNode* {
+        const registry_ptr: GenericRegistry* = this.ctx.get_generic_registry();
+        mut has_noncopy_capture: boolean = false;
+        for (mut di: i64 = 0; di < lambda.captured_names.length; di++) {
+            if (!OwnershipQuery::is_copy(this.arena, registry_ptr, this.intern, lambda.captured_types[di])) {
+                has_noncopy_capture = true;
+                break;
+            }
+        }
+        if (!has_noncopy_capture) { return null; }
+        const drop_id: DefId = registry_ptr.wellknown(LangItem::Drop);
+        if (!drop_id.is_valid()) { return null; }
+
+        const drop_name: SymbolStr = this.intern.intern("drop");
+        mut drop_fn: FunctionDeclNode* = new FunctionDeclNode(drop_name, span);
+        drop_fn.set_resolved_return_type(this.arena.get_void());
+        drop_fn.set_origin_trait(drop_id);
+        drop_fn.add_parameter(this.closure_receiver(struct_ref, span));
+        drop_fn.set_body(new BlockStmtNode(span));
+        mut drop_method: MethodNode* = new MethodNode(drop_fn, span);
+        drop_fn.def = this.ctx.define_method(struct_decl.def, drop_name, span,
+            drop_method as ASTNode*);
+        drop_method.set_visibility(Visibility::Public);
+        drop_method.set_static(false);
+        drop_method.set_sink(false);
+
+        mut impl_node: ImplBlockNode* = new ImplBlockNode(struct_decl.name, span);
+        // A synthesized head is walked by no resolver, so the synthesizer,
+        // which holds both definitions, records what it names.
+        impl_node.res.answer(Res::Def(struct_decl.def));
+        mut trait_ann: NamedAnnotation* = new NamedAnnotation {
+            name: this.intern.intern("Drop"), span: span, pre_resolved: TypeRef::invalid(),
+            res: ResSlot::Pending,
+        };
+        trait_ann.res.answer(Res::Def(drop_id));
+        impl_node.set_trait_annotation(new TypeAnnotation::Named(trait_ann));
+        impl_node.trait_def = drop_id;
+        impl_node.add_method(drop_method);
+
+        mut impl_methods: MethodNode*[] = [drop_method];
+        this.ctx.decl_index.register_methods(
+            struct_ref, impl_methods, this.intern, this.arena, "closure/drop impl");
+        registry_ptr.register_trait_impl(drop_id, struct_ref, impl_node);
+        return impl_node;
     }
 
     /// True when `ty` is a struct carrying a `__call__` method (a closure type).
