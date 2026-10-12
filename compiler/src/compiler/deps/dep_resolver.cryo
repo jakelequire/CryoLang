@@ -39,7 +39,6 @@ import compiler::deps::git::{ Git };
 import compiler::deps::lockfile::{ LockedDep, LockedVendor, Lockfile };
 import compiler::deps::semver::{ Constraint };
 import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
-import utils::text::{ Text };
 
 
 /// What the resolver is asked to do.
@@ -99,12 +98,12 @@ type struct DepKey {
     /// "path:<abs>" or "git:<sanitized-url>@<sha>".
     val: string;
 
-    static for_path(abs_path_text: Text) -> DepKey {
-        const abs_path: string = abs_path_text.as_string();
+    static for_path(abs_path_text: string) -> DepKey {
+        const abs_path: string = abs_path_text;
         return DepKey { val: fmt::format("path:%s", abs_path) };
     }
-    static for_git(url_text: Text, sha_text: Text) -> DepKey {
-        const sha: string = sha_text.as_string();
+    static for_git(url_text: string, sha_text: string) -> DepKey {
+        const sha: string = sha_text;
         return DepKey { val: fmt::format("git:%s@%s", Cache::sanitize_url(url_text), sha) };
     }
 }
@@ -123,7 +122,7 @@ type struct DepResolver {
     /// it.
     static resolve(top_config: ProjectConfig*,
                      mode: ResolveMode,
-                     lock_path_text: Text) -> ResolveOutcome {
+                     lock_path_text: string) -> ResolveOutcome {
         mut outcome: ResolveOutcome = ResolveOutcome::empty();
         mut visited: string[] = [];
 
@@ -224,24 +223,24 @@ type struct DepResolver {
                               new_lock: Lockfile*,
                               visited: string[]*,
                               outcome: ResolveOutcome*) -> void {
-        const dep_root: string = DepResolver::join_path(Text::new(cfg.project_root), Text::new(dep.path));
+        const dep_root: string = DepResolver::join_path(cfg.project_root, dep.path);
         if (!metadata::exists(Path::from(fmt::format("%s/cryoconfig", dep_root)))) {
-            cdebug(Text::new("[deps] path dep '%s': no cryoconfig at %s\n"), dep.name, dep_root);
+            cdebug("[deps] path dep '%s': no cryoconfig at %s\n", dep.name, dep_root);
             return;
         }
 
-        const key: DepKey = DepKey::for_path(Text::new(dep_root));
+        const key: DepKey = DepKey::for_path(dep_root);
         if (visited.contains(&key.val)) { return; }
         visited.push(key.val);
 
         const dep_cfg: ProjectConfig = ProjectConfig::parse(
-            Text::new(fmt::format("%s/cryoconfig", dep_root)));
+            fmt::format("%s/cryoconfig", dep_root));
         if (dep_cfg.error_count > 0) {
             fmt::eprintln(f"error: dependency '{dep.name}' has invalid cryoconfig at {dep_root}");
             outcome.failed = true;
             return;
         }
-        DepResolver::harvest_roots(&dep_cfg, Text::new(dep_root), Text::new(dep.path), dep.name, outcome);
+        DepResolver::harvest_roots(&dep_cfg, dep_root, dep.path, dep.name, outcome);
         DepResolver::walk_deps(&dep_cfg, mode, existing, new_lock, visited, outcome);
     }
 
@@ -272,8 +271,8 @@ type struct DepResolver {
                     return;
                 }
                 sha = locked.sha;
-                if (!Git::is_checkout_present(Text::new(dep.git_url), Text::new(sha))) {
-                    if (!Git::materialize_checkout(Text::new(dep.git_url), Text::new(sha))) {
+                if (!Git::is_checkout_present(dep.git_url, sha)) {
+                    if (!Git::materialize_checkout(dep.git_url, sha)) {
                         outcome.failed = true;
                         return;
                     }
@@ -291,7 +290,7 @@ type struct DepResolver {
                     }
                 }
                 if (!reused) {
-                    if (!Git::ensure_bare_clone(Text::new(dep.git_url), true)) {
+                    if (!Git::ensure_bare_clone(dep.git_url, true)) {
                         outcome.failed = true;
                         return;
                     }
@@ -301,7 +300,7 @@ type struct DepResolver {
                         return;
                     }
                 }
-                if (!Git::materialize_checkout(Text::new(dep.git_url), Text::new(sha))) {
+                if (!Git::materialize_checkout(dep.git_url, sha)) {
                     outcome.failed = true;
                     return;
                 }
@@ -317,11 +316,11 @@ type struct DepResolver {
         }
 
         // Cycle detection: scoped to this URL@SHA pair.
-        const key: DepKey = DepKey::for_git(Text::new(dep.git_url), Text::new(sha));
+        const key: DepKey = DepKey::for_git(dep.git_url, sha);
         if (visited.contains(&key.val)) { return; }
         visited.push(key.val);
 
-        const co_dir: string = Git::checkout_path(Text::new(dep.git_url), Text::new(sha));
+        const co_dir: string = Git::checkout_path(dep.git_url, sha);
         const dep_root: string = if (dep.subdir.length() > 0) {
             fmt::format("%s/%s", co_dir, dep.subdir)
         } else {
@@ -334,7 +333,7 @@ type struct DepResolver {
             outcome.failed = true;
             return;
         }
-        const dep_cfg: ProjectConfig = ProjectConfig::parse(Text::new(dep_cryo));
+        const dep_cfg: ProjectConfig = ProjectConfig::parse(dep_cryo);
         if (dep_cfg.error_count > 0) {
             fmt::eprintln(f"error: dependency '{dep.name}' has invalid cryoconfig at {dep_root}");
             outcome.failed = true;
@@ -343,7 +342,7 @@ type struct DepResolver {
         // Harvest using the absolute checkout path so source roots are
         // self-contained; the consumer's project_root is irrelevant for
         // git deps.
-        DepResolver::harvest_roots_abs(&dep_cfg, Text::new(dep_root), dep.name, outcome);
+        DepResolver::harvest_roots_abs(&dep_cfg, dep_root, dep.name, outcome);
         DepResolver::walk_deps(&dep_cfg, mode, existing, new_lock, visited, outcome);
     }
 
@@ -353,31 +352,31 @@ type struct DepResolver {
     static resolve_to_sha(dep: Dependency) -> string {
         match (dep.ref_kind) {
             GitRefKind::Version => {
-                const c: Constraint = Constraint::parse(Text::new(dep.ref_val));
+                const c: Constraint = Constraint::parse(dep.ref_val);
                 if (!c.valid) {
                     fmt::eprintln(f"error: dependency '{dep.name}' has invalid version constraint '{dep.ref_val}'");
                     return "";
                 }
-                const tags: string[] = Git::list_tags(Text::new(dep.git_url));
+                const tags: string[] = Git::list_tags(dep.git_url);
                 const best: string = Constraint::select_best_tag(c, tags);
                 if (best.length() == 0) {
                     fmt::eprintln(f"error: no tag in {dep.git_url} satisfies version '{dep.ref_val}'");
                     return "";
                 }
                 return Git::resolve_ref_to_sha(
-                    Text::new(dep.git_url), GitRefKind::Tag, Text::new(best));
+                    dep.git_url, GitRefKind::Tag, best);
             }
             GitRefKind::Tag => {
                 return Git::resolve_ref_to_sha(
-                    Text::new(dep.git_url), GitRefKind::Tag, Text::new(dep.ref_val));
+                    dep.git_url, GitRefKind::Tag, dep.ref_val);
             }
             GitRefKind::Branch => {
                 return Git::resolve_ref_to_sha(
-                    Text::new(dep.git_url), GitRefKind::Branch, Text::new(dep.ref_val));
+                    dep.git_url, GitRefKind::Branch, dep.ref_val);
             }
             GitRefKind::Rev => {
                 return Git::resolve_ref_to_sha(
-                    Text::new(dep.git_url), GitRefKind::Rev, Text::new(dep.ref_val));
+                    dep.git_url, GitRefKind::Rev, dep.ref_val);
             }
             GitRefKind::None => {
                 // parse_inline_table_into_dep would have flagged this.
@@ -413,11 +412,11 @@ type struct DepResolver {
     /// is the form the loader expects (relative for path deps so the
     /// loader prefixes consumer_root, absolute for git deps).
     static harvest_roots(dep_cfg: ProjectConfig*,
-                           dep_root: Text,
-                           path_for_loader_text: Text,
+                           dep_root: string,
+                           path_for_loader_text: string,
                            dep_name: string,
                            outcome: ResolveOutcome*) -> void {
-        const path_for_loader: string = path_for_loader_text.as_string();
+        const path_for_loader: string = path_for_loader_text;
         if (dep_cfg.lib.is_present() && dep_cfg.lib.source_dir.length() > 0) {
             outcome.roots.push(DepRoot {
                 path: fmt::format("%s/%s", path_for_loader, dep_cfg.lib.source_dir),
@@ -435,10 +434,10 @@ type struct DepResolver {
     /// Same as `harvest_roots` but always uses absolute paths; git deps
     /// live outside the consumer's project tree.
     static harvest_roots_abs(dep_cfg: ProjectConfig*,
-                               dep_root_text: Text,
+                               dep_root_text: string,
                                dep_name: string,
                                outcome: ResolveOutcome*) -> void {
-        const dep_root: string = dep_root_text.as_string();
+        const dep_root: string = dep_root_text;
         if (dep_cfg.lib.is_present() && dep_cfg.lib.source_dir.length() > 0) {
             outcome.roots.push(DepRoot {
                 path: fmt::format("%s/%s", dep_root, dep_cfg.lib.source_dir),
@@ -454,9 +453,9 @@ type struct DepResolver {
     }
 
     /// `<base>/<rel>` with a defensive shortcut when `base` is "." or empty.
-    static join_path(base_text: Text, rel_text: Text) -> string {
-        const base: string = base_text.as_string();
-        const rel: string = rel_text.as_string();
+    static join_path(base_text: string, rel_text: string) -> string {
+        const base: string = base_text;
+        const rel: string = rel_text;
         if (base.length() == 0 || base.eq(".")) {
             return rel;
         }

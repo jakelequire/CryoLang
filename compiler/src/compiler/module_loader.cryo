@@ -50,7 +50,6 @@ import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::module_graph::{ ModulePath, RecordedEdge };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
-import utils::text::{ Text };
 
 type struct ModuleLoader {
     project_root: string;
@@ -213,8 +212,8 @@ public:
                      graph: ModuleGraph*, sink: DiagnosticSink*,
                      entry_path: string, debug: boolean) -> boolean {
         if (debug) {
-            cdebug(Text::new("[ModuleLoader] Discovering project from: %s\n"), entry_path);
-            cdebug(Text::new("[ModuleLoader] Project root: %s\n"), this.project_root);
+            cdebug("[ModuleLoader] Discovering project from: %s\n", entry_path);
+            cdebug("[ModuleLoader] Project root: %s\n", this.project_root);
         }
 
         // Pre-scan: walk the project directory tree and lex every .cryo file
@@ -237,13 +236,13 @@ public:
                 fmt::format("%s/%s", this.project_root, rel)
             };
             if (debug) {
-                cdebug(Text::new("[ModuleLoader] Scanning extra root: %s\n"), root);
+                cdebug("[ModuleLoader] Scanning extra root: %s\n", root);
             }
             this.scan_all_project_files(intern, root, debug);
         }
 
         if (debug) {
-            cdebug(Text::new("[ModuleLoader] Pre-scan complete: %d namespaces indexed\n"),
+            cdebug("[ModuleLoader] Pre-scan complete: %d namespaces indexed\n",
                 this.ns_map.length());
         }
 
@@ -361,7 +360,7 @@ public:
 
         mut scan_sink: DiagnosticSink = DiagnosticSink::new();
         const source: string = this.source_for(file_path);
-        const lexer: Lexer = Lexer::new(Text::new(file_path), Text::new(source), &scan_sink);
+        const lexer: Lexer = Lexer::new(file_path, source, &scan_sink);
         const tokens: Token[] = lexer.lex();
 
         // Extract just the namespace; scan_tokens gives us everything
@@ -406,8 +405,8 @@ public:
             if (idx < 0) { return ""; }
             // A `[vendor.<lib>]` pin overrides the build triple for this lib.
             const triple: string =
-                VendorRegistry::normalize_triple(Text::new(this.triple_for_lib(lib)));
-            const f: string = this.vendor_registry.entries[idx].cache_file_for(Text::new(triple));
+                VendorRegistry::normalize_triple(this.triple_for_lib(lib));
+            const f: string = this.vendor_registry.entries[idx].cache_file_for(triple);
             if (f.length() > 0 && metadata::exists(Path::from(f))) {
                 // Surface the binding in the project build tree: copy the
                 // cache file into `<vendor_build_root>/<Name>/<Name>.cryo` and
@@ -421,7 +420,7 @@ public:
                     const name: string = this.vendor_registry.entries[idx].name;
                     const dest: string = fmt::format("%s/%s/%s.cryo",
                         this.vendor_build_root, name, name);
-                    ProjectConfig::mkdir_p(Text::new(dest.parent_dir()));
+                    ProjectConfig::mkdir_p(dest.parent_dir());
                     match (file::copy(Path::from(f), Path::from(dest))) {
                         Result::Ok(_)  => { return dest; }
                         Result::Err(_) => { return f; }
@@ -523,10 +522,10 @@ public:
             if (idx < 0) { continue; }
             const name: string = this.vendor_registry.entries[idx].name;
             const triple: string =
-                VendorRegistry::normalize_triple(Text::new(this.triple_for_lib(name)));
-            const file: string = this.vendor_registry.entries[idx].cache_file_for(Text::new(triple));
+                VendorRegistry::normalize_triple(this.triple_for_lib(name));
+            const file: string = this.vendor_registry.entries[idx].cache_file_for(triple);
             if (file.length() == 0) { continue; }
-            const sha: string = LockedVendor::file_sha(Text::new(file));
+            const sha: string = LockedVendor::file_sha(file);
             if (sha.length() == 0) { continue; }
             out.push(LockedVendor { name: name, triple: triple, binding_sha: sha });
         }
@@ -549,23 +548,23 @@ public:
         mut span: SourceSpan = SourceSpan::none();
         if (at < scan.import_spans.length) {
             const raw: SourceSpan = scan.import_spans[at];
-            span = SourceSpan::new(Text::new(file_path),
+            span = SourceSpan::new(file_path,
                 raw.start_line, raw.start_col,
                 raw.end_line, raw.end_col);
         }
         const suggestion: string = this.suggest_module(path);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0500_MODULE_NOT_FOUND,
-            Text::new(fmt::format("cannot find module `%s`", path)));
+            fmt::format("cannot find module `%s`", path));
         if (span.has_location()) {
             diag = diag.at_with_label(span,
-                Text::new(fmt::format("no module named `%s` is in scope", path)));
+                fmt::format("no module named `%s` is in scope", path));
         }
         if (suggestion.length() > 0) {
-            diag = diag.with_note(Text::new(fmt::format("did you mean `%s`?", suggestion)));
+            diag = diag.with_note(fmt::format("did you mean `%s`?", suggestion));
         }
         return diag.help(
-            Text::new("imports resolve against the project root, the entry-point directory, and the standard library; module paths are case-sensitive"));
+            "imports resolve against the project root, the entry-point directory, and the standard library; module paths are case-sensitive");
     }
 
     suggest_module(&this, import_path: string) -> string {
@@ -616,7 +615,7 @@ public:
                 && this.lsp_override_path.eq(file_path));
         if (!is_override && !metadata::exists(Path::from(file_path))) {
             const msg: string = fmt::format("module file not found: '%s'", file_path);
-            sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, Text::new(msg)));
+            sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, msg));
             return false;
         }
 
@@ -624,13 +623,13 @@ public:
         this.push_loading(norm_path);
 
         if (debug) {
-            cdebug(Text::new("[ModuleLoader] Discovering: %s\n"), file_path);
+            cdebug("[ModuleLoader] Discovering: %s\n", file_path);
         }
 
         // Quick-scan the file: lex only, extract namespace and import paths
         mut scan_sink: DiagnosticSink = DiagnosticSink::new();
         const source: string = this.source_for(file_path);
-        const lexer: Lexer = Lexer::new(Text::new(file_path), Text::new(source), &scan_sink);
+        const lexer: Lexer = Lexer::new(file_path, source, &scan_sink);
         const tokens: Token[] = lexer.lex();
 
         // Extract namespace and imports from token stream
@@ -643,7 +642,7 @@ public:
         }
 
         if (debug) {
-            cdebug(Text::new("[ModuleLoader]   namespace: '%s', imports: %d\n"),
+            cdebug("[ModuleLoader]   namespace: '%s', imports: %d\n",
                 intern.resolve(scan.namespace_name), scan.import_count);
         }
 
@@ -691,7 +690,7 @@ public:
             // _module.cryo).
             mut resolved: string = this.resolve_import_path(intern, import_sym, file_dir);
             if (debug) {
-                cdebug(Text::new("[ModuleLoader]   import '%s' -> '%s'\n"), import_path, resolved);
+                cdebug("[ModuleLoader]   import '%s' -> '%s'\n", import_path, resolved);
             }
             if (resolved.length() == 0) {
                 // Filesystem resolution failed; check if the module was
@@ -705,7 +704,7 @@ public:
                     // Module already in graph: use its recorded file path
                     resolved = graph.modules[already_idx].file_path;
                     if (debug) {
-                        cdebug(Text::new("[ModuleLoader]   import '%s' -> '%s' (found in graph)\n"),
+                        cdebug("[ModuleLoader]   import '%s' -> '%s' (found in graph)\n",
                             import_path, resolved);
                     }
                 } else if (scan.import_entry_items[i] >= 0) {
@@ -837,7 +836,7 @@ public:
             const sub_file: string = this.sub_module_file(intern, owner_file, scan.path_rests[bp]);
             if (sub_file.length() == 0) { continue; }
             if (debug) {
-                cdebug(Text::new("[ModuleLoader]   path '%s' -> '%s'\n"), intern.resolve(scan.path_rests[bp]), sub_file);
+                cdebug("[ModuleLoader]   path '%s' -> '%s'\n", intern.resolve(scan.path_rests[bp]), sub_file);
             }
             if (!this.discover_module(intern, graph, sink, sub_file, debug)) {
                 success = false;
@@ -866,7 +865,7 @@ public:
             const exp_path: string = intern.resolve(exp_sym);
             const exp_resolved: string = this.resolve_import_path(intern, exp_sym, file_dir);
             if (debug) {
-                cdebug(Text::new("[ModuleLoader]   export '%s' -> '%s'\n"), exp_path, exp_resolved);
+                cdebug("[ModuleLoader]   export '%s' -> '%s'\n", exp_path, exp_resolved);
             }
             if (exp_resolved.length() > 0) {
                 if (!this.discover_module(intern, graph, sink, exp_resolved, debug)) {
@@ -903,18 +902,18 @@ public:
             mut exp_span: SourceSpan = SourceSpan::none();
             if (ei < scan.export_spans.length) {
                 const raw: SourceSpan = scan.export_spans[ei];
-                exp_span = SourceSpan::new(Text::new(file_path),
+                exp_span = SourceSpan::new(file_path,
                     raw.start_line, raw.start_col, raw.end_line, raw.end_col);
             }
             mut exp_diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0500_MODULE_NOT_FOUND,
-                Text::new(fmt::format("cannot find module `%s`", exp_path)));
+                fmt::format("cannot find module `%s`", exp_path));
             if (exp_span.has_location()) {
                 exp_diag = exp_diag.at_with_label(exp_span,
-                    Text::new(fmt::format("no module named `%s` is in scope", exp_path)));
+                    fmt::format("no module named `%s` is in scope", exp_path));
             }
             exp_diag = exp_diag.with_note(
-                Text::new("an `export` names a module path, the same as an `import`"));
+                "an `export` names a module path, the same as an `import`");
             sink.emit(exp_diag);
             success = false;
         }
@@ -962,7 +961,7 @@ public:
             const sub_sym: SymbolStr = scan.submodule_paths[s];
             const sub_resolved: string = this.resolve_import_path(intern, sub_sym, file_dir);
             if (debug) {
-                cdebug(Text::new("[ModuleLoader]   submodule '%s' -> '%s'\n"), intern.resolve(sub_sym), sub_resolved);
+                cdebug("[ModuleLoader]   submodule '%s' -> '%s'\n", intern.resolve(sub_sym), sub_resolved);
             }
             if (sub_resolved.length() > 0) {
                 if (!this.discover_module(intern, graph, sink, sub_resolved, debug)) {
@@ -1130,7 +1129,7 @@ public:
                         end_line = last.line;
                         end_col  = last.column + last.source_length;
                     }
-                    const path_span: SourceSpan = SourceSpan::new(Text::new(""),
+                    const path_span: SourceSpan = SourceSpan::new("",
                         path_line as u32, path_col as u32,
                         end_line as u32, end_col as u32);
                     if (is_exp) {
