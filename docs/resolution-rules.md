@@ -1620,3 +1620,207 @@ dropped, and are not to be started:
 
 The pending allows, the residue file and the approved-names file are
 retired after the flow conversions, and are left alone until then.
+
+### Earlier decisions (D1-D77)
+
+Decided before the numbered rulings began, and numbered apart from them.
+Each is stated as the behaviour it requires.  A decision since replaced,
+dropped or deferred says so; a deferred one is listed in
+`docs/roadmap.md`.
+
+- **D1.** A name's stamp (`Res`) is authoritative: what the name layer
+  bound is what the name means, not a hint a later pass may override.
+- **D2.** There is no separate function namespace.  The value namespace
+  holds every value-bearing declaration: variables, parameters, constants,
+  enum variants, functions, methods and intrinsics.
+- **D3, D4.** *Replaced by D5.* Modules binding in the type namespace, and
+  `A::B` preferring the type.
+- **D5.** Modules and types share one namespace.  In a file's scope a name
+  is a module or a type, never both; the pair is a redeclaration (E0205)
+  at the declaration or import that completed it.
+- **D6.** Intrinsics are namespaced.  A bare name always means a
+  declaration in scope, never an intrinsic reached around it; intrinsics
+  are reached through `std::core::intrinsics`.
+- **D7.** Imports do not glob.  A plain `import M;` binds the module and no
+  names from it.  The globs that remain are the written `M::*`, the prelude
+  and the formatted-string runtime the compiler imports for a program.
+- **D8.** There is no inline `<T: Bound>` form; bounds are written in
+  `where`.
+- **D9.** Type declarations take `where` between the head and the body,
+  and an instantiation whose argument does not satisfy a bound is E0306 at
+  the annotation that wrote it.
+- **D10.** A leaf that names two declarations is E0155, never a bind in
+  directory order - and so is a leaf two children of one facade declare,
+  reached by a qualified path, in a call as in an annotation.
+- **D11.** The resolution counter and its audit streams are removed from
+  the compiler entirely.
+- **D12.** *Ended by the five rules.* A public name-keyed lookup guarded by
+  a gate instead of privacy.
+- **D13.** The parser records a `new` path whole; resolution classifies
+  it.  A type owning the tail means a variant; any other answer means the
+  path names the type.
+- **D14.** A re-exported name is reachable through the facade that
+  re-exports it: one item, many paths, one identity.  A name two of the
+  facade's children declare is refused, not picked.
+- **D15.** *Stopped.* Requalifying the tree to `import M;` plus `M::Thing`
+  is not resumed without a new decision.
+- **D16.** An `implement` head writes every parameter of the template it
+  names, as its own parameters or as a concrete instantiation; one left
+  out is E0302.  `implement<A> trait Display for String<A>`, or `for
+  String<GlobalAlloc>`.  The concrete spelling is honoured by selection:
+  `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>`.
+- **D17.** An `extern "C"` function is public unless written `private`.
+- **D18.** The primitive type names stop being keywords, and the alias
+  keywords `int`, `uint`, `float`, `double` fold to their primitive at the
+  name layer (`int` is `i32`).  The alias fold is part of the language; the
+  keyword half is deferred to a branch of its own after the merge.
+- **D19.** A bare `malloc`, `free` or `realloc` with no declaration in the
+  writing module is an error (E0202), whose note names the modules that
+  declare the leaf: write `libc::free` or `heap::free`.
+- **D20.** `import Unknown;` naming no module is E0502 at the import, in
+  every form; the help names the module the path abbreviates.
+- **D21.** An unknown type in expression or type-argument position
+  (`sizeof(Nope)`, `1 as Nope`, `String<Nope>`) is an error.  A defaulted
+  type parameter resolves in the module where the type is declared, so
+  `String` fills in `GlobalAlloc` without the user importing it; a user who
+  writes the argument needs it in scope.
+- **D22.** A trait head's trailing type list declares nothing: a name there
+  declared nowhere is E0302, and the head is written `implement<T> trait
+  Atomic<T> for ...`.
+- **D23.** A consumer that meets an unstamped node treats it as an error,
+  never as a cue to look the name up another way.
+- **D24.** The trait-implementation registry is keyed by the trait's
+  identity and the target, a list per key, with one selector by
+  unification.  Two traits of one leaf implemented for one type are two
+  implementations.
+- **D25.** `(Beta for P)::make()` is the impl-qualified call: the method
+  `Beta`'s implementation for `P` delivers.  It covers static and receiver
+  methods (`(Beta for P)::go(&p)`), values, and generic bodies (`(Beta for
+  T)::make()`).
+- **D26.** Two traits providing one method for a type is an error (E0156)
+  in both call forms, `recv.m(...)` and `T::m(recv, ...)`, with each
+  candidate named; never a pick by declaration or import order.  The
+  trait-qualified `Tr::m(&recv, ...)` or the impl-qualified call chooses.
+- **D27.** *Rejected.* Requiring a trait to be in scope before its methods
+  can be called.  Trait methods are called with the trait imported nowhere,
+  and scope would not settle a tie; D25 gives a tie its spelling.  Not to
+  be proposed again without new measurements.
+- **D28.** Overlapping implementations - two heads of one trait that could
+  both accept one type - are refused at the later head (E0308), not
+  resolved by specialization or declaration order.
+- **D29.** `implement trait Tick for struct Holder<S>` with `S` declared
+  nowhere is E0302, whose message says the head names `S`, declared
+  nowhere.  A nested `Holder<Vec<S>>` is E0203 from the general refusal.
+- **D30.** A generic parameter that shadows an enclosing one is refused
+  (E0311): a method's `<T>` inside `Box<T>`, a trait method's, an impl
+  method's, and `<T, T>` in one list.  Each parameter is its own identity,
+  so substitution never merges two parameters of one name.
+- **D31.** In expression position `<` opens type arguments only
+  immediately after `::`; anywhere else it is a comparison.
+  `foo::<i32>(y)`, `Array::<int>::new()`.
+- **D32.** *Replaced by the five rules.* A completion criterion counted in
+  name-keyed reads.
+- **D33.** A `DefId` is a position in a `DefTable` only its own module can
+  extend.  `register` always appends and never looks anything up; no
+  accessor returns the number, which never reaches output and is never
+  persisted or compared across builds.  Instantiations carry their own
+  handle rather than a definition.
+- **D34.** Intrinsic functions are exported through their module: `import`
+  brings them in and the module path reaches them.  A bare `panic` is
+  `std::core`'s function.
+- **D35.** Function and method overloading are both kept.  A family is
+  keyed by its owner (a module or a type) and the written leaf; a lookup
+  returns the set and its caller chooses.
+- **D36.** Every non-static method writes its receiver explicitly; a method
+  the compiler generates still gets one synthesized.  Deferred to a branch
+  of its own after the merge.
+- **D37.** A check of reference mutability runs before the async lowering,
+  which turns an async method's receiver into a raw pointer.  Deferred to
+  a branch of its own after the merge.
+- **D38.** The editor's bare-name finders live in the editor, not the
+  compiler, until the editor's own work after the merge.
+- **D39.** An implement block's parameters bind through its head, and a
+  parameter's type is its declaration's: every comparison of parameters is
+  by identity.
+- **D40.** An incremental build loses the warnings of a module reused from
+  cache.  Filed, not fixed: a warning total is evidence only from a clean
+  build, and warnings compare as sets.
+- **D41.** *Replaced by the five rules.* An approved list of name-taking
+  functions.
+- **D42.** *Removed with the lint layer.* The compiler reporting its own
+  lookups through `--emit=facts`.
+- **D43.** *Removed with the lane gate.* The lane counts' re-pins.
+- **D44.** An import that binds nothing in the requested namespace keeps
+  its answer in the other; it is neither an error nor a cue to walk on.
+- **D45.** Nothing stores a namespace as text.  A type's, template's or
+  symbol's module is a module identity, made once where source text enters;
+  `ModuleGraph::module_named` is a door private to the name layer and the
+  module loader.
+- **D46.** `TypeRef` is sealed: its number and constructor are private to
+  its module, read through `key`, compared through `equals`, and made only
+  by the arena's allocator.
+- **D47.** Identities carry a generation tag checked where they are read: a
+  `DefId`, `SymbolID`, `TypeRef` or `OverloadId` another table made, or one
+  made before a rebuild, is refused by the table rather than answered.
+- **D48.** *Replaced by D47.* One allocator per identity kind.  A second
+  table still compiles; nothing it mints is answered.
+- **D49.** Both a `deprecated` attribute and a deny-by-default lint whose
+  allow carries a reason, for their separate jobs.  Deferred to a branch of
+  its own after the merge; the attribute is reconsidered once the lint
+  exists (D64).
+- **D50.** Two records that disagree are re-measured, not reconciled to
+  either document.
+- **D51.** A literal or range pattern whose kind is not the subject's type
+  is E0200 at the pattern, not an arm that silently never matches.
+- **D52-D55, D57, D58.** *Removed with the lint layer.* The spelling-type
+  list, the spelling lint's site, E0157, its spec text, the `Keyword` type
+  and the lane counts' re-pins.
+- **D56.** A link symbol is a `MangledName`, a type of its own, not a
+  spelling with a written reason.
+- **D59.** A bare identifier in expression position may not name a type:
+  it is asked in the value namespace alone, and a name that is only a type
+  is E0201 as a value and E0231 as a callee.
+- **D60.** The `raw` subcommand builds a module graph as `check` and
+  `build` do.  Deferred to a branch of its own after the merge.
+- **D61.** A dynamic array's method arguments are type-checked before code
+  generation, against `Array<T>`'s method (E0214).
+- **D62.** *Removed with the facts emitter.* Declaration records for the
+  move checker's count.
+- **D63.** The editor drops its fallback for a file with no project.
+  Deferred to the editor's work after the merge.
+- **D64.** The `deprecated` attribute is reconsidered once the lint of D49
+  exists.  Deferred with it.
+- **D65.** Explicit receivers on every non-static function, as D36.
+  Deferred to a branch of its own after the merge.
+- **D66.** With the primitive keywords (D18), a cast followed by a
+  comparison without parentheses (`x as u32 < y`) is refused and the
+  parentheses asked for.  Deferred with D18.
+- **D67, D75.** *Replaced by the five rules.* The audit rounds and the
+  third condition of the old finish line.
+- **D68.** A class that declares a constructor binds it in the value
+  namespace beside the class in the type namespace: `Node(1)` calls the
+  constructor.
+- **D69-D72, D76.** *Dropped* (2026-09-28, above).
+- **D73.** `new C(args)` and the by-value `C(args)` are checked against the
+  constructor of their arity.
+- **D74.** The monomorphizer matches type arguments by identity: a type
+  argument's shape is its kind in the arena, and a written instantiation is
+  compared as the type it denotes, never by its display text.
+- **D77.** The fast check catches what the full build does for a struct
+  compared with `null`, `printf`-style call arguments, and `Point(1, 2)` on
+  a struct (closed by D59).
+
+### Open questions carried from the ledger
+
+- **Q1.** *Answered by measurement.* Per-item `public` was not needed at a
+  scale that blocked the work.
+- **Q2.** *Answered.* An `extern module` alias (`extern module libc as
+  cit;`) is a real module in the graph, with a stamp, not a namespace
+  symbol resolution special-cases.
+- **Q3.** A module cycle is E0501, which names the modules in the cycle.
+  Whether it prints the cycle's path, in order, is open; see
+  `docs/roadmap.md`.
+- **Q4.** Whether `std::Range` is a name: nothing re-exports `Range` at the
+  root of `std` today, so the path is refused.  Open; see
+  `docs/roadmap.md`.
+- **Q13.** *Answered by D68.*

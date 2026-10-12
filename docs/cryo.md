@@ -399,7 +399,10 @@ implicitly flips the lambda to move semantics. The compiler synthesises an
 anonymous struct holding the captured fields plus a `__call__` method whose
 body is the lambda body; the closure value is the struct instance and the
 call site dispatches directly through `__call__`. Stack-allocated; no heap
-allocation.
+allocation. A closure with a non-Copy capture implements `Drop` - an empty
+`drop`, after which the captures are released as any aggregate's fields are
+- so a written `f.drop()` releases what it captured exactly once, and so does
+leaving its scope; a closure whose captures are all Copy is itself Copy.
 
 ```cryo
 const bias: i32 = 10;
@@ -447,6 +450,8 @@ const h: (i32) -> i32 = idf;         // idf::<i32>
 const k = idf::<i64>;                // (i64) -> i64
 const n: i32 = h(3);                 // 3
 ```
+
+**A bare name in expression position is a value.** An identifier written alone in an expression is looked up among values only. A name that declares only a type is refused there - as a value (E0201) and as a callee (E0231) - so `Point(1, 2)` on a struct is an error and `Point { x: 1, y: 2 }` is the literal; a class's constructor is a value and is called by the class's name ([section 9.2](#92-constructors-and-destructors)).
 
 **Calling something that is not a function.** A call whose callee has a
 non-function type is refused with E0213, whether the callee is a call's
@@ -587,6 +592,8 @@ const a: i64 = 42;
 const b: i32 = a as i32;          // narrowing: programmer's responsibility
 const p: u8* = some_string as u8*; // pointer reinterpretation
 ```
+
+A cast to a struct, class, tuple or array **value** is a cast from a value of that same type, and nothing else: `p as Point` with `p` a pointer, or one aggregate cast to another, is refused (`E0208`). A class converts along its hierarchy by pointer - `dog_ptr as Animal*` - and `*p` reads the value a pointer points at.
 
 ### 2.10 Optional Types (`T?`)
 
@@ -974,7 +981,7 @@ Only `mut` bindings can be assigned to.
 | `*`            | Dereference (unary).                                                                                                                          |
 | `sizeof(T)`    | Compile-time size of `T` in bytes.                                                                                                            |
 | `alignof(T)`   | Compile-time alignment of `T` in bytes.                                                                                                       |
-| `typeof(expr)` | Compile-time type of `expr`, used in type position (decltype-style).                                                                          |
+| `typeof(expr)` | Compile-time type of `expr`, used in type position.                                                                                          |
 | `new` `delete` | Heap allocation / deallocation.                                                                                                               |
 
 > **Reserved.** `?.` and `...` in call position are recognised by the lexer but not yet lowered. See [section 22](#22-reserved-syntax). (The range operators `..` / `..=` *are* fully lowered - see [section 5.7](#57-operator-precedence).)
@@ -1308,6 +1315,8 @@ A pattern describes the shape of a value. When a value matches, any variables in
 | Enum (with payload) | `Shape::Circle(r)`             | That variant; binds the payload to `r`. |
 | Range               | `'0'..'9'`                     | Any value in the range (inclusive).     |
 | Or                  | `pat \| pat \| pat`            | Any of the listed patterns.             |
+
+A literal or range pattern is of its literal's kind, and that kind must be the subject's own type: an integer pattern matches an integer subject, a string pattern a `string`, a character pattern a `char`. A pattern of any other kind is refused at the pattern (`E0200`) rather than built as an arm that never matches - `"x"` against a struct subject is an error, not a dead arm.
 
 ### 7.2 Enum Destructuring
 
@@ -1647,7 +1656,7 @@ p.greet();
 
 ### 9.2 Constructors and Destructors
 
-Constructors share the class name. They are real language constructs that `new` invokes, not a naming convention as on structs.
+Constructors share the class name. They are real language constructs that `new` invokes, not a naming convention as on structs. A class that declares a constructor binds it in the **value** namespace beside the class in the type namespace, so `Person("Alice", 30)` in expression position calls the constructor, while `Person` in a type position names the class.
 
 A generic class constructed by value is the instance its written type arguments name, else the one the expected type names, else the one its constructor's arguments bind - inferred as a generic function call infers its own, a literal by its own type when nothing else binds the parameter:
 
@@ -1924,7 +1933,7 @@ implement trait Ord for i32 {
 }
 ```
 
-You may implement a trait for any type defined in the same crate, including primitive types.
+You may implement a trait for any type a program can name, including primitive types.
 
 A trait has at most one implementation for any type, and that is decided by the heads alone. Two implementations of one trait whose heads unify - some type both would accept - are refused at the later one (`E0308`), whether the heads are identical, one generic and one concrete (`Show for Wrap<T>` beside `Show for Wrap<i32>`: a `Wrap<i32>` would select both), or told apart only by their `where` clauses (`Emit for Holder<T> where T: Alpha` beside `Emit for Holder<T> where T: Beta`: a bound narrows which types a head is for but nothing can prove two bounds disjoint). There is no specialisation and no selection by declaration order. Heads that no type satisfies together are distinct implementations: `Show for Pair<T, T>` beside `Show for Pair<i32, u8>`, or `From<i8> for u64` beside `From<u8> for u64`.
 
@@ -2319,6 +2328,8 @@ implement<T, A> trait Clone for Array<T, A> { /* ... */ }      // not `Array<T>`
 
 An inherent block declares its parameters in the same list that names them, so `implement enum Option<T> { /* ... */ }` is the one spelling for `Option<T>`.
 
+A trait head declares its parameters in the leading list. A name in the trailing list that is declared nowhere is the same error (E0302), with the head spelled as it must be written: `implement trait Atomic<T> for Cell<T>` with no `T` declared is refused, and `implement<T> trait Atomic<T> for Cell<T>` is the head it meant.
+
 ### 12.3 Generic Enums
 
 ```cryo
@@ -2569,7 +2580,7 @@ const b: i64 = (Beta for IgTn)::go(&ig, 7);  // 2
 const c: i64 = via::<IgTn>(&ig);             // 2: the bound names `Beta::go`
 ```
 
-**A method as a value.** A method named by path without a call is a function value. A static method's value has the method's own signature; a method with a receiver takes the receiver as its first parameter: for `step(&this, u: i32) -> i64`, `Pt::step` is a `(&Pt, i32) -> i64`, called `f(&p, 7)`; `mut &this` gives `mut &Pt` and `this` gives `Pt`. The value names one method, so an inherent `m` beside a trait's `m` is the same tie (E0156) and `(Tr for T)::m` chooses. A method generic in its own parameters, or a method of a generic owner, is taken as a value the same way, and its type arguments are inferred from the use, as a generic function's are ([section 2.5](#25-function-types)): `const g: (&Wrap<i32>) -> i32 = Wrap::get;`.
+**A method as a value.** A method named by path without a call is a function value. A static method's value has the method's own signature; a method with a receiver takes the receiver as its first parameter: for `step(&this, u: i32) -> i64`, `Pt::step` is a `(&Pt, i32) -> i64`, called `f(&p, 7)`; `mut &this` gives `mut &Pt` and `this` gives `Pt`. The value names one method, so an inherent `m` beside a trait's `m` is the same tie (E0156) and `(Tr for T)::m` chooses. A method generic in its own parameters, or a method of a generic owner, is taken as a value the same way, and its type arguments are inferred from the use, as a generic function's are ([section 2.5](#25-function-types)): `const g: (&Wrap<i32>) -> i32 = Wrap::get;`. A generic owner's method with parameters of its own binds both sets: the owner's from the arguments written on the owner or the expected type, the method's from its turbofish or the expected type, so `Wrap::<i32>::conv::<u8>` and `const k: (&Wrap<i32>, u16) -> i32 = Wrap::keep;` are each one instance. A parameter nothing binds is E0307.
 
 ```cryo
 type struct Pt { v: i32; }
@@ -2642,6 +2653,8 @@ import Math::Vector::{ Vec2, Vec3 };  // selective import (brace list)
 import Math::Vector::{ Vec2 as P2 };  // an item under another name
 import Math::Vector::Vec3 as P3;      // the same, for one item
 ```
+
+A plain `import Math::Vector;` binds the module and no names from it: its items are reached by path, `Vector::Vec2`. Only the wildcard brings a module's names in bare, and the compiler's own prelude is the one wildcard a file gets without writing it. An import whose path names no module is refused at the import (`E0502`), and the help names the module the path abbreviates (`core::option` for `std::core::option`).
 
 An entry's `as` binds the declaration it names under another name, and only that name: `import Toml::{ parse as toml_parse };` makes `toml_parse` Toml's `parse`, and does not bring `parse` into scope. The alias is the declaration itself - its overloads, its generic parameters, a type's statics and methods - not a second spelling looked up later.
 
@@ -2756,6 +2769,8 @@ Two rules follow and are not optional:
 
 - **An export never widens visibility.** A `private` declaration stays unreachable through any number of hops. Naming one in a brace list is `E0241`, reported where the export is written, because that is the only place an author can fix it.
 - **Re-exports chain, and every hop is explicit.** An `export` may name something the exporting module itself obtained through an `export`, so a chain can be as long as you like — but a module that writes no `export` re-exports nothing. No name arrives anywhere by accident, and moving a declaration between a module's children stays invisible to that module's ancestors.
+
+A re-exported name is one declaration reachable by many paths: through the facade it is the same item, with the same identity, as at its home. A name that two of the facade's children both declare and both reach it through is refused where it is used through the facade (`E0155`), in a call as in a type annotation; neither child is picked.
 
 Because an `export` changes what is *reachable* and never what is *compiled first*, two modules may re-export from each other without either becoming unsatisfiable.
 

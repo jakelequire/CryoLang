@@ -5907,18 +5907,51 @@ type struct CallResolver {
     /// function type binds when unified with the method's signature -
     /// receiver first for a method with one.  The method's definition, its
     /// owner and the arguments are recorded on the node, from which
-    /// monomorphization mints and pins the instance.  `owns` says whether
-    /// the path names such a method at all - on an owner without type
-    /// parameters of its own - so the caller's answer is this one, valid or
-    /// refused.
+    /// monomorphization mints and pins the instance.  On a generic owner,
+    /// `Wrap::<i32>::conv::<u8>`, the value is the method of one instance
+    /// of the owner too, whose arguments the path writes on the owner or the
+    /// expected type binds.  `owns` says whether the path names such a
+    /// method at all, so the caller's answer is this one, valid or refused.
     generic_method_value(mut &this, scope: ScopeResolutionNode*, found: TypeRef,
                          owns: mut &boolean) -> TypeRef {
         if (!found.is_valid() || scope.impl_trait != null) { return TypeRef::invalid(); }
-        const ft0: Type* = this.arena.lookup(found);
+        mut owner: TypeRef = this.arena.inst_generic_base(found);
+        if (!owner.is_valid()) { owner = found; }
+        const ft0: Type* = this.arena.lookup(owner);
         if (ft0 == null || (ft0.kind != TypeKind::Struct && ft0.kind != TypeKind::Class)) { return TypeRef::invalid(); }
-        const m: MethodInfo* = this.ctx.decl_index.type_method(found, scope.member_name, this.arena);
-        if (m == null || m.ast_node == null) { return TypeRef::invalid(); }
-        const node: MethodNode* = m.ast_node as MethodNode*;
+        // A generic owner's methods are its template's family, read through
+        // the member-function door; a type's own are its method table's.
+        const owner_entry: TemplateEntry* = this.ctx.generic_registry.template_of_type(owner);
+        const generic_owner: boolean = owner_entry != null && owner_entry.param_types.length > 0;
+        mut node: MethodNode* = null;
+        mut is_static: boolean = false;
+        mut call_params: TypeRef[] = [];
+        mut ret: TypeRef = TypeRef::invalid();
+        mut variadic: boolean = false;
+        if (generic_owner) {
+            const entries: OverloadId[] = this.member_entries(FamilyOwner::Type(owner), scope.member_name);
+            if (entries.length != 1) { return TypeRef::invalid(); }
+            node = this.ctx.decl_index.entry_method(entries[0]);
+            if (node == null || node.func == null) { return TypeRef::invalid(); }
+            is_static = node.is_static;
+            for (mut i: i64 = 0; i < node.func.parameters.length; i++) {
+                const p: VarDeclNode* = node.func.parameters[i];
+                if (p == null || !p.resolved_type.is_valid()) { return TypeRef::invalid(); }
+                if (!p.is_receiver()) { call_params.push(p.resolved_type); }
+            }
+            ret = node.func.resolved_return_type;
+        } else {
+            const m: MethodInfo* = this.ctx.decl_index.type_method(owner, scope.member_name, this.arena);
+            if (m == null || m.ast_node == null) { return TypeRef::invalid(); }
+            node = m.ast_node as MethodNode*;
+            is_static = m.is_static;
+            const st: Type* = this.arena.lookup(m.function_type);
+            if (st == null || st.kind != TypeKind::Function) { return TypeRef::invalid(); }
+            const ft: FunctionType* = st as FunctionType*;
+            for (mut i: i64 = 0; i < ft.param_types.length; i++) { call_params.push(ft.param_types[i]); }
+            ret = ft.return_type;
+            variadic = ft.is_variadic;
+        }
         if (node.func == null || node.func.generic_params.length == 0 || !node.func.def.is_valid()) {
             return TypeRef::invalid();
         }
@@ -5927,23 +5960,33 @@ type struct CallResolver {
         // Read again after monomorphization: the instance it was pinned to.
         const pinned: OverloadId = scope.resolved_callee.decl_entry();
         if (pinned.is_valid()) { return this.ctx.decl_index.entry_signature(pinned); }
-        const st: Type* = this.arena.lookup(m.function_type);
-        if (st == null || st.kind != TypeKind::Function) { return TypeRef::invalid(); }
-        const ft: FunctionType* = st as FunctionType*;
-        mut params: TypeRef[] = [];
-        if (!m.is_static) {
-            if (node.func.parameters.length == 0) { return TypeRef::invalid(); }
-            const recv: VarDeclNode* = node.func.parameters[0];
-            if (recv == null || !recv.is_receiver() || !recv.resolved_type.is_valid()) { return TypeRef::invalid(); }
-            params.push(recv.resolved_type);
-        }
-        for (mut i: i64 = 0; i < ft.param_types.length; i++) { params.push(ft.param_types[i]); }
-        const sig: TypeRef = this.arena.get_function(ft.return_type, &params, ft.is_variadic);
+        if (!ret.is_valid()) { return TypeRef::invalid(); }
         // Each type parameter as the signature names it, found by the
         // symbol its declaration bound; one the signature never names has
         // no handle, and only a turbofish binds it.
         mut named: TypeRef[] = [];
-        this.arena.generic_params_in(sig, &named);
+        for (mut i: i64 = 0; i < call_params.length; i++) { this.arena.generic_params_in(call_params[i], &named); }
+        this.arena.generic_params_in(ret, &named);
+        mut owner_handles: TypeRef[] = [];
+        if (generic_owner && !this.owner_param_handles(owner_entry, node, &named, &owner_handles)) {
+            return TypeRef::invalid();
+        }
+        mut params: TypeRef[] = [];
+        if (!is_static) {
+            if (node.func.parameters.length == 0) { return TypeRef::invalid(); }
+            const recv: VarDeclNode* = node.func.parameters[0];
+            if (recv == null || !recv.is_receiver() || !recv.resolved_type.is_valid()) { return TypeRef::invalid(); }
+            // A generic owner's receiver is the owner over the parameters
+            // the signature names.
+            params.push(if (generic_owner) {
+                this.receiver_over(recv.resolved_type,
+                    this.arena.create_instantiation(owner_entry.base_type, &owner_handles))
+            } else {
+                recv.resolved_type
+            });
+        }
+        for (mut i: i64 = 0; i < call_params.length; i++) { params.push(call_params[i]); }
+        const sig: TypeRef = this.arena.get_function(ret, &params, variadic);
         mut handles: TypeRef[] = [];
         mut syms: SymbolID[] = [];
         mut bindings: TypeRef[] = [];
@@ -5958,6 +6001,25 @@ type struct CallResolver {
             syms.push(gp.sym_id);
             bindings.push(TypeRef::invalid());
         }
+        // A generic owner's type parameters are bound by the arguments the
+        // path writes on the owner, or else with the method's own by the
+        // expected function type.
+        mut owner_args: TypeRef[] = [];
+        mut owner_unbound: boolean = false;
+        if (generic_owner) {
+            mut written_owner: TypeRef = TypeRef::invalid();
+            if (scope.scope_generic_args.length > 0) {
+                written_owner = this.resolve_generic_scope_type(owner_entry.base_type, &scope.scope_generic_args, scope.span);
+                if (!written_owner.is_valid() || written_owner.equals(owner_entry.base_type)) { return TypeRef::invalid(); }
+            } else if (!found.equals(owner)) {
+                written_owner = found;
+            }
+            if (written_owner.is_valid()) { owner_args = this.types.view_type_args_copy(written_owner); }
+            for (mut i: i64 = owner_args.length; i < owner_handles.length; i++) {
+                owner_args.push(TypeRef::invalid());
+                owner_unbound = true;
+            }
+        }
         const shown: string = fmt::format("%s::%s",
             this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name));
         const with_args: string = fmt::format("%s::<...>", shown);
@@ -5969,7 +6031,8 @@ type struct CallResolver {
                 if (!tr.is_valid()) { return TypeRef::invalid(); }
                 bindings[i] = tr;
             }
-        } else {
+        }
+        if (scope.generic_args.length == 0 || owner_unbound) {
             const expected: TypeRef = this.state.expected_type;
             mut et: Type* = null;
             if (expected.is_valid()) { et = this.arena.lookup(expected); }
@@ -5977,17 +6040,33 @@ type struct CallResolver {
                     && (this.state.in_symbolic_check || !this.types.contains_generic_param(expected))) {
                 mut pids: TypeRef[] = [];
                 for (mut i: i64 = 0; i < handles.length; i++) {
-                    if (handles[i].is_valid()) { pids.push(handles[i]); }
+                    if (handles[i].is_valid() && !bindings[i].is_valid()) { pids.push(handles[i]); }
+                }
+                for (mut i: i64 = 0; i < owner_handles.length; i++) {
+                    if (!owner_args[i].is_valid()) { pids.push(owner_handles[i]); }
                 }
                 mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
                 ictx.unify(sig, expected);
                 mut p: i64 = 0;
                 for (mut i: i64 = 0; i < handles.length; i++) {
-                    if (!handles[i].is_valid()) { continue; }
+                    if (!handles[i].is_valid() || bindings[i].is_valid()) { continue; }
                     bindings[i] = ictx.bindings[p];
                     p = p + 1;
                 }
+                for (mut i: i64 = 0; i < owner_handles.length; i++) {
+                    if (owner_args[i].is_valid()) { continue; }
+                    owner_args[i] = ictx.bindings[p];
+                    p = p + 1;
+                }
             }
+        }
+        for (mut i: i64 = 0; i < owner_args.length; i++) {
+            if (owner_args[i].is_valid()) { continue; }
+            this.report_uninferable_value(this.types.type_display_name(owner_entry.param_types[i]), shown,
+                fmt::format("%s::<...>::%s", this.intern.resolve(scope.scope_name),
+                    this.intern.resolve(scope.member_name)),
+                scope.span);
+            return TypeRef::invalid();
         }
         for (mut i: i64 = 0; i < bindings.length; i++) {
             if (bindings[i].is_valid()) { continue; }
@@ -6013,10 +6092,22 @@ type struct CallResolver {
                 sub_args.push(bindings[i]);
             }
         }
+        for (mut i: i64 = 0; i < owner_handles.length; i++) {
+            sub_params.push(owner_handles[i]);
+            sub_args.push(owner_args[i]);
+        }
         const value_ty: TypeRef = this.subst_params(&sub_params, &sub_args, sig);
         if (!value_ty.is_valid()) { return TypeRef::invalid(); }
         scope.template_method = node.func.def;
-        scope.spec_owner = found;
+        scope.spec_owner = if (owner_handles.length == 0) {
+            found
+        } else {
+            if (this.types.contains_generic_param(value_ty)) {
+                this.arena.create_instantiation(owner_entry.base_type, &owner_args)
+            } else {
+                this.ctx.generic_registry.instantiate(owner_entry.base_type, &owner_args)
+            }
+        };
         scope.value_type_args = bindings;
         return value_ty;
     }
@@ -6063,25 +6154,7 @@ type struct CallResolver {
         }
         this.arena.generic_params_in(m.func.resolved_return_type, &named);
         mut tparams: TypeRef[] = [];
-        for (mut b: i64 = 0; b < owner_entry.impl_blocks.length && tparams.length == 0; b++) {
-            const block: ImplBlockNode* = owner_entry.impl_blocks[b];
-            if (block == null || block.trait_annotation != null) { continue; }
-            if (!MethodNode::is_method_of(m, block as ASTNode*)) { continue; }
-            if (block.generic_params.length != owner_entry.param_types.length) { return TypeRef::invalid(); }
-            for (mut i: i64 = 0; i < block.generic_params.length; i++) {
-                mut handle: TypeRef = owner_entry.param_types[i];
-                for (mut k: i64 = 0; k < named.length; k++) {
-                    const gt: Type* = this.arena.lookup(named[k]);
-                    if (gt != null && (gt as GenericParamType*).param_sym.equals(block.generic_params[i].sym_id)) {
-                        handle = named[k];
-                    }
-                }
-                tparams.push(handle);
-            }
-        }
-        if (tparams.length == 0) {
-            for (mut i: i64 = 0; i < owner_entry.param_types.length; i++) { tparams.push(owner_entry.param_types[i]); }
-        }
+        if (!this.owner_param_handles(owner_entry, m, &named, &tparams)) { return TypeRef::invalid(); }
         const self_ty: TypeRef = this.arena.create_instantiation(owner_entry.base_type, &tparams);
         mut params: TypeRef[] = [];
         for (mut i: i64 = 0; i < m.func.parameters.length; i++) {
@@ -6106,6 +6179,40 @@ type struct CallResolver {
         };
         scope.template_method = m.func.def;
         return value_ty;
+    }
+
+    /// The generic owner's type parameters as the signature of its method
+    /// `m` names them, one per owner parameter, into `out`.  The signature
+    /// names those of the block that declares the method: an inherent
+    /// `implement<T> struct Wrap<T>` block's own, which stand positionally
+    /// for the owner's, or the owner's when the method is declared in the
+    /// type's body.  `named` is every type parameter the signature names;
+    /// each block parameter is found among them by the symbol its
+    /// declaration bound, and one the signature never names is held by the
+    /// owner's, which nothing in the signature matches.  False when the
+    /// block's parameters do not stand one for one for the owner's.
+    owner_param_handles(&this, owner_entry: TemplateEntry*, m: MethodNode*, named: &TypeRef[],
+                        out: mut &TypeRef[]) -> boolean {
+        for (mut b: i64 = 0; b < owner_entry.impl_blocks.length && out.length == 0; b++) {
+            const block: ImplBlockNode* = owner_entry.impl_blocks[b];
+            if (block == null || block.trait_annotation != null) { continue; }
+            if (!MethodNode::is_method_of(m, block as ASTNode*)) { continue; }
+            if (block.generic_params.length != owner_entry.param_types.length) { return false; }
+            for (mut i: i64 = 0; i < block.generic_params.length; i++) {
+                mut handle: TypeRef = owner_entry.param_types[i];
+                for (mut k: i64 = 0; k < named.length; k++) {
+                    const gt: Type* = this.arena.lookup(named[k]);
+                    if (gt != null && (gt as GenericParamType*).param_sym.equals(block.generic_params[i].sym_id)) {
+                        handle = named[k];
+                    }
+                }
+                out.push(handle);
+            }
+        }
+        if (out.length == 0) {
+            for (mut i: i64 = 0; i < owner_entry.param_types.length; i++) { out.push(owner_entry.param_types[i]); }
+        }
+        return true;
     }
 
     /// A receiver's declared type `recv` - the owner by value, by reference
