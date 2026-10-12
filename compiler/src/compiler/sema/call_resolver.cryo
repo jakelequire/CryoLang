@@ -1734,7 +1734,7 @@ type struct CallResolver {
         }
 
         // E0306 - where-clause bound satisfaction for the bound type args.
-        if (!this.check_call_where_bounds(call.span, tmpl, entry, &bindings)) {
+        if (!this.check_call_where_bounds(call.span, tmpl, &entry.param_syms, &bindings)) {
             return TypeRef::invalid();
         }
 
@@ -5875,23 +5875,150 @@ type struct CallResolver {
         }
         for (mut i: i64 = 0; i < bindings.length; i++) {
             if (bindings[i].is_valid()) { continue; }
-            const pname: string = this.types.type_display_name(entry.param_types[i]);
-            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
-                fmt::format("cannot infer `%s` for `%s` used as a value", pname, shown));
-            d = d.at_with_label(span, "generic, and nothing here says which instance this names");
-            d = d.help(fmt::format(
-                "write the type arguments, `%s`, or give the binding a function type", with_args));
-            this.ctx.emit_diagnostic(d);
+            this.report_uninferable_value(this.types.type_display_name(entry.param_types[i]),
+                shown, with_args, span);
             return TypeRef::invalid();
         }
         // A function's where-clause holds for the instance, as for a call.
         if (entry.node_kind == NodeKind::FunctionDeclaration && entry.ast_node != null
-                && !this.check_call_where_bounds(span, entry.ast_node as FunctionDeclNode*, entry, &bindings)) {
+                && !this.check_call_where_bounds(span, entry.ast_node as FunctionDeclNode*, &entry.param_syms, &bindings)) {
             return TypeRef::invalid();
         }
         const ty: TypeRef = this.subst_params(params, &bindings, sig);
         if (ty.is_valid()) { *out_args = bindings; }
         return ty;
+    }
+
+    /// E0307 for a generic function or method taken as a value whose type
+    /// parameter `pname` nothing binds.
+    report_uninferable_value(mut &this, pname: string, shown: string, with_args: string,
+                             span: SourceSpan) -> void {
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            fmt::format("cannot infer `%s` for `%s` used as a value", pname, shown));
+        d = d.at_with_label(span, "generic, and nothing here says which instance this names");
+        d = d.help(fmt::format(
+            "write the type arguments, `%s`, or give the binding a function type", with_args));
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// A method with type parameters of its own taken as a value,
+    /// `Box::wrap::<i32>`: one instance of it, whose type arguments the
+    /// turbofish on the member writes, one per parameter, or the expected
+    /// function type binds when unified with the method's signature -
+    /// receiver first for a method with one.  The method's definition, its
+    /// owner and the arguments are recorded on the node, from which
+    /// monomorphization mints and pins the instance.  `owns` says whether
+    /// the path names such a method at all - on an owner without type
+    /// parameters of its own - so the caller's answer is this one, valid or
+    /// refused.
+    generic_method_value(mut &this, scope: ScopeResolutionNode*, found: TypeRef,
+                         owns: mut &boolean) -> TypeRef {
+        if (!found.is_valid() || scope.impl_trait != null) { return TypeRef::invalid(); }
+        const ft0: Type* = this.arena.lookup(found);
+        if (ft0 == null || (ft0.kind != TypeKind::Struct && ft0.kind != TypeKind::Class)) { return TypeRef::invalid(); }
+        const m: MethodInfo* = this.ctx.decl_index.type_method(found, scope.member_name, this.arena);
+        if (m == null || m.ast_node == null) { return TypeRef::invalid(); }
+        const node: MethodNode* = m.ast_node as MethodNode*;
+        if (node.func == null || node.func.generic_params.length == 0 || !node.func.def.is_valid()) {
+            return TypeRef::invalid();
+        }
+        *owns = true;
+        if (this.scope_callee_signature_refused(scope, false)) { return TypeRef::invalid(); }
+        // Read again after monomorphization: the instance it was pinned to.
+        const pinned: OverloadId = scope.resolved_callee.decl_entry();
+        if (pinned.is_valid()) { return this.ctx.decl_index.entry_signature(pinned); }
+        const st: Type* = this.arena.lookup(m.function_type);
+        if (st == null || st.kind != TypeKind::Function) { return TypeRef::invalid(); }
+        const ft: FunctionType* = st as FunctionType*;
+        mut params: TypeRef[] = [];
+        if (!m.is_static) {
+            if (node.func.parameters.length == 0) { return TypeRef::invalid(); }
+            const recv: VarDeclNode* = node.func.parameters[0];
+            if (recv == null || !recv.is_receiver() || !recv.resolved_type.is_valid()) { return TypeRef::invalid(); }
+            params.push(recv.resolved_type);
+        }
+        for (mut i: i64 = 0; i < ft.param_types.length; i++) { params.push(ft.param_types[i]); }
+        const sig: TypeRef = this.arena.get_function(ft.return_type, &params, ft.is_variadic);
+        // Each type parameter as the signature names it, found by the
+        // symbol its declaration bound; one the signature never names has
+        // no handle, and only a turbofish binds it.
+        mut named: TypeRef[] = [];
+        this.arena.generic_params_in(sig, &named);
+        mut handles: TypeRef[] = [];
+        mut syms: SymbolID[] = [];
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < node.func.generic_params.length; i++) {
+            const gp: GenericParamNode* = node.func.generic_params[i];
+            mut handle: TypeRef = TypeRef::invalid();
+            for (mut k: i64 = 0; k < named.length; k++) {
+                const gt: Type* = this.arena.lookup(named[k]);
+                if (gt != null && (gt as GenericParamType*).param_sym.equals(gp.sym_id)) { handle = named[k]; }
+            }
+            handles.push(handle);
+            syms.push(gp.sym_id);
+            bindings.push(TypeRef::invalid());
+        }
+        const shown: string = fmt::format("%s::%s",
+            this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name));
+        const with_args: string = fmt::format("%s::<...>", shown);
+        if (scope.generic_args.length > 0) {
+            mut rc: ResolutionContext = ResolutionContext::new("");
+            this.symbolic.symbolic_bind_params(&rc);
+            for (mut i: i64 = 0; i < scope.generic_args.length && i < bindings.length; i++) {
+                const tr: TypeRef = this.ctx.type_resolver.resolve(scope.generic_args[i], &rc);
+                if (!tr.is_valid()) { return TypeRef::invalid(); }
+                bindings[i] = tr;
+            }
+        } else {
+            const expected: TypeRef = this.state.expected_type;
+            mut et: Type* = null;
+            if (expected.is_valid()) { et = this.arena.lookup(expected); }
+            if (et != null && et.kind == TypeKind::Function
+                    && (this.state.in_symbolic_check || !this.types.contains_generic_param(expected))) {
+                mut pids: TypeRef[] = [];
+                for (mut i: i64 = 0; i < handles.length; i++) {
+                    if (handles[i].is_valid()) { pids.push(handles[i]); }
+                }
+                mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+                ictx.unify(sig, expected);
+                mut p: i64 = 0;
+                for (mut i: i64 = 0; i < handles.length; i++) {
+                    if (!handles[i].is_valid()) { continue; }
+                    bindings[i] = ictx.bindings[p];
+                    p = p + 1;
+                }
+            }
+        }
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (bindings[i].is_valid()) { continue; }
+            this.report_uninferable_value(this.intern.resolve(node.func.generic_params[i].name),
+                shown, with_args, scope.span);
+            return TypeRef::invalid();
+        }
+        if (scope.generic_args.length > bindings.length) {
+            const plural: string = if (bindings.length == 1) { "" } else { "s" };
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+                fmt::format("`%s` has %lld type parameter%s, and %lld type arguments are written", shown,
+                    bindings.length, plural, scope.generic_args.length));
+            d = d.at_with_label(scope.span, "too many type arguments");
+            this.ctx.emit_diagnostic(d);
+            return TypeRef::invalid();
+        }
+        if (!this.check_call_where_bounds(scope.span, node.func, &syms, &bindings)) { return TypeRef::invalid(); }
+        mut sub_params: TypeRef[] = [];
+        mut sub_args: TypeRef[] = [];
+        for (mut i: i64 = 0; i < handles.length; i++) {
+            if (handles[i].is_valid()) {
+                sub_params.push(handles[i]);
+                sub_args.push(bindings[i]);
+            }
+        }
+        const value_ty: TypeRef = this.subst_params(&sub_params, &sub_args, sig);
+        if (!value_ty.is_valid()) { return TypeRef::invalid(); }
+        scope.template_method = node.func.def;
+        scope.spec_owner = found;
+        scope.value_type_args = bindings;
+        return value_ty;
     }
 
     /// A generic owner's method taken as a value, `Wrap::get` or
@@ -6876,7 +7003,7 @@ type struct CallResolver {
 
         // E0306 - where-clause bound satisfaction for the bound method args, so an
         // unsatisfied bound is a clean call-site error rather than a downstream miss.
-        if (!this.check_call_where_bounds(call.span, tmpl, entry, &binds)) {
+        if (!this.check_call_where_bounds(call.span, tmpl, &entry.param_syms, &binds)) {
             return TypeRef::invalid();
         }
 
@@ -6896,18 +7023,19 @@ type struct CallResolver {
     }
 
     /// E0306 where-clause bound check for a generic call whose bound args are in
-    /// `bindings` (declaration order, index-aligned with `entry.param_syms`).
+    /// `bindings` (declaration order, index-aligned with `param_syms`, the
+    /// symbols the type parameters were declared as).
     /// Emits the bound failure and returns false on the first unsatisfied bound;
     /// true when every bound holds (or the arg is still abstract/skippable).
     /// Shared by the free-function and static-method-template call paths and
-    /// a generic function taken as a value; `at` is the use's span.
+    /// a generic function or method taken as a value; `at` is the use's span.
     check_call_where_bounds(mut &this, at: SourceSpan, tmpl: FunctionDeclNode*,
-                            entry: TemplateEntry*, bindings: &TypeRef[]) -> boolean {
+                            param_syms: &SymbolID[], bindings: &TypeRef[]) -> boolean {
         for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
             const bound: TraitBound* = &tmpl.trait_bounds[bi];
             mut idx: i64 = -1;
-            for (mut pi: i64 = 0; pi < entry.param_syms.length; pi++) {
-                if (entry.param_syms[pi].equals(bound.subject_sym)) { idx = pi; break; }
+            for (mut pi: i64 = 0; pi < param_syms.length; pi++) {
+                if (param_syms[pi].equals(bound.subject_sym)) { idx = pi; break; }
             }
             if (idx < 0 || idx >= bindings.length) { continue; }
             const concrete: TypeRef = bindings[idx];

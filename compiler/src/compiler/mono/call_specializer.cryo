@@ -777,7 +777,7 @@ type struct MonoCallSpecializer {
     /// The path form of `specialize_fn_value_ref`: a module's generic
     /// function taken as a value, `m::idf`.
     specialize_path_fn_value(mut &this, scope: ScopeResolutionNode*, subst: TypeSubstitution*) -> void {
-        if (scope.value_type_args.length == 0 || scope.resolved_callee.is_some()) { return; }
+        if (!scope.value_template.is_valid() || scope.resolved_callee.is_some()) { return; }
         if (this.generic_registry == null) { return; }
         const inst: TypeRef = this.value_instance(
             this.generic_registry.template_of_type(scope.value_template), &scope.value_type_args, subst);
@@ -1006,54 +1006,47 @@ type struct MonoCallSpecializer {
 
     /// Bind `call` to the instance of `orig_method` - the receiver's method,
     /// held by `impl_node` or declared on `inherent_owner_ast` - at the
-    /// call's type arguments, minting it on the first request.  A method
-    /// with no type parameters of its own, or a call whose type arguments
-    /// are still a generic body's parameters, is left alone.
+    /// type arguments sema stashed on the call (`method_instance_entry`).
     instantiate_generic_method(mut &this, call: CallExprNode*, orig_method: MethodNode*,
                                impl_node: ImplBlockNode*, inherent_owner_ast: ASTNode*,
                                recv_type: TypeRef, subst: TypeSubstitution*) -> void {
-        if (impl_node == null && inherent_owner_ast == null) { return; }
+        this.pin_spec_entry(call, this.method_instance_entry(orig_method, impl_node, inherent_owner_ast,
+            recv_type, &call.resolved_type_args, subst));
+    }
 
-
+    /// The instance of `orig_method` - the receiver's method, held by
+    /// `impl_node` or declared on `inherent_owner_ast` - at the type
+    /// arguments `stashed` (sema's, in declaration order, concretized by
+    /// `subst`), minted on the first request.  Invalid for a method with no
+    /// type parameters of its own, arguments not one per parameter, and
+    /// arguments that are still a generic body's parameters.
+    method_instance_entry(mut &this, orig_method: MethodNode*,
+                          impl_node: ImplBlockNode*, inherent_owner_ast: ASTNode*,
+                          recv_type: TypeRef, stashed: &TypeRef[], subst: TypeSubstitution*) -> OverloadId {
+        if (impl_node == null && inherent_owner_ast == null) { return OverloadId::invalid(); }
         const orig_func: FunctionDeclNode* = orig_method.func;
-        if (orig_func == null) { return; }
+        if (orig_func == null) { return OverloadId::invalid(); }
 
-        // The method's OWN generic params (e.g. <H> on hash<H>).
+        // The method's OWN generic params (e.g. <H> on hash<H>), bound SOLELY
+        // from sema's stash: a use without one stashed per parameter is
+        // outside sema's visibility and is left unspecialized.
         const n_method_params: i64 = orig_func.generic_params.length;
-        if (n_method_params == 0) { return; }
+        if (n_method_params == 0 || stashed.length != n_method_params) { return OverloadId::invalid(); }
         mut bindings: TypeRef[] = [];
-        mut method_param_names: SymbolStr[] = [];
-        mut method_param_syms: SymbolID[] = [];
         for (mut i: i64 = 0; i < n_method_params; i++) {
-            const gp: GenericParamNode* = orig_func.generic_params[i];
-            if (gp == null) { return; }
-            bindings.push(TypeRef::invalid());
-            method_param_names.push(gp.name);
-            method_param_syms.push(gp.sym_id);
+            const sv: TypeRef = this.concretize_stashed_arg(stashed[i], subst);
+            if (!sv.is_valid()) { return OverloadId::invalid(); }
+            bindings.push(sv);
         }
 
-        // Method-level bindings come SOLELY from sema's stash (declaration order).
-        // A call without a length-matched stash is outside sema's visibility and is
-        // left unspecialized (it was deferred pre-flip too).
-        mut m_from_stash: boolean = false;
-        if (call.resolved_type_args.length == n_method_params && n_method_params > 0) {
-            m_from_stash = true;
-            for (mut i: i64 = 0; i < n_method_params; i++) {
-                const sv: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
-                if (!sv.is_valid()) { m_from_stash = false; break; }
-                bindings[i] = sv;
-            }
-        }
-        if (!m_from_stash) { return; }
-
-        // Defer when a binding isn't concrete: this call is being walked inside a
+        // Defer when a binding isn't concrete: this use is being walked inside a
         // still-generic context (e.g. `value.fmt(f)` in a template body binds W to
         // the enclosing W).  Minting now would emit a bogus still-generic spec
         // (E0636); the concrete spec is minted when the enclosing method is itself
-        // specialized with a concrete binding and its body re-walked (Shape-4 guard).
+        // specialized with a concrete binding and its body re-walked.
         for (mut bi: i64 = 0; bi < bindings.length; bi++) {
             if (this.arena.contains_generic_param(bindings[bi])) {
-                return;
+                return OverloadId::invalid();
             }
         }
 
@@ -1066,18 +1059,15 @@ type struct MonoCallSpecializer {
         // template's whether the receiver's method is the template's own
         // declaration or a specialization's copy of it.
         const def_of: DefId = if (orig_func.def.is_valid()) { orig_func.def } else { orig_func.copy_of };
-        if (!def_of.is_valid()) { return; }
+        if (!def_of.is_valid()) { return OverloadId::invalid(); }
         const def_slot: DefKey = this.decl_index.defs.table_key(def_of);
         const made: OverloadId = this.state.method_instance(recv_type, def_slot, &bindings);
-        if (made.is_valid()) {
-            this.pin_spec_entry(call, made);
-            return;
-        }
+        if (made.is_valid()) { return made; }
 
         mut copy_subst: TypeSubstitution* = null;
         const spec_method: MethodNode* = this.specialize_method(
             orig_method, &orig_func.generic_params, &bindings, recv_type, impl_node, &copy_subst);
-        if (spec_method == null) { return; }
+        if (spec_method == null) { return OverloadId::invalid(); }
         // Whether this spec is resolved through a PINNED `resolved_callee` (the
         // precise mangled symbol) rather than the trait-impl/combinator DI path.
         // Only the pinned (inherent) regime gets the `$MG...` method-spec-args
@@ -1189,7 +1179,6 @@ type struct MonoCallSpecializer {
         mut inst_args: TypeRef[] = [];
         for (mut ai: i64 = 0; ai < bindings.length; ai++) { inst_args.push(bindings[ai]); }
         this.state.add_method_instance(recv_type, def_slot, inst_args, spec_method.func.overload_entry);
-        this.pin_spec_entry(call, spec_method.func.overload_entry);
 
         // Compile-time `static match` arm pruning on the freshly-minted spec body.
         // A method-level `static match (T)` (e.g. `string::parse_int<T>`) was cloned
@@ -1221,6 +1210,7 @@ type struct MonoCallSpecializer {
             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
             this.walk_body(spec_method.func, &rw_ctx, copy_subst);
         }
+        return spec_method.func.overload_entry;
     }
 
     /// The receiver's method for the definition `d`, and where it is held:
@@ -1456,8 +1446,19 @@ type struct MonoCallSpecializer {
             return;
         }
         const m: MethodNode* = this.recorded_method_on(scope.template_method, owner);
-        if (m == null || m.func == null || m.func.generic_params.length > 0
-                || !m.func.overload_entry.is_valid()) { return; }
+        if (m == null || m.func == null) { return; }
+        // A method with type parameters of its own is the instance at the
+        // arguments the type check kept on the path.
+        if (m.func.generic_params.length > 0) {
+            mut impl_node: ImplBlockNode* = null;
+            mut owner_ast: ASTNode* = null;
+            if (!this.method_placement(m, owner, &impl_node, &owner_ast)) { return; }
+            const inst: OverloadId = this.method_instance_entry(m, impl_node, owner_ast, owner,
+                &scope.value_type_args, subst);
+            if (inst.is_valid()) { scope.set_resolved_callee(CalleePin::Decl(inst)); }
+            return;
+        }
+        if (!m.func.overload_entry.is_valid()) { return; }
         scope.set_resolved_callee(CalleePin::Decl(m.func.overload_entry));
     }
 
