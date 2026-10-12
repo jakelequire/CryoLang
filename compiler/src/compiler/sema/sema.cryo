@@ -251,7 +251,7 @@ public:
 
     SemaVisitor(arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*) : BaseASTVisitor() {
         this.arena    = arena;
-        this.checker  = TypeChecker::new(arena, ctx.decl_index, ctx.generic_registry);
+        this.checker  = TypeChecker::new(arena, ctx.decl_index);
         this.intern   = intern;
         this.ctx      = ctx;
         this.this_sym = intern.intern("this");
@@ -1038,14 +1038,26 @@ public:
         }
     }
 
+    /// Type `cond` and require it to be exactly `boolean`: a condition is
+    /// held to the rule a value assigned to `boolean` is, and no other type
+    /// converts to one.
+    resolve_condition(mut &this, cond: ExpressionNode*) -> void {
+        const ty: TypeRef = this.resolve_expr(cond);
+        if (cond == null || !ty.is_valid() || !this.assignment_judgeable(ty)) { return; }
+        const want: TypeRef = this.arena.get_bool();
+        if (this.checker.can_assign(ty, want)) { return; }
+        this.diag.emit_type_mismatch_with_value(ErrorCode::E0200_TYPE_MISMATCH, cond.span,
+            want, ty, Text::new("a condition must be a `boolean`"), SourceSpan::none(), cond);
+    }
+
     override visit(mut &this, node: IfStmtNode*) -> void {
-        this.resolve_expr(node.condition);
+        this.resolve_condition(node.condition);
         this.dispatch_stmt(node.then_stmt);
         if (node.has_else()) { this.dispatch_stmt(node.else_stmt); }
     }
 
     override visit(mut &this, node: WhileStmtNode*) -> void {
-        this.resolve_expr(node.condition);
+        this.resolve_condition(node.condition);
         mut counters: LoopCounter[] = [];
         if (this.ctx.options.emit_facts) {
             const stepped: u64[] = CallFacts::stepped_locals(null, node.body);
@@ -1062,7 +1074,7 @@ public:
         this.state.loop_depth += 1;
         this.dispatch_stmt(node.body);
         this.state.loop_depth -= 1;
-        this.resolve_expr(node.condition);
+        this.resolve_condition(node.condition);
     }
 
     override visit(mut &this, node: ForStmtNode*) -> void {
@@ -1094,7 +1106,7 @@ public:
                 this.resolve_expr((node.init as ExprStmtNode*).expression);
             }
         }
-        if (node.condition != null) { this.resolve_expr(node.condition); }
+        if (node.condition != null) { this.resolve_condition(node.condition); }
         if (node.update != null)    { this.resolve_expr(node.update); }
         // A counter the header declares belongs to the loop it drives, one
         // deeper than the header: a record reads an element indexed by it as
@@ -1186,7 +1198,7 @@ public:
             if (arm == null) { continue; }
             const save: i64 = this.scopes.save_scope();
             this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
-            if (arm.guard != null) { this.resolve_expr(arm.guard); }
+            if (arm.guard != null) { this.resolve_condition(arm.guard); }
             if (arm.body != null) { this.dispatch_stmt(arm.body); }
             this.scopes.restore_scope(save);
         }
@@ -2628,6 +2640,9 @@ public:
             }
             this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP, Text::new(result.error_message), bin.span);
         }
+        // A refused comparison, or one over an operand already reported, is
+        // still a `boolean`, so the condition holding it reports nothing more.
+        if (bin.op.kind.yields_boolean()) { return this.arena.get_bool(); }
         if (lhs.is_valid()) { return lhs; }
         if (rhs.is_valid()) { return rhs; }
         return TypeRef::invalid();
@@ -2871,6 +2886,15 @@ public:
                 Text::new("invalid cast between an aggregate type (struct/class/tuple/array) and a scalar or pointer: there is no valid representation for this conversion"),
                 cast.span);
         }
+        if (from_ty.is_valid() && to_ty.is_valid()
+            && this.diag.kind_or_void(to_ty) == TypeKind::Bool
+            && this.assignment_judgeable(from_ty)
+            && !this.checker.can_assign(from_ty, to_ty)) {
+            this.ctx.emit_error_at(ErrorCode::E0208_INVALID_CAST,
+                Text::new(fmt::format("cannot cast `%s` to `boolean`: nothing converts to `boolean`; %s",
+                    this.types.type_display_name(from_ty), this.diag.truth_test_hint(from_ty))),
+                cast.span);
+        }
         return cast.resolved_target;
     }
 
@@ -2944,7 +2968,7 @@ public:
     }
 
     resolve_if_expr(mut &this, if_expr: IfExprNode*) -> TypeRef {
-        this.resolve_expr(if_expr.condition);
+        this.resolve_condition(if_expr.condition);
         const then_type: TypeRef = this.resolve_expr(if_expr.then_expr);
         const else_type: TypeRef = this.resolve_expr(if_expr.else_expr);
         this.check_branch_agreement(then_type, if_expr.then_expr.span,
@@ -2956,7 +2980,7 @@ public:
     }
 
     resolve_ternary(mut &this, ternary: TernaryExprNode*) -> TypeRef {
-        this.resolve_expr(ternary.condition);
+        this.resolve_condition(ternary.condition);
         const true_type: TypeRef = this.resolve_expr(ternary.true_expr);
         const false_type: TypeRef = this.resolve_expr(ternary.false_expr);
         this.check_branch_agreement(true_type, ternary.true_expr.span,
@@ -2982,7 +3006,7 @@ public:
             if (arm == null || arm.body == null) { continue; }
             const save: i64 = this.scopes.save_scope();
             this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
-            if (arm.guard != null) { this.resolve_expr(arm.guard); }
+            if (arm.guard != null) { this.resolve_condition(arm.guard); }
             const body_node: ASTNode* = arm.body as ASTNode*;
             if (body_node.kind == NodeKind::BlockStatement) {
                 const block: BlockStmtNode* = arm.body as BlockStmtNode*;

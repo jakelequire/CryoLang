@@ -257,6 +257,36 @@ Noted with no ruling: the identity-text check does not follow a number
 taken from `.spelling().id` used as a key.  It is left as it is, since the
 check is being deleted and the seals are what hold.  (Jake)
 
+242. **Enums are strict: no enum ever converts implicitly to `boolean`,**
+     simple or not.  A test on one is written `c == Color::Red`.  This
+     amends the conversion half of 232; its other half stands - a variant
+     whose type arguments cannot be inferred is refused in the type check
+     (E0307).  (Jake)
+
+243. **Five known defects are fixed before the merge, as the last tasks
+     after the cleanup:** an overloaded generic used as a value takes the
+     first overload; `p as SomeClass` passes the type check and then fails
+     in LLVM; arrays of function values do not work and
+     `((i32) -> i32)[]` does not parse; a generic method cannot be used as
+     a value; and the closure synthesizer's leftover inherent `drop`
+     (ruling 78).  Recorded only.  (Jake)
+
+244. **`const n = Option::None;`, with no type arguments determinable
+     anywhere, is refused** (the E0307 family).  (Jake)
+
+245. **A variant's payload is checked against the type arguments written
+     on it:** `Result::<i32, i32>::Ok("x")` and
+     `Result::Ok::<i32, i32>("x")` are refused.  (Jake)
+
+246. **Booleans are strict.**  An `if`, `while` or loop condition, the
+     operands of `&&`, `||` and `!`, and anything assigned or passed to a
+     `boolean` must be exactly `boolean`.  No integer, `char`, pointer,
+     enum, `Option` or `Result` is ever truthy.  `boolean as` an integer
+     type stays allowed (0 or 1); an integer `as boolean` is refused
+     (write `n != 0`); a pointer needs an explicit null comparison.  The
+     type checker refuses each case with a clear error rather than leaving
+     it to fail in LLVM.  (Jake)
+
 ### 2026-10-10
 
 211. **Before `docs/name-resolution.md` is deleted, its decisions D1-D77

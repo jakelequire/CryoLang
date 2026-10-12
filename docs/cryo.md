@@ -266,7 +266,15 @@ false
 null            // null pointer; valid in any pointer context
 ```
 
-There is no implicit conversion between `boolean` and integers; `if (1)` is a type error.
+Booleans are strict. Nothing converts to `boolean`, implicitly or with `as`: no integer, `char`, float, pointer, enum, `Option` or `Result` has a truth value. Every place that wants a truth value requires exactly `boolean`: an `if`, `while`, `do`/`while` or `for` condition, a match guard, an `if` expression, the operands of `&&`, `||` and `!`, and any value assigned, passed or returned as a `boolean`. A test is written as the comparison it means:
+
+```cryo
+if (n != 0) { ... }            // not `if (n)`; `n as boolean` is refused too
+while (p != null) { ... }      // not `while (p)`
+if (c == Color::Red) { ... }   // not `if (c)`, for any enum
+```
+
+The other direction stays: `boolean as` an integer type is `1` for `true` and `0` for `false`.
 
 ---
 

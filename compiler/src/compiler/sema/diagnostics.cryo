@@ -158,6 +158,9 @@ type struct Diagnostics {
         if (context_msg.as_string() != "") {
             diag = diag.with_note(context_msg);
         }
+        if (this.kind_or_void(expected) == TypeKind::Bool) {
+            diag = diag.with_note(Text::new(this.truth_test_hint(found)));
+        }
         diag = this.attach_type_coercion_suggestion(diag, span,
             expected, found, expected_name, value_expr);
         this.ctx.emit_diagnostic(diag);
@@ -168,6 +171,30 @@ type struct Diagnostics {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return TypeKind::Void; }
         return t.kind;
+    }
+
+    /// How a truth test on a value of type `ty` is written, since no type
+    /// converts to `boolean`: as the comparison the test means.
+    truth_test_hint(&this, ty: TypeRef) -> string {
+        mut t: Type* = this.arena.lookup(ty);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const it: InstantiatedType* = t as InstantiatedType*;
+            if (it.has_resolved_type()) { t = this.arena.lookup(it.resolved_type); }
+        }
+        if (t == null) { return "write the comparison the test means, or `match` on it"; }
+        if (t.kind == TypeKind::Enum && !(t as EnumType*).is_simple_enum()) {
+            return "`match` on it";
+        }
+        return match (t.kind) {
+            TypeKind::Int     => { "compare it explicitly, as in `n != 0`" }
+            TypeKind::Float   => { "compare it explicitly, as in `x != 0.0`" }
+            TypeKind::Char    => { "compare it explicitly, as in `c != '\\0'`" }
+            TypeKind::Pointer => { "compare it with `null` explicitly, as in `p != null`" }
+            TypeKind::String  => { "compare it with `null` explicitly, as in `s != null`" }
+            TypeKind::Enum    => { fmt::format("compare it with one of `%s`'s variants (`==`), or `match` on it",
+                                       this.types.type_display_name(ty)) }
+            _                 => { "write the comparison the test means, or `match` on it" }
+        };
     }
 
     /// Attach a literal-aware quickfix when the (expected, found, value) triple
