@@ -203,6 +203,23 @@ yet is recorded with the change that builds it, not here.
 261. **The wording of the cast errors stays as it is, and E0307 stays the
      error for too many type arguments.**  (Jake)
 
+262. **E0312, the trait-implementation check, keeps its number and
+     wording.**  (Jake)
+
+263. **`const a: i32 = i32::MAX;` storing nothing, so the local is read
+     uninitialized, is fixed before the merge.**  (Jake)  No type declares
+     constants, so the path names no value: it is refused where it is
+     written (E0201), as any path naming nothing is; a primitive's bounds
+     are its `min_value()` and `max_value()`.
+
+264. **A generic impl method with a parameter typed `&This` is found when
+     called,** as it is with the parameter written `&Wrap<T>`.  Fixed
+     before the merge.  (Jake)
+
+265. **A generic alias used as a path (`type Stack<T> = Array<T>;
+     Stack::<i32>::new()`) is refused with a clear error for now;** full
+     support is on the roadmap.  (Jake)
+
 ### 2026-10-11
 
 227. **The cleanup that removes the Python gates also removes

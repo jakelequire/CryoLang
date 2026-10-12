@@ -2571,6 +2571,8 @@ implement boolean {
 
 After the block is loaded, `my_bool.to_i32()` resolves like any other method call. Resolution is at compile time; no dynamic dispatch.
 
+A primitive owns methods and nothing else: no type declares constants, so `i32::MAX` names no value and is refused (E0201), through an alias of the primitive too. An integer type's bounds are its static methods, `i32::max_value()` and `i32::min_value()`.
+
 ### 13.4 Which Method a Call Names
 
 A method call `recv.m(...)` names the one method `m` its arguments bind to, and no kind of method outranks another. Two methods of one name that both fit the arguments make the call ambiguous, and it is an error; in particular, a non-generic method does not win over a generic one by being non-generic:
