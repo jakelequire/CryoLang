@@ -2796,6 +2796,18 @@ public:
             this.ctx.emit_error_at(ErrorCode::E0208_INVALID_CAST,
                 "invalid cast between an aggregate type (struct/class/tuple/array) and a scalar or pointer: there is no valid representation for this conversion",
                 cast.span);
+        } else if (from_ty.is_valid() && to_ty.is_valid()
+            && this.types.arg_type_is_concrete(from_ty) && this.types.arg_type_is_concrete(to_ty)
+            && this.is_cast_into_other_aggregate(from_ty, to_ty)) {
+            const to_name: string = this.types.type_display_name(to_ty);
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0208_INVALID_CAST,
+                fmt::format("cannot cast `%s` to `%s`: a struct, class, tuple or array value is cast only from a value of its own type",
+                    this.types.type_display_name(from_ty), to_name));
+            d = d.at_with_label(cast.span, "no conversion makes this value");
+            if (this.diag.kind_or_void(this.cast_subject(to_ty)) == TypeKind::Class) {
+                d = d.help(fmt::format("a class converts along its hierarchy by pointer, `p as %s*`; `*p` reads the value a pointer points at", to_name));
+            }
+            this.ctx.emit_diagnostic(d);
         }
         if (from_ty.is_valid() && to_ty.is_valid()
             && this.diag.kind_or_void(to_ty) == TypeKind::Bool
@@ -2825,9 +2837,37 @@ public:
         return this.names_receiver(expr as IdentifierNode*);
     }
 
-    /// True when a cast crosses between a memory aggregate and a scalar/pointer
-    /// type (no valid LLVM lowering).  Class instances are heap pointers, so not
-    /// aggregates here.
+    /// True when a cast's target is a struct, class, tuple or array value and
+    /// its operand is of any other type.  Such a value is laid out in memory,
+    /// and no conversion builds one from a pointer, a scalar or a different
+    /// aggregate: code generation has only a bitcast to offer, which is
+    /// invalid between those representations.  An instantiation compares as
+    /// the type it resolved to.
+    is_cast_into_other_aggregate(&this, from: TypeRef, to: TypeRef) -> boolean {
+        const f: TypeRef = this.cast_subject(from);
+        const t: TypeRef = this.cast_subject(to);
+        if (!f.is_valid() || !t.is_valid() || f.equals(t)) { return false; }
+        const tt: Type* = this.arena.lookup(t);
+        if (tt == null) { return false; }
+        return tt.kind == TypeKind::Struct || tt.kind == TypeKind::Class
+            || tt.kind == TypeKind::Tuple || tt.kind == TypeKind::Array;
+    }
+
+    /// The type an instantiation resolved to; any other type is itself.
+    /// Invalid for an instantiation not yet resolved.
+    cast_subject(&this, ty: TypeRef) -> TypeRef {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind != TypeKind::InstantiatedType) { return ty; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        if (!inst.has_resolved_type()) { return TypeRef::invalid(); }
+        return inst.resolved_type;
+    }
+
+    /// True when a cast crosses between a struct, tuple or array value and a
+    /// scalar/pointer type (no valid LLVM lowering).  A class value as the
+    /// operand is not refused here: a class local reaches the cast as the
+    /// address of its storage, so its cast to a pointer is that address.
     is_aggregate_scalar_cast(&this, from: TypeRef, to: TypeRef) -> boolean {
         mut f: Type* = this.arena.lookup(from);
         mut t: Type* = this.arena.lookup(to);
