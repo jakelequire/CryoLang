@@ -365,16 +365,24 @@ type struct SpecializationPasses {
         const module_sym: SymbolStr = ctx.intern(ctx.source_file);
         mono.set_current_source_file(module_sym);
 
-        const reg_start: i64 = mono.get_injection_cursor();
-        const reg_end: i64 = mono.spec_count();
-        for (mut i: i64 = reg_start; i < reg_end; i++) {
-            const entry: SpecializationEntry* = mono.spec_entry_at(i);
-            SpecializationPasses::register_spec(ctx, mono, entry);
-        }
-        mono.advance_injection_cursor();
         // A call bound to a method of an instantiation is bound once the
-        // instantiation's methods are registered.
-        mono.bind_queued_calls();
+        // instantiation's methods are registered.  Binding one to a generic
+        // method instantiates the method, whose body can mint instantiations
+        // of its own with calls of their own queued, so register, bind and
+        // drain until a round makes nothing new.
+        loop {
+            const reg_start: i64 = mono.get_injection_cursor();
+            const reg_end: i64 = mono.spec_count();
+            for (mut i: i64 = reg_start; i < reg_end; i++) {
+                const entry: SpecializationEntry* = mono.spec_entry_at(i);
+                SpecializationPasses::register_spec(ctx, mono, entry);
+            }
+            mono.advance_injection_cursor();
+            const before_methods: i64 = mono.spec_owner_file_count();
+            mono.bind_queued_calls();
+            if (!mono.drain_pending_worklist()) { break; }
+            if (mono.spec_count() == reg_end && mono.spec_owner_file_count() == before_methods) { break; }
+        }
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }

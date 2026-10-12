@@ -1587,9 +1587,12 @@ type struct MonoCallSpecializer {
     /// Bind each queued call whose receiver or owner is now minted, by the
     /// identity it recorded: the method a generated call names, the method
     /// `template_method` names on `template_recv`, or the trait's method at
-    /// the position the call's member recorded.  Bound only to a method
-    /// bound as written: an instance minted here would never be
-    /// registered.  A call whose receiver is still not minted stays queued.
+    /// the position the call's member recorded.  A method with type
+    /// parameters of its own is bound to its instance at the call's
+    /// stashed arguments, minted here when no earlier call made it; its
+    /// body's own instantiations are drained by the caller's next round.
+    /// Any other is bound only as written.  A call whose receiver is still
+    /// not minted stays queued.
     bind_queued_calls(mut &this) -> void {
         mut still: CallExprNode*[] = [];
         for (mut i: i64 = 0; i < this.queued_binds.length; i++) {
@@ -1602,8 +1605,16 @@ type struct MonoCallSpecializer {
                 still.push(call);
                 continue;
             }
+            const own_params: FunctionDeclNode* = if (call.template_method.is_valid()) {
+                this.decl_index.method_func_of(call.template_method)
+            } else { null };
             if (call.named_method.is_valid()) {
                 this.pin_plain(call, this.named_method_on(call.named_method, owner));
+            } else if (own_params != null && own_params.generic_params.length > 0) {
+                mut gm_impl: ImplBlockNode* = null;
+                mut gm_owner: ASTNode* = null;
+                const gm: MethodNode* = this.receiver_method_of(call.template_method, owner, &gm_impl, &gm_owner);
+                if (gm != null) { this.instantiate_generic_method(call, gm, gm_impl, gm_owner, owner, null); }
             } else if ((call.callee as ASTNode*).kind == NodeKind::ScopeResolution) {
                 this.pin_plain(call, this.path_method_on(call, owner));
             } else if (call.template_method.is_valid()) {
@@ -1876,6 +1887,10 @@ type struct MonoCallSpecializer {
         mut spec_entry: SpecializationEntry* = this.find_owner_spec_entry(inst_ref);
         if (spec_entry == null) {
             this.state.enqueue_from_type_ref(inst_ref);
+            if (!call.template_recv.equals(inst_ref)) {
+                call.template_recv = inst_ref;
+                this.queue_bind(call);
+            }
             return true;
         }
         const recv_type: TypeRef = spec_entry.specialized_type;
