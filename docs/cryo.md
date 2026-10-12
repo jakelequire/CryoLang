@@ -2773,17 +2773,17 @@ An `export` declaration lets a module pass names it did not declare on to its ow
 namespace std::future;
 
 public module future::waker;                  // structure (section 14.2)
-export future::waker::{ Context, Waker };     // re-export: importers get these
+export future::waker::{ Context, Waker };     // re-export two names
 export future::poll;                          // re-export the whole submodule
 ```
 
-After this, `import std::future;` alone puts `Context`, `Waker`, and everything `future::poll` exports in scope.
+After this, a file that writes `import std::future;` reaches `future::Context`, `future::Waker` and `future::poll`'s names through the facade (`future::Poll`), and the module `poll` itself (`poll::Poll`). A plain import binds the module and no names from it (section 14.3), so none of these is in scope bare: `Context` alone is refused. `import std::future::{ Context, Waker };` brings those two in bare, and `import std::future::*;` everything the facade offers.
 
 **The rule, entire: an `export` grants an importer of this module exactly what the same path would grant if it were imported here** — and it grants this module the same thing, so a module that re-exports a name may also use it without writing the path a second time. The forms mirror `import`:
 
 ```cryo
 export Math::Vector;                  // importers get the module, hence Vector::Vec2
-export Math::Vector::{ Vec2, Vec3 };  // importers get Vec2 and Vec3
+export Math::Vector::{ Vec2, Vec3 };  // importers get Vec2 and Vec3, as Facade::Vec2
 export Math::Vector as V;             // importers get the name V
 export Math::Vector::{ Vec2 as P2 };  // importers get P2, naming Vec2
 ```
