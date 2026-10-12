@@ -1843,6 +1843,8 @@ const r: Result<string, int>  = Result::Ok("success");
 
 Each instantiation is an independent type at the machine level; `Option<int>` and `Option<string>` share no runtime representation.
 
+A variant constructs one instantiation, and something must say which: type arguments written on the path (`Option::<i32>::None`, `Result::Ok::<i32, i32>(4)`), the expected type (an annotation, a parameter, a return type), or the variant's own arguments (`Option::Some(42)` is an `Option<i32>`). A variant nothing instantiates - `const n = Option::None;`, or `Result::Ok(1)` with `E` unbound - is refused (`E0307`). Type arguments written on the path also type the payload: `Result::<i32, i32>::Ok("x")` is refused (`E0214`), and in `Option::<u8>::Some(200)` the literal is a `u8`.
+
 ### 10.4 Methods on Enums
 
 Enums cannot declare methods inline. Methods are added via an `implement` block, which is also how the standard library gives `Option` and `Result` their rich API:

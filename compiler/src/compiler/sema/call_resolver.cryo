@@ -492,6 +492,19 @@ type struct CallResolver {
         // instance not yet minted has no variants to ask.
         const type_ref: TypeRef = this.types.scope_qualifier_type(scope);
         if (!type_ref.is_valid()) { return []; }
+        // An instance named on the qualifier gives the payload its own
+        // arguments, so each argument is typed against what it must be.
+        const inst_base: TypeRef = this.types.view_generic_base(type_ref);
+        if (inst_base.is_valid()) {
+            const base_t: Type* = this.arena.lookup(inst_base);
+            if (base_t == null || base_t.kind != TypeKind::Enum) { return []; }
+            const bet: EnumType* = base_t as EnumType*;
+            const bvi: i64 = bet.variant_index(scope.member_name);
+            if (bvi < 0) { return []; }
+            scope.set_resolved_member(MemberPin::Variant(bvi));
+            const inst_args: TypeRef[] = this.types.view_type_args_copy(type_ref);
+            return this.substitute_payload_types(bet.variants[bvi].payload_types, inst_base, &inst_args);
+        }
         mut enum_t: Type* = this.arena.lookup(type_ref);
         if (enum_t == null) { return []; }
         if (enum_t.kind == TypeKind::Enum) {
@@ -1998,6 +2011,18 @@ type struct CallResolver {
         const scope: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
         const n_targs: i64 = if (call.generic_args.length > 0) { call.generic_args.length } else { scope.generic_args.length };
         if (n_targs == 0) { return out; }
+        // A variant's turbofish names its enum's instance
+        // (`Result::Ok::<u8, i32>(5)`): each argument is typed against the
+        // payload in that instance.
+        const payload: TypeRef[] = this.written_variant_payload(scope);
+        if (payload.length > 0 && payload.length == out.length) {
+            for (mut i: i64 = 0; i < out.length; i++) {
+                if (!out[i].is_valid() || !this.types.contains_generic_param(out[i])) { continue; }
+                out[i] = payload[i];
+                if (i < forced.length) { forced[i] = true; }
+            }
+            return out;
+        }
         mut owner: FamilyOwner = FamilyOwner::Def(DefId::invalid());
         if (!this.scope_owner(scope, &owner)) { return out; }
         const head_trait: DefId = if (scope.impl_trait != null) { this.impl_qualified_trait(scope) } else { DefId::invalid() };
@@ -2020,6 +2045,31 @@ type struct CallResolver {
             if (i < forced.length) { forced[i] = true; }
         }
         return out;
+    }
+
+    /// The payload types of the variant `scope` names, in the instance the
+    /// variant's own type arguments write (`Result::Ok::<u8, i32>`); none when
+    /// the path names no generic enum's variant or an argument does not
+    /// resolve.
+    written_variant_payload(mut &this, scope: ScopeResolutionNode*) -> TypeRef[] {
+        if (scope.generic_args.length == 0) { return []; }
+        const base: TypeRef = this.types.scope_qualifier_type(scope);
+        const t: Type* = this.arena.lookup(base);
+        if (t == null || t.kind != TypeKind::Enum) { return []; }
+        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(base);
+        if (tmpl == null || tmpl.param_count != scope.generic_args.length) { return []; }
+        const et: EnumType* = t as EnumType*;
+        const vi: i64 = et.variant_index(scope.member_name);
+        if (vi < 0) { return []; }
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        this.symbolic.symbolic_bind_params(&rc);
+        mut args: TypeRef[] = [];
+        for (mut i: i64 = 0; i < scope.generic_args.length; i++) {
+            const tr: TypeRef = this.ctx.type_resolver.resolve(scope.generic_args[i], &rc);
+            if (!tr.is_valid()) { return []; }
+            args.push(tr);
+        }
+        return this.substitute_payload_types(et.variants[vi].payload_types, base, &args);
     }
 
     substitute_explicit_method_param_types(mut &this, call: CallExprNode*,
@@ -7378,6 +7428,7 @@ type struct CallResolver {
         if (enum_t == null || enum_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
         if (base.is_valid()) {
             scope.set_resolved_type(type_ref);
+            this.check_variant_arguments(scope, call, type_ref);
             return type_ref;
         }
         // Type arguments written on the variant (`Result::Ok::<i32, i32>(4)`)
@@ -7385,6 +7436,7 @@ type struct CallResolver {
         if (scope.generic_args.length > 0) {
             const written: TypeRef = this.demanded_scope_type(type_ref, &scope.generic_args, scope.span);
             scope.set_resolved_type(written);
+            this.check_variant_arguments(scope, call, written);
             return written;
         }
         const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
@@ -7412,6 +7464,38 @@ type struct CallResolver {
         return promoted;
     }
 
+    /// E0214 at each argument of a variant constructed in `instance` - named
+    /// by type arguments written on the path - that its payload type in that
+    /// instance does not accept.  The payload is the template's with the
+    /// instance's arguments substituted, so `Result::<i32, i32>::Ok("x")` is
+    /// checked against `i32`, not the template's `T`.
+    check_variant_arguments(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*,
+                            instance: TypeRef) -> void {
+        if (call == null || !instance.is_valid()) { return; }
+        const base: TypeRef = this.types.view_generic_base(instance);
+        if (!base.is_valid()) { return; }
+        const base_t: Type* = this.arena.lookup(base);
+        if (base_t == null || base_t.kind != TypeKind::Enum) { return; }
+        const et: EnumType* = base_t as EnumType*;
+        const vi: i64 = et.variant_index(scope.member_name);
+        if (vi < 0) { return; }
+        const args: TypeRef[] = this.types.view_type_args_copy(instance);
+        const payload: TypeRef[] = this.substitute_payload_types(et.variants[vi].payload_types, base, &args);
+        const n: i64 = if (call.arguments.length < payload.length) { call.arguments.length } else { payload.length };
+        for (mut i: i64 = 0; i < n; i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null || !arg.resolved_type.is_valid()) { continue; }
+            const want: TypeRef = payload[i];
+            if (!this.types.arg_type_is_concrete(want) || !this.types.arg_type_is_concrete(arg.resolved_type)) { continue; }
+            if (this.checker.can_assign(arg.resolved_type, want)) { continue; }
+            this.diag.emit_type_mismatch_with_value(ErrorCode::E0214_ARGUMENT_MISMATCH, arg.span,
+                want, arg.resolved_type,
+                Text::new(fmt::format("argument %lld of `%s` is its payload in `%s`", i + 1,
+                    this.intern.resolve(scope.member_name), this.types.type_display_name(instance))),
+                SourceSpan::none(), arg);
+        }
+    }
+
     /// E0307 at each recorded variant still typed as its generic enum: no
     /// instance was named, and neither its arguments, the expected type nor
     /// an enclosing call determined one, so the value has no layout.
@@ -7430,11 +7514,19 @@ type struct CallResolver {
     emit_variant_cannot_infer(mut &this, scope: ScopeResolutionNode*, enum_ref: TypeRef) -> void {
         const enum_str: string = this.types.type_display_name(enum_ref);
         const member_str: string = this.intern.resolve(scope.member_name);
+        mut has_payload: boolean = true;
+        const et_t: Type* = this.arena.lookup(enum_ref);
+        if (et_t != null && et_t.kind == TypeKind::Enum) {
+            const et: EnumType* = et_t as EnumType*;
+            const vi: i64 = et.variant_index(scope.member_name);
+            if (vi >= 0) { has_payload = et.variants[vi].payload_types.length > 0; }
+        }
+        const args_tail: string = if (has_payload) { "(...)" } else { "" };
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
             Text::new(fmt::format("cannot infer the type arguments of `%s` for its variant `%s`", enum_str, member_str)));
         d = d.at_with_label(scope.span, Text::new("generic, and nothing here says which instance this constructs"));
         d = d.help(Text::new(fmt::format(
-            "write the type arguments, `%s::<...>::%s(...)`, or give the value an expected type", enum_str, member_str)));
+            "write the type arguments, `%s::<...>::%s%s`, or give the value an expected type", enum_str, member_str, args_tail)));
         this.ctx.emit_diagnostic(d);
     }
 
