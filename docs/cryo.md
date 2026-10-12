@@ -583,6 +583,8 @@ type StringResult<T> = Result<T, string>;
 type Callback        = (int) -> void;
 ```
 
+A path through an alias names what the same path through its target names, type arguments included: with `type PI = Pl<i32>;`, `PI::plain(8)` is `Pl::<i32>::plain(8)`, and with `type Hue = Color;`, `Hue::Green` is `Color::Green`. An alias of an alias is followed. An alias with parameters of its own (`StringResult<T>` above) and an alias of a type that is no named type (`Callback`) name no path.
+
 ### 2.9 Casting with `as`
 
 Cryo never inserts an implicit numeric or pointer conversion. To convert between types, use the `as` keyword. The compiler does not insert range checks for narrowing casts; this is a deliberate choice that keeps the conversion's cost visible.

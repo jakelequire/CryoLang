@@ -26,7 +26,7 @@ import compiler::diag::diagnostic;
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::ast;
 import compiler::ast::{
-    ImportStyle, NamedAnnotation, NodeKind, PatternBinding, PatternKind, ProjectionAnnotation,
+    GenericAnnotation, ImportStyle, NamedAnnotation, NodeKind, PatternBinding, PatternKind, ProjectionAnnotation,
     TraitBound, TraitRef, TypeAnnotation, Visibility, declaration, expression, node,
     pattern, statement, visitor
 };
@@ -464,6 +464,7 @@ public:
             }
             NodeKind::TypeAliasDeclaration => {
                 const alias_node: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
+                this.ctx.note_alias_decl(node);
                 if (!alias_node.binding_namespace.is_valid()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
                         alias_node.alias_name, alias_node.span, true);
@@ -2125,6 +2126,23 @@ public:
     /// is passed as the symbol rather than as a yes/no because a type-relative
     /// answer has to name the type it stopped on, and that name is exactly what
     /// the caller's lookup produced.
+    /// Answer the scope segment with the type `base` names.  A type alias's
+    /// path is its target's, and the target may be stamped in a module
+    /// walked later: claimed now, and answered once every module's names
+    /// are (`NameResolutionPass::settle_alias_paths`).
+    answer_type_scope(&this, node: ScopeResolutionNode*, base: ResBase, trailing: u32) -> void {
+        match (base) {
+            ResBase::Def(d) => {
+                if (NameResolutionPass::alias_decl(this.ctx, d) != null) {
+                    if (node.defer_to_alias(d)) { this.ctx.note_alias_path(node as ASTNode*); }
+                    return;
+                }
+            }
+            _ => { }
+        }
+        node.set_scope_res(Res::TypeRelative(base, trailing));
+    }
+
     stamp_module_scope(&this, node: ScopeResolutionNode*,
                        scope_sym: SymbolID) -> void {
         const binds_in_scope: boolean = scope_sym.is_valid();
@@ -2207,7 +2225,7 @@ public:
         if (binds_in_scope && have_base) {
             const bound: Symbol = this.resolver.get_symbol(scope_sym);
             if (bound.kind == SymbolKind::GenericParam || this.symbol_names_type(&bound)) {
-                node.set_scope_res(Res::TypeRelative(base, trailing));
+                this.answer_type_scope(node, base, trailing);
                 return;
             }
             // A refused import in the scope position owns nothing; its
@@ -2306,7 +2324,7 @@ public:
                 // The segment binds in scope, so it names a TYPE and the module
                 // spellings never applied to it.  No diagnostic was emitted, so
                 // `Err` would be a refusal nobody reported.
-                node.set_scope_res(Res::TypeRelative(base, trailing));
+                this.answer_type_scope(node, base, trailing);
             }
             return;
         }
@@ -2332,7 +2350,7 @@ public:
                 // Binds in scope: a type wearing a module's spelling.  The
                 // module was never what this path named, so its unreachability
                 // is not this node's answer.
-                node.set_scope_res(Res::TypeRelative(base, trailing));
+                this.answer_type_scope(node, base, trailing);
             }
             return;
         }
@@ -2370,7 +2388,7 @@ public:
             }
             return;
         }
-        node.set_scope_res(Res::TypeRelative(base, trailing));
+        this.answer_type_scope(node, base, trailing);
     }
 
     /// Stamp the written types in a `where` clause.
@@ -4015,6 +4033,77 @@ type struct NameDeclarationPass {
 /// brittle at codegen time (compilation-ordering dependent); static methods
 /// resolve reliably.
 type struct NameResolutionPass {
+    /// Answer every path whose scope segment names a type alias
+    /// (`ResSlot::Alias`) as the same path through the alias's target:
+    /// `PI::plain` with `type PI = Pl<i32>;` becomes `Pl::<i32>::plain`,
+    /// the target's stamp on the segment and its written arguments copied
+    /// onto it, so every later stage reads the path the target spells.  An
+    /// alias of an alias is followed.  Run once every module's names are
+    /// resolved, when every alias's target is stamped.  A target that is no
+    /// named type (a pointer, a function type) or an alias with parameters
+    /// of its own owns no path of its own, and the segment is answered with
+    /// the alias, which owns nothing.
+    static settle_alias_paths(ctx: CompilationContext*) -> void {
+        for (mut i: i64 = 0; i < ctx.alias_paths.length; i++) {
+            const node: ScopeResolutionNode* = ctx.alias_paths[i].node as ScopeResolutionNode*;
+            mut alias: TypeAliasDeclNode* = NameResolutionPass::alias_decl(ctx, node.scope_res.pending_alias());
+            mut answer: Res = Res::TypeRelative(ResBase::Def(node.scope_res.pending_alias()), 1);
+            mut hops: i32 = 0;
+            while (alias != null && alias.generic_params.length == 0 && hops < 16) {
+                hops += 1;
+                const target: TypeAnnotation* = alias.target_annotation;
+                if (target == null) { break; }
+                mut base: TypeAnnotation* = target;
+                mut gen: GenericAnnotation* = null;
+                match (*target) {
+                    TypeAnnotation::Generic(g) => { gen = g; base = g.base; }
+                    _ => { }
+                }
+                mut next: DefId = DefId::invalid();
+                match (*base) {
+                    TypeAnnotation::Primitive(p) => {
+                        answer = Res::TypeRelative(ResBase::PrimTy(p.name), 1);
+                    }
+                    TypeAnnotation::Named(n) => {
+                        match (n.res) {
+                            ResSlot::Answered(r) => {
+                                match (r) {
+                                    Res::Def(d)    => { next = d; answer = Res::TypeRelative(ResBase::Def(d), 1); }
+                                    Res::PrimTy(p) => { answer = Res::TypeRelative(ResBase::PrimTy(p), 1); }
+                                    _              => { }
+                                }
+                            }
+                            _ => { }
+                        }
+                    }
+                    _ => { }
+                }
+                if (gen != null && node.scope_generic_args.length == 0) {
+                    mut args: TypeAnnotation*[] = [];
+                    for (mut a: i64 = 0; a < gen.args.length; a++) {
+                        args.push(TypeAnnotation::clone_ptr(gen.args[a]));
+                    }
+                    node.scope_generic_args = args;
+                }
+                if (gen != null || !next.is_valid()) { break; }
+                alias = NameResolutionPass::alias_decl(ctx, next);
+            }
+            node.scope_res.settle_alias(answer);
+        }
+        ctx.alias_paths.clear();
+        ctx.alias_decls.clear();
+    }
+
+    /// The alias declared as `d`, or null when `d` is not one.
+    static alias_decl(ctx: CompilationContext*, d: DefId) -> TypeAliasDeclNode* {
+        if (!d.is_valid()) { return null; }
+        for (mut i: i64 = 0; i < ctx.alias_decls.length; i++) {
+            const a: TypeAliasDeclNode* = ctx.alias_decls[i].node as TypeAliasDeclNode*;
+            if (a.def.equals(d)) { return a; }
+        }
+        return null;
+    }
+
     /// Run the name resolution pass on the compilation context.
     static run(ctx: CompilationContext*) -> PassResult {
         LOG_DEBUG(LogComponent::General, "[NameResolution] run() entry");

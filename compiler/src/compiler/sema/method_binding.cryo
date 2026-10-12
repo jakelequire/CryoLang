@@ -1169,16 +1169,16 @@ type struct MethodBinding {
         // template and leaks a sibling spec's return.
         const owner_base: TypeRef = this.types.view_generic_base(owner_ref);
         mut owner_ast: ASTNode* = null;
+        mut owner_tmpl: TemplateEntry* = null;
         if (owner_base.is_valid()) {
-            const tmpl: TemplateEntry* =
-                this.ctx.generic_registry.template_of_type(owner_base);
-            if (tmpl != null) { owner_ast = tmpl.ast_node; }
+            owner_tmpl = this.ctx.generic_registry.template_of_type(owner_base);
+            if (owner_tmpl != null) { owner_ast = owner_tmpl.ast_node; }
         }
         if (owner_ast == null) {
             owner_ast = this.ctx.generic_registry.lookup_inherent_owner(owner_ref);
             if (owner_ast == null) {
-                const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(owner_ref);
-                if (tmpl != null) { owner_ast = tmpl.ast_node; }
+                owner_tmpl = this.ctx.generic_registry.template_of_type(owner_ref);
+                if (owner_tmpl != null) { owner_ast = owner_tmpl.ast_node; }
             }
         }
         // Primitive / non-generic receiver whose generic method lives in an
@@ -1213,39 +1213,46 @@ type struct MethodBinding {
         }
         if (owner_ast == null) { return fallback; }
 
-        const empty_methods: MethodNode*[] = [];
         const empty_params: GenericParamNode*[] = [];
-        mut owner_methods: &MethodNode*[] = &empty_methods;
         mut owner_params:  &GenericParamNode*[] = &empty_params;
         mut owner_def: DefId = DefId::invalid();
         if (owner_ast.kind == NodeKind::StructDeclaration) {
             const sn: StructDeclNode* = owner_ast as StructDeclNode*;
-            owner_methods = &sn.methods;
             owner_params  = &sn.generic_params;
             owner_def     = sn.def;
         } else if (owner_ast.kind == NodeKind::UnionDeclaration) {
             const un: UnionDeclNode* = owner_ast as UnionDeclNode*;
-            owner_methods = &un.methods;
             owner_params  = &un.generic_params;
             owner_def     = un.def;
         } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
             const cn: ClassDeclNode* = owner_ast as ClassDeclNode*;
-            owner_methods = &cn.methods;
             owner_params  = &cn.generic_params;
             owner_def     = cn.def;
         } else {
             return fallback;
         }
 
+        // The method as the member-function door answers the leaf, declared
+        // in the type's body or in an inherent `implement` block; the owner's
+        // parameters are then the ones the declaring block names them by.
         mut found: MethodNode* = null;
         const named: MethodNode*[] = this.ctx.decl_index.methods_named(this.ctx.generic_registry.methods_owner_of(owner_def), member.member);
-        for (mut k: i64 = 0; k < owner_methods.length; k++) {
-            const m: MethodNode* = owner_methods[k];
+        for (mut k: i64 = 0; k < named.length; k++) {
+            const m: MethodNode* = named[k];
             if (m == null || m.func == null) { continue; }
-            if (!DeclarationIndex::holds_method(&named, m)) { continue; }
             if (m.func.generic_params.length != member.generic_args.length) { continue; }
             found = m;
             break;
+        }
+        if (found != null && owner_tmpl != null) {
+            for (mut b: i64 = 0; b < owner_tmpl.impl_blocks.length; b++) {
+                const block: ImplBlockNode* = owner_tmpl.impl_blocks[b];
+                if (block == null || block.trait_annotation != null) { continue; }
+                if (MethodNode::is_method_of(found, block as ASTNode*)) {
+                    owner_params = &block.generic_params;
+                    break;
+                }
+            }
         }
         mut impl_block: ImplBlockNode* = null;
         if (found == null) {
