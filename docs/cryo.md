@@ -2789,6 +2789,32 @@ type struct Vertex { v: i32; }         // E0205: `Vertex` spells the imported mo
 
 A module may declare a type named like a *different* module, and a type may be reached through its module's path (`Buffer::Handle`) without being imported. The consequence is that a scope segment names exactly one owner, so `Buffer::make` is the module's function or nothing — there is no rule choosing between a module and a same-named type, because no scope holds both.
 
+### 14.7 Name Lookup
+
+A bare name is looked up through three tiers, innermost first:
+
+1. the locals and generic parameters in scope at the use;
+2. the file's own scope: the module's items, private ones included, and the names its imports bind - one scope, so a clash between the two is a redeclaration (E0205, [section 14.3](#143-imports));
+3. the prelude.
+
+An inner tier shadows an outer one silently. A local named like an imported function is not a diagnostic, and an imported type named like a prelude type replaces it in that file:
+
+```cryo
+import Shapes::{ Option, twice };     // Shapes's own `Option` struct
+
+function main() -> i32 {
+    const o: Option = Option { n: 3 };   // Shapes::Option, not the prelude's
+    const twice: i32 = 4;                // a local; `twice` is that local below
+    return twice - 4;
+}
+```
+
+Two candidates are ambiguous only within one tier: two wildcards offering one name (E0154), two brace entries binding it (E0243).
+
+Nothing outside the tiers is reachable. A name declared exactly once in the whole program still does not resolve where nothing brings it into scope, and a path whose first segment no tier binds is not found, however fully it is spelled: `std::math::pow(2.0, 3.0)` in a file that imports no `std::math` is E0203.
+
+A path resolves one segment at a time. Its first segment is a bare name, looked up as above; each later segment is looked up in what the segment before it named. A module is found only among those the file can see - its own and the ones it imports, spelled as [section 14.6](#146-modules-and-types-share-one-namespace) allows - never by searching the program for its spelling, so what a path means never depends on which other modules exist in the program. A path that does not resolve is an error, with a suggestion where one exists.
+
 ---
 
 ## 15. Pointers and Memory

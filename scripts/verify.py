@@ -12,7 +12,7 @@ build:
     incr       scripts/incremental-instance-check.py
                                          an edit asking a cached module for a
                                          new generic instance still links
-    fast       make check-fast           section 0, pin integrity
+    fast       make check-fast           verify's self-test, pin integrity
 
 They are independent: each writes its own build directory, and nothing here
 rebuilds a shared archive while another reads it (which is why the gates are
@@ -101,7 +101,7 @@ GATES = {
     "incr":     ([PY, "scripts/incremental-instance-check.py", "--cryo", "{cryo}"],
                  r"^incremental-instance-check: "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to
-    # child makes, and check-fast's ns-status-check would receive verify's flags.
+    # child makes, and no check-fast target is meant to receive verify's flags.
     "fast":     (["make", "--no-print-directory", "check-fast", "ARGS="], r"check-fast: "),
 }
 # The gates whose objects are compared.  A baseline run needs only these.

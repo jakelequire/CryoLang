@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -186,16 +186,12 @@ help:
 	@echo "                         concurrently; hash their objects (ARGS=--baseline HEAD"
 	@echo "                         compares them against HEAD's compiler)"
 	@echo "  make test-list         List the discovered test cases without running them"
-	@echo "  make ns-status-check   Run every check docs/name-resolution.md §0 carries"
-	@echo "  make check-fast        verify's self-test + ns-status-check + verify-pin (builds nothing)"
-	@echo "  make install-hooks     Point git at the tracked hooks (run once per checkout)"
+	@echo "  make check-fast        verify's self-test + verify-pin (builds nothing)"
 	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
 	@echo "                         (installs nothing; the only gate that builds it)"
 	@echo "  make vendor-check     Check every constant shape survives cryo vendor"
 	@echo "  make api-index         Regenerate docs/stdlib-api.txt (the stdlib API index)"
 	@echo "  make api-index-check   Fail if docs/stdlib-api.txt is stale"
-	@echo "                         (name-resolution cascade regrowth gate;"
-	@echo "                         re-pin deliberately with ARGS=--update)"
 	@echo "  make examples          Compile every examples/*/ project (CI smoke gate)"
 	@echo "  make runtime-tiers     Build the runtime tier archives (freestanding +"
 	@echo "                         hosted); every link needs the panic tier"
@@ -594,45 +590,11 @@ endif
 verify-selftest:
 	@$(PYTHON) scripts/verify.py --selftest
 
-# ---- name-resolution status gate ---------------------------------------
-# Run every check §0 of docs/name-resolution.md carries and fail on drift.
-#
-# §0 exists so an incoming agent reads 143 lines instead of re-deriving truth
-# from 16,000 append-only ones.  Nothing about a status section breaks when it
-# goes stale, which is exactly how the archive it replaces got that way, so the
-# rows are executable and this runs them.
-#
-# No compiler, no stdlib, no link: it greps the tree, running the rows
-# concurrently, in about half a minute.  That matters more than usual here - CI fires on `main` only, so
-# on a migration branch the enforcement point is somebody running this.
-ns-status-check:
-	@$(PYTHON) scripts/ns-status-check.py $(ARGS)
-
-# The guards' own test: the commit-msg guard and ns-status-check driven
-# through a throwaway repository, every rule in both directions.  A guard
-# that stops guarding is silent by construction, and so is a self-test
-# nothing runs, which is why CI runs this.  About two minutes - each case
-# stands up a git repository - so it is a merge gate, not part of check-fast.
-guard-selftest:
-	@$(PYTHON) scripts/ns-guard-selftest.py
-
 # ---- the pre-commit sweep ----------------------------------------------
-# Every gate here is source- or document-derived, so this target builds
-# nothing.  A short gate everybody runs is worth more than a twenty-minute
-# one nobody does.
-check-fast: verify-selftest ns-status-check verify-pin
-	@echo "check-fast: OK (verify's declared-program self-test, section 0, pin integrity)"
-
-# ---- git hooks ---------------------------------------------------------
-# Point git at the tracked hook directory.  Hooks live in scripts/git-hooks so
-# they are versioned with the rules they enforce; .git/hooks is per-checkout and
-# a fresh clone inherits nothing, which is the same trap `.claude/settings.json`
-# already carries in CLAUDE.md.  Run this once per checkout.
-install-hooks:
-	@git config core.hooksPath scripts/git-hooks
-	@echo "install-hooks: core.hooksPath -> scripts/git-hooks"
-	@echo "  commit-msg: refuses a ledger-only commit, a §8 LANDED/FIXED/RULED"
-	@echo "  entry that does not move §0, and a §0 re-pinned on its own."
+# Every gate here is source-derived, so this target builds nothing.  A short
+# gate everybody runs is worth more than a twenty-minute one nobody does.
+check-fast: verify-selftest verify-pin
+	@echo "check-fast: OK (verify's declared-program self-test, pin integrity)"
 
 # ---- language-server compile gate --------------------------------------
 # The LSP links the compiler as a LIBRARY (tools/CryoLSP/cryoconfig ->

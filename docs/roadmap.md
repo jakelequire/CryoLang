@@ -113,11 +113,13 @@ language's features; each is a branch of its own after the merge.
 - **How wide a `char` is**, and so what a character literal holds above
   255 (`'\u{e9}'` fits either way; `'\u{1F600}'` does not fit a byte).
   Undecided.
-- **Checking trait implementations against their traits.**  Today an
-  implementation's methods are not compared with the trait's declared
-  signatures.  Whether that check lands before or after the merge is
-  undecided.
 - **A module cycle's report.**  E0501 names the modules in a cycle; whether
-  it prints the cycle as a path, in order, is open.
+  it prints the cycle as a path, in order, is open, and so is whether a
+  cycle that crosses packages is E0501 too or an error of its own.
+- **A private type reached by inference.**  E0503 refuses a `private` type
+  where the source names it, but a value of one returned by a public
+  function and bound by inference crosses the module boundary and answers
+  method calls.  `tests/tests/projects/resolution_tripwire` pins the
+  behaviour as it is.  Whether that is refused, and where, is open.
 - **`std::Range`.**  Nothing re-exports `Range` at the root of `std`, so the
   path is refused today.  Whether `stdlib/lib.cryo` exports it there is open.

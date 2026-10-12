@@ -10,7 +10,9 @@ Where the code breaks one, the code is the defect.
    layer stamps the node that carries it with a definition, or refuses it at
    that spot. No later pass looks a name up again from its text. A consumer
    that finds an unstamped node treats it as a hard error, never as a cue to
-   try another lookup.
+   try another lookup.  A pass that synthesizes a name-bearing node -
+   desugaring, the async lowering, the AST cloner - knows what it refers
+   to, so it creates the node already stamped.
 2. **Stores are keyed by identity.** Every write into a declaration store
    takes its key from a definition, type or module identity, or from a door.
 3. **A spelling reaches a lookup only through a door** from the list below.
@@ -158,6 +160,48 @@ yet is recorded with the change that builds it, not here.
      arguments, `Wrap::<i32>::conv::<u8>(7)`, is fixed before the merge,**
      in the spirit of ruling 243: known defects are fixed before the merge,
      as the last tasks.  (Dispatch, delegated)
+
+251. **The ledger (`docs/name-resolution.md`) is retired now,** with its
+     status check, its commit hook, `install-hooks`, and the Makefile and
+     verify wiring that served only them, as ruling 106 required before
+     the merge.  (Jake)
+
+252. **Every trait implementation is checked against its trait before the
+     merge:** a missing method, a method the trait does not declare, and a
+     parameter, receiver or return type that differs from the trait's are
+     each refused, under an error code of their own.  A method the trait
+     gives a default body is not missing.  (Jake)
+
+253. **Casting a class value to a pointer (`av as void*`) is refused;**
+     the address is written `&av`.  (Jake)
+
+254. **A type alias reaches its type's static methods:** with `type PI =
+     Pl<i32>;`, `PI::plain(8)` is `Pl<i32>::plain(8)`.  Fixed before the
+     merge.  (Jake)
+
+255. **A method call with explicit type arguments inside a generic
+     function works when the method is declared in an `implement` block,**
+     as it does when the method is in the type's body: `w.conv::<u32>(5)`
+     inside `function thn<A>(w: Wrap<A>)`.  Fixed before the merge.  (Jake)
+
+256. **`Allocate`'s release method keeps its default body, which does
+     nothing.**  (Jake)
+
+257. **A struct may implement `Allocate`;** with no inheritance, only that
+     struct's own `new` goes through it.  (Jake)
+
+258. **Casting a class value up or down its hierarchy stays refused;**
+     casting a pointer along the hierarchy is allowed.  (Jake)
+
+259. **The ledger's status rows go with it,** the ones expecting zero
+     included; none is ported to another check.  (Jake)
+
+260. **What `import std::future;` brings into scope is settled by what the
+     compiler does, checked first, and `docs/cryo.md` is made to match the
+     rule** that a plain import binds no names (D7).  (Jake)
+
+261. **The wording of the cast errors stays as it is, and E0307 stays the
+     error for too many type arguments.**  (Jake)
 
 ### 2026-10-11
 

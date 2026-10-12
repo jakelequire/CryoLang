@@ -32,9 +32,7 @@ make verify              # build once; census, examples, lsp, cross, check-fast 
                          # a program the baseline built, in tests/started-passing
 make roster-check        # every unit test, project and negative file against the roster
                          # golden (tests/test-roster.txt); its OK line prints the current counts
-make ns-status-check     # run every check docs/name-resolution.md §0 carries
-make check-fast          # verify's self-test + §0 + pin, builds nothing. Run before committing.
-make install-hooks       # point git at scripts/git-hooks (ONCE per checkout)
+make check-fast          # verify's self-test + pin integrity, builds nothing. Run before committing.
 make lsp-check           # compile tools/CryoLSP with the compiler under test
 make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s
 make vendor-check        # every constant shape survives `cryo vendor`
@@ -59,42 +57,11 @@ only things that run are what a person or an agent runs.
 
 So:
 
-- **`make check-fast`** before committing. verify's self-test, §0, pin
-  integrity; it builds nothing. About a minute: the ledger's status rows run
-  one shell each, concurrently, in Git's bash on Windows (never the
-  WSL launcher a bare `bash` resolves to there), and the rows that parse
-  `compiler/src` share one parse per run (`scripts/parse_cache.py`). A short
-  gate everybody runs beats a twenty-minute one nobody does.
-- **`make install-hooks`**, once per checkout. `.git/hooks` is per-checkout and
-  a fresh clone inherits nothing, the same trap `.claude/settings.json` carries.
-  It installs a `commit-msg` hook that refuses three things: a ledger file
-  that lands alone, a §8 entry marked LANDED/FIXED/RULED that does not move
-  §0 in the same commit, and a §0 whose expected values change while nothing
-  outside `docs/` does. The last one is what stops §0 being re-pinned into
-  agreement with itself.
-- **Neither check names a ledger file.** §0 is found by its `## 0. Current
-  state` heading, and the archive by a directive §0 carries:
-  `<!-- ns-archive: docs/<glob>.md -->`, repeatable, relative to the repo
-  root. Undeclared, the archive is the §0 document itself - which holds while
-  that document still carries entry headings, and is REFUSED once it does
-  not, because that is the state where the archive has moved somewhere the
-  checks cannot see. Splitting the archive needs the directive and nothing
-  else.
-  Waive the second, visibly, with a `no-section-0: <reason>` line in the commit
-  message; `git log --grep=no-section-0` is the audit.
-  `python scripts/ns-guard-selftest.py` drives all three through a throwaway
-  repository and shows them refuse and allow.
-- **If your change moves a number §0 pins, update that row BY HAND in the same
-  commit.** The guard cannot do it for you: its third rule runs
-  `ns-status-check` only when the commit STAGES §0, so a commit that moves a
-  pinned number without touching the ledger goes straight through and leaves
-  the row wrong at HEAD; a pinned line count once stood hundreds of lines
-  away from its file that way. `make ns-status-check` names every drifted
-  row and needs no build.
-  The same rule bites from the other side in a SHARED checkout: a commit that
-  does stage §0 is refused while anyone else's uncommitted edit has any row
-  drifted, and that refusal has no waiver. Land §0 changes when the tree is
-  yours.
+- **`make check-fast`** before committing: verify's self-test and pin
+  integrity. It builds nothing and takes seconds, so it is no evidence about
+  the compiler; `make verify` is.
+- **No commit hook runs.** Nothing refuses a commit; the gates above are
+  what a person or an agent runs.
 
 ### What a green gate does NOT tell you
 
@@ -112,7 +79,7 @@ not done. The remaining limits are here so nobody rediscovers them:
   `compiler/src/compiler/instance.cryo`; the fix is to store each reused
   module's warnings beside its object and replay them, and it is not done.
   This was diagnosed once already and lost, because it lived only in a
-  ledger entry's prose.
+  status document's prose.
 - **`make test` passes on an exit code.** A suite that ran nothing prints no
   header, no summary and no explanation, and exits 0 with `OVERALL PASS`.
   Use `make test-census` wherever the run is being taken as evidence; it
@@ -140,12 +107,6 @@ not done. The remaining limits are here so nobody rediscovers them:
   E0236 is one; its negative test can assert the code alone.
 - **`selfhost-check` proves stability, not correctness.** Stage 3 builds
   stage 4, so a miscompile that reproduces itself is invisible to it.
-- **§0's row checks catch a NUMBER that moved and nothing else.** Not a
-  decision that never got a row (§8.39's second decision survived ninety-five
-  entries that way), not a row whose count is right and whose status word is
-  wrong, not a gate's blind spot changing - nobody would have grepped
-  `lsp-check` off the pin; that came from reading the Makefile. The commit
-  hook covers the missing-row half. Neither replaces reading it.
 - **`make lsp-check` builds with the stage-2 compiler**, which is what makes
   it a gate; `make lsp` builds with the pin and certifies nothing about the
   compiler being built.
@@ -206,8 +167,8 @@ done; grep -a "^verify\|^  [a-z]\|JOB_EXIT" .verify/run.out
 | document | governs |
 |---|---|
 | `docs/cryo.md` | the language |
-| `docs/name-resolution.md` | symbol resolution, modules, visibility, scope |
-| `docs/resolution-rules.md` | the five rules resolution is done by, and the doors - the only functions a spelling may be looked up through |
+| `docs/resolution-rules.md` | the five rules resolution is done by, and the doors - the only functions a spelling may be looked up through; its appendix holds the rulings |
+| `docs/roadmap.md` | the work planned for after the merge, and the open questions |
 | `docs/cryo-mangling-spec.md` | symbol mangling |
 | `docs/abi.md` | calling convention, layout |
 | `docs/grammar.md` | syntax |
@@ -439,8 +400,8 @@ honest zeros here were measured over the wrong population entirely.
   per-checkout and a fresh clone does NOT inherit it - set it again there. This
   line is the part that travels.
 - A commit message says what changed and why, in plain terms. It does not
-  cite internal bookkeeping: no ruling numbers ("Rulings 149-158"), ledger
-  entries ("8.540"), session numbers, `HANDOFF.md` sections, audit files or
+  cite internal bookkeeping: no ruling numbers ("Rulings 149-158"), old
+  ledger entries ("8.540"), session numbers, `HANDOFF.md` sections, audit files or
   store/slice labels. Those are dead references within months; state the
   behaviour or rule itself instead.
 - Cryo has no `else if` in an if-**expression**; statements are fine.
@@ -448,37 +409,21 @@ honest zeros here were measured over the wrong population entirely.
 
 ## Commits
 
-**A ledger entry commits with the code it documents.** `docs/name-resolution.md`
-is the migration's evidence, and an entry is the record of a change - not a
-separate deliverable. Write both, commit them together.
+**A change's docs commit with its code.** A ruling recorded in
+`docs/resolution-rules.md`, a rule written into `docs/cryo.md`, an item moved
+in `docs/roadmap.md` - each lands in the commit that builds it. A doc change
+that lands apart from its code turns a behaviour change into two half-records:
+the commit says what moved without saying why, and the doc claims a behaviour
+with no diff to check it against.
 
-- **Never commit `docs/name-resolution.md` alone.** Not as a follow-up, not as
-  a preceding commit, not as a docs-only tidy-up. A ledger entry that lands
-  apart from its change turns a behaviour change into two half-records: the
-  commit says what moved without saying why, and the entry claims a measurement
-  with no diff to check it against.
 - **Bundle to complete-work boundaries.** Prefer fewer, larger commits. A
   commit is one finished thing - the code, its tests, its goldens and its
-  ledger entry - not one file's worth of edits.
+  docs - not one file's worth of edits.
 - **The same goes for goldens.** A re-pinned `test-roster.txt` rides with
   the change that moved the number, and the message says why it moved.
-
-### No exceptions, including the handoff
-
-**A `docs/name-resolution.md` change never lands in a commit of its own.** There
-is no case - not a follow-up, not a docs-only tidy-up, and **not an end-of-session
-handoff**. A handoff entry goes into the session's FINAL WORK COMMIT.
-
-That means writing it **before** the last gate pass, so it is staged with the
-code rather than appended after it. Doing so takes foresight at the end of a
-session, and that is the point: an entry written while the work is still open is
-a record of what the work did, and an entry written after the last commit has
-landed is a record of nothing a diff can check.
-
-"The ledger update did not fit anywhere" is not a reason to land one alone; it
-means the commit boundary was drawn in the wrong place. If an entry documents a
-change already committed, amend that commit or fold the entry into the next one
-touching the same area.
+- Write the docs **before** the last gate pass, so they are staged with the
+  code rather than appended after it. If a doc change belongs to a change
+  already committed, fold it into the next commit touching the same area.
 
 ## Environment landmines
 
@@ -521,8 +466,8 @@ touching the same area.
 
 ## Enforcement (maintainer setup — not yet wired)
 
-The rules above are honored by discipline, which is the same thing
-`docs/name-resolution.md` §7 says will be violated under deadline. To make them
+The rules above are honored by discipline, which is what gets violated under
+deadline. To make them
 harness-enforced, add to `.claude/settings.json`:
 
 - **`PreToolUse`** on `Edit|Write` → `scripts/guard-edit.py`, exiting non-zero
