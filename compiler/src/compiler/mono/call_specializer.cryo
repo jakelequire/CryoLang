@@ -99,17 +99,6 @@ type struct MonoCallSpecializer {
     trait_spec:       MonoTraitSpecializer*;
     ast_resolver:     MonoAstResolver*;
     current_source_file: SymbolStr;
-    // Transient owner context, set only while re-walking a generic static
-    // method's specialized body (finish_generic_static_method_spec): an
-    // owner-constructing struct literal (`Wrap { v: item }`) whose type the
-    // symbolic template walk left invalid is stamped with `gsm_owner_recv` (the
-    // concrete owner spec).  This runs after the whole-spec type-resolution pass
-    // that types a sibling like `Wrap::base`'s literal, which the late-added
-    // method spec misses.  Cleared (recv invalid) outside that re-walk.
-    // `gsm_owner_def` is the owner template's definition, what a literal or
-    // annotation in the body that names the owner was stamped with.
-    gsm_owner_def:    DefId;
-    gsm_owner_recv:   TypeRef;
     /// Calls bound by identity to a method of a receiver or owner whose
     /// instantiation was not minted when the call was walked: a copy's body
     /// is walked once, when it is made, often before the instantiations it
@@ -142,8 +131,6 @@ type struct MonoCallSpecializer {
             trait_spec:       null,
             ast_resolver:     null,
             current_source_file: SymbolStr::empty(),
-            gsm_owner_def:    DefId::invalid(),
-            gsm_owner_recv:   TypeRef::invalid(),
             queued_binds:     [],
             queued_path_values: [],
             current_fn:       null,
@@ -335,14 +322,6 @@ type struct MonoCallSpecializer {
                 }
                 if (inner != null && (inner as ASTNode*).kind == NodeKind::VariableDeclaration) {
                     mut vd: VarDeclNode* = inner as VarDeclNode*;
-                    // Inside a generic-static-method body re-walk: a local typed with
-                    // the bare owner name (`mut s: String`) keeps the bare template
-                    // type; give it the concrete owner spec so it agrees with the
-                    // concretized return, exactly as owner materialization types a
-                    // non-generic sibling's local.
-                    if (this.gsm_owner_recv.is_valid()) {
-                        this.concretize_owner_local(vd);
-                    }
                     if (vd.initializer != null) {
                         this.walk_expr(vd.initializer, res_ctx, subst);
                         // Sema already typed this binding to a concrete
@@ -541,24 +520,6 @@ type struct MonoCallSpecializer {
             }
             NodeKind::StructLiteral => {
                 const sl: StructLiteralNode* = expr as StructLiteralNode*;
-                // Only while re-walking a generic-static-method's specialized body
-                // (gsm_owner_* set): concretize an owner-typed struct literal
-                // (`Wrap { v: item }`) whose type the symbolic template walk left
-                // bare/invalid.  Gated on `gsm_owner_recv` so the ordinary walk path
-                // is unaffected.
-                if (this.gsm_owner_recv.is_valid()) {
-                    if (this.names_gsm_owner(&sl.res)) {
-                        sl.set_resolved_type(this.gsm_owner_recv);
-                    } else if (subst != null && sl.resolved_type.is_valid()) {
-                        // A different generic type built in the body (`Pair<T>{..}`):
-                        // concretize via the active owner/method subst.
-                        const concrete: TypeRef = subst.apply(sl.resolved_type, this.arena);
-                        if (concrete.is_valid() && !concrete.equals(sl.resolved_type)
-                                && !this.arena.contains_generic_param(concrete)) {
-                            sl.set_resolved_type(concrete);
-                        }
-                    }
-                }
                 for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
                     this.walk_expr(sl.field_inits[i].value, res_ctx, subst);
                 }
@@ -1845,22 +1806,22 @@ type struct MonoCallSpecializer {
         // identity once the owner is minted, wherever the owner's method is
         // written - its declaration, an impl block of the template, or a
         // trait's declaration (`HashSet::<i32>::default()`,
-        // `(Beta for Wrap<i32>)::make()`).  A generic static one
-        // (`Wrap<A>::make<T>`) needs its OWN `<T>` specialized within the
-        // owner spec - the stash is the METHOD's `<T>`; owner args come from
-        // the scope turbofish or template defaults.
+        // `(Beta for Wrap<i32>)::make()`).  A generic one (`Wrap<A>::make<T>`,
+        // `Wrap<A>::keep<T>(&w, t)`), wherever it is written, needs its OWN
+        // `<T>` specialized on the owner's specialization - the stash is the
+        // METHOD's `<T>`; owner args come from the scope turbofish or
+        // template defaults.
         const func: FunctionDeclNode* = this.decl_index.method_func_of(call.template_method);
         if (func == null) { return false; }
         const recorded: ASTNode* = this.decl_index.method_decl_of(call.template_method);
         const m: MethodNode* = if (recorded.kind == NodeKind::MethodDeclaration) { recorded as MethodNode* } else { null };
         const trait_item: boolean = this.generic_registry.trait_item_position(call.template_method) >= 0;
-        const in_decl: boolean = m != null && MethodNode::is_method_of(m, entry.ast_node);
-        const nongeneric: boolean = func.generic_params.length == 0
-            && (trait_item || in_decl || (m != null && this.template_holds(entry, m)));
-        const matched_generic: MethodNode* = if (m != null && m.is_static && func.generic_params.length > 0 && in_decl) { m } else { null };
+        const held: boolean = trait_item
+            || (m != null && (MethodNode::is_method_of(m, entry.ast_node) || this.template_holds(entry, m)));
+        if (!held) { return false; }
 
         // --- Non-generic method on a generic owner ---
-        if (nongeneric) {
+        if (func.generic_params.length == 0) {
             // The owner's type args come from sema's stash (declaration order).
             if (call.resolved_type_args.length != entry.param_types.length) { return false; }
             mut binds: TypeRef[] = [];
@@ -1882,38 +1843,24 @@ type struct MonoCallSpecializer {
             return true;
         }
 
-        // --- Generic static method on a generic owner (`Wrap<A>::make<T>`) ---
-        if (matched_generic != null) {
-            return this.specialize_generic_static_method(call, scope, entry, matched_generic, subst);
-        }
-        return false;
+        // --- Generic method on a generic owner (`Wrap<A>::make<T>`) ---
+        return this.specialize_generic_path_method(call, scope, entry, subst);
     }
 
-    /// Specialize a call to a GENERIC static method on a GENERIC owner
-    /// (`Wrap<A>::make<T>(item)`).  The owner spec is materialized (via the
-    /// scope turbofish / template defaults) and the method's OWN `<T>` (sema's
-    /// stash) is specialized WITHIN that owner spec - exactly how an instance
-    /// generic method (`push<T>`) is handled, with the owner-default instantiation
-    /// standing in for the receiver.  Returns true when the call is claimed.  On
-    /// the first walk the owner spec entry does not exist yet: the owner is
-    /// enqueued and the call is left UNPINNED so the walk/drain fixpoint
-    /// (specialization.cryo) re-visits it once the entry materializes.
-    specialize_generic_static_method(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
-                                     entry: TemplateEntry*, orig_method: MethodNode*,
-                                     subst: TypeSubstitution*) -> boolean {
+    /// Specialize a call through a path to a GENERIC method of a GENERIC
+    /// owner (`Wrap<A>::make<T>(item)`, `Wrap<A>::keep<T>(&w, t)`).  The owner
+    /// spec is materialized (via the scope turbofish / template defaults) and
+    /// the owner's method for the recorded definition is instantiated at
+    /// sema's stash of the method's OWN `<T>` - exactly as a member call
+    /// (`w.keep::<T>(t)`) is, with the owner's specialization as the
+    /// receiver.  Returns true when the call is claimed.  On the first walk
+    /// the owner spec entry does not exist yet: the owner is enqueued and the
+    /// call is left UNPINNED so the walk/drain fixpoint (specialization.cryo)
+    /// re-visits it once the entry materializes.
+    specialize_generic_path_method(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
+                                   entry: TemplateEntry*, subst: TypeSubstitution*) -> boolean {
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return false; }
-
-        // Method binds: sema stashed the method's OWN `<T>` (declaration order).
-        const n_method: i64 = orig_method.func.generic_params.length;
-        if (n_method == 0) { return false; }
-        if (call.resolved_type_args.length != n_method) { return false; }
-        mut method_binds: TypeRef[] = [];
-        for (mut i: i64 = 0; i < n_method; i++) {
-            const b: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
-            if (!b.is_valid() || this.arena.contains_generic_param(b)) { return false; }
-            method_binds.push(b);
-        }
 
         // Owner binds: scope turbofish, else template defaults.
         mut owner_binds: TypeRef[] = this.compute_owner_default_binds(scope, entry, subst);
@@ -1931,8 +1878,12 @@ type struct MonoCallSpecializer {
             this.state.enqueue_from_type_ref(inst_ref);
             return true;
         }
-        return this.finish_generic_static_method_spec(
-            call, spec_entry, entry, orig_method, &method_binds);
+        const recv_type: TypeRef = spec_entry.specialized_type;
+        mut impl_node: ImplBlockNode* = null;
+        mut owner_ast: ASTNode* = null;
+        const m: MethodNode* = this.receiver_method_of(call.template_method, recv_type, &impl_node, &owner_ast);
+        if (m != null) { this.instantiate_generic_method(call, m, impl_node, owner_ast, recv_type, subst); }
+        return true;
     }
 
     /// Owner type args for a generic-owner static call in mono: explicit scope
@@ -1961,34 +1912,6 @@ type struct MonoCallSpecializer {
         return binds;
     }
 
-    /// Type a local whose annotation names the BARE owner (`mut s: String` in a
-    /// generic-static-method body) as the concrete owner spec.  Only fires
-    /// inside the generic-static-method body re-walk (`gsm_owner_*` set).
-    /// Together with the struct-literal case it types every bare owner
-    /// reference in the spec body as the concrete owner, so a
-    /// `new()+push()+return-local` constructor body is internally consistent.
-    concretize_owner_local(mut &this, vd: VarDeclNode*) -> void {
-        if (vd == null || vd.type_annotation == null) { return; }
-        match (*vd.type_annotation) {
-            TypeAnnotation::Named(named) => {
-                if (named != null && this.names_gsm_owner(&named.res)) {
-                    vd.resolved_type = this.gsm_owner_recv;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Whether a name in the re-walked generic-static-method body was bound
-    /// to the owner template.  An unanswered slot names nothing.
-    names_gsm_owner(&this, slot: &ResSlot) -> boolean {
-        if (!this.gsm_owner_def.is_valid()) { return false; }
-        return match (slot) {
-            ResSlot::Answered(r) => { r.def_id().equals(this.gsm_owner_def) }
-            _                    => { false }
-        };
-    }
-
     /// Find the materialized owner spec entry for an owner instantiation
     /// (display-equal on `instantiated_type`, matching the instance-method path).
     find_owner_spec_entry(&this, owner_inst: TypeRef) -> SpecializationEntry* {
@@ -2002,123 +1925,6 @@ type struct MonoCallSpecializer {
         }
         return null;
     }
-
-    /// Specialize `orig_method`'s own `<T>` into the already-materialized owner
-    /// spec entry and pin the `$MG`-disambiguated callee.  This is the static
-    /// analogue of the inherent tail of `specialize_method_call`: the owner spec's
-    /// concrete type stands in for the receiver, binding the owner's `A` in the
-    /// body (add_owner_param_bindings), and the method's `<T>` is substituted +
-    /// its `static match` reduced to the live arm.
-    finish_generic_static_method_spec(mut &this, call: CallExprNode*,
-                                      spec_entry: SpecializationEntry*, owner_entry: TemplateEntry*,
-                                      orig_method: MethodNode*,
-                                      method_binds: &TypeRef[]) -> boolean {
-        const recv_type: TypeRef = spec_entry.specialized_type;
-        mut owner_ast: ASTNode* = spec_entry.ast_node;
-        if (!recv_type.is_valid() || owner_ast == null) { return false; }
-        if (orig_method.func == null) { return false; }
-
-        for (mut i: i64 = 0; i < orig_method.func.generic_params.length; i++) {
-            if (orig_method.func.generic_params[i] == null) { return false; }
-        }
-        if (orig_method.func.generic_params.length != method_binds.length) { return false; }
-
-        // An instance is minted once per (owner, method definition, the
-        // method's type arguments), and a later call asking for the same one
-        // is pinned to it: a second mint would push the method onto the owner
-        // twice.  Asked by identity, in the table a receiver's generic method
-        // keeps its instances in; the type arguments are what tell apart two
-        // instances whose signatures do not mention them.
-        const def_of: DefId = if (orig_method.func.def.is_valid()) { orig_method.func.def } else { orig_method.func.copy_of };
-        if (!def_of.is_valid()) { return false; }
-        const def_slot: DefKey = this.decl_index.defs.table_key(def_of);
-        const made: OverloadId = this.state.method_instance(recv_type, def_slot, method_binds);
-        if (made.is_valid()) {
-            this.pin_spec_entry(call, made);
-            return true;
-        }
-
-        mut copy_subst: TypeSubstitution* = null;
-        const spec_method: MethodNode* = this.specialize_method(
-            orig_method, &orig_method.func.generic_params, method_binds, recv_type, null, &copy_subst);
-        if (spec_method == null || spec_method.func == null) { return false; }
-
-        // A `-> Owner` (bare-template) return substitutes to the still-bare owner
-        // template (0-field layout), while the body constructs the concrete owner
-        // spec - an ABI mismatch that returns garbage.  Remap a bare-owner
-        // return to the concrete owner spec, matching how a NON-generic
-        // sibling (`Wrap::base`) resolves.  Done
-        // BEFORE the `$MG`/mangle step so the emitted symbol carries the right
-        // return type.  (Nested owner returns like `Result<Owner, E>` are
-        // concretized by the substituter and are unaffected.)
-        if (owner_entry != null
-                && spec_method.func.resolved_return_type.equals(owner_entry.base_type)) {
-            spec_method.func.set_resolved_return_type(recv_type);
-        }
-
-        // Stamp the concrete method type args so the spec's mangled symbol carries
-        // the `$MG...` disambiguator (two specs whose signature doesn't mention the
-        // method param - `make<i32>` vs `make<boolean>` returning the owner - would
-        // otherwise mangle identically and collapse onto the first emitted spec).
-        mut spec_args_owned: TypeRef[] = [];
-        for (mut i: i64 = 0; i < method_binds.length; i++) { spec_args_owned.push(method_binds[i]); }
-        spec_method.func.set_spec_type_args(spec_args_owned);
-
-        // Reduce the freshly-minted body's `static match (T)` to the live arm
-        // (T is concrete now), then re-resolve the body's type annotations against
-        // the CONCRETE owner + method binds.  Without this, an owner-typed struct
-        // literal in the body (`Wrap { v: item }`) keeps the bare template type the
-        // symbolic template walk gave it and codegen reports E0638 ("no slot").
-        // This mirrors owner materialization (resolve_specialized_ast), which is
-        // why a NON-generic sibling like `Wrap::base` concretizes but this fresh
-        // method spec would not.
-        if (spec_method.func.body != null && this.ast_resolver != null) {
-            mut prune_ctx: ResolutionContext = ResolutionContext::new("");
-            if (recv_type.is_valid()) { prune_ctx.set_this_type(recv_type); }
-            this.ast_resolver.prune_static_match_in_block(spec_method.func.body, &prune_ctx);
-
-            mut body_ctx: ResolutionContext = ResolutionContext::new("");
-            // The body's local annotations were written in the owner's module;
-            // the ambient scope chain is the caller's.
-            this.ast_resolver.resolve_func_and_body(spec_method.func, &body_ctx, recv_type);
-        }
-
-        // Route the spec'd method onto the owner spec entry's AST so codegen emits
-        // it (the generic template AST is skipped by codegen - generic_params > 0).
-        if (owner_ast.kind == NodeKind::StructDeclaration) {
-            (owner_ast as StructDeclNode*).methods.push(spec_method);
-        } else if (owner_ast.kind == NodeKind::UnionDeclaration) {
-            (owner_ast as UnionDeclNode*).methods.push(spec_method);
-        } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
-            (owner_ast as ClassDeclNode*).methods.push(spec_method);
-        } else {
-            return false;
-        }
-        this.register_spec_method_in_di_inherent(spec_method, recv_type, owner_ast);
-        mut inst_args: TypeRef[] = [];
-        for (mut ai: i64 = 0; ai < method_binds.length; ai++) { inst_args.push(method_binds[ai]); }
-        this.state.add_method_instance(recv_type, def_slot, inst_args, spec_method.func.overload_entry);
-        this.pin_spec_entry(call, spec_method.func.overload_entry);
-
-        // Re-walk the body for its own generic calls under the substitution
-        // it was copied with (the owner's `A` -> concrete, and the method's
-        // own parameters) so nested owner-typed calls (`Wrap::base(item)`)
-        // resolve against the owner spec.
-        if (spec_method.func.body != null) {
-            mut rw_ctx: ResolutionContext = ResolutionContext::new("");
-            // Publish the owner context so walk_expr can stamp owner-constructing
-            // struct literals whose type the symbolic walk left invalid.
-            const saved_def: DefId = this.gsm_owner_def;
-            const saved_recv: TypeRef = this.gsm_owner_recv;
-            this.gsm_owner_def = if (owner_entry != null) { owner_entry.def } else { DefId::invalid() };
-            this.gsm_owner_recv = recv_type;
-            this.walk_body(spec_method.func, &rw_ctx, copy_subst);
-            this.gsm_owner_def = saved_def;
-            this.gsm_owner_recv = saved_recv;
-        }
-        return true;
-    }
-
 
     // -- A generic method's receiver --
 

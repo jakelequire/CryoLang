@@ -154,6 +154,11 @@ yet is recorded with the change that builds it, not here.
      A context allocator (an allocator scope) may come later; a class's
      own `Allocate` wins over it.  Not built now.  (Jake)
 
+250. **Calling a generic type's generic method with explicit type
+     arguments, `Wrap::<i32>::conv::<u8>(7)`, is fixed before the merge,**
+     in the spirit of ruling 243: known defects are fixed before the merge,
+     as the last tasks.  (Dispatch, delegated)
+
 ### 2026-10-11
 
 227. **The cleanup that removes the Python gates also removes
