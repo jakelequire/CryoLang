@@ -449,52 +449,37 @@ public:
         while (this.check(TokenType::KwAs)) {
             this.advance();
             mut target: TypeAnnotation* = null;
-            // A parenthesized cast target - function `(T) -> R`, tuple
-            // `(T, U)`, unit `()`, or grouping `(T)` - cannot be reached
-            // through parse_base_type, which has no LParen branch.  The
-            // narrow entry below is deliberate for bare base types (it keeps
-            // `x as u64 * 8` parsing as `(x as u64) * 8`), but that ambiguity
-            // needs a base type sitting to the left of the `*`; a leading `(`
-            // can never be a binary operator, so delegate to the same paren
-            // parser the annotation grammar uses.  It consumes its own
-            // suffixes, so the `*` disambiguation must not run over it again.
+            // `as const T*` casts to a pointer-to-const; the const binds
+            // to the first pointer suffix (threaded via
+            // parse_type_suffixes_q).
+            mut pending_const: boolean = false;
+            if (this.check(TokenType::KwConst)) {
+                this.advance();
+                pending_const = true;
+            }
+            // The target's base first, then its suffixes selectively: `x as
+            // u64 * 8` is (x as u64) * 8, not x as (u64*) followed by an
+            // orphaned 8.  A parenthesized base - function `(T) -> R`, tuple
+            // `(T, U)`, unit `()`, grouping `(T)` - is read by the paren
+            // parser the annotation grammar uses; parse_base_type has no
+            // `(` branch.
             if (this.check(TokenType::LParen)) {
                 target = this.parse_paren_type();
-                if (target == null) {
-                    this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                        "expected type after 'as'");
-                    return expr;
-                }
             } else {
-                // `as const T*` casts to a pointer-to-const; the const binds
-                // to the first pointer suffix (threaded via
-                // parse_type_suffixes_q).
-                mut pending_const: boolean = false;
-                if (this.check(TokenType::KwConst)) {
-                    this.advance();
-                    pending_const = true;
-                }
-                // Parse base type first, then selectively apply suffixes.
-                // This resolves the ambiguity: `x as u64 * 8` should be
-                // (x as u64) * 8, not x as (u64*) followed by orphaned 8.
-                // We consume * as pointer suffix only if it's NOT followed
-                // by a token that could start an expression (number, ident, etc.).
                 target = this.parse_base_type();
-                if (target == null) {
-                    this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                        "expected type after 'as'");
-                    return expr;
-                }
-                // Apply pointer/array suffixes only when * is not an operator.
-                // Disambiguate: `x as u64 * 8` -> (x as u64) * 8, not x as (u64*)
-                // Heuristic: * is a pointer suffix if followed by a non-expression
-                // token (;  )  }  ]  ,  as  EOF).  Otherwise it's multiplication.
-                if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
-                    target = this.parse_type_suffixes_q(target, pending_const);
-                } else if (!this.check(TokenType::Star)) {
-                    // Non-star suffixes ([], ?) are unambiguous
-                    target = this.parse_type_suffixes_q(target, pending_const);
-                }
+            }
+            if (target == null) {
+                this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                    "expected type after 'as'");
+                return expr;
+            }
+            // `*` is a pointer suffix when followed by a token that cannot
+            // start an expression (;  )  }  ]  ,  as  EOF); otherwise it is
+            // multiplication.  Other suffixes ([], ?) are unambiguous.
+            if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
+                target = this.parse_type_suffixes_q(target, pending_const);
+            } else if (!this.check(TokenType::Star)) {
+                target = this.parse_type_suffixes_q(target, pending_const);
             }
             const span: SourceSpan = ParserBase::merge_spans(expr.span, this.current_span());
             expr = new CastExprNode(expr, target, span);
@@ -2759,8 +2744,12 @@ public:
         // Parenthesized types: tuple `(T, U)`, 1-tuple `(T,)`, grouping `(T)`,
         // unit `()`, or function `(T, U) -> R`. Disambiguated by the trailing
         // comma (grouping vs 1-tuple) and a following `->` (function type).
+        // The suffixes after the `)` apply to the whole group:
+        // `(i32, i32)[]`, and `((i32) -> i32)[]` for an array of functions.
         if (this.check(TokenType::LParen)) {
-            return this.parse_paren_type();
+            const group: TypeAnnotation* = this.parse_paren_type();
+            if (group == null) { return null; }
+            return this.parse_type_suffixes(group);
         }
 
         // Bracket tuple types `[T, U]` are not supported; tuples use the
@@ -3189,7 +3178,9 @@ public:
     ///   `(T, U, ...)` -> tuple type.
     ///   `(T, U) -> R` -> function type (also `() -> R`).
     /// The trailing comma (grouping vs 1-tuple) and a following `->` (function
-    /// type) are the two disambiguators.
+    /// type) are the two disambiguators.  Suffixes after the `)` are the
+    /// caller's: a cast target reads a `*` there as multiplication when an
+    /// operand follows it.
     parse_paren_type() -> TypeAnnotation* {
         const start: Token = this.advance(); // consume '('
 
@@ -3235,19 +3226,17 @@ public:
             return new TypeAnnotation::Tuple(unit_ann);
         }
 
-        // `(T)` with no trailing comma -> grouping; the inner type is complete
-        // (it already ran through parse_type_annotation, suffixes included).
+        // `(T)` with no trailing comma -> grouping: the inner type.
         if (params.length == 1 && !trailing_comma) {
             return params[0];
         }
 
-        // `(T,)` 1-tuple or `(T, U, ...)` tuple. Allow type suffixes so
-        // `(i32, i32)*`, `(i32, i32)?`, `(i32, i32)[]` all work.
+        // `(T,)` 1-tuple or `(T, U, ...)` tuple.
         const tup_ann: TupleAnnotation* = new TupleAnnotation {
             elements: params,
             span:     this.span_from(start),
         };
-        return this.parse_type_suffixes(new TypeAnnotation::Tuple(tup_ann));
+        return new TypeAnnotation::Tuple(tup_ann);
     }
 
     /// Parse the DEPRECATED bracket tuple type `[T, U, V]`. Retained only for
