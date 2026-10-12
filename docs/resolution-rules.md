@@ -65,9 +65,7 @@ number cannot fill; a definition's name is a `DeclName` and a link symbol a
 `MangledName`, whose text comes back only through `InternTable::shown`;
 and the named types' paths are sealed the same way.  A new accessor that
 hands identity text out as a `SymbolStr`, or a table keyed by a raw number
-or text, is a change a reviewer has to refuse.  The `![allow(...)]`
-directives and door comments still written in the compiler say why a
-function was exempt from the check that was removed; they do nothing.
+or text, is a change a reviewer has to refuse.
 
 Rule three is also held by visibility, one store at a time: a store's name
 fields are `private` to the module whose file holds the store and its
@@ -132,6 +130,29 @@ caller of a door, or an identity lookup.
 Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
+
+### 2026-10-12
+
+247. **The compiler's `![allow]`s that named the deleted lint, and the
+     door doc-comment markers, are deleted now.**  `![allow]` stays a
+     language feature; the editor's allows wait for its rebuild after the
+     merge (ruling 184).  (Jake)
+
+248. **`x as boolean` is refused for a float as for an integer:** nothing
+     but a `boolean` converts to `boolean`, so a test on a float is
+     written `x != 0.0`.  (Jake)
+
+249. **Allocation goes through a trait.**  `new T(...)` is sugar for an
+     `Allocate` trait, as `a[i]` is for `Index` and `*p` for `Deref`.  A
+     class that implements `Allocate` gets its memory from it, and its
+     subclasses inherit it: the nearest ancestor's implementation wins.
+     The trait carries a matching release method, so `delete` hands the
+     memory back the same way; for an arena it is typically a no-op.
+     `Allocate` replaces the `![arena(f)]` directive entirely, and
+     `ASTNode` implements it over the AST arena.  The allocator's
+     signature is checked by the type checker, as any trait method's is.
+     A context allocator (an allocator scope) may come later; a class's
+     own `Allocate` wins over it.  Not built now.  (Jake)
 
 ### 2026-10-11
 
