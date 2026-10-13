@@ -1925,9 +1925,10 @@ type trait Ord : Eq {
 }
 ```
 
-A trait is not a type. A pointer or reference to one - a trait object - is not supported yet, and `&Shape` or `Shape*` with `Shape` a trait is refused where it is written (`E0313`). Code that accepts any type implementing a trait takes a bounded type parameter instead ([section 11.3](#113-trait-bounds-with-where)):
+A trait is not a type. Written where a value's type goes - `p: Shape`, a return type, a field, a local, a type argument, an alias's target - it is refused where it is written (`E0313`). A pointer or reference to one - a trait object - is not supported yet, and `&Shape` or `Shape*` with `Shape` a trait is refused the same way. Code that accepts any type implementing a trait takes a bounded type parameter instead ([section 11.3](#113-trait-bounds-with-where)):
 
 ```cryo
+function area_of(p: Shape) -> i32 { ... }                      // error[E0313]: `Shape` is a trait, not a type
 function area_of(p: &Shape) -> i32 { ... }                     // error[E0313]: `Shape` is a trait, so `&Shape` is not a type
 function area_of<T>(p: &T) -> i32 where T: Shape { ... }       // ok: one copy per implementing type
 ```

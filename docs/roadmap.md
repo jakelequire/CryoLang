@@ -207,7 +207,8 @@ v1.0 (ruling 286).
 
 - **Spelling:** `virtual &Shape` and `virtual Shape*`, a prefix as in
   `mut &this`; there is no `dyn` (ruling 285).  Until then `&Shape` and
-  `Shape*` are refused where they are written (`E0313`; ruling 287).
+  `Shape*` are refused where they are written (`E0313`; ruling 287), as
+  is a bare `p: Shape` (ruling 304).
 - **Object safety is per method** (ruling 288): a method that cannot go in
   the table - one with type parameters of its own, for instance - is unavailable on
   the object, and the rest of the trait still works.

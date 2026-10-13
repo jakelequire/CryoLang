@@ -133,6 +133,33 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-13
+
+299. **Before the merge, the scratch directories are deleted:** `.objcmp/`,
+     `compiler/build-b2`, `compiler/.selfprobe`, `.cross-check`, `scratch`,
+     `dist` and `.verify` - only after an inventory confirms each is
+     untracked, regenerable scratch.  (Jake)
+
+300. **The compiler's warning count is reduced before the merge.**  (Jake)
+
+301. **Calling an overloaded generic static method on a non-generic owner
+     (`Plain::conv(7, 9)`), which crashes with internal error E0900, is
+     fixed before the merge,** like the generic static call of ruling 250.
+     (Dispatch, delegated)
+
+302. **E0313's code and wording stay:** "`Shape` is a trait, so `&Shape` is
+     not a type", with the `virtual &Shape` note and the
+     bounded-type-parameter help.  (Dispatch, delegated)
+
+303. **Ruling 294 stays as built:** no class with a base class may
+     implement `Allocate`.  (Dispatch, delegated)
+
+304. **A bare trait used as a value type (`p: Shape`) is refused with E0313
+     where it is written.**  (Dispatch, delegated)
+
+305. **E0458's wording stays:** "a capturing closure cannot be held by a
+     variable of function type ...".  (Dispatch, delegated)
+
 ### 2026-10-12
 
 247. **The compiler's `![allow]`s that named the deleted lint, and the

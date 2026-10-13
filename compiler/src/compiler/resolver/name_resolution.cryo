@@ -1198,9 +1198,9 @@ public:
         // The head's own name is a trait; what it is applied to is not.
         const trait_head: TypeAnnotation* = TypeAnnotation::head_base(node.trait_annotation);
         this.naming_trait = true;
-        this.stamp_annotation(trait_head);
+        this.stamp_annotation_tree(trait_head);
         this.naming_trait = false;
-        this.stamp_annotation(node.trait_annotation);
+        this.stamp_annotation_tree(node.trait_annotation);
         const outer_trait: DefId = this.this_trait;
         this.this_trait = TypeAnnotation::trait_def(node.trait_annotation);
         // What the head writes AFTER the target: a parameter of its own, or
@@ -1979,7 +1979,7 @@ public:
         this.stamp_annotation_list(&node.generic_args);
         // The trait of an impl-qualified path, `(Beta for P)::make`, is a
         // written type name like the arguments beside it.
-        this.stamp_annotation(node.impl_trait);
+        this.stamp_annotation_tree(node.impl_trait);
         // Member resolution within the type's scope is deferred to
         // TypeResolution (needs type info to find the TypeBody scope).
     }
@@ -2471,6 +2471,14 @@ public:
         }
     }
 
+    /// Stamp an annotation written where a value's type goes, and refuse it
+    /// when it names a trait: a trait is no type, so `p: Shape` declares
+    /// nothing a value could have.
+    stamp_annotation(&this, ann: TypeAnnotation*) -> void {
+        this.stamp_annotation_tree(ann);
+        this.refuse_trait_type(ann, SourceSpan::none(), "", "", "a trait used as a type");
+    }
+
     /// Stamp every `Named` node in a type-annotation tree.
     ///
     /// A `TypeAnnotation` is not an AST node and is never `accept`-visited, so
@@ -2481,17 +2489,22 @@ public:
     /// argument keeps the span of the file it came FROM, so judging it at the
     /// enclosing declaration would make one declaration's default mean a
     /// different thing per caller.
-    stamp_annotation(&this, ann: TypeAnnotation*) -> void {
+    ///
+    /// The root itself may name a trait - an impl's head, an `impl Trait`
+    /// bound, a pointee (refused as a pointer to a trait instead), a generic
+    /// type's base; every child that holds a value's type is stamped through
+    /// `stamp_annotation`.
+    stamp_annotation_tree(&this, ann: TypeAnnotation*) -> void {
         if (ann == null) { return; }
         match (*ann) {
             TypeAnnotation::Named(n)       => { this.stamp_named_annotation(n); }
             TypeAnnotation::Pointer(p)     => {
-                this.stamp_annotation(p.inner);
-                this.refuse_trait_pointee(p.inner, p.span, false);
+                this.stamp_annotation_tree(p.inner);
+                this.refuse_trait_type(p.inner, p.span, "", "*", "a pointer to a trait");
             }
             TypeAnnotation::Reference(r)   => {
-                this.stamp_annotation(r.inner);
-                this.refuse_trait_pointee(r.inner, r.span, true);
+                this.stamp_annotation_tree(r.inner);
+                this.refuse_trait_type(r.inner, r.span, "&", "", "a reference to a trait");
             }
             TypeAnnotation::Array(a)       => {
                 this.stamp_annotation(a.element);
@@ -2503,7 +2516,7 @@ public:
                 if (a.size_expr != null) { a.size_expr.accept(this); }
             }
             TypeAnnotation::Projection(pj) => {
-                this.stamp_annotation(pj.base);
+                this.stamp_annotation_tree(pj.base);
                 match (*pj.base) {
                     TypeAnnotation::ThisType(_t) => {
                         pj.owner_trait = this.this_trait;
@@ -2532,14 +2545,14 @@ public:
                 }
             }
             TypeAnnotation::Generic(g)     => {
-                this.stamp_annotation(g.base);
+                this.stamp_annotation_tree(g.base);
                 for (mut i: i64 = 0; i < g.args.length; i++) {
                     this.stamp_annotation(g.args[i]);
                 }
             }
             TypeAnnotation::ImplTrait(imp) => {
                 for (mut i: i64 = 0; i < imp.bounds.length; i++) {
-                    this.stamp_annotation(imp.bounds[i]);
+                    this.stamp_annotation_tree(imp.bounds[i]);
                 }
             }
             // `typeof(expr)` carries an expression whose names are written
@@ -2782,29 +2795,28 @@ public:
         return ResSlot::Answered(Res::Err);
     }
 
-    /// Record what one annotation's written name refers to.
-    ///
-    /// The annotation is one of two nodes carrying a written TYPE SPELLING;
-    /// a generic struct literal's `struct_type` is the other, and both are
-    /// answered by `type_spelling_res` so the two cannot come to disagree
-    /// about what a spelling names.
-    /// E0313 at a pointer or reference whose pointee, `inner`, names a
-    /// trait: `&Shape`, `Shape*` or `&Conv<i64>`.  A trait is no type, so
-    /// the pointer would point at nothing a value has; a trait object is not
+    /// E0313 at an annotation, `ann`, that names a trait where a type is
+    /// written: `Shape`, `Conv<i64>`, or the pointee of `&Shape` or `Shape*`
+    /// (`before` and `after` spell the pointer around it, `span` covers it).
+    /// A trait is
+    /// no type, so nothing a value has matches it; a trait object is not
     /// supported yet.  The trait's name is answered `Err` in this position,
     /// so the annotation reads as refused where it is written and nothing
     /// after reports it again.  `&This` names the implementing type.
-    refuse_trait_pointee(&this, inner: TypeAnnotation*, span: SourceSpan, is_ref: boolean) -> void {
-        if (inner == null) { return; }
+    refuse_trait_type(&this, ann: TypeAnnotation*, span: SourceSpan, before: string, after: string,
+                      label: string) -> void {
+        if (ann == null) { return; }
         mut named: NamedAnnotation* = null;
         mut generic: boolean = false;
-        match (*inner) {
-            TypeAnnotation::Named(n)   => { named = n; }
+        mut at: SourceSpan = span;
+        match (*ann) {
+            TypeAnnotation::Named(n)   => { named = n; if (!at.has_location()) { at = n.span; } }
             TypeAnnotation::Generic(g) => {
                 match (*g.base) {
                     TypeAnnotation::Named(bn) => { named = bn; generic = true; }
                     _                         => { }
                 }
+                if (!at.has_location()) { at = g.span; }
             }
             _ => { }
         }
@@ -2823,17 +2835,28 @@ public:
         named.res = ResSlot::Answered(Res::Err);
         const name: string = this.resolver.intern_table.resolve(named.name);
         const shown: string = if (generic) { fmt::format("%s<...>", name) } else { name };
-        const written: string = if (is_ref) { fmt::format("&%s", shown) } else { fmt::format("%s*", shown) };
-        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0313_TRAIT_AS_POINTEE,
-            fmt::format("`%s` is a trait, so `%s` is not a type", name, written));
-        d = d.at_with_label(span, if (is_ref) { "a reference to a trait" } else { "a pointer to a trait" });
+        const written: string = before + shown + after;
+        const message: string = if (written == name) {
+            fmt::format("`%s` is a trait, not a type", name)
+        } else {
+            fmt::format("`%s` is a trait, so `%s` is not a type", name, written)
+        };
+        const param: string = if (written == shown) { "T" } else { "&T" };
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0313_TRAIT_AS_TYPE, message);
+        d = d.at_with_label(at, label);
         d = d.with_note(fmt::format("a trait object is not supported yet; it will be written `virtual &%s` or `virtual %s*`",
             shown, shown));
-        d = d.help(fmt::format("to accept any type that implements `%s`, use a bounded type parameter: `function f<T>(p: &T) where T: %s`",
-            name, shown));
+        d = d.help(fmt::format("to accept any type that implements `%s`, use a bounded type parameter: `function f<T>(p: %s) where T: %s`",
+            name, param, shown));
         this.ctx.emit_diagnostic(d);
     }
 
+    /// Record what one annotation's written name refers to.
+    ///
+    /// The annotation is one of two nodes carrying a written TYPE SPELLING;
+    /// a generic struct literal's `struct_type` is the other, and both are
+    /// answered by `type_spelling_res` so the two cannot come to disagree
+    /// about what a spelling names.
     stamp_named_annotation(&this, n: NamedAnnotation*) -> void {
         // A synthesizer that knows its referent answers the slot at birth
         // (bindgen's C-import types), and its answer stands: the walk is not
