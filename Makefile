@@ -4,14 +4,8 @@
 # ELF) and bin/cryo.exe (Windows PE) bootstrap every other target - 
 # every build flows through one of them depending on the host OS.
 #
-# Targets:
-#   stdlib           Build the standard library via bin/cryo
-#   cryo             Build the self-hosted compiler via bin/cryo
-#   pin              Refresh both pins (host-aware; Windows uses WSL)
-#   selfhost-check   Host-aware byte-identity gate
-#   install          Symlink bin/cryo + stdlib system-wide (delegates to install.sh)
-#   uninstall        Remove the install.sh symlinks
-#   clean            Remove compiler + stdlib build outputs
+# `make help` lists every target, and every side effect a target has beyond
+# the build output it names.
 
 ROOT       := $(CURDIR)
 PIN        := $(ROOT)/bin/cryo
@@ -83,10 +77,18 @@ PIN_EXE      := $(ROOT)/bin/cryo.exe
 # named from it is the one the linker will search.  Guessing is SILENT when
 # wrong: `runtime_dir_pick` falls back to the flat directory and the two
 # toolchains resume overwriting each other's archives there.
+#
+# Asking means launching the pin, and the rules below name the triple in their
+# prerequisites, so it would be asked while the Makefile is read.  The goals in
+# NO_TRIPLE_GOALS build nothing and read no archive, so when every goal given
+# is one of them the pin is not launched; any other goal asks once, up front.
+NO_TRIPLE_GOALS := help clean check-fast verify-selftest verify-pin verify-pin-clean
+ifneq ($(filter-out $(NO_TRIPLE_GOALS),$(or $(MAKECMDGOALS),help)),)
 ifeq ($(HOST_OS),windows)
 HOST_TRIPLE  := $(shell "$(subst /,\,$(PIN_EXE))" version --triple)
 else
 HOST_TRIPLE  := $(shell "$(PIN)" version --triple)
+endif
 endif
 MINGW_GCC    := x86_64-w64-mingw32-gcc
 MINGW_STRIP  := x86_64-w64-mingw32-strip
@@ -130,21 +132,17 @@ TEST_CPP_HELPERS_O   := $(TEST_HELPERS_DIR)/cpp_link_helper-unix.o
 TEST_CPP_HELPERS_A   := $(TEST_HELPERS_DIR)/libcpplinkhelper-unix.a
 CXX                  ?= c++
 
-# `nproc` is POSIX-only; on Windows make (cmd as recipe shell) the
-# `$(shell)` call would spam "system cannot find the path specified" from
-# the bash-flavoured 2>/dev/null redirect.  Just default to 4 there.
-ifeq ($(HOST_OS),windows)
-    NPROC := 4
-else
-    NPROC := $(shell nproc 2>/dev/null || echo 4)
-endif
-
-# Python interpreter for the helper scripts.  Windows ships `python.exe`
-# (no `python3` alias); Linux/macOS use `python3`.
+# Python interpreter for the helper scripts, and the only spelling of it in
+# the recipes.  Windows ships `python.exe`, and its `python3` is an App
+# Execution Alias that exits 49; Linux/macOS use `python3`.  NOOP is a recipe
+# line that does nothing in either shell, so a target that only prints through
+# `$(info)` does not also report "Nothing to be done".
 ifeq ($(HOST_OS),windows)
     PYTHON := python
+    NOOP   := @rem
 else
     PYTHON := python3
+    NOOP   := @:
 endif
 
 # The LSP binary grows a `.exe` suffix on a Windows host (the self-hosted
@@ -165,47 +163,103 @@ EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
 .PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
-        pin-linux-impl pin-windows-impl _pin-windows-do \
+        pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
+# The help text is printed by make itself (`$(info)`), not by a shell, so it
+# reads the same under cmd and sh.  A target added to this Makefile is added
+# here too.
+define HELP_TEXT
+Cryo build targets.  ARGS="..." passes arguments through where noted.
+
+Build
+  make cryo              Stage-2 compiler from the pin, then stamped with the
+                         commit it was built from (`cryo stamp`, which is what
+                         `cryo version` reports; the stamp rewrites a region
+                         of the binary, so no object changes).
+  make stdlib            Standard library archive for the host triple.
+  make runtime-tiers     Runtime tier archives for the host triple (every
+                         hosted link needs the panic tier).
+  make runtime-tiers-win The same tiers cross-built for the Windows triple
+                         (skipped without the mingw toolchain).
+  make cryo-exe          Cross-build compiler/build/cryo.exe from Linux, and
+                         stamp it.
+  make lsp               Build tools/CryoLSP with the pin and install it as
+                         bin/cryolsp.
+  make install-lsp       Package tools/CryoAnalyzer and install it into VS
+                         Code, REPLACING the installed CryoAnalyzer extension.
+
+Tests and gates
+  make test              cryo test over tests/ (the working loop; ARGS=filter).
+  make test-list         List the discovered unit tests without running them.
+  make test-census       The same run as test, with each suite's count
+                         asserted against tests/test-roster.txt (evidence).
+  make roster-check      The discovered roster against tests/test-roster.txt
+                         (ARGS=--merge after adding, --update after removing).
+  make verify            Build once; census, examples, lsp-check, cross-check,
+                         incremental-instance-check and check-fast run
+                         concurrently and their objects are hashed
+                         (ARGS="--baseline HEAD --require-identical").
+  make check-fast        verify's self-test and verify-pin; builds nothing.
+  make verify-selftest   verify's judges, driven through their cases.
+  make lsp-check         tools/CryoLSP builds with the compiler under test
+                         (into its own directory; installs nothing).
+  make cross-check       runtime, stdlib, compiler and CryoLSP for the other
+                         OS's triple, objects only (ARGS=--triple=...).
+  make examples          Build every examples/ project.
+  make examples-golden   Build and run four examples, diff their stdout
+                         (POSIX only; refuses on Windows).
+  make valgrind-check    The same four under valgrind (Linux only).
+  make incremental-check Incremental build == clean build, per module
+                         (refuses on Windows: a PE carries a link timestamp).
+  make incremental-instance-check  An edit asking a cached module for a new
+                         generic instance still links.
+  make vendor-check      Every constant shape survives `cryo vendor`.
+  make verify-freestanding  Runtime tiers' freestanding acceptance check
+                         (POSIX only; refuses on Windows).
+  make selfhost-check    Byte-identity fixed point.  Linux host: the 6-stage
+                         chain, then the Windows chain under wine (a skipped
+                         arm fails unless ARGS=--allow-skipped-arm).  Windows
+                         host: a native cryo.exe pre-check, then the Linux
+                         chain through WSL.
+  make api-index         Regenerate docs/stdlib-api.txt.
+  make api-index-check   Fail if docs/stdlib-api.txt is stale.
+
+Pins and release
+  make pin               Refresh bin/cryo and bin/cryo.exe and their sidecars
+                         (Windows host: through WSL).
+  make verify-pin        Each pin matches its sidecar's sha256, and both name
+                         the same commit.
+  make verify-pin-clean  The same, and the pins were built from a clean tree.
+  make release           Alias of release-linux.
+  make release-linux     dist/ tarball with a static, stamped cryo (POSIX).
+  make release-windows   dist/ zip (POSIX host, cross-built).
+  make install           Symlink bin/cryo and the stdlib into a prefix (POSIX).
+  make uninstall         Remove those symlinks.
+  make clean             Remove the compiler, stdlib, runtime tier, LSP and
+                         test-helper build outputs.
+
+Internal, called by pin: pin-linux-impl, pin-windows-impl, _pin-windows-do.
+
+Side effects beyond the named output
+  stdlib          deletes stdlib/.bin/<triple>/ and a flat stdlib/.bin/libcryo.a.
+  lsp             overwrites bin/cryolsp; fails while an editor holds it open.
+  install-lsp     uninstalls the VS Code extension it replaces.
+  pin             rewrites both pins; copies LLVM-C.dll and libclang.dll to bin/.
+  selfhost-check  deletes stdlib/.bin and compiler/build.
+  test, examples, lsp-check and every gate that needs the compiler rebuild
+                  it first when any .cryo under compiler/src or stdlib is
+                  newer than it.
+  verify          runs `make check-fast` from inside itself, and keeps a
+                  clone and baseline compilers under .verify/.
+  install         writes symlinks outside the repository (may need sudo).
+endef
+
 help:
-	@echo "Cryo build targets:"
-	@echo "  make stdlib            Build the standard library via bin/cryo"
-	@echo "  make cryo              Build the self-hosted compiler via bin/cryo"
-	@echo "  make lsp               Build the Cryo-language LSP server (bin/cryolsp)"
-	@echo "  make install-lsp       Package + install the CryoAnalyzer VS Code extension"
-	@echo "  make pin               Refresh both pins (bin/cryo + bin/cryo.exe)"
-	@echo "                         Linux host: builds natively; Windows host: via WSL."
-	@echo "  make selfhost-check    Host-aware byte-identity gate."
-	@echo "                         Linux host: 6-stage chain + optional wine Windows."
-	@echo "                         Windows host: native cryo.exe pre-check + the"
-	@echo "                         Linux 6-stage chain via WSL."
-	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
-	@echo "  make test-census       Same run, with the suite COUNTS asserted"
-	@echo "  make verify            Build once; census, examples, lsp, cross, check-fast"
-	@echo "                         concurrently; hash their objects (ARGS=--baseline HEAD"
-	@echo "                         compares them against HEAD's compiler)"
-	@echo "  make test-list         List the discovered test cases without running them"
-	@echo "  make check-fast        verify's self-test + verify-pin (builds nothing)"
-	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
-	@echo "                         (installs nothing; the only gate that builds it)"
-	@echo "  make vendor-check     Check every constant shape survives cryo vendor"
-	@echo "  make api-index         Regenerate docs/stdlib-api.txt (the stdlib API index)"
-	@echo "  make api-index-check   Fail if docs/stdlib-api.txt is stale"
-	@echo "  make examples          Compile every examples/*/ project (CI smoke gate)"
-	@echo "  make runtime-tiers     Build the runtime tier archives (freestanding +"
-	@echo "                         hosted); every link needs the panic tier"
-	@echo "  make verify-freestanding  Build runtime/ tiers + run the freestanding"
-	@echo "                         acceptance check (entry, panic, alloc, backtrace)"
-	@echo "  make cross-check       Compile runtime/, stdlib/, compiler/, tools/CryoLSP"
-	@echo "                         for the OTHER OS's triple, objects only: the gated"
-	@echo "                         half this host never resolves (ARGS=--triple=...)"
-	@echo "  make cryo-exe          Cross-build cryo.exe (x86_64-pc-windows-gnu)"
-	@echo "  make install           Symlink bin/cryo + stdlib system-wide (sudo)"
-	@echo "  make uninstall         Remove the install.sh symlinks"
-	@echo "  make clean             Remove compiler + stdlib build outputs"
-	@echo ""
-	@echo "Detected host: $(HOST_OS) ($(UNAME_S))"
+	$(info $(HELP_TEXT))
+	$(info )
+	$(info Detected host: $(HOST_OS) ($(UNAME_S)))
+	$(NOOP)
 
 # ---- guard: pin must exist --------------------------------------------
 $(PIN):
@@ -274,9 +328,10 @@ cryo: $(LIBCRYO_A) runtime-tiers
 	@echo "==> Self-hosted cryo built: $(STAGE2)"
 endif
 
-# File-target rule so downstream targets (test, lsp) can depend on the
-# binary itself instead of the phony `cryo` target. If the binary is
-# present, Make treats it as up-to-date and skips the rebuild.
+# File-target rule so downstream targets (test, lsp-check, examples) can depend
+# on the binary itself instead of the phony `cryo` target.  The binary is
+# rebuilt when it is missing or older than any .cryo under compiler/src or
+# stdlib, so those targets never gate a stale compiler.
 $(STAGE2): $(CRYO_SOURCES)
 	@$(MAKE) --no-print-directory cryo
 
@@ -355,7 +410,7 @@ else
 pin: pin-linux-impl pin-windows-impl
 
 pin-linux-impl: cryo
-	@python3 scripts/cryo-pin.py --source "$(STAGE2)" --pin "$(PIN)"
+	@$(PYTHON) scripts/cryo-pin.py --source "$(STAGE2)" --pin "$(PIN)"
 
 pin-windows-impl:
 	@if command -v $(MINGW_GCC) >/dev/null 2>&1 && [ -f "$(WIN_LLVM_LIB)" ] && [ -f "$(WIN_CLANG_LIB)" ]; then \
@@ -370,7 +425,7 @@ pin-windows-impl:
 	fi
 
 _pin-windows-do: cryo-exe
-	@python3 scripts/cryo-pin.py --source "$(STAGE2_EXE)" --pin "$(PIN_EXE)" --strip-tool $(MINGW_STRIP)
+	@$(PYTHON) scripts/cryo-pin.py --source "$(STAGE2_EXE)" --pin "$(PIN_EXE)" --strip-tool $(MINGW_STRIP)
 	@cp -f "$(WIN_LLVM_DLL)" "$(ROOT)/bin/LLVM-C.dll" 2>/dev/null \
 		&& echo "==> Runtime LLVM-C.dll copied to bin/ (gitignored)" || true
 	@cp -f "$(WIN_CLANG_DLL)" "$(ROOT)/bin/libclang.dll" 2>/dev/null \
@@ -392,8 +447,7 @@ ifeq ($(HOST_OS),windows)
 # Windows host: recipes run under cmd, which has no `cp`.  `$(PIN)` (bin/cryo,
 # no extension) launches via PATHEXT -> bin/cryo.exe.  The built binary is
 # `cryolsp.exe`; copy it to the pin with the `copy` builtin (backslash paths,
-# stdout silenced).  Windows recipes can't run the POSIX `$(LIBCRYO_A)`
-# delegate, so this target stands alone.
+# stdout silenced).
 lsp:
 	@echo "==> Building CryoLSP via bin/cryo.exe"
 	cd tools/CryoLSP && "$(PIN)" build
@@ -443,8 +497,9 @@ endif
 #
 # The script is host-aware:
 #   Linux host:   runs the full 6-stage Linux chain natively, then the
-#                 optional wine-based Windows verification (skipped if the
-#                 mingw toolchain + wine + .toolchains are absent).
+#                 wine-based Windows chain.  Without the mingw toolchain,
+#                 wine and .toolchains that arm is skipped, and a skipped arm
+#                 fails the check unless ARGS=--allow-skipped-arm says so.
 #   Windows host: runs a Windows-native pre-check using bin/cryo.exe
 #                 (smoke + stdlib byte-identity against the WSL Linux
 #                 cross-compiled IR), then delegates the full 6-stage
@@ -461,10 +516,10 @@ selfhost-check: runtime-tiers
 	scripts\selfhost-check-windows.cmd $(ARGS)
 else
 selfhost-check: $(PIN) runtime-tiers
-	@python3 scripts/selfhost-check.py $(ARGS)
+	@$(PYTHON) scripts/selfhost-check.py $(ARGS)
 endif
 
-# ---- pin self-verification (M14 / M12) --------------------------------
+# ---- pin self-verification --------------------------------------------
 # Assert each committed pin's bytes match its .pin.txt sidecar sha256
 # (catches a binary committed without regenerating its sidecar, corruption,
 # or a hand-edited sidecar).  Pure-python, no build, runs on any host.
@@ -477,7 +532,7 @@ verify-pin:
 verify-pin-clean:
 	@$(PYTHON) scripts/verify-pin.py --require-clean
 
-# ---- incremental-build soundness (M13) --------------------------------
+# ---- incremental-build soundness --------------------------------------
 # Run the per-module incremental byte-identity matrix: every incremental
 # build must equal a clean `--no-incremental` build of the same source.
 # Needs the stage-2 compiler (builds it first if absent).
@@ -486,13 +541,13 @@ incremental-check: $(STAGE2_EXE)
 	@$(PYTHON) scripts/incremental-check.py --cryo "$(STAGE2_EXE)"
 else
 incremental-check: $(STAGE2)
-	@python3 scripts/incremental-check.py --cryo "$(STAGE2)"
+	@$(PYTHON) scripts/incremental-check.py --cryo "$(STAGE2)"
 endif
 
 # ---- test suite -------------------------------------------------------
-# Builds the stage-2 compiler only if $(STAGE2) is missing, then drives
-# `cryo test` against the tests/ project.  Run `make cryo` first to pick
-# up compiler changes.  See tests/cryoconfig and docs/testing.md for the
+# Rebuilds the stage-2 compiler when it is missing or older than its sources
+# (the $(STAGE2) file rule), then drives `cryo test` against the tests/
+# project.  See tests/cryoconfig and docs/testing.md for the
 # project layout and the framework surface (`![test]`, `![ignore]`,
 # `![should_panic]`).  Pass arguments through with `make test ARGS=...`
 # (e.g. `make test ARGS="--ignored some_filter"`).
@@ -524,13 +579,13 @@ test-list: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2_EXE_WIN)" test --list $(ARGS)
 
 roster-check: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
-	@python scripts/roster-check.py "$(STAGE2_EXE_WIN)" $(ARGS)
+	@$(PYTHON) scripts/roster-check.py "$(STAGE2_EXE_WIN)" $(ARGS)
 
 test-census: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A) runtime-tiers
 	@$(PYTHON) scripts/test-census.py --cryo "$(STAGE2_EXE)" $(ARGS)
 
 vendor-check: $(STAGE2_EXE) $(LIBCRYO_A) runtime-tiers
-	@python scripts/vendor-consts-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
+	@$(PYTHON) scripts/vendor-consts-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
 else
 test: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
 	@cd tests && "$(STAGE2)" test $(ARGS)
@@ -542,7 +597,7 @@ test-list: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 # that silently breaks `![test]` discovery would otherwise stay green
 # ("0 of 0 failed" is a pass).  Re-pin deliberately with ARGS=--update.
 roster-check: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
-	@python3 scripts/roster-check.py "$(STAGE2)" $(ARGS)
+	@$(PYTHON) scripts/roster-check.py "$(STAGE2)" $(ARGS)
 
 # `make test` with the counts asserted.  The runner reports a zero the same way
 # it reports success - silently - so an exit code cannot tell a suite that ran
@@ -551,7 +606,7 @@ roster-check: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 # wherever the run is being taken as evidence; `make test` stays for the
 # working loop, where a pattern filter is the point.
 test-census: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
-	@python3 scripts/test-census.py --cryo "$(STAGE2)" $(ARGS)
+	@$(PYTHON) scripts/test-census.py --cryo "$(STAGE2)" $(ARGS)
 
 # End-to-end gate on the constants `cryo vendor` carries out of a C header.
 # The importer binds a constant and the serializer writes it, and when those
@@ -565,12 +620,12 @@ test-census: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runt
 # runs everywhere.  Hermetic: the fixture registers under a throwaway
 # $CRYO_HOME and leaves nothing on the machine.
 vendor-check: $(STAGE2) $(LIBCRYO_A) runtime-tiers
-	@python3 scripts/vendor-consts-gate.py "$(STAGE2)" $(ARGS)
+	@$(PYTHON) scripts/vendor-consts-gate.py "$(STAGE2)" $(ARGS)
 endif
 
 # ---- one verification run ----------------------------------------------
-# Build once, then run census, examples, lsp-check, cross-check and check-fast
-# at the same time, and hash the objects the census and examples compiled.
+# Build once, then run census, examples, lsp-check, cross-check,
+# incremental-instance-check and check-fast at the same time, and hash the objects the census and examples compiled.
 # ARGS="--baseline HEAD" also compares those objects against a compiler built
 # from HEAD's compiler/src (in a clone under .verify/, cached), which is the
 # evidence that a change moved no compiled output.  See scripts/verify.py.
@@ -683,9 +738,9 @@ api-index-check: $(LIBCRYO_A)
 # Compile every examples/*/ project with the freshly-built stage-2 compiler
 # so a stdlib/compiler change that breaks a shipped "getting started" example
 # fails CI instead of reaching users.  Build-only (no run); the per-example
-# build/ dirs are gitignored.  Run `make cryo` first to pick up compiler
-# changes.  CRYO_STDLIB pins the in-tree stdlib so resolution is independent
-# of which compiler binary builds the examples.
+# build/ dirs are gitignored.  The script pins CRYO_STDLIB to the in-tree
+# stdlib so resolution is independent of which compiler binary builds the
+# examples.
 # Driven by a script rather than a shell loop because the loop was POSIX-only
 # and the Windows branch printed "run it from WSL" and exited 0.  A gate that
 # exits 0 having done nothing is counted as evidence, so this one refuses to
@@ -701,11 +756,11 @@ endif
 # ---- examples golden-output check -------------------------------------
 # Build AND run the deterministic, input-free examples and diff their stdout
 # against committed goldens (examples/<name>/expected.out).  Catches runtime
-# regressions that the build-only `examples` target misses.  POSIX-only, same
-# as `examples` (the script loops + runs binaries).
+# regressions that the build-only `examples` target misses.  POSIX-only: the
+# script is bash, so a Windows host refuses rather than reporting success.
 ifeq ($(HOST_OS),windows)
 examples-golden: $(STAGE2_EXE) $(LIBCRYO_A)
-	@$(PYTHON) scripts/gate-unavailable.py examples-golden "it builds AND RUNS the examples and diffs stdout; run it from WSL."
+	$(error examples-golden: UNAVAILABLE on this host -- it builds AND RUNS the examples and diffs stdout with bash; run it from WSL)
 else
 examples-golden: $(STAGE2) $(LIBCRYO_A)
 	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/check-examples-output.sh
@@ -719,7 +774,7 @@ endif
 # caught here.  POSIX/Linux-only and requires valgrind on PATH.
 ifeq ($(HOST_OS),windows)
 valgrind-check: $(STAGE2_EXE) $(LIBCRYO_A)
-	@$(PYTHON) scripts/gate-unavailable.py valgrind-check "valgrind is POSIX/Linux only; run it from WSL."
+	$(error valgrind-check: UNAVAILABLE on this host -- valgrind is POSIX/Linux only; run it from WSL)
 else
 valgrind-check: $(STAGE2) $(LIBCRYO_A)
 	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/valgrind-check.sh
@@ -776,19 +831,15 @@ runtime-tiers: $(PIN)
 	@cd runtime/hosted && "$(PIN)" build --no-incremental --build-dir=../.bin/$(HOST_TRIPLE)
 endif
 
-# The same tiers cross-built for the windows triple, for `cryo-exe`.  These land
-# in a per-triple subdirectory rather than beside the host archives: a project's
-# artifacts hoist to the root of its output_dir, so writing them flat OVERWROTE
-# the host tiers with PE objects and the next host link died on
-# `undefined reference to RtlAllocateHeap`.  `runtime_dir_pick`
-# (codegen/passes.cryo) already looks in `<dir>/<triple>` before falling back to
-# `<dir>`, so the cross tiers are found here and the host ones keep the flat
-# path.  The triple is safe to spell here because an explicit `--target=` is
-# returned verbatim by `resolve_effective_triple` - it is the same string the
-# lookup will use.  A NATIVE build must stay flat: its triple comes from a probe
-# of the host toolchain, so the build system cannot predict the directory name.
-# Skipped (not failed) without the cross toolchain, matching how
-# `pin-windows-impl` treats a Linux-only checkout.
+# The same tiers cross-built for the windows triple, for `cryo-exe`.  They land
+# in `runtime/.bin/$(WIN_TRIPLE)`, beside the host triple's directory, where
+# `runtime_dir_pick` (codegen/passes.cryo) looks first.  The triple is safe to
+# spell here because an explicit `--target=` is returned verbatim by
+# `resolve_effective_triple` - it is the same string the lookup will use; a
+# native build's triple comes from a toolchain probe, which is why
+# `runtime-tiers` asks the pin for it instead.  Skipped (not failed) without
+# the cross toolchain, matching how `pin-windows-impl` treats a Linux-only
+# checkout.
 runtime-tiers-win: $(PIN)
 	@if command -v $(MINGW_GCC) >/dev/null 2>&1; then \
 		echo "==> Building runtime tiers for $(WIN_TRIPLE) via bin/cryo"; \
@@ -820,7 +871,7 @@ runtime-tiers-win: $(PIN)
 # examples-golden and valgrind-check do.
 ifeq ($(HOST_OS),windows)
 verify-freestanding:
-	@$(PYTHON) scripts/gate-unavailable.py verify-freestanding "the acceptance script is bash and links ELF objects natively; run it from WSL."
+	$(error verify-freestanding: UNAVAILABLE on this host -- the acceptance script is bash and links ELF objects natively; run it from WSL)
 else
 verify-freestanding: $(STAGE2)
 	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash runtime/verify-freestanding.sh $(ARGS)
@@ -850,9 +901,29 @@ uninstall:
 	@./install.sh --dev --uninstall
 
 # ---- clean ------------------------------------------------------------
+# Every build output the targets above write inside the tree, for every
+# triple: the compiler, the stdlib and runtime tier archives, the LSP build and
+# its installed copy, and the test helper archives.  The committed pins and
+# the caches outside these directories (.verify/, .toolchains/) stay.
+# Windows cannot delete a file a running process holds (an editor's
+# cryolsp.exe), and `rmdir` does not report it, so the Windows recipe checks
+# what is left afterwards and fails naming it.
+ifeq ($(HOST_OS),windows)
 clean:
-	@echo "==> Cleaning compiler + stdlib build outputs"
-	@rm -rf compiler/build stdlib/.bin
+	@echo ==^> Cleaning compiler, stdlib, runtime tier, LSP and test-helper build outputs
+	@if exist compiler\build rmdir /s /q compiler\build
+	@if exist stdlib\.bin rmdir /s /q stdlib\.bin
+	@if exist runtime\.bin rmdir /s /q runtime\.bin
+	@if exist tools\CryoLSP\build rmdir /s /q tools\CryoLSP\build
+	@if exist bin\cryolsp.exe del /q bin\cryolsp.exe
+	@if exist bin\cryolsp del /q bin\cryolsp
+	@del /q tests\helpers\*.o tests\helpers\*.a 2>NUL || rem
+	@for %%d in (compiler\build stdlib\.bin runtime\.bin tools\CryoLSP\build bin\cryolsp.exe) do @if exist %%d (echo clean: %%d is still there; a running process holds a file in it & exit /b 1)
+else
+clean:
+	@echo "==> Cleaning compiler, stdlib, runtime tier, LSP and test-helper build outputs"
+	@rm -rf compiler/build stdlib/.bin runtime/.bin
 	@rm -rf tools/CryoLSP/build
-	@rm -f bin/cryolsp
+	@rm -f bin/cryolsp bin/cryolsp.exe
 	@rm -f $(TEST_HELPERS_DIR)/*.o $(TEST_HELPERS_DIR)/*.a
+endif

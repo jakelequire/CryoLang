@@ -732,9 +732,9 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
 # and the Windows one.  Both mapped a SKIPPED arm to exit 0 - so an environment
 # without wine ran half the gate and reported success, and "the fixed point
 # holds on both hosts" was a claim about a run nobody could tell apart from a
-# run that checked one host.  The repo already has the rule this violates, in
-# scripts/gate-unavailable.py: a gate has two honest outcomes, it ran and
-# passed or it did not pass, and "it could not run here" is the second.
+# run that checked one host.  The rule this violates is the one every gate here
+# keeps: a gate has two honest outcomes, it ran and passed or it did not pass,
+# and "it could not run here" is the second.
 #
 # So the arms are counted and named, and a skip is a refusal unless the caller
 # declared it.  The declaration is a flag rather than a silent default because
