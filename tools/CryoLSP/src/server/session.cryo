@@ -32,6 +32,7 @@ import std::core::option;
 import std::core::result;
 import std::core::drop;
 import std::core::intrinsics;
+import std::core::mem;
 import std::collections::str;
 import std::collections::string;
 import std::collections::string::{ String };
@@ -168,7 +169,7 @@ type struct CompilerSession {
         this.content_buf = PathFinder::build_cstring_buffer(content);
         this.config_buf  = PathFinder::discover_project_cryoconfig(fs_path);
         this.stdlib_buf  = PathFinder::discover_stdlib_root(fs_path);
-        fs_path_owned.drop();                    // fs_path (borrow) unused below
+        mem::drop(fs_path_owned);                    // fs_path (borrow) unused below
 
         // Wire the discovered stdlib path through to the compiler's
         // `--stdlib=` equivalent.  If `stdlib_buf` is empty the
@@ -196,7 +197,7 @@ type struct CompilerSession {
         // stay in libc and are safe to free explicitly).
         if (this.arena == null) {
             const arena_box: Box<arena::Arena> = Box::<arena::Arena>::new(
-                arena::Arena::with_chunk_size(8u64 * 1024u64 * 1024u64));
+                arena::Arena::with_chunk_size(8 * 1024 * 1024));
             this.arena = arena_box.leak();
         }
         // Make THIS session's arena the current AST + container arena, then
@@ -293,7 +294,7 @@ type struct SessionMap {
                 Option::Some(s) => { s.release_ctx(); }
                 Option::None    => { }
             }
-            evicted.drop();
+            mem::drop(evicted);
         }
     }
 
@@ -307,7 +308,7 @@ type struct SessionMap {
                 Option::Some(p) => {
                     if (p.as_str().equals(&uri)) {
                         mut gone: String = this.live_order.remove(i);
-                        gone.drop();
+                        mem::drop(gone);
                         return;
                     }
                 }
@@ -389,7 +390,7 @@ type struct SessionMap {
         const key: String = String::from_str(uri);
         const result: Option<CompilerSession*> = this.by_uri.get_ref(&key);
         mut owned: String = key;
-        owned.drop();
+        mem::drop(owned);
         return result;
     }
 
@@ -460,14 +461,14 @@ type struct SessionMap {
         match (this.by_uri.remove(&key)) {
             Option::Some(session) => {
                 mut s: CompilerSession = session;
-                s.drop();
+                mem::drop(s);
                 mut k: String = key;
-                k.drop();
+                mem::drop(k);
                 return true;
             }
             Option::None => {
                 mut k: String = key;
-                k.drop();
+                mem::drop(k);
                 return false;
             }
         }
@@ -501,7 +502,7 @@ type struct PathFinder {
 static discover_stdlib_root(fs_path: str::Str) -> String {
     mut dir: String = PathFinder::lsp_parent_dir(fs_path);
     loop {
-        if (dir.length() == 0) { dir.drop(); return String::new(); }
+        if (dir.length() == 0) { mem::drop(dir); return String::new(); }
 
         mut probe: String = String::with_capacity(dir.length() + 16);
         probe.push(dir.as_str());
@@ -519,14 +520,14 @@ static discover_stdlib_root(fs_path: str::Str) -> String {
             out.push_byte(0 as u8);
             const out_len: u64 = out.length() - 1;
             out.truncate(out_len);
-            probe.drop();
-            dir.drop();
+            mem::drop(probe);
+            mem::drop(dir);
             return out;
         }
-        probe.drop();
+        mem::drop(probe);
 
         const next: String = PathFinder::lsp_parent_dir(dir.as_str());
-        dir.drop();
+        mem::drop(dir);
         dir = next;
     }
     return String::new();
@@ -545,7 +546,7 @@ static discover_project_cryoconfig(fs_path: str::Str) -> String {
     // Start from the file's directory.
     mut dir: String = PathFinder::lsp_parent_dir(fs_path);
     loop {
-        if (dir.length() == 0) { dir.drop(); return String::new(); }
+        if (dir.length() == 0) { mem::drop(dir); return String::new(); }
 
         mut candidate: String = String::with_capacity(dir.length() + 12);
         candidate.push(dir.as_str());
@@ -557,15 +558,15 @@ static discover_project_cryoconfig(fs_path: str::Str) -> String {
 
         // F_OK == 0; access returns 0 when the path is reachable.
         if (libc::access(c_cstr, 0 as i32) == 0 as i32) {
-            dir.drop();
+            mem::drop(dir);
             return candidate;
         }
-        candidate.drop();
+        mem::drop(candidate);
 
         // Step up to the parent.  lsp_parent_dir of "/" is "" - that's
         // the loop's exit condition.
         const next: String = PathFinder::lsp_parent_dir(dir.as_str());
-        dir.drop();
+        mem::drop(dir);
         dir = next;
     }
     return String::new();
