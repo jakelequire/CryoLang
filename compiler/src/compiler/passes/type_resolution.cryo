@@ -73,6 +73,7 @@ import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Suggestion };
 import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -367,6 +368,9 @@ type struct TypeResolutionRunner {
         } else {
             impl_node.span
         };
+        if (trait_id.equals(this.ctx.generic_registry.wellknown(LangItem::Allocate))) {
+            this.check_allocate_owner(owner, head_span);
+        }
 
         mut terms: ImplTerms = ImplTerms {
             trait_ty:  this.ctx.decl_index.type_of_decl(trait_id, "type_resolution/impl conformance"),
@@ -643,6 +647,22 @@ type struct TypeResolutionRunner {
     static receiver_spelling(p: VarDeclNode*) -> string {
         if (p.is_value_receiver()) { return "this"; }
         return if (p.is_mutable) { "mut &this" } else { "&this" };
+    }
+
+    /// The type an `Allocate` implementation is for.  Only a struct's or a
+    /// class's `new` takes memory from an implementation, so one for any
+    /// other type would never run (E0312).
+    check_allocate_owner(&this, owner: TypeRef, head_span: SourceSpan) -> void {
+        const t: Type* = this.arena.lookup(owner);
+        if (t == null) { return; }
+        const shown: string = this.shown_type(owner);
+        if (t.kind != TypeKind::Struct && t.kind != TypeKind::Class) {
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0312_TRAIT_IMPL_MISMATCH,
+                fmt::format("trait `Allocate` can be implemented only for a struct or a class, and `%s` is neither",
+                    shown));
+            d = d.at_with_label(head_span, "`new` of this type never calls an `Allocate` implementation");
+            this.ctx.emit_diagnostic(d);
+        }
     }
 
     report_conformance(&this, span: SourceSpan, msg: string) -> void {

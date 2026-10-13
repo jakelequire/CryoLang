@@ -4048,6 +4048,11 @@ type struct NameResolutionPass {
             const node: ScopeResolutionNode* = ctx.alias_paths[i].node as ScopeResolutionNode*;
             mut alias: TypeAliasDeclNode* = NameResolutionPass::alias_decl(ctx, node.scope_res.pending_alias());
             mut answer: Res = Res::TypeRelative(ResBase::Def(node.scope_res.pending_alias()), 1);
+            if (alias != null && alias.generic_params.length == 0 && node.scope_generic_args.length > 0) {
+                NameResolutionPass::refuse_alias_type_args(ctx, node);
+                node.scope_res.settle_alias(Res::Err);
+                continue;
+            }
             mut hops: i32 = 0;
             while (alias != null && alias.generic_params.length == 0 && hops < 16) {
                 hops += 1;
@@ -4112,6 +4117,23 @@ type struct NameResolutionPass {
                 written, member, written));
         d = d.at_with_label(span, "a generic alias used as a path");
         d = d.help("write the path through the type the alias names, with its type arguments");
+        ctx.emit_diagnostic(d);
+    }
+
+    /// E0307 at type arguments written on an alias with no type parameters,
+    /// `PI::<u8>::size()` with `type PI = Pl<i32>;`: the alias fixes its
+    /// target's arguments, so arguments written on it are too many rather
+    /// than a second choice of the target's.
+    static refuse_alias_type_args(ctx: CompilationContext*, node: ScopeResolutionNode*) -> void {
+        const written: string = ctx.resolver.intern_table.resolve(node.scope_name);
+        const n: i64 = node.scope_generic_args.length;
+        const plural: string = if (n == 1) { "" } else { "s" };
+        const span: SourceSpan = if (node.scope_span.has_location()) { node.scope_span } else { node.span };
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            fmt::format("`%s` is a type alias with no type parameters, and %lld type argument%s %s written",
+                written, n, plural, if (n == 1) { "is" } else { "are" }));
+        d = d.at_with_label(span, "too many type arguments");
+        d = d.help("the alias fixes its target's type arguments; to choose others, write the path through the target type");
         ctx.emit_diagnostic(d);
     }
 

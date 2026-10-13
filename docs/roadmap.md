@@ -232,6 +232,15 @@ supported); a non-generic alias's path already names its target's members.
 Open: whether an alias that fixes some of its target's parameters
 (`type StrMap<V> = HashMap<string, V>`) infers only the alias's own.
 
+## `Allocate` on a generic class
+
+`implement<T> trait Allocate for class G<T>` type-checks, and then `new
+G<i64>(77)` fails at link time: the allocator is never instantiated for
+`G<i64>`, and the linker reports the missing symbol.  It is refused late,
+not miscompiled (ruling 292: left for after the merge).  It may become
+moot with the class removal.  Whether a generic struct's `Allocate` fails
+the same way has not been measured.
+
 ## Open questions
 
 - **How wide a `char` is**, and so what a character literal holds above

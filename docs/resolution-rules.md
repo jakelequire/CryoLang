@@ -267,6 +267,73 @@ yet is recorded with the change that builds it, not here.
 279. **`make verify-pin` also checks that each pin's stamped commit is the
      commit its sidecar names.**  (Jake)
 
+280. **On Windows, `make clean` fails, naming what it could not delete,
+     when a running program holds a file.**  (Jake)
+
+281. **The Makefile keeps its short list of targets that do not need the
+     host triple.**  (Jake)
+
+282. **On Windows, the targets that only refuse (`examples-golden`,
+     `valgrind-check`, `verify-freestanding`) do not build the compiler
+     first.**  (Jake)
+
+283. **The merge notes stay at the top of `docs/roadmap.md`.**  (Jake)
+
+284. **`.objcmp/` is deleted entirely as the last step before the merge,**
+     by Jake.  (Jake)
+
+285. **Trait objects, when they come, are spelled `virtual &Shape` and
+     `virtual Shape*`:** a prefix, as `mut &this` is.  There is no `dyn`.
+     (Jake)
+
+286. **Trait objects are built after the class removal,** possibly after
+     v1.0.  (Jake)
+
+287. **A trait used as a pointer or reference type (`p: &Shape`,
+     `p: Shape*` with `Shape` a trait) is refused where it is written.**
+     (Jake)
+
+288. **Object safety is per method:** a method that cannot go in a vtable
+     is unavailable on the object, and the rest of the trait still works.
+     (Jake)
+
+289. **Trait objects start with borrowed pointers only;** owning boxes come
+     later.  (Jake)
+
+290. **The class removal converts the AST straight to enums and `match`.**
+     (Jake)
+
+291. **The known class defects are left alone, since classes are going:**
+     `override` is not checked, a missing vtable slot is not reported, and
+     vtable slots are matched by name.  (Jake)
+
+292. **Before the merge: an overloaded generic static method taken as a
+     value is chosen like a function's or refused; type arguments written
+     on an alias with no parameters are refused; an `Allocate`
+     implementation for an enum is refused.**  `Allocate` on a generic
+     class failing to link is left for the roadmap.  (Jake)
+
+293. **A capturing closure stored in a function-typed variable, field or
+     return value is refused (E0458),** where it compiled and crashed.
+     Supporting it is roadmap work.  (Jake)
+
+294. **`Allocate` on a class whose base class gets its memory from another
+     allocator is refused,** so `delete` through a base pointer never
+     releases through an allocator that did not hand out the memory.
+     (Jake)
+
+295. **`delete` through a base-class pointer runs the static type's `Drop`,
+     not the derived class's.**  The spec says so; it is not fixed, since
+     classes are going.  (Jake)
+
+296. **The merge into `main` is a `--no-ff` merge commit,** when Jake
+     authorizes it.  (Jake)
+
+297. **Old commit messages are left as they are.**  (Jake)
+
+298. **`make verify --baseline` against a commit from before the version
+     stamp, `main` included, is fixed after the merge.**  (Jake)
+
 ### 2026-10-11
 
 227. **The cleanup that removes the Python gates also removes

@@ -5848,6 +5848,143 @@ type struct CallResolver {
         return ty;
     }
 
+    /// The overload of a method family `entries` that a method taken as a
+    /// VALUE names, when the family holds a generic method: the one entry
+    /// whose value fits the turbofish `scope` writes and the expected type,
+    /// as `value_family_entry` chooses among a function's.  With neither a
+    /// turbofish nor an expected function type nothing chooses, and more
+    /// than one fit is ambiguous: both are refused (E0154) and `refused`
+    /// says so.  Null with no refusal when the family is a single method or
+    /// holds no generic one, and when nothing fits - the first method is
+    /// then the value, and the binding it flows into reports the mismatch.
+    method_value_entry(mut &this, entries: &OverloadId[], scope: ScopeResolutionNode*,
+                       refused: mut &boolean) -> MethodNode* {
+        if (entries.length < 2) { return null; }
+        mut any_generic: boolean = false;
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const m: MethodNode* = this.ctx.decl_index.entry_method(entries[i]);
+            if (m != null && m.func != null && m.func.generic_params.length > 0) { any_generic = true; }
+        }
+        if (!any_generic) { return null; }
+        const shown: string = fmt::format("%s::%s",
+            this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name));
+        mut expected: TypeRef = this.state.expected_type;
+        if (expected.is_valid()) {
+            const et: Type* = this.arena.lookup(expected);
+            if (et == null || et.kind != TypeKind::Function
+                    || (!this.state.in_symbolic_check && this.types.contains_generic_param(expected))) {
+                expected = TypeRef::invalid();
+            }
+        }
+        if (scope.generic_args.length == 0 && !expected.is_valid()) {
+            this.report_ambiguous_value(entries, shown, scope.span, scope as ExpressionNode*,
+                this.ctx.decl_index.entry_signature(entries[0]));
+            *refused = true;
+            return null;
+        }
+        // The written arguments are resolved once here; one that names no
+        // type is reported by the value's own instance.
+        mut written: TypeRef[] = [];
+        if (scope.generic_args.length > 0) {
+            mut rc: ResolutionContext = ResolutionContext::new("");
+            this.symbolic.symbolic_bind_params(&rc);
+            for (mut i: i64 = 0; i < scope.generic_args.length; i++) {
+                const tr: TypeRef = this.ctx.type_resolver.resolve(scope.generic_args[i], &rc);
+                if (!tr.is_valid()) { return null; }
+                written.push(tr);
+            }
+        }
+        mut fits: OverloadId[] = [];
+        mut example: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const ty: TypeRef = this.method_value_fit(entries[i], &written, expected);
+            if (ty.is_valid()) {
+                fits.push(entries[i]);
+                example = ty;
+            }
+        }
+        if (fits.length == 1) { return this.ctx.decl_index.entry_method(fits[0]); }
+        if (fits.length == 0) { return null; }
+        this.report_ambiguous_value(&fits, shown, scope.span, scope as ExpressionNode*, example);
+        *refused = true;
+        return null;
+    }
+
+    /// The type method entry `entry` takes as a value under the type
+    /// arguments `written` and the function type `expected` (either may be
+    /// absent), or invalid when one of its own type parameters stays
+    /// unbound, more arguments are written than it has, or the result is not
+    /// `expected`.  A method with no type parameters fits only with nothing
+    /// written.  Reports nothing.
+    method_value_fit(mut &this, entry: OverloadId, written: &TypeRef[], expected: TypeRef) -> TypeRef {
+        const node: MethodNode* = this.ctx.decl_index.entry_method(entry);
+        const sig: TypeRef = this.ctx.decl_index.entry_signature(entry);
+        if (node == null || node.func == null || !sig.is_valid()) { return TypeRef::invalid(); }
+        const gps: &GenericParamNode*[] = &node.func.generic_params;
+        if (gps.length == 0) {
+            if (written.length == 0 && expected.is_valid() && sig.equals(expected)) { return sig; }
+            return TypeRef::invalid();
+        }
+        if (written.length > gps.length) { return TypeRef::invalid(); }
+        mut named: TypeRef[] = [];
+        this.arena.generic_params_in(sig, &named);
+        mut handles: TypeRef[] = [];
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < gps.length; i++) {
+            mut handle: TypeRef = TypeRef::invalid();
+            for (mut k: i64 = 0; k < named.length; k++) {
+                const gt: Type* = this.arena.lookup(named[k]);
+                if (gt != null && (gt as GenericParamType*).param_sym.equals(gps[i].sym_id)) { handle = named[k]; }
+            }
+            handles.push(handle);
+            bindings.push(if (i < written.length) { written[i] } else { TypeRef::invalid() });
+        }
+        // A generic owner's parameters the signature names are bound by the
+        // expected type alone; the path's owner arguments are applied to the
+        // instance the value becomes, not to the choice of overload.
+        mut others: TypeRef[] = [];
+        for (mut k: i64 = 0; k < named.length; k++) {
+            mut own: boolean = false;
+            for (mut i: i64 = 0; i < handles.length; i++) {
+                if (handles[i].is_valid() && handles[i].equals(named[k])) { own = true; }
+            }
+            if (!own) { others.push(named[k]); }
+        }
+        mut sub_params: TypeRef[] = [];
+        mut sub_args: TypeRef[] = [];
+        if (expected.is_valid()) {
+            mut pids: TypeRef[] = [];
+            for (mut i: i64 = 0; i < handles.length; i++) {
+                if (handles[i].is_valid() && !bindings[i].is_valid()) { pids.push(handles[i]); }
+            }
+            for (mut k: i64 = 0; k < others.length; k++) { pids.push(others[k]); }
+            mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+            ictx.unify(sig, expected);
+            mut p: i64 = 0;
+            for (mut i: i64 = 0; i < handles.length; i++) {
+                if (!handles[i].is_valid() || bindings[i].is_valid()) { continue; }
+                bindings[i] = ictx.bindings[p];
+                p = p + 1;
+            }
+            for (mut k: i64 = 0; k < others.length; k++) {
+                if (!ictx.bindings[p].is_valid()) { return TypeRef::invalid(); }
+                sub_params.push(others[k]);
+                sub_args.push(ictx.bindings[p]);
+                p = p + 1;
+            }
+        }
+        for (mut i: i64 = 0; i < handles.length; i++) {
+            if (!bindings[i].is_valid()) { return TypeRef::invalid(); }
+            if (handles[i].is_valid()) {
+                sub_params.push(handles[i]);
+                sub_args.push(bindings[i]);
+            }
+        }
+        const ty: TypeRef = this.subst_params(&sub_params, &sub_args, sig);
+        if (expected.is_valid() && !ty.equals(expected)) { return TypeRef::invalid(); }
+        return ty;
+    }
+
     /// The type of a generic function or a generic owner's method taken as a
     /// VALUE: its signature `sig`, written over `params` - the template's
     /// type parameters, positionally `entry`'s - with the type arguments the
@@ -5937,10 +6074,21 @@ type struct CallResolver {
         mut call_params: TypeRef[] = [];
         mut ret: TypeRef = TypeRef::invalid();
         mut variadic: boolean = false;
+        // An overloaded family is the overload the value's turbofish and
+        // expected type choose; a single method is itself.
+        const entries: OverloadId[] = this.member_entries(FamilyOwner::Type(owner), scope.member_name);
+        mut refused: boolean = false;
+        const chosen: MethodNode* = this.method_value_entry(&entries, scope, &refused);
+        if (refused) {
+            *owns = true;
+            return TypeRef::invalid();
+        }
         if (generic_owner) {
-            const entries: OverloadId[] = this.member_entries(FamilyOwner::Type(owner), scope.member_name);
-            if (entries.length != 1) { return TypeRef::invalid(); }
-            node = this.ctx.decl_index.entry_method(entries[0]);
+            if (chosen != null) {
+                node = chosen;
+            } else if (entries.length == 1) {
+                node = this.ctx.decl_index.entry_method(entries[0]);
+            }
             if (node == null || node.func == null) { return TypeRef::invalid(); }
             is_static = node.is_static;
             for (mut i: i64 = 0; i < node.func.parameters.length; i++) {
@@ -5950,7 +6098,13 @@ type struct CallResolver {
             }
             ret = node.func.resolved_return_type;
         } else {
-            const m: MethodInfo* = this.ctx.decl_index.type_method(owner, scope.member_name, this.arena);
+            mut m: MethodInfo* = null;
+            if (chosen != null) {
+                const one: MethodNode*[] = [chosen];
+                m = this.ctx.decl_index.type_method_among(owner, &one, this.arena);
+            } else {
+                m = this.ctx.decl_index.type_method(owner, scope.member_name, this.arena);
+            }
             if (m == null || m.ast_node == null) { return TypeRef::invalid(); }
             node = m.ast_node as MethodNode*;
             is_static = m.is_static;
