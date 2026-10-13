@@ -232,6 +232,21 @@ supported); a non-generic alias's path already names its target's members.
 Open: whether an alias that fixes some of its target's parameters
 (`type StrMap<V> = HashMap<string, V>`) infers only the alias's own.
 
+## Capturing closures held by function-typed slots
+
+A capturing closure stored in a variable, field or array element of
+function type, assigned to one, or returned from a function is refused
+today (`E0458`; ruling 293: refused until it is supported properly).  A
+function-typed value is a bare function pointer, with nowhere to keep the
+captures, so supporting it means a function value that carries an
+environment: a pointer to the code beside a pointer to the captures, with
+an owner that releases them.
+
+Open: whether every function-typed value becomes the two-pointer form or
+only a separate closure-value type does; who owns an escaping closure's
+captures and when they are released; and whether a non-capturing function
+keeps its single-pointer form across the C boundary.
+
 ## `Allocate` on a generic class
 
 `implement<T> trait Allocate for class G<T>` type-checks, and then `new

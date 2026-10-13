@@ -651,7 +651,8 @@ type struct TypeResolutionRunner {
 
     /// The type an `Allocate` implementation is for.  Only a struct's or a
     /// class's `new` takes memory from an implementation, so one for any
-    /// other type would never run (E0312).
+    /// other type would never run (E0312).  A class below another is
+    /// refused one once its base is known (`refuse_allocate_below_base`).
     check_allocate_owner(&this, owner: TypeRef, head_span: SourceSpan) -> void {
         const t: Type* = this.arena.lookup(owner);
         if (t == null) { return; }
@@ -3478,6 +3479,31 @@ type struct TypeResolutionPasses {
     }
 
 
+    /// E0308 at an `Allocate` implementation for `class_ref`, a class with
+    /// the base class `base_ref`.  `delete` through a pointer to the base
+    /// releases through the base's allocator - an ancestor's implementation
+    /// or the global one - which did not hand out the memory, so only the
+    /// root of a hierarchy may implement it; every class below uses that one.
+    static refuse_allocate_below_base(ctx: CompilationContext*, class_ref: TypeRef, base_ref: TypeRef) -> void {
+        const registry: GenericRegistry* = ctx.generic_registry;
+        const trait_id: DefId = registry.wellknown(LangItem::Allocate);
+        if (!trait_id.is_valid()) { return; }
+        const block: ImplBlockNode* = registry.select_trait_impl(trait_id, class_ref, ctx.get_intern_table());
+        if (block == null) { return; }
+        const ct: Type* = ctx.type_arena.lookup(class_ref);
+        const bt: Type* = ctx.type_arena.lookup(base_ref);
+        if (ct == null || bt == null) { return; }
+        const shown: string = ctx.type_arena.format_display(ct);
+        const base_shown: string = ctx.type_arena.format_display(bt);
+        const span: SourceSpan = if (block.target_type_span.has_location()) { block.target_type_span } else { block.span };
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0308_CONFLICTING_TRAIT_IMPL,
+            fmt::format("`%s` cannot implement `Allocate`: it derives from `%s`, and `delete` through a `%s*` releases through `%s`'s allocator",
+                shown, base_shown, base_shown, base_shown));
+        d = d.at_with_label(span, "a class with a base class");
+        d = d.help("implement `Allocate` for the root of the hierarchy; every class below it uses that implementation");
+        ctx.emit_diagnostic(d);
+    }
+
     // Pass 3: StructFieldTypeSync (order 10)
 
     /// Syncs resolved field types from AST FieldDeclNode nodes back to
@@ -3756,6 +3782,7 @@ type struct TypeResolutionPasses {
                                 anc_ref = anc_cls.base_class;
                                 anc_depth += 1;
                             }
+                            TypeResolutionPasses::refuse_allocate_below_base(ctx, type_ref, base_ref);
                         }
                     }
                     class_count++;

@@ -754,6 +754,30 @@ type struct LambdaSynth {
             this.intern, this.arena, QualifiedName::from_symbol(orig), &closure_tys);
     }
 
+    /// E0458 when a capturing closure of type `value_ty` is held by a slot
+    /// of function type `slot_ty` - `what`, a variable, a field, an array
+    /// element, an assigned place or a returned value.  A variant's payload
+    /// is a scope-resolution call's argument, refused as such.  A function-typed
+    /// slot holds a function pointer, which has no room for the closure's
+    /// captures: only a non-generic free function's parameter is
+    /// specialised to the closure's own type.
+    refuse_stored_closure(mut &this, value_ty: TypeRef, slot_ty: TypeRef, span: SourceSpan,
+                          what: string) -> void {
+        if (!this.is_closure_struct_type(value_ty)) { return; }
+        const st: Type* = this.arena.lookup(slot_ty);
+        if (st == null || st.kind != TypeKind::Function) { return; }
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0458_CLOSURE_ARG_NON_FREE,
+            fmt::format("a capturing closure cannot be held by %s of function type `%s`", what,
+                this.arena.format_display(st)));
+        diag = diag.at_with_label(span, "this closure captures from its environment");
+        diag = diag.with_note(
+            "a function-typed value is a function pointer, with no room for a closure's captures; a capturing closure is passed only to a non-generic free function's `(Args) -> Ret` parameter");
+        diag = diag.help(
+            "pass the closure straight to such a function, or leave the variable's type to inference: `const f = (...) -> T { ... };`");
+        this.ctx.emit_diagnostic(diag);
+    }
+
     /// Emit E0458 for each closure-struct argument to a method / scope call (v1.0
     /// routes closures through free-function `(Args) -> Ret` params only).
     reject_closure_struct_args_in_non_free_call(mut &this, call: CallExprNode*,

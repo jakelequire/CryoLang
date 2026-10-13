@@ -483,6 +483,14 @@ falling back to an indirect call:
 | Scope-resolution call - `Type::run(c)`    | E0458                       | yes                             |
 | `extern "C"` callback parameter           | never (no environment slot) | yes                             |
 
+A capturing closure is not a function pointer, so a slot of function type cannot hold one either. A variable, field or array element typed `(Args) -> Ret`, a place of that type assigned to, and a function returning one are each refused where the capturing closure meets them (**E0458**). A variable with no annotation takes the closure's own type and holds it:
+
+```cryo
+const bias: i32 = 40;
+const f = (x: i32) -> i32 { return x + bias; };              // ok: the closure's own type
+const g: (i32) -> i32 = (x: i32) -> i32 { return x + bias; }; // error[E0458]: a capturing closure cannot be held by a variable of function type `(i32) -> i32`
+```
+
 The distinction is *capture*, not syntax. A lambda that captures nothing is an
 ordinary function pointer and binds anywhere a function pointer does, including
 every row above; a lambda that captures becomes an anonymous struct value, and
@@ -2898,9 +2906,9 @@ type trait Allocate {
 }
 ```
 
-`new T(...)` and `new T { ... }` of a struct or class that implements `Allocate` take their storage from `T::allocate(size, align)`, with `T`'s size and alignment; the vtable is then seeded and the constructor run as for any `new`. A class that does not implement it uses the implementation of its nearest base class that does, so one implementation on a base serves the whole hierarchy below it, and a subclass with its own replaces it for itself and the classes below. `new T[n]` of such an element type takes the block from the same `allocate`, with alignment 16. A type with no implementation anywhere uses the global allocator, unchanged.
+`new T(...)` and `new T { ... }` of a struct or class that implements `Allocate` take their storage from `T::allocate(size, align)`, with `T`'s size and alignment; the vtable is then seeded and the constructor run as for any `new`. Only the root of a class hierarchy may implement it, and every class below uses the root's implementation. A class with a base class that implements `Allocate` is refused (`E0308`): `delete` through a pointer to the base releases through the base's allocator, the root's or the global one, which did not hand out the memory. `new T[n]` of such an element type takes the block from the same `allocate`, with alignment 16. A type with no implementation anywhere uses the global allocator, unchanged.
 
-`delete p` runs the pointee's `Drop`, if it has one, and then hands `p` to the same implementation's `release` with the pointee type's alignment, instead of freeing it. `release` does nothing unless an implementation writes it, which is what an arena wants: its storage is reclaimed whole, never one object at a time. An allocator that does free single objects writes both methods.
+`delete p` runs the `Drop` of `p`'s static pointee type - the type the pointer is declared with, not the class of the object it points at. A `Base*` holding a `Derived` runs `Base`'s `Drop`, if `Base` has one, and never `Derived`'s; a cleanup a subclass needs is not run through a pointer to its base. Then `delete p` hands `p` to the same implementation's `release` with the pointee type's alignment, instead of freeing it. `release` does nothing unless an implementation writes it, which is what an arena wants: its storage is reclaimed whole, never one object at a time. An allocator that does free single objects writes both methods.
 
 ```cryo
 mut g_pool: u8[4096] = [0; 4096];
