@@ -46,6 +46,7 @@ namespace compiler::build_manifest;
 import compiler::project_config;
 import compiler::project_config::{ ProjectConfig };
 import utils::logger;
+import utils::build_stamp::{ StampSlot };
 import std::fs::file;
 import std::fs::metadata;
 import std::fs::metadata::{ metadata };
@@ -349,6 +350,12 @@ type struct Manifest {
     /// guard. File reading is compiler-specific, so this lives here and drives
     /// the canonical `Hasher::fold` for the actual byte mixing.
     static fold_file(h: Fnv128Hasher*, path_text: string) -> void {
+        Manifest::fold_file_contents(h, path_text, false);
+    }
+
+    /// `fold_file`, reading a binary's build stamp as zeros when
+    /// `clear_stamp` is set.
+    static fold_file_contents(h: Fnv128Hasher*, path_text: string, clear_stamp: boolean) -> void {
         const path: string = path_text;
         if (!metadata::exists(Path::from(path))) {
             h.fold("<missing>");
@@ -359,6 +366,9 @@ type struct Manifest {
                 mut bytes: Array<u8> = data;
                 const n: u64 = bytes.length();
                 const d: u8* = bytes.as_ptr();
+                if (clear_stamp) {
+                    StampSlot::clear_text(d, n);
+                }
                 for (mut i: u64 = 0; i < n; i++) {
                     h.fold(d[i]);
                 }
@@ -382,7 +392,10 @@ type struct Manifest {
     }
 
     /// FNV-1a digest of the running compiler's own bytes. Changes whenever the
-    /// compiler changes, invalidating every cached build it produced.
+    /// compiler changes, invalidating every cached build it produced.  The
+    /// build stamp reads as zeros: `cryo stamp` rewrites it in place and it
+    /// changes nothing the compiler emits, so a new stamp is not a new
+    /// compiler.
     static compiler_fingerprint() -> u128 {
         const exe: string = Manifest::self_exe_path();
         mut h: Fnv128Hasher = Fnv128Hasher::new();
@@ -390,7 +403,7 @@ type struct Manifest {
             h.fold("<unknown-compiler>");
             return h.finish128();
         }
-        Manifest::fold_file(&h, exe);
+        Manifest::fold_file_contents(&h, exe, true);
         return h.finish128();
     }
 

@@ -563,6 +563,7 @@ void     LLVMInitializeX86AsmPrinter(void);
 void     LLVMInitializeX86AsmParser(void);
 
 char    *LLVMGetDefaultTargetTriple(void);
+void     LLVMGetVersion(unsigned *Major, unsigned *Minor, unsigned *Patch);
 LLVMBool LLVMGetTargetFromTriple(const char *Triple, LLVMTargetRef *T, char **ErrorMessage);
 
 LLVMTargetMachineRef LLVMCreateTargetMachine(LLVMTargetRef T, const char *Triple,

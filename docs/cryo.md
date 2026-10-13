@@ -4300,9 +4300,13 @@ color  = "auto"                     # auto | always | never
 | `cryo fetch`             | Fetch dependencies and write `cryoconfig.lock`.                                                                     |
 | `cryo update`            | Re-resolve every dependency, ignoring the lockfile.                                                                 |
 | `cryo vendor <sub>`      | Manage the per-machine registry of vendored C libraries: `<path>` \| `list` \| `remove <name>` \| `rebuild [name]`. |
-| `cryo version`           | Print the compiler version.                                                                                         |
+| `cryo version`           | Print the compiler version; `--verbose` adds the build details, `--triple` prints only the default target triple.  |
 
 Running `cryo <file.cryo>` with no command compiles that file directly.
+
+**The version string.** `cryo -v`, `cryo version` and the banner `cryo` prints with no arguments give the release number, its pre-release label, and after a `+` the build: the first eight hex digits of the commit the compiler was built from, with `-dirty` when tracked files differed from that commit (`cryo version 1.0.0-alpha+3f9c2a1b`). Pre-release labels order the way the release number reads (`1.0.0-alpha` comes before `1.0.0`); the build part identifies a binary and does not order it. The release number and the label are `VERSION` and `PRERELEASE` in `compiler/src/main.cryo`.
+
+The build part is not compiled in. A compiler binary holds a reserved region that `cryo stamp <binary>` rewrites after linking, from the git checkout in the current directory, so stamping changes no code and nothing the compiler emits. An unstamped binary, or one built outside a git checkout, prints `+unknown`. `cryo stamp` is not listed in `cryo help`; `cryo help stamp` describes it. `cryo version --verbose` prints, beneath the version line, the binary's path and size, the full commit, its date, the branch, `git describe`, whether the tree was dirty, the build profile (all from the stamp), and the LLVM version, the default target triple and the stdlib root a build would use. A compiler's build cache key reads the region as zeros, so restamping a compiler does not invalidate what it built.
 
 ### 25.2 Build flags
 

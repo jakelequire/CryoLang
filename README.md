@@ -369,7 +369,7 @@ Run with `cryo test`. See [`docs/cryo.md` section 20](./docs/cryo.md#20-testing)
 | `cryo fetch`               | Resolve `[dependencies]`; write `cryoconfig.lock`.                |
 | `cryo update`              | Re-resolve dependencies, ignoring the lock.                       |
 | `cryo demangle <symbol>`   | Decode a mangled Cryo symbol.                                     |
-| `cryo version`             | Print version info.                                               |
+| `cryo version`             | Print version info (`--verbose`: commit, date, LLVM, target...).  |
 
 Run `cryo help` for the canonical list.
 

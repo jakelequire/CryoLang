@@ -1,0 +1,303 @@
+///! Build stamp
+///!
+///! What a built compiler knows about the checkout it was built from: the
+///! commit, its date, the branch, `git describe`, whether tracked files
+///! differed from the commit, and the build profile.  None of it is compiled
+///! in.  The compiler carries a fixed region, `BUILD_STAMP`, that `cryo stamp`
+///! rewrites in the linked binary, so every object the compiler emits and
+///! every object it is built from stays the same at every commit, and a
+///! binary nobody stamped reports `unknown`.
+namespace utils::build_stamp;
+
+import std::fmt;
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::slice::{ Slice };
+import std::fs::file;
+import std::fs::path::{ Path };
+import std::process::command::{ Command, Output };
+
+/// The region `cryo stamp` rewrites.  `marker` opens it and is the only copy
+/// of its sixteen bytes in a built binary, which is how the region is found
+/// in a stripped one; code that needs those bytes reads `BUILD_STAMP.marker`,
+/// since a literal spelling them would be a second copy.  `text` is
+/// `key=value` lines ended by a NUL, all zero when unstamped.
+type struct StampSlot {
+    marker: u8[16];
+    text:   u8[496];
+}
+
+/// Mutable and externally visible: a read of it is a load of whatever bytes
+/// the binary holds, never the zeros it was compiled with.
+mut BUILD_STAMP: StampSlot = StampSlot {
+    marker: [67, 82, 89, 79, 45, 66, 85, 73, 76, 68, 45, 83, 84, 65, 77, 80],
+    text:   [0; 496],
+};
+
+/// `text`'s length.  The last byte stays NUL, so a stamp holds one fewer.
+const SLOT_TEXT_LEN: u64 = 496;
+
+implement struct StampSlot {
+    /// Offset of the text of the one stamp region in `data`, or -1 when
+    /// `data` holds none.  `*count` is the number of markers found; a
+    /// binary holding more than one has no region to answer with.
+    static locate(data: u8*, n: u64, count: u64*) -> i64 {
+        const marker_len: u64 = 16;
+        *count = 0;
+        mut found: i64 = -1;
+        if (n < marker_len + SLOT_TEXT_LEN) { return -1; }
+        const first: u8 = BUILD_STAMP.marker[0];
+        const last_start: u64 = n - marker_len - SLOT_TEXT_LEN;
+        for (mut i: u64 = 0; i <= last_start; i++) {
+            if (data[i] != first) { continue; }
+            mut matched: boolean = true;
+            for (mut k: u64 = 1; k < marker_len; k++) {
+                if (data[i + k] != BUILD_STAMP.marker[k]) { matched = false; break; }
+            }
+            if (matched) {
+                *count = *count + 1;
+                found = (i + marker_len) as i64;
+            }
+        }
+        if (*count != 1) { return -1; }
+        return found;
+    }
+
+    /// Zero the stamp text inside `data`, the bytes of a whole binary, so a
+    /// digest over them is the same for every stamp.  A binary with no
+    /// single region is left as it is.
+    static clear_text(data: u8*, n: u64) -> void {
+        mut count: u64 = 0;
+        const at: i64 = StampSlot::locate(data, n, &count);
+        if (at < 0) { return; }
+        for (mut i: u64 = 0; i < SLOT_TEXT_LEN; i++) {
+            data[at as u64 + i] = 0;
+        }
+    }
+
+    /// Write `text` into the stamp region of the binary at `path`, zeroing
+    /// the rest of it.  Returns "" on success or the reason the binary was
+    /// left as it was, phrased to follow "cannot stamp <path>: ".  An unchanged region is not rewritten, so
+    /// stamping twice from one checkout leaves the file untouched.
+    static write_into(path: string, text: string) -> string {
+        const text_len: u64 = text.length();
+        if (text_len >= SLOT_TEXT_LEN) {
+            return fmt::format("the stamp is %d bytes; the region holds %d",
+                text_len as i64, (SLOT_TEXT_LEN - 1) as i64);
+        }
+        match (file::read(Path::from(path))) {
+            Result::Ok(data) => {
+                mut bytes: Array<u8> = data;
+                const n: u64 = bytes.length();
+                const d: u8* = bytes.as_ptr();
+                mut count: u64 = 0;
+                const at: i64 = StampSlot::locate(d, n, &count);
+                if (at < 0) {
+                    return fmt::format("it holds %d stamp regions; expected exactly one",
+                        count as i64);
+                }
+                mut changed: boolean = false;
+                for (mut i: u64 = 0; i < SLOT_TEXT_LEN; i++) {
+                    const want: u8 = if (i < text_len) { text[i as i64] as u8 } else { 0 };
+                    if (d[at as u64 + i] != want) {
+                        d[at as u64 + i] = want;
+                        changed = true;
+                    }
+                }
+                mut message: string = "";
+                if (changed) {
+                    match (file::write(Path::from(path), Slice::<u8>::from_raw(d, n))) {
+                        Result::Ok(_) => {}
+                        Result::Err(_) => { message = "it cannot be written"; }
+                    }
+                }
+                return message;
+            }
+            Result::Err(_) => {
+                return "it cannot be read";
+            }
+        }
+    }
+}
+
+/// The fields of a stamp.  Each is "" when the binary was not stamped.
+type struct BuildStamp {
+    commit:   string;
+    date:     string;
+    branch:   string;
+    describe: string;
+    dirty:    string;
+    profile:  string;
+}
+
+implement struct BuildStamp {
+    static empty() -> BuildStamp {
+        return BuildStamp {
+            commit: "", date: "", branch: "", describe: "", dirty: "", profile: "",
+        };
+    }
+
+    /// The stamp of the running binary.
+    static running() -> BuildStamp {
+        const text: string = &BUILD_STAMP.text[0] as string;
+        return BuildStamp::parse(text);
+    }
+
+    /// Read `key=value` lines.  A key it does not know is skipped, so a
+    /// stamp written by a newer `cryo stamp` still reads.
+    static parse(text: string) -> BuildStamp {
+        mut stamp: BuildStamp = BuildStamp::empty();
+        if (text == null || text.length() == 0) { return stamp; }
+        const lines: string[] = text.split_char(10 as i8);
+        for (mut i: u64 = 0; i < lines.length(); i++) {
+            const line: string = lines[i as i64];
+            const eq: i64 = line.find_char(61 as i8);
+            if (eq <= 0) { continue; }
+            const key: string = line.substr(0, eq);
+            const value: string = line.substr(eq + 1, line.length() as i64 - eq - 1);
+            match (key) {
+                "commit"   => { stamp.commit = value; }
+                "date"     => { stamp.date = value; }
+                "branch"   => { stamp.branch = value; }
+                "describe" => { stamp.describe = value; }
+                "dirty"    => { stamp.dirty = value; }
+                "profile"  => { stamp.profile = value; }
+                _ => {}
+            }
+        }
+        return stamp;
+    }
+
+    /// The text `parse` reads back.  "" for an unstamped build, so writing
+    /// it clears a region.
+    render(&this) -> string {
+        if (this.commit.length() == 0) { return ""; }
+        return fmt::format("commit=%s\ndate=%s\nbranch=%s\ndescribe=%s\ndirty=%s\nprofile=%s\n",
+            this.commit, this.date, this.branch, this.describe, this.dirty, this.profile);
+    }
+
+    is_stamped(&this) -> boolean {
+        return this.commit.length() > 0;
+    }
+
+    /// `core`, then `-prerelease` when there is one, then the build: the
+    /// commit's first eight hex digits, `-dirty` when tracked files differed
+    /// from it, or `unknown` when the binary was not stamped.
+    version(&this, core: string, prerelease: string) -> string {
+        mut v: string = core;
+        if (prerelease.length() > 0) {
+            v = v + "-" + prerelease;
+        }
+        if (!this.is_stamped()) {
+            return v + "+unknown";
+        }
+        v = v + "+" + this.commit.substr(0, 8);
+        if (this.dirty == "yes") {
+            v = v + "-dirty";
+        }
+        return v;
+    }
+
+    /// Query the git checkout the current directory is in.  Paths in
+    /// `exclude` are named from the top of the checkout, and a change to
+    /// one of them does not make the tree dirty: they are the files the
+    /// build that asks for the stamp is itself writing.  Outside a checkout,
+    /// or with no `git`, the stamp is empty.
+    static from_checkout(exclude: string[], profile: string) -> BuildStamp {
+        mut stamp: BuildStamp = BuildStamp::empty();
+        stamp.commit = BuildStamp::git_line(["rev-parse", "HEAD"]);
+        if (stamp.commit.length() == 0) { return stamp; }
+        stamp.date     = BuildStamp::git_line(["log", "-1", "--format=%cs", "HEAD"]);
+        stamp.branch   = BuildStamp::git_line(["rev-parse", "--abbrev-ref", "HEAD"]);
+        stamp.describe = BuildStamp::git_line(["describe", "--always", "--tags"]);
+        stamp.profile  = profile;
+
+        // A build rewrites tracked files' timestamps without changing their
+        // bytes, which leaves git's stat cache stale; refresh it so only a
+        // real content difference reads as dirty.  It exits non-zero when it
+        // refreshed anything, which says nothing about the tree.
+        BuildStamp::git_status(["update-index", "-q", "--refresh"]);
+        mut diff: string[] = ["diff-index", "--quiet", "HEAD", "--"];
+        for (mut i: u64 = 0; i < exclude.length(); i++) {
+            diff.push(":(top,exclude)" + exclude[i as i64]);
+        }
+        const status: i32 = BuildStamp::git_status(diff);
+        stamp.dirty = if (status == 0) { "no" } else { "yes" };
+        return stamp;
+    }
+
+    /// The first line `git <args>` prints, or "" when it fails.
+    static git_line(args: string[]) -> string {
+        mut cmd: Command = Command::new(Str::new("git"));
+        for (mut i: u64 = 0; i < args.length(); i++) {
+            cmd.arg(Str::new(args[i as i64]));
+        }
+        match (cmd.output()) {
+            Result::Ok(out) => {
+                mut o: Output = out;
+                if (!o.status.success()) { return ""; }
+                const bytes: Slice<u8> = o.stdout();
+                mut line: String = String::new();
+                for (mut i: u64 = 0; i < bytes.length(); i++) {
+                    const b: u8 = bytes.get(i).unwrap_or(0 as u8);
+                    if (b == 10 as u8 || b == 13 as u8) { break; }
+                    line.push_byte(b);
+                }
+                return line.into_raw();
+            }
+            Result::Err(_) => { return ""; }
+        }
+    }
+
+    /// `git <args>`'s exit code; -1 when it could not be run.
+    static git_status(args: string[]) -> i32 {
+        mut cmd: Command = Command::new(Str::new("git"));
+        for (mut i: u64 = 0; i < args.length(); i++) {
+            cmd.arg(Str::new(args[i as i64]));
+        }
+        match (cmd.output()) {
+            Result::Ok(out) => {
+                mut o: Output = out;
+                return o.status.exit_code().unwrap_or(-1);
+            }
+            Result::Err(_) => { return -1; }
+        }
+    }
+}
+
+/// What `cryo version --verbose` prints beneath the version line.  Every
+/// field is text; one that could not be read is "".
+type struct VersionReport {
+    version: string;
+    binary:  string;
+    size:    string;
+    stamp:   BuildStamp;
+    llvm:    string;
+    target:  string;
+    stdlib:  string;
+}
+
+implement struct VersionReport {
+    /// The version line, a blank line, then one labelled line per field,
+    /// with `unknown` for a field nobody could read.
+    render(&this) -> string {
+        mut out: string = this.version + "\n\n";
+        out = out + VersionReport::line("binary:", this.binary);
+        out = out + VersionReport::line("size:", this.size);
+        out = out + VersionReport::line("commit:", this.stamp.commit);
+        out = out + VersionReport::line("commit-date:", this.stamp.date);
+        out = out + VersionReport::line("branch:", this.stamp.branch);
+        out = out + VersionReport::line("describe:", this.stamp.describe);
+        out = out + VersionReport::line("dirty:", this.stamp.dirty);
+        out = out + VersionReport::line("llvm:", this.llvm);
+        out = out + VersionReport::line("target:", this.target);
+        out = out + VersionReport::line("stdlib:", this.stdlib);
+        out = out + VersionReport::line("profile:", this.stamp.profile);
+        return out;
+    }
+
+    static line(label: string, value: string) -> string {
+        const shown: string = if (value.length() == 0) { "unknown" } else { value };
+        return fmt::format("%-14s%s\n", label, shown);
+    }
+}

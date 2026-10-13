@@ -34,6 +34,8 @@ import compiler::compilation_context;
 import compiler::instance;
 import compiler::project_config;
 import utils::keyword::{ Keyword };
+import utils::build_stamp::{ BuildStamp, StampSlot, VersionReport };
+import compiler::build_manifest;
 
 // Test-output framing (ASCII only). 80-column rules; kept in sync with the
 // unit runner's framing in stdlib/test/runner.cryo so the two suites read
@@ -283,6 +285,7 @@ type enum CommandKind {
     Fetch;
     Update;
     Vendor;
+    Stamp;
     Unknown;
 }
 
@@ -301,6 +304,7 @@ implement enum CommandKind {
             CommandKind::Fetch    => { "fetch"    }
             CommandKind::Update   => { "update"   }
             CommandKind::Vendor   => { "vendor"   }
+            CommandKind::Stamp    => { "stamp"    }
             _ => { "" }
         };
     }
@@ -308,7 +312,7 @@ implement enum CommandKind {
     description(&this) -> string {
         return match (this) {
             CommandKind::Help     => { "Display help information"                      }
-            CommandKind::Version  => { "Display version information (--triple: target triple)" }
+            CommandKind::Version  => { "Display version information (--verbose: build details; --triple: target triple)" }
             CommandKind::Init     => { "Scaffold a new Cryo project (cryoconfig + main.cryo)" }
             CommandKind::Build    => { "Build a file or cryoconfig project"                    }
             CommandKind::Run      => { "Build the project and run the resulting binary" }
@@ -319,6 +323,7 @@ implement enum CommandKind {
             CommandKind::Fetch    => { "Fetch dependencies and write cryoconfig.lock" }
             CommandKind::Update   => { "Re-resolve every dependency, ignoring the lockfile" }
             CommandKind::Vendor   => { "Register a C library for `import vendor::Name`" }
+            CommandKind::Stamp    => { "Record the checkout a built compiler came from in that binary" }
             _ => { "" }
         };
     }
@@ -326,7 +331,7 @@ implement enum CommandKind {
     usage(&this) -> string {
         return match (this) {
             CommandKind::Help     => { "cryo help [command|flag]"         }
-            CommandKind::Version  => { "cryo version [--triple]"          }
+            CommandKind::Version  => { "cryo version [--verbose|--triple]" }
             CommandKind::Init     => { "cryo init [dir]"                  }
             CommandKind::Build    => { "cryo build [file|dir] [flags]"  }
             CommandKind::Run      => { "cryo run [flags]"                 }
@@ -337,6 +342,7 @@ implement enum CommandKind {
             CommandKind::Fetch    => { "cryo fetch"                        }
             CommandKind::Update   => { "cryo update"                       }
             CommandKind::Vendor   => { "cryo vendor <path>|list|remove <name>|clean|rebuild [name]" }
+            CommandKind::Stamp    => { "cryo stamp <binary> [--profile=NAME] [--exclude=PATH,...]" }
             _ => { "" }
         };
     }
@@ -360,7 +366,19 @@ implement enum CommandKind {
             }
             CommandKind::Version => {
                 fmt::printf("Prints the compiler's name and version string, then exits.\n");
-                fmt::printf("Equivalent to the global `--version` / `-v` flag.\n");
+                fmt::printf("Equivalent to the global `--version` / `-v` flag.\n\n");
+                fmt::printf("The version is the release number, its pre-release label, and after\n");
+                fmt::printf("a `+` the first eight hex digits of the commit the compiler was built\n");
+                fmt::printf("from, with `-dirty` when tracked files differed from that commit:\n");
+                fmt::printf("  cryo version 1.0.0-alpha+3f9c2a1b\n");
+                fmt::printf("A compiler that was never stamped (see `cryo help stamp`) prints\n");
+                fmt::printf("`+unknown` there.\n\n");
+                fmt::printf("Flags:\n");
+                fmt::printf("  --verbose   Also print the binary's path and size, the full commit,\n");
+                fmt::printf("              its date, the branch, `git describe`, whether the tree\n");
+                fmt::printf("              was dirty, the LLVM version, the default target triple,\n");
+                fmt::printf("              the stdlib root and the build profile\n");
+                fmt::printf("  --triple    Print only the triple a build with no --target= uses\n");
             }
             CommandKind::Init => {
                 fmt::printf("Interactively scaffolds a new Cryo project.  Prompts for the\n");
@@ -471,6 +489,21 @@ implement enum CommandKind {
                 fmt::printf("`<cache>/vendor/registry.json`; bindings are cached per target triple.\n\n");
                 fmt::printf("Flags:\n");
                 fmt::printf("  --target=TRIPLE   Cache bindings for the given triple (default: host)\n");
+            }
+            CommandKind::Stamp => {
+                fmt::printf("Writes the git checkout in the current directory into a built\n");
+                fmt::printf("compiler: the commit, its date, the branch, `git describe`, whether\n");
+                fmt::printf("tracked files differ from the commit, and the build profile.  The\n");
+                fmt::printf("binary then reports them in `cryo version`.  The build runs this\n");
+                fmt::printf("after linking the compiler; it is not listed in `cryo help`.\n\n");
+                fmt::printf("Only a reserved region of <binary> changes, so stamping alters no\n");
+                fmt::printf("code.  Outside a git checkout the region is cleared, and the binary\n");
+                fmt::printf("reports `unknown`.  A binary with no region, or more than one, is\n");
+                fmt::printf("refused.\n\n");
+                fmt::printf("Flags:\n");
+                fmt::printf("  --profile=NAME      The profile the binary was built with\n");
+                fmt::printf("  --exclude=PATH,...  Tracked paths, from the top of the checkout,\n");
+                fmt::printf("                      whose changes do not make the tree dirty\n");
             }
             _ => {}
         }
@@ -652,6 +685,9 @@ type struct Executor {
 
         const vendor: CommandKind = CommandKind::Vendor;
         runner.add_command(cli::Command::new(vendor.name(), vendor.description(), vendor.usage()));
+
+        const stamp: CommandKind = CommandKind::Stamp;
+        runner.add_command(cli::Command::unlisted(stamp.name(), stamp.description(), stamp.usage()));
     }
 
     /// Apply the build-profile and incremental flags shared by
@@ -710,6 +746,61 @@ type struct Executor {
         return passes::CodegenPasses::run_emit_worker(manifest, widx, wcount) as int;
     }
 
+    /// `cryo version --verbose`: the version line, then what this binary
+    /// knows about itself.  The stamped fields come from its own stamp
+    /// region; the rest are read now.  The stdlib is the root a build with
+    /// no `--stdlib=` and no project setting would use.
+    static print_version_report(runner: cli::Runner*) -> void {
+        const exe: string = build_manifest::Manifest::self_exe_path();
+        mut size: string = "";
+        if (exe.length() > 0) {
+            match (metadata::metadata(path::Path::from(exe))) {
+                Result::Ok(m) => { size = fmt::format("%d bytes", m.len() as i64); }
+                Result::Err(_) => {}
+            }
+        }
+        const report: VersionReport = VersionReport {
+            version: runner.version_line(),
+            binary:  exe,
+            size:    size,
+            stamp:   BuildStamp::running(),
+            llvm:    LTargetMachine::llvm_version(),
+            target:  LTargetMachine::get_default_triple(),
+            stdlib:  instance::CompilerInstance::resolve_stdlib_root("", "", "", null),
+        };
+        fmt::printf("%s", report.render());
+    }
+
+    /// `cryo stamp <binary>`: write the checkout in the current directory
+    /// into the binary's stamp region.  Outside a checkout the region is
+    /// cleared rather than left holding an earlier checkout's stamp.
+    static cmd_stamp(args: cli::ParsedArgs) -> int {
+        if (args.positional_count() != 1) {
+            const kind: CommandKind = CommandKind::Stamp;
+            fmt::eprintf("usage: %s\n", kind.usage());
+            return 1;
+        }
+        const target: string = args.positional_at(0);
+        mut exclude: string[] = [];
+        if (args.has_arg("exclude")) {
+            exclude = args.get_value("exclude").split_nonempty(",");
+        }
+        const profile: string = if (args.has_arg("profile")) { args.get_value("profile") } else { "" };
+        const stamp: BuildStamp = BuildStamp::from_checkout(exclude, profile);
+        const failure: string = StampSlot::write_into(target, stamp.render());
+        if (failure.length() > 0) {
+            fmt::eprintf("error: cannot stamp %s: %s\n", target, failure);
+            return 1;
+        }
+        if (!stamp.is_stamped()) {
+            fmt::printf("==> %s: not in a git checkout; stamp cleared\n", target);
+            return 0;
+        }
+        fmt::printf("==> %s stamped: %s %s, dirty: %s, profile: %s\n", target,
+            stamp.commit.substr(0, 8), stamp.date, stamp.dirty, stamp.profile);
+        return 0;
+    }
+
     /// Resolves a command name string to a CommandKind.
     static resolve(name: string) -> CommandKind {
         return match (name) {
@@ -725,6 +816,7 @@ type struct Executor {
             "fetch"    => { CommandKind::Fetch }
             "update"   => { CommandKind::Update }
             "vendor"   => { CommandKind::Vendor }
+            "stamp"    => { CommandKind::Stamp }
             _          => { CommandKind::Unknown }
         };
     }
@@ -751,6 +843,10 @@ type struct Executor {
 ", LTargetMachine::get_default_triple());
                     return 0;
                 }
+                if (args.has_flag("verbose")) {
+                    Executor::print_version_report(runner);
+                    return 0;
+                }
                 runner.print_version();
                 return 0;
             }
@@ -764,6 +860,7 @@ type struct Executor {
             CommandKind::Fetch    => { return Executor::cmd_fetch(args); }
             CommandKind::Update   => { return Executor::cmd_update(args); }
             CommandKind::Vendor   => { return Executor::cmd_vendor(args); }
+            CommandKind::Stamp    => { return Executor::cmd_stamp(args); }
             CommandKind::Unknown => {
                 fmt::eprintf("Error: Unknown command. Run 'cryo help' for usage.\n");
                 return 1;
