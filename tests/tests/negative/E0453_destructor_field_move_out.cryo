@@ -1,0 +1,59 @@
+// E0453: a destructor cannot move a field of `this` out.
+//
+// A `Drop` implementation's `drop` runs with the value still owning its
+// fields, and field glue releases every droppable field when `drop` returns.
+// Moving a field out - handing it to `mem::drop`, matching on it, binding it
+// to a local - copies its owning handle into a second owner, so the field is
+// released twice. The receiver is a borrow, which is why the general field
+// rule lets the move through; a destructor's receiver is the one borrow whose
+// fields are certainly released again.
+//
+// The permitted side - leaving the field to field glue, or swapping a
+// replacement in to release it early - is lang/destructor_field_release.cryo.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::DestructorFieldMoveOut;
+
+import std::core::mem;
+
+type struct Res { id: i64; }
+
+implement trait Drop for struct Res {
+    drop(mut &this) -> void { }
+}
+
+type struct Inner { res: Res; }
+
+type struct ByCall { inner: Res; }
+
+implement trait Drop for struct ByCall {
+    drop(mut &this) -> void {
+        mem::drop(this.inner);
+        //~^ ERROR[E0453] cannot move field 'inner' out of `this` in a destructor
+    }
+}
+
+type struct ByMatch { opt: Option<Res>; }
+
+implement trait Drop for struct ByMatch {
+    drop(mut &this) -> void {
+        match (this.opt) {
+        //~^ ERROR[E0453] cannot move field 'opt' out of `this` in a destructor
+            Option::Some(r) => { }
+            Option::None    => { }
+        }
+    }
+}
+
+type struct ByNestedLocal { inner: Inner; }
+
+implement trait Drop for struct ByNestedLocal {
+    drop(mut &this) -> void {
+        const r: Res = this.inner.res;
+        //~^ ERROR[E0453] cannot move field 'res' out of `this` in a destructor
+    }
+}
+
+function main() -> int {
+    return 0;
+}

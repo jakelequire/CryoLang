@@ -3084,6 +3084,21 @@ implement trait Drop for Owner {
 
 **Releasing a field by hand releases it twice**, which is why the next rule is a requirement rather than advice.
 
+**A destructor cannot move a field of `this` out** (`E0453`). Handing a field to `mem::drop`, matching on it by value, or binding it to a local copies its owning handle into a second owner, and field glue releases the field again when `drop` returns. A destructor that must release a field before the rest of its body runs swaps a replacement in and drops what comes out:
+
+```cryo
+implement trait Drop for Session {
+    drop(mut &this) -> void {
+        mem::drop(this.socket);             // E0453: released again after the body
+
+        mut closing: Option<Socket> = Option::None;
+        mem::swap(&closing, &this.socket);  // the field now holds None
+        mem::drop(closing);                 // released here, once
+        log_closed();
+    }
+}
+```
+
 > **A `drop` implementation must be idempotent.** Releasing an
 > already-released value must be a no-op, not a second release. Null the handle
 > you free and guard on it:

@@ -41,7 +41,7 @@ import compiler::resolver::{ symbol_str, intern_table };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
 import compiler::resolver::res;
-import compiler::resolver::res::{ Res };
+import compiler::resolver::res::{ DefId, Res };
 import utils::logger;
 import utils::logger::{ cdebug };
 import std::core::option;
@@ -229,6 +229,12 @@ type struct MoveChecker {
     /// mirrored in drop_insertion.
     branch_depth: i64;
 
+    /// The receiver of the function being walked when that function is a
+    /// `Drop` implementation's `drop`, invalid otherwise.  Its fields are
+    /// released by field glue when the destructor returns, so moving one out
+    /// releases it twice (`check_destructor_field_move_out`).
+    drop_receiver: SymbolID;
+
     fired: i64;
     /// Count of fatal (loop-carried) use-after-move errors.  Non-zero
     /// fails the pass, which (MoveCheck being fatal_on_failure) aborts
@@ -258,6 +264,7 @@ type struct MoveChecker {
             branch_depth:       0,
             unsafe_depth:        0,
             arg_binding_unknown: false,
+            drop_receiver:       SymbolID::invalid(),
             fired: 0,
             fatal: 0,
         };
@@ -280,10 +287,14 @@ type struct MoveChecker {
         this.branch_depth       = 0;
         this.unsafe_depth       = 0;
         this.arg_binding_unknown = false;
+        this.drop_receiver       = SymbolID::invalid();
+        const drop_trait: DefId = this.registry.wellknown(LangItem::Drop);
+        const is_destructor: boolean = drop_trait.is_valid() && func.origin_trait.equals(drop_trait);
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
             this.register_binding(param.sym_id, param.resolved_type, param.name, param.span);
+            if (is_destructor && param.is_receiver()) { this.drop_receiver = param.sym_id; }
         }
     }
 
@@ -1713,7 +1724,9 @@ type struct MoveChecker {
     /// `core::mem::swap` (leave the field a valid value to be dropped in
     /// place) or a `Copy` field type.  Moving a field out THROUGH a
     /// pointer/reference (heap or borrowed storage) is the caller's to
-    /// manage and is deliberately allowed - see `is_owned_value_place`.
+    /// manage and is deliberately allowed - see `is_owned_value_place` -
+    /// except out of a destructor's own receiver
+    /// (`check_destructor_field_move_out`).
     check_field_move_out(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null || expr.kind != NodeKind::MemberAccess) { return; }
         const ma: MemberAccessNode* = expr as MemberAccessNode*;
@@ -1723,7 +1736,10 @@ type struct MoveChecker {
         const field_ty: TypeRef = expr.resolved_type;
         if (!field_ty.is_valid() || this.is_copy(field_ty)) { return; }
         // The source must be an owned, glue-dropped value place.
-        if (!this.is_owned_value_place(ma.object)) { return; }
+        if (!this.is_owned_value_place(ma.object)) {
+            this.check_destructor_field_move_out(ma, field_ty);
+            return;
+        }
         // Partial-move model ("allow + track" half): a non-Copy *droppable*
         // field moved out of a straight-line, non-`Drop` owned local is
         // ALLOWED and recorded, so drop_insertion skips exactly this field at
@@ -1743,6 +1759,48 @@ type struct MoveChecker {
             return;
         }
         this.emit_move_out_error(ma);
+    }
+
+    /// Reject moving a field of the receiver out inside a `Drop`
+    /// implementation's `drop`.
+    ///
+    /// The receiver is a borrow, so `is_owned_value_place` lets the move
+    /// through, but a destructor's receiver is the one borrow whose fields are
+    /// certainly released again: field glue runs over every droppable field
+    /// when `drop` returns.  `mem::drop(this.inner)` and `match (this.opt)`
+    /// both copy the field's owning handle into a second owner, so the value
+    /// is released twice.
+    check_destructor_field_move_out(mut &this, ma: MemberAccessNode*, field_ty: TypeRef) -> void {
+        if (!this.drop_receiver.is_valid()) { return; }
+        if (!this.is_receiver_value_place(ma.object)) { return; }
+        if (!this.type_needs_drop(field_ty)) { return; }
+        const field: string = this.intern.resolve(ma.member);
+        const headline: string = fmt::format(
+            "cannot move field '%s' out of `this` in a destructor", field);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0453_DOUBLE_FREE, headline);
+        diag = diag.at_with_label(ma.span,
+            "the field is released again when the destructor returns (double free)");
+        diag = diag.help(
+            "leave the field alone: it is released when `drop` returns; to release it earlier, swap a replacement into it with `core::mem::swap` and drop what comes out");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// True when `obj` is the destructor's receiver, or a value-typed field
+    /// chain under it with no pointer or reference link: storage field glue
+    /// releases when `drop` returns.
+    is_receiver_value_place(&this, obj: ExpressionNode*) -> boolean {
+        if (obj == null) { return false; }
+        if (obj.kind == NodeKind::Identifier) {
+            return (obj as IdentifierNode*).res.local_sym().equals(this.drop_receiver);
+        }
+        if (obj.kind == NodeKind::MemberAccess) {
+            if (this.is_ptr_or_ref(obj.resolved_type)) { return false; }
+            return this.is_receiver_value_place((obj as MemberAccessNode*).object);
+        }
+        return false;
     }
 
     /// Apply the storage-duplicating move-out rules to a `match` subject.

@@ -397,13 +397,7 @@ public:
     /// sees EOF; this is deadlock-avoidant for children that read all of
     /// stdin before writing to stdout.
     wait(mut &this) -> Result<ExitStatus, IoError> {
-        match (this.stdin) {
-            Option::Some(mut handle) => {
-                handle.drop();
-                this.stdin = Option::None;
-            }
-            Option::None => { }
-        }
+        this.close_stdin();
         const r: Result<ExitStatus, IoError> = os_proc_wait(this.pid, this.handle);
         match (r) {
             Result::Ok(_)  => { this.waited = true; }
@@ -427,13 +421,7 @@ public:
     /// left to fill while this awaits — the same deadlock `wait` can hit, and
     /// the reason `Command::output` drains before it waits.
     async join(mut &this) -> Result<ExitStatus, IoError> {
-        match (this.stdin) {
-            Option::Some(mut handle) => {
-                handle.drop();
-                this.stdin = Option::None;
-            }
-            Option::None => { }
-        }
+        this.close_stdin();
         // `pid` / `handle` are read before the suspension; the future carries
         // its own copies, so nothing borrows the `Child` across the await.
         mut r: Result<ExitStatus, IoError> = await ChildWait::start(this.pid, this.handle);
@@ -470,6 +458,14 @@ public:
         return os_proc_signal(this.pid, this.handle, sig.as_i32());
     }
 
+    /// Close the child's stdin now, if it is still held, so the child sees
+    /// EOF before the parent waits.  Assigning `None` through `&this` would
+    /// not release the handle, so it is swapped out and dropped here.
+    private close_stdin(mut &this) -> void {
+        mut closing: Option<ChildStdin> = Option::None;
+        mem::swap(&closing, &this.stdin);
+        mem::drop(closing);
+    }
 }
 
 /// The block a `ChildWait` hands to the blocking pool: the pool's job header,
@@ -1076,7 +1072,8 @@ implement trait Drop for struct ChildStderr {
     }
 }
 
-/// Close any captured pipe ends and best-effort-reap the child. The
+/// Best-effort-reap the child; any captured pipe ends still held are
+/// closed by their fields when this returns. The
 /// reap is **non-blocking** (`WNOHANG`): if the child has already
 /// exited, its zombie is released here; if it is still running we
 /// cannot block in a destructor, so a still-running child that is
@@ -1085,25 +1082,6 @@ implement trait Drop for struct ChildStderr {
 /// finishes, drop without wait" zombie leak without ever blocking.
 implement trait Drop for struct Child {
     drop(mut &this) -> void {
-        // Drop synthesis releases each `mut handle` at its match-arm
-        // scope exit, which closes the pipe fd before we clear the
-        // field below.
-        match (this.stdin) {
-            Option::Some(mut handle) => { }
-            Option::None => { }
-        }
-        this.stdin = Option::None;
-        match (this.stdout) {
-            Option::Some(mut handle) => { }
-            Option::None => { }
-        }
-        this.stdout = Option::None;
-        match (this.stderr) {
-            Option::Some(mut handle) => { }
-            Option::None => { }
-        }
-        this.stderr = Option::None;
-
         // POSIX: non-blocking reap of an already-exited child (skipped if
         // `wait`/`try_wait` already reaped it). Windows: close the process
         // HANDLE exactly once (always, even after `wait`, which does not

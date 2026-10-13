@@ -176,6 +176,24 @@ yet is recorded with the change that builds it, not here.
      the standard library's were.  This is not the editor's rebuild.
      (Dispatch, delegated)
 
+309. **Moving a field of `this` out inside a destructor is refused** - for
+     example `mem::drop(this.inner)` in `drop` - because field glue releases
+     the field again when the destructor returns.  Full move checking, which
+     refuses every move out from behind a reference, waits until after the
+     merge.  (Jake)
+
+310. **A free-function call that a generic and a non-generic overload both
+     accept is refused with E0154,** the same as a method or a static call;
+     the non-generic overload is not chosen silently.  (Jake)
+
+311. **The remaining explicit `.drop()` calls in the standard library and the
+     editor are fixed before the merge,** each site checked on its own as
+     before.  (Jake)
+
+312. **`Child::wait` and `Child::join` close stdin without moving the field
+     out of `this`,** leaving `None` behind, and are fixed together with 309.
+     (Jake)
+
 ### 2026-10-12
 
 247. **The compiler's `![allow]`s that named the deleted lint, and the
