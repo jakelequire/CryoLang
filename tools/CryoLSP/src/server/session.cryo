@@ -161,14 +161,18 @@ type struct CompilerSession {
         // raw `string` pointers into the OLD buffers, but we leak the
         // ctx anyway (see `Drop` impl) so the buffer aliasing is a
         // non-issue.
-        this.path_buf.drop();
-        this.content_buf.drop();
-        this.config_buf.drop();
-        this.stdlib_buf.drop();
-        this.path_buf    = PathFinder::build_cstring_buffer(fs_path);
-        this.content_buf = PathFinder::build_cstring_buffer(content);
-        this.config_buf  = PathFinder::discover_project_cryoconfig(fs_path);
-        this.stdlib_buf  = PathFinder::discover_stdlib_root(fs_path);
+        mut old_path: String = PathFinder::build_cstring_buffer(fs_path);
+        mem::swap(&old_path, &this.path_buf);
+        mem::drop(old_path);
+        mut old_content: String = PathFinder::build_cstring_buffer(content);
+        mem::swap(&old_content, &this.content_buf);
+        mem::drop(old_content);
+        mut old_config: String = PathFinder::discover_project_cryoconfig(fs_path);
+        mem::swap(&old_config, &this.config_buf);
+        mem::drop(old_config);
+        mut old_stdlib: String = PathFinder::discover_stdlib_root(fs_path);
+        mem::swap(&old_stdlib, &this.stdlib_buf);
+        mem::drop(old_stdlib);
         mem::drop(fs_path_owned);                    // fs_path (borrow) unused below
 
         // Wire the discovered stdlib path through to the compiler's
@@ -371,8 +375,8 @@ type struct SessionMap {
                 Option::None => { }
             }
         }
-        this.pending.drop();
-        this.pending = kept;
+        mem::swap(&kept, &this.pending);
+        mem::drop(kept);
     }
 
     /// Insert a fresh session for `uri`.  If one already exists it is
@@ -381,7 +385,7 @@ type struct SessionMap {
     insert(mut &this, uri: str::Str, session: CompilerSession) -> void {
         const key: String = String::from_str(uri);
         match (this.by_uri.insert(key, session)) {
-            Option::Some(prev) => { mut p: CompilerSession = prev; p.drop(); }
+            Option::Some(prev) => { mem::drop(prev); }
             Option::None       => { }
         }
     }
@@ -617,21 +621,14 @@ implement trait Drop for CompilerSession {
         // Release this session's arena (frees `ctx` and every container it
         // owns in one shot) and free the Arena struct itself.  The ctx lives
         // in a session-owned region, so closing/dropping the session
-        // reclaims it directly.
+        // reclaims it directly.  The backing buffers the ctx pointed into
+        // are released by their fields after this returns.
         this.release_ctx();
-        this.path_buf.drop();
-        this.content_buf.drop();
-        this.config_buf.drop();
-        this.stdlib_buf.drop();
     }
 }
 
 implement trait Drop for SessionMap {
-    drop(mut &this) -> void {
-        this.by_uri.drop();
-        this.pending.drop();
-        this.live_order.drop();
-    }
+    drop(mut &this) -> void { }
 }
 
 
