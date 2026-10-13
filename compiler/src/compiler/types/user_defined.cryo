@@ -4,18 +4,32 @@
 ///! alias declarations.  Supports forward declaration (is_complete flag)
 ///! and incremental population of fields/methods.
 
-namespace Compiler::Types::UserDefined;
+namespace compiler::types::user_defined;
 
-import Compiler::Types;
-import Compiler::Types::TypeRef;
-import Compiler::Resolver::{ SymbolStr, InternTable };
-import Compiler::AST::Expression;
+import compiler::types;
+import compiler::types::{ TypeKind };
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::resolver::{ symbol_str, intern_table };
+import compiler::ast::expression;
+import compiler::ast::expression::{ ExpressionNode };
+import compiler::types::type_base;
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name;
+import compiler::resolver::decl_name::{ DeclName };
+import compiler::resolver::res::{ DefId };
+import compiler::types::type_base::{ Type };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
 
 
 // FieldInfo: Metadata for a struct/class field
 
 type struct FieldInfo {
+private:
     name:       SymbolStr;
+public:
     field_type: TypeRef;
     offset:     u64;
     is_public:  boolean;
@@ -46,6 +60,14 @@ type struct FieldInfo {
 
     has_default(&this) -> boolean { return this.default_value != null; }
     set_default_value(v: ExpressionNode*) -> void { this.default_value = v; }
+
+    /// The field's declared name, sealed: printed with `InternTable::shown`,
+    /// or carried by a node synthesized for this field (`spelling`) beside
+    /// the position it is pinned to.  Never a key: a field is found by the
+    /// `member-field` door.
+    decl_name(&this) -> DeclName {
+        return DeclName::of(this.name);
+    }
 }
 
 
@@ -94,9 +116,13 @@ type struct MethodInfo {
 
 
 // EnumVariantInfo: Metadata for an enum variant
+//
+// The variant's name is private to this module: `EnumType::variant_index`
+// is the one place a written leaf finds a variant, and any other reader
+// asks for the name as text to print.
 
 type struct EnumVariantInfo {
-    name:          SymbolStr;
+    private name:  SymbolStr;
     payload_types: TypeRef[];
     tag_value:     u64;
 
@@ -111,6 +137,18 @@ type struct EnumVariantInfo {
     has_payload(&this) -> boolean {
         return this.payload_types.length > 0;
     }
+
+    /// This variant with `payload_types` in place of its own: the same
+    /// name and tag, for an instance whose payloads are substituted.
+    with_payloads(&this, payload_types: TypeRef[]) -> EnumVariantInfo {
+        return EnumVariantInfo::new(this.name, payload_types, this.tag_value);
+    }
+
+    /// The variant's name as text, for a message.  Never a key: a variant
+    /// is found by its leaf only through `EnumType::variant_index`.
+    display_name(&this, table: InternTable*) -> string {
+        return table.resolve(this.name);
+    }
 }
 
 
@@ -118,13 +156,17 @@ type struct EnumVariantInfo {
 
 type class StructType : Type {
 public:
-    qualified_name: SymbolStr;
-    module_name:    SymbolStr;
+    qualified_name: DeclName;
+    /// The module the type is declared in; none for a unit the module graph
+    /// did not load.
+    declared_in:    ModulePath;
     intern_table:   InternTable*;
     fields:         FieldInfo[];
     methods:        MethodInfo[];
     is_complete:    boolean;
-    custom_display: string;     // Set by monomorphizer for human-readable generic form
+    /// A specialization's display (`Vec<i32>`), read off its template's and
+    /// arguments' definitions; the name of nothing on any other type.
+    custom_display: DeclName;
     computed_size:  u64;        // Computed by TypeLowering pass (0 = not yet computed)
     computed_align: u64;        // Computed by TypeLowering pass (0 = not yet computed)
     /// Layout attributes copied from the StructDeclNode by TypeResolution.
@@ -145,23 +187,27 @@ public:
     /// since the active member is unknown).  The struct machinery (field lookup,
     /// member resolution, generics) is otherwise shared.
     is_union:         boolean;
+    /// The index in `fields` of the receiver slot on a future the async
+    /// lowering minted for an `async` method (`StructDeclNode.async_recv_slot`,
+    /// carried onto every instantiation of it); -1 on every other struct.
+    async_recv_slot:  i64;
     /// The generic instantiation this concrete IS, carried intrinsically:
     /// `Box<i32>` holds `generic_base` = the `Box` template and `type_args` =
-    /// `[i32]`.  This is the rustc `TyKind::Adt(AdtDef, SubstsRef)` shape - the
-    /// substitutions live ON the type, so no side node has to be consulted.
+    /// `[i32]`.  The template and its arguments - the
+    /// substitutions - live ON the type, so no side node has to be consulted.
     /// Invalid / empty for a non-generic type.
     generic_base:     TypeRef;
     type_args:        TypeRef[];
 
-    StructType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
+    StructType(id: u64, qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*)
         : Type(id, TypeKind::Struct) {
-        this.qualified_name   = qualified_name;
-        this.module_name      = module_name;
+        this.qualified_name   = DeclName::of(qualified_name);
+        this.declared_in      = declared_in;
         this.intern_table     = intern_table;
         this.fields           = [];
         this.methods          = [];
         this.is_complete      = false;
-        this.custom_display   = "";
+        this.custom_display   = DeclName::empty();
         this.computed_size    = 0;
         this.computed_align   = 0;
         this.repr_c           = false;
@@ -169,6 +215,7 @@ public:
         this.repr_transparent = false;
         this.min_alignment    = 0;
         this.is_union         = false;
+        this.async_recv_slot  = -1;
         this.generic_base     = TypeRef::invalid();
         this.type_args        = [];
     }
@@ -193,6 +240,17 @@ public:
         this.is_union = u;
     }
 
+    set_async_recv_slot(mut &this, slot: i64) -> void {
+        this.async_recv_slot = slot;
+    }
+
+    /// The receiver slot's entry on a future struct, or null on a struct
+    /// that carries none.
+    async_recv_field(&this) -> FieldInfo* {
+        if (this.async_recv_slot < 0 || this.async_recv_slot >= this.fields.length) { return null; }
+        return &this.fields[this.async_recv_slot];
+    }
+
     set_min_alignment(mut &this, n: u64) -> void {
         this.min_alignment = n;
     }
@@ -203,46 +261,21 @@ public:
         this.is_complete = true;
     }
 
-    add_field(mut &this, field: FieldInfo) -> void {
-        this.fields.push(field);
-    }
-
     add_method(mut &this, method: MethodInfo) -> void {
         this.methods.push(method);
     }
 
-    /// Returns -1 if not found.
-    field_index(name: SymbolStr) -> i64 {
+    /// A field written as a leaf on a struct in hand:
+    /// its position among the struct's fields, or -1.  The owner is known,
+    /// so the leaf is asked inside it, here beside the field list.
+    field_position(&this, leaf: SymbolStr) -> i64 {
         for (mut i: i64 = 0; i < this.fields.length; i++) {
-            if (this.fields[i].name.equals(name)) {
-                return i;
-            }
+            if (this.fields[i].name.equals(leaf)) { return i; }
         }
         return -1;
     }
 
-    get_field(name: SymbolStr) -> FieldInfo* {
-        for (mut i: i64 = 0; i < this.fields.length; i++) {
-            if (this.fields[i].name.equals(name)) {
-                return &this.fields[i];
-            }
-        }
-        return null;
-    }
-
-    get_method(name: SymbolStr) -> MethodInfo* {
-        for (mut i: i64 = 0; i < this.methods.length; i++) {
-            if (this.methods[i].name.equals(name)) {
-                return &this.methods[i];
-            }
-        }
-        return null;
-    }
-
-    field_count(&this) -> i64   { return this.fields.length; }
-    method_count(&this) -> i64  { return this.methods.length; }
-
-    set_display_name(mut &this, name: string) -> void { this.custom_display = name; }
+    set_display_name(mut &this, name: DeclName) -> void { this.custom_display = name; }
 
     set_layout(mut &this, size: u64, align: u64) -> void {
         this.computed_size  = size;
@@ -254,8 +287,8 @@ public:
     }
 
     override display_name(&this) -> string {
-        if (this.custom_display.length() > 0) { return this.custom_display; }
-        return this.intern_table.resolve(this.qualified_name);
+        if (this.custom_display.is_valid()) { return this.intern_table.shown(this.custom_display); }
+        return this.intern_table.shown(this.qualified_name);
     }
 
     override size_bytes(&this) -> u64 { return this.computed_size; }
@@ -270,8 +303,8 @@ public:
 
 type class ClassType : Type {
 public:
-    qualified_name:      SymbolStr;
-    module_name:         SymbolStr;
+    qualified_name:      DeclName;
+    declared_in:         ModulePath;
     intern_table:        InternTable*;
     fields:              FieldInfo[];
     methods:             MethodInfo[];
@@ -279,7 +312,8 @@ public:
     has_base:            boolean;
     has_virtual_methods: boolean;
     is_complete:         boolean;
-    custom_display:      string;
+    /// A specialization's display; the name of nothing on any other type.
+    custom_display:      DeclName;
     computed_size:       u64;
     computed_align:      u64;
 
@@ -294,10 +328,10 @@ public:
     generic_base:     TypeRef;
     type_args:        TypeRef[];
 
-    ClassType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
+    ClassType(id: u64, qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*)
         : Type(id, TypeKind::Class) {
-        this.qualified_name      = qualified_name;
-        this.module_name         = module_name;
+        this.qualified_name      = DeclName::of(qualified_name);
+        this.declared_in         = declared_in;
         this.intern_table        = intern_table;
         this.fields              = [];
         this.methods             = [];
@@ -305,7 +339,7 @@ public:
         this.has_base            = false;
         this.has_virtual_methods = false;
         this.is_complete         = false;
-        this.custom_display      = "";
+        this.custom_display      = DeclName::empty();
         this.computed_size       = 0;
         this.computed_align      = 0;
         this.repr_c              = false;
@@ -344,10 +378,6 @@ public:
         this.has_base   = true;
     }
 
-    add_field(mut &this, field: FieldInfo) -> void {
-        this.fields.push(field);
-    }
-
     add_method(mut &this, method: MethodInfo) -> void {
         const is_virtual: boolean  = method.is_virtual;
         const is_override: boolean = method.is_override;
@@ -355,36 +385,19 @@ public:
         if (is_virtual || is_override) {
             this.has_virtual_methods = true;
         }
-    } 
+    }
 
-    field_index(name: SymbolStr) -> i64 {
+    /// A field written as a leaf on a class in hand:
+    /// its position among the class's OWN fields, or -1.  A base's fields
+    /// are its own class's to answer; the caller walks the chain.
+    own_field_position(&this, leaf: SymbolStr) -> i64 {
         for (mut i: i64 = 0; i < this.fields.length; i++) {
-            if (this.fields[i].name.equals(name)) {
-                return i;
-            }
+            if (this.fields[i].name.equals(leaf)) { return i; }
         }
         return -1;
     }
 
-    get_field(name: SymbolStr) -> FieldInfo* {
-        for (mut i: i64 = 0; i < this.fields.length; i++) {
-            if (this.fields[i].name.equals(name)) {
-                return &this.fields[i];
-            }
-        }
-        return null;
-    }
-
-    get_method(name: SymbolStr) -> MethodInfo* {
-        for (mut i: i64 = 0; i < this.methods.length; i++) {
-            if (this.methods[i].name.equals(name)) {
-                return &this.methods[i];
-            }
-        }
-        return null;
-    }
-
-    set_display_name(mut &this, name: string) -> void { this.custom_display = name; }
+    set_display_name(mut &this, name: DeclName) -> void { this.custom_display = name; }
 
     set_layout(mut &this, size: u64, align: u64) -> void {
         this.computed_size  = size;
@@ -396,8 +409,8 @@ public:
     }
 
     override display_name(&this) -> string {
-        if (this.custom_display.length() > 0) { return this.custom_display; }
-        return this.intern_table.resolve(this.qualified_name);
+        if (this.custom_display.is_valid()) { return this.intern_table.shown(this.custom_display); }
+        return this.intern_table.shown(this.qualified_name);
     }
     override size_bytes(&this) -> u64 { return this.computed_size; }
     override alignment(&this) -> u64  {
@@ -411,13 +424,14 @@ public:
 
 type class EnumType : Type {
 public:
-    qualified_name: SymbolStr;
-    module_name:    SymbolStr;
+    qualified_name: DeclName;
+    declared_in:    ModulePath;
     intern_table:   InternTable*;
     variants:       EnumVariantInfo[];
     methods:        MethodInfo[];
 
-    custom_display: string;
+    /// A specialization's display; the name of nothing on any other type.
+    custom_display: DeclName;
     computed_size:  u64;
     computed_align: u64;
     /// Layout attributes copied from EnumDeclNode by TypeResolution.
@@ -436,14 +450,14 @@ public:
     generic_base:      TypeRef;
     type_args:         TypeRef[];
 
-    EnumType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
+    EnumType(id: u64, qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*)
         : Type(id, TypeKind::Enum) {
-        this.qualified_name = qualified_name;
-        this.module_name    = module_name;
+        this.qualified_name = DeclName::of(qualified_name);
+        this.declared_in    = declared_in;
         this.intern_table   = intern_table;
         this.variants       = [];
         this.methods        = [];
-        this.custom_display = "";
+        this.custom_display = DeclName::empty();
         this.computed_size  = 0;
         this.computed_align = 0;
         this.repr_c         = false;
@@ -491,27 +505,23 @@ public:
         return true;
     }
 
-    get_variant(name: SymbolStr) -> EnumVariantInfo* {
+    /// `E::V` and a `V(..)` pattern name a variant
+    /// of an enum the name layer bound; the variant is written as a leaf of
+    /// that owner, so it is found here by the owner and the leaf.
+    ///
+    /// The ordinal of the variant named `name` in `variants`, or -1: the
+    /// coordinate a node carries so a later stage reads `variants[i]` and
+    /// searches nothing.
+    variant_index(name: SymbolStr) -> i64 {
         for (mut i: i64 = 0; i < this.variants.length; i++) {
             if (this.variants[i].name.equals(name)) {
-                return &this.variants[i];
+                return i;
             }
         }
-        return null;
+        return -1;
     }
 
-    get_method(name: SymbolStr) -> MethodInfo* {
-        for (mut i: i64 = 0; i < this.methods.length; i++) {
-            if (this.methods[i].name.equals(name)) {
-                return &this.methods[i];
-            }
-        }
-        return null;
-    }
-
-    variant_count(&this) -> i64 { return this.variants.length; }
-
-    set_display_name(mut &this, name: string) -> void { this.custom_display = name; }
+    set_display_name(mut &this, name: DeclName) -> void { this.custom_display = name; }
 
     set_layout(mut &this, size: u64, align: u64) -> void {
         this.computed_size  = size;
@@ -519,8 +529,8 @@ public:
     }
 
     override display_name(&this) -> string {
-        if (this.custom_display.length() > 0) { return this.custom_display; }
-        return this.intern_table.resolve(this.qualified_name);
+        if (this.custom_display.is_valid()) { return this.intern_table.shown(this.custom_display); }
+        return this.intern_table.shown(this.qualified_name);
     }
     override size_bytes(&this) -> u64 { return this.computed_size; }
     override alignment(&this) -> u64  {
@@ -534,24 +544,22 @@ public:
 
 type class TraitType : Type {
 public:
-    qualified_name:   SymbolStr;
-    module_name:      SymbolStr;
+    qualified_name:   DeclName;
+    declared_in:      ModulePath;
     intern_table:     InternTable*;
     required_methods: MethodInfo[];
-    super_traits:     TypeRef[];
     /// Names of associated types declared in this trait (`type Item;`). Empty
     /// for traits without associated types. The concrete binding for each is
     /// per-impl (see ImplBlockNode's assoc bindings); a projection
     /// `X::<name>` resolves by looking up X's impl of this trait.
     assoc_type_names: SymbolStr[];
 
-    TraitType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
+    TraitType(id: u64, qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*)
         : Type(id, TypeKind::Trait) {
-        this.qualified_name   = qualified_name;
-        this.module_name      = module_name;
+        this.qualified_name   = DeclName::of(qualified_name);
+        this.declared_in      = declared_in;
         this.intern_table     = intern_table;
         this.required_methods = [];
-        this.super_traits     = [];
         this.assoc_type_names = [];
     }
 
@@ -563,29 +571,7 @@ public:
         this.assoc_type_names.push(name);
     }
 
-    has_assoc_type(&this, name: SymbolStr) -> boolean {
-        for (mut i: i64 = 0; i < this.assoc_type_names.length; i++) {
-            if (this.assoc_type_names[i].equals(name)) { return true; }
-        }
-        return false;
-    }
-
-    assoc_type_count(&this) -> i64 { return this.assoc_type_names.length; }
-
-    add_super_trait(trait_ref: TypeRef) -> void {
-        this.super_traits.push(trait_ref);
-    }
-
-    get_method(name: SymbolStr) -> MethodInfo* {
-        for (mut i: i64 = 0; i < this.required_methods.length; i++) {
-            if (this.required_methods[i].name.equals(name)) {
-                return &this.required_methods[i];
-            }
-        }
-        return null;
-    }
-
-    override display_name(&this) -> string { return this.intern_table.resolve(this.qualified_name); }
+    override display_name(&this) -> string { return this.intern_table.shown(this.qualified_name); }
     override size_bytes(&this) -> u64      { return 0; }  // Traits have no size
     override alignment(&this) -> u64       { return 0; }
 }
@@ -644,16 +630,16 @@ public:
 
 type class FunctionTemplateType : Type {
 public:
-    qualified_name: SymbolStr;
+    qualified_name: DeclName;
     intern_table:   InternTable*;
 
     FunctionTemplateType(id: u64, qualified_name: SymbolStr, intern_table: InternTable*)
         : Type(id, TypeKind::FunctionTemplate) {
-        this.qualified_name = qualified_name;
+        this.qualified_name = DeclName::of(qualified_name);
         this.intern_table   = intern_table;
     }
 
-    override display_name(&this) -> string { return this.intern_table.resolve(this.qualified_name); }
+    override display_name(&this) -> string { return this.intern_table.shown(this.qualified_name); }
     override size_bytes(&this) -> u64 { return 0; }
     override alignment(&this) -> u64 { return 0; }
 }

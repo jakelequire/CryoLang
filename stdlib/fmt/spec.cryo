@@ -1,7 +1,7 @@
 ///! Format-spec parsing and rendering for f-string holes.
 ///!
 ///! An f-string hole may carry a spec after a colon: `f"{value:spec}"`.
-///! The grammar is a subset of Rust's:
+///! The grammar:
 ///!
 ///!   spec := [[fill]align][#][0][width][.precision][type]
 ///!   align := '<' | '>' | '^'          (left, right, centre)
@@ -19,13 +19,21 @@
 
 namespace std::fmt::spec;
 
-import core::option;
-import core::result;
-import core::iter;
-import collections::str;
-import collections::string;
-import collections::pair;
-import fmt::display;
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::iter;
+import std::core::iter::{ Iterator };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::pair;
+import std::collections::pair::{ Pair };
+import std::fmt::display;
+import std::fmt::display::{ Display, encode_utf8, format_to_string };
+import std::core::mem;
 
 /// No radix: format the value in its natural (decimal / Display) form.
 const RADIX_NONE:      u8 = 0;
@@ -35,8 +43,8 @@ const RADIX_OCT:       u8 = 3;
 const RADIX_BIN:       u8 = 4;
 
 /// Default alignment: left for text and numbers alike (a `0` flag or an
-/// explicit `>`/`^` overrides it). Chosen for predictability over Rust's
-/// type-dependent default.
+/// explicit `>`/`^` overrides it), whatever the value's type, so the
+/// default never depends on what is formatted.
 const ALIGN_DEFAULT: u8 = 0;
 const ALIGN_LEFT:    u8 = 1;
 const ALIGN_RIGHT:   u8 = 2;
@@ -199,13 +207,13 @@ function fmt_uint_body(val: u64, spec: &FmtSpec) -> BodyText {
     }
     mut digits: String = radix_digits(val, spec);
     out.push(digits.as_str());
-    digits.drop();
+    mem::drop(digits);
     return BodyText { text: out, head_len: head };
 }
 
 /// Body for a signed integer. Decimal keeps the sign; a radix formats the
 /// two's-complement bit pattern `masked` (already narrowed to the value's
-/// own width by the caller) with no sign, matching Rust.
+/// own width by the caller) with no sign: `-1i8` in hex is `ff`.
 function fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec) -> BodyText {
     if (spec.radix != RADIX_NONE) {
         return fmt_uint_body(masked, spec);
@@ -236,8 +244,8 @@ function fmt_float_body(val: f64, spec: &FmtSpec) -> BodyText {
         const written: u64 = val.to_buf_with(&buffer[0], spec.precision);
         out.push(Str::from_raw(&buffer[0], written));
     } else {
-        match (format_to_string<f64>(&val)) {
-            Result::Ok(s)  => { mut tmp: String = s; out.push(tmp.as_str()); tmp.drop(); }
+        match (format_to_string::<f64>(&val)) {
+            Result::Ok(s)  => { mut tmp: String = s; out.push(tmp.as_str()); mem::drop(tmp); }
             Result::Err(_) => { }
         }
     }
@@ -251,8 +259,8 @@ function fmt_float_body(val: f64, spec: &FmtSpec) -> BodyText {
 function fmt_display_body<T>(value: &T, spec: &FmtSpec) -> BodyText
 where T: Display {
     mut out: String = String::new();
-    match (format_to_string<T>(value)) {
-        Result::Ok(s)  => { mut tmp: String = s; out.push(tmp.as_str()); tmp.drop(); }
+    match (format_to_string::<T>(value)) {
+        Result::Ok(s)  => { mut tmp: String = s; out.push(tmp.as_str()); mem::drop(tmp); }
         Result::Err(_) => { }
     }
     if (spec.has_precision) {
@@ -260,7 +268,7 @@ where T: Display {
         if (truncated.length() < out.length()) {
             mut shorter: String = String::new();
             shorter.push(truncated);
-            out.drop();
+            mem::drop(out);
             out = shorter;
         }
     }
@@ -272,8 +280,10 @@ where T: Display {
 type struct BodyText {
     text:     String;
     head_len: u64;
+}
 
-    drop(mut &this) -> void { this.text.drop(); }
+implement trait Drop for struct BodyText {
+    drop(mut &this) -> void { }
 }
 
 /// Truncate `s` to at most `n` Unicode scalars, returning a borrowed

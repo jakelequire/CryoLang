@@ -4,13 +4,22 @@
 /// Supports deduplication, max-errors cutoff, warnings-as-errors promotion,
 /// and per-code suppression via DiagConfig.
 
-namespace Compiler::Diag::Sink;
+namespace compiler::diag::sink;
 
-import Compiler::Diag;
-import Compiler::Diag::{ Severity, Diagnostic, Snapshot, Config, Renderer };
+import compiler::diag;
+import compiler::diag::{ severity, diagnostic, snapshot, config, renderer };
 import std::collections::hashmap;
-import Utils::Logger;
-import Utils::DiagSink;
+import std::collections::hashmap::{ HashMap };
+import utils::logger;
+import utils::logger::{ cdebug };
+import utils::diag_sink;
+import utils::diag_sink::{ DiagSink };
+import std::fmt;
+import compiler::diag::config::{ DiagConfig };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::renderer::{ DiagRenderer };
+import compiler::diag::severity::{ Severity };
+import compiler::diag::snapshot::{ DiagnosticSnapshot };
 
 
 /// Collects all diagnostics emitted during compilation.
@@ -30,6 +39,16 @@ type struct DiagnosticSink {
     suppress_depth:    u32;
     suppressed_errors: u32;
 
+    // Source files whose WARNINGS are not the consumer's to act on: generated
+    // vendor bindings. Nobody can fix a warning about a file that says DO NOT
+    // EDIT in its header and is rewritten wholesale whenever the manifest
+    // changes, so reporting one only buries the warnings about code the author
+    // does own. Errors from these files still surface - an error stops the
+    // build, and the author needs to see what stopped it.
+    // Populated after module discovery has classified each module's origin.
+    vendor_files:      string[];
+    suppressed_vendor_warnings: u32;
+
     static new() -> DiagnosticSink {
         return DiagnosticSink {
             diagnostics:       [],
@@ -38,10 +57,33 @@ type struct DiagnosticSink {
             renderer:          null,
             config:            DiagConfig::default(),
             reached_max_errors: false,
-            seen_keys:         HashMap<string, boolean>::new(),
+            seen_keys:         HashMap::<string, boolean>::new(),
             suppress_depth:    0,
             suppressed_errors: 0,
+            vendor_files:      [],
+            suppressed_vendor_warnings: 0,
         };
+    }
+
+    /// Record that `path` is a generated vendor binding, so warnings pointing
+    /// into it are dropped.  Called once per vendored module, after discovery
+    /// has classified module origins.
+    mark_vendor_file(mut &this, path_text: string) -> void {
+        const path: string = path_text;
+        for (mut i: i64 = 0; i < this.vendor_files.length; i++) {
+            if (this.vendor_files[i].eq(path)) { return; }
+        }
+        this.vendor_files.push(path);
+    }
+
+    /// True when `path` is one of the generated vendor bindings.
+    is_vendor_file(&this, path_text: string) -> boolean {
+        const path: string = path_text;
+        if (path.length() == 0) { return false; }
+        for (mut i: i64 = 0; i < this.vendor_files.length; i++) {
+            if (this.vendor_files[i].eq(path)) { return true; }
+        }
+        return false;
     }
 
     /// Attach a renderer for rich diagnostic output.
@@ -75,7 +117,17 @@ type struct DiagnosticSink {
             return;
         }
 
-        // 3. Warnings-as-errors promotion
+        // 3. A warning about generated vendor bindings is dropped: it reports on
+        //    a file the author did not write and must not edit.  Judged BEFORE
+        //    warnings-as-errors promotion, so `-Werror` cannot turn a vendored
+        //    library's style warnings into errors that fail a build nobody can
+        //    fix.  Errors fall through untouched.
+        if (diag.severity.is_warning() && this.is_vendor_file(diag.span.file)) {
+            this.suppressed_vendor_warnings += 1;
+            return;
+        }
+
+        // 4. Warnings-as-errors promotion
         mut effective_diag: Diagnostic = diag;
         if (this.config.warnings_as_errors && effective_diag.severity.is_warning()) {
             // Promote in place: `effective_diag` is already a copy of `diag`,
@@ -85,13 +137,13 @@ type struct DiagnosticSink {
             effective_diag.severity = Severity::Error;
         }
 
-        // 4. Deduplication: skip only a TRUE duplicate - same code, position,
+        // 5. Deduplication: skip only a TRUE duplicate - same code, position,
         // AND message. Message is part of the key, so two genuinely
         // different diagnostics that share an error code and start position
         // (common: many distinct conditions funnel through E0100/E0102/E0104)
         // stay distinct instead of collapsing into one with the second
         // silently dropped.
-        const dedup_key: string = format("%u:%s:%u:%u:%s",
+        const dedup_key: string = fmt::format("%u:%s:%u:%u:%s",
             effective_diag.code.to_u32(), effective_diag.span.file,
             effective_diag.span.start_line, effective_diag.span.start_col,
             effective_diag.message);
@@ -100,7 +152,7 @@ type struct DiagnosticSink {
         }
         this.seen_keys.insert(dedup_key, true);
 
-        // 5. Update counters
+        // 6. Update counters
         if (effective_diag.severity.is_error()) {
             this.error_count += 1;
         }
@@ -108,12 +160,12 @@ type struct DiagnosticSink {
             this.warning_count += 1;
         }
 
-        // 6. Store (rendering is deferred until flush() is called at the
+        // 7. Store (rendering is deferred until flush() is called at the
         //    end of compilation, so all diagnostics appear together rather
         //    than interleaved with phase logs).
         this.diagnostics.push(effective_diag);
 
-        // 7. Check max-errors limit. We only set the cutoff flag here;
+        // 8. Check max-errors limit. We only set the cutoff flag here;
         //    the summary is printed by the caller after flush().
         if (this.config.max_errors > 0 && this.error_count >= this.config.max_errors) {
             this.reached_max_errors = true;
@@ -126,13 +178,21 @@ type struct DiagnosticSink {
     /// preserved. Call this once at the end of compilation, before
     /// print_summary, to flush the deferred terminal output.
     flush(mut &this) -> void {
+        // Dropped vendor warnings stay recoverable without costing the ordinary
+        // build a line: a count nobody can act on is noise in the terminal, but
+        // silence with no way to see behind it hides a regression in what the
+        // generator emits.
+        if (this.suppressed_vendor_warnings > 0) {
+            cdebug("[Diag] suppressed %u warning(s) from generated vendor bindings\n",
+                   this.suppressed_vendor_warnings);
+        }
         if (this.renderer != null) {
-            for (mut i: int = 0; i < this.diagnostics.length; i++) {
+            for (mut i: i64 = 0; i < this.diagnostics.length; i++) {
                 if (!this.diagnostics[i].severity.is_error()) {
                     this.renderer.render(&this.diagnostics[i]);
                 }
             }
-            for (mut i: int = 0; i < this.diagnostics.length; i++) {
+            for (mut i: i64 = 0; i < this.diagnostics.length; i++) {
                 if (this.diagnostics[i].severity.is_error()) {
                     this.renderer.render(&this.diagnostics[i]);
                 }
@@ -141,13 +201,13 @@ type struct DiagnosticSink {
             // Fall-back path with no renderer attached. Goes to stderr so
             // LSP-mode callers (which speak JSON-RPC over stdout) are not
             // corrupted if a flush sneaks through.
-            for (mut i: int = 0; i < this.diagnostics.length; i++) {
+            for (mut i: i64 = 0; i < this.diagnostics.length; i++) {
                 if (!this.diagnostics[i].severity.is_error()) {
                     DiagSink::emit_raw(null, this.diagnostics[i].to_string());
                     DiagSink::emit_raw(null, "\n");
                 }
             }
-            for (mut i: int = 0; i < this.diagnostics.length; i++) {
+            for (mut i: i64 = 0; i < this.diagnostics.length; i++) {
                 if (this.diagnostics[i].severity.is_error()) {
                     DiagSink::emit_raw(null, this.diagnostics[i].to_string());
                     DiagSink::emit_raw(null, "\n");
@@ -156,34 +216,6 @@ type struct DiagnosticSink {
         }
     }
 
-    /// Begin a speculative-suppression scope. Nestable: each begin must be
-    /// matched by an end_suppress(). While active, emit() counts errors but
-    /// stores/renders nothing.
-    begin_suppress(mut &this) -> void {
-        this.suppress_depth += 1;
-    }
-
-    /// End a speculative-suppression scope opened by begin_suppress().
-    end_suppress(mut &this) -> void {
-        if (this.suppress_depth > 0) {
-            this.suppress_depth -= 1;
-        }
-    }
-
-    /// Whether a suppression scope is currently active.
-    is_suppressing(&this) -> boolean {
-        return this.suppress_depth > 0;
-    }
-
-    /// Total errors that have been suppressed (counted) since the last reset.
-    suppressed_error_total(&this) -> u32 {
-        return this.suppressed_errors;
-    }
-
-    /// Reset the suppressed-error tally to zero.
-    reset_suppressed(mut &this) -> void {
-        this.suppressed_errors = 0;
-    }
 
     /// Take a snapshot of current counters.
     snapshot(&this) -> DiagnosticSnapshot {
@@ -211,11 +243,6 @@ type struct DiagnosticSink {
     /// discarded.
     has_warnings(&this) -> boolean {
         return this.warning_count > 0;
-    }
-
-    /// Total number of diagnostics collected.
-    count(&this) -> u32 {
-        return this.diagnostics.length as u32;
     }
 
 }

@@ -1,0 +1,892 @@
+/// Res
+///
+/// What a written path refers to, recorded ON the node that wrote it.
+///
+/// A span-keyed side table cannot be exact: two spans that pack to the same
+/// key silently overwrite each other, and a synthesized node has no span to
+/// key on at all.  A slot on the node has neither failure mode, and it cannot
+/// desynchronize from the syntax it answers for.
+///
+/// Two rules make the answer safe to copy and safe to trust:
+///
+/// **A `Res` names a definition, never an instantiation.**  `T` stamps
+/// `GenericParam(<the id of the declaration that bound T>)`, not whatever `T`
+/// is bound to at some call site.
+/// Substitution happens strictly below this, in the type layer.  That is what
+/// lets `ASTCloner` copy a `Res` verbatim, and it is the difference between
+/// this and `NamedAnnotation.pre_resolved`, which holds a `TypeRef` - an
+/// instantiation - and therefore has to be dropped on every clone.
+///
+/// **`Err` is an answer, not a failure.**  It is produced once, with its
+/// diagnostic already emitted, and poisons downstream without triggering a
+/// second lookup.  There is deliberately no state meaning "did not resolve,
+/// try something else": that state is what grows a resolution cascade, because
+/// each recovery path added to it becomes a correctness path the next time
+/// something reaches it.
+///
+/// **`Res` has no variant meaning "missing".**  Every variant is an answer, so
+/// a consumer holding one has nothing to branch on and no place to put a
+/// second strategy.  Absence lives in `ResSlot` below, one type up, where only
+/// the resolver can observe it - which is what makes "re-resolve it later"
+/// unwriteable rather than merely discouraged.
+///
+/// `TypeRelative` is a POSITIVE claim of ownership, not a shrug: the language
+/// says a path whose first segment names a type is finished by the type layer,
+/// which needs a receiver type and so cannot run here.  It must never be used
+/// to record that a lookup was attempted and failed - that is `Err` when the
+/// name layer is the authority, and a defect in the lookup when it is not.
+/// Laundering a tool's limitation into an ownership claim rebuilds the
+/// cascade under a better name.
+///
+/// It carries the base it stopped on and a count of trailing segments, which
+/// is what makes that claim checkable rather than merely asserted: a base can
+/// only be a type, so a path the name layer failed to walk has nothing to put
+/// there and cannot be recorded as type-owned by accident.
+
+namespace compiler::resolver::res;
+
+import std::fmt;
+import std::core::hash::{ Hash, Hasher };
+import std::core::cmp::{ Eq };
+
+import compiler::resolver::symbol_str;
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name;
+import compiler::resolver::decl_name::{ DeclName };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::resolver::intern_table;
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+
+/// The identity of a declaration, as resolution answered it: a position in
+/// the compilation's `DefTable`, and the tag of the table that made it.
+///
+/// An id says nothing about what it names.  Its path, its parent, its leaf
+/// are the table's to answer (`path_of`, `parent_of`, `leaf_of`) - a lookup,
+/// never an unwrap - so no id can be assembled from a spelling and no holder
+/// can re-key a map by one without going through the table that made it.
+///
+/// Only `DefTable::register` builds one.  The field is `private`, a private
+/// field is private to its module, and the table is in this module, so the
+/// literal can be written nowhere else (E0353).  The seal holds only while a
+/// field stays private - members are public by default - and nothing checks
+/// that it does: a field made public reopens it.
+///
+/// **The number must never reach output, and never be persisted or compared
+/// across builds.**  It is the order declarations were registered in, which
+/// follows module discovery, which follows the filesystem - and that differs
+/// between hosts.  A mangled symbol, an emission order, a diagnostic or a
+/// cache key built from it would make two hosts' builds of one source
+/// differ.  That is why nothing here returns it: text comes from `path_of`.
+///
+/// A wrong index is a quieter failure than a wrong name.  A bad name misses
+/// every table; an index in range names SOME real definition.  The seal is
+/// one defence: an id exists only where a declaration was registered.  The
+/// tag is the other: every table a process makes carries a different one,
+/// each id carries its maker's, and a table refuses - loudly, where it is
+/// read - an id another table made, or one made before this table was
+/// rebuilt, instead of answering whichever definition sits at that index.
+type struct DefId {
+private:
+    /// Position in the table's parallel arrays; `0xFFFFFFFF` for none.
+    index: u32;
+    /// The tag of the table that made this id; 0 for the invalid id.
+    table: u32;
+
+public:
+    /// The id naming no definition, for a slot that must hold one before an
+    /// answer exists.  Distinct from `Res::Err`, which is an ANSWER: this is
+    /// the absence of one and never reaches a `Res`.
+    static invalid() -> DefId {
+        return DefId { index: 4294967295, table: 0 };
+    }
+
+    /// Whether this names a definition at all.
+    is_valid(&this) -> boolean {
+        return this.index != 4294967295;
+    }
+
+    /// Identity: one registration, one id.  Two declarations that share a
+    /// path - two overloads of `f`, two impls' `mul` - are two ids, and so
+    /// are two tables' registrations at one index.
+    equals(&this, other: DefId) -> boolean {
+        return this.index == other.index && this.table == other.table;
+    }
+}
+
+/// The key of a table keyed by definitions.  Made only by
+/// `DefTable::table_key`, so such a table is handed a definition's identity
+/// and nothing else.  Hashes as the definition's slot does.
+type struct DefKey {
+private:
+    slot: u64;
+}
+
+implement trait Hash for struct DefKey {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.slot.hash(hasher);
+    }
+}
+
+implement trait Eq for struct DefKey {
+    equals(&this, other: &DefKey) -> boolean {
+        return this.slot == other.slot;
+    }
+}
+
+/// What kind of declaration a table entry is.  Recorded at registration from
+/// what the registrar holds, never inferred from a name.
+type enum DefKind {
+    /// A module: registered by the module graph when it is discovered.
+    Module;
+    /// A struct, class, enum, union, trait or type alias.
+    Type;
+    /// A free function, method or intrinsic.
+    Function;
+    /// A constant or a global variable.
+    Value;
+    /// A primitive type: declared nowhere, registered by the compiler with
+    /// its spelling as the leaf.
+    Primitive;
+    /// A monomorphized instantiation of a generic type.  An instantiation is
+    /// not a definition; it is registered here only until instantiations
+    /// carry their own handle instead.
+    Instance;
+    /// A method: its parent is the type it is declared on (in the type's
+    /// body, an inherent implementation or a trait implementation) or the
+    /// trait that declares it.  A copy - a trait default placed in an
+    /// implementation, a monomorphized clone - is not a definition and gets
+    /// none.
+    Method;
+}
+
+/// Where a definition's name came from, recorded by the registrar that
+/// holds the declaration.  `Generated` is a name the compiler minted while
+/// lowering - a closure's struct, an async function's future, the body an
+/// `async main` is renamed to.  A generated definition's path is composed
+/// in a space no written name reaches (`DefTable::register_generated`), so
+/// it never coincides with a declaration the program wrote: every store
+/// keyed by a definition's path, and every symbol mangled from one, keeps
+/// the two apart: a generated name can never be one a program wrote.
+///
+type enum NameOrigin {
+    Written;
+    Generated;
+}
+
+/// Whether a definition may be named from outside the module that declares
+/// it, as its registration recorded.  `Unrecorded` until the registrar that
+/// holds the declaration says, so a definition asked about before then is
+/// told apart from a private one.
+type enum DeclVisibility {
+    Unrecorded;
+    Public;
+    Private;
+}
+
+/// Every definition of one compilation, in registration order.
+///
+/// The one place a `DefId` is made and the one place a definition's path is
+/// composed.  `register` always appends: it never looks anything up, so no
+/// string can retrieve an existing id through it, and registering one
+/// declaration twice gives two ids - which is why every registrar is a place
+/// that holds the declaration it registers, and every other holder of an id
+/// copies it.
+///
+/// There is deliberately no "find by path": it would turn a spelling back
+/// into an existing id, which is the door this table exists to close.
+///
+/// Every read of an id goes through `slot`, which refuses an id this table
+/// did not make.
+type struct DefTable {
+private:
+    intern:  InternTable*;
+    /// This table's tag, distinct from every other table the process made;
+    /// stamped on each id `append` makes and checked by `slot`.
+    tag:     u32;
+    parents: DefId[];
+    leaves:  SymbolStr[];
+    kinds:   DefKind[];
+    paths:   SymbolStr[];
+    spans:   SourceSpan[];
+    visibility: DeclVisibility[];
+    refused:    boolean[];
+    origins:    NameOrigin[];
+    /// Each primitive's definition by its position in the primitive table;
+    /// invalid until the primitive is first asked for.
+    prim_defs:   DefId[];
+
+public:
+    static new(intern: InternTable*) -> DefTable {
+        g_def_table_tags = g_def_table_tags + 1;
+        return DefTable {
+            intern:  intern,
+            tag:     g_def_table_tags,
+            parents: [],
+            leaves:  [],
+            kinds:   [],
+            paths:   [],
+            spans:   [],
+            visibility: [],
+            refused:    [],
+            origins:    [],
+            prim_defs:   [],
+        };
+    }
+
+    /// The definition of the primitive spelled `leaf`, registered the first
+    /// time it is asked for: a primitive is declared nowhere, so whichever
+    /// stage first needs it registers it - the name layer, for a method
+    /// written in `implement i32 { .. }`, or the type declarations, for the
+    /// primitive's type.  One primitive, one id, whoever asks first.  `leaf`
+    /// is a primitive's spelling as the primitive table answered it
+    /// (`Res::PrimTy`), never a written name; anything else is refused.
+    primitive(mut &this, leaf: SymbolStr) -> DefId {
+        const at: i64 = ResBase::primitive_position(this.intern.resolve(leaf));
+        if (at < 0) {
+            panic(fmt::format(
+                "internal compiler error: `%s` was registered as a primitive, and the primitive table does not hold it",
+                this.intern.resolve(leaf)), FILE, LINE);
+        }
+        while (this.prim_defs.length <= at) { this.prim_defs.push(DefId::invalid()); }
+        if (!this.prim_defs[at].is_valid()) {
+            this.prim_defs[at] = this.append(DefId::invalid(), leaf, DefKind::Primitive,
+                SourceSpan::none(), NameOrigin::Written);
+        }
+        return this.prim_defs[at];
+    }
+
+    /// Append a definition declared in `parent` (the module, type or impl it
+    /// is written in; invalid for a root) under `leaf`, the name as written
+    /// at the declaration.  Its path is composed here, once, from the
+    /// parent's path and the leaf.
+    register(mut &this, parent: DefId, leaf: SymbolStr, kind: DefKind,
+             span: SourceSpan) -> DefId {
+        return this.append(parent, leaf, kind, span, NameOrigin::Written);
+    }
+
+    /// Append a definition the compiler generated, under the leaf it minted.
+    /// Its path marks the leaf with `$`, which begins no identifier a program
+    /// can write, so a program declaring the same leaf in the same module
+    /// declares a different path: `main::$__Closure_0`, never
+    /// `main::__Closure_0`.  `leaf_of` answers the leaf as minted.
+    register_generated(mut &this, parent: DefId, leaf: SymbolStr, kind: DefKind,
+                       span: SourceSpan) -> DefId {
+        return this.append(parent, leaf, kind, span, NameOrigin::Generated);
+    }
+
+    /// The position of `d` in this table's arrays.  An id another table
+    /// made - a second table built beside this one, or this one's
+    /// predecessor before a rebuild - is refused here, and so is the invalid
+    /// id: its index is a position in SOME table, and answering it would
+    /// read whichever definition sits there.
+    slot(&this, d: DefId) -> i64 {
+        if (d.table != this.tag) { DefTable::refuse(d.table, this.tag); }
+        return d.index as i64;
+    }
+
+    /// The key a table keyed by definitions stores `d` under: its slot,
+    /// refused as `slot` refuses an id another table made.
+    table_key(&this, d: DefId) -> DefKey {
+        return DefKey { slot: this.slot(d) as u64 };
+    }
+
+    /// The refusal `slot` raises, kept out of the read it guards.
+    static refuse(made_by: u32, read_by: u32) -> void {
+        panic(fmt::format(
+            "internal compiler error: a definition id made by table %u was read against table %u (the invalid id carries 0)",
+            made_by, read_by), FILE, LINE);
+    }
+
+    /// `leaf` as a path segment of a definition of `origin`: as written, or
+    /// marked `$` for a generated one.  The one place the marker is spelled.
+    static spelled_in(origin: NameOrigin, leaf: string) -> string {
+        return match (origin) {
+            NameOrigin::Written   => { leaf }
+            NameOrigin::Generated => { "$" + leaf }
+        };
+    }
+
+    /// Where `d`'s name came from; `Written` for the invalid id.
+    origin_of(&this, d: DefId) -> NameOrigin {
+        if (!d.is_valid()) { return NameOrigin::Written; }
+        return this.origins[this.slot(d)];
+    }
+
+    append(mut &this, parent: DefId, leaf: SymbolStr, kind: DefKind,
+           span: SourceSpan, origin: NameOrigin) -> DefId {
+        const shown: string = DefTable::spelled_in(origin, this.intern.resolve(leaf));
+        const path: SymbolStr = if (parent.is_valid()) {
+            this.intern.intern(this.intern.resolve(this.paths[this.slot(parent)])
+                + "::" + shown)
+        } else {
+            this.intern.intern(shown)
+        };
+        const at: u32 = this.paths.length as u32;
+        this.origins.push(origin);
+        this.parents.push(parent);
+        this.leaves.push(leaf);
+        this.kinds.push(kind);
+        this.paths.push(path);
+        this.spans.push(span);
+        this.visibility.push(DeclVisibility::Unrecorded);
+        this.refused.push(false);
+        return DefId { index: at, table: this.tag };
+    }
+
+    /// The canonical path of `d`: its parent's path and its leaf.  For a
+    /// diagnostic or a mangled symbol; `d` itself answers anything a key
+    /// would.  Empty for the invalid id.
+    path_of(&this, d: DefId) -> DeclName {
+        if (!d.is_valid()) { return DeclName::empty(); }
+        return DeclName::of(this.paths[this.slot(d)]);
+    }
+
+    /// The definition `d` is declared in: a module, type or impl; invalid
+    /// for a root.
+    parent_of(&this, d: DefId) -> DefId {
+        if (!d.is_valid()) { return DefId::invalid(); }
+        return this.parents[this.slot(d)];
+    }
+
+    /// The name `d` was declared under, as written.
+    leaf_of(&this, d: DefId) -> DeclName {
+        if (!d.is_valid()) { return DeclName::empty(); }
+        return DeclName::of(this.leaves[this.slot(d)]);
+    }
+
+    kind_of(&this, d: DefId) -> DefKind {
+        return this.kinds[this.slot(d)];
+    }
+
+    /// The module `d` is declared in: `d` itself for a module, else the
+    /// nearest module on its parent chain; invalid when there is none.
+    module_of(&this, d: DefId) -> DefId {
+        mut at: DefId = d;
+        while (at.is_valid()) {
+            if (this.kinds[this.slot(at)] == DefKind::Module) { return at; }
+            at = this.parents[this.slot(at)];
+        }
+        return DefId::invalid();
+    }
+
+    /// Record `d`'s visibility.  Called by the registrar that holds the
+    /// declaration, which is the one place its `public` / `private` is read.
+    record_visibility(mut &this, d: DefId, is_public: boolean) -> void {
+        if (!d.is_valid()) { return; }
+        this.visibility[this.slot(d)] = if (is_public) {
+            DeclVisibility::Public
+        } else {
+            DeclVisibility::Private
+        };
+    }
+
+    /// Record that `d`'s written signature carries a name the name layer
+    /// refused, so its registration registers no signature for it.
+    record_signature_refused(mut &this, d: DefId) -> void {
+        if (!d.is_valid()) { return; }
+        this.refused[this.slot(d)] = true;
+    }
+
+    /// Whether `d`'s signature was refused where it was written.
+    signature_refused(&this, d: DefId) -> boolean {
+        if (!d.is_valid()) { return false; }
+        return this.refused[this.slot(d)];
+    }
+
+    /// `d`'s visibility as its registration recorded it.
+    visibility_of(&this, d: DefId) -> DeclVisibility {
+        if (!d.is_valid()) { return DeclVisibility::Unrecorded; }
+        return this.visibility[this.slot(d)];
+    }
+}
+
+
+
+/// What an overload family hangs off.  A family is its owner and the leaf
+/// its members were declared under - as a definition is its parent and its
+/// leaf (`DefTable::register`) - so two owners declaring one leaf are two
+/// families, and nothing names a family by a composed string.
+///
+/// `Def` is the owner's definition: the module a free function is declared
+/// in, or the type a method is declared on - a definition's parent.  An
+/// invalid id is the root, which owns a specialization's clone (its minted
+/// identifier is program-unique) and a function of a program that has no
+/// module.  `Type` is a type by its arena identity, for an owner held as a
+/// type: a pin can name an instantiation before the monomorphizer registers
+/// it, so that owner's definition is read when the family is asked, not
+/// when it is named.  `Template` is a generic type's definition as the
+/// owner of the methods it declares, in its own parameters: the members a
+/// generic body asks of its own unminted instantiation.  Its families are
+/// apart from every instance's and from the definition's `Def` families, so
+/// an instance asked of never answers with the template's declarations.
+type enum FamilyOwner {
+    Def(DefId);
+    Type(TypeRef);
+    Template(DefId);
+}
+
+/// The part of a type-relative path the name layer DID finish.
+///
+/// Exactly the three answers that can name a type, so a base that could not
+/// own members - a local, a failure, or another type-relative path - is
+/// unrepresentable rather than merely unexpected.  That is what stops
+/// `TypeRelative` from degenerating into "something went wrong here": there is
+/// no value to put in it unless a type was actually named.
+///
+/// It is a separate enum because `Res` cannot contain itself by value - an ADT
+/// enum is laid out as a tag plus a payload area sized to its largest variant,
+/// which for a self-referential variant has no finite size.
+type enum ResBase {
+    /// A declared type, by the id resolution answered with.
+    Def(DefId);
+    /// A type parameter, by the symbol its declaration bound - its members
+    /// are reached through its bound.  The id and not the spelling, because
+    /// two parameters of one spelling in one scope chain are two
+    /// declarations, and a stamp carrying the spelling could not say which.
+    GenericParam(SymbolID);
+    /// A primitive, by its spelling.  Primitives own members without being
+    /// declared anywhere, so there is no qualified name to give.
+    PrimTy(SymbolStr);
+}
+
+implement enum ResBase {
+    /// The primitives are a table the language fixes, not
+    /// declarations, so no scope binds them and their spelling is the only
+    /// thing that names them.
+    ///
+    /// Whether a spelling names a primitive.
+    ///
+    /// A primitive owns members without being declared anywhere, so it binds in
+    /// no scope and appears in no module's export set.  Every lookup therefore
+    /// reports it as absent, and only the spelling distinguishes "a primitive,
+    /// which needs no declaration" from "a name nothing in the program owns".
+    ///
+    /// This is the ONE predicate for that question.  The lexer's keyword table
+    /// cannot be it: `()` is punctuation, so no keyword spells the unit type,
+    /// and a table that cannot express a primitive cannot be the authority on
+    /// which spellings are primitive.
+    ///
+    /// It is deliberately NOT the set of every spelling the lexer accepts as a
+    /// type keyword.  `int`, `uint`, `float` and `double` are alias keywords a
+    /// module may also be named for - `float` IS one, `std::fmt::float` - and a
+    /// scope qualifier answered `PrimTy` here would name the primitive in every
+    /// file that does not import the module.  The names below are the ones no
+    /// module can also own.
+    static is_primitive_spelling(name: string) -> boolean {
+        // The unit type owns members without being declared, exactly as the
+        // scalars do, and its spelling is likewise its registration key - the
+        // declaration index registers `()` beside them.  It reaches here as an
+        // impl head's target TEXT; a written `()` in annotation position parses
+        // as the empty tuple and never asks this.
+        return ResBase::primitive_position(name) >= 0;
+    }
+
+    /// The same fixed table in its one ordered form: the
+    /// predicate above is this position being present.
+    ///
+    /// The position of `name` in the fixed primitive table, or -1 when it
+    /// spells no primitive; the index a primitive's definition is kept under
+    /// (`DefTable::primitive`).
+    static primitive_position(name: string) -> i64 {
+        return match (name) {
+            "()"      => { 0 }
+            "void"    => { 1 }
+            "boolean" => { 2 }
+            "char"    => { 3 }
+            "string"  => { 4 }
+            "i8"      => { 5 }
+            "i16"     => { 6 }
+            "i32"     => { 7 }
+            "i64"     => { 8 }
+            "i128"    => { 9 }
+            "u8"      => { 10 }
+            "u16"     => { 11 }
+            "u32"     => { 12 }
+            "u64"     => { 13 }
+            "u128"    => { 14 }
+            "isize"   => { 15 }
+            "usize"   => { 16 }
+            "f32"     => { 17 }
+            "f64"     => { 18 }
+            "never"   => { 19 }
+            "va_list" => { 20 }
+            _         => { -1 }
+        };
+    }
+
+    /// Whether the primitive at `position` in the table above is read as an
+    /// integer: a signed or unsigned integer, `char` or `boolean`.  False
+    /// for -1, no primitive.
+    static reads_as_integer(position: i64) -> boolean {
+        return position == 2 || position == 3 || (position >= 5 && position <= 16);
+    }
+
+    /// The alias keywords are the same fixed table: each
+    /// is a second spelling of a primitive and has no identity of its own.
+    ///
+    /// The primitive an ALIAS KEYWORD spells, or "" for any other name.
+    ///
+    /// `int`, `uint`, `float` and `double` are the complement of
+    /// `is_primitive_spelling` among the lexer's type keywords: each is
+    /// another spelling of a primitive that has its own, and none has an
+    /// identity of its own - a `PrimTy` is never recorded under one of these,
+    /// only under the spelling it folds to, so one type has one key wherever
+    /// a stamp is read.
+    ///
+    /// A module may also own one of these names (`std::fmt::float`), which is
+    /// why the fold is not the answer FIRST: an alias keyword names the
+    /// primitive only after every scope has failed to bind it, the way a
+    /// prelude alias would.  The name layer asks this at that point and
+    /// nowhere earlier; a consumer holding a keyword's own lexeme asks it
+    /// too, so the alias table has this one home.
+    static primitive_of_alias(name: string) -> string {
+        if (name.eq("int"))    { return "i32"; }
+        if (name.eq("uint"))   { return "u32"; }
+        if (name.eq("float"))  { return "f32"; }
+        if (name.eq("double")) { return "f64"; }
+        return "";
+    }
+
+}
+
+/// A source-location pseudo-constant: a builtin the compiler expands AT THE
+/// REFERENCE, to the file or line the reference was written on.
+///
+/// Like a primitive, it is declared nowhere and so binds in no scope; unlike
+/// a primitive it is a VALUE, so it is the answer for a bare identifier that
+/// no binding claims and one of these spells.  The kind is the whole answer:
+/// a consumer types or expands it by the kind, and the spelling is compared
+/// in exactly one place, `of_spelling`.
+type enum SourceLoc {
+    /// `FILE`: the path of the file the reference is in, a `string`.
+    File;
+    /// `LINE`: the line the reference is on, a `u32`.
+    Line;
+}
+
+implement enum SourceLoc {
+    /// The source-location pseudo-constants are a table
+    /// the language fixes, declared nowhere, so their spelling is the only
+    /// thing that names them.
+    ///
+    /// The pseudo-constant a bare spelling names, or `None` for every other
+    /// spelling.  The one place the two names are written.
+    static of_spelling(name: string) -> Option<SourceLoc> {
+        return match (name) {
+            "FILE" => { Option::Some(SourceLoc::File) }
+            "LINE" => { Option::Some(SourceLoc::Line) }
+            _      => { Option::None }
+        };
+    }
+
+}
+
+type enum Res {
+    /// A declaration or module, by the id resolution answered with.
+    Def(DefId);
+    /// A local binding (parameter or local variable).
+    Local(SymbolID);
+    /// A type parameter, by the symbol its declaration bound - never the type
+    /// it is bound to.
+    GenericParam(SymbolID);
+    /// A primitive, by its spelling.
+    PrimTy(SymbolStr);
+    /// A source-location pseudo-constant (`FILE`, `LINE`), by its kind.  An
+    /// answer for a bare VALUE name that nothing in scope binds, as `PrimTy`
+    /// is for a type spelling; a binding of the same spelling shadows it.
+    SourceLoc(SourceLoc);
+    /// The type layer owns the REST of this path.  The payload states how far
+    /// the name layer got: the type its walk ended on, and how many trailing
+    /// segments are left for the type layer to finish.
+    ///
+    /// Carrying the base is what lets sema resume at a known position instead
+    /// of re-searching from a bare name, which is the whole reason a private
+    /// resolver grew in sema in the first place.  A marker with no payload
+    /// says only "not mine", and "not mine" is not an answer anyone can use.
+    TypeRelative(ResBase, u32);
+    /// Resolution failed and the diagnostic has already been emitted.
+    Err;
+}
+
+implement enum Res {
+    /// The id of a resolved definition, or an invalid one for every other
+    /// answer.  Callers that only accept a definition use this; callers that
+    /// must tell one non-definition answer from another match instead.
+    ///
+    /// This deliberately does not hand back a name.  A consumer that wanted a
+    /// name in order to key a lookup is re-deriving what it was already given,
+    /// and taking the id is what makes that lookup take the answer instead of
+    /// the spelling; one that genuinely emits text asks for the name through
+    /// `DefId::qualified_name` and says so at the call site.
+    def_id(&this) -> DefId {
+        return match (&this) {
+            Res::Def(d) => { d }
+            _           => { DefId::invalid() }
+        };
+    }
+
+    /// The symbol a local binding's declaration bound, or an invalid one for
+    /// every other answer.  This is the key a pass's own per-binding state
+    /// takes: two locals in one function may share a spelling - an inner
+    /// block's binding shadows an outer one - and a set keyed by the spelling
+    /// gives them one slot, so a move recorded against either is read back
+    /// against both.
+    local_sym(&this) -> SymbolID {
+        return match (&this) {
+            Res::Local(s) => { s }
+            _             => { SymbolID::invalid() }
+        };
+    }
+
+    /// The symbol a type parameter's declaration bound, or an invalid one for
+    /// every other answer.  This is the key every substitution table takes:
+    /// a binding is keyed by the parameter's symbol and never by its
+    /// spelling, because a trait default's body is resolved in the trait's
+    /// file and copied under an impl whose own parameter may spell the
+    /// body's - two declarations the spelling cannot tell apart.
+    generic_param_sym(&this) -> SymbolID {
+        return match (&this) {
+            Res::GenericParam(s) => { s }
+            _                    => { SymbolID::invalid() }
+        };
+    }
+
+    /// The symbol of the type parameter a type-relative path is rooted at
+    /// (`I::Item`, `T::default`), or an invalid one when the path is rooted
+    /// elsewhere or the answer is not a path at all.
+    relative_param_sym(&this) -> SymbolID {
+        return match (&this) {
+            Res::TypeRelative(b, _) => {
+                match (b) {
+                    ResBase::GenericParam(s) => { s }
+                    _                        => { SymbolID::invalid() }
+                }
+            }
+            _ => { SymbolID::invalid() }
+        };
+    }
+
+}
+
+/// The slot a node carries: either no resolver has answered yet, or one has.
+///
+/// This type exists so that `Pending` is not a `Res`.  A consumer reaches an
+/// answer only through `require`, which is total over `Res` - so the code that
+/// would re-derive a name has no state to test for and no branch to live in.
+/// The resolver writes through `answer`, which is first-write-wins, and that
+/// is a correctness rule rather than an optimization: a `Res` records what the
+/// file that WROTE the path can see, so a second walk standing in a different
+/// module must not be able to overwrite the first answer with its own view.
+type enum ResSlot {
+    /// No resolver has answered for this node yet.
+    Pending;
+    /// A resolver has answered, including with a failure.
+    Answered(Res);
+    /// The compiler wrote this reference while desugaring, and it names a
+    /// language item - `for`'s `Iterator`, `a..b`'s `Range`, `x ?? d`'s
+    /// `Option` - whatever the writing module's scope holds under the leaf.
+    /// It is written before any declaration is registered, so it cannot hold
+    /// the item's id yet; `settle` answers it once the item is claimed.
+    /// Claimed all the same: no resolver may answer it by looking the leaf up.
+    Lang(LangItem);
+    /// A path's scope segment names this type alias.  The path means what
+    /// the same path through the alias's target means, and the target is
+    /// stamped where the alias is declared, which may be a module whose
+    /// names are resolved later; `settle_alias` answers it once every
+    /// module's are.
+    Alias(DefId);
+}
+
+implement enum ResSlot {
+    /// Whether no resolver has answered yet.
+    ///
+    /// For DIAGNOSING an unstamped node at a consumer that holds it, never for
+    /// deciding what to do about one: a consumer that branches on absence is
+    /// the fallback this type exists to make unwriteable.  `require` remains
+    /// the only way to reach an answer.
+    is_pending(&this) -> boolean {
+        return match (&this) {
+            ResSlot::Answered(_) => { false }
+            _                    => { true }
+        };
+    }
+
+    /// The local binding this slot's answer names, or an invalid symbol.
+    ///
+    /// An unanswered node names no binding: whatever it spells was decided by
+    /// nobody, so a rib keyed by identity must not match it.  That surfaces as
+    /// the use staying outside the pass's state rather than as a spelling
+    /// being adopted, which is the failure this key exists to prevent.
+    local_sym(&this) -> SymbolID {
+        return match (&this) {
+            ResSlot::Answered(r) => { r.local_sym() }
+            _                    => { SymbolID::invalid() }
+        };
+    }
+
+    /// The type parameter this slot's answer names, or an invalid symbol.
+    ///
+    /// Not a door around `require`: the question is "which parameter is
+    /// this", and a node no resolver answered for names none - it is a
+    /// spelling the substitution tables must not match, because whatever it
+    /// spells was decided by nobody.  An unanswered node that WAS meant to
+    /// name a parameter is its synthesizer's defect, and it surfaces as the
+    /// parameter staying unresolved rather than as a spelling being adopted.
+    generic_param_sym(&this) -> SymbolID {
+        return match (&this) {
+            ResSlot::Answered(r) => { r.generic_param_sym() }
+            _                    => { SymbolID::invalid() }
+        };
+    }
+
+    /// The type parameter a type-relative answer is rooted at, as
+    /// `generic_param_sym` for the parameter itself.
+    relative_param_sym(&this) -> SymbolID {
+        return match (&this) {
+            ResSlot::Answered(r) => { r.relative_param_sym() }
+            _                    => { SymbolID::invalid() }
+        };
+    }
+
+    /// Record an answer.  The first one wins; later ones are dropped.
+    answer(mut &this, r: Res) -> void {
+        match (&this) {
+            ResSlot::Pending => { *this = ResSlot::Answered(r); }
+            _                => { }
+        }
+    }
+
+    /// Answer a language-item reference with the item's claimed id.  Only a
+    /// `Lang` slot changes; any other state is left as it is.
+    settle(mut &this, r: Res) -> void {
+        match (&this) {
+            ResSlot::Lang(_) => { *this = ResSlot::Answered(r); }
+            _                => { }
+        }
+    }
+
+    /// Answer a path through a type alias with what the same path through
+    /// its target is.  Only an `Alias` slot changes.
+    settle_alias(mut &this, r: Res) -> void {
+        match (&this) {
+            ResSlot::Alias(_) => { *this = ResSlot::Answered(r); }
+            _                 => { }
+        }
+    }
+
+    /// The alias an unsettled `Alias` slot names, or an invalid id.
+    pending_alias(&this) -> DefId {
+        return match (&this) {
+            ResSlot::Alias(d) => { d }
+            _                 => { DefId::invalid() }
+        };
+    }
+
+    /// The answer this node carries.
+    ///
+    /// `Pending` here means no resolver claimed a node that a later stage
+    /// depends on, which is an internal error and never a licence to guess.
+    /// It is recorded rather than fatal: a compilation that has already
+    /// emitted a diagnostic may legitimately have skipped work, so the bug is
+    /// reported only if the build otherwise succeeds (see
+    /// `pending_bug_count`).  The value handed back is `Err`, which stops the
+    /// caller for the same reason a real failure would - there is deliberately
+    /// no third outcome for a caller to route around.
+    require(&this, site: string) -> Res {
+        return match (&this) {
+            ResSlot::Answered(r) => { r }
+            _                    => {
+                record_pending_bug(site);
+                Res::Err
+            }
+        };
+    }
+}
+
+/// How many canonical names a consumer could not find a declaration for, and
+/// where the first one was.  Distinct from the `Pending` tally below: a
+/// `Res::Def` IS an answer, so reaching one the index cannot serve means the
+/// declaration never registered, not that a pass never ran.
+/// The tag the next `DefTable` is made with.  Starts above 0, the invalid
+/// id's tag, so no table accepts the invalid id.
+mut g_def_table_tags: u32 = 0;
+
+mut g_unregistered_defs: u64 = 0;
+mut g_unregistered_first_site: string = "";
+
+/// Note that a consumer held a canonical name no declaration answers to.
+public function record_unregistered_def(site: string) -> void {
+    if (g_unregistered_defs == 0) { g_unregistered_first_site = site; }
+    g_unregistered_defs = g_unregistered_defs + 1;
+}
+
+/// How many canonical names named no declaration.  Zero is the only value a
+/// successful build may end on.
+public function unregistered_def_count() -> u64 {
+    return g_unregistered_defs;
+}
+
+/// Where the first unregistered name was consumed, for the report.
+public function unregistered_def_first_site() -> string {
+    return g_unregistered_first_site;
+}
+
+/// How many type-declaration nodes reached a consumer with no registration
+/// stamped on them, and where the first one was.  Distinct from both tallies
+/// above: the stamp is written by the registration that minted it, in a
+/// stage with no error exit before that registration, so a missing one is
+/// never the consequence of a user error and is reported whatever else the
+/// build said - deferring it would hide the defect behind the cascade it
+/// causes (a method that cannot find `this`, a field that is not on its own
+/// type).
+mut g_unstamped_decls: u64 = 0;
+mut g_unstamped_first_site: string = "";
+
+/// Note that a consumer held a type declaration no registration stamped.
+public function record_unstamped_decl(site: string) -> void {
+    if (g_unstamped_decls == 0) { g_unstamped_first_site = site; }
+    g_unstamped_decls = g_unstamped_decls + 1;
+}
+
+/// How many type declarations reached a consumer unstamped.
+public function unstamped_decl_count() -> u64 {
+    return g_unstamped_decls;
+}
+
+/// Where the first unstamped declaration was consumed, for the report.
+public function unstamped_decl_first_site() -> string {
+    return g_unstamped_first_site;
+}
+
+/// How many `require` calls found a `Pending` slot, and where the first one
+/// was.  Held here rather than on the diagnostic engine because a `Res` slot
+/// is reachable from parts of the tree that cannot see a
+/// `CompilationContext`; the flush that turns this into a diagnostic runs
+/// where one is in hand.
+mut g_pending_bugs: u64 = 0;
+mut g_pending_first_site: string = "";
+
+
+/// Note that a stage required an answer no resolver had written.
+public function record_pending_bug(site: string) -> void {
+    if (g_pending_bugs == 0) { g_pending_first_site = site; }
+    g_pending_bugs = g_pending_bugs + 1;
+}
+
+/// How many times a required answer was missing.  Zero is the only value a
+/// successful build may end on.
+public function pending_bug_count() -> u64 {
+    return g_pending_bugs;
+}
+
+/// Where the first missing answer was required, for the report.
+public function pending_bug_first_site() -> string {
+    return g_pending_first_site;
+}

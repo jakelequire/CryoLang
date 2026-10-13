@@ -1,0 +1,69 @@
+/// A detached thread's result is released exactly once, by whichever side
+/// is last: the handle, when the thread finished before `detach`; the
+/// thread, when `detach` came first.  Both release it in place through
+/// `std::core::ptr::drop_in_place`, which runs the result's `Drop`
+/// implementation.  The exit code says which count was wrong; 0 means both
+/// held.
+namespace ThreadDetachedResultReleasedOnce::Main;
+
+import std::core::drop::{ Drop };
+import std::thread;
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::ffi::libc;
+
+type struct Res {
+    tally: Atomic<u32>*;
+}
+
+implement trait Drop for struct Res {
+    drop(mut &this) -> void {
+        (*this.tally).fetch_add(1, MemoryOrder::AcqRel);
+    }
+}
+
+type struct Ctx {
+    tally: Atomic<u32>*;
+    gate:  Atomic<u32>*;
+}
+
+/// Returns its result once `gate` is open.
+function produce(c: Ctx) -> Res {
+    while ((*c.gate).load(MemoryOrder::Acquire) == 0) { thread::sleep_ms(1); }
+    return Res { tally: c.tally };
+}
+
+/// Waits up to about two seconds for `a` to read `want`.
+function settles(a: Atomic<u32>*, want: u32) -> boolean {
+    mut tries: i32 = 0;
+    while (tries < 2000) {
+        if ((*a).load(MemoryOrder::Acquire) == want) { return true; }
+        thread::sleep_ms(1);
+        tries = tries + 1;
+    }
+    return false;
+}
+
+function main() -> int {
+    // The thread finishes first; `detach` releases the result.
+    mut tally_a: Atomic<u32> = Atomic::<u32>::new(0);
+    mut open_a: Atomic<u32> = Atomic::<u32>::new(1);
+    const h_a: thread::JoinHandle<Res> = thread::spawn(Ctx { tally: &tally_a, gate: &open_a }, produce);
+    mut waited: i32 = 0;
+    while (!h_a.is_finished() && waited < 2000) { thread::sleep_ms(1); waited = waited + 1; }
+    if (!h_a.is_finished()) { return 1; }
+    h_a.detach();
+    if (tally_a.load(MemoryOrder::Acquire) != 1) { return 2; }
+
+    // `detach` comes first; the thread releases the result when it ends.
+    mut tally_b: Atomic<u32> = Atomic::<u32>::new(0);
+    mut open_b: Atomic<u32> = Atomic::<u32>::new(0);
+    const h_b: thread::JoinHandle<Res> = thread::spawn(Ctx { tally: &tally_b, gate: &open_b }, produce);
+    h_b.detach();
+    open_b.store(1, MemoryOrder::Release);
+    if (!settles(&tally_b, 1)) { return 3; }
+    thread::sleep_ms(20);
+    if (tally_b.load(MemoryOrder::Acquire) != 1) { return 4; }
+
+    libc::printf("detached-result ok\n");
+    return 0;
+}

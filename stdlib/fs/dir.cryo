@@ -9,17 +9,27 @@
 
 namespace std::fs::dir;
 
-import core::option;
-import core::result;
-import core::iter;
-import core::drop;
-import collections::string;
-import collections::str;
-import io::error;
-import ffi::libc;
-import sys::syscall;
-import fs::path;
-import fs::metadata;
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::iter;
+import std::core::iter::{ Iterator };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::io::error;
+import std::io::error::{ IoError, IoErrorKind };
+import std::ffi::libc;
+import std::sys::syscall;
+import std::fs::path;
+import std::fs::path::{ Path, PathBuf };
+import std::fs::metadata;
+import std::fs::metadata::{ FileType, metadata };
+import std::core::mem;
 
 // `d_type` values we classify (others fall through to FileType::Other).
 // We normalise both platforms onto these so `DirEntry` stays uniform.
@@ -61,7 +71,7 @@ function dirent_dtype(ent: u8*, base: Str, name: Str) -> u8 {
     full.push(name);
     full.push_byte(0 as u8);
     const attrs: u32 = syscall::GetFileAttributesA(full.as_ptr());
-    full.drop();
+    mem::drop(full);
     if (attrs == INVALID_FILE_ATTRIBUTES)       { return 0; }      // DT_UNKNOWN
     if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) { return DT_LNK; }
     if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)     { return DT_DIR; }
@@ -97,9 +107,7 @@ type struct DirEntry {
 }
 
 implement trait Drop for struct DirEntry {
-    drop(mut &this) -> void {
-        this.entry_name.drop();
-    }
+    drop(mut &this) -> void { }
 }
 
 /// Forward iterator over the entries of a directory. Yields owned
@@ -139,7 +147,6 @@ implement trait Drop for struct ReadDir {
             libc::closedir(this.dirp);
             this.dirp = null;
         }
-        this.base.drop();
     }
 }
 
@@ -160,7 +167,7 @@ function read_dir(p: Path) -> Result<ReadDir, IoError> {
     mut c_path: String = String::with_null(p.as_str());
     const dirp: void* = libc::opendir(c_path.as_ptr());
     const err: i32 = libc::errno();
-    c_path.drop();
+    mem::drop(c_path);
     if (dirp == null) {
         return Result::Err(IoError::from_errno(err));
     }
@@ -173,7 +180,7 @@ function create_dir(p: Path) -> Result<(), IoError> {
     mut c_path: String = String::with_null(p.as_str());
     const rc: i32 = libc::mkdir(c_path.as_ptr(), DEFAULT_DIR_MODE);
     const err: i32 = libc::errno();
-    c_path.drop();
+    mem::drop(c_path);
     if (rc != 0) {
         return Result::Err(IoError::from_errno(err));
     }
@@ -214,7 +221,7 @@ function remove_file(p: Path) -> Result<(), IoError> {
     mut c_path: String = String::with_null(p.as_str());
     const rc: i32 = libc::unlink(c_path.as_ptr());
     const err: i32 = libc::errno();
-    c_path.drop();
+    mem::drop(c_path);
     if (rc != 0) {
         return Result::Err(IoError::from_errno(err));
     }
@@ -244,7 +251,7 @@ function remove_dir_all(p: Path) -> Result<(), IoError> {
         }
     }
     // Close the handle before removing the now-empty directory.
-    rd.drop();
+    mem::drop(rd);
     return remove_dir(p);
 }
 
@@ -253,7 +260,7 @@ function remove_dir(p: Path) -> Result<(), IoError> {
     mut c_path: String = String::with_null(p.as_str());
     const rc: i32 = libc::rmdir(c_path.as_ptr());
     const err: i32 = libc::errno();
-    c_path.drop();
+    mem::drop(c_path);
     if (rc != 0) {
         return Result::Err(IoError::from_errno(err));
     }
@@ -267,8 +274,8 @@ function rename(from: Path, to: Path) -> Result<(), IoError> {
     mut c_to: String = String::with_null(to.as_str());
     const rc: i32 = libc::rename(c_from.as_ptr(), c_to.as_ptr());
     const err: i32 = libc::errno();
-    c_to.drop();
-    c_from.drop();
+    mem::drop(c_to);
+    mem::drop(c_from);
     if (rc != 0) {
         return Result::Err(IoError::from_errno(err));
     }
@@ -289,7 +296,7 @@ function canonicalize(p: Path) -> Result<PathBuf, IoError> {
     mut buf: u8[4096];
     const res: u8* = libc::realpath(c_path.as_ptr(), &buf[0]);
     const err: i32 = libc::errno();
-    c_path.drop();
+    mem::drop(c_path);
     if (res == null) {
         return Result::Err(IoError::from_errno(err));
     }
@@ -301,7 +308,7 @@ function canonicalize(p: Path) -> Result<PathBuf, IoError> {
     mut c_path: String = String::with_null(p.as_str());
     mut buf: u8[4096];
     const n: u32 = syscall::GetFullPathNameA(c_path.as_ptr(), 4096, &buf[0], null);
-    c_path.drop();
+    mem::drop(c_path);
     if (n == 0 || n >= 4096) {
         return Result::Err(IoError::new(IoErrorKind::Other, 0));
     }

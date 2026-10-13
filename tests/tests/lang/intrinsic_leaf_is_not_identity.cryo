@@ -1,0 +1,64 @@
+///! An intrinsic is what a call is PINNED to, never what its callee is spelled.
+///! Codegen lowers a call inline only when sema pinned it to a declaration
+///! marked `intrinsic function`; a call through a VALUE - a parameter or a
+///! local holding a function pointer - carries no pin and is a call, whatever
+///! the value is named.  Before the pin decided, an unpinned callee spelled
+///! like a codegen kind was inlined as that kind: `apply(nine, 0x07000000)`
+///! below answered 7 - the byte swap of its argument - instead of 9.  And a
+///! function a user declares under the `try_catch` leaf was lowered as the
+///! catch_unwind primitive, which failed the module's LLVM verification
+///! ("Called function must be a pointer!").
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::IntrinsicLeafIsNotIdentity;
+
+import std::core::result;
+import std::core::result::{ Result };
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+
+function nine(x: u32) -> u32 { return 9; }
+
+// The parameter is spelled like the `bswap32` codegen kind; the call goes
+// through the pointer.
+function apply(bswap32: (u32) -> u32, x: u32) -> u32 { return bswap32(x); }
+
+// A user function under the catch_unwind primitive's leaf; a plain function.
+function try_catch(a: i32, b: i32) -> i32 { return a + b; }
+
+![test]
+function fn_pointer_parameter_named_like_an_intrinsic_is_called() -> Result<(), TestError> {
+    // 0x07000000: the byte swap would answer 7, the call answers 9.
+    const got: u32 = apply(nine, 117440512);
+    const want: u32 = 9;
+    match (expect_eq(got, want)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function fn_pointer_local_named_like_an_intrinsic_is_called() -> Result<(), TestError> {
+    const bswap32: (u32) -> u32 = nine;
+    const got: u32 = bswap32(117440512);
+    const want: u32 = 9;
+    match (expect_eq(got, want)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function user_function_under_the_try_catch_leaf_is_called() -> Result<(), TestError> {
+    const got: i32 = try_catch(3, 4);
+    const want: i32 = 7;
+    match (expect_eq(got, want)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

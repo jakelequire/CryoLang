@@ -1,0 +1,141 @@
+/// ============================ TRIPWIRE ==================================
+///
+/// THE TWO `WRONG_` TESTS BELOW PIN BEHAVIOR docs/cryo.md SAYS IS
+/// WRONG. They pass today because the compiler is wrong today.
+///
+/// IF YOU ARE HERE BECAUSE ONE STARTED FAILING: that is the intended outcome,
+/// and it means someone landed the fix. Do NOT delete the assertion to get
+/// back to green. Move the case to a `compile_fail` project with the right
+/// `expect.diagnostic`, in the same change that made it an error -- which is
+/// exactly what happened to this file's visibility half on 2026-08-05; see
+/// below.
+///
+/// Same trust-loop reasoning as tests/tests/projects/known_fail_canary: a
+/// defect that nothing in CI observes is how this subsystem regressed for
+/// years (§7's opening premise).
+///
+/// ---- WHAT LEFT, AND WHEN ----------------------------------------------
+///
+/// The cross-module `private` call that used to head this file is GONE: the
+/// visibility gate landed on 2026-08-05 and it is now an E0353 error, pinned
+/// through all three of its binding doors at
+/// tests/tests/projects/visibility_gate. The flip was performed exactly as
+/// the instruction above directs -- the case moved, it was not weakened.
+///
+/// What unblocked it was provenance. The gate had been built and reverted on
+/// 2026-08-04 because its "does the use site live in the declaring module?"
+/// exemption asked `current_module_ns()`, the AMBIENT CURSOR, which points at
+/// whatever module is being processed rather than at the module that wrote
+/// the call. The exemption now asks `module_ns_sym_of_file(span.file)`.
+///
+/// The §5.1 half below is untouched and still open.
+///
+/// ========================================================================
+![config(testing)]
+namespace ResolutionTripwire::TripwireTest;
+
+import std::core::result;
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+
+import ResolutionTripwire::Vault;
+
+/// CONTROL for the gate that landed, and it stays HERE rather than moving to
+/// the compile_fail project with the defect: this one has to keep RUNNING.
+/// `visibility_gate` can only assert that a name is absent from a build's
+/// diagnostics, which would still hold if public cross-module calls had been
+/// broken some other way. This executes one and checks the value.
+![test]
+function CONTROL_a_public_function_is_callable_from_another_module()
+        -> Result<(), TestError> {
+    expect_eq(ResolutionTripwire::Vault::door(), 1)?;
+    return Result::Ok(());
+}
+
+// ---- KNOWN DEFECT: a bare name resolves with NOTHING in scope (§5.1) ----
+//
+// §5.1: "The first segment resolves in scope. There is no substring
+// matching, no suffix matching, and no dependence on what other modules
+// happen to exist in the program."
+//
+// `ResolutionTripwire::Orphan` has no `import` statement at all, and names
+// `Crate` in two signatures. `Crate` is declared only by
+// `ResolutionTripwire::Depot`. Nothing binds it in Orphan's scope, so under
+// §5.1 both signatures must be an E0203 "unknown type" -- and instead they
+// resolve, because cascade step 5 (the GLOBAL LEAF INDEX, types/arena.cryo)
+// answers from the whole program without consulting scope at all.
+//
+// MEASURED 2026-08-05, by deleting the equivalent import from
+// tests/projects/generic_name_collision and diffing CRYO_LEAF_AUDIT:
+// removing one import moved exactly 6 resolutions onto the leaf index --
+// 3 logged with a home module set, 3 logged with an EMPTY use-site, the
+// scope-less sites the §5.2 keystone exists to fix. Nothing else in the
+// counter moved.
+//
+// This is §8.2a's root cause reduced to a project small enough to reason
+// about: previously it was only observable as an aggregate over a full
+// compiler build. It is the reason the leaf index cannot simply be deleted
+// -- 2,538 answers in the compiler's own build depend on it, and every one
+// of them is a name that was never in scope.
+//
+// THIS FLIPPED, AND BOTH ARMS WENT. The reachability gate (E0240) landed;
+// `Orphan`'s bare `Crate` is now rejected through BOTH doors, so both cases
+// moved to tests/tests/projects/namespace_gate as a compile_fail. They were
+// moved, not weakened, exactly as the visibility half was -- `Orphan` itself
+// now lives there, which is why this project no longer declares it.
+//
+// One thing did NOT come out clean, and namespace_gate records it: the
+// free-function arm reports E0240 with the declaring module and an import
+// suggestion, while the static-template arm reports E0233 ("no matching
+// static method"). Scope is enforced on both -- the annotation fails to
+// resolve and the template is rejected -- but the static path names the
+// symptom instead of the cause. That is a diagnostic defect, not a hole in
+// the gate, and it is pinned there rather than here.
+//
+// What survives below is the CONTROL half: the qualified path must keep
+// reaching the same type, or a "fix" that made the arms above fail did so by
+// breaking qualified paths rather than by enforcing scope.
+
+// ---- KNOWN DEFECT: a private TYPE that is never NAMED (§7.1's rider) ----
+//
+// The visibility gates that landed 2026-08-10 closed the shapes where the
+// source WRITES the private name: `check_type_name_visibility` runs on
+// annotations and struct literals, and it now asks the resolved qualified
+// symbol rather than the bare leaf, so an unrelated module declaring the same
+// leaf can no longer switch the error off.
+//
+// It cannot reach a type the use site never writes. `issue()` returns a
+// `private Ledger`, the binding below is inferred, and the value crosses the
+// module boundary and answers a method call. MEASURED 2026-08-10 on a scratch
+// project first: same shape, exit 7, the private type's own value.
+//
+// This is why §7.1's rider still stands in narrowed form -- a type-level
+// fallback entry point must be DELETED, not made `private`, because `private`
+// stops the name and not the value.
+
+/// KNOWN DEFECT. Passes because the compiler is wrong here. If this starts
+/// failing, someone closed the last type door: move it to a `compile_fail`
+/// project with the right `expect.diagnostic` in the same change, exactly as
+/// this file's visibility and §5.1 halves were moved. Do NOT weaken it.
+![test]
+function WRONG_a_private_type_crosses_when_the_use_site_never_names_it()
+        -> Result<(), TestError> {
+    mut led = ResolutionTripwire::Vault::issue();
+    expect_eq(led.get(), 7)?;
+    return Result::Ok(());
+}
+
+/// CONTROL. `Depot` is imported nowhere by `Orphan`, but a module that DOES
+/// spell the path in full must keep working -- otherwise a fix that made the
+/// tripwires above fail did so by breaking qualified paths rather than by
+/// enforcing scope.
+![test]
+function CONTROL_a_qualified_path_still_reaches_the_same_type()
+        -> Result<(), TestError> {
+    mut c: ResolutionTripwire::Depot::Crate<i64> =
+        ResolutionTripwire::Depot::Crate::<i64> { v: 25 };
+    expect_eq(c.unwrap(), 25 as i64)?;
+    return Result::Ok(());
+}

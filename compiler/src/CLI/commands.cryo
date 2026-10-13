@@ -1,27 +1,42 @@
-namespace CLI::Commands;
+namespace cli::commands;
 
 import std::fmt;
 import std::env;
 import std::io::stdio;
-import Compiler::{ Instance, CompilationContext, ProjectConfig };
-import Compiler::Codegen::{ Passes };
-import Compiler::Deps::DepResolver;
-import Compiler::Resolver::Demangler;
-import Compiler::Vendor::Registry;
-import Compiler::Bindgen::Generator;
-import Utils;
-import Utils::Logger;
+import compiler::{ compilation_context, instance, project_config };
+import compiler::codegen::{ llvm_types, passes };
+import compiler::deps::dep_resolver;
+import compiler::resolver::demangler;
+import compiler::vendor::registry;
+import compiler::bindgen::generator;
+import utils;
+import utils::logger;
 import std::collections::string;
+import std::collections::string::{ String };
 import std::collections::str;
 import std::fs::file;
 import std::fs::path;
 import std::fs::metadata;
 import std::fs::dir;
+import std::core::intrinsics;
+import std::core::mem;
 import std::process::exec;
 import std::process;
+import std::thread;
+import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::json::parser;
 import std::json::value;
 import std::json::serializer;
+import cli;
+import std::ffi::libc;
+import compiler::codegen::llvm_types;
+import compiler::codegen::passes;
+import compiler::compilation_context;
+import compiler::instance;
+import compiler::project_config;
+import utils::keyword::{ Keyword };
+import utils::build_stamp::{ BuildStamp, StampSlot, VersionReport };
+import compiler::build_manifest;
 
 // Test-output framing (ASCII only). 80-column rules; kept in sync with the
 // unit runner's framing in stdlib/test/runner.cryo so the two suites read
@@ -36,6 +51,16 @@ const NEG_ANSI_GREEN: string = "\x1B[32m";
 const NEG_ANSI_RED:   string = "\x1B[31m";
 const NEG_ANSI_RESET: string = "\x1B[0m";
 
+// `cryo vendor list` framing (ASCII only). Each library is a bordered block
+// whose top rule carries the library's name, so consecutive blocks share one
+// rule and the whole listing reads as a table. Widths are fixed rather than
+// terminal-derived, and a value too wide for its column wraps at a path
+// separator instead of being cut: a truncated path is not something the
+// reader can act on.
+const VENDOR_BOX_WIDTH:   i64 = 76;   // '+' to '+' inclusive
+const VENDOR_LABEL_WIDTH: i64 = 12;
+const VENDOR_VALUE_WIDTH: i64 = 58;   // BOX_WIDTH - 2 bars - 4 padding - LABEL
+
 /// Tally returned by the compile-fail suite so `cmd_test`'s unified
 /// OVERALL footer can quote it alongside the unit-suite outcome.
 type struct NegSuiteResult {
@@ -47,7 +72,7 @@ type struct NegSuiteResult {
 /// must emit a diagnostic at `line`, of `severity` ("error"/"warning"), carrying
 /// `code`, and - when `msg` is non-empty - a message CONTAINING `msg`.  A `//~`
 /// sits on the offending line; each leading `^` backs the target line up one
-/// (`//~^` = previous line), matching the rustc `//~ ERROR` convention.
+/// (`//~^` = previous line).
 type struct NegExpect {
     line:     i64;
     severity: string;
@@ -118,7 +143,7 @@ type struct ProjOutcome {
 // `system(3)`, which runs `sh -c` on a POSIX-hosted compiler and `cmd /c`
 // on a native Windows one.  Two things differ by host and so are gated on
 // the COMPILER's OWN target (ConfigGating strips one side at build time),
-// mirroring the link/hoist helpers in `Compiler::Codegen` (`passes.cryo`):
+// mirroring the link/hoist helpers in `compiler::codegen` (`passes.cryo`):
 //
 //   * Path form: a built binary path like `build/app.exe` carries forward
 //     slashes.  `cmd` will not execute a forward-slash relative path - it
@@ -131,9 +156,10 @@ type struct ProjOutcome {
 /// Rewrite a path's `/` to `\` so a `cmd`-executed command resolves it.
 /// Windows-host only; never referenced on the POSIX side.
 ![target(windows)]
-function exec_path(path: string) -> string {
+function exec_path(path_text: string) -> string {
+    const path: string = path_text;
     const len: u64 = path.length();
-    const buf: i8* = malloc(len + 1) as i8*;
+    const buf: i8* = libc::malloc(len + 1) as i8*;
     const pb: i8* = path as i8*;
     for (mut i: u64 = 0; i < len; i++) {
         const ch: i8 = pb[i];
@@ -145,7 +171,8 @@ function exec_path(path: string) -> string {
 
 /// POSIX shells execute forward-slash paths fine; pass through unchanged.
 ![target(unix)]
-function exec_path(path: string) -> string {
+function exec_path(path_text: string) -> string {
+    const path: string = path_text;
     return path;
 }
 
@@ -168,39 +195,82 @@ function host_os_name() -> string {
     return "macos";
 }
 
+// The platform shell's spelling of "run `cmd` with `dir` as its working
+// directory".  A suite job sets its directory inside its own shell because
+// the process working directory is one value shared by every thread here.
+![target(windows)]
+function shell_in_dir(dir_text: string, cmd_text: string) -> string {
+    const cmd: string = cmd_text;
+    const dir: string = dir_text;
+    return fmt::format("cd /d \"%s\" && %s", dir, cmd);
+}
+
+![target(unix)]
+function shell_in_dir(dir_text: string, cmd_text: string) -> string {
+    const cmd: string = cmd_text;
+    const dir: string = dir_text;
+    return fmt::format("cd \"%s\" && %s", dir, cmd);
+}
+
+/// One batch of shell commands for a suite's worker pool, moved into each
+/// worker by value.  The pointers alias arrays the suite owns and keeps alive
+/// until its scope has joined every worker.  A worker takes the next index off
+/// `cursor`, runs that command, stores its exit status, and only then
+/// publishes `done` for it (release); the suite reads a result only after
+/// seeing `done` (acquire), and reads them strictly in index order, so what it
+/// prints does not depend on which worker finished first.
+type struct ShellJobs {
+    cursor: Atomic<u64>*;
+    cmds:   string*;
+    n:      u64;
+    status: i32*;
+    done:   Atomic<u32>*;
+}
+
+// Pool worker body.  A free function because it is handed to
+// `Scope::spawn` as a plain function pointer.
+function shell_jobs_worker(ctx: ShellJobs) -> void {
+    loop {
+        const k: u64 = (*ctx.cursor).fetch_add(1, MemoryOrder::Relaxed);
+        if (k >= ctx.n) { break; }
+        ctx.status[k] = exec::shell(ctx.cmds[k]);
+        ctx.done[k].store(1, MemoryOrder::Release);
+    }
+}
+
 /// Per-process scratch path for capturing a negative test's compiler
 /// output.  Windows has no `/tmp`, so use `%TEMP%`/`%TMP%` and fall back
 /// to the current directory; the negative suite ran Linux-only before this.
 ![target(windows)]
 function neg_tmp_path() -> string {
-    match (env::var(Str::new("TEMP"))) {
+    match (env::var(str::Str::new("TEMP"))) {
         Option::Some(v) => {
             mut s: String = v;
-            return format("%s\\cryo_negtest_%d.out", s.as_cstr() as string, process::id());
+            return fmt::format("%s\\cryo_negtest_%d.out", s.as_cstr() as string, process::id());
         }
         Option::None => {}
     }
-    match (env::var(Str::new("TMP"))) {
+    match (env::var(str::Str::new("TMP"))) {
         Option::Some(v) => {
             mut s: String = v;
-            return format("%s\\cryo_negtest_%d.out", s.as_cstr() as string, process::id());
+            return fmt::format("%s\\cryo_negtest_%d.out", s.as_cstr() as string, process::id());
         }
         Option::None => {}
     }
-    return format("cryo_negtest_%d.out", process::id());
+    return fmt::format("cryo_negtest_%d.out", process::id());
 }
 
 /// POSIX: honor `$TMPDIR`, else `/tmp`.
 ![target(unix)]
 function neg_tmp_path() -> string {
-    match (env::var(Str::new("TMPDIR"))) {
+    match (env::var(str::Str::new("TMPDIR"))) {
         Option::Some(v) => {
             mut s: String = v;
-            return format("%s/cryo_negtest_%d.out", s.as_cstr() as string, process::id());
+            return fmt::format("%s/cryo_negtest_%d.out", s.as_cstr() as string, process::id());
         }
         Option::None => {}
     }
-    return format("/tmp/cryo_negtest_%d.out", process::id());
+    return fmt::format("/tmp/cryo_negtest_%d.out", process::id());
 }
 
 type enum CommandKind {
@@ -216,6 +286,7 @@ type enum CommandKind {
     Fetch;
     Update;
     Vendor;
+    Stamp;
     Unknown;
 }
 
@@ -234,6 +305,7 @@ implement enum CommandKind {
             CommandKind::Fetch    => { "fetch"    }
             CommandKind::Update   => { "update"   }
             CommandKind::Vendor   => { "vendor"   }
+            CommandKind::Stamp    => { "stamp"    }
             _ => { "" }
         };
     }
@@ -241,7 +313,7 @@ implement enum CommandKind {
     description(&this) -> string {
         return match (this) {
             CommandKind::Help     => { "Display help information"                      }
-            CommandKind::Version  => { "Display version information"                   }
+            CommandKind::Version  => { "Display version information (--verbose: build details; --triple: target triple)" }
             CommandKind::Init     => { "Scaffold a new Cryo project (cryoconfig + main.cryo)" }
             CommandKind::Build    => { "Build a file or cryoconfig project"                    }
             CommandKind::Run      => { "Build the project and run the resulting binary" }
@@ -252,6 +324,7 @@ implement enum CommandKind {
             CommandKind::Fetch    => { "Fetch dependencies and write cryoconfig.lock" }
             CommandKind::Update   => { "Re-resolve every dependency, ignoring the lockfile" }
             CommandKind::Vendor   => { "Register a C library for `import vendor::Name`" }
+            CommandKind::Stamp    => { "Record the checkout a built compiler came from in that binary" }
             _ => { "" }
         };
     }
@@ -259,7 +332,7 @@ implement enum CommandKind {
     usage(&this) -> string {
         return match (this) {
             CommandKind::Help     => { "cryo help [command|flag]"         }
-            CommandKind::Version  => { "cryo version"                     }
+            CommandKind::Version  => { "cryo version [--verbose|--triple]" }
             CommandKind::Init     => { "cryo init [dir]"                  }
             CommandKind::Build    => { "cryo build [file|dir] [flags]"  }
             CommandKind::Run      => { "cryo run [flags]"                 }
@@ -269,7 +342,8 @@ implement enum CommandKind {
             CommandKind::Demangle => { "cryo demangle <mangled-symbol>"  }
             CommandKind::Fetch    => { "cryo fetch"                        }
             CommandKind::Update   => { "cryo update"                       }
-            CommandKind::Vendor   => { "cryo vendor <path>|list|remove <name>|rebuild [name]" }
+            CommandKind::Vendor   => { "cryo vendor <path>|list|remove <name>|clean|rebuild [name]" }
+            CommandKind::Stamp    => { "cryo stamp <binary> [--profile=NAME] [--exclude=PATH,...]" }
             _ => { "" }
         };
     }
@@ -293,7 +367,19 @@ implement enum CommandKind {
             }
             CommandKind::Version => {
                 fmt::printf("Prints the compiler's name and version string, then exits.\n");
-                fmt::printf("Equivalent to the global `--version` / `-v` flag.\n");
+                fmt::printf("Equivalent to the global `--version` / `-v` flag.\n\n");
+                fmt::printf("The version is the release number, its pre-release label, and after\n");
+                fmt::printf("a `+` the first eight hex digits of the commit the compiler was built\n");
+                fmt::printf("from, with `-dirty` when tracked files differed from that commit:\n");
+                fmt::printf("  cryo version 1.0.0-alpha+3f9c2a1b\n");
+                fmt::printf("A compiler that was never stamped (see `cryo help stamp`) prints\n");
+                fmt::printf("`+unknown` there.\n\n");
+                fmt::printf("Flags:\n");
+                fmt::printf("  --verbose   Also print the binary's path and size, the full commit,\n");
+                fmt::printf("              its date, the branch, `git describe`, whether the tree\n");
+                fmt::printf("              was dirty, the LLVM version, the default target triple,\n");
+                fmt::printf("              the stdlib root and the build profile\n");
+                fmt::printf("  --triple    Print only the triple a build with no --target= uses\n");
             }
             CommandKind::Init => {
                 fmt::printf("Interactively scaffolds a new Cryo project.  Prompts for the\n");
@@ -396,12 +482,29 @@ implement enum CommandKind {
                 fmt::printf("                            include_dirs, defines, link, bindings_file).\n");
                 fmt::printf("  cryo vendor list          List registered vendor libraries.\n");
                 fmt::printf("  cryo vendor remove <name> Unregister a library (by name or key).\n");
+                fmt::printf("  cryo vendor clean         Unregister every library whose source path is\n");
+                fmt::printf("                            gone.  Cached bindings are left on disk.\n");
                 fmt::printf("  cryo vendor rebuild [name] Regenerate bindings from a library's recorded\n");
                 fmt::printf("                            source (all libraries when no name is given).\n\n");
                 fmt::printf("The registry is global (per machine), stored under the cryo cache at\n");
                 fmt::printf("`<cache>/vendor/registry.json`; bindings are cached per target triple.\n\n");
                 fmt::printf("Flags:\n");
                 fmt::printf("  --target=TRIPLE   Cache bindings for the given triple (default: host)\n");
+            }
+            CommandKind::Stamp => {
+                fmt::printf("Writes the git checkout in the current directory into a built\n");
+                fmt::printf("compiler: the commit, its date, the branch, `git describe`, whether\n");
+                fmt::printf("tracked files differ from the commit, and the build profile.  The\n");
+                fmt::printf("binary then reports them in `cryo version`.  The build runs this\n");
+                fmt::printf("after linking the compiler; it is not listed in `cryo help`.\n\n");
+                fmt::printf("Only a reserved region of <binary> changes, so stamping alters no\n");
+                fmt::printf("code.  Outside a git checkout the region is cleared, and the binary\n");
+                fmt::printf("reports `unknown`.  A binary with no region, or more than one, is\n");
+                fmt::printf("refused.\n\n");
+                fmt::printf("Flags:\n");
+                fmt::printf("  --profile=NAME      The profile the binary was built with\n");
+                fmt::printf("  --exclude=PATH,...  Tracked paths, from the top of the checkout,\n");
+                fmt::printf("                      whose changes do not make the tree dirty\n");
             }
             _ => {}
         }
@@ -434,7 +537,7 @@ implement enum FlagKind {
     /// `-q`, `-o`), so `cryo help --debug`, `cryo help debug` and
     /// `cryo help -h` all land on the right entry.
     static resolve(topic: string) -> FlagKind {
-        const name: string = ArgumentParser::normalize_flag_name(topic);
+        const name: string = cli::ArgumentParser::normalize_flag_name(topic);
         return match (name) {
             "help"      | "h" => { FlagKind::Help }
             "version"   | "v" => { FlagKind::Version }
@@ -547,42 +650,45 @@ implement enum FlagKind {
 
 type struct Executor {
     /// Registers all built-in commands with the Runner.
-    static register_commands(runner: Runner*) -> void {
+    static register_commands(runner: cli::Runner*) -> void {
         const help: CommandKind = CommandKind::Help;
-        runner.add_command(CLI::Command::new(help.name(), help.description(), help.usage()));
+        runner.add_command(cli::Command::new(help.name(), help.description(), help.usage()));
 
         const version: CommandKind = CommandKind::Version;
-        runner.add_command(CLI::Command::new(version.name(), version.description(), version.usage()));
+        runner.add_command(cli::Command::new(version.name(), version.description(), version.usage()));
 
         const init: CommandKind = CommandKind::Init;
-        runner.add_command(CLI::Command::new(init.name(), init.description(), init.usage()));
+        runner.add_command(cli::Command::new(init.name(), init.description(), init.usage()));
 
         const build: CommandKind = CommandKind::Build;
-        runner.add_command(CLI::Command::new(build.name(), build.description(), build.usage()));
+        runner.add_command(cli::Command::new(build.name(), build.description(), build.usage()));
 
         const run: CommandKind = CommandKind::Run;
-        runner.add_command(CLI::Command::new(run.name(), run.description(), run.usage()));
+        runner.add_command(cli::Command::new(run.name(), run.description(), run.usage()));
 
         const test_cmd: CommandKind = CommandKind::Test;
-        runner.add_command(CLI::Command::new(test_cmd.name(), test_cmd.description(), test_cmd.usage()));
+        runner.add_command(cli::Command::new(test_cmd.name(), test_cmd.description(), test_cmd.usage()));
 
         const check: CommandKind = CommandKind::Check;
-        runner.add_command(CLI::Command::new(check.name(), check.description(), check.usage()));
+        runner.add_command(cli::Command::new(check.name(), check.description(), check.usage()));
 
         const raw: CommandKind = CommandKind::Raw;
-        runner.add_command(CLI::Command::new(raw.name(), raw.description(), raw.usage()));
+        runner.add_command(cli::Command::new(raw.name(), raw.description(), raw.usage()));
 
         const demangle: CommandKind = CommandKind::Demangle;
-        runner.add_command(CLI::Command::new(demangle.name(), demangle.description(), demangle.usage()));
+        runner.add_command(cli::Command::new(demangle.name(), demangle.description(), demangle.usage()));
 
         const fetch: CommandKind = CommandKind::Fetch;
-        runner.add_command(CLI::Command::new(fetch.name(), fetch.description(), fetch.usage()));
+        runner.add_command(cli::Command::new(fetch.name(), fetch.description(), fetch.usage()));
 
         const update: CommandKind = CommandKind::Update;
-        runner.add_command(CLI::Command::new(update.name(), update.description(), update.usage()));
+        runner.add_command(cli::Command::new(update.name(), update.description(), update.usage()));
 
         const vendor: CommandKind = CommandKind::Vendor;
-        runner.add_command(CLI::Command::new(vendor.name(), vendor.description(), vendor.usage()));
+        runner.add_command(cli::Command::new(vendor.name(), vendor.description(), vendor.usage()));
+
+        const stamp: CommandKind = CommandKind::Stamp;
+        runner.add_command(cli::Command::unlisted(stamp.name(), stamp.description(), stamp.usage()));
     }
 
     /// Apply the build-profile and incremental flags shared by
@@ -599,7 +705,7 @@ type struct Executor {
     ///                       the release profile when none is given
     /// `--release` wins over `--dev` wins over `--profile=` when several are
     /// passed. Leaving all unset keeps the cryoconfig `[profile] default`.
-    static apply_profile_flags(config: CompilerConfig*, args: &ParsedArgs) -> void {
+    static apply_profile_flags(config: instance::CompilerConfig*, args: &cli::ParsedArgs) -> void {
         if (args.has_flag("release")) {
             config.profile_override = "release";
         } else if (args.has_flag("dev")) {
@@ -630,7 +736,7 @@ type struct Executor {
     /// Internal child entry for the multi-process object emitter.  Positional
     /// args: `<manifest> <worker_idx> <worker_count>`.  Delegates to the
     /// codegen worker, which reads the manifest and emits this worker's slice.
-    static cmd_emit_obj(args: ParsedArgs) -> int {
+    static cmd_emit_obj(args: cli::ParsedArgs) -> int {
         if (args.positional_count() < 3) {
             fmt::eprintf("__emit-obj: usage: __emit-obj <manifest> <worker_idx> <worker_count>\n");
             return 1;
@@ -638,7 +744,62 @@ type struct Executor {
         const manifest: string = args.positional_at(0);
         const widx:  u32 = args.positional_at(1).parse_c_uint() as u32;
         const wcount: u32 = args.positional_at(2).parse_c_uint() as u32;
-        return CodegenPasses::run_emit_worker(manifest, widx, wcount) as int;
+        return passes::CodegenPasses::run_emit_worker(manifest, widx, wcount) as int;
+    }
+
+    /// `cryo version --verbose`: the version line, then what this binary
+    /// knows about itself.  The stamped fields come from its own stamp
+    /// region; the rest are read now.  The stdlib is the root a build with
+    /// no `--stdlib=` and no project setting would use.
+    static print_version_report(runner: cli::Runner*) -> void {
+        const exe: string = build_manifest::Manifest::self_exe_path();
+        mut size: string = "";
+        if (exe.length() > 0) {
+            match (metadata::metadata(path::Path::from(exe))) {
+                Result::Ok(m) => { size = fmt::format("%d bytes", m.len() as i64); }
+                Result::Err(_) => {}
+            }
+        }
+        const report: VersionReport = VersionReport {
+            version: runner.version_line(),
+            binary:  exe,
+            size:    size,
+            stamp:   BuildStamp::running(),
+            llvm:    LTargetMachine::llvm_version(),
+            target:  LTargetMachine::get_default_triple(),
+            stdlib:  instance::CompilerInstance::resolve_stdlib_root("", "", "", null),
+        };
+        fmt::printf("%s", report.render());
+    }
+
+    /// `cryo stamp <binary>`: write the checkout in the current directory
+    /// into the binary's stamp region.  Outside a checkout the region is
+    /// cleared rather than left holding an earlier checkout's stamp.
+    static cmd_stamp(args: cli::ParsedArgs) -> int {
+        if (args.positional_count() != 1) {
+            const kind: CommandKind = CommandKind::Stamp;
+            fmt::eprintf("usage: %s\n", kind.usage());
+            return 1;
+        }
+        const target: string = args.positional_at(0);
+        mut exclude: string[] = [];
+        if (args.has_arg("exclude")) {
+            exclude = args.get_value("exclude").split_nonempty(",");
+        }
+        const profile: string = if (args.has_arg("profile")) { args.get_value("profile") } else { "" };
+        const stamp: BuildStamp = BuildStamp::from_checkout(exclude, profile);
+        const failure: string = StampSlot::write_into(target, stamp.render());
+        if (failure.length() > 0) {
+            fmt::eprintf("error: cannot stamp %s: %s\n", target, failure);
+            return 1;
+        }
+        if (!stamp.is_stamped()) {
+            fmt::printf("==> %s: not in a git checkout; stamp cleared\n", target);
+            return 0;
+        }
+        fmt::printf("==> %s stamped: %s %s, dirty: %s, profile: %s\n", target,
+            stamp.commit.substr(0, 8), stamp.date, stamp.dirty, stamp.profile);
+        return 0;
     }
 
     /// Resolves a command name string to a CommandKind.
@@ -656,21 +817,40 @@ type struct Executor {
             "fetch"    => { CommandKind::Fetch }
             "update"   => { CommandKind::Update }
             "vendor"   => { CommandKind::Vendor }
+            "stamp"    => { CommandKind::Stamp }
             _          => { CommandKind::Unknown }
         };
     }
 
     /// Entry point from Runner: resolves the name and dispatches.
-    static dispatch(cmd_name: string, runner: Runner*, args: ParsedArgs) -> int {
+    static dispatch(cmd_name: string, runner: cli::Runner*, args: cli::ParsedArgs) -> int {
         const kind: CommandKind = Executor::resolve(cmd_name);
         return Executor::execute(kind, runner, args);
     }
 
     /// Executes a command by its kind.
-    static execute(kind: CommandKind, runner: Runner*, args: ParsedArgs) -> int {
+    static execute(kind: CommandKind, runner: cli::Runner*, args: cli::ParsedArgs) -> int {
         match (kind) {
             CommandKind::Help    => { runner.print_help();    return 0; }
-            CommandKind::Version => { runner.print_version(); return 0; }
+            CommandKind::Version => {
+                if (args.has_flag("triple")) {
+                    // The triple a build with no `--target=` resolves to.  A
+                    // native build's triple comes from a toolchain probe, so
+                    // it is not derivable from the host OS; printing the value
+                    // the linker's own lookup will use is what lets a build
+                    // system name a per-target directory instead of guessing
+                    // one and silently missing it.
+                    fmt::printf("%s
+", LTargetMachine::get_default_triple());
+                    return 0;
+                }
+                if (args.has_flag("verbose")) {
+                    Executor::print_version_report(runner);
+                    return 0;
+                }
+                runner.print_version();
+                return 0;
+            }
             CommandKind::Init    => { return Executor::cmd_init(args); }
             CommandKind::Build   => { return Executor::cmd_build(args); }
             CommandKind::Run     => { return Executor::cmd_run(args); }
@@ -681,6 +861,7 @@ type struct Executor {
             CommandKind::Fetch    => { return Executor::cmd_fetch(args); }
             CommandKind::Update   => { return Executor::cmd_update(args); }
             CommandKind::Vendor   => { return Executor::cmd_vendor(args); }
+            CommandKind::Stamp    => { return Executor::cmd_stamp(args); }
             CommandKind::Unknown => {
                 fmt::eprintf("Error: Unknown command. Run 'cryo help' for usage.\n");
                 return 1;
@@ -813,7 +994,7 @@ type struct Executor {
     /// project-name prompt; pressing Enter at any prompt accepts the
     /// default in brackets, so `cryo init hello && (echo; echo; echo)` is
     /// effectively non-interactive.
-    static cmd_init(args: ParsedArgs) -> int {
+    static cmd_init(args: cli::ParsedArgs) -> int {
         const has_positional: boolean = args.positional_count() > 0;
         const target_dir: string = if (has_positional) {
             args.input_file()
@@ -826,7 +1007,7 @@ type struct Executor {
         // there; we don't have errno-aware bindings yet, so just attempt
         // and let the file writes below fail loudly if the dir is bogus.
         if (target_dir != ".") {
-            mkdir(target_dir, 493);
+            libc::mkdir(target_dir, 493);
         }
 
         // Read the interactive answers straight from fd 0 through the
@@ -867,15 +1048,15 @@ type struct Executor {
         if (src_dir == "." || src_dir == "") {
             src_path = target_dir;
         } else {
-            src_path = format("%s/%s", target_dir, src_dir);
-            mkdir(src_path, 493);
+            src_path = fmt::format("%s/%s", target_dir, src_dir);
+            libc::mkdir(src_path, 493);
         }
 
-        const main_path: string = format("%s/main.cryo", src_path);
+        const main_path: string = fmt::format("%s/main.cryo", src_path);
         const ns_name: string = Executor::derive_namespace(name);
         if (!Executor::write_main_cryo(main_path, ns_name)) { return 1; }
 
-        const config_path: string = format("%s/cryoconfig", target_dir);
+        const config_path: string = fmt::format("%s/cryoconfig", target_dir);
         if (!Executor::write_cryoconfig(config_path, name, src_dir, out_dir, ttype)) { return 1; }
 
         fmt::printf("\n  Created %s\n", config_path);
@@ -890,21 +1071,25 @@ type struct Executor {
 
     /// Read a line from `input`, returning `def` when the user
     /// presses Enter (empty input) or stdin closes.
-    static prompt_default(input: mut &stdio::Stdin, label: string, def: string) -> string {
+    static prompt_default(input: mut &stdio::Stdin, label_text: string, def_text: string) -> string {
+        const def: string = def_text;
+        const label: string = label_text;
         fmt::printf("%s [%s]: ", label, def);
-        fflush(null);
-        return Executor::read_line_or(input, def);
+        libc::fflush(null);
+        return Executor::read_line_or(input, def_text);
     }
 
     /// Like `prompt_default` but with no default: returns the empty
     /// string on EOF / blank input so the caller can reject it.
-    static prompt_required(input: mut &stdio::Stdin, label: string) -> string {
+    static prompt_required(input: mut &stdio::Stdin, label_text: string) -> string {
+        const label: string = label_text;
         fmt::printf("%s: ", label);
-        fflush(null);
+        libc::fflush(null);
         return Executor::read_line_or(input, "");
     }
 
-    static read_line_or(input: mut &stdio::Stdin, def: string) -> string {
+    static read_line_or(input: mut &stdio::Stdin, def_text: string) -> string {
+        const def: string = def_text;
         // Read one line into a local buffer.  Keeping it out of the `match`
         // binding lets it drop as an ordinary local on the `def` paths and
         // be consumed by `into_raw` on the success path.
@@ -940,19 +1125,20 @@ type struct Executor {
         return n;
     }
 
-    static write_main_cryo(path: string, ns_name: string) -> boolean {
-        const f: void* = fopen(path, "w");
+    static write_main_cryo(path_text: string, ns_name: string) -> boolean {
+        const path: string = path_text;
+        const f: void* = libc::fopen(path, "w");
         if (f == null) {
             fmt::eprintf("Error: cannot open %s for writing\n", path);
             return false;
         }
-        const header: string = format("namespace %s;\n\nimport std::fmt;\n\n", ns_name);
-        fputs(header, f);
-        fputs("function main() -> int {\n", f);
-        fputs("    fmt::printf(\"Hello, world!\\n\");\n", f);
-        fputs("    return 0;\n", f);
-        fputs("}\n", f);
-        fclose(f);
+        const header: string = fmt::format("namespace %s;\n\nimport std::fmt;\n\n", ns_name);
+        libc::fputs(header, f);
+        libc::fputs("function main() -> int {\n", f);
+        libc::fputs("    fmt::printf(\"Hello, world!\\n\");\n", f);
+        libc::fputs("    return 0;\n", f);
+        libc::fputs("}\n", f);
+        libc::fclose(f);
         return true;
     }
 
@@ -971,7 +1157,7 @@ type struct Executor {
         const n: u64 = name.length();
         if (n == 0) { return "Main"; }
 
-        const buf: i8* = malloc(n + 1);
+        const buf: i8* = libc::malloc(n + 1) as i8*;
         mut j: u64 = 0;
         for (mut i: u64 = 0; i < n; i++) {
             const ch: char = name[i];
@@ -1009,7 +1195,7 @@ type struct Executor {
             // Qualified for the same reason as module_graph.cryo: bare `free`
             // is ambiguous with `std::alloc::heap::free` until the resolver
             // bug is fixed.
-            intrinsics::free(buf as void*);
+            libc::free(buf as void*);
             return "Main";
         }
         const term: i8* = buf + (j as i64);
@@ -1017,9 +1203,12 @@ type struct Executor {
         return buf as string;
     }
 
-    static write_cryoconfig(path: string, name: string, src_dir: string,
-                            out_dir: string, target_type: string) -> boolean {
-        const f: void* = fopen(path, "w");
+    static write_cryoconfig(path_text: string, name: string, src_dir_text: string,
+                            out_dir_text: string, target_type: string) -> boolean {
+        const out_dir: string = out_dir_text;
+        const path: string = path_text;
+        const src_dir: string = src_dir_text;
+        const f: void* = libc::fopen(path, "w");
         if (f == null) {
             fmt::eprintf("Error: cannot open %s for writing\n", path);
             return false;
@@ -1028,21 +1217,21 @@ type struct Executor {
         // "main.cryo" when source_dir is "." / empty).  Only emit the
         // entry_point key for executables; libraries discover via
         // <source_dir>/lib.cryo instead.
-        fputs("[project]\n", f);
-        fprintf(f, "project_name = \"%s\"\n", name);
-        fprintf(f, "output_dir = \"%s\"\n", out_dir);
-        fprintf(f, "target_type = \"%s\"\n", target_type);
-        fprintf(f, "source_dir = \"%s\"\n", src_dir);
+        libc::fputs("[project]\n", f);
+        libc::fprintf(f, "project_name = \"%s\"\n", name);
+        libc::fprintf(f, "output_dir = \"%s\"\n", out_dir);
+        libc::fprintf(f, "target_type = \"%s\"\n", target_type);
+        libc::fprintf(f, "source_dir = \"%s\"\n", src_dir);
         if (target_type == "executable") {
             if (src_dir == "." || src_dir == "") {
-                fputs("entry_point = \"main.cryo\"\n", f);
+                libc::fputs("entry_point = \"main.cryo\"\n", f);
             } else {
-                fprintf(f, "entry_point = \"%s/main.cryo\"\n", src_dir);
+                libc::fprintf(f, "entry_point = \"%s/main.cryo\"\n", src_dir);
             }
         }
-        fputs("\n[compiler]\n", f);
-        fputs("\n[dependencies]\n", f);
-        fclose(f);
+        libc::fputs("\n[compiler]\n", f);
+        libc::fputs("\n[dependencies]\n", f);
+        libc::fclose(f);
         return true;
     }
 
@@ -1052,12 +1241,12 @@ type struct Executor {
     /// - `cryo build [dir]`:       find the cryoconfig in `dir` (default: `.`)
     ///                              and run a full project build.
     /// - `cryo build`:             same as above with dir = `.`.
-    static cmd_build(args: ParsedArgs) -> int {
+    static cmd_build(args: cli::ParsedArgs) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
-        cdebug("[Build] Starting build process.\n");
+        logger::cdebug("[Build] Starting build process.\n");
 
         const file: string = args.input_file();
 
@@ -1078,7 +1267,7 @@ type struct Executor {
 
         // Project build: find cryoconfig in the given dir (or ".").
         const dir: string = if (file.length() > 0) { file } else { "." };
-        const config_path: string = ProjectConfig::find_cryoconfig(dir);
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(dir);
         if (config_path.length() == 0) {
             if (file.length() > 0) {
                 fmt::eprintf("Error: '%s' is not a .cryo file and no cryoconfig was found in that directory.\n", file);
@@ -1090,11 +1279,11 @@ type struct Executor {
             return 1;
         }
 
-        cdebug("[Build] Found cryoconfig: %s\n", config_path);
+        logger::cdebug("[Build] Found cryoconfig: %s\n", config_path);
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_flag("ast")) {
             config.show_ast = true;
@@ -1130,7 +1319,7 @@ type struct Executor {
         // Never changes the emitted bytes, only build speed.
         if (args.has_arg("codegen-threads")) {
             config.codegen_threads_override =
-                ProjectConfig::parse_codegen_threads(
+                project_config::ProjectConfig::parse_codegen_threads(
                     args.get_value("codegen-threads")) as i32;
         }
         // `-g` / `--debug-info`: emit DWARF source-line debug info.
@@ -1151,13 +1340,13 @@ type struct Executor {
         // `unwind` emits invoke/landingpad cleanup edges + `__cryo_personality_v0`
         // and links the `panic/unwind` runtime tier; `abort` opts back out.
         if (args.has_arg("panic")) {
-            config.panic = PanicStrategy::from_string(args.get_value("panic"));
+            config.panic = project_config::PanicStrategy::from_string(Keyword::new(args.get_value("panic")));
         }
         Executor::apply_profile_flags(&config, &args);
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        cdebug("[Build] Compiling project from config: %s\n", config_path);
-        const result: CompilationResult = compiler.compile_project(config_path);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        logger::cdebug("[Build] Compiling project from config: %s\n", config_path);
+        const result: instance::CompilationResult = compiler.compile_project(config_path);
 
         if (result.success) {
             if (result.output_path.length() > 0) {
@@ -1177,12 +1366,12 @@ type struct Executor {
     /// binary.  Returns the binary's exit code.  Library / stdlib targets
     /// have no entry point and produce no executable, so `run` rejects
     /// them with a clear error rather than silently doing nothing.
-    static cmd_run(args: ParsedArgs) -> int {
+    static cmd_run(args: cli::ParsedArgs) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
-        cdebug("[Run] Building project before execution.\n");
+        logger::cdebug("[Run] Building project before execution.\n");
 
         // Find cryoconfig in CWD (or explicit positional dir).
         const dir: string = if (args.positional_count() > 0) {
@@ -1190,16 +1379,16 @@ type struct Executor {
         } else {
             "."
         };
-        const config_path: string = ProjectConfig::find_cryoconfig(dir);
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(dir);
         if (config_path == "") {
             fmt::eprintf("Error: No cryoconfig found in '%s' or parent directories.\n", dir);
             fmt::eprintf("Usage: cryo run [flags]   (run from a directory containing a cryoconfig)\n");
             return 1;
         }
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_flag("ast")) {
             config.show_ast = true;
@@ -1218,8 +1407,8 @@ type struct Executor {
         }
         Executor::apply_profile_flags(&config, &args);
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        const result: CompilationResult = compiler.compile_project(config_path);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const result: instance::CompilationResult = compiler.compile_project(config_path);
 
         if (!result.success) {
             fmt::eprintf("Project compilation failed (%u errors, %u warnings)\n",
@@ -1234,11 +1423,11 @@ type struct Executor {
             return 1;
         }
 
-        cdebug("[Run] %s\n", result.output_path);
+        logger::cdebug("[Run] %s\n", result.output_path);
         // Flush so the [Run] header appears before the child binary's
         // output (under --debug); otherwise the libc line buffer can
         // interleave them.
-        fflush(null);
+        libc::fflush(null);
         // Run the produced binary through the platform shell (`Command::shell`
         // under the hood), inheriting stdio so its output reaches the terminal.
         // `exec_path` host-normalizes the leading path for the `cmd /c` route on
@@ -1261,23 +1450,23 @@ type struct Executor {
     /// plus the test-runner flags forwarded to the produced binary:
     /// optional positional pattern, `--ignored`, `--list`, `--exact`,
     /// `-q` / `--quiet`.
-    static cmd_test(args: ParsedArgs) -> int {
+    static cmd_test(args: cli::ParsedArgs) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
-        cdebug("[Test] Building test binary.\n");
+        logger::cdebug("[Test] Building test binary.\n");
 
-        const config_path: string = ProjectConfig::find_cryoconfig(".");
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(".");
         if (config_path == "") {
             fmt::eprintf("Error: No cryoconfig found in '.' or parent directories.\n");
             fmt::eprintf("Usage: cryo test [pattern] [flags]   (run from a Cryo project)\n");
             return 1;
         }
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_arg("build-dir")) {
             config.output_dir_override = args.get_value("build-dir");
@@ -1291,8 +1480,8 @@ type struct Executor {
         Executor::apply_profile_flags(&config, &args);
         config.test_mode = true;
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        const result: CompilationResult = compiler.compile_project(config_path);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const result: instance::CompilationResult = compiler.compile_project(config_path);
 
         if (!result.success) {
             fmt::eprintf("Test build failed (%u errors, %u warnings)\n",
@@ -1310,20 +1499,20 @@ type struct Executor {
         // execute it; the appended flags carry no path separators.
         mut cmd: string = exec_path(result.output_path);
         if (args.positional_count() > 0) {
-            cmd = format("%s %s", cmd, args.input_file());
+            cmd = fmt::format("%s %s", cmd, args.input_file());
         }
-        if (args.has_flag("ignored")) { cmd = format("%s --ignored", cmd); }
-        if (args.has_flag("list"))    { cmd = format("%s --list",    cmd); }
-        if (args.has_flag("exact"))   { cmd = format("%s --exact",   cmd); }
-        if (args.has_flag("quiet"))   { cmd = format("%s --quiet",   cmd); }
-        if (args.has_flag("q"))       { cmd = format("%s -q",        cmd); }
+        if (args.has_flag("ignored")) { cmd = fmt::format("%s --ignored", cmd); }
+        if (args.has_flag("list"))    { cmd = fmt::format("%s --list",    cmd); }
+        if (args.has_flag("exact"))   { cmd = fmt::format("%s --exact",   cmd); }
+        if (args.has_flag("quiet"))   { cmd = fmt::format("%s --quiet",   cmd); }
+        if (args.has_flag("q"))       { cmd = fmt::format("%s -q",        cmd); }
         // Worker count and per-test timeout (value-bearing); capture controls
         // (boolean). Forwarded so `cryo test --jobs=1 --nocapture` reaches the
         // runner; each also has a `CRYO_TEST_*` env fallback.
-        if (args.has_arg("jobs"))        { cmd = format("%s --jobs=%s", cmd, args.get_value("jobs")); }
-        if (args.has_arg("timeout"))     { cmd = format("%s --timeout=%s", cmd, args.get_value("timeout")); }
-        if (args.has_flag("nocapture"))  { cmd = format("%s --nocapture",  cmd); }
-        if (args.has_flag("show-output")) { cmd = format("%s --show-output", cmd); }
+        if (args.has_arg("jobs"))        { cmd = fmt::format("%s --jobs=%s", cmd, args.get_value("jobs")); }
+        if (args.has_arg("timeout"))     { cmd = fmt::format("%s --timeout=%s", cmd, args.get_value("timeout")); }
+        if (args.has_flag("nocapture"))  { cmd = fmt::format("%s --nocapture",  cmd); }
+        if (args.has_flag("show-output")) { cmd = fmt::format("%s --show-output", cmd); }
 
         // Resolve --format and --color once. CLI wins over cryoconfig; the
         // resolved values are forwarded to the unit-test binary AND drive the
@@ -1337,7 +1526,7 @@ type struct Executor {
             col_choice = args.get_value("color");
         }
         if (fmt_choice.length() == 0 || col_choice.length() == 0) {
-            const proj_cfg: ProjectConfig = ProjectConfig::parse(config_path);
+            const proj_cfg: project_config::ProjectConfig = project_config::ProjectConfig::parse(config_path);
             if (fmt_choice.length() == 0 && proj_cfg.test_format.length() > 0) {
                 fmt_choice = proj_cfg.test_format;
             }
@@ -1346,10 +1535,10 @@ type struct Executor {
             }
         }
         if (fmt_choice.length() > 0) {
-            cmd = format("%s --format=%s", cmd, fmt_choice);
+            cmd = fmt::format("%s --format=%s", cmd, fmt_choice);
         }
         if (col_choice.length() > 0) {
-            cmd = format("%s --color=%s", cmd, col_choice);
+            cmd = fmt::format("%s --color=%s", cmd, col_choice);
         }
 
         // Resolve this compiler's own path (via /proc/self/exe) and the
@@ -1363,17 +1552,17 @@ type struct Executor {
         }
         mut stdlib_abs: string = "";
         if (result.stdlib_root.length() > 0) {
-            match (dir::canonicalize(Path::from(result.stdlib_root))) {
+            match (dir::canonicalize(path::Path::from(result.stdlib_root))) {
                 Result::Ok(pb)  => { stdlib_abs = pb.into_raw(); }
                 Result::Err(_)  => { stdlib_abs = result.stdlib_root; }
             }
         }
 
-        cdebug("[Test] %s\n", cmd);
+        logger::cdebug("[Test] %s\n", cmd);
         // Flush parent stdio before spawning so the [Test] header lands
         // before the child's output under --debug.  Same precaution as
         // `cmd_run`.
-        fflush(null);
+        libc::fflush(null);
         const status: i32 = exec::shell(cmd);
         if (status < 0) {
             fmt::eprintf("Error: failed to spawn '%s'\n", result.output_path);
@@ -1393,10 +1582,13 @@ type struct Executor {
             const proj_root: string = Executor::dir_of(config_path);
             mut pattern: string = "";
             if (args.positional_count() > 0) { pattern = args.input_file(); }
-            const neg_dir: string = format("%s/tests/negative", proj_root);
+            mut jobs_value: string = "";
+            if (args.has_arg("jobs")) { jobs_value = args.get_value("jobs"); }
+            const jobs: u32 = Executor::suite_jobs(jobs_value);
+            const neg_dir: string = fmt::format("%s/tests/negative", proj_root);
             const neg_res: NegSuiteResult =
                 Executor::run_negative_suite(self_exe, stdlib_abs, neg_dir,
-                                             pattern, fmt_choice, col_choice);
+                                             pattern, fmt_choice, col_choice, jobs);
             neg_ran      = neg_res.ran;
             neg_failures = neg_res.failures;
             if (neg_failures > 0 && exit_code == 0) {
@@ -1407,10 +1599,10 @@ type struct Executor {
             // tests/projects/ carrying a test.json. Driven via this compiler
             // as a subprocess (collect / build / run). Absent dir is a
             // clean no-op.
-            const proj_dir: string = format("%s/tests/projects", proj_root);
+            const proj_dir: string = fmt::format("%s/tests/projects", proj_root);
             const proj_res: NegSuiteResult =
                 Executor::run_projects_suite(self_exe, stdlib_abs, proj_dir,
-                                             pattern, fmt_choice, col_choice);
+                                             pattern, fmt_choice, col_choice, jobs);
             proj_ran      = proj_res.ran;
             proj_failures = proj_res.failures;
             if (proj_failures > 0 && exit_code == 0) {
@@ -1453,7 +1645,8 @@ type struct Executor {
     /// Directory portion of `path` (everything before the last `/`), or
     /// "." when there is no slash. Used to locate tests/negative relative
     /// to the resolved cryoconfig.
-    static dir_of(path: string) -> string {
+    static dir_of(path_text: string) -> string {
+        const path: string = path_text;
         const n: u64 = path.length();
         if (n == 0) { return "."; }
         mut i: i64 = (n - 1) as i64;
@@ -1461,7 +1654,7 @@ type struct Executor {
             const c: i8 = *((path as i8*) + (i as u64));
             if (c == 47 || c == 92) {            // '/' or '\' (Windows)
                 if (i == 0) { return "/"; }
-                const buf: i8* = malloc((i as u64) + 1) as i8*;
+                const buf: i8* = libc::malloc((i as u64) + 1) as i8*;
                 mut k: u64 = 0;
                 while (k < i as u64) {
                     buf[k] = *((path as i8*) + k);
@@ -1476,8 +1669,9 @@ type struct Executor {
     }
 
     /// Read a file's full contents, or "" if it can't be opened.
-    static read_file_or_empty(path: string) -> string {
-        match (file::read_to_string(Path::from(path))) {
+    static read_file_or_empty(path_text: string) -> string {
+        const path: string = path_text;
+        match (file::read_to_string(path::Path::from(path))) {
             Result::Ok(s)  => { return s.into_raw(); }
             Result::Err(_) => { return ""; }
         }
@@ -1485,7 +1679,8 @@ type struct Executor {
 
     /// Pull the expected error code out of a `![config(negative, <code>)]`
     /// directive in `content`. Returns "" if absent.
-    static neg_code_from(content: string) -> string {
+    static neg_code_from(content_text: string) -> string {
+        const content: string = content_text;
         const idx: i64 = content.find("config(negative");
         if (idx < 0) { return ""; }
         mut p: i8* = (content as i8*) + (idx as u64) + ("config(negative".length() as u64);
@@ -1510,12 +1705,13 @@ type struct Executor {
             p++;
         }
         buf[i] = 0;
-        return format("%s", &buf[0] as string);
+        return fmt::format("%s", &buf[0] as string);
     }
 
     /// Read a base-10 unsigned integer from `s` starting at byte `start`,
     /// stopping at the first non-digit.  -1 if no digit is present.
-    static neg_parse_uint(s: string, start: u64) -> i64 {
+    static neg_parse_uint(s_text: string, start: u64) -> i64 {
+        const s: string = s_text;
         const n: u64 = s.length();
         mut v: i64 = 0;
         mut k: u64 = start;
@@ -1533,7 +1729,9 @@ type struct Executor {
 
     /// True if the FIRST line of `view` (up to '\n') contains `needle`.  Used to
     /// bind a `-->` arrow to the test file without scanning the rest of output.
-    static neg_line_contains(view: string, needle: string) -> boolean {
+    static neg_line_contains(view_text: string, needle_text: string) -> boolean {
+        const needle: string = needle_text;
+        const view: string = view_text;
         const n: u64 = view.length();
         mut eol: u64 = 0;
         while (eol < n && *((view as i8*) + eol) != 10) { eol += 1; }
@@ -1555,7 +1753,8 @@ type struct Executor {
     /// LINE (the integer after the second-to-last colon of the arrow line).
     /// Parsing from the tail is Windows-safe: a drive-letter colon (`C:\...`)
     /// sits earlier and never becomes one of the final two.  -1 if unparseable.
-    static neg_arrow_line(view: string) -> i64 {
+    static neg_arrow_line(view_text: string) -> i64 {
+        const view: string = view_text;
         const n: u64 = view.length();
         mut k: u64 = 0;
         mut last_colon: i64 = -1;
@@ -1570,14 +1769,15 @@ type struct Executor {
             k += 1;
         }
         if (prev_colon < 0) { return -1; }
-        return Executor::neg_parse_uint(view, (prev_colon as u64) + 1);
+        return Executor::neg_parse_uint(view_text, (prev_colon as u64) + 1);
     }
 
     /// Parse every `//~ [^...] <SEV>[<CODE>] <msg>` expectation out of a negative
     /// test's source.  `SEV` is `ERROR` or `WARN`/`WARNING`; each `^` after `//~`
     /// backs the target line up one (`//~^` = previous line).  `<msg>` (the rest
     /// of the line, trimmed) is an optional message-substring assertion.
-    static parse_neg_expectations(content: string) -> NegExpect[] {
+    static parse_neg_expectations(content_text: string) -> NegExpect[] {
+        const content: string = content_text;
         mut out: NegExpect[] = [];
         const clen: u64 = content.length();
         mut line_no: i64 = 1;
@@ -1606,7 +1806,7 @@ type struct Executor {
                 sev_buf[sj] = sc; sj += 1; p += 1;
             }
             sev_buf[sj] = 0;
-            const sev_raw: string = format("%s", &sev_buf[0] as string);
+            const sev_raw: string = fmt::format("%s", &sev_buf[0] as string);
             mut severity: string = "";
             if (sev_raw == "ERROR") { severity = "error"; }
             else if (sev_raw == "WARN" || sev_raw == "WARNING") { severity = "warning"; }
@@ -1623,7 +1823,7 @@ type struct Executor {
                 code_buf[cj] = cc; cj += 1; p += 1;
             }
             code_buf[cj] = 0;
-            const code: string = format("%s", &code_buf[0] as string);
+            const code: string = fmt::format("%s", &code_buf[0] as string);
             if (p < clen && *((content as i8*) + p) == 93) { p += 1; }
             // Optional message substring: the rest of the line, trimmed.
             while (p < clen && *((content as i8*) + p) == 32) { p += 1; }
@@ -1636,7 +1836,7 @@ type struct Executor {
             }
             while (mj > 0 && (mbuf[mj - 1] == 32 || mbuf[mj - 1] == 13)) { mj -= 1; }
             mbuf[mj] = 0;
-            const msg: string = format("%s", &mbuf[0] as string);
+            const msg: string = fmt::format("%s", &mbuf[0] as string);
             out.push(NegExpect { line: line_no - up, severity: severity,
                                  code: code, msg: msg });
             i = p;   // resume at the line's '\n' (or EOF); line_no advances there
@@ -1648,7 +1848,8 @@ type struct Executor {
     /// anchored in the test file `fname` (its basename must appear in the `-->`
     /// arrow line).  Scoping to the file keeps `//~` exhaustiveness from tripping
     /// on stdlib-internal diagnostics.
-    static parse_diagnostics(out: string, fname: string) -> NegDiag[] {
+    static parse_diagnostics(out_text: string, fname_text: string) -> NegDiag[] {
+        const out: string = out_text;
         mut diags: NegDiag[] = [];
         const n: u64 = out.length();
         mut off: u64 = 0;
@@ -1682,7 +1883,7 @@ type struct Executor {
                 code_buf[cj] = *((hview as i8*) + q); cj += 1; q += 1;
             }
             code_buf[cj] = 0;
-            const code: string = format("%s", &code_buf[0] as string);
+            const code: string = fmt::format("%s", &code_buf[0] as string);
             // Message = header line after "]: ", up to end-of-line.
             mut mstart: u64 = (rb as u64) + 1;
             while (mstart < hview.length()
@@ -1699,14 +1900,14 @@ type struct Executor {
                 mbuf[mj] = mc; mj += 1; r += 1;
             }
             mbuf[mj] = 0;
-            const message: string = format("%s", &mbuf[0] as string);
+            const message: string = fmt::format("%s", &mbuf[0] as string);
             // Source line from the first "-->" arrow inside this block, IF it
             // names the test file.
             const arel: i64 = hview.find("-->");
             mut lineno: i64 = -1;
             if (arel >= 0 && habs + (arel as u64) < next_habs) {
                 const aview: string = ((out as i8*) + habs + (arel as u64)) as string;
-                if (Executor::neg_line_contains(aview, fname)) {
+                if (Executor::neg_line_contains(aview, fname_text)) {
                     lineno = Executor::neg_arrow_line(aview);
                 }
             }
@@ -1724,8 +1925,8 @@ type struct Executor {
     /// (severity + code + line, and the message-substring when given), and every
     /// diagnostic anchored in the file must be annotated - so an unexpected
     /// cascade fails the test.  "" on success, else a one-line reason.
-    static check_annotations(anns: &NegExpect[], out: string, fname: string) -> string {
-        const diags: NegDiag[] = Executor::parse_diagnostics(out, fname);
+    static check_annotations(anns: &NegExpect[], out_text: string, fname_text: string) -> string {
+        const diags: NegDiag[] = Executor::parse_diagnostics(out_text, fname_text);
         for (mut a: i64 = 0; a < anns.length; a++) {
             const e: NegExpect* = &anns[a];
             mut matched: boolean = false;
@@ -1738,10 +1939,10 @@ type struct Executor {
             }
             if (!matched) {
                 if (e.msg.length() > 0) {
-                    return format("expected %s[%s] at line %lld containing \"%s\"",
+                    return fmt::format("expected %s[%s] at line %lld containing \"%s\"",
                         e.severity, e.code, e.line, e.msg);
                 }
-                return format("expected %s[%s] at line %lld",
+                return fmt::format("expected %s[%s] at line %lld",
                     e.severity, e.code, e.line);
             }
         }
@@ -1755,7 +1956,7 @@ type struct Executor {
                 }
             }
             if (!ann) {
-                return format("unannotated %s[%s] at line %lld (add a `//~` or fix the cascade)",
+                return fmt::format("unannotated %s[%s] at line %lld (add a `//~` or fix the cascade)",
                     g.severity, g.code, g.line);
             }
         }
@@ -1766,11 +1967,12 @@ type struct Executor {
     /// on/off decision for ANSI color emission. Auto checks `NO_COLOR`
     /// (presence forces off, per https://no-color.org/) and `isatty(1)`.
     /// Mirrors `resolve_color_active` in `stdlib/test/runner.cryo`.
-    static neg_color_active(col_choice: string) -> boolean {
+    static neg_color_active(col_choice_text: string) -> boolean {
+        const col_choice: string = col_choice_text;
         if (col_choice == "always") { return true;  }
         if (col_choice == "never")  { return false; }
         // "auto" or "" (default): NO_COLOR > isatty.
-        match (env::var(Str::new("NO_COLOR"))) {
+        match (env::var(str::Str::new("NO_COLOR"))) {
             Option::Some(_) => { return false; }
             Option::None => {}
         }
@@ -1803,9 +2005,52 @@ type struct Executor {
     /// runner's positional filter). `fmt_choice` / `col_choice` mirror the
     /// unit runner's `--format=` / `--color=` surface so the two halves of
     /// `cryo test` paint identically.
+    /// Worker count for the compile-fail and project suites, resolved the way
+    /// the unit runner resolves its own: `--jobs=N` (`cli_value`, "" when the
+    /// flag is absent), else `CRYO_TEST_JOBS`; 0, neither, or a value that is
+    /// not a whole number means the CPU count.  `1` runs one child at a time.
+    static suite_jobs(cli_value_text: string) -> u32 {
+        const cli_value: string = cli_value_text;
+        mut n: u32 = 0;
+        if (cli_value.length() > 0) {
+            match (u32::try_from(str::Str::new(cli_value))) {
+                Result::Ok(v)  => { n = v; }
+                Result::Err(_) => { }
+            }
+        } else {
+            match (env::var(str::Str::new("CRYO_TEST_JOBS"))) {
+                Option::Some(s) => {
+                    match (u32::try_from(s.as_str())) {
+                        Result::Ok(v)  => { n = v; }
+                        Result::Err(_) => { }
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        if (n == 0) { n = thread::available_parallelism(); }
+        if (n == 0) { n = 1; }
+        return n;
+    }
+
+    /// Block until worker `k` of a suite's pool has published its result.
+    static wait_job(done: Atomic<u32>*, k: u64) -> void {
+        while (done[k].load(MemoryOrder::Acquire) == 0) {
+            thread::sleep_ms(1);
+        }
+    }
+
+    /// Each suite job's own capture file: jobs run at once, so one shared
+    /// scratch path would be overwritten by whichever finished last.
+    static job_tmp_path(tmp_text: string, k: u64) -> string {
+        const tmp: string = tmp_text;
+        return fmt::format("%s.%llu", tmp, k);
+    }
+
     static run_negative_suite(self_exe: string, stdlib_abs: string,
                               neg_dir: string, pattern: string,
-                              fmt_choice: string, col_choice: string)
+                              fmt_choice: string, col_choice: string,
+                              jobs: u32)
             -> NegSuiteResult {
         // Pre-pass: count how many entries actually survive the filter.
         // Suppresses the entire compile-fail section (header + body + summary)
@@ -1813,15 +2058,15 @@ type struct Executor {
         // unit-only runs don't leave an empty stub block behind. We close
         // and reopen the dir between passes because there's no `rewinddir`
         // intrinsic in core::intrinsics.
-        const pre_dp: void* = opendir(neg_dir);
+        const pre_dp: void* = libc::opendir(neg_dir);
         if (pre_dp == null) {
             // No tests/negative -> nothing to do.
             return NegSuiteResult { ran: 0, failures: 0 };
         }
         mut to_run: i32 = 0;
-        mut pre_entry: void* = readdir(pre_dp);
+        mut pre_entry: void* = libc::readdir(pre_dp);
         while (pre_entry != null) {
-            const pn: string = dirent_name(pre_entry);
+            const pn: string = intrinsics::dirent_name(pre_entry);
             const pnl: u64 = pn.length();
             // We deliberately do NOT filter on `dirent_type` here: mingw-w64's
             // `struct dirent` has no `d_type` field, so the `dirent_type`
@@ -1834,13 +2079,13 @@ type struct Executor {
                 && (pattern == "" || pn.contains(pattern))) {
                 to_run += 1;
             }
-            pre_entry = readdir(pre_dp);
+            pre_entry = libc::readdir(pre_dp);
         }
-        closedir(pre_dp);
+        libc::closedir(pre_dp);
         if (to_run == 0) {
             return NegSuiteResult { ran: 0, failures: 0 };
         }
-        const dp: void* = opendir(neg_dir);
+        const dp: void* = libc::opendir(neg_dir);
         if (dp == null) {
             return NegSuiteResult { ran: 0, failures: 0 };
         }
@@ -1862,109 +2107,151 @@ type struct Executor {
             fmt::printf("compile-fail                                      ");
         }
 
+        // Collect the entries in directory order first.  Only the `cryo check`
+        // children run on the worker pool; every verdict below is judged and
+        // printed in this order, whatever order the children finish in.
         const tmp: string = neg_tmp_path();
-        mut failures: i32 = 0;
-        mut ran: i32 = 0;
-        mut entry: void* = readdir(dp);
+        mut names:    string[] = [];
+        mut contents: string[] = [];
+        mut expects:  string[] = [];
+        mut job_of:   i64[]    = [];
+        mut cmds:     string[] = [];
+        mut entry: void* = libc::readdir(dp);
         while (entry != null) {
-            const name: string = dirent_name(entry);
-            if (name == "." || name == "..") {
-                entry = readdir(dp); continue;
-            }
+            // Copied: the next `readdir` reuses the buffer the name points into.
+            const name: string = fmt::format("%s", intrinsics::dirent_name(entry));
+            entry = libc::readdir(dp);
+            if (name == "." || name == "..") { continue; }
             // No `dirent_type` filter - see the pre-pass note above (mingw has
             // no d_type); the ".cryo" extension check below is the real filter.
             const nlen: u64 = name.length();
-            if (nlen <= 5) { entry = readdir(dp); continue; }
+            if (nlen <= 5) { continue; }
             const ext: string = name + ((nlen - 5) as u64);
-            if (ext != ".cryo") { entry = readdir(dp); continue; }
-            if (pattern != "" && !name.contains(pattern)) {
-                entry = readdir(dp); continue;
-            }
+            if (ext != ".cryo") { continue; }
+            if (pattern != "" && !name.contains(pattern)) { continue; }
 
-            const full: string = format("%s/%s", neg_dir, name);
+            const full: string = fmt::format("%s/%s", neg_dir, name);
             const content: string = Executor::read_file_or_empty(full);
             const expected: string = Executor::neg_code_from(content);
-
-            // Per-test prefix: Plain emits `test (negative) NAME ... ` up
-            // front so a hang is visible; Pretty emits `  NAME ... ` with
-            // the same intent; Compact stays silent until the result lands.
-            if (is_pretty) {
-                fmt::printf("  %s ... ", name);
-            } else if (!is_compact) {
-                fmt::printf("test (negative) %s ... ", name);
-            }
-            fflush(null);
-
+            names.push(name);
+            contents.push(content);
+            expects.push(expected);
             if (expected.length() == 0) {
-                if (is_compact) {
-                    fmt::printf("F");
-                } else if (is_pretty) {
-                    Executor::neg_chip_fail(color_on);
-                    fmt::printf("  (no ![config(negative, <code>)] directive)\n");
+                job_of.push(-1);
+            } else {
+                const out_path: string = Executor::job_tmp_path(tmp, cmds.length as u64);
+                job_of.push(cmds.length as i64);
+                if (stdlib_abs.length() > 0) {
+                    cmds.push(fmt::format("%s check %s --stdlib=%s > %s 2>&1",
+                        self_exe, full, stdlib_abs, out_path));
                 } else {
-                    fmt::printf("FAILED (no ![config(negative, <code>)] directive)\n");
+                    cmds.push(fmt::format("%s check %s > %s 2>&1", self_exe, full, out_path));
                 }
-                failures += 1; ran += 1; entry = readdir(dp); continue;
+            }
+        }
+        libc::closedir(dp);
+
+        const n_jobs: u64 = cmds.length as u64;
+        mut status: i32[] = [];
+        mut done: Atomic<u32>[] = [];
+        for (mut k: u64 = 0; k < n_jobs; k++) {
+            status.push(0);
+            done.push(Atomic::<u32>::new(0));
+        }
+        mut cursor: Atomic<u64> = Atomic::<u64>::new(0);
+        mut failures: i32 = 0;
+        mut ran: i32 = 0;
+        libc::fflush(null);
+        {
+            // Joined when this block ends, after the last verdict is read.
+            mut scope: thread::Scope = thread::Scope::new();
+            mut w: u32 = 0;
+            while (w < jobs && (w as u64) < n_jobs) {
+                scope.spawn::<ShellJobs>(ShellJobs {
+                    cursor: &cursor, cmds: cmds.as_ptr(), n: n_jobs,
+                    status: status.as_ptr(), done: done.as_ptr()
+                }, shell_jobs_worker);
+                w = w + 1;
             }
 
-            mut runcmd: string;
-            if (stdlib_abs.length() > 0) {
-                runcmd = format("%s check %s --stdlib=%s > %s 2>&1",
-                    self_exe, full, stdlib_abs, tmp);
-            } else {
-                runcmd = format("%s check %s > %s 2>&1", self_exe, full, tmp);
-            }
-            fflush(null);
-            exec::shell(runcmd);
-            const out: string = Executor::read_file_or_empty(tmp);
-            // Warning codes (`W....`) render as `warning[Wxxxx]`; everything else
-            // as `error[Exxxx]`.  A warning-only file still exits 0, but the suite
-            // asserts on the rendered marker, not the exit status.
-            mut marker: string = "error";
-            if (expected.length() > 0 && (*(expected as i8*)) == 87) {   // 'W'
-                marker = "warning";
-            }
-            const want: string = format("%s[%s]", marker, expected);
-            mut passed: boolean = out.contains(want);
-            // When the file carries `//~` annotations, ALSO assert each one's
-            // message text and source line, and that every diagnostic anchored in
-            // the file is annotated (so an unexpected cascade fails).  Files with
-            // no annotations keep the code-presence-only behavior.
-            mut detail: string = "";
-            if (passed) {
-                const anns: NegExpect[] = Executor::parse_neg_expectations(content);
-                if (anns.length > 0) {
-                    detail = Executor::check_annotations(&anns, out, name);
-                    if (detail.length() > 0) { passed = false; }
+            for (mut i: i64 = 0; i < names.length as i64; i++) {
+                const name: string = names[i];
+                const content: string = contents[i];
+                const expected: string = expects[i];
+
+                // Per-test prefix: Plain emits `test (negative) NAME ... ` up
+                // front so a hang is visible; Pretty emits `  NAME ... ` with
+                // the same intent; Compact stays silent until the result lands.
+                if (is_pretty) {
+                    fmt::printf("  %s ... ", name);
+                } else if (!is_compact) {
+                    fmt::printf("test (negative) %s ... ", name);
                 }
-            }
-            if (passed) {
-                if (is_compact) {
-                    fmt::printf(".");
-                } else if (is_pretty) {
-                    Executor::neg_chip_pass(color_on);
-                    fmt::printf("\n");
+                libc::fflush(null);
+
+                if (expected.length() == 0) {
+                    if (is_compact) {
+                        fmt::printf("F");
+                    } else if (is_pretty) {
+                        Executor::neg_chip_fail(color_on);
+                        fmt::printf("  (no ![config(negative, <code>)] directive)\n");
+                    } else {
+                        fmt::printf("FAILED (no ![config(negative, <code>)] directive)\n");
+                    }
+                    failures += 1; ran += 1; continue;
+                }
+
+                const k: u64 = job_of[i] as u64;
+                Executor::wait_job(done.as_ptr(), k);
+                const out_path: string = Executor::job_tmp_path(tmp, k);
+                const out: string = Executor::read_file_or_empty(out_path);
+                dir::remove_file(path::Path::from(out_path));
+                // Warning codes (`W....`) render as `warning[Wxxxx]`; everything else
+                // as `error[Exxxx]`.  A warning-only file still exits 0, but the suite
+                // asserts on the rendered marker, not the exit status.
+                mut marker: string = "error";
+                if (expected.length() > 0 && (*(expected as i8*)) == 87) {   // 'W'
+                    marker = "warning";
+                }
+                const want: string = fmt::format("%s[%s]", marker, expected);
+                mut passed: boolean = out.contains(want);
+                // When the file carries `//~` annotations, ALSO assert each one's
+                // message text and source line, and that every diagnostic anchored in
+                // the file is annotated (so an unexpected cascade fails).  Files with
+                // no annotations keep the code-presence-only behavior.
+                mut detail: string = "";
+                if (passed) {
+                    const anns: NegExpect[] = Executor::parse_neg_expectations(content);
+                    if (anns.length > 0) {
+                        detail = Executor::check_annotations(&anns, out, name);
+                        if (detail.length() > 0) { passed = false; }
+                    }
+                }
+                if (passed) {
+                    if (is_compact) {
+                        fmt::printf(".");
+                    } else if (is_pretty) {
+                        Executor::neg_chip_pass(color_on);
+                        fmt::printf("\n");
+                    } else {
+                        fmt::printf("ok\n");
+                    }
                 } else {
-                    fmt::printf("ok\n");
+                    if (is_compact) {
+                        fmt::printf("F");
+                    } else if (is_pretty) {
+                        Executor::neg_chip_fail(color_on);
+                        if (detail.length() > 0) { fmt::printf("  (%s)\n", detail); }
+                        else { fmt::printf("  (expected %s)\n", expected); }
+                    } else {
+                        if (detail.length() > 0) { fmt::printf("FAILED (%s)\n", detail); }
+                        else { fmt::printf("FAILED (expected %s)\n", expected); }
+                    }
+                    failures += 1;
                 }
-            } else {
-                if (is_compact) {
-                    fmt::printf("F");
-                } else if (is_pretty) {
-                    Executor::neg_chip_fail(color_on);
-                    if (detail.length() > 0) { fmt::printf("  (%s)\n", detail); }
-                    else { fmt::printf("  (expected %s)\n", expected); }
-                } else {
-                    if (detail.length() > 0) { fmt::printf("FAILED (%s)\n", detail); }
-                    else { fmt::printf("FAILED (expected %s)\n", expected); }
-                }
-                failures += 1;
+                ran += 1;
             }
-            ran += 1;
-            entry = readdir(dp);
         }
-        closedir(dp);
-        dir::remove_file(Path::from(tmp));
 
         // Compact: close out the single in-flight line with the tally.
         if (is_compact && ran > 0) {
@@ -1996,7 +2283,7 @@ type struct Executor {
     /// Copy a borrowed `Str` into an owned NUL-terminated C string. The copy
     /// outlives the `JsonValue` it was read from (which we drop right after
     /// parsing), so the dispatch logic can keep using it.
-    static dup_cstr(s: Str) -> string {
+    static dup_cstr(s: str::Str) -> string {
         mut owned: String = String::from_str(s);
         return owned.into_raw();
     }
@@ -2036,11 +2323,11 @@ type struct Executor {
     /// True when a single `requires` token holds (see `proj_first_unmet_requirement`).
     static proj_requirement_met(req: string) -> boolean {
         if (req == "display") {
-            match (env::var(Str::new("DISPLAY"))) {
+            match (env::var(str::Str::new("DISPLAY"))) {
                 Option::Some(v) => { mut s: String = v; if (s.length() > 0) { return true; } }
                 Option::None => {}
             }
-            match (env::var(Str::new("WAYLAND_DISPLAY"))) {
+            match (env::var(str::Str::new("WAYLAND_DISPLAY"))) {
                 Option::Some(v) => { mut s: String = v; return s.length() > 0; }
                 Option::None => {}
             }
@@ -2048,12 +2335,12 @@ type struct Executor {
         }
         if (req.starts_with("vendor:")) {
             const lib: string = req + 7;   // strip "vendor:"
-            const reg: VendorRegistry = VendorRegistry::load_global();
+            const reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
             const idx: i64 = reg.find_index(lib);
             if (idx < 0) { return false; }
             const f: string = reg.entries[idx].cache_file_for(
-                VendorRegistry::normalize_triple(""));
-            return f.length() > 0 && metadata::exists(Path::from(f));
+                registry::VendorRegistry::normalize_triple(""));
+            return f.length() > 0 && metadata::exists(path::Path::from(f));
         }
         if (req.starts_with("os:")) {
             // The project's sources hard-use one platform's surface (e.g.
@@ -2082,10 +2369,11 @@ type struct Executor {
 
     /// Parse a project's `test.json` into a `ProjSpec`. Returns `None` if the
     /// file is malformed (the caller reports that as a failing project).
-    static parse_test_json(content: string) -> Option<ProjSpec> {
-        mut root: JsonValue = match (parser::parse(Str::from(content))) {
+    static parse_test_json(content_text: string) -> Option<ProjSpec> {
+        const content: string = content_text;
+        mut root: value::JsonValue = match (parser::parse(str::Str::from(content))) {
             Result::Ok(v)      => { v }
-            Result::Err(mut e) => { e.drop(); return Option::None; }
+            Result::Err(e)     => { mem::drop(e); return Option::None; }
         };
         mut spec: ProjSpec = ProjSpec {
             outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
@@ -2095,12 +2383,12 @@ type struct Executor {
         // Outcome selects the FIXTURE: collect (default) / build / run.
         // `compile_fail` is a recognized alias for `build` + `fails`, so the
         // pre-orthogonal spelling keeps working.
-        const build_str: Str = Str::new("build");
-        const cf_str:    Str = Str::new("compile_fail");
-        const run_str:   Str = Str::new("run");
-        match (root.get(Str::new("outcome"))) {
+        const build_str: str::Str = str::Str::new("build");
+        const cf_str:    str::Str = str::Str::new("compile_fail");
+        const run_str:   str::Str = str::Str::new("run");
+        match (root.get(str::Str::new("outcome"))) {
             Option::Some(vp) => {
-                match (vp.as<Str>()) {
+                match (vp.as::<str::Str>()) {
                     Option::Some(os) => {
                         if (os.equals(&build_str))    { spec.outcome = 1; }
                         else if (os.equals(&cf_str))  { spec.outcome = 1; spec.fails = true; }
@@ -2111,22 +2399,22 @@ type struct Executor {
             }
             Option::None => { }
         }
-        match (root.get(Str::new("ignore"))) {
+        match (root.get(str::Str::new("ignore"))) {
             Option::Some(vp) => {
-                match (vp.as<boolean>()) {
+                match (vp.as::<boolean>()) {
                     Option::Some(b) => { spec.ignore = b; }
                     Option::None    => { }
                 }
             }
             Option::None => { }
         }
-        match (root.get(Str::new("requires"))) {
+        match (root.get(str::Str::new("requires"))) {
             Option::Some(rp) => {
                 const n: u64 = rp.length();
                 for (mut i: u64 = 0; i < n; i++) {
                     match (rp.at(i)) {
                         Option::Some(ep) => {
-                            match (ep.as<Str>()) {
+                            match (ep.as::<str::Str>()) {
                                 Option::Some(es) => { spec.requires.push(Executor::dup_cstr(es)); }
                                 Option::None     => { }
                             }
@@ -2137,20 +2425,20 @@ type struct Executor {
             }
             Option::None => { }
         }
-        match (root.get(Str::new("expect"))) {
+        match (root.get(str::Str::new("expect"))) {
             Option::Some(ep) => {
-                match (ep.get(Str::new("exit_code"))) {
+                match (ep.get(str::Str::new("exit_code"))) {
                     Option::Some(xp) => {
-                        match (xp.as<i64>()) {
+                        match (xp.as::<i64>()) {
                             Option::Some(n) => { spec.exit_code = n; }
                             Option::None    => { }
                         }
                     }
                     Option::None => { }
                 }
-                match (ep.get(Str::new("fails"))) {
+                match (ep.get(str::Str::new("fails"))) {
                     Option::Some(fp) => {
-                        match (fp.as<boolean>()) {
+                        match (fp.as::<boolean>()) {
                             Option::Some(b) => { spec.fails = b; }
                             Option::None    => { }
                         }
@@ -2160,35 +2448,35 @@ type struct Executor {
                 // `diagnostic` is sugar for a failing build that must emit a
                 // specific error code: it sets `fails` and appends the
                 // `error[<code>]` marker to `output_contains`.
-                match (ep.get(Str::new("diagnostic"))) {
+                match (ep.get(str::Str::new("diagnostic"))) {
                     Option::Some(dp) => {
-                        match (dp.as<Str>()) {
+                        match (dp.as::<str::Str>()) {
                             Option::Some(ds) => {
                                 const dcode: string = Executor::dup_cstr(ds);
                                 spec.fails = true;
-                                spec.output_contains.push(format("error[%s]", dcode));
+                                spec.output_contains.push(fmt::format("error[%s]", dcode));
                             }
                             Option::None     => { }
                         }
                     }
                     Option::None => { }
                 }
-                match (ep.get(Str::new("stdout_contains"))) {
+                match (ep.get(str::Str::new("stdout_contains"))) {
                     Option::Some(sp) => {
-                        match (sp.as<Str>()) {
+                        match (sp.as::<str::Str>()) {
                             Option::Some(ss) => { spec.stdout_sub = Executor::dup_cstr(ss); }
                             Option::None     => { }
                         }
                     }
                     Option::None => { }
                 }
-                match (ep.get(Str::new("output_contains"))) {
+                match (ep.get(str::Str::new("output_contains"))) {
                     Option::Some(ap) => {
                         const n: u64 = ap.length();
                         for (mut i: u64 = 0; i < n; i++) {
                             match (ap.at(i)) {
                                 Option::Some(iv) => {
-                                    match (iv.as<Str>()) {
+                                    match (iv.as::<str::Str>()) {
                                         Option::Some(is) => { spec.output_contains.push(Executor::dup_cstr(is)); }
                                         Option::None     => { }
                                     }
@@ -2199,13 +2487,13 @@ type struct Executor {
                     }
                     Option::None => { }
                 }
-                match (ep.get(Str::new("output_excludes"))) {
+                match (ep.get(str::Str::new("output_excludes"))) {
                     Option::Some(ap) => {
                         const n: u64 = ap.length();
                         for (mut i: u64 = 0; i < n; i++) {
                             match (ap.at(i)) {
                                 Option::Some(iv) => {
-                                    match (iv.as<Str>()) {
+                                    match (iv.as::<str::Str>()) {
                                         Option::Some(is) => { spec.output_excludes.push(Executor::dup_cstr(is)); }
                                         Option::None     => { }
                                     }
@@ -2219,14 +2507,15 @@ type struct Executor {
             }
             Option::None => { }
         }
-        root.drop();
+        mem::drop(root);
         return Option::Some(spec);
     }
 
     /// True if `<projects_dir>/<name>/test.json` exists and `name` is a real
     /// subdirectory entry (not `.`/`..`) passing the optional `pattern`.
-    static proj_marker_path(projects_dir: string, name: string) -> string {
-        return format("%s/%s/test.json", projects_dir, name);
+    static proj_marker_path(projects_dir_text: string, name: string) -> string {
+        const projects_dir: string = projects_dir_text;
+        return fmt::format("%s/%s/test.json", projects_dir, name);
     }
 
     /// Run every multi-module test project under `projects_dir`. Each project
@@ -2238,31 +2527,32 @@ type struct Executor {
     /// `projects_dir` is a clean no-op (returns {0,0}).
     static run_projects_suite(self_exe: string, stdlib_abs: string,
                               projects_dir: string, pattern: string,
-                              fmt_choice: string, col_choice: string)
+                              fmt_choice: string, col_choice: string,
+                              jobs: u32)
             -> NegSuiteResult {
         // Pre-pass: count projects (subdirs with a readable test.json that
         // pass the filter) so an empty/absent dir prints no section at all.
-        const pre_dp: void* = opendir(projects_dir);
+        const pre_dp: void* = libc::opendir(projects_dir);
         if (pre_dp == null) {
             return NegSuiteResult { ran: 0, failures: 0 };
         }
         mut to_run: i32 = 0;
-        mut pre_entry: void* = readdir(pre_dp);
+        mut pre_entry: void* = libc::readdir(pre_dp);
         while (pre_entry != null) {
-            const pn: string = dirent_name(pre_entry);
+            const pn: string = intrinsics::dirent_name(pre_entry);
             if (pn != "." && pn != ".."
                 && (pattern == "" || pn.contains(pattern))) {
                 const tj: string = Executor::proj_marker_path(projects_dir, pn);
-                if (metadata::exists(Path::from(tj))) { to_run += 1; }
+                if (metadata::exists(path::Path::from(tj))) { to_run += 1; }
             }
-            pre_entry = readdir(pre_dp);
+            pre_entry = libc::readdir(pre_dp);
         }
-        closedir(pre_dp);
+        libc::closedir(pre_dp);
         if (to_run == 0) {
             return NegSuiteResult { ran: 0, failures: 0 };
         }
 
-        const dp: void* = opendir(projects_dir);
+        const dp: void* = libc::opendir(projects_dir);
         if (dp == null) {
             return NegSuiteResult { ran: 0, failures: 0 };
         }
@@ -2280,27 +2570,29 @@ type struct Executor {
             fmt::printf("projects                                          ");
         }
 
+        // Decide every project in directory order first: its test.json, its
+        // requirements, and - for the ones that run - its command.  Only the
+        // commands run on the worker pool; every verdict below is reported in
+        // this order, whatever order the children finish in.
+        //   verdict_of[i]: 0 run job_of[i], 1 malformed test.json, 2 ignored,
+        //                  3 unknown requirement, 4 unmet requirement,
+        //                  5 project directory missing
         const tmp: string = neg_tmp_path();
-        mut failures: i32 = 0;
-        mut ran: i32 = 0;
-        mut entry: void* = readdir(dp);
+        mut names:      string[]   = [];
+        mut verdict_of: i32[]      = [];
+        mut reason_of:  string[]   = [];
+        mut job_of:     i64[]      = [];
+        mut specs:      ProjSpec[] = [];
+        mut cmds:       string[]   = [];
+        mut entry: void* = libc::readdir(dp);
         while (entry != null) {
-            const name: string = dirent_name(entry);
-            if (name == "." || name == "..") {
-                entry = readdir(dp); continue;
-            }
-            if (pattern != "" && !name.contains(pattern)) {
-                entry = readdir(dp); continue;
-            }
+            // Copied: the next `readdir` reuses the buffer the name points into.
+            const name: string = fmt::format("%s", intrinsics::dirent_name(entry));
+            entry = libc::readdir(dp);
+            if (name == "." || name == "..") { continue; }
+            if (pattern != "" && !name.contains(pattern)) { continue; }
             const tj: string = Executor::proj_marker_path(projects_dir, name);
-            if (!metadata::exists(Path::from(tj))) { entry = readdir(dp); continue; }
-
-            if (is_pretty) {
-                fmt::printf("  %s ... ", name);
-            } else if (!is_compact) {
-                fmt::printf("test (project) %s ... ", name);
-            }
-            fflush(null);
+            if (!metadata::exists(path::Path::from(tj))) { continue; }
 
             const content: string = Executor::read_file_or_empty(tj);
             mut spec: ProjSpec = ProjSpec {
@@ -2312,58 +2604,126 @@ type struct Executor {
                 Option::Some(s) => { spec = s; parsed_ok = true; }
                 Option::None    => { parsed_ok = false; }
             }
+            mut verdict: i32 = 0;
+            mut reason: string = "";
+            const proj_dir: string = fmt::format("%s/%s", projects_dir, name);
             if (!parsed_ok) {
-                Executor::proj_report(is_pretty, is_compact, color_on, false,
-                    "malformed test.json");
-                failures += 1; ran += 1; entry = readdir(dp); continue;
-            }
-            if (spec.ignore) {
-                if (is_compact) { fmt::printf("i"); }
-                else if (is_pretty) { fmt::printf("[IGNORED]\n"); }
-                else { fmt::printf("ignored\n"); }
-                entry = readdir(dp); continue;
-            }
-
-            // A `requires` token the harness doesn't recognize is a hard
-            // FAILURE, not a skip: a typo'd requirement would otherwise
-            // silently change semantics from "gated" to "always-run".
-            const unknown_req: string = Executor::proj_first_unknown_requirement(&spec.requires);
-            if (unknown_req.length() > 0) {
-                Executor::proj_report(is_pretty, is_compact, color_on, false,
-                    format("unknown requires token \"%s\"", unknown_req));
-                failures += 1; ran += 1; entry = readdir(dp); continue;
-            }
-
-            // Environment-gated skip: a project declaring `requires` runs only
-            // where every prerequisite holds (a display, a registered vendor
-            // lib, ...); elsewhere it is skipped WITH A REASON, never counted as
-            // a failure, so a portable `make test` stays green.
-            const unmet: string = Executor::proj_first_unmet_requirement(&spec.requires);
-            if (unmet.length() > 0) {
-                if (is_compact) { fmt::printf("s"); }
-                else if (is_pretty) { fmt::printf("[SKIPPED: requires %s]\n", unmet); }
-                else { fmt::printf("skipped (requires %s)\n", unmet); }
-                entry = readdir(dp); continue;
-            }
-
-            const proj_dir: string = format("%s/%s", projects_dir, name);
-            const res: ProjOutcome =
-                Executor::dispatch_project(self_exe, stdlib_abs, proj_dir, &spec, tmp);
-            Executor::proj_report(is_pretty, is_compact, color_on, res.passed, res.detail);
-            if (!res.passed) {
-                failures += 1;
-                // Surface the captured subprocess output on failure so the
-                // reason is visible (kept quiet on success).
-                if (!is_compact) {
-                    const out: string = Executor::read_file_or_empty(tmp);
-                    if (out.length() > 0) { fmt::printf("%s\n", out); }
+                verdict = 1;
+            } else if (spec.ignore) {
+                verdict = 2;
+            } else {
+                // A `requires` token the harness doesn't recognize is a hard
+                // FAILURE, not a skip: a typo'd requirement would otherwise
+                // silently change semantics from "gated" to "always-run".
+                const unknown_req: string = Executor::proj_first_unknown_requirement(&spec.requires);
+                // Environment-gated skip: a project declaring `requires` runs
+                // only where every prerequisite holds (a display, a registered
+                // vendor lib, ...); elsewhere it is skipped WITH A REASON, never
+                // counted as a failure, so a portable `make test` stays green.
+                if (unknown_req.length() > 0) {
+                    verdict = 3; reason = unknown_req;
+                } else {
+                    const unmet: string = Executor::proj_first_unmet_requirement(&spec.requires);
+                    if (unmet.length() > 0) {
+                        verdict = 4; reason = unmet;
+                    } else if (!metadata::exists(path::Path::from(proj_dir))) {
+                        verdict = 5; reason = proj_dir;
+                    }
                 }
             }
-            ran += 1;
-            entry = readdir(dp);
+            names.push(name);
+            verdict_of.push(verdict);
+            reason_of.push(reason);
+            if (verdict == 0) {
+                const out_path: string = Executor::job_tmp_path(tmp, cmds.length as u64);
+                job_of.push(cmds.length as i64);
+                cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir, &spec, out_path));
+            } else {
+                job_of.push(-1);
+            }
+            specs.push(spec);
         }
-        closedir(dp);
-        dir::remove_file(Path::from(tmp));
+        libc::closedir(dp);
+
+        const n_jobs: u64 = cmds.length as u64;
+        mut status: i32[] = [];
+        mut done: Atomic<u32>[] = [];
+        for (mut k: u64 = 0; k < n_jobs; k++) {
+            status.push(0);
+            done.push(Atomic::<u32>::new(0));
+        }
+        mut cursor: Atomic<u64> = Atomic::<u64>::new(0);
+        mut failures: i32 = 0;
+        mut ran: i32 = 0;
+        libc::fflush(null);
+        {
+            // Joined when this block ends, after the last verdict is read.
+            mut scope: thread::Scope = thread::Scope::new();
+            mut w: u32 = 0;
+            while (w < jobs && (w as u64) < n_jobs) {
+                scope.spawn::<ShellJobs>(ShellJobs {
+                    cursor: &cursor, cmds: cmds.as_ptr(), n: n_jobs,
+                    status: status.as_ptr(), done: done.as_ptr()
+                }, shell_jobs_worker);
+                w = w + 1;
+            }
+
+            for (mut i: i64 = 0; i < names.length as i64; i++) {
+                const name: string = names[i];
+                if (is_pretty) {
+                    fmt::printf("  %s ... ", name);
+                } else if (!is_compact) {
+                    fmt::printf("test (project) %s ... ", name);
+                }
+                libc::fflush(null);
+
+                const verdict: i32 = verdict_of[i];
+                if (verdict == 1) {
+                    Executor::proj_report(is_pretty, is_compact, color_on, false,
+                        "malformed test.json");
+                    failures += 1; ran += 1; continue;
+                }
+                if (verdict == 2) {
+                    if (is_compact) { fmt::printf("i"); }
+                    else if (is_pretty) { fmt::printf("[IGNORED]\n"); }
+                    else { fmt::printf("ignored\n"); }
+                    continue;
+                }
+                if (verdict == 3) {
+                    Executor::proj_report(is_pretty, is_compact, color_on, false,
+                        fmt::format("unknown requires token \"%s\"", reason_of[i]));
+                    failures += 1; ran += 1; continue;
+                }
+                if (verdict == 4) {
+                    if (is_compact) { fmt::printf("s"); }
+                    else if (is_pretty) { fmt::printf("[SKIPPED: requires %s]\n", reason_of[i]); }
+                    else { fmt::printf("skipped (requires %s)\n", reason_of[i]); }
+                    continue;
+                }
+                if (verdict == 5) {
+                    Executor::proj_report(is_pretty, is_compact, color_on, false,
+                        fmt::format("cannot chdir to %s", reason_of[i]));
+                    failures += 1; ran += 1; continue;
+                }
+
+                const k: u64 = job_of[i] as u64;
+                Executor::wait_job(done.as_ptr(), k);
+                const out_path: string = Executor::job_tmp_path(tmp, k);
+                const res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path);
+                Executor::proj_report(is_pretty, is_compact, color_on, res.passed, res.detail);
+                if (!res.passed) {
+                    failures += 1;
+                    // Surface the captured subprocess output on failure so the
+                    // reason is visible (kept quiet on success).
+                    if (!is_compact) {
+                        const out: string = Executor::read_file_or_empty(out_path);
+                        if (out.length() > 0) { fmt::printf("%s\n", out); }
+                    }
+                }
+                dir::remove_file(path::Path::from(out_path));
+                ran += 1;
+            }
+        }
 
         if (is_compact && ran > 0) {
             fmt::printf("   %d ok", ran - failures);
@@ -2393,7 +2753,8 @@ type struct Executor {
     /// Print one project's PASS/FAIL line in the active format. `detail` is
     /// shown after a FAIL (e.g. "expected E0200").
     static proj_report(is_pretty: boolean, is_compact: boolean,
-                       color_on: boolean, passed: boolean, detail: string) -> void {
+                       color_on: boolean, passed: boolean, detail_text: string) -> void {
+        const detail: string = detail_text;
         if (passed) {
             if (is_compact)      { fmt::printf("."); }
             else if (is_pretty)  { Executor::neg_chip_pass(color_on); fmt::printf("\n"); }
@@ -2409,60 +2770,67 @@ type struct Executor {
         }
     }
 
-    /// Drive one project to its declared outcome by running this compiler in
-    /// the project directory (`chdir` in, run, `chdir` back). All paths handed
-    /// to the subprocess (`self_exe`, `stdlib_abs`, `tmp`) are absolute so the
-    /// changed cwd doesn't break them.
-    static dispatch_project(self_exe: string, stdlib_abs: string,
-                            proj_dir: string, spec: &ProjSpec, tmp: string)
-            -> ProjOutcome {
-        mut cwd_buf: i8[4096];
-        const got: i8* = getcwd(&cwd_buf[0], 4096);
-        const saved_cwd: string = if (got != null) { format("%s", &cwd_buf[0] as string) } else { "." };
-        if (chdir(proj_dir) != 0) {
-            return ProjOutcome { passed: false, detail: format("cannot chdir to %s", proj_dir) };
-        }
-
+    /// The shell command that drives one project to its declared outcome: this
+    /// compiler run in the project directory, its combined output captured in
+    /// `tmp`.  The directory is set inside the command's own shell, never by
+    /// `chdir`, because projects run concurrently and the process working
+    /// directory is shared.  All paths handed to the subprocess (`self_exe`,
+    /// `stdlib_abs`, `tmp`) are absolute so the changed cwd doesn't break them.
+    static project_command(self_exe_text: string, stdlib_abs_text: string,
+                           proj_dir_text: string, spec: &ProjSpec, tmp_text: string) -> string {
+        const self_exe: string = self_exe_text;
+        const stdlib_abs: string = stdlib_abs_text;
+        const tmp: string = tmp_text;
         mut std_flag: string = "";
-        if (stdlib_abs.length() > 0) { std_flag = format(" --stdlib=%s", stdlib_abs); }
+        if (stdlib_abs.length() > 0) { std_flag = fmt::format(" --stdlib=%s", stdlib_abs); }
+        if (spec.outcome == 1 || spec.outcome == 2) {
+            // FIXTURE build (`cryo build`) or run (`cryo run`); both capture the
+            // combined stdout+stderr so the ASSERTIONS in `project_outcome`
+            // can scan it.
+            const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
+            return shell_in_dir(proj_dir_text,
+                fmt::format("%s %s%s > %s 2>&1", self_exe, verb, std_flag, tmp));
+        }
+        // collect: run the project's own `cryo test`.
+        return shell_in_dir(proj_dir_text,
+            fmt::format("%s test --format=plain%s > %s 2>&1", self_exe, std_flag, tmp));
+    }
 
+    /// Judge one project from its command's exit status `st` and the output
+    /// captured in `tmp`.
+    static project_outcome(spec: &ProjSpec, st: i32, tmp_text: string) -> ProjOutcome {
         mut passed: boolean = false;
         mut detail: string = "";
 
         if (spec.outcome == 1 || spec.outcome == 2) {
-            // FIXTURE build (`cryo build`) or run (`cryo run`); both capture the
-            // combined stdout+stderr so the ASSERTIONS below can scan it.  The
-            // fixture and the checks are orthogonal: a failing build is just
-            // build + `fails`, a diagnostic is `fails` + an `output_contains`
-            // marker (both folded in at parse time).
+            // The fixture and the checks are orthogonal: a failing build is
+            // just build + `fails`, a diagnostic is `fails` + an
+            // `output_contains` marker (both folded in at parse time).
             const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
-            const cmd: string = format("%s %s%s > %s 2>&1", self_exe, verb, std_flag, tmp);
-            fflush(null);
-            const st: i32 = exec::shell(cmd);
             const ec: i64 = st as i64;
-            const out: string = Executor::read_file_or_empty(tmp);
+            const out: string = Executor::read_file_or_empty(tmp_text);
 
             if (spec.fails) {
                 passed = ec != 0;
-                if (!passed) { detail = format("expected %s to fail (exit non-zero)", verb); }
+                if (!passed) { detail = fmt::format("expected %s to fail (exit non-zero)", verb); }
             } else {
                 passed = ec == spec.exit_code;
-                if (!passed) { detail = format("exit %lld, expected %lld", ec, spec.exit_code); }
+                if (!passed) { detail = fmt::format("exit %lld, expected %lld", ec, spec.exit_code); }
             }
             if (passed && spec.stdout_sub.length() > 0) {
                 passed = out.contains(spec.stdout_sub);
-                if (!passed) { detail = format("output missing \"%s\"", spec.stdout_sub); }
+                if (!passed) { detail = fmt::format("output missing \"%s\"", spec.stdout_sub); }
             }
             for (mut i: i64 = 0; passed && i < spec.output_contains.length; i++) {
                 if (!out.contains(spec.output_contains[i])) {
                     passed = false;
-                    detail = format("output missing \"%s\"", spec.output_contains[i]);
+                    detail = fmt::format("output missing \"%s\"", spec.output_contains[i]);
                 }
             }
             for (mut i: i64 = 0; passed && i < spec.output_excludes.length; i++) {
                 if (out.contains(spec.output_excludes[i])) {
                     passed = false;
-                    detail = format("output must not contain \"%s\"", spec.output_excludes[i]);
+                    detail = fmt::format("output must not contain \"%s\"", spec.output_excludes[i]);
                 }
             }
         } else {
@@ -2473,9 +2841,6 @@ type struct Executor {
             // expect_* / Result propagation / runner exit codes that converts
             // failures into passes flips the canary's exit to 0 and fails the
             // canary project (and the suite) instead of shipping silently.
-            const cmd: string = format("%s test --format=plain%s > %s 2>&1", self_exe, std_flag, tmp);
-            fflush(null);
-            const st: i32 = exec::shell(cmd);
             if (spec.fails) {
                 passed = st != 0;
                 if (!passed) { detail = "expected project tests to FAIL (exit non-zero)"; }
@@ -2484,15 +2849,13 @@ type struct Executor {
                 if (!passed) { detail = "project tests failed"; }
             }
         }
-
-        chdir(saved_cwd);
         return ProjOutcome { passed: passed, detail: detail };
     }
 
     /// `cryo check <file>`: frontend + semantic analysis, no codegen.
-    static cmd_check(args: ParsedArgs) -> int {
+    static cmd_check(args: cli::ParsedArgs) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
         const file: string = args.input_file();
@@ -2501,9 +2864,9 @@ type struct Executor {
             return 1;
         }
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_flag("ast")) {
             config.show_ast = true;
@@ -2515,8 +2878,8 @@ type struct Executor {
             config.target_triple_override = args.get_value("target");
         }
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        const result: CompilationResult = compiler.compile_for_check(file);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const result: instance::CompilationResult = compiler.compile_for_check(file);
 
         if (result.success) {
             if (result.warning_count > 0) {
@@ -2535,9 +2898,9 @@ type struct Executor {
     }
 
     /// `cryo raw <file>`: compile without stdlib or prelude.
-    static cmd_raw(args: ParsedArgs) -> int {
+    static cmd_raw(args: cli::ParsedArgs) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
         const file: string = args.input_file();
@@ -2546,16 +2909,16 @@ type struct Executor {
             return 1;
         }
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_flag("ast")) {
             config.show_ast = true;
         }
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        const result: CompilationResult = compiler.compile_raw(file);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const result: instance::CompilationResult = compiler.compile_raw(file);
 
         if (result.success) {
             fmt::printf("Compilation succeeded.\n");
@@ -2575,7 +2938,7 @@ type struct Executor {
     /// variable expansions even inside double quotes; by the time argv
     /// reaches us, every `$<letter>` segment is gone.  Use single quotes
     /// (`'C$...$Rv'`) or pipe the symbol on stdin to avoid it.
-    static cmd_demangle(args: ParsedArgs) -> int {
+    static cmd_demangle(args: cli::ParsedArgs) -> int {
         // Positional form: demangle the single argument.
         if (args.positional_count() > 0) {
             const sym: string = args.input_file();
@@ -2617,8 +2980,9 @@ type struct Executor {
     /// Prints the demangled form of a single symbol, with a quoting hint
     /// when the input looks like a shell-expanded mangled name (starts
     /// with `C` but no `$` follows (typical when bash ate the `$` tokens).
-    static print_demangled(sym: string) -> void {
-        const pretty: string = Demangler::demangle(sym);
+    static print_demangled(sym_text: string) -> void {
+        const sym: string = sym_text;
+        const pretty: string = demangler::Demangler::demangle(sym);
         fmt::printf("\n%s\n", pretty);
         if (Executor::looks_shell_expanded(sym)) {
             fmt::printf("(hint: input has no `$` tokens; looks like the shell expanded them.\n");
@@ -2657,10 +3021,11 @@ type struct Executor {
     /// payloads here, so the rejection reason rides alongside the kind.
     /// `is_rejected = true` means the extension is one we explicitly
     /// refuse (e.g. `.a` archive); the caller should print an error.
-    static infer_output_kind(path: string, mut rejected: boolean*) -> OutputKind {
+    static infer_output_kind(path_text: string, mut rejected: boolean*) -> compilation_context::OutputKind {
+        const path: string = path_text;
         *rejected = false;
         const len: i64 = path.length() as i64;
-        if (len == 0) { return OutputKind::Exe; }
+        if (len == 0) { return compilation_context::OutputKind::Exe; }
         // Find last '/' and last '.' so we only look at the basename's
         // extension.
         mut last_slash: i64 = -1;
@@ -2672,33 +3037,34 @@ type struct Executor {
         }
         if (last_dot < 0 || last_dot == last_slash + 1) {
             // No extension, or hidden file like `.foo` with no real ext
-            return OutputKind::Exe;
+            return compilation_context::OutputKind::Exe;
         }
         const ext: string = path + ((last_dot + 1) as i64);
-        if (ext == "o")   { return OutputKind::Object; }
-        if (ext == "asm") { return OutputKind::Asm; }
-        if (ext == "s")   { return OutputKind::Asm; }
-        if (ext == "ll")  { return OutputKind::IRText; }
-        if (ext == "a")   { *rejected = true; return OutputKind::None; }
+        if (ext == "o")   { return compilation_context::OutputKind::Object; }
+        if (ext == "asm") { return compilation_context::OutputKind::Asm; }
+        if (ext == "s")   { return compilation_context::OutputKind::Asm; }
+        if (ext == "ll")  { return compilation_context::OutputKind::IRText; }
+        if (ext == "a")   { *rejected = true; return compilation_context::OutputKind::None; }
         // Unknown extension: caller may want an executable named like
         // `foo.bin` or `tool.exe`.  Treat as Exe; the link step writes
         // the bytes regardless of suffix.
-        return OutputKind::Exe;
+        return compilation_context::OutputKind::Exe;
     }
 
     /// Compiles a single file directly from a path.
     /// Routes through CompilerInstance for proper phase management.
-    static compile_file(file_path: string, args: ParsedArgs) -> int {
+    static compile_file(file_path_text: string, args: cli::ParsedArgs) -> int {
+        const file_path: string = file_path_text;
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
-        cdebug("[Compile] Compiling file: %s\n", file_path);
+        logger::cdebug("[Compile] Compiling file: %s\n", file_path);
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
 
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_flag("ast")) {
             config.show_ast = true;
@@ -2730,7 +3096,7 @@ type struct Executor {
         // Never changes the emitted bytes, only build speed.
         if (args.has_arg("codegen-threads")) {
             config.codegen_threads_override =
-                ProjectConfig::parse_codegen_threads(
+                project_config::ProjectConfig::parse_codegen_threads(
                     args.get_value("codegen-threads")) as i32;
         }
         // `-g` / `--debug-info`: emit DWARF source-line debug info.
@@ -2747,7 +3113,7 @@ type struct Executor {
         }
         // `--panic=<abort|unwind>`: exception strategy (default unwind).
         if (args.has_arg("panic")) {
-            config.panic = PanicStrategy::from_string(args.get_value("panic"));
+            config.panic = project_config::PanicStrategy::from_string(Keyword::new(args.get_value("panic")));
         }
 
         // `-o PATH` / `--output PATH`: single-file output redirect.
@@ -2766,7 +3132,7 @@ type struct Executor {
         if (args.has_arg("output")) { out_path = args.get_value("output"); }
         if (out_path.length() > 0) {
             mut rejected: boolean = false;
-            const kind: OutputKind = Executor::infer_output_kind(out_path, &rejected);
+            const kind: compilation_context::OutputKind = Executor::infer_output_kind(out_path, &rejected);
             if (rejected) {
                 fmt::eprintf("Error: unsupported output extension for '%s'\n", out_path);
                 fmt::printf("  supported: .o (object), .asm/.s (assembly), .ll (LLVM IR text), no-extension (executable)\n");
@@ -2776,8 +3142,8 @@ type struct Executor {
             config.output_kind          = kind;
         }
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        const result: CompilationResult = compiler.compile_file(file_path);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const result: instance::CompilationResult = compiler.compile_file(file_path_text);
 
         if (result.success) {
             if (result.output_path.length() > 0) {
@@ -2796,31 +3162,31 @@ type struct Executor {
     /// `cryo fetch`: resolve every dep against its remote, materialize
     /// missing checkouts, and write `cryoconfig.lock`.  Reuses existing
     /// lockfile entries when the cryoconfig spec is unchanged.
-    static cmd_fetch(args: ParsedArgs) -> int {
-        return Executor::run_dep_resolve(args, ResolveMode::Fetch);
+    static cmd_fetch(args: cli::ParsedArgs) -> int {
+        return Executor::run_dep_resolve(args, dep_resolver::ResolveMode::Fetch);
     }
 
     /// `cryo update`: like `fetch`, but ignores the existing lockfile
     /// and re-resolves every git dep from scratch.  Used to bump pinned
     /// SHAs to the latest tag/branch tip.
-    static cmd_update(args: ParsedArgs) -> int {
-        return Executor::run_dep_resolve(args, ResolveMode::Update);
+    static cmd_update(args: cli::ParsedArgs) -> int {
+        return Executor::run_dep_resolve(args, dep_resolver::ResolveMode::Update);
     }
 
     /// Shared implementation for `cryo fetch` and `cryo update`.
-    static run_dep_resolve(args: ParsedArgs, mode: ResolveMode) -> int {
+    static run_dep_resolve(args: cli::ParsedArgs, mode: dep_resolver::ResolveMode) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
-        const config_path: string = ProjectConfig::find_cryoconfig(".");
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(".");
         if (config_path.length() == 0) {
             fmt::eprintf("Error: no cryoconfig found in this directory.\n");
             fmt::eprintf("       run `cryo init` first to scaffold a project.\n");
             return 1;
         }
 
-        mut config: ProjectConfig = ProjectConfig::parse(config_path);
+        mut config: project_config::ProjectConfig = project_config::ProjectConfig::parse(config_path);
         if (config.error_count > 0) {
             fmt::eprintf("cryoconfig has %lld schema error(s); fix them before fetching.\n",
                 config.error_count);
@@ -2832,9 +3198,9 @@ type struct Executor {
             return 0;
         }
 
-        const lock_path: string = format("%s/cryoconfig.lock",
+        const lock_path: string = fmt::format("%s/cryoconfig.lock",
             config.project_root);
-        const outcome: ResolveOutcome = DepResolver::resolve(
+        const outcome: dep_resolver::ResolveOutcome = dep_resolver::DepResolver::resolve(
             &config, mode, lock_path);
         if (outcome.failed) {
             fmt::printf("Dependency resolution failed.\n");
@@ -2842,7 +3208,7 @@ type struct Executor {
         }
 
         const verb: string = match (mode) {
-            ResolveMode::Update => { "Updated" }
+            dep_resolver::ResolveMode::Update => { "Updated" }
             _                   => { "Fetched" }
         };
         fmt::printf("%s %lld dependency entr%s; lockfile written to %s\n",
@@ -2853,18 +3219,19 @@ type struct Executor {
         return 0;
     }
 
-    /// `cryo vendor <path>|list|remove <name>|rebuild [name]`: manage the
+    /// `cryo vendor <path>|list|remove <name>|clean|rebuild [name]`: manage the
     /// per-machine registry of vendored C libraries.
-    static cmd_vendor(args: ParsedArgs) -> int {
-        if (args.has_flag("debug")) { Logger::enable_debug(); }
+    static cmd_vendor(args: cli::ParsedArgs) -> int {
+        if (args.has_flag("debug")) { logger::Logger::enable_debug(); }
 
         const sub: string = args.input_file();
         if (sub == "") {
             fmt::eprintf("Error: cryo vendor needs a subcommand or path.\n");
-            fmt::eprintf("Usage: cryo vendor <path>|list|remove <name>|rebuild [name]\n");
+            fmt::eprintf("Usage: cryo vendor <path>|list|remove <name>|clean|rebuild [name]\n");
             return 1;
         }
         if (sub == "list")   { return Executor::vendor_list(); }
+        if (sub == "clean")  { return Executor::vendor_clean(); }
         if (sub == "remove") { return Executor::vendor_remove(args.positional_at(1)); }
         if (sub == "rebuild") {
             return Executor::vendor_rebuild(args.positional_at(1), args);
@@ -2888,11 +3255,12 @@ type struct Executor {
     /// always regenerates; a bare `cryo vendor <path>` passes `false`, so an
     /// unchanged (headers + triple + libclang + generator) provenance is a
     /// cache hit and libclang is not re-run.
-    static vendor_register(path: string, args: &ParsedArgs, force: boolean) -> int {
+    static vendor_register(path_text: string, args: &cli::ParsedArgs, force: boolean) -> int {
+        const path: string = path_text;
         // Resolve to an absolute path (the registry stores absolute roots so
         // `import vendor::Name` works from any project directory).
         mut abs: string = "";
-        match (dir::canonicalize(Path::from(path))) {
+        match (dir::canonicalize(path::Path::from(path))) {
             Result::Ok(pb)  => { abs = pb.into_raw(); }
             Result::Err(_)  => {
                 fmt::eprintf("Error: cannot resolve vendor path '%s' (does it exist?).\n", path);
@@ -2900,58 +3268,58 @@ type struct Executor {
             }
         }
 
-        const manifest_path: string = format("%s/cryo-vendor.json", abs);
-        if (!metadata::exists(Path::from(manifest_path))) {
+        const manifest_path: string = fmt::format("%s/cryo-vendor.json", abs);
+        if (!metadata::exists(path::Path::from(manifest_path))) {
             fmt::eprintf("Error: no cryo-vendor.json manifest found at %s\n", manifest_path);
             fmt::eprintf("       a vendored library needs a manifest declaring its name,\n");
             fmt::eprintf("       headers, link libraries, and (Stage 1) a bindings_file.\n");
             return 1;
         }
         mut content: string = "";
-        match (file::read_to_string(Path::from(manifest_path))) {
+        match (file::read_to_string(path::Path::from(manifest_path))) {
             Result::Ok(s)  => { content = s.into_raw(); }
             Result::Err(_) => {
                 fmt::eprintf("Error: cannot read %s\n", manifest_path);
                 return 1;
             }
         }
-        mut root: JsonValue = match (parser::parse(Str::from(content))) {
+        mut root: value::JsonValue = match (parser::parse(str::Str::from(content))) {
             Result::Ok(v)      => { v }
-            Result::Err(mut e) => {
-                e.drop();
+            Result::Err(e)     => {
+                mem::drop(e);
                 fmt::eprintf("Error: %s is not valid JSON.\n", manifest_path);
                 return 1;
             }
         };
 
         const key: string = Executor::to_lower(Executor::path_basename(abs));
-        const name: string = VendorRegistry::jstr(&root, "name", Executor::derive_namespace(key));
+        const name: string = registry::VendorRegistry::jstr(&root, "name", Executor::derive_namespace(key));
 
-        mut entry: VendorEntry = VendorEntry {
+        mut entry: registry::VendorEntry = registry::VendorEntry {
             key:            key,
             name:           name,
             source_path:    abs,
-            binding_source: VendorRegistry::jstr(&root, "binding_source", "manual"),
-            headers:        VendorRegistry::jstrs(&root, "headers"),
-            include_dirs:   VendorRegistry::jstrs(&root, "include_dirs"),
-            defines:        VendorRegistry::jstrs(&root, "defines"),
-            language:       VendorRegistry::jstr(&root, "language", ""),
-            std:            VendorRegistry::jstr(&root, "std", ""),
-            link:           VendorLink::empty(),
+            binding_source: registry::VendorRegistry::jstr(&root, "binding_source", "manual"),
+            headers:        registry::VendorRegistry::jstrs(&root, "headers"),
+            include_dirs:   registry::VendorRegistry::jstrs(&root, "include_dirs"),
+            defines:        registry::VendorRegistry::jstrs(&root, "defines"),
+            language:       registry::VendorRegistry::jstr(&root, "language", ""),
+            std:            registry::VendorRegistry::jstr(&root, "std", ""),
+            link:           registry::VendorLink::empty(),
             cache:          [],
         };
-        match (root.get(Str::new("link"))) {
-            Option::Some(lp) => { entry.link = VendorRegistry::read_link(lp); }
+        match (root.get(str::Str::new("link"))) {
+            Option::Some(lp) => { entry.link = registry::VendorRegistry::read_link(lp); }
             Option::None     => { }
         }
 
         const triple: string = if (args.has_arg("target")) { args.get_value("target") } else { "" };
-        const norm_triple: string = VendorRegistry::normalize_triple(triple);
-        const bindings_file: string = VendorRegistry::jstr(&root, "bindings_file", "");
-        root.drop();
+        const norm_triple: string = registry::VendorRegistry::normalize_triple(triple);
+        const bindings_file: string = registry::VendorRegistry::jstr(&root, "bindings_file", "");
+        mem::drop(root);
 
-        const cache_dir: string = VendorRegistry::cache_dir_for(key, triple);
-        const dest: string = format("%s/%s.cryo", cache_dir, name);
+        const cache_dir: string = registry::VendorRegistry::cache_dir_for(key, triple);
+        const dest: string = fmt::format("%s/%s.cryo", cache_dir, name);
         mut produced: boolean = false;
 
         // Serialize the load -> (maybe generate) -> save against any other
@@ -2959,21 +3327,21 @@ type struct Executor {
         // so a concurrent writer can't drop the entry this one adds.  Held
         // across generation too (so two racers don't both run libclang for the
         // same lib); best-effort, so it must be released on EVERY return below.
-        mut lock: VendorLock = VendorLock::acquire();
+        mut lock: registry::VendorLock = registry::VendorLock::acquire();
 
         // Load the on-disk registry up front: it carries any cache entries for
         // OTHER triples (so they coexist after this re-register) and the prior
         // provenance key for THIS triple (for the cache-hit check).
         // `string` fields are non-owning pointers into leaked buffers, so the
         // carried-over items stay valid after the old entry is replaced.
-        mut reg: VendorRegistry = VendorRegistry::load_global();
+        mut reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
         mut prev_key:  string = "";
         mut prev_file: string = "";
         const prev_idx: i64 = reg.find_index(key);
         if (prev_idx >= 0) {
             for (mut c: i64 = 0; c < reg.entries[prev_idx].cache.length; c++) {
                 const ct: string = reg.entries[prev_idx].cache[c].triple;
-                entry.cache.push(VendorCacheItem {
+                entry.cache.push(registry::VendorCacheItem {
                     triple: ct,
                     file:   reg.entries[prev_idx].cache[c].file,
                     key:    reg.entries[prev_idx].cache[c].key,
@@ -2988,8 +3356,8 @@ type struct Executor {
         if (bindings_file != "") {
             // Escape hatch: copy pre-written bindings verbatim into the cache.
             // (No provenance key: a hand-supplied file is always re-copied.)
-            const src: string = format("%s/%s", abs, bindings_file);
-            if (!metadata::exists(Path::from(src))) {
+            const src: string = fmt::format("%s/%s", abs, bindings_file);
+            if (!metadata::exists(path::Path::from(src))) {
                 lock.release();
                 fmt::eprintf("Error: bindings_file '%s' not found at %s\n", bindings_file, src);
                 return 1;
@@ -3011,12 +3379,12 @@ type struct Executor {
                 fmt::eprintf("Error: manifest declares no \"headers\" to generate bindings from.\n");
                 return 1;
             }
-            const prov_key: string = VendorGenerator::provenance_key(
+            const prov_key: string = generator::VendorGenerator::provenance_key(
                 abs, &entry.headers, &entry.include_dirs, &entry.defines,
                 norm_triple, prev_file, entry.lang_arg());
             const hit: boolean = !force
                 && prev_key != "" && prev_key == prov_key
-                && prev_file != "" && metadata::exists(Path::from(prev_file));
+                && prev_file != "" && metadata::exists(path::Path::from(prev_file));
             if (hit) {
                 fmt::printf("Bindings for '%s' are up to date for triple '%s' (cache hit).\n",
                     name, norm_triple);
@@ -3028,7 +3396,7 @@ type struct Executor {
                 fmt::printf("Generating bindings for '%s' from %lld header(s) via libclang...\n",
                     name, entry.headers.length as i64);
                 mut inputs: string[] = [];
-                const src_text: string = VendorGenerator::generate(
+                const src_text: string = generator::VendorGenerator::generate(
                     name, abs, &entry.headers, &entry.include_dirs, &entry.defines, &inputs,
                     entry.lang_arg(), entry.std);
                 if (src_text == "") {
@@ -3036,23 +3404,23 @@ type struct Executor {
                     fmt::eprintf("Error: binding generation produced no output (no header parsed).\n");
                     return 1;
                 }
-                const gf: void* = fopen(dest, "w");
+                const gf: void* = libc::fopen(dest, "w");
                 if (gf == null) {
                     lock.release();
                     fmt::eprintf("Error: cannot write generated bindings to %s\n", dest);
                     return 1;
                 }
-                fputs(src_text, gf);
-                fclose(gf);
+                libc::fputs(src_text, gf);
+                libc::fclose(gf);
                 // Record the include graph next to the bindings so a later cache
                 // check folds every transitively-included header, not just the
                 // entry header (see VendorGenerator::provenance_key).
-                VendorGenerator::write_depfile(dest, &inputs);
+                generator::VendorGenerator::write_depfile(dest, &inputs);
                 // Store the key computed FROM the just-written depfile (not the
                 // pre-generation `prov_key`, which folded the previous graph), so
                 // the next unchanged check folds the same `dest.deps` and hits
                 // without a spurious one-time regeneration.
-                const store_key: string = VendorGenerator::provenance_key(
+                const store_key: string = generator::VendorGenerator::provenance_key(
                     abs, &entry.headers, &entry.include_dirs, &entry.defines,
                     norm_triple, dest, entry.lang_arg());
                 entry.set_cache(norm_triple, dest, store_key);
@@ -3076,7 +3444,7 @@ type struct Executor {
         lock.release();
         if (!saved) {
             fmt::eprintf("Error: failed to write the vendor registry at %s\n",
-                VendorRegistry::registry_path());
+                registry::VendorRegistry::registry_path());
             return 1;
         }
 
@@ -3099,24 +3467,211 @@ type struct Executor {
         return 0;
     }
 
+    /// `n` copies of `ch`, for box rules and column padding.
+    static vendor_fill(ch: u8, n: i64) -> string {
+        mut out: String = String::new();
+        for (mut i: i64 = 0; i < n; i++) { out.push_byte(ch); }
+        return out.into_raw();
+    }
+
+    /// A `+- label ------+` rule opening one library's block.  Passing "" gives
+    /// the plain rule that closes the last block.
+    static vendor_box_rule(label_text: string) -> void {
+        const label: string = label_text;
+        if (label == "") {
+            const plain: string = Executor::vendor_fill('-' as u8, VENDOR_BOX_WIDTH - 2);
+            fmt::printf("+%s+\n", plain);
+            return;
+        }
+        // "+- " + label + " " + dashes + "+" spans the box width; a label wider
+        // than the box keeps a stub of rule rather than a negative count.
+        mut dashes: i64 = VENDOR_BOX_WIDTH - 5 - (label.length() as i64);
+        if (dashes < 3) { dashes = 3; }
+        const fill: string = Executor::vendor_fill('-' as u8, dashes);
+        fmt::printf("+- %s %s+\n", label, fill);
+    }
+
+    /// A bordered but empty row, closing one library's block off from the rule
+    /// that opens the next.
+    static vendor_box_gap() -> void {
+        const blank: string = Executor::vendor_fill(' ' as u8, VENDOR_BOX_WIDTH - 2);
+        fmt::printf("|%s|\n", blank);
+    }
+
+    /// One `|  label  value  |` row.  A value wider than its column continues
+    /// on further rows under an empty label, broken after the last path
+    /// separator that fits so each row still holds whole path segments; a
+    /// single segment longer than the column breaks at the column edge.
+    static vendor_box_field(label_text: string, value_text: string) -> void {
+        const label: string = label_text;
+        const value: string = value_text;
+        const text: str::Str = str::Str::new(value);
+        const n: u64 = text.length();
+        mut start: u64 = 0;
+        mut first: boolean = true;
+        // The `first` guard prints one row for an empty value, so a field is
+        // never silently absent from the block.
+        while (first || start < n) {
+            mut end: u64 = start + (VENDOR_VALUE_WIDTH as u64);
+            if (end >= n) {
+                end = n;
+            } else {
+                const cut: i64 = path::Path::last_separator(text.sub_bytes(start, end), 0);
+                if (cut > 0) { end = start + (cut as u64) + 1; }
+            }
+            const chunk: str::Str = text.sub_bytes(start, end);
+            mut shown: String = String::from_str(chunk);
+            mut head: string = "";
+            if (first) { head = label; }
+            const lpad: string = Executor::vendor_fill(' ' as u8,
+                VENDOR_LABEL_WIDTH - (head.length() as i64));
+            const vpad: string = Executor::vendor_fill(' ' as u8,
+                VENDOR_VALUE_WIDTH - (chunk.length() as i64));
+            fmt::printf("|  %s%s%s%s  |\n", head, lpad, shown.as_cstr() as string, vpad);
+            start = end;
+            first = false;
+        }
+    }
+
+    /// How an entry's bindings were produced, for its `bindings` row.
+    static vendor_binding_kind(entry: &registry::VendorEntry) -> string {
+        if (entry.binding_source == "manual") { return "pre-written"; }
+        if (entry.binding_source == "headers"
+                || entry.binding_source == "cxx-headers") {
+            if (entry.is_cxx()) { return "generated from C++ headers"; }
+            return "generated from C headers";
+        }
+        return entry.binding_source;
+    }
+
+    /// The target triples an entry has cached bindings for.  The files sit at
+    /// `<cache>/<key>/<triple>/<Name>.cryo`, so the listing prints the cache
+    /// root once and names only the triples here.
+    static vendor_cached_targets(entry: &registry::VendorEntry) -> string {
+        if (entry.cache.length == 0) { return "none cached"; }
+        mut out: String = String::new();
+        for (mut c: i64 = 0; c < entry.cache.length; c++) {
+            if (c > 0) { out.push(", "); }
+            out.push(entry.cache[c].triple);
+        }
+        return out.into_raw();
+    }
+
+    /// Registry indices ordered by library key.  Insertion order is whatever
+    /// sequence the machine happened to register in; sorting is what makes two
+    /// runs of `list` comparable to each other.  The stored order is untouched.
+    static vendor_key_order(reg: &registry::VendorRegistry) -> i64[] {
+        mut order: i64[] = [];
+        for (mut i: i64 = 0; i < reg.entries.length; i++) { order.push(i); }
+        for (mut a: i64 = 0; a + 1 < order.length; a++) {
+            mut low: i64 = a;
+            for (mut b: i64 = a + 1; b < order.length; b++) {
+                const cand: str::Str = str::Str::new(reg.entries[order[b]].key);
+                const best: str::Str = str::Str::new(reg.entries[order[low]].key);
+                if (cand < best) { low = b; }
+            }
+            if (low != a) {
+                const held: i64 = order[a];
+                order[a] = order[low];
+                order[low] = held;
+            }
+        }
+        return order;
+    }
+
     /// `cryo vendor list`: print the registered libraries.
     static vendor_list() -> int {
-        const reg: VendorRegistry = VendorRegistry::load_global();
+        const reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
         if (reg.entries.length == 0) {
             fmt::printf("No vendor libraries registered.\n");
             fmt::printf("Register one with: cryo vendor <path-to-c-project>\n");
             return 0;
         }
-        fmt::printf("Registered vendor libraries (%lld):\n", reg.entries.length as i64);
-        for (mut i: i64 = 0; i < reg.entries.length; i++) {
-            fmt::printf("  %s  ->  import vendor::%s\n",
-                reg.entries[i].key, reg.entries[i].name);
-            fmt::printf("      source: %s\n", reg.entries[i].source_path);
-            for (mut c: i64 = 0; c < reg.entries[i].cache.length; c++) {
-                fmt::printf("      [%s] %s\n",
-                    reg.entries[i].cache[c].triple, reg.entries[i].cache[c].file);
+        const order: i64[] = Executor::vendor_key_order(&reg);
+        fmt::printf("Registered vendor libraries (%lld)\n", reg.entries.length as i64);
+        fmt::printf("Bindings cache: %s\n\n",
+            exec_path(registry::VendorRegistry::vendor_root()));
+        mut missing: i64 = 0;
+        for (mut oi: i64 = 0; oi < order.length; oi++) {
+            const i: i64 = order[oi];
+            const gone: boolean =
+                !metadata::exists(path::Path::from(reg.entries[i].source_path));
+            mut title: string = reg.entries[i].key;
+            if (gone) {
+                missing++;
+                title = fmt::format("%s  (source missing)", reg.entries[i].key);
+            }
+            Executor::vendor_box_rule(title);
+            Executor::vendor_box_field("import as",
+                fmt::format("vendor::%s", reg.entries[i].name));
+            Executor::vendor_box_field("bindings",
+                Executor::vendor_binding_kind(&reg.entries[i]));
+            Executor::vendor_box_field("targets",
+                Executor::vendor_cached_targets(&reg.entries[i]));
+            Executor::vendor_box_field("source",
+                exec_path(reg.entries[i].source_path));
+            Executor::vendor_box_gap();
+        }
+        Executor::vendor_box_rule("");
+        if (missing > 0) {
+            fmt::printf("\n%lld of %lld libraries no longer have their source; unregister them\n",
+                missing, reg.entries.length as i64);
+            fmt::printf("with `cryo vendor clean`.\n");
+        }
+        return 0;
+    }
+
+    /// `cryo vendor clean`: unregister every library whose recorded source path
+    /// is gone.  Registry-only, like `vendor remove`: the generated bindings
+    /// under the cache stay on disk, and re-registering the library reuses
+    /// them.
+    static vendor_clean() -> int {
+        mut lock: registry::VendorLock = registry::VendorLock::acquire();
+        mut reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
+        if (reg.entries.length == 0) {
+            lock.release();
+            fmt::printf("No vendor libraries registered.\n");
+            return 0;
+        }
+        // One downward walk decides and deletes: each removal shifts the tail
+        // down, so descending indices leave the entries not yet examined where
+        // they were.  Deleting by index (not by key) is what keeps a library
+        // whose namespace collides with a doomed entry's key from being the one
+        // that goes.  The recorded key and path outlive their entry - a
+        // `string` field is a borrowed pointer its owner's drop does not free.
+        const total: i64 = reg.entries.length;
+        mut doomed: string[] = [];
+        mut paths:  string[] = [];
+        for (mut i: i64 = total - 1; i >= 0; i--) {
+            if (!metadata::exists(path::Path::from(reg.entries[i].source_path))) {
+                doomed.push(reg.entries[i].key);
+                paths.push(reg.entries[i].source_path);
+                reg.remove_at(i);
             }
         }
+        if (doomed.length == 0) {
+            lock.release();
+            fmt::printf("Nothing to clean: all %lld registered libraries still have\n",
+                total);
+            fmt::printf("their source.\n");
+            return 0;
+        }
+        if (!reg.save_global()) {
+            lock.release();
+            fmt::eprintf("Error: failed to write the vendor registry.\n");
+            return 1;
+        }
+        lock.release();
+        fmt::printf("Unregistered %lld vendor librar%s with a missing source:\n",
+            doomed.length as i64, if (doomed.length == 1) { "y" } else { "ies" });
+        // Collection ran downwards; report upwards so the order matches the
+        // registry.
+        for (mut d: i64 = doomed.length - 1; d >= 0; d--) {
+            fmt::printf("  %s\n", doomed[d]);
+            fmt::printf("      was %s\n", exec_path(paths[d]));
+        }
+        fmt::printf("%lld librar%s left registered.\n", reg.entries.length as i64,
+            if (reg.entries.length == 1) { "y" } else { "ies" });
         return 0;
     }
 
@@ -3126,8 +3681,8 @@ type struct Executor {
             fmt::eprintf("Error: cryo vendor remove needs a library name.\n");
             return 1;
         }
-        mut lock: VendorLock = VendorLock::acquire();
-        mut reg: VendorRegistry = VendorRegistry::load_global();
+        mut lock: registry::VendorLock = registry::VendorLock::acquire();
+        mut reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
         if (!reg.remove(name)) {
             lock.release();
             fmt::eprintf("No vendor library named '%s' is registered.\n", name);
@@ -3145,8 +3700,8 @@ type struct Executor {
 
     /// `cryo vendor rebuild [name]`: regenerate bindings from a library's
     /// recorded source path.  With no name, rebuilds every registered library.
-    static vendor_rebuild(name: string, args: ParsedArgs) -> int {
-        const reg: VendorRegistry = VendorRegistry::load_global();
+    static vendor_rebuild(name: string, args: cli::ParsedArgs) -> int {
+        const reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
         if (reg.entries.length == 0) {
             fmt::printf("No vendor libraries registered.\n");
             return 0;
@@ -3155,11 +3710,11 @@ type struct Executor {
         for (mut i: i64 = 0; i < reg.entries.length; i++) {
             if (name != ""
                     && reg.entries[i].key != name
-                    && !VendorRegistry::ieq(reg.entries[i].name, name)) {
+                    && !registry::VendorRegistry::ieq(reg.entries[i].name, name)) {
                 continue;
             }
             const src: string = reg.entries[i].source_path;
-            if (!metadata::exists(Path::from(src))) {
+            if (!metadata::exists(path::Path::from(src))) {
                 fmt::eprintf("Error: source path for '%s' is gone: %s\n",
                     reg.entries[i].key, src);
                 failures += 1;
@@ -3175,7 +3730,8 @@ type struct Executor {
 
     /// The final path component of `p` (handles both `/` and `\` separators).
     /// Returns a pointer into `p`.
-    static path_basename(p: string) -> string {
+    static path_basename(p_text: string) -> string {
+        const p: string = p_text;
         const n: i64 = p.length() as i64;
         mut start: i64 = 0;
         for (mut i: i64 = 0; i < n; i++) {
@@ -3185,9 +3741,10 @@ type struct Executor {
     }
 
     /// ASCII-lowercase a string into a fresh heap buffer.
-    static to_lower(s: string) -> string {
+    static to_lower(s_text: string) -> string {
+        const s: string = s_text;
         const n: u64 = s.length();
-        const buf: i8* = malloc(n + 1) as i8*;
+        const buf: i8* = libc::malloc(n + 1) as i8*;
         for (mut i: u64 = 0; i < n; i++) {
             mut c: char = s[i];
             if (c >= 65 && c <= 90) { c = (c + 32) as char; }
@@ -3199,16 +3756,18 @@ type struct Executor {
 
     /// Copy a text file `src` -> `dest` (truncating dest).  Used to seed the
     /// vendor cache with hand-written bindings.
-    static copy_text_file(src: string, dest: string) -> boolean {
+    static copy_text_file(src_text: string, dest_text: string) -> boolean {
+        const dest: string = dest_text;
+        const src: string = src_text;
         mut text: string = "";
-        match (file::read_to_string(Path::from(src))) {
+        match (file::read_to_string(path::Path::from(src))) {
             Result::Ok(s)  => { text = s.into_raw(); }
             Result::Err(_) => { return false; }
         }
-        const f: void* = fopen(dest, "w");
+        const f: void* = libc::fopen(dest, "w");
         if (f == null) { return false; }
-        fputs(text, f);
-        fclose(f);
+        libc::fputs(text, f);
+        libc::fclose(f);
         return true;
     }
 }

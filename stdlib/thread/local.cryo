@@ -37,14 +37,22 @@
 
 namespace std::thread::local;
 
-import core::intrinsics;
-import core::ptr;
-import core::result;
-import core::drop;
-import alloc::layout;
-import alloc::allocator;
-import ffi::libc;
-import sys::syscall;
+import std::core::intrinsics;
+import std::core::ptr;
+import std::core::ptr::{ NonNull };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::alloc::layout;
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator;
+import std::alloc::allocator::{ GlobalAlloc };
+import std::ffi::libc;
+import std::ffi::libc::{
+    pthread_getspecific, pthread_key_create, pthread_key_delete, pthread_setspecific
+};
+import std::sys::syscall;
 
 
 // Per-OS thread-local storage primitives.  POSIX pthread keys vs Win32 TLS
@@ -99,7 +107,7 @@ type struct ThreadLocal<T> {
             core::panic("ThreadLocal::new: os_tls_create failed",
                               FILE, LINE);
         }
-        return ThreadLocal<T> { key: key, init: init };
+        return ThreadLocal::<T> { key: key, init: init };
     }
 
     /// Get a raw pointer to the current thread's value, initializing
@@ -113,10 +121,10 @@ type struct ThreadLocal<T> {
         }
         // First access on this thread: allocate and initialize.
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        const layout: Layout = Layout::of<T>();
+        const layout: Layout = Layout::of::<T>();
         match (alloc.allocate(layout)) {
             Result::Ok(buf) => {
-                const tp: T* = buf.cast<T>().as_ptr();
+                const tp: T* = buf.cast::<T>().as_ptr();
                 *tp = (this.init)();
                 os_tls_set(this.key, tp as u8*);
                 return tp;
@@ -131,18 +139,16 @@ type struct ThreadLocal<T> {
     /// Free the current thread's value if it has been initialized.
     /// Subsequent `get()` from this thread will re-run `init`.  Other
     /// threads' values are untouched.
-    clear(&this) -> void
-    where T: Drop {
+    clear(&this) -> void {
         const raw: u8* = os_tls_get(this.key);
         if (raw == null) { return; }
-        // Run T's destructor on the stored value before reclaiming its
-        // storage, so owning fields (String, Box, ...) inside T are released
-        // rather than leaked. Primitives' Drop impls are no-ops, so this is
-        // free for POD thread-locals.
+        // Release the stored value in place before reclaiming its storage,
+        // so owning fields (String, Box, ...) inside T are released rather
+        // than leaked.
         const tp: T* = raw as T*;
-        (*tp).drop();
+        ptr::drop_in_place::<T>(tp);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        const layout: Layout = Layout::of<T>();
+        const layout: Layout = Layout::of::<T>();
         alloc.deallocate(NonNull::new(raw), layout);
         os_tls_set(this.key, null);
     }

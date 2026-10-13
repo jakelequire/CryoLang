@@ -3,34 +3,63 @@
 /// Entry points for the four codegen passes: IRGeneration, Optimization,
 /// ObjectEmission, and Linking.  Called by PassRegistry::run_pass().
 
-namespace Compiler::Codegen::Passes;
+namespace compiler::codegen::passes;
 import std::env;
 import std::collections::str;
+import std::collections::str::{ Str };
 import std::collections::string;
-import std::core::slice;
+import std::collections::string::{ String };
+import std::core::slice::{ Slice };
 import std::fs::dir;
 import std::fs::path;
+import std::fs::path::{ Path };
 import std::fs::file;
 import std::fs::metadata;
+import std::fs::metadata::{ metadata };
 import std::process::command;
+import std::process::command::{ Command, Output, Stdio };
 import std::process::child;
+import std::process::child::{ Child };
 import std::core::slice;
 
-import Compiler::Codegen;
-import Compiler::Codegen::{ LLVMTypes, TypeMap, Context };
-import Compiler::Codegen::Ops::IntrinsicsCodegen;
-import Compiler::Codegen::Visit::IRGenerator;
-import Compiler::CompilationContext;
-import Compiler::ProjectConfig;
-import Compiler::ModuleGraph;
-import Compiler::Artifacts;
-import Compiler::Diag;
-import Compiler::Diag::{ Diagnostic, Sink, Snapshot };
-import Compiler::AST::Node;
-import Compiler::Passes::PassID;
-import Compiler::Resolver::{ InternTable, SymbolStr };
+import compiler::codegen;
+import compiler::codegen::{ context, llvm, llvm_types, type_map };
+import compiler::types;
+import compiler::types::{ arena, type_base, type_ref, TypeKind, user_defined };
+import compiler::codegen::visit::ir_generator;
+import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext, OutputOverride };
+import compiler::project_config;
+import compiler::project_config::{ ProjectConfig, TargetType };
+import compiler::module_graph;
+import compiler::module_graph::{ ModuleInfo };
+import compiler::artifacts;
+import compiler::artifacts::{ IROutput, LinkedOutput };
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, sink, snapshot };
+import compiler::ast::node;
+import compiler::ast::node::{ ProgramNode };
+import compiler::passes::pass_id;
+import compiler::passes::pass_id::{ PassResult };
+import compiler::resolver::{ intern_table, symbol_str };
 import std::fmt;
-import Utils::Logger;
+import utils::logger;
+import utils::logger::{ cdebug };
+import std::ffi::libc;
+import compiler::codegen::context::{ CodegenContext };
+import compiler::codegen::ops::declaration_emitter::{ DebugInfoState };
+import compiler::codegen::llvm_types::{
+    LContext, LFileType, LModule, LTargetMachine, LType, LValue
+};
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::snapshot::{ DiagnosticSnapshot };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::type_base::{ Type };
+import compiler::types::user_defined::{ ClassType, FieldInfo, StructType };
+import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
+import std::core::mem;
+import compiler::resolver::mangled_name::{ MangledName };
 
 
 // Linker configuration per target
@@ -83,7 +112,8 @@ type struct LinkerConfig {
     ///   - anything else (aarch64, riscv, windows-msvc, ...): unsupported;
     ///     `run_linking` falls back to the object-files-only bailout that
     ///     prints a manual-link hint.
-    static linker_config_for_triple(triple: string) -> LinkerConfig {
+    static linker_config_for_triple(triple_text: string) -> LinkerConfig {
+        const triple: string = triple_text;
         // Host build: a null/empty triple, or one that matches the (coerced)
         // host triple, takes the per-host config below.  The split is
         // platform-gated because the host config diverges by OS - exe suffix
@@ -186,18 +216,62 @@ type struct CodegenPasses {
     // unaffected: that link runs in `sh` on the Linux host, so the POSIX forms
     // are correct there.)
 
+    /// Run a toolchain command - the linker, the archiver - with its combined
+    /// output captured to `log_path`, and answer its exit code, the output in
+    /// `*out`.  The output is read back rather than left on the terminal:
+    /// the compiler's diagnostics render after every pass has run, so a
+    /// tool's own reason for failing, printed as the tool ran, would sit
+    /// above all of them, apart from the one error it explains.  A caller
+    /// puts it in that error; a command that succeeds has its output printed
+    /// here, as it would have been (a linker's warnings).  The log is
+    /// removed on success and kept on failure, beside the response file.
+    static run_tool(cmd_text: string, log_path_text: string, out: string*) -> i32 {
+        const cmd: string = cmd_text;
+        const log_path: string = log_path_text;
+        const rc: i32 = Command::shell(fmt::format("%s > %s 2>&1", cmd,
+            CodegenPasses::link_quote(log_path_text)));
+        mut text: string = "";
+        match (file::read_to_string(Path::from(log_path))) {
+            Result::Ok(t)  => { text = t.into_raw(); }
+            Result::Err(_) => { }
+        }
+        *out = text;
+        if (rc == 0) {
+            if (text.length() > 0) { fmt::eprintf("%s", text); }
+            dir::remove_file(Path::from(log_path));
+        }
+        return rc;
+    }
+
+    /// The error for a toolchain command that failed: what ran, where its
+    /// inputs are kept, and - as a note - what the tool itself reported,
+    /// which is the reason.
+    static tool_failure(what: string, cmd_text: string, rsp_path_text: string,
+                        output_text: string) -> Diagnostic {
+        const cmd: string = cmd_text;
+        const output: string = output_text;
+        const rsp_path: string = rsp_path_text;
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            fmt::format("%s: %s\n  object list retained at: %s", what, cmd, rsp_path));
+        if (output.length() > 0) {
+            d = d.with_note(fmt::format("the tool reported:\n%s", output));
+        }
+        return d;
+    }
+
     /// Quote one path/argument for the active build host's shell.  POSIX:
     /// `shell_quote`'s secure single-quote form.  Windows: a plain double-quote
     /// wrap - `cmd` honours only double quotes, and build paths never contain
     /// an embedded `"` (same assumption the archiver's response-file paths make).
     ![target(unix)]
-    static link_quote(s: string) -> string {
-        return CodegenPasses::shell_quote(s);
+    static link_quote(s_text: string) -> string {
+        return CodegenPasses::shell_quote(s_text);
     }
 
     ![target(windows)]
-    static link_quote(s: string) -> string {
-        return format("\"%s\"", s);
+    static link_quote(s_text: string) -> string {
+        const s: string = s_text;
+        return fmt::format("\"%s\"", s);
     }
 
     /// Append the runtime tiers a HOSTED link needs, plus the entry override
@@ -248,21 +322,23 @@ type struct CodegenPasses {
     /// that ships `libunwind.so.8` but no `libunwind.so` dev symlink, for no
     /// benefit (identical ABI).  An LLVM-libunwind / freestanding combination
     /// that needs an explicit unwinder is a follow-up (a `[link]`-config knob).
-    static append_hosted_runtime_libs(ctx: CompilationContext*, cmd: string,
-                                      triple: string) -> string {
-        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple, true);
+    static append_hosted_runtime_libs(ctx: CompilationContext*, cmd_text: string,
+                                      triple_text: string) -> string {
+        const cmd: string = cmd_text;
+        const triple: string = triple_text;
+        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple_text, true);
         if (lib_dir.length() == 0) {
             return cmd;
         }
         mut out: string = cmd;
-        out = format("%s %s", out, CodegenPasses::link_quote(
-            format("%s/libcryort-core-hosted.a", lib_dir)));
-        const archive: string = match (ctx.project_panic_unwind) {
+        out = fmt::format("%s %s", out, CodegenPasses::link_quote(
+            fmt::format("%s/libcryort-core-hosted.a", lib_dir)));
+        const archive: string = match (ctx.options.unwinds()) {
             true  => { "libcryort-panic-unwind-hosted.a" }
             false => { "libcryort-panic-abort-hosted.a" }
         };
-        out = format("%s %s", out, CodegenPasses::link_quote(
-            format("%s/%s", lib_dir, archive)));
+        out = fmt::format("%s %s", out, CodegenPasses::link_quote(
+            fmt::format("%s/%s", lib_dir, archive)));
         // Windows resolves the `_Unwind_*` ABI through LLVM's libunwind rather
         // than libgcc_s, and the mingw clang driver links it SHARED whenever the
         // toolchain ships `libunwind.dll.a` - which makes every binary we emit
@@ -293,13 +369,13 @@ type struct CodegenPasses {
             const driver: string =
                 CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc");
             if (driver.contains("clang")) {
-                out = format("%s --unwindlib=none -Wl,-Bstatic -lunwind -Wl,-Bdynamic", out);
+                out = fmt::format("%s --unwindlib=none -Wl,-Bstatic -lunwind -Wl,-Bdynamic", out);
             }
         }
-        if (ctx.release_static) {
+        if (ctx.options.static_link) {
             return out;
         }
-        return format("%s -Wl,-e,__cryo_entry", out);
+        return fmt::format("%s -Wl,-e,__cryo_entry", out);
     }
 
     /// A directory holds the runtime tiers when the base tier archive for the
@@ -308,26 +384,52 @@ type struct CodegenPasses {
     /// link that settled for a freestanding-only directory would name an entry
     /// symbol nothing defines, and `-e` on a missing symbol is a linker WARNING
     /// — the binary still links, and starts at whatever address ld defaulted to.
-    static runtime_dir_has_core(dir: string, hosted: boolean) -> boolean {
+    static runtime_dir_has_core(dir_text: string, hosted: boolean) -> boolean {
+        const dir: string = dir_text;
         const base: string = match (hosted) {
             true  => { "libcryort-core-hosted.a" }
             false => { "libcryort-core.a" }
         };
-        return metadata::exists(Path::from(format("%s/%s", dir, base)));
+        return metadata::exists(Path::from(fmt::format("%s/%s", dir, base)));
     }
 
     /// Prefer `<dir>/<triple>`, fall back to `<dir>`, else "".  Always returns a
     /// freshly allocated path: callers build candidates from borrowed env-var
     /// views that drop at the end of their match arm.
-    static runtime_dir_pick(dir: string, triple: string, hosted: boolean) -> string {
-        const per_target: string = format("%s/%s", dir, triple);
+    static runtime_dir_pick(dir_text: string, triple_text: string, hosted: boolean) -> string {
+        const dir: string = dir_text;
+        const triple: string = triple_text;
+        const per_target: string = fmt::format("%s/%s", dir, triple);
         if (CodegenPasses::runtime_dir_has_core(per_target, hosted)) {
             return per_target;
         }
-        if (CodegenPasses::runtime_dir_has_core(dir, hosted)) {
-            return format("%s", dir);
+        if (CodegenPasses::runtime_dir_has_core(dir_text, hosted)) {
+            return fmt::format("%s", dir);
         }
         return "";
+    }
+
+    /// The stdlib archive to link for `triple`.
+    ///
+    /// Prefers `<root>/.bin/<triple>/libcryo.a`.  One archive per target is
+    /// what stops a native build and a build for another target from
+    /// overwriting each other's `libcryo.a` in place -- they are both ar
+    /// archives with the same name, so the loser is not detected until the
+    /// link reports another architecture's objects.
+    ///
+    /// Unlike `runtime_dir_pick` this falls back to the flat path rather than
+    /// to "" when nothing is present: the result is handed to the linker
+    /// either way, so naming the canonical location is what makes a missing
+    /// archive report itself as the file it should have been.
+    static stdlib_archive_path(stdlib_root_text: string, triple_text: string) -> string {
+        const stdlib_root: string = stdlib_root_text;
+        const triple: string = triple_text;
+        const per_target: string = fmt::format("%s/.bin/%s/libcryo.a",
+                                          stdlib_root, triple);
+        if (metadata::exists(Path::from(per_target))) {
+            return per_target;
+        }
+        return fmt::format("%s/.bin/libcryo.a", stdlib_root);
     }
 
     /// Locate the directory holding the runtime tier archives for `triple`, or
@@ -346,14 +448,14 @@ type struct CodegenPasses {
     ///
     /// `hosted` selects WHICH tier set the caller needs; a directory that holds
     /// only the other kind is not a hit (see `runtime_dir_has_core`).
-    static resolve_runtime_lib_dir(ctx: CompilationContext*, triple: string,
+    static resolve_runtime_lib_dir(ctx: CompilationContext*, triple_text: string,
                                    hosted: boolean) -> string {
         // 0. Explicit override, for a runtime built somewhere else entirely.
         match (env::var(Str::new("CRYO_RUNTIME"))) {
             Option::Some(v) => {
                 mut s: String = v;
                 const hit: string = CodegenPasses::runtime_dir_pick(
-                    s.as_cstr() as string, triple, hosted);
+                    s.as_cstr() as string, triple_text, hosted);
                 if (hit.length() > 0) { return hit; }
             }
             Option::None => {}
@@ -365,10 +467,10 @@ type struct CodegenPasses {
                 mut s: String = v;
                 const home: string = s.as_cstr() as string;
                 const hit_lib: string = CodegenPasses::runtime_dir_pick(
-                    format("%s/lib/cryo", home), triple, hosted);
+                    fmt::format("%s/lib/cryo", home), triple_text, hosted);
                 if (hit_lib.length() > 0) { return hit_lib; }
                 const hit_rt: string = CodegenPasses::runtime_dir_pick(
-                    format("%s/runtime/.bin", home), triple, hosted);
+                    fmt::format("%s/runtime/.bin", home), triple_text, hosted);
                 if (hit_rt.length() > 0) { return hit_rt; }
             }
             Option::None => {}
@@ -398,21 +500,21 @@ type struct CodegenPasses {
                 exe_buf[dir_end] = 0;
                 const bindir: string = exe_buf as string;
                 const hit_inst: string = CodegenPasses::runtime_dir_pick(
-                    format("%s/../lib/cryo", bindir), triple, hosted);
+                    fmt::format("%s/../lib/cryo", bindir), triple_text, hosted);
                 if (hit_inst.length() > 0) { return hit_inst; }
                 const hit_dev: string = CodegenPasses::runtime_dir_pick(
-                    format("%s/../runtime/.bin", bindir), triple, hosted);
+                    fmt::format("%s/../runtime/.bin", bindir), triple_text, hosted);
                 if (hit_dev.length() > 0) { return hit_dev; }
                 const hit_dev2: string = CodegenPasses::runtime_dir_pick(
-                    format("%s/../../runtime/.bin", bindir), triple, hosted);
+                    fmt::format("%s/../../runtime/.bin", bindir), triple_text, hosted);
                 if (hit_dev2.length() > 0) { return hit_dev2; }
             }
         }
         // 3. Beside the resolved stdlib.  Covers an install that keeps the two
         //    together but places neither relative to the binary.
-        if (ctx.stdlib_root.length() > 0) {
+        if (ctx.options.stdlib_root.length() > 0) {
             const hit: string = CodegenPasses::runtime_dir_pick(
-                format("%s/../runtime/.bin", ctx.stdlib_root), triple, hosted);
+                fmt::format("%s/../runtime/.bin", ctx.options.stdlib_root), triple_text, hosted);
             if (hit.length() > 0) { return hit; }
         }
         return "";
@@ -433,27 +535,29 @@ type struct CodegenPasses {
     /// import `NtTerminateProcess`/`RtlVirtualUnwind` (ntdll) and
     /// `WriteFile`/`VirtualAlloc` (kernel32), so naming those first would leave
     /// the tiers' references unresolved.
-    static append_runtime_tier_libs(ctx: CompilationContext*, cmd: string,
-                                     triple: string) -> string {
-        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple, false);
+    static append_runtime_tier_libs(ctx: CompilationContext*, cmd_text: string,
+                                     triple_text: string) -> string {
+        const cmd: string = cmd_text;
+        const triple: string = triple_text;
+        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple_text, false);
         if (lib_dir.length() == 0) {
             return cmd;
         }
         mut out: string = cmd;
-        out = format("%s %s", out, CodegenPasses::link_quote(
-            format("%s/libcryort-alloc.a", lib_dir)));
-        out = format("%s %s", out, CodegenPasses::link_quote(
-            format("%s/libcryort-backtrace.a", lib_dir)));
-        out = format("%s %s", out, CodegenPasses::link_quote(
-            format("%s/libcryort-core.a", lib_dir)));
-        const panic_tier: string = match (ctx.project_panic_unwind) {
+        out = fmt::format("%s %s", out, CodegenPasses::link_quote(
+            fmt::format("%s/libcryort-alloc.a", lib_dir)));
+        out = fmt::format("%s %s", out, CodegenPasses::link_quote(
+            fmt::format("%s/libcryort-backtrace.a", lib_dir)));
+        out = fmt::format("%s %s", out, CodegenPasses::link_quote(
+            fmt::format("%s/libcryort-core.a", lib_dir)));
+        const panic_tier: string = match (ctx.options.unwinds()) {
             true  => { "libcryort-panic-unwind.a" }
             false => { "libcryort-panic-abort.a" }
         };
-        out = format("%s %s", out, CodegenPasses::link_quote(
-            format("%s/%s", lib_dir, panic_tier)));
+        out = fmt::format("%s %s", out, CodegenPasses::link_quote(
+            fmt::format("%s/%s", lib_dir, panic_tier)));
         if (triple.contains("windows")) {
-            out = format("%s -lkernel32 -lntdll", out);
+            out = fmt::format("%s -lkernel32 -lntdll", out);
         }
         return out;
     }
@@ -462,7 +566,9 @@ type struct CodegenPasses {
     /// root.  Cross-platform via `fs::file::copy`, which creates/truncates the
     /// destination and mirrors the source's Unix mode bits (so the hoisted
     /// binary stays executable).  Returns 0 on success, 1 on failure.
-    static hoist_binary(src: string, dst: string) -> i32 {
+    static hoist_binary(src_text: string, dst_text: string) -> i32 {
+        const dst: string = dst_text;
+        const src: string = src_text;
         match (file::copy(Path::from(src), Path::from(dst))) {
             Result::Ok(_)  => { return 0; }
             Result::Err(_) => { return 1; }
@@ -473,7 +579,8 @@ type struct CodegenPasses {
     /// double-quoted path per line (parses identically under a POSIX `sh -c`
     /// driver or a Windows `cmd /c` one, so selfhost byte-identity is
     /// unaffected).  Returns false if the file could not be written.
-    static write_rsp_file(path: string, objects: &string[]) -> boolean {
+    static write_rsp_file(path_text: string, objects: &string[]) -> boolean {
+        const path: string = path_text;
         mut text: String = String::new();
         for (mut i: i64 = 0; i < objects.length; i++) {
             text.push_byte(34 as u8);           // "
@@ -485,7 +592,7 @@ type struct CodegenPasses {
             Result::Ok(_)  => { true }
             Result::Err(_) => { false }
         };
-        text.drop();
+        mem::drop(text);
         return ok;
     }
 
@@ -495,10 +602,11 @@ type struct CodegenPasses {
     /// Windows-hosted compiler this is a no-op - the dump is a Linux CI aid, not
     /// part of a normal build's output.
     ![target(unix)]
-    static emit_linked_ir_dump(profile_dir: string, ll_path: string) -> void {
-        const ll_cmd: string = format(
+    static emit_linked_ir_dump(profile_dir_text: string, ll_path_text: string) -> void {
+        const ll_path: string = ll_path_text;
+        const ll_cmd: string = fmt::format(
             "llvm-link-20 -S %s/*/ir/*.ll -o %s 2>/dev/null",
-            CodegenPasses::shell_quote(profile_dir), CodegenPasses::shell_quote(ll_path));
+            CodegenPasses::shell_quote(profile_dir_text), CodegenPasses::shell_quote(ll_path_text));
         const ll_rc: i32 = Command::shell(ll_cmd);
         if (ll_rc == 0) {
             cdebug("[Codegen] Linked IR dump: %s\n", ll_path);
@@ -508,9 +616,170 @@ type struct CodegenPasses {
     }
 
     ![target(windows)]
-    static emit_linked_ir_dump(profile_dir: string, ll_path: string) -> void {
+    static emit_linked_ir_dump(profile_dir_text: string, ll_path_text: string) -> void {
         // cmd has no glob / `2>/dev/null`; the IR dump is a POSIX selfhost-check
         // aid and is not produced on a native Windows build.
+    }
+
+    /// Compare, for every nominal type this module actually mapped, the size
+    /// the front end computed against the size LLVM lays out for the mapped
+    /// body.  The two are independent computations of the same number and
+    /// nothing else in the pipeline compares them, so a front-end layout bug
+    /// is otherwise invisible until a `sizeof`-driven write overruns.
+    ///
+    /// Switched on by `CRYO_LAYOUT_AUDIT`; one line per disagreement plus a
+    /// per-module examined/disagree count, so a run reports the population and
+    /// not just the exceptions.
+    static audit_layout(ctx: CompilationContext*, cg: CodegenContext*, module_name: string) -> void {
+        mut audit_all: boolean = false;
+        match (env::var(Str::new("CRYO_LAYOUT_AUDIT"))) {
+            Option::Some(v) => { if (v.starts_with(&Str::new("all"))) { audit_all = true; } }
+            Option::None    => { return; }
+        }
+        const arena: TypeArena* = ctx.type_arena;
+        if (arena == null) { return; }
+
+        mut nominal:   i64 = 0;
+        mut unmapped:  i64 = 0;
+        mut opaque:    i64 = 0;
+        mut fe_zero:   i64 = 0;
+        mut llvm_zero: i64 = 0;
+        mut examined:  i64 = 0;
+        mut disagree:  i64 = 0;
+        mut align_dis: i64 = 0;
+        mut padded_n:  i64 = 0;
+        mut offset_dis: i64 = 0;
+        for (mut i: i64 = 0; i < arena.types.length; i++) {
+            const t: Type* = arena.types[i];
+            if (t == null) { continue; }
+            if (t.kind != TypeKind::Struct && t.kind != TypeKind::Class) { continue; }
+            nominal += 1;
+
+            // Only types this module put through the type mapper: mapping one
+            // here to measure it would mint LLVM structs the module never
+            // referenced and perturb what is being measured.
+            const mapped: LType = cg.type_mapper.lookup_cache(t.id);
+            if (!mapped.is_valid()) { unmapped += 1; continue; }
+            if (mapped.is_opaque_struct()) { opaque += 1; continue; }
+
+            const fe_size: u64 = t.size_bytes();
+            if (fe_size == 0) { fe_zero += 1; continue; }
+            const llvm_size: u64 = cg.llvm_module.abi_size_of(mapped);
+            if (llvm_size == 0) { llvm_zero += 1; continue; }
+            const llvm_align: u64 = cg.llvm_module.abi_align_of(mapped);
+
+            // A second, independent number for structs: the size of a LITERAL
+            // struct built from this type's own field list.  The named struct
+            // in the cache is reused by mangled name across type ids, so a
+            // name that two distinct field lists mangle to keeps the FIRST
+            // body -- which this comparison, and only this comparison, sees.
+            mut lit_size: u64 = 0;
+            if (t.kind == TypeKind::Struct) {
+                const st0: StructType* = t as StructType*;
+                const nf: u32 = st0.fields.length as u32;
+                if (!st0.is_union && nf > 0) {
+                    const fbuf: void* = libc::malloc(nf as u64 * 8);
+                    const fslots: void** = fbuf as void**;
+                    // Read the cache; do NOT map.  Mapping here would add
+                    // entries the module never asked for, and the next
+                    // module would then find them cached -- an instrument
+                    // that moves its own population.
+                    mut ok: boolean = true;
+                    for (mut fi: u32 = 0; fi < nf; fi++) {
+                        const ft: LType = cg.type_mapper.lookup_cache(st0.fields[fi].field_type.key());
+                        if (!ft.is_valid()) { ok = false; }
+                        else { fslots[fi] = ft.raw; }
+                    }
+                    if (ok) {
+                        const lit: LType = LType::literal_struct(fbuf, nf, st0.repr_packed);
+                        lit_size = cg.llvm_module.abi_size_of(lit);
+                    }
+                    libc::free(fbuf);
+                }
+            }
+
+            examined += 1;
+            mut name:      string = "<anon>";
+            mut min_align: u64    = 0;
+            mut nargs:     i64    = 0;
+            mut kind:      string = "C";
+            if (t.kind == TypeKind::Struct) {
+                const st: StructType* = t as StructType*;
+                name      = ctx.intern_table.shown(st.qualified_name);
+                min_align = st.min_alignment;
+                nargs     = st.type_args.length;
+                kind      = "S";
+            } else {
+                const cl: ClassType* = t as ClassType*;
+                name      = ctx.intern_table.shown(cl.qualified_name);
+                min_align = cl.min_alignment;
+            }
+
+            // WHERE each field lives, not just how big the type is.  Size and
+            // alignment can both agree while the offsets do not: an
+            // over-aligned member is placed by the front end on its declared
+            // boundary, and if the body does not carry a filler in front of it
+            // the tail padding hides the difference in the total.  The element
+            // index comes from `field_element_index` - the same routine the
+            // body was built from and every field GEP addresses through - so
+            // this compares the mapping against LLVM's own layout rather than
+            // re-deriving it.  A class is checked on its OWN fields: an
+            // ancestor's recorded offset is relative to that ancestor's
+            // layout, and every class is audited in its own right anyway.
+            mut off_bad: i64 = 0;
+            {
+                const empty_fields: FieldInfo[] = [];
+                mut fields_ref: &FieldInfo[] = &empty_fields;
+                mut skip: boolean = false;
+                if (t.kind == TypeKind::Struct) {
+                    const st1: StructType* = t as StructType*;
+                    if (st1.is_union) { skip = true; }
+                    fields_ref = &st1.fields;
+                } else {
+                    fields_ref = &(t as ClassType*).fields;
+                }
+                const n_elems: i64 = llvm::LLVMCountStructElementTypes(mapped.raw) as i64;
+                if (!skip) {
+                    for (mut fi: i64 = 0; fi < (*fields_ref).length; fi++) {
+                        const slot: i64 = cg.type_mapper.field_element_index(t, fi);
+                        if (slot < 0 || slot >= n_elems) { continue; }
+                        const want: u64 = (*fields_ref)[fi].offset;
+                        const got:  u64 = cg.llvm_module.offset_of_element(mapped, slot as u32);
+                        if (want != got) {
+                            off_bad += 1;
+                            fmt::eprintf("LAYOUT-OFF module=%s type=%s field=%lld slot=%lld fe_offset=%llu llvm_offset=%llu\n",
+                                   module_name, name, fi, slot, want, got);
+                        }
+                    }
+                }
+            }
+            if (off_bad > 0) { offset_dis += 1; }
+
+            // A body LARGER than its own field list carries the tail padding
+            // that reproduces a declared `![align(N)]`; a body SMALLER than
+            // its field list is an identified struct reused under a mangled
+            // name a different field list already claimed.
+            const padded: boolean = lit_size != 0 && lit_size < llvm_size;
+            if (padded) { padded_n += 1; }
+            const size_ok: boolean = fe_size == llvm_size;
+            const body_ok: boolean = lit_size == 0 || lit_size == llvm_size || padded;
+            const agrees:  boolean = size_ok && body_ok;
+            if (!agrees) { disagree += 1; }
+            if (t.alignment() != llvm_align) { align_dis += 1; }
+            if (agrees && !padded && t.alignment() == llvm_align && !audit_all) { continue; }
+
+            mut tag: string = "LAYOUT-DIS";
+            if (agrees) {
+                tag = "LAYOUT-OK";
+                if (padded) { tag = "LAYOUT-PADDED"; }
+                if (t.alignment() != llvm_align) { tag = "LAYOUT-ALIGN-DIS"; }
+            }
+            fmt::eprintf("%s module=%s kind=%s type=%s id=%llu fe_size=%llu fe_align=%llu llvm_size=%llu llvm_align=%llu lit_size=%llu min_align=%llu targs=%lld\n",
+                   tag, module_name, kind, name, t.id, fe_size, t.alignment(), llvm_size, llvm_align, lit_size, min_align, nargs);
+        }
+        fmt::eprintf("LAYOUT-AUDIT module=%s nominal=%lld examined=%lld disagree=%lld align_dis=%lld offset_dis=%lld padded=%lld skip_unmapped=%lld skip_opaque=%lld skip_fe0=%lld skip_llvm0=%lld\n",
+               module_name, nominal, examined, disagree, align_dis, offset_dis, padded_n, unmapped, opaque, fe_zero, llvm_zero);
+        libc::fflush(null);
     }
 
     /// IRGeneration pass.  Creates an LLVM module, walks the AST, and
@@ -532,8 +801,8 @@ type struct CodegenPasses {
 
         // Resolve module name.
         mut module_name: string = "main";
-        if (ctx.namespace_str.is_valid()) {
-            module_name = ctx.intern_table.resolve(ctx.namespace_str);
+        if (ctx.has_namespace()) {
+            module_name = ctx.namespace_display();
         }
 
         cdebug("[Codegen] Step 1: IR generation for module: %s\n", module_name);
@@ -547,7 +816,7 @@ type struct CodegenPasses {
         // CompilationContext is already large on the stack, and CodegenContext
         // adds ~400+ bytes of arrays and maps per module.
         cdebug("[Codegen] Step 4: Creating CodegenContext...\n");
-        const _box_cg: Box<CodegenContext> = Box<CodegenContext>::new(CodegenContext::new(ctx, module_name));
+        const _box_cg: Box<CodegenContext> = Box::<CodegenContext>::new(CodegenContext::new(ctx, module_name));
         const cg: CodegenContext* = _box_cg.leak();
         // Two-phase init step 2: wire back-pointers on sub-components now
         // that `cg` is at its stable heap address.  Wiring before the move
@@ -561,7 +830,7 @@ type struct CodegenPasses {
         // LLVM.  The resolved triple is also fed to the target machine
         // below so the data-layout string matches.
         cdebug("[Codegen] Step 6: Setting target triple...\n");
-        const triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const triple: string = ctx.options.target_triple;
         cg.llvm_module.set_target_triple(triple);
         cdebug("[Codegen] Step 7: Target triple set: %s\n", triple);
 
@@ -576,42 +845,23 @@ type struct CodegenPasses {
         // DWARF debug-info scaffolding (no-op unless `-g`/--debug-info).
         // Must run before function-body emission so each prologue can
         // attach a DISubprogram + source location to its function.
-        CodegenPasses::setup_debug_info(ctx, cg.llvm_module.raw);
+        CodegenPasses::setup_debug_info(ctx, cg);
 
-        // Cross-module externs are declared lazily by `resolve_function` /
-        // `resolve_function_with_arity` / `resolve_global` on first reference
+        // Cross-module externs are declared lazily by `resolve_symbol` /
+        // `resolve_family` / `resolve_global` on first reference
         // from this module, avoiding an O(modules x funcs x overloads) bulk
         // pre-declaration pass.
 
-        // Emit the inline runtime helpers (`format`, `panic`, etc.) into
-        // this module with linkonce_odr linkage.  Idempotent and
-        // per-module; the linker collapses the 100+ copies down to one.
-        // Resolve the arena-aware heap allocator so the `format` runtime routes
-        // its result buffer through `GlobalAlloc` (arena while active, libc
-        // otherwise) instead of libc `vasprintf`'s own `malloc`.  This lets a
-        // long-running host (the LSP, which recompiles per keystroke) reclaim the
-        // pervasively-leaked `format()` result strings in bulk at the next arena
-        // reset instead of leaking them to libc every compile.  Resolved by
-        // qualified name like every other cross-module runtime call; invalid
-        // under `--no-std` (no stdlib linked), where the runtime keeps its libc
-        // `vasprintf` buffer unchanged.
-        // Suppressed under `no_runtime`: the `format` runtime forwards to libc
-        // `vasprintf`, which a `-nostdlib` freestanding link cannot resolve, and
-        // the freestanding runtime tier provides its own formatting instead.
-        // The panic funnel is no longer emitted per-module at all — every panic
-        // calls the external `__cryo_panic` supplied by the linked panic tier
-        // (see `emit_panic_call`).
-        if (!ctx.project_no_runtime) {
-            const gha_fn: LValue = cg.resolver.resolve_function(
-                cg.intern_str("std::alloc::allocator::alloc"));
-            cg.intrinsics.emit_format_runtime(gha_fn);
-        }
+        // No runtime helper is emitted per-module any more.  A panic calls the
+        // external `__cryo_panic` supplied by the linked panic tier (see
+        // `emit_panic_call`), and formatting is `fmt::format`, an ordinary
+        // stdlib function resolved and linked like any other.
 
         // Create the visitor and generate IR.  Heap-allocate via Box::leak
         // so sub-emitters can hold stable `state: VisitorState*` back-pointers
         // into `gen.state`; same two-phase pattern as `CodegenContext` above.
         cdebug("[Codegen] Step 12: Creating IRGeneratorVisitor...\n");
-        const _box_gen: Box<IRGeneratorVisitor> = Box<IRGeneratorVisitor>::new(IRGeneratorVisitor(cg));
+        const _box_gen: Box<IRGeneratorVisitor> = Box::<IRGeneratorVisitor>::new(IRGeneratorVisitor(cg));
         const gen: IRGeneratorVisitor* = _box_gen.leak();
         // Two-phase init step 2: wire back-pointers on sub-emitters now
         // that `gen` is at its stable heap address.  No-op while the
@@ -625,10 +875,10 @@ type struct CodegenPasses {
         mut step15_status: string = "failed";
         if (success) { step15_status = "succeeded"; }
         cdebug("[Codegen] Step 15: Program IR generation %s\n", step15_status);
-        fflush(null);
+        libc::fflush(null);
 
         if (!success) {
-            if (ctx.debug_mode) {
+            if (ctx.options.verbose) {
                 cdebug("[Codegen] IR generation failed for module: %s\n", module_name);
             }
             cg.dispose_builder();
@@ -652,11 +902,13 @@ type struct CodegenPasses {
         // this module.
         CodegenPasses::cascade_strip_dependents(cg);
 
+        CodegenPasses::audit_layout(ctx, cg, module_name);
+
         // Finalize debug info: wires every DISubprogram into the compile
         // unit and resolves temporary metadata. Must run before
         // LLVMVerifyModule, which checks debug-info well-formedness.
-        if (ctx.di_builder != null) {
-            llvm::LLVMDIBuilderFinalize(ctx.di_builder);
+        if (cg.debug_info.is_on()) {
+            llvm::LLVMDIBuilderFinalize(cg.debug_info.builder);
         }
 
         // Pre-verify: scan all functions for corrupt types before calling
@@ -681,7 +933,7 @@ type struct CodegenPasses {
                     }
                     const param_count: u32 = llvm::LLVMCountParamTypes(fn_ty);
                     if (param_count > 0) {
-                        const param_buf: void* = intrinsics::malloc(param_count as u64 * 8);
+                        const param_buf: void* = libc::malloc(param_count as u64 * 8);
                         llvm::LLVMGetParamTypes(fn_ty, param_buf);
                         const slots: void** = param_buf as void**;
                         for (mut pi: u32 = 0; pi < param_count; pi++) {
@@ -692,7 +944,7 @@ type struct CodegenPasses {
                                 has_corrupt = true;
                             }
                         }
-                        intrinsics::free(param_buf);
+                        libc::free(param_buf);
                     }
                 }
                 fn_val = llvm::LLVMGetNextFunction(fn_val);
@@ -700,7 +952,7 @@ type struct CodegenPasses {
         }
 
         // Dump .ll BEFORE verification so failing modules are inspectable.
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             const mn_len: u64 = module_name.length();
             const mn_src: i8* = module_name as i8*;
             mut mn_s: String = String::with_capacity(mn_len + 1);
@@ -718,11 +970,11 @@ type struct CodegenPasses {
                     CodegenPasses::current_origin_subdir(ctx));
             }
             ProjectConfig::mkdir_p(ll_dir);
-            const ll_path: string = format("%s/%s.ll", ll_dir, mn_s.as_cstr() as string);
+            const ll_path: string = fmt::format("%s/%s.ll", ll_dir, mn_s.as_cstr() as string);
             mut ll_err: i8* = null;
             llvm::LLVMPrintModuleToFile(cg.llvm_module.raw, ll_path, &ll_err as void*);
             if (ll_err != null) { llvm::LLVMDisposeMessage(ll_err as void*); }
-            mn_s.drop();
+            mem::drop(mn_s);
         }
 
         if (has_corrupt) {
@@ -741,7 +993,7 @@ type struct CodegenPasses {
                 // builds with several verify failures.
                 mut diag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    format("LLVM module verification failed for %s", module_name));
+                    fmt::format("LLVM module verification failed for %s", module_name));
                 if (verify_err != null) {
                     const max_len: u64 = 2048;
                     const err_len: u64 = (verify_err as string).length();
@@ -768,7 +1020,7 @@ type struct CodegenPasses {
             }
         }
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug("[Codegen] Module verified: %s\n", module_name);
         }
 
@@ -792,9 +1044,9 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug("[Codegen] Optimization for module: %s (O%u)\n",
-                ctx.artifacts.ir.module_name, ctx.opt_level);
+                ctx.artifacts.ir.module_name, ctx.options.opt_level);
         }
 
         // O0: skip the IR optimization pipeline entirely. This leaves the
@@ -802,23 +1054,23 @@ type struct CodegenPasses {
         // inlining, no folding) so an O0 build stays debuggable and maps
         // cleanly back to source. The backend TargetMachine level below
         // still governs instruction selection / register allocation.
-        if (ctx.opt_level == 0) {
-            if (ctx.debug_mode) {
+        if (ctx.options.opt_level == 0) {
+            if (ctx.options.verbose) {
                 cdebug("[Codegen] O0: skipping IR optimization pipeline\n");
             }
             return PassResult::ok();
         }
 
-        const opt_triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const opt_triple: string = ctx.options.target_triple;
         mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-            opt_triple, ctx.opt_level as i32);
+            opt_triple, ctx.options.opt_level as i32);
         if (!tm.is_valid()) {
             return PassResult::ok();
         }
 
         // Run the default optimization pipeline at the configured level.
         const opts: void* = llvm::LLVMCreatePassBuilderOptions();
-        const passes: string = format("default<O%u>", ctx.opt_level);
+        const passes: string = fmt::format("default<O%u>", ctx.options.opt_level);
         const result: i32 = llvm::LLVMRunPasses(
             ctx.artifacts.ir.llvm_module, passes, tm.raw, opts);
         llvm::LLVMDisposePassBuilderOptions(opts);
@@ -826,7 +1078,7 @@ type struct CodegenPasses {
         if (result != 0) {
             tm.dispose();
             ctx.emit_error(ErrorCode::E0605_OPTIMIZATION_FAILED,
-                format("LLVM optimization pipeline failed for module '%s' (error code %d)",
+                fmt::format("LLVM optimization pipeline failed for module '%s' (error code %d)",
                     ctx.artifacts.ir.module_name, result));
             return PassResult::failure(1);
         }
@@ -841,7 +1093,7 @@ type struct CodegenPasses {
         if (verify_rc != 0) {
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0605_OPTIMIZATION_FAILED,
-                format("LLVM module verification failed after optimization for '%s'",
+                fmt::format("LLVM module verification failed after optimization for '%s'",
                     ctx.artifacts.ir.module_name));
             if (verify_err != null) {
                 const max_len: u64 = 2048;
@@ -889,24 +1141,24 @@ type struct CodegenPasses {
     /// for an explicit Asm/Object/IRText artifact (a user-facing file `cc` must
     /// not re-link); Exe and the no-override case register their `.o`.
     static resolve_emit_target(ctx: CompilationContext*) -> EmitTarget {
-        mut kind: OutputKind = ctx.output_kind;
+        mut output: OutputOverride = ctx.options.output;
         if (ctx.project_config != null && !CodegenPasses::is_entry_module_active(ctx)) {
-            kind = OutputKind::None;
+            output = OutputOverride::Default;
         }
-        match (kind) {
-            OutputKind::IRText => {
+        match (output) {
+            OutputOverride::IRText(path) => {
                 return EmitTarget { is_ir_text: true,
-                    emit_path: ctx.output_path_override,
+                    emit_path: path,
                     emit_type: LFileType::Object, should_register: false };
             }
-            OutputKind::Asm => {
+            OutputOverride::Asm(path) => {
                 return EmitTarget { is_ir_text: false,
-                    emit_path: ctx.output_path_override,
+                    emit_path: path,
                     emit_type: LFileType::Assembly, should_register: false };
             }
-            OutputKind::Object => {
+            OutputOverride::Object(path) => {
                 return EmitTarget { is_ir_text: false,
-                    emit_path: ctx.output_path_override,
+                    emit_path: path,
                     emit_type: LFileType::Object, should_register: false };
             }
             _ => {
@@ -923,7 +1175,7 @@ type struct CodegenPasses {
     /// thread - a worker must not recompute it (the resolver reads process
     /// state that is only stable to read serially).
     static effective_triple(ctx: CompilationContext*) -> string {
-        return LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        return ctx.options.target_triple;
     }
 
 
@@ -950,7 +1202,8 @@ type struct CodegenPasses {
     }
 
     /// Index of the first byte `b` in `s`, or -1.
-    static index_of_byte(s: string, b: u8) -> i64 {
+    static index_of_byte(s_text: string, b: u8) -> i64 {
+        const s: string = s_text;
         const len: u64 = s.length();
         mut i: u64 = 0;
         while (i < len) {
@@ -961,7 +1214,8 @@ type struct CodegenPasses {
     }
 
     /// `s[start .. start+len]` as a fresh NUL-terminated string.
-    static substr(s: string, start: u64, len: u64) -> string {
+    static substr(s_text: string, start: u64, len: u64) -> string {
+        const s: string = s_text;
         mut out: String = String::from_str(Str::from_raw(((s as i8*) + start) as u8*, len));
         return out.into_raw();
     }
@@ -970,8 +1224,9 @@ type struct CodegenPasses {
     /// the manifest and emit the objects assigned to this worker (module line
     /// `k` belongs to worker `k % count`, round-robin so large modules spread
     /// across workers).  Returns 0 if every assigned object emitted.
-    static run_emit_worker(manifest_path: string, worker_idx: u32,
+    static run_emit_worker(manifest_path_text: string, worker_idx: u32,
                            worker_count: u32) -> i32 {
+        const manifest_path: string = manifest_path_text;
         mut content: String = String::new();
         match (file::read_to_string(Path::from(manifest_path))) {
             Result::Ok(s)  => { content = s; }
@@ -1017,20 +1272,23 @@ type struct CodegenPasses {
     /// PROCESS (own address space, own LLVM globals) - so there is no shared
     /// LLVM state to race, which is what makes this safe where in-process
     /// threading was not.  Returns true if every worker exited successfully.
-    static run_multiprocess_emit(bc: string[]*, obj: string[]*, triple: string,
-                                 opt: u32, worker_count: u32, self_exe: string,
-                                 manifest_path: string) -> boolean {
+    static run_multiprocess_emit(bc: string[]*, obj: string[]*, triple_text: string,
+                                 opt: u32, worker_count: u32, self_exe_text: string,
+                                 manifest_path_text: string) -> boolean {
+        const manifest_path: string = manifest_path_text;
+        const self_exe: string = self_exe_text;
+        const triple: string = triple_text;
         // Manifest: triple, opt, then "<bc>\t<o>" per module in topo order.
         mut mf: String = String::new();
         mf.push(triple);            mf.push_byte(10);
-        mf.push(format("%u", opt)); mf.push_byte(10);
+        mf.push(fmt::format("%u", opt)); mf.push_byte(10);
         const cnt: i64 = (*bc).length as i64;
         for (mut k: i64 = 0; k < cnt; k++) {
             mf.push((*bc)[k]);  mf.push_byte(9);
             mf.push((*obj)[k]); mf.push_byte(10);
         }
         match (file::write(Path::from(manifest_path),
-                           Slice<u8>::from_raw(mf.as_str().as_ptr(), mf.length()))) {
+                           Slice::<u8>::from_raw(mf.as_str().as_ptr(), mf.length()))) {
             Result::Ok(_)  => { }
             Result::Err(_) => {
                 fmt::eprintln("codegen: failed to write emit manifest");
@@ -1045,8 +1303,8 @@ type struct CodegenPasses {
             mut cmd: Command = Command::new(Str::new(self_exe));
             cmd.arg(Str::new("__emit-obj"));
             cmd.arg(Str::new(manifest_path));
-            cmd.arg(Str::new(format("%u", w)));
-            cmd.arg(Str::new(format("%u", worker_count)));
+            cmd.arg(Str::new(fmt::format("%u", w)));
+            cmd.arg(Str::new(fmt::format("%u", worker_count)));
             match (cmd.spawn()) {
                 Result::Ok(c)  => { children.push(c); }
                 Result::Err(_) => { fmt::eprintln("codegen: failed to spawn emit worker"); }
@@ -1087,12 +1345,12 @@ type struct CodegenPasses {
     /// own process, so there is no shared LLVM global state to race - the whole
     /// point of going multi-process instead of multi-thread.  Returns true iff
     /// the object was emitted.
-    static emit_object_from_bitcode(bc_path: string, o_path: string,
-                                    triple: string, opt_level: u32) -> boolean {
+    static emit_object_from_bitcode(bc_path_text: string, o_path_text: string,
+                                    triple_text: string, opt_level: u32) -> boolean {
         LTargetMachine::init_native_target();
-        const eff: string = LTargetMachine::resolve_effective_triple(triple);
+        const eff: string = LTargetMachine::resolve_effective_triple(triple_text);
         const lctx: LContext = LContext::create();
-        mut m: LModule = LModule::parse_ir_file(bc_path, lctx);
+        mut m: LModule = LModule::parse_ir_file(bc_path_text, lctx);
         if (!m.is_valid()) {
             mut c0: LContext = lctx;
             c0.dispose();
@@ -1102,7 +1360,7 @@ type struct CodegenPasses {
         mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
             eff, opt_level as i32);
         if (tm.is_valid()) {
-            ok = tm.emit_to_file(m, o_path, LFileType::Object);
+            ok = tm.emit_to_file(m, o_path_text, LFileType::Object);
             tm.dispose();
         }
         m.dispose();
@@ -1128,9 +1386,9 @@ type struct CodegenPasses {
         // (ELF / COFF / Mach-O) is selected by the target machine, so
         // a stale host machine here would silently undo the cross-
         // compile we set up in IR generation.
-        const obj_triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const obj_triple: string = ctx.options.target_triple;
         mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-            obj_triple, ctx.opt_level as i32);
+            obj_triple, ctx.options.opt_level as i32);
         if (!tm.is_valid()) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 "failed to create target machine for object emission");
@@ -1143,7 +1401,7 @@ type struct CodegenPasses {
 
         if (!success) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("failed to emit object file: %s", target.emit_path));
+                fmt::format("failed to emit object file: %s", target.emit_path));
             return PassResult::failure(1);
         }
 
@@ -1163,7 +1421,7 @@ type struct CodegenPasses {
             ctx.artifacts.register_object_file(target.emit_path);
         }
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug("[Codegen] Emitted: %s\n", target.emit_path);
         }
 
@@ -1200,9 +1458,9 @@ type struct CodegenPasses {
         // truth for this mapping, shared with the incremental cache probe/reuse
         // and the manifest's artifact prediction; they MUST agree or the
         // predicted path diverges from the emitted one and caching breaks.
-        const rel: string = Compiler::BuildManifest::Manifest::path_module(
+        const rel: string = compiler::build_manifest::Manifest::path_module(
             ctx.artifacts.ir.module_name);
-        const obj_path: string = format("%s/%s.o", output_dir, rel);
+        const obj_path: string = fmt::format("%s/%s.o", output_dir, rel);
         // mkdir_p the object's PARENT (the namespace subdirs), which subsumes
         // `deps/` and any `--build-dir=...` prefix; a bare `mkdir` of the deep
         // path would fail and object emission would error "No such file or
@@ -1214,20 +1472,21 @@ type struct CodegenPasses {
     /// Dump the LLVM module to a `.ll` text file at `path`.  Skips the
     /// target machine entirely; IR text is target-independent and the
     /// only failure mode is filesystem (permissions, missing parent).
-    static emit_ir_text(ctx: CompilationContext*, path: string) -> PassResult {
+    static emit_ir_text(ctx: CompilationContext*, path_text: string) -> PassResult {
+        const path: string = path_text;
         const mod_ref: void* = ctx.artifacts.ir.llvm_module;
         mut err: i8* = null;
         const rc: i32 = llvm::LLVMPrintModuleToFile(mod_ref, path, &err as void*);
         if (rc != 0) {
             const note: string = if (err != null) { err as string } else { "(no detail)" };
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("failed to write IR text to %s: %s", path, note));
+                fmt::format("failed to write IR text to %s: %s", path, note));
             if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
             return PassResult::failure(1);
         }
         if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
         ctx.artifacts.linked = LinkedOutput { object_file_path: path };
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug("[Codegen] Emitted IR text: %s\n", path);
         }
         return PassResult::ok();
@@ -1250,19 +1509,16 @@ type struct CodegenPasses {
             // Object / IRText emit their final artifact straight from
             // object emission; Default (no `-o`) leaves the .o behind
             // without linking, matching the historic behaviour.
-            return match (ctx.output_kind) {
-                OutputKind::Exe => { CodegenPasses::run_linking_singlefile(ctx) }
-                _               => { PassResult::ok() }
-            };
+            if (ctx.options.output.is_exe()) {
+                return CodegenPasses::run_linking_singlefile(ctx);
+            }
+            return PassResult::ok();
         }
         // `-o foo.o` / `foo.s` / `foo.ll` on a single-file build: the
         // entry module's artifact was already written by ObjectEmission
         // directly to the override path; there is no executable to link.
-        match (ctx.output_kind) {
-            OutputKind::Object => { return PassResult::ok(); }
-            OutputKind::Asm    => { return PassResult::ok(); }
-            OutputKind::IRText => { return PassResult::ok(); }
-            _                  => { /* None / Exe: link normally */ }
+        if (ctx.options.output.is_unlinked_artifact()) {
+            return PassResult::ok();
         }
         if (!ctx.project_config.requires_entry_point()) {
             // Library / stdlib target: no executable to produce, but
@@ -1286,14 +1542,14 @@ type struct CodegenPasses {
         // know how to drive end-to-end (aarch64, riscv, windows-msvc,
         // ...) `supported` is false and we keep the historic
         // object-files-only bailout below.
-        const effective_triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const effective_triple: string = ctx.options.target_triple;
         const link_cfg: LinkerConfig = LinkerConfig::linker_config_for_triple(effective_triple);
 
         if (!link_cfg.supported) {
             const obj_only_dir: string = cfg.profile_dir();
-            fmt::println(f"Cross-compile: produced {ctx.artifacts.object_files.length} object file(s) for target '{ctx.target_triple}' in {obj_only_dir}");
-            fmt::println(f"  (host linker skipped; link with a {ctx.target_triple}-aware toolchain, e.g.:");
-            fmt::println(f"     clang --target={ctx.target_triple} {obj_only_dir}/*/deps/*.o -o <output>)");
+            fmt::println(f"Cross-compile: produced {ctx.artifacts.object_files.length} object file(s) for target '{ctx.options.target_triple}' in {obj_only_dir}");
+            fmt::println(f"  (host linker skipped; link with a {ctx.options.target_triple}-aware toolchain, e.g.:");
+            fmt::println(f"     clang --target={ctx.options.target_triple} {obj_only_dir}/*/deps/*.o -o <output>)");
             return PassResult::ok();
         }
 
@@ -1330,14 +1586,14 @@ type struct CodegenPasses {
         // it parses identically under `sh -c` and `cmd /c`.  Same objects,
         // same order, same libs => a byte-identical executable on every
         // host, so selfhost byte-identity is unaffected.
-        const link_rsp_path: string = format("%s.rsp", exe_path);
+        const link_rsp_path: string = fmt::format("%s.rsp", exe_path);
         if (!CodegenPasses::write_rsp_file(link_rsp_path, &ctx.artifacts.object_files)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("could not open linker response file for writing: %s", link_rsp_path));
+                fmt::format("could not open linker response file for writing: %s", link_rsp_path));
             return PassResult::failure(1);
         }
 
-        mut cmd: string = format("%s -o %s @\"%s\"",
+        mut cmd: string = fmt::format("%s -o %s @\"%s\"",
             link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
         // `no_runtime`: freestanding link.  `-nostartfiles` drops crt0 (the
         // runtime provides its own `_start`), `-nostdlib` drops the default
@@ -1356,9 +1612,9 @@ type struct CodegenPasses {
         //     them ahead of those references, which ld would not resolve.
         if (cfg.no_runtime) {
             if (effective_triple.contains("windows")) {
-                cmd = format("%s -nostartfiles -nostdlib -Wl,-e,_start", cmd);
+                cmd = fmt::format("%s -nostartfiles -nostdlib -Wl,-e,_start", cmd);
             } else {
-                cmd = format("%s -nostartfiles -nostdlib -static", cmd);
+                cmd = fmt::format("%s -nostartfiles -nostdlib -static", cmd);
             }
         }
         // Project-configured linking ([link] in cryoconfig).  -L and -l are
@@ -1367,13 +1623,13 @@ type struct CodegenPasses {
         // resolving `system` libs), `system` -> -l, `static` -> the archive
         // path passed to the linker verbatim.
         for (mut i: i64 = 0; i < cfg.link_search.length; i++) {
-            cmd = format("%s -L%s", cmd, CodegenPasses::link_quote(cfg.link_search[i]));
+            cmd = fmt::format("%s -L%s", cmd, CodegenPasses::link_quote(cfg.link_search[i]));
         }
         for (mut i: i64 = 0; i < cfg.link_system.length; i++) {
-            cmd = format("%s -l%s", cmd, CodegenPasses::link_quote(cfg.link_system[i]));
+            cmd = fmt::format("%s -l%s", cmd, CodegenPasses::link_quote(cfg.link_system[i]));
         }
         for (mut i: i64 = 0; i < cfg.link_static.length; i++) {
-            cmd = format("%s %s", cmd, CodegenPasses::link_quote(cfg.link_static[i]));
+            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(cfg.link_static[i]));
         }
         // Per-OS overlay ([link.unix] / [link.windows]).  Appended after
         // the common set, so a project can carry platform-divergent libs
@@ -1386,13 +1642,13 @@ type struct CodegenPasses {
         // -> verbatim path.
         if (effective_triple.contains("windows")) {
             for (mut i: i64 = 0; i < cfg.link_search_windows.length; i++) {
-                cmd = format("%s -L%s", cmd, CodegenPasses::link_quote(cfg.link_search_windows[i]));
+                cmd = fmt::format("%s -L%s", cmd, CodegenPasses::link_quote(cfg.link_search_windows[i]));
             }
             for (mut i: i64 = 0; i < cfg.link_system_windows.length; i++) {
-                cmd = format("%s -l%s", cmd, CodegenPasses::link_quote(cfg.link_system_windows[i]));
+                cmd = fmt::format("%s -l%s", cmd, CodegenPasses::link_quote(cfg.link_system_windows[i]));
             }
             for (mut i: i64 = 0; i < cfg.link_static_windows.length; i++) {
-                cmd = format("%s %s", cmd, CodegenPasses::link_quote(cfg.link_static_windows[i]));
+                cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(cfg.link_static_windows[i]));
             }
         } else {
             // The `[link.unix]` overlay carries the host libLLVM (`-lLLVM-20`
@@ -1402,16 +1658,16 @@ type struct CodegenPasses {
             // so skip the overlay's search/system entries here.  `[link.unix]`
             // is LLVM-only today; if it ever grows non-LLVM libs, switch this
             // to value-filtering "LLVM-20" rather than skipping the overlay.
-            if (!ctx.release_static) {
+            if (!ctx.options.static_link) {
                 for (mut i: i64 = 0; i < cfg.link_search_unix.length; i++) {
-                    cmd = format("%s -L%s", cmd, CodegenPasses::link_quote(cfg.link_search_unix[i]));
+                    cmd = fmt::format("%s -L%s", cmd, CodegenPasses::link_quote(cfg.link_search_unix[i]));
                 }
                 for (mut i: i64 = 0; i < cfg.link_system_unix.length; i++) {
-                    cmd = format("%s -l%s", cmd, CodegenPasses::link_quote(cfg.link_system_unix[i]));
+                    cmd = fmt::format("%s -l%s", cmd, CodegenPasses::link_quote(cfg.link_system_unix[i]));
                 }
             }
             for (mut i: i64 = 0; i < cfg.link_static_unix.length; i++) {
-                cmd = format("%s %s", cmd, CodegenPasses::link_quote(cfg.link_static_unix[i]));
+                cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(cfg.link_static_unix[i]));
             }
         }
         // `--release-static`: splice the static libLLVM component set
@@ -1419,14 +1675,14 @@ type struct CodegenPasses {
         // llvm-config in place of the dynamic `-lLLVM-20` skipped above.
         // Placed before the stdlib archive + system libs so the single-pass
         // static link order is objects -> LLVM -> libcryo.a -> libm/libstdc++.
-        if (ctx.release_static) {
+        if (ctx.options.static_link) {
             const llvm_static: string = CodegenPasses::static_llvm_link_flags(CodegenPasses::pick_llvm_config());
             if (llvm_static.length() == 0) {
                 ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                     "could not obtain static LLVM link flags from llvm-config (is it installed? set CRYO_LLVM_CONFIG)");
                 return PassResult::failure(1);
             }
-            cmd = format("%s %s", cmd, llvm_static);
+            cmd = fmt::format("%s %s", cmd, llvm_static);
         }
         // Stdlib archive: the stdlib build emits `<stdlib_root>/.bin/libcryo.a`
         // (see bundle_archive); pull it in for host builds unless the
@@ -1436,10 +1692,10 @@ type struct CodegenPasses {
         // line (cryo re-compiles every reachable std module when
         // target != host).
         if (link_cfg.use_stdlib_archive && !cfg.no_std && !cfg.no_runtime
-                && ctx.stdlib_root.length() > 0) {
-            const stdlib_archive: string = format("%s/.bin/libcryo.a",
-                ctx.stdlib_root);
-            cmd = format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
+                && ctx.options.stdlib_root.length() > 0) {
+            const stdlib_archive: string = CodegenPasses::stdlib_archive_path(
+                ctx.options.stdlib_root, effective_triple);
+            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
         }
         // A freestanding link has no libc to satisfy the panic/alloc/backtrace
         // lang items, so the tier archives ARE the runtime and must all be on
@@ -1452,15 +1708,14 @@ type struct CodegenPasses {
         } else {
             cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, effective_triple);
         }
-        // Cryo runtime support is fully inline-lowered: every bare-name
-        // intrinsic (i32_to_i64, ptr_diff, format, bswap*, clz*, fpclass,
-        // atomic_fence, dirent_*) is emitted directly into LLVM IR by
-        // IntrinsicsCodegen.  No C runtime to link beyond what the
+        // Cryo runtime support is fully inline-lowered: every intrinsic
+        // with a kind (ptr_diff, fpclass, atomic_*, dirent_*, ...) is
+        // emitted directly into LLVM IR by IntrinsicEmitter.  No C runtime to link beyond what the
         // active target's system library line provides.  Under `no_runtime`
         // there is no libc/libm to pull in (they were dropped by
         // `-nostdlib` above), so the system-lib line is suppressed.
         if (!cfg.no_runtime) {
-            cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
+            cmd = fmt::format("%s %s", cmd, link_cfg.extra_system_libs);
         }
 
         // `--release-static`: statically link libc (`-static`) and the C++
@@ -1469,27 +1724,32 @@ type struct CodegenPasses {
         // position-independent driver flags, so trailing placement is safe;
         // `-static-libstdc++` makes the earlier `-lstdc++` resolve to the
         // archive.  Linux host only (this branch is the unix link path).
-        if (ctx.release_static) {
-            cmd = format("%s -static -static-libstdc++ -static-libgcc", cmd);
+        if (ctx.options.static_link) {
+            cmd = fmt::format("%s -static -static-libstdc++ -static-libgcc", cmd);
         }
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug("[Codegen] Linking %lld objects -> %s\n",
                 ctx.artifacts.object_files.length, exe_path);
             cdebug("[Codegen] Link command: %s\n", cmd);
         }
 
-        const rc: i32 = Command::shell(cmd);
+        mut link_out: string = "";
+        const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", link_rsp_path), &link_out);
+        if (rc != 0) {
+            // Keep the response file on the failure path: the command in the
+            // diagnostic names it with `@`, so deleting it makes that command
+            // unreplayable - the linker just reports the missing file instead
+            // of the original error.
+            ctx.emit_diagnostic(CodegenPasses::tool_failure(
+                fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc),
+                cmd, link_rsp_path, link_out));
+            return PassResult::failure(1);
+        }
         // The response file has served its purpose; remove it so it doesn't
         // linger in the per-profile dir (best-effort - a failed unlink is
         // harmless).
         dir::remove_file(Path::from(link_rsp_path));
-        if (rc != 0) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("linker invocation failed (%s exited with %d): %s",
-                    link_cfg.driver, rc, cmd));
-            return PassResult::failure(1);
-        }
 
         cdebug("[Codegen] Linked executable: %s\n", exe_path);
 
@@ -1505,7 +1765,7 @@ type struct CodegenPasses {
         const hrc: i32 = CodegenPasses::hoist_binary(exe_path, hoisted_exe);
         if (hrc != 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("failed to hoist executable to %s (copy exited with %d)",
+                fmt::format("failed to hoist executable to %s (copy exited with %d)",
                     hoisted_exe, hrc));
             return PassResult::failure(1);
         }
@@ -1514,20 +1774,16 @@ type struct CodegenPasses {
         // Single-file `-o PATH` (Exe): mirror the hoisted binary to the
         // user's explicit output path.  The path is taken verbatim - no
         // `.exe` auto-append - since `-o` is explicit user intent.
-        const exe_override: boolean = match (ctx.output_kind) {
-            OutputKind::Exe => { true }
-            _               => { false }
-        };
-        if (exe_override && ctx.output_path_override.length() > 0) {
-            const orc: i32 = CodegenPasses::hoist_binary(hoisted_exe, ctx.output_path_override);
+        const exe_out: string = ctx.options.output.path();
+        if (ctx.options.output.is_exe() && exe_out.length() > 0) {
+            const orc: i32 = CodegenPasses::hoist_binary(hoisted_exe, exe_out);
             if (orc != 0) {
                 ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    format("failed to copy executable to %s (copy exited with %d)",
-                        ctx.output_path_override, orc));
+                    fmt::format("failed to copy executable to %s (copy exited with %d)",
+                        exe_out, orc));
                 return PassResult::failure(1);
             }
-            cdebug("[Codegen] Mirrored executable to -o path: %s\n",
-                ctx.output_path_override);
+            cdebug("[Codegen] Mirrored executable to -o path: %s\n", exe_out);
         }
 
         // Emit a combined `.ll` text dump of the project's per-module IR
@@ -1540,7 +1796,7 @@ type struct CodegenPasses {
         // to /dev/null so `llvm-link-20`'s "No such file or directory"
         // complaint (when no .ll files were written because emit_llvm was
         // unset) doesn't pollute the user's terminal in the silent default.
-        const ll_path: string = format("%s.ll", hoisted_exe);
+        const ll_path: string = fmt::format("%s.ll", hoisted_exe);
         // POSIX-only (shell glob + `2>/dev/null`); a no-op on a native
         // Windows-hosted compiler, where `cmd` provides neither.
         CodegenPasses::emit_linked_ir_dump(profile_dir, ll_path);
@@ -1552,26 +1808,24 @@ type struct CodegenPasses {
     /// Single-file `-o PATH` Exe link.  Mirrors the project link path
     /// minus the cryoconfig-driven extras: there are no `[link]` paths,
     /// no test-suffix logic, and no llvm-link IR dump.  The stdlib
-    /// archive is still pulled in for host builds when `ctx.stdlib_root`
+    /// archive is still pulled in for host builds when `ctx.options.stdlib_root`
     /// was resolved - without it most non-trivial programs would fail to
     /// link.  Cross-compile builds skip the archive (same reasoning as
     /// the project link path).  The user-supplied `exe_path` is taken
     /// verbatim: we do NOT auto-append `.exe` for Windows targets,
     /// since `-o` is explicit user intent.
     static run_linking_singlefile(ctx: CompilationContext*) -> PassResult {
-        const exe_path: string = ctx.output_path_override;
+        const exe_path: string = ctx.options.output.path();
         if (exe_path.length() == 0) {
-            // Defensive: run_linking only routes here when output_kind
-            // is Exe, which the CLI sets alongside output_path_override.
             return PassResult::ok();
         }
 
-        const effective_triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const effective_triple: string = ctx.options.target_triple;
         const link_cfg: LinkerConfig = LinkerConfig::linker_config_for_triple(effective_triple);
         if (!link_cfg.supported) {
             // Unknown triple - same fallback as the project path.
-            fmt::println(f"Cross-compile: produced {ctx.artifacts.object_files.length} object file(s) for target '{ctx.target_triple}'");
-            fmt::println(f"  (host linker skipped; link with a {ctx.target_triple}-aware toolchain)");
+            fmt::println(f"Cross-compile: produced {ctx.artifacts.object_files.length} object file(s) for target '{ctx.options.target_triple}'");
+            fmt::println(f"  (host linker skipped; link with a {ctx.options.target_triple}-aware toolchain)");
             return PassResult::ok();
         }
 
@@ -1581,25 +1835,25 @@ type struct CodegenPasses {
         // host (where `system(3)` routes through cmd), and `@file` keeps the
         // spawned command short and byte-identical on every host.  `@"%s"`
         // (literal double quotes) parses the same under `sh -c` and `cmd /c`.
-        const link_rsp_path: string = format("%s.rsp", exe_path);
+        const link_rsp_path: string = fmt::format("%s.rsp", exe_path);
         if (!CodegenPasses::write_rsp_file(link_rsp_path, &ctx.artifacts.object_files)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("could not open linker response file for writing: %s", link_rsp_path));
+                fmt::format("could not open linker response file for writing: %s", link_rsp_path));
             return PassResult::failure(1);
         }
 
-        mut cmd: string = format("%s -o %s @\"%s\"",
+        mut cmd: string = fmt::format("%s -o %s @\"%s\"",
             link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
         // `no_runtime`: freestanding link (see run_linking).  In raw mode
-        // `ctx.project_no_runtime` carries the flag.  Same per-OS split as the
+        // `ctx.options.freestanding()` carries the flag.  Same per-OS split as the
         // project path: a PE cannot be `-static` (ntdll is always a DLL) and
         // needs its entry pointed at the runtime's `_start`.
         const raw_triple: string = CodegenPasses::effective_triple(ctx);
-        if (ctx.project_no_runtime) {
+        if (ctx.options.freestanding()) {
             if (raw_triple.contains("windows")) {
-                cmd = format("%s -nostartfiles -nostdlib -Wl,-e,_start", cmd);
+                cmd = fmt::format("%s -nostartfiles -nostdlib -Wl,-e,_start", cmd);
             } else {
-                cmd = format("%s -nostartfiles -nostdlib -static", cmd);
+                cmd = fmt::format("%s -nostartfiles -nostdlib -static", cmd);
             }
         }
         // Stdlib archive: same lookup as the project link path, and same
@@ -1607,34 +1861,37 @@ type struct CodegenPasses {
         // never resolved one (e.g. user passed `--no-std` semantically by
         // stripping prelude resolution); skip the archive in that case
         // and let the linker error if the program needs stdlib symbols.
-        if (link_cfg.use_stdlib_archive && !ctx.project_no_runtime
-                && ctx.stdlib_root.length() > 0) {
-            const stdlib_archive: string = format("%s/.bin/libcryo.a",
-                ctx.stdlib_root);
-            cmd = format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
+        if (link_cfg.use_stdlib_archive && !ctx.options.freestanding()
+                && ctx.options.stdlib_root.length() > 0) {
+            const stdlib_archive: string = CodegenPasses::stdlib_archive_path(
+                ctx.options.stdlib_root, raw_triple);
+            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
         }
-        if (ctx.project_no_runtime) {
+        if (ctx.options.freestanding()) {
             cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, raw_triple);
         } else {
             cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, raw_triple);
-            cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
+            cmd = fmt::format("%s %s", cmd, link_cfg.extra_system_libs);
         }
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug("[Codegen] Single-file link -> %s\n", exe_path);
             cdebug("[Codegen] Link command: %s\n", cmd);
         }
 
-        const rc: i32 = Command::shell(cmd);
+        mut link_out: string = "";
+        const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", link_rsp_path), &link_out);
+        if (rc != 0) {
+            // Retained on failure so the reported command can be re-run; see
+            // the project link path for the reasoning.
+            ctx.emit_diagnostic(CodegenPasses::tool_failure(
+                fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc),
+                cmd, link_rsp_path, link_out));
+            return PassResult::failure(1);
+        }
         // Discard the response file once the link has consumed it
         // (best-effort - a failed unlink is harmless).
         dir::remove_file(Path::from(link_rsp_path));
-        if (rc != 0) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("linker invocation failed (%s exited with %d): %s",
-                    link_cfg.driver, rc, cmd));
-            return PassResult::failure(1);
-        }
 
         cdebug("[Codegen] Linked executable: %s\n", exe_path);
         ctx.artifacts.linked = LinkedOutput { object_file_path: exe_path };
@@ -1655,7 +1912,7 @@ type struct CodegenPasses {
         const cfg: ProjectConfig* = ctx.project_config;
         const archive_name: string = match (cfg.target_type) {
             TargetType::Stdlib => { "libcryo.a" }
-            _                  => { format("lib%s.a", cfg.project_name) }
+            _                  => { fmt::format("lib%s.a", cfg.project_name) }
         };
         // Archive lands at the build root (`<output_dir>/lib<name>.a`).
         ProjectConfig::mkdir_p(cfg.output_dir);
@@ -1668,8 +1925,9 @@ type struct CodegenPasses {
     /// "link-twice" path, where a `[[bin]]` derives `lib<name>.a` from its own
     /// object set (minus the entry module) instead of a second full compile.
     static bundle_object_list(
-        ctx: CompilationContext*, archive_path: string, objs: &string[]
+        ctx: CompilationContext*, archive_path_text: string, objs: &string[]
     ) -> PassResult {
+        const archive_path: string = archive_path_text;
         // Invoke `<ar> rcs <archive> @<response-file>`.  `r` replaces stale
         // members on re-bundle, `c` suppresses the empty-archive warning,
         // `s` writes the symbol index that `ld` consults to satisfy
@@ -1700,29 +1958,32 @@ type struct CodegenPasses {
         // `c_header_import` leaves `cc`) so a quoted-path first token can't
         // trip cmd's outer-quote-stripping rule.
         const ar: string = CodegenPasses::pick_archiver();
-        const rsp_path: string = format("%s.rsp", archive_path);
+        const rsp_path: string = fmt::format("%s.rsp", archive_path);
         if (!CodegenPasses::write_rsp_file(rsp_path, objs)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("could not open archiver response file for writing: %s", rsp_path));
+                fmt::format("could not open archiver response file for writing: %s", rsp_path));
             return PassResult::failure(1);
         }
 
-        const cmd: string = format("%s rcs \"%s\" @\"%s\"", ar, archive_path, rsp_path);
+        const cmd: string = fmt::format("%s rcs \"%s\" @\"%s\"", ar, archive_path, rsp_path);
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug("[Codegen] Bundling %lld objects -> %s (via %s)\n",
                 objs.length, archive_path, rsp_path);
             cdebug("[Codegen] Bundle command: %s\n", cmd);
         }
 
-        const rc: i32 = Command::shell(cmd);
-        // Drop the response file now the archiver has read it (best-effort).
-        dir::remove_file(Path::from(rsp_path));
+        mut ar_out: string = "";
+        const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", rsp_path), &ar_out);
         if (rc != 0) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("ar invocation failed (exited with %d): %s", rc, cmd));
+            // Retained on failure so the reported command can be re-run; see
+            // the project link path for the reasoning.
+            ctx.emit_diagnostic(CodegenPasses::tool_failure(
+                fmt::format("ar invocation failed (exited with %d)", rc), cmd, rsp_path, ar_out));
             return PassResult::failure(1);
         }
+        // Drop the response file now the archiver has read it (best-effort).
+        dir::remove_file(Path::from(rsp_path));
 
         cdebug("[Codegen] Bundled archive: %s (%lld objects)\n",
             archive_path, objs.length);
@@ -1740,10 +2001,11 @@ type struct CodegenPasses {
             ctx.project_config.discovery_root_path());
     }
 
-    /// Returns true if `name` is in the stripped-functions set.
-    static is_stripped(cg: CodegenContext*, name: string) -> boolean {
-        if (name == null) { return false; }
-        return cg.diag.is_stripped(name);
+    /// Returns true if the LLVM function `fn_val` is in the
+    /// stripped-functions set.
+    static is_stripped(cg: CodegenContext*, fn_val: void*) -> boolean {
+        if (fn_val == null) { return false; }
+        return cg.diag.is_stripped(fn_val);
     }
 
     /// Walk a function's basic blocks and instructions; if any call instruction
@@ -1766,11 +2028,8 @@ type struct CodegenPasses {
                     const n: i32 = llvm::LLVMGetNumOperands(inst);
                     if (n > 0) {
                         const callee: void* = llvm::LLVMGetOperand(inst, (n - 1) as u32);
-                        if (callee != null) {
-                            const callee_name: string = llvm::LLVMGetValueName(callee) as string;
-                            if (callee_name != null && CodegenPasses::is_stripped(cg, callee_name)) {
-                                return true;
-                            }
+                        if (callee != null && CodegenPasses::is_stripped(cg, callee)) {
+                            return true;
                         }
                     }
                 }
@@ -1781,29 +2040,30 @@ type struct CodegenPasses {
         return false;
     }
 
-    /// Create the per-module DWARF scaffolding when `ctx.emit_debug_info` is
+    /// Create the per-module DWARF scaffolding when `ctx.options.debug_info` is
     /// set: a DIBuilder, a DIFile for the module's source path, a
     /// DICompileUnit, and the module-level `Debug Info Version` / `Dwarf
     /// Version` flags (without which the backend drops all debug metadata).
-    /// The handles are stashed on `ctx` for the function prologue to attach
+    /// The handles go on `cg.debug_info` for the function prologue to attach
     /// per-function DISubprograms; `LLVMDIBuilderFinalize` must be called
     /// before verification. No-op when debug info is off.
-    static setup_debug_info(ctx: CompilationContext*, module_raw: void*) -> void {
-        if (!ctx.emit_debug_info) { return; }
+    static setup_debug_info(ctx: CompilationContext*, cg: CodegenContext*) -> void {
+        if (!ctx.options.debug_info) { return; }
+        const module_raw: void* = cg.llvm_module.raw;
 
         const dib: void* = llvm::LLVMCreateDIBuilder(module_raw);
-        ctx.di_builder = dib;
 
         // DIFile: use the module's source path as the file name and "." as the
         // directory; debuggers join the two.
         const src: string = ctx.source_file;
         const file: void* = llvm::LLVMDIBuilderCreateFile(
             dib, src, src.length(), ".", 1);
-        ctx.di_file = file;
+        cg.debug_info = DebugInfoState { builder: dib, file: file };
 
         // DICompileUnit: Lang = C (1), EmissionKind = Full (1); other flags off.
+        // The builder keeps it; nothing here reads it back.
         const producer: string = "Cryo compiler";
-        const cu: void* = llvm::LLVMDIBuilderCreateCompileUnit(
+        llvm::LLVMDIBuilderCreateCompileUnit(
             dib, 1, file,
             producer, producer.length(),
             0,            // isOptimized
@@ -1816,7 +2076,6 @@ type struct CodegenPasses {
             0,            // DebugInfoForProfiling
             "", 0,        // SysRoot
             "", 0);       // SDK
-        ctx.di_cu = cu;
 
         // Module flags (behavior Warning = 1). "Debug Info Version" must be 3
         // (DEBUG_METADATA_VERSION) or LLVM silently strips the debug info.
@@ -1855,9 +2114,9 @@ type struct CodegenPasses {
                 const first_bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val);
                 if (first_bb != null) {
                     if (CodegenPasses::function_calls_stripped(cg, fn_val)) {
-                        // Don't double-strip a name that's already in the set.
+                        // Don't double-strip a function that's already in the set.
                         const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
-                        if (!CodegenPasses::is_stripped(cg, fn_name)) {
+                        if (!CodegenPasses::is_stripped(cg, fn_val)) {
                             const fn_name_safe: string = if (fn_name == null) {
                                 "<unnamed>"
                             } else {
@@ -1865,7 +2124,7 @@ type struct CodegenPasses {
                             };
                             mut wdiag: Diagnostic = Diagnostic::warning(
                                 ErrorCode::E0633_FUNCTION_BODY_ERROR,
-                                format("codegen: function '%s' transitively stripped because it calls a previously-stripped sibling in this module; see preceding error",
+                                fmt::format("codegen: function '%s' transitively stripped because it calls a previously-stripped sibling in this module; see preceding error",
                                     fn_name_safe));
                             cg.diag.emit(wdiag);
                             const wrap: LValue = LValue { raw: fn_val };
@@ -1893,7 +2152,8 @@ type struct CodegenPasses {
     /// interpolated user-controlled path needs this treatment.  Without it,
     /// a working directory with a space breaks linking, and a path containing
     /// shell metacharacters is an arbitrary-command-execution hazard.
-    static shell_quote(s: string) -> string {
+    static shell_quote(s_text: string) -> string {
+        const s: string = s_text;
         const len: u64 = s.length();
         // Worst case: every byte is a single quote, expanding to 4 bytes,
         // plus two outer quotes and a NUL terminator.
@@ -1922,7 +2182,8 @@ type struct CodegenPasses {
     /// it's usable.  Mirrors `pick_c_preprocessor`'s `cc_available` probe.  The
     /// probe runs after IR is emitted (link/archive time), so the tool chosen
     /// never affects the `.ll` the selfhost gate compares.
-    static tool_available(tool: string) -> boolean {
+    static tool_available(tool_text: string) -> boolean {
+        const tool: string = tool_text;
         mut probe: Command = Command::new(Str::new(tool));
         probe.arg(Str::new("--version"));
         probe.stdout(Stdio::Null);
@@ -1978,7 +2239,8 @@ type struct CodegenPasses {
     ///   3. A cross driver (`*-mingw32-*`) that's missing has no sane host
     ///      substitute, so we DON'T fall back for it - the original name is
     ///      kept so the link error names the absent cross toolchain.
-    static pick_link_driver(default_driver: string) -> string {
+    static pick_link_driver(default_driver_text: string) -> string {
+        const default_driver: string = default_driver_text;
         match (env::var(Str::new("CRYO_CC"))) {
             Option::Some(v) => {
                 const env_val: string = v.into_raw();
@@ -1986,7 +2248,7 @@ type struct CodegenPasses {
             }
             Option::None => {}
         }
-        if (CodegenPasses::tool_available(default_driver)) { return default_driver; }
+        if (CodegenPasses::tool_available(default_driver_text)) { return default_driver; }
         if (!default_driver.contains("mingw")) {
             if (CodegenPasses::tool_available("gcc"))   { return "gcc"; }
             if (CodegenPasses::tool_available("clang")) { return "clang"; }
@@ -2026,7 +2288,8 @@ type struct CodegenPasses {
     /// caller can fail the link with a clear diagnostic.  Captures the tool's
     /// stdout via `Command::output()`.  Runs at link time (after IR is emitted),
     /// so it never touches the `.ll` the selfhost gate compares.
-    static static_llvm_link_flags(llvm_config: string) -> string {
+    static static_llvm_link_flags(llvm_config_text: string) -> string {
+        const llvm_config: string = llvm_config_text;
         mut probe: Command = Command::new(Str::new(llvm_config));
         probe.arg(Str::new("--ldflags"));
         probe.arg(Str::new("--libs"));
@@ -2060,7 +2323,9 @@ type struct CodegenPasses {
     /// separator.  `ctx.source_file` and `discovery_root_path()` are built
     /// by different code paths and can disagree on separator style on a
     /// native Windows host even when they name the same file.
-    static paths_equal_loose(a: string, b: string) -> boolean {
+    static paths_equal_loose(a_text: string, b_text: string) -> boolean {
+        const a: string = a_text;
+        const b: string = b_text;
         const la: i64 = a.length() as i64;
         const lb: i64 = b.length() as i64;
         if (la != lb) { return false; }
@@ -2084,9 +2349,9 @@ type struct CodegenPasses {
     /// and the incremental-build manifest in instance.cryo stats it.
     static profile_bin_path_for_target(cfg: ProjectConfig*,
                                          ctx: CompilationContext*) -> string {
-        const tri: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const tri: string = ctx.options.target_triple;
         const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
-        return cfg.profile_bin_path(ctx.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
+        return cfg.profile_bin_path(ctx.options.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
     }
 
     /// Hoisted (build-root) executable path for the active target, with
@@ -2095,9 +2360,9 @@ type struct CodegenPasses {
     /// `<output_dir>/<name>[.exe]` instead of the per-profile cache.
     static bin_artifact_path_for_target(cfg: ProjectConfig*,
                                           ctx: CompilationContext*) -> string {
-        const tri: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const tri: string = ctx.options.target_triple;
         const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
-        return cfg.bin_artifact_path(ctx.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
+        return cfg.bin_artifact_path(ctx.options.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
     }
 }
 

@@ -12,22 +12,44 @@
 /// passed at each call site as `ASTVisitor*` so body statements
 /// recurse through `dispatch.generate_block(visitor, ...)`.
 
-namespace Compiler::Codegen::Visit::DeclVisitEmitter;
+namespace compiler::codegen::visit::decl_visit_emitter;
 
-import Compiler::Codegen;
-import Compiler::Codegen::{ LLVMTypes, Context, Util };
-import Compiler::Codegen::State::VisitorState;
-import Compiler::Codegen::Visit::ExprDispatch;
-import Compiler::CompilationContext;
-import Compiler::DeclIndex;
-import Compiler::Diag;
-import Compiler::Diag::{ Diagnostic, SourceSpan };
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Type, Arena, Compound, Generic, GenericRegistry };
-import Compiler::AST;
-import Compiler::AST::{ Node, Visitor, Expression, Statement, Declaration };
-import Compiler::Resolver::{ SymbolStr, InternTable };
+import compiler::codegen;
+import compiler::codegen::{ context, llvm, llvm_types, util };
+import compiler::codegen::state::visitor_state;
+import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::codegen::visit::expr_dispatch;
+import compiler::codegen::visit::expr_dispatch::{ ExprDispatch };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::decl_index;
+import compiler::diag;
+import compiler::diag::{ diagnostic, source_span };
+import compiler::types;
+import compiler::types::{ type_ref, type_base, arena, compound, generic, generic_registry };
+import compiler::ast;
+import compiler::ast::{ node, visitor, expression, statement, declaration };
+import compiler::resolver::{ symbol_str, intern_table };
+import utils::logger;
+import utils::logger::{ cdebug };
 import std::collections::pair;
+import std::collections::pair::{ Pair };
+import std::ffi::libc;
+import std::fmt;
+import compiler::ast::declaration::{
+    ClassDeclNode, FunctionDeclNode, ImplBlockNode, MethodNode, StructDeclNode,
+    UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::context::{ CodegenContext };
+import compiler::codegen::llvm_types::{ LType, LTypeKind, LValue };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResSlot };
+import compiler::types::generic_registry::{ GenericRegistry };
+import compiler::types::type_ref::{ TypeRef };
 
 
 type struct DeclVisitEmitter {
@@ -61,50 +83,24 @@ type struct DeclVisitEmitter {
         // `cryo test` synthesizes its own `main`; suppress the user's so
         // the LLVM module has exactly one `main` symbol.  Mirrors the
         // `declare_function` guard.
-        if (this.cg.ctx.mode.skip_user_main()
-                && fn_name.eq("main")) {
+        if (this.cg.ctx.options.mode.skip_user_main()
+                && node.def.is_valid() && node.def.equals(this.cg.ctx.entry_fn)) {
             cdebug("[IRGen]   func body: main (suppressed by test mode)\n");
-            fflush(null);
+            libc::fflush(null);
             return;
         }
-        cdebug("[IRGen]   func body: %s\n", fn_name); fflush(null);
+        cdebug("[IRGen]   func body: %s\n", fn_name); libc::fflush(null);
         this.generate_function_body(visitor, node);
-        cdebug("[IRGen]   func done\n"); fflush(null);
+        cdebug("[IRGen]   func done\n"); libc::fflush(null);
     }
 
     emit_impl_block_visit(mut &this, visitor: ASTVisitor*, node: ImplBlockNode*) -> void {
         if (node == null) { return; }
         const impl_target: string = this.cg.resolve(node.target_type);
         cdebug("[IRGen]   impl block: %s (%lld methods)\n",
-               impl_target, node.methods.length); fflush(null);
+               impl_target, node.methods.length); libc::fflush(null);
         this.generate_impl_block(visitor, node);
-        cdebug("[IRGen]   impl done\n"); fflush(null);
-    }
-
-    /// The arena's CANONICAL qualified name for a struct/union/class decl - 
-    /// the prefix its method bodies must mangle under.  Must agree exactly with
-    /// `DeclarationEmitter::canonical_type_qname`, which named the declaration:
-    /// if the two disagree, the declaration is left bodyless (and, being a
-    /// monomorph, `linkonce_odr`) while the body is emitted under a second
-    /// symbol nobody references - LLVM rejects the module with "Global is
-    /// external, but doesn't have external or weak linkage".
-    ///
-    /// `this.cg.qualify` stamps the EMITTING module's namespace, which is the
-    /// canonical one only by coincidence.  For an injected monomorph the two
-    /// diverge - a spec lives in the module owning its type argument, not its
-    /// template's - so fall through to the arena's bare-name alias, which the
-    /// monomorphizer registers for every spec.
-    canonical_impl_target(mut &this, name: SymbolStr) -> SymbolStr {
-        const di: DeclarationIndex* = this.cg.get_decl_index();
-        const local: SymbolStr = this.cg.qualify(name);
-        mut tref: TypeRef = di.lookup_type(local);
-        if (!tref.is_valid()) { tref = di.lookup_type(name); }
-        if (!tref.is_valid()) { tref = this.cg.get_arena().lookup_by_name(name); }
-        if (tref.is_valid()) {
-            const q: SymbolStr = this.cg.get_arena().get_qualified_name(tref);
-            if (q.is_valid()) { return q; }
-        }
-        return local;
+        cdebug("[IRGen]   impl done\n"); libc::fflush(null);
     }
 
     emit_struct_decl(mut &this, visitor: ASTVisitor*, node: StructDeclNode*) -> void {
@@ -113,13 +109,13 @@ type struct DeclVisitEmitter {
         if (node.methods.length == 0) { return; }
         const sname: string = this.cg.resolve(node.name);
         cdebug("[IRGen]   struct methods: %s (%lld methods)\n",
-               sname, node.methods.length); fflush(null);
-        this.state.current_impl_target = this.canonical_impl_target(node.name);
+               sname, node.methods.length); libc::fflush(null);
+        this.state.current_impl_target = this.cg.ctx.decl_index.type_of_decl(node.def, "codegen/struct method bodies");
         for (mut j: i64 = 0; j < node.methods.length; j++) {
-            this.generate_method_body(visitor, node.methods[j]);
+            this.generate_method_body(visitor, node.methods[j], null);
         }
-        this.state.current_impl_target = SymbolStr::empty();
-        cdebug("[IRGen]   struct methods done\n"); fflush(null);
+        this.state.current_impl_target = TypeRef::invalid();
+        cdebug("[IRGen]   struct methods done\n"); libc::fflush(null);
     }
 
     /// Emit method bodies for a union declaration.  A union's type is a
@@ -128,11 +124,11 @@ type struct DeclVisitEmitter {
         if (node == null) { return; }
         if (node.generic_params.length > 0) { return; }
         if (node.methods.length == 0) { return; }
-        this.state.current_impl_target = this.canonical_impl_target(node.name);
+        this.state.current_impl_target = this.cg.ctx.decl_index.type_of_decl(node.def, "codegen/union method bodies");
         for (mut j: i64 = 0; j < node.methods.length; j++) {
-            this.generate_method_body(visitor, node.methods[j]);
+            this.generate_method_body(visitor, node.methods[j], null);
         }
-        this.state.current_impl_target = SymbolStr::empty();
+        this.state.current_impl_target = TypeRef::invalid();
     }
 
     emit_class_decl(mut &this, visitor: ASTVisitor*, node: ClassDeclNode*) -> void {
@@ -141,13 +137,13 @@ type struct DeclVisitEmitter {
         if (node.methods.length == 0) { return; }
         const cname: string = this.cg.resolve(node.name);
         cdebug("[IRGen]   class methods: %s (%lld methods)\n",
-               cname, node.methods.length); fflush(null);
-        this.state.current_impl_target = this.canonical_impl_target(node.name);
+               cname, node.methods.length); libc::fflush(null);
+        this.state.current_impl_target = this.cg.ctx.decl_index.type_of_decl(node.def, "codegen/class method bodies");
         for (mut j: i64 = 0; j < node.methods.length; j++) {
-            this.generate_method_body(visitor, node.methods[j]);
+            this.generate_method_body(visitor, node.methods[j], &node.base_res);
         }
-        this.state.current_impl_target = SymbolStr::empty();
-        cdebug("[IRGen]   class methods done\n"); fflush(null);
+        this.state.current_impl_target = TypeRef::invalid();
+        cdebug("[IRGen]   class methods done\n"); libc::fflush(null);
     }
 
 
@@ -174,18 +170,18 @@ type struct DeclVisitEmitter {
         }
         const fn_val: LValue = this.cg.decl.codegen_function_prologue(node);
         if (!fn_val.is_valid()) {
-            cdebug("[IRGen]     func prologue failed\n"); fflush(null);
+            cdebug("[IRGen]     func prologue failed\n"); libc::fflush(null);
             return;
         }
-        cdebug("[IRGen]     func prologue ok, generating block...\n"); fflush(null);
+        cdebug("[IRGen]     func prologue ok, generating block...\n"); libc::fflush(null);
         this.dispatch.generate_block(visitor,node.body);
-        cdebug("[IRGen]     func block done, epilogue...\n"); fflush(null);
+        cdebug("[IRGen]     func block done, epilogue...\n"); libc::fflush(null);
         this.cg.decl.codegen_function_epilogue(node);
 
         // DWARF: clear the current debug location at the end of the body so
         // it can't leak into the next function or into subprogram-less code
         // (globals / runtime helpers), which the verifier would reject.
-        if (this.cg.ctx.emit_debug_info && this.cg.ctx.di_builder != null) {
+        if (this.cg.debug_info.is_on()) {
             llvm::LLVMSetCurrentDebugLocation2(this.cg.builder.raw, null);
         }
 
@@ -200,48 +196,41 @@ type struct DeclVisitEmitter {
         }
     }
 
+    /// Compute the module's started globals - those whose initializer no
+    /// constant fold answers - in one function that runs before `main`,
+    /// each initializer evaluated as it is written and stored, in
+    /// declaration order.
+    emit_global_initializers(mut &this, visitor: ASTVisitor*) -> void {
+        const fn_val: LValue = this.cg.decl.begin_global_initializer();
+        if (!fn_val.is_valid()) { return; }
+        for (mut k: i64 = 0; k < this.cg.decl.started.nodes.length; k++) {
+            const node: VarDeclNode* = this.cg.decl.started.nodes[k];
+            const value: LValue = this.dispatch.codegen_rvalue(visitor, node.initializer);
+            this.cg.decl.store_started_global(k, value);
+        }
+        this.cg.decl.finish_global_initializer(fn_val);
+        if (!this.cg.diag.is_function_body_valid(fn_val)) {
+            this.cg.diag.report_invalid_function_body(fn_val, "__cryo.global_init",
+                this.cg.decl.started.nodes[0].span);
+        }
+    }
+
     /// Generate every method body for an impl block.
     generate_impl_block(mut &this, visitor: ASTVisitor*, node: ImplBlockNode*) -> void {
         if (node.generic_params.length > 0) {
-            cdebug("[IRGen]     impl skipped (generic)\n"); fflush(null);
+            cdebug("[IRGen]     impl skipped (generic)\n"); libc::fflush(null);
             return;
         }
 
-        // Prefer TypeResolution's canonical-qualified target so cross-
-        // module trait impls (`implement trait FmtWrite for struct
-        // Stdout` in fmt::write where Stdout lives in io::stdio) emit
-        // method bodies under the same key declare_method registered
-        // them under.  Mirrors the resolution logic in declare_impl_block.
-        const di_ptr: DeclarationIndex* = this.cg.get_decl_index();
-        mut qualified_impl_target: SymbolStr = SymbolStr::empty();
-        if (node.qualified_target_name.is_valid()) {
-            qualified_impl_target = node.qualified_target_name;
-        } else {
-            const impl_target_str: string = this.cg.resolve(node.target_type);
-            if (impl_target_str.contains("::")) {
-                qualified_impl_target = node.target_type;
-            } else if (di_ptr.lookup_type(node.target_type).is_valid()) {
-                qualified_impl_target = node.target_type;
-            } else {
-                const resolved: SymbolStr = this.cg.ctx.resolve_scoped_or(node.target_type);
-                if (!resolved.equals(node.target_type)) {
-                    qualified_impl_target = resolved;
-                } else {
-                    qualified_impl_target = this.cg.qualify(node.target_type);
-                }
-            }
-        }
         // Mirror declare_impl_block: skip when the target type is a generic
         // template; only spec'd clones should be codegen'd.
         const cg_ctx: CompilationContext* = this.cg.ctx;
-        if (cg_ctx.generic_registry != null) {
-            const greg: GenericRegistry* = cg_ctx.generic_registry;
-            if (greg.get_template(qualified_impl_target) != null) {
-                cdebug("[IRGen]     impl skipped (template target)\n"); fflush(null);
-                return;
-            }
+        const greg: GenericRegistry* = cg_ctx.generic_registry;
+        if (greg.template_of(node.target_def()) != null) {
+            cdebug("[IRGen]     impl skipped (template target)\n"); libc::fflush(null);
+            return;
         }
-        this.state.current_impl_target = qualified_impl_target;
+        this.state.current_impl_target = this.cg.ctx.decl_index.impl_owner(node, "codegen/impl bodies");
 
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const m: MethodNode* = node.methods[i];
@@ -250,18 +239,24 @@ type struct DeclVisitEmitter {
                 const mname: string = this.cg.resolve(mfunc.name);
                 cdebug("[IRGen]     method[%lld]: %s (static=%d, generic=%lld, body=%p)\n",
                        i, mname, m.is_static as i32,
-                       mfunc.generic_params.length, mfunc.body as void*); fflush(null);
+                       mfunc.generic_params.length, mfunc.body as void*); libc::fflush(null);
             }
-            this.generate_method_body(visitor, m);
-            cdebug("[IRGen]     method[%lld] done\n", i); fflush(null);
+            this.generate_method_body(visitor, m, null);
+            cdebug("[IRGen]     method[%lld] done\n", i); libc::fflush(null);
         }
 
-        this.state.current_impl_target = SymbolStr::empty();
+        this.state.current_impl_target = TypeRef::invalid();
     }
 
     /// Generate a method body: prologue, optional base-ctor call, block walk,
     /// epilogue, validate.
-    generate_method_body(mut &this, visitor: ASTVisitor*, node: MethodNode*) -> void {
+    ///
+    /// `base` is the enclosing CLASS's stamped base, or null where there is
+    /// no class - a struct, a union, an `implement` block.  A constructor's
+    /// `: Base(args)` names that base and nothing else, so the class's answer
+    /// is the constructor's.
+    generate_method_body(mut &this, visitor: ASTVisitor*, node: MethodNode*,
+                         base: ResSlot*) -> void {
         const func: FunctionDeclNode* = node.func;
         if (func == null || func.body == null) { return; }
         if (func.generic_params.length > 0) { return; }
@@ -271,10 +266,10 @@ type struct DeclVisitEmitter {
         // specializations (flag cleared).
         if (func.is_self_returning_default || func.is_lazy_self_growing) { return; }
 
-        cdebug("[IRGen]       method prologue...\n"); fflush(null);
+        cdebug("[IRGen]       method prologue...\n"); libc::fflush(null);
         const fn_val: LValue = this.cg.decl.codegen_method_prologue(node, this.state.current_impl_target);
         if (!fn_val.is_valid()) {
-            cdebug("[IRGen]       method prologue FAILED\n"); fflush(null);
+            cdebug("[IRGen]       method prologue FAILED\n"); libc::fflush(null);
             return;
         }
 
@@ -285,19 +280,21 @@ type struct DeclVisitEmitter {
         // after storing its params into locals, and downstream uses of inherited
         // fields read garbage.
         if (node.is_constructor && node.has_base_ctor()) {
-            this.emit_base_ctor_call(visitor, node, fn_val);
+            this.emit_base_ctor_call(visitor, node, fn_val, base);
         }
 
-        cdebug("[IRGen]       method body block...\n"); fflush(null);
+        cdebug("[IRGen]       method body block...\n"); libc::fflush(null);
         this.dispatch.generate_block(visitor,func.body);
-        cdebug("[IRGen]       method body done, epilogue...\n"); fflush(null);
+        cdebug("[IRGen]       method body done, epilogue...\n"); libc::fflush(null);
         this.cg.decl.codegen_function_epilogue(func);
 
         if (!this.cg.diag.is_function_body_valid(fn_val)) {
-            const target_str: string = this.cg.resolve(this.state.current_impl_target);
+            const target_str: string = if (this.state.current_impl_target.is_valid()) {
+                this.cg.ctx.type_arena.resolve_display_name(this.state.current_impl_target)
+            } else { "" };
             const method_str: string = this.cg.resolve(func.name);
             const pretty: string = if (target_str.length() > 0) {
-                format("%s::%s", target_str, method_str)
+                fmt::format("%s::%s", target_str, method_str)
             } else {
                 method_str
             };
@@ -309,39 +306,33 @@ type struct DeclVisitEmitter {
     /// constructor with `: BaseClass(args)` initialisation.  `this` (the LLVM
     /// param 0 of the enclosing constructor) is passed as the receiver, and
     /// `node.base_ctor_args` are codegen'd as rvalues for the remaining args.
-    emit_base_ctor_call(mut &this, visitor: ASTVisitor*, node: MethodNode*, fn_val: LValue) -> void {
+    emit_base_ctor_call(mut &this, visitor: ASTVisitor*, node: MethodNode*, fn_val: LValue,
+                        base: ResSlot*) -> void {
         const intern: InternTable* = this.cg.get_intern();
-        const di: DeclarationIndex* = this.cg.get_decl_index();
         const ctx_ptr: CompilationContext* = this.cg.ctx;
 
-        // Resolve the base class name (e.g. bare "ExprParser") to its
-        // qualified form so we can build the constructor's mangled lookup
-        // key (`QualifiedBase::BareBase`).
-        mut base_qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.base_ctor_name);
-        mut base_type: TypeRef = di.lookup_type(base_qualified);
-        if (base_type.is_invalid()) {
-            base_qualified = ctx_ptr.resolve_scoped_or(node.base_ctor_name);
-            base_type = di.lookup_type(base_qualified);
-        }
-        if (base_type.is_invalid()) {
-            base_qualified = node.base_ctor_name;
-            base_type = di.lookup_type(base_qualified);
+        // The base the constructor delegates to is the class's base, which
+        // the name layer stamped on the class declaration under the canonical
+        // name the base's type and constructor are registered by.  The
+        // written base name is not consulted: it is the same spelling the
+        // class declaration wrote, and that one was already answered where
+        // its imports were in hand.
+        mut base_def: DefId = DefId::invalid();
+        mut base_type: TypeRef = TypeRef::invalid();
+        if (base != null) {
+            const r: Res = base.require("base-constructor call");
+            base_type = ctx_ptr.decl_index.type_of_res(r);
+            // The constructor is one the base class's definition registered.
+            base_def = r.def_id();
         }
         if (base_type.is_invalid()) { cdebug("[BCTOR-BAIL] type invalid\n"); return; }
 
-        const base_qualified_str: string = intern.resolve(base_qualified);
-        const base_bare_str: string = intern.resolve(node.base_ctor_name);
-        const ctor_combined: string = format("%s::%s", base_qualified_str, base_bare_str);
-        const ctor_sym: SymbolStr = intern.intern(ctor_combined);
-
         // Constructor LLVM arity = user args + 1 for the implicit `this`.
         const ctor_arity: u32 = (node.base_ctor_args.length + 1) as u32;
-        mut ctor_fn: LValue = this.cg.resolver.resolve_function_with_arity(ctor_sym, ctor_arity);
+        const ctor_fn: LValue = this.cg.resolver.resolve_constructor(base_def, ctor_arity as i64);
         if (!ctor_fn.is_valid()) {
-            ctor_fn = this.cg.resolver.resolve_function(ctor_sym);
-        }
-        if (!ctor_fn.is_valid()) {
-            cdebug("[BCTOR-BAIL] ctor not found: '%s' arity=%u\n", ctor_combined, ctor_arity);
+            cdebug("[BCTOR-BAIL] ctor not found: '%s' arity=%u\n",
+                intern.resolve(node.base_ctor_name), ctor_arity);
             return;
         }
 
@@ -352,7 +343,7 @@ type struct DeclVisitEmitter {
         const this_arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
 
         mut ctor_args: Pair<LValue, TypeRef>[] = [];
-        ctor_args.push(Pair<LValue, TypeRef>::new(this_arg, base_type));
+        ctor_args.push(Pair::<LValue, TypeRef>::new(this_arg, base_type));
         mut any_arg_invalid: boolean = false;
         for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
             const arg_node: ExpressionNode* = node.base_ctor_args[i];
@@ -394,7 +385,7 @@ type struct DeclVisitEmitter {
                     }
                 }
             }
-            ctor_args.push(Pair<LValue, TypeRef>::new(arg, arg_node.resolved_type));
+            ctor_args.push(Pair::<LValue, TypeRef>::new(arg, arg_node.resolved_type));
         }
         if (any_arg_invalid) { cdebug("[BCTOR-BAIL] any_arg_invalid\n"); return; }
 

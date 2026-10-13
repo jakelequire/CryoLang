@@ -1,4 +1,4 @@
-/// Mono State  (Compiler::Mono::State)
+/// Mono State  (compiler::mono::state)
 ///
 /// Shared mutable per-run state for the monomorphization subsystem: the pending
 /// worklist, the nested-instantiation discovery engine, and the error counter,
@@ -15,14 +15,61 @@
 /// cycle-detection set, injection cursor, current module, and consumer tracking
 /// stay on the orchestrator - only it touches them.
 
-namespace Compiler::Mono::State;
+namespace compiler::mono::state;
 
-import Compiler::AST;
-import Compiler::Types::{ Generic, UserDefined, Compound, Type, Arena, TypeRef, Resolver, GenericRegistry };
-import Compiler::Diag::SourceSpan;
-import Compiler::Resolver::{ InternTable, SymbolStr };
+import compiler::ast;
+import compiler::types::{
+    generic, user_defined, compound, type_base, arena, type_ref, resolver, generic_registry, TypeKind
+};
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::{ intern_table, symbol_str, res };
+import compiler::decl_index::{ OverloadId };
 import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
+import compiler::ast::node;
+import compiler::ast::node::{ ASTNode };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::types::resolver::{ ResolutionContext, TypeResolver };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef, TypeKey };
+import compiler::types::user_defined::{ ClassType, EnumType, StructType };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
+import compiler::resolver::res::{ DefKey };
+import std::core::hash::{ Hash, Hasher };
+import std::core::cmp::{ Eq };
 
+
+/// The key of an owner's instances of a method definition: the owner type
+/// and the definition.  Made only by `MonoState::instance_key`.
+type struct InstanceKey {
+private:
+    owner: TypeKey;
+    def:   DefKey;
+}
+
+implement trait Hash for struct InstanceKey {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.owner.hash(hasher);
+        this.def.hash(hasher);
+    }
+}
+
+implement trait Eq for struct InstanceKey {
+    equals(&this, other: &InstanceKey) -> boolean {
+        return this.owner.equals(&other.owner) && this.def.equals(&other.def);
+    }
+}
 
 // MonomorphRequest: a pending instantiation to specialize
 
@@ -62,15 +109,30 @@ type struct MonomorphRequest {
 
 type struct SpecializationEntry {
     specialized_type:  TypeRef;
-    specialized_name:  SymbolStr;
     ast_node:          ASTNode*;
     impl_nodes:        ASTNode*[];
-    origin_module:     SymbolStr;      // Module that created this spec (creating-module fallback owner)
-    template_module:   SymbolStr;      // Module where the template is defined (deterministic owner key)
+    template_module:   ModulePath;     // Module where the template is defined (deterministic owner key)
     instantiated_type: TypeRef;        // The InstantiatedType that was resolved
     injected:          boolean;        // True once placed into its owner module's AST root (Phase 6a-iii)
     owner_source:      SymbolStr;      // Resolved owner module's source-file path; drives BOTH DI
                                        // ownership and AST placement so they always agree.
+}
+
+/// One instance of a method with type parameters of its own: its type
+/// arguments, in the method's declaration order, and the entry the instance
+/// was registered under.
+type struct MethodInstance {
+    args:  TypeRef[];
+    entry: OverloadId;
+
+    /// Whether this instance is the one at `args`, compared by identity.
+    binds(&this, args: &TypeRef[]) -> boolean {
+        if (this.args.length != args.length) { return false; }
+        for (mut i: i64 = 0; i < args.length; i++) {
+            if (!this.args[i].equals(args[i])) { return false; }
+        }
+        return true;
+    }
 }
 
 
@@ -87,8 +149,9 @@ type struct MonoState {
     pending:          MonomorphRequest[];
     pending_cursor:   i64;                  // Index cursor (avoids O(n) erase-from-front)
 
-    // Completed specialization entries (parallel to the orchestrator's
-    // string-keyed `spec_index`).  Shared so MonoCallSpecializer can read it.
+    // Completed specialization entries, indexed by the orchestrator's
+    // `spec_index` under each one's instantiation.  Shared so
+    // MonoCallSpecializer can read it.
     spec_entries:     SpecializationEntry[];
 
     // Visited set for request_nested_instantiations cycle detection.
@@ -98,17 +161,17 @@ type struct MonoState {
     // emit diagnostics both bump this; process_all returns error_count == 0).
     error_count:      i64;
 
-    // Generic-method specialization registry, keyed by the spec method's mangled
-    // symbol.  A generic method call is specialized once per (owner, method,
-    // bindings); the same logical spec can be requested again from multiple call
-    // sites - notably an in-source `arr.fmt(f)` AND a clone of that same call in a
-    // specialized body (whose `resolved_callee`/`resolved_method` the substituter
-    // clears, forcing re-resolution).  Without dedup the second request
-    // materializes a DUPLICATE spec method (double AST push + double DI entry),
-    // which corrupts the owner spec's method set.  This set persists across the
-    // batch (it is NOT cleared by `reset_worklist`): the spec, once emitted, is
-    // shared by every module.
-    method_specs:     HashMap<string, boolean>;
+    // The instances of methods with type parameters of their own: the
+    // owner's method for a definition, at its own type arguments, minted
+    // once and shared by every call that asks for it, whichever body the
+    // call was copied into - a method called on a receiver and a static one
+    // called through its generic owner alike.  Keyed by identity - the
+    // owner type and the definition - with the type arguments compared
+    // within a key's positions.  Persists across the batch (it is not
+    // cleared by `reset_worklist`): an instance, once emitted, is shared by
+    // every module.
+    method_instances: MethodInstance[];
+    instance_keys:    HashMap<InstanceKey, i64[]>;
 
     // Arena ids of InstantiatedTypes that have a REGISTERED spec entry.
     //
@@ -121,10 +184,10 @@ type struct MonoState {
     // spec it is currently inside - the `String<GlobalAlloc>` self-reference case).
     // During that window the slot still reads as an unresolved wrapper even though
     // the spec exists, so the slot kind cannot answer it and this set must.
-    // Keyed by the instantiation's arena id directly, so membership costs no
-    // allocation or string hash, and "same instantiation" is decided by the
-    // arena's interner rather than independently here.
-    materialized_insts: HashMap<u64, boolean>;
+    // Keyed by the instantiation itself, so membership costs no allocation
+    // or string hash, and "same instantiation" is decided by the arena's
+    // interner rather than independently here.
+    materialized_insts: HashMap<TypeKey, boolean>;
 
     // Owner modules of generic-METHOD specs (those attached to an impl block or a
     // fixed receiver's decl, NOT the `spec_entries` type/free-function specs).
@@ -138,7 +201,7 @@ type struct MonoState {
     // the spec's definition - is reused, yielding an undefined-symbol link error.
     // One entry per newly-materialized method spec (may repeat an owner); the cache
     // consumer folds them into a per-module boolean, so duplicates are harmless.
-    spec_owner_modules: SymbolStr[];
+    spec_owner_files: SymbolStr[];
 
     static null() -> MonoState {
         return MonoState {
@@ -151,26 +214,40 @@ type struct MonoState {
             spec_entries:     [],
             nested_visited:   [],
             error_count:      0,
-            method_specs:     HashMap<string, boolean>::new(),
-            materialized_insts: HashMap<u64, boolean>::new(),
-            spec_owner_modules: [],
+            method_instances: [],
+            instance_keys:    HashMap::<InstanceKey, i64[]>::new(),
+            materialized_insts: HashMap::<TypeKey, boolean>::new(),
+            spec_owner_files: [],
         };
     }
 
-    /// True if a generic-method spec with this mangled symbol was already
-    /// materialized (AST-pushed + DI-registered) earlier in the build.
-    method_spec_seen(&this, mangled: SymbolStr) -> boolean {
-        if (!mangled.is_valid()) { return false; }
-        const key: string = this.intern_table.resolve(mangled);
-        return this.method_specs.contains_key(&key);
+    /// The entry of `owner`'s instance of the method definition `def` at
+    /// the type arguments `args`; invalid when none was minted.
+    method_instance(&this, owner: TypeRef, def: DefKey, args: &TypeRef[]) -> OverloadId {
+        const key: InstanceKey = MonoState::instance_key(owner, def);
+        match (this.instance_keys.get_ref(&key)) {
+            Option::Some(positions) => {
+                for (mut k: i64 = 0; k < (*positions).length; k++) {
+                    const inst: MethodInstance* = &this.method_instances[(*positions)[k]];
+                    if (inst.binds(args)) { return inst.entry; }
+                }
+            }
+            Option::None => { }
+        }
+        return OverloadId::invalid();
     }
 
-    /// Record that a generic-method spec with this mangled symbol has been
-    /// materialized, so later requests for the same spec reuse it.
-    mark_method_spec(mut &this, mangled: SymbolStr) -> void {
-        if (!mangled.is_valid()) { return; }
-        const key: string = this.intern_table.resolve(mangled);
-        this.method_specs.insert(key, true);
+    /// Record `entry` as `owner`'s instance of the method definition `def`
+    /// at the type arguments `args`.
+    add_method_instance(mut &this, owner: TypeRef, def: DefKey, args: TypeRef[], entry: OverloadId) -> void {
+        const key: InstanceKey = MonoState::instance_key(owner, def);
+        const positions: i64[]* = this.instance_keys.get_or_insert(key, []);
+        positions.push(this.method_instances.length);
+        this.method_instances.push(MethodInstance { args: args, entry: entry });
+    }
+
+    static instance_key(owner: TypeRef, def: DefKey) -> InstanceKey {
+        return InstanceKey { owner: owner.table_key(), def: def };
     }
 
     /// True if a spec entry has been REGISTERED for this instantiation (see
@@ -179,26 +256,23 @@ type struct MonoState {
     /// latter is the instantiation itself.
     has_materialized_spec(&this, inst: TypeRef) -> boolean {
         if (!inst.is_valid()) { return false; }
-        const key: u64 = inst.id;
-        return this.materialized_insts.contains_key(&key);
+        return this.materialized_insts.contains_key(&inst.table_key());
     }
 
     /// Record that a spec entry has been registered for this instantiation.
     /// Called at spec-entry registration, before the wrapper->concrete swap.
     mark_materialized_spec(mut &this, inst: TypeRef) -> void {
         if (!inst.is_valid()) { return; }
-        const key: u64 = inst.id;
-        this.materialized_insts.insert(key, true);
+        this.materialized_insts.insert(inst.table_key(), true);
     }
 
-    /// Record the module that owns a just-materialized generic-method spec (the
-    /// module whose impl block / receiver decl the spec method was pushed onto),
-    /// so the per-module incremental cache treats it as a spec owner.  Called once
-    /// per new method spec at DI registration; a `key` (namespace or source path)
-    /// resolvable by `ModuleGraph::source_file_for_owner_key`.
-    record_spec_owner_module(mut &this, key: SymbolStr) -> void {
-        if (!key.is_valid()) { return; }
-        this.spec_owner_modules.push(key);
+    /// Record the source file of the unit that owns a just-materialized
+    /// generic-method spec (the unit whose impl block / receiver decl the spec
+    /// method was pushed onto), so the per-module incremental cache treats it
+    /// as a spec owner.  Called once per new method spec at DI registration.
+    record_spec_owner_file(mut &this, file: SymbolStr) -> void {
+        if (!file.is_valid()) { return; }
+        this.spec_owner_files.push(file);
     }
 
     wire(mut &this, arena: TypeArena*, generic_registry: GenericRegistry*,
@@ -238,17 +312,23 @@ type struct MonoState {
     ///   - Base type is not a registered template (e.g., void, primitives)
     ///   - Base type is a TypeAlias (generic aliases are expanded during type
     ///     resolution, not monomorphized)
-    ///   - Type args containing unresolved GenericParamType or BoundedParamType
+    ///   - Type args containing an unresolved GenericParamType
     enqueue_from_type_ref(mut &this, ty: TypeRef) -> void {
-        const t: Type* = this.arena.lookup(ty.id);
-        if (t == null || t.kind != TypeKind::InstantiatedType) { return; }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || t.kind != TypeKind::InstantiatedType) {
+            return;
+        }
         const inst: InstantiatedType* = t as InstantiatedType*;
 
         // Skip if base type is not a monomorphizable kind.  Only Struct, Enum,
         // Class, Trait, and Function types can be templates.
-        const base_t: Type* = this.arena.lookup(inst.generic_base.id);
-        if (base_t == null) { return; }
-        if (base_t.kind == TypeKind::TypeAlias) { return; }
+        const base_t: Type* = this.arena.lookup(inst.generic_base);
+        if (base_t == null) {
+            return;
+        }
+        if (base_t.kind == TypeKind::TypeAlias) {
+            return;
+        }
         if (base_t.kind != TypeKind::Struct &&
             base_t.kind != TypeKind::Enum &&
             base_t.kind != TypeKind::Class &&
@@ -260,7 +340,7 @@ type struct MonoState {
 
         // Double-check against the GenericRegistry; only enqueue types that were
         // actually registered as templates during TemplateRegistration.
-        if (!this.generic_registry.is_template(inst.generic_base.id)) {
+        if (!this.generic_registry.is_template(inst.generic_base)) {
             return;
         }
 
@@ -296,10 +376,9 @@ type struct MonoState {
         // ORIGINAL (lower-arity) `ty`, so the later `set_resolved_type` still lands
         // on the instantiation the program actually references, resolving it.
         const tmpl: TemplateEntry* =
-            this.generic_registry.get_template_by_type_id(inst.generic_base.id);
+            this.generic_registry.template_of_type(inst.generic_base);
         if (tmpl != null && args.length < tmpl.param_count) {
-            const _pm: string = "";
-            mut ex_ctx: ResolutionContext = ResolutionContext::new(_pm, _pm);
+            mut ex_ctx: ResolutionContext = ResolutionContext::new("");
             args = this.type_resolver.expand_default_type_args(tmpl, args, &ex_ctx);
         }
         const request: MonomorphRequest = MonomorphRequest {
@@ -316,15 +395,15 @@ type struct MonoState {
     /// through the same validation.  `nested_visited` must be reset by the caller
     /// before each top-level traversal.
     request_nested_instantiations(mut &this, ty: TypeRef) -> void {
-        if (ty.is_invalid() || ty.id == 0) { return; }
+        if (ty.is_invalid() || ty.key() == 0) { return; }
 
         // Cycle detection: skip types we've already visited in this traversal
         for (mut v: i64 = 0; v < this.nested_visited.length; v++) {
-            if (this.nested_visited[v] == ty.id) { return; }
+            if (this.nested_visited[v] == ty.key()) { return; }
         }
-        this.nested_visited.push(ty.id);
+        this.nested_visited.push(ty.key());
 
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null) { return; }
 
         match (t.kind) {
@@ -352,18 +431,14 @@ type struct MonoState {
                 // Array<elem> is monomorphized.  T[] creates ArrayType but not
                 // InstantiatedType(Array,[T]), so the worklist misses it.
                 if (arr.is_dynamic() && arr.element.is_valid()) {
-                    const elem_t: Type* = this.arena.lookup(arr.element.id);
-                    if (elem_t != null && elem_t.kind != TypeKind::GenericParam
-                                       && elem_t.kind != TypeKind::BoundedParam) {
-                        const array_sym: SymbolStr = this.intern_table.intern(
-                            "std::collections::array::Array");
-                        const array_entry: TemplateEntry* =
-                            this.generic_registry.get_template(array_sym);
+                    const elem_t: Type* = this.arena.lookup(arr.element);
+                    if (elem_t != null && elem_t.kind != TypeKind::GenericParam) {
+                        const array_entry: TemplateEntry* = this.generic_registry.template_of(
+                            this.generic_registry.wellknown(LangItem::Array));
                         if (array_entry != null) {
                             mut args: TypeRef[] = [];
                             args.push(arr.element);
-                            const _empty: string = "";
-                            mut nested_ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
+                            mut nested_ctx: ResolutionContext = ResolutionContext::new("");
                             args = this.type_resolver.expand_default_type_args(array_entry, args, &nested_ctx);
                             const inst_ref: TypeRef =
                                 this.generic_registry.instantiate(array_entry.base_type, args);

@@ -39,15 +39,25 @@
 
 namespace std::sync::mpsc;
 
-import core::intrinsics;
-import core::ptr;
-import core::result;
-import core::option;
-import core::drop;
-import alloc::layout;
-import alloc::allocator;
-import ffi::libc;
-import sys::syscall;
+import std::core::intrinsics;
+import std::core::ptr;
+import std::core::ptr::{ NonNull };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::option;
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::alloc::layout;
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator;
+import std::alloc::allocator::{ GlobalAlloc };
+import std::ffi::libc;
+import std::ffi::libc::{
+    pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_signal,
+    pthread_cond_wait, pthread_mutex_destroy, pthread_mutex_init, pthread_mutex_lock,
+    pthread_mutex_unlock
+};
+import std::sys::syscall;
 
 
 // Per-OS channel lock/cond primitives.  The channel embeds its own mutex
@@ -130,8 +140,8 @@ type struct ChannelInner<T> {
 function new_inner<T>() -> ChannelInner<T>* {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
     mut inner: ChannelInner<T>* = null;
-    match (alloc.allocate(Layout::of<ChannelInner<T>>())) {
-        Result::Ok(raw) => { inner = raw.cast<ChannelInner<T>>().as_ptr(); }
+    match (alloc.allocate(Layout::of::<ChannelInner<T>>())) {
+        Result::Ok(raw) => { inner = raw.cast::<ChannelInner<T>>().as_ptr(); }
         Result::Err(_)  => { core::panic("mpsc::channel: allocation failed", FILE, LINE); }
     }
     const mtx: u8* = &inner.mutex[0];
@@ -157,7 +167,7 @@ function free_inner<T>(inner: ChannelInner<T>*) -> void {
     chan_cond_destroy(&inner.cond[0]);
     chan_mtx_destroy(&inner.mutex[0]);
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(inner as u8*), Layout::of<ChannelInner<T>>());
+    alloc.deallocate(NonNull::new(inner as u8*), Layout::of::<ChannelInner<T>>());
 }
 
 
@@ -190,15 +200,15 @@ type struct Sender<T> {
         chan_mtx_lock(&inner.mutex[0]);
         if (!inner.rx_open) {
             chan_mtx_unlock(&inner.mutex[0]);
-            return Result::Err(SendError<T> { value: value });
+            return Result::Err(SendError::<T> { value: value });
         }
         mut node: ChanNode<T>* = null;
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        match (alloc.allocate(Layout::of<ChanNode<T>>())) {
-            Result::Ok(raw) => { node = raw.cast<ChanNode<T>>().as_ptr(); }
+        match (alloc.allocate(Layout::of::<ChanNode<T>>())) {
+            Result::Ok(raw) => { node = raw.cast::<ChanNode<T>>().as_ptr(); }
             Result::Err(_)  => {
                 chan_mtx_unlock(&inner.mutex[0]);
-                return Result::Err(SendError<T> { value: value });
+                return Result::Err(SendError::<T> { value: value });
             }
         }
         (*node).next = null;
@@ -226,7 +236,7 @@ type struct Sender<T> {
         inner.senders = inner.senders + 1;
         inner.refs    = inner.refs + 1;
         chan_mtx_unlock(&inner.mutex[0]);
-        return Sender<T> { inner: inner };
+        return Sender::<T> { inner: inner };
     }
 
     /// Explicitly drop this sender now (rather than at scope end). Useful
@@ -234,7 +244,7 @@ type struct Sender<T> {
     /// released before the body returns.
     close(mut this) -> void {
         const { inner }: Sender<T> = this;
-        release_sender<T>(inner);
+        release_sender::<T>(inner);
     }
 }
 
@@ -250,13 +260,13 @@ function release_sender<T>(inner: ChannelInner<T>*) -> void {
     inner.refs = inner.refs - 1;
     const last: boolean = inner.refs == 0;
     chan_mtx_unlock(&inner.mutex[0]);
-    if (last) { free_inner<T>(inner); }
+    if (last) { free_inner::<T>(inner); }
 }
 
 implement<T> trait Drop for struct Sender<T> {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
-        release_sender<T>(this.inner);
+        release_sender::<T>(this.inner);
         this.inner = null;
     }
 }
@@ -278,7 +288,7 @@ type struct Receiver<T> {
         inner.senders = inner.senders + 1;
         inner.refs    = inner.refs + 1;
         chan_mtx_unlock(&inner.mutex[0]);
-        return Sender<T> { inner: inner };
+        return Sender::<T> { inner: inner };
     }
 
     /// Block until a value is available and return it, or return
@@ -305,7 +315,7 @@ type struct Receiver<T> {
         mut value: T;
         unsafe { value = *slot; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(node as u8*), Layout::of<ChanNode<T>>());
+        alloc.deallocate(NonNull::new(node as u8*), Layout::of::<ChanNode<T>>());
         return Result::Ok(value);
     }
 
@@ -331,13 +341,12 @@ type struct Receiver<T> {
         mut value: T;
         unsafe { value = *slot; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(node as u8*), Layout::of<ChanNode<T>>());
+        alloc.deallocate(NonNull::new(node as u8*), Layout::of::<ChanNode<T>>());
         return Result::Ok(value);
     }
 }
 
-implement<T> trait Drop for struct Receiver<T>
-where T: Drop {
+implement<T> trait Drop for struct Receiver<T> {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner: ChannelInner<T>* = this.inner;
@@ -349,9 +358,9 @@ where T: Drop {
         while (node != null) {
             const nxt: ChanNode<T>* = (*node).next;
             const slot: T* = &(*node).value;
-            (*slot).drop();
+            ptr::drop_in_place::<T>(slot);
             mut a: GlobalAlloc = GlobalAlloc::new();
-            a.deallocate(NonNull::new(node as u8*), Layout::of<ChanNode<T>>());
+            a.deallocate(NonNull::new(node as u8*), Layout::of::<ChanNode<T>>());
             node = nxt;
         }
         inner.head = null;
@@ -359,7 +368,7 @@ where T: Drop {
         inner.refs = inner.refs - 1;
         const last: boolean = inner.refs == 0;
         chan_mtx_unlock(&inner.mutex[0]);
-        if (last) { free_inner<T>(inner); }
+        if (last) { free_inner::<T>(inner); }
         this.inner = null;
     }
 }
@@ -384,5 +393,5 @@ where T: Drop {
 /// the channel's lifetime. Panics only on allocation / pthread-init
 /// failure.
 function channel<T>() -> Receiver<T> {
-    return Receiver<T> { inner: new_inner<T>() };
+    return Receiver::<T> { inner: new_inner::<T>() };
 }

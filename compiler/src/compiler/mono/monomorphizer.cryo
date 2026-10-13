@@ -1,4 +1,4 @@
-///! Monomorphizer  (Compiler::Mono::Monomorphizer)
+///! Monomorphizer  (compiler::mono::monomorphizer)
 ///!
 ///! Worklist-driven engine that processes all generic instantiations to completion.
 ///! Repeatedly dequeues InstantiatedTypes, specializes them via ASTSpecializer,
@@ -20,28 +20,63 @@
 ///! collaborators + the shared `MonoState` (worklist/discovery/error) by value,
 ///! wiring their back-pointers via `wire()` AFTER it reaches a stable heap address.
 
-namespace Compiler::Mono::Monomorphizer;
+namespace compiler::mono::monomorphizer;
 
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration, Statement, Expression, Pattern };
-import Compiler::Types::{
-    Generic, UserDefined, Compound, Type, Arena, TypeRef, Substitution,
-    Checker, Resolver, GenericRegistry, Ownership, TraitChecker
+import compiler::ast;
+import compiler::ast::{ declaration, expression, node, NodeKind, pattern, statement, TraitBound, TraitRef };
+import compiler::types::{
+    generic, user_defined, compound, type_base, arena, type_ref, substitution,
+    checker, resolver, generic_registry, ownership, trait_checker, TypeKind
 };
-import Compiler::Diag;
-import Compiler::Diag::{ Sink, Diagnostic, SourceSpan };
-import Compiler::DeclIndex;
-import Compiler::Lex;
-import Compiler::Resolver::{ InternTable, SymbolStr, Resolver, QualifiedName, MangledName };
-import Compiler::Mono::{
-    State, Specializer, DispatchAnnotator, TraitSpecializer,
-    TypePopulator, AstResolver, CallSpecializer
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
+import compiler::decl_index;
+import compiler::decl_index::{ DeclarationIndex };
+import compiler::lex;
+import compiler::resolver::{
+    intern_table, symbol_str, resolver, qualified_name, mangled_name
+};
+import compiler::mono::{
+    state, specializer, trait_specializer,
+    type_populator, ast_resolver, call_specializer
 };
 import std::collections::hashmap;
-import Utils::Logger;
+import std::collections::hashmap::{ HashMap };
+import utils::logger;
+import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
+import std::fmt;
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::sink::{ DiagnosticSink };
+import compiler::mono::ast_resolver::{ MonoAstResolver };
+import compiler::mono::call_specializer::{ MonoCallSpecializer };
+import compiler::mono::specializer::{ ASTSpecializer, SpecializationResult };
+import compiler::mono::state::{ MonomorphRequest, MonoState, SpecializationEntry };
+import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
+import compiler::mono::type_populator::{ MonoTypePopulator };
+import compiler::resolver::decl_name::{ DeclName };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, DefKind, DefTable };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{ ArrayType };
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::types::resolver::{ ResolutionContext, TypeResolver };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::trait_checker::{ TraitChecker };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef, TypeKey };
+import compiler::types::user_defined::{ ClassType, EnumType, StructType };
 
 
-// `SpecializationEntry` + `MonomorphRequest` live in `Compiler::Mono::State` so
+// `SpecializationEntry` + `MonomorphRequest` live in `compiler::mono::state` so
 // the collaborators can see them without a cycle.
 
 
@@ -66,22 +101,22 @@ type struct Monomorphizer {
     state:             MonoState;
 
     // -- Collaborators (owned by value; wired after the orchestrator is stable) --
-    dispatch_annotator: MonoDispatchAnnotator;  // bound-directed fmt dispatch (pre-mono AST pass)
     trait_spec:         MonoTraitSpecializer;    // trait-impl conditional inst + bounds + assoc-proj
     type_populator:     MonoTypePopulator;       // spec'd AST -> concrete arena types
     ast_resolver:       MonoAstResolver;         // post-clone re-resolution + static-match arm pruning
     call_specializer:   MonoCallSpecializer;     // sema-stash consumer: free/method per-call specialization
 
     // -- Specialization cache (orchestrator-private; spec_entries live on state) --
-    // Keyed by the CANONICAL INSTANTIATION ID for (base, args) - see `make_key`.
-    // (`spec_keys: string[]` used to sit here too; it was write-only and is gone.)
-    spec_index:        HashMap<u64, i64>;      // key -> index in state.spec_entries
+    // Keyed by the CANONICAL INSTANTIATION for (base, args) - see `make_key`.
+    spec_index:        HashMap<TypeKey, i64>;  // key -> index in state.spec_entries
 
     // -- Incremental injection tracking (for batch compilation) --
     injection_cursor:  i64;
 
-    // Current module being processed (set by pass before calling process_all)
-    current_module:    SymbolStr;
+    // Source file of the unit being processed (set by pass before calling
+    // process_all): the spec owner a method spec is recorded under when its
+    // impl block carries none.
+    current_source_file: SymbolStr;
 
 
     /// Construct the orchestrator with its environment.  Collaborators + state are
@@ -99,18 +134,17 @@ type struct Monomorphizer {
             diagnostics:           diagnostics,
             type_resolver:         type_resolver,
             decl_index:            decl_index,
-            specializer:           ASTSpecializer::new(arena, intern_table),
+            specializer:           ASTSpecializer::new(arena, intern_table, type_resolver),
             trait_checker:         TraitChecker::new(arena, generic_registry,
                                                      intern_table, diagnostics),
             state:                 MonoState::null(),
-            dispatch_annotator:    MonoDispatchAnnotator::null(),
             trait_spec:            MonoTraitSpecializer::null(),
             type_populator:        MonoTypePopulator::null(),
             ast_resolver:          MonoAstResolver::null(),
             call_specializer:      MonoCallSpecializer::null(),
-            spec_index:            HashMap<u64, i64>::new(),
+            spec_index:            HashMap::<TypeKey, i64>::new(),
             injection_cursor:      0,
-            current_module:        SymbolStr::empty(),
+            current_source_file:   SymbolStr::empty(),
         };
     }
 
@@ -121,7 +155,6 @@ type struct Monomorphizer {
     wire(mut &this) -> void {
         this.state.wire(this.arena, this.generic_registry, this.intern_table,
                         this.type_resolver);
-        this.dispatch_annotator.wire(this.arena, this.intern_table);
         this.trait_spec.wire(this.arena, this.generic_registry, this.intern_table,
                              this.diagnostics, this.type_resolver, &this.trait_checker);
         this.type_populator.wire(this.arena, this.intern_table);
@@ -135,17 +168,10 @@ type struct Monomorphizer {
 
     // Public per-pass API (called by passes/specialization.cryo)
 
-    /// Set the current module context for origin tracking.
-    set_current_module(mut &this, module: SymbolStr) -> void {
-        this.current_module = module;
-        this.call_specializer.set_current_module(module);
-    }
-
-    /// Set the current module NAMESPACE for import-scoped generic scope
-    /// resolution in the call specializer (distinct from `current_module`, the
-    /// source-file origin identity).  Cascaded to the call specializer.
-    set_current_ns(mut &this, ns: SymbolStr) -> void {
-        this.call_specializer.set_current_ns(ns);
+    /// Set the source file of the unit being specialized.
+    set_current_source_file(mut &this, file: SymbolStr) -> void {
+        this.current_source_file = file;
+        this.call_specializer.set_current_source_file(file);
     }
 
     /// True if every queued specialization request has been drained.
@@ -171,26 +197,19 @@ type struct Monomorphizer {
         return this.state.spec_entries[i].owner_source;
     }
 
-    /// Number of recorded generic-METHOD spec owner modules (see
-    /// MonoState::spec_owner_modules).  Parallel to `spec_count` for the
+    /// Number of recorded generic-METHOD spec owner files (see
+    /// MonoState::spec_owner_files).  Parallel to `spec_count` for the
     /// `spec_entries` type/free-function specs.
-    spec_owner_module_count(&this) -> i64 {
-        return this.state.spec_owner_modules.length;
+    spec_owner_file_count(&this) -> i64 {
+        return this.state.spec_owner_files.length;
     }
 
-    /// The owner-module key (namespace or source path) of method-spec record `i`,
-    /// resolvable via `ModuleGraph::source_file_for_owner_key`.
-    spec_owner_module_at(&this, i: i64) -> SymbolStr {
-        if (i < 0 || i >= this.state.spec_owner_modules.length) {
+    /// The source file of the unit that emits method-spec record `i`.
+    spec_owner_file_at(&this, i: i64) -> SymbolStr {
+        if (i < 0 || i >= this.state.spec_owner_files.length) {
             return SymbolStr::empty();
         }
-        return this.state.spec_owner_modules[i];
-    }
-
-    /// Bound-directed dispatch annotation (Display::fmt vs Debug::fmt).  Runs over
-    /// EVERY decl before mono clones any template.  See MonoDispatchAnnotator.
-    annotate_bound_dispatch_in_module(mut &this, root: ProgramNode*) -> void {
-        this.dispatch_annotator.annotate_bound_dispatch_in_module(root);
+        return this.state.spec_owner_files[i];
     }
 
     /// Consume sema's `resolved_type_args` stash across a module's call sites,
@@ -240,7 +259,7 @@ type struct Monomorphizer {
             iterations += 1;
             if (iterations > max_iterations) {
                 this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    format("monomorphization exceeded %lld instantiations - a generic type that grows its type arguments at each level (e.g. `Wrap<T> { f: Wrap<Wrap<T>> }`) instantiates without bound",
+                    fmt::format("monomorphization exceeded %lld instantiations - a generic type that grows its type arguments at each level (e.g. `Wrap<T> { f: Wrap<Wrap<T>> }`) instantiates without bound",
                         max_iterations)));
                 this.state.error_count += 1;
                 break;
@@ -248,7 +267,7 @@ type struct Monomorphizer {
             const request: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
             this.state.pending_cursor += 1;
 
-            const key: u64 = this.make_key(request);
+            const key: TypeKey = this.make_key(request);
 
             // Already cached; mark monomorphized + propagate the cached concrete
             // type to this module's fresh InstantiatedType.
@@ -270,24 +289,22 @@ type struct Monomorphizer {
         // monomorphized types.  Standalone T[] creates ArrayType without
         // InstantiatedType.  Scan the arena once for dynamic ArrayTypes with
         // concrete elements and enqueue any missing Array<T> instantiations.
-        const array_sym: SymbolStr = this.intern_table.intern("std::collections::array::Array");
-        const array_entry: TemplateEntry* = this.generic_registry.get_template(array_sym);
+        const array_entry: TemplateEntry* =
+            this.generic_registry.template_of(this.generic_registry.wellknown(LangItem::Array));
         if (array_entry != null) {
             const array_base: TypeRef = array_entry.base_type;
             const type_count: i64 = this.arena.type_count();
-            for (mut tid: u64 = 1; tid <= type_count as u64; tid++) {
-                const at: Type* = this.arena.lookup(tid);
+            for (mut ti: i64 = 0; ti < type_count; ti++) {
+                const at: Type* = this.arena.types[ti];
                 if (at == null || at.kind != TypeKind::Array) { continue; }
                 const arr: ArrayType* = at as ArrayType*;
                 if (!arr.is_dynamic() || !arr.element.is_valid()) { continue; }
-                const elem_t: Type* = this.arena.lookup(arr.element.id);
+                const elem_t: Type* = this.arena.lookup(arr.element);
                 if (elem_t == null) { continue; }
-                if (elem_t.kind == TypeKind::GenericParam ||
-                    elem_t.kind == TypeKind::BoundedParam) { continue; }
+                if (elem_t.kind == TypeKind::GenericParam) { continue; }
                 mut arr_args: TypeRef[] = [];
                 arr_args.push(arr.element);
-                const _mod_dummy: string = "";
-                mut arr_ctx: ResolutionContext = ResolutionContext::new(_mod_dummy, _mod_dummy);
+                mut arr_ctx: ResolutionContext = ResolutionContext::new("");
                 arr_args = this.type_resolver.expand_default_type_args(array_entry, arr_args, &arr_ctx);
                 const inst_ref: TypeRef = this.generic_registry.instantiate(array_base, arr_args);
                 this.state.enqueue_from_type_ref(inst_ref);
@@ -296,7 +313,7 @@ type struct Monomorphizer {
             while (this.state.pending_cursor < this.state.pending.length) {
                 const req: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
                 this.state.pending_cursor += 1;
-                const rkey: u64 = this.make_key(req);
+                const rkey: TypeKey = this.make_key(req);
                 if (this.is_cached(rkey)) {
                     this.propagate_cached_resolution(rkey, req);
                     this.generic_registry.mark_monomorphized(req.base_type, req.type_args);
@@ -311,7 +328,7 @@ type struct Monomorphizer {
         // enqueue_from_type_ref() filtered out, so collect_unmonomorphized()
         // doesn't keep returning them on every subsequent module in a batch build.
         for (mut i: i64 = 0; i < unprocessed.length; i++) {
-            const t: Type* = this.arena.lookup(unprocessed[i].id);
+            const t: Type* = this.arena.lookup(unprocessed[i]);
             if (t != null && t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = t as InstantiatedType*;
                 this.generic_registry.mark_monomorphized(inst.generic_base, inst.type_args);
@@ -335,14 +352,14 @@ type struct Monomorphizer {
             drain_iters += 1;
             if (drain_iters > max_iterations) {
                 this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    format("monomorphization exceeded %lld instantiations (type-growing generic that grows its type arguments at each level)",
+                    fmt::format("monomorphization exceeded %lld instantiations (type-growing generic that grows its type arguments at each level)",
                         max_iterations)));
                 this.state.error_count += 1;
                 break;
             }
             const request: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
             this.state.pending_cursor += 1;
-            const key: u64 = this.make_key(request);
+            const key: TypeKey = this.make_key(request);
             if (this.is_cached(key)) {
                 this.propagate_cached_resolution(key, request);
                 this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
@@ -360,19 +377,19 @@ type struct Monomorphizer {
 
     // Single request specialization
 
-    specialize_request(mut &this, request: &MonomorphRequest, key: u64) -> boolean {
-        cdebug("[Monomorphizer::specialize_request] key=%llu base_type.id=%llu\n", key, request.base_type.id);
-        const _base_dbg: Type* = this.arena.lookup(request.base_type.id);
+    specialize_request(mut &this, request: &MonomorphRequest, key: TypeKey) -> boolean {
+        cdebug("[Monomorphizer::specialize_request] key=%llu base_type.id=%llu\n", key, request.base_type.key());
+        const _base_dbg: Type* = this.arena.lookup(request.base_type);
         if (_base_dbg != null) {
             cdebug("  base type: kind=%s display='%s'\n", _base_dbg.kind.to_string(), _base_dbg.display_name());
         } else {
-            cdebug("  base type: LOOKUP FAILED for id=%llu\n", request.base_type.id);
+            cdebug("  base type: LOOKUP FAILED for id=%llu\n", request.base_type.key());
         }
         cdebug("  registered templates: %lld\n", this.generic_registry.template_count());
-        const entry: TemplateEntry* = this.generic_registry.get_template_by_type_id(request.base_type.id);
+        const entry: TemplateEntry* = this.generic_registry.template_of_type(request.base_type);
         if (entry == null) {
             this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("no template found for type ID %llu", request.base_type.id)));
+                fmt::format("no template found for type ID %llu", request.base_type.key())));
             return false;
         }
 
@@ -382,13 +399,13 @@ type struct Monomorphizer {
     // `request` is BORROWED, not taken by value: it carries an owning
     // `type_args: TypeRef[]`; a by-value parameter would bitwise-copy the struct
     // (aliasing the caller's buffer) and the copy's drop would double-free.
-    specialize_with_entry(mut &this, request: &MonomorphRequest, key: u64,
+    specialize_with_entry(mut &this, request: &MonomorphRequest, key: TypeKey,
                           entry: TemplateEntry*) -> boolean {
         // Validate arg count
         if (request.type_args.length != entry.param_count) {
-            const qn_str: string = this.intern_table.resolve(entry.qualified_name);
+            const qn_str: string = this.intern_table.shown(entry.qualified_name);
             this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("arg count mismatch for %s: expected %lld, got %lld",
+                fmt::format("arg count mismatch for %s: expected %lld, got %lld",
                         qn_str, entry.param_count, request.type_args.length)));
             return false;
         }
@@ -397,32 +414,36 @@ type struct Monomorphizer {
         // user-defined types so cross-module resolution works.
         mut type_arg_displays: string[] = [];
         for (mut i: i64 = 0; i < request.type_args.length; i++) {
-            const arg_t: Type* = this.arena.lookup(request.type_args[i].id);
+            const arg_t: Type* = this.arena.lookup(request.type_args[i]);
             if (arg_t != null) {
-                const qname: SymbolStr = this.arena.get_qualified_name(request.type_args[i]);
+                const qname: DeclName = this.arena.get_qualified_name(request.type_args[i]);
                 if (qname.is_valid()) {
-                    type_arg_displays.push(this.intern_table.resolve(qname));
+                    type_arg_displays.push(this.intern_table.shown(qname));
                 } else {
                     type_arg_displays.push(this.arena.format_display(arg_t));
                 }
             } else {
-                type_arg_displays.push(format("unknown_%llu", request.type_args[i].id));
+                type_arg_displays.push(fmt::format("unknown_%llu", request.type_args[i].key()));
             }
         }
 
         // Call AST specializer
+        // The wrapper's id IS the concrete's id on the swap-relocate path, so
+        // handing it to the substituter now attaches the id the concrete will
+        // have.  Invalid for a function template (not `is_named`, no wrapper),
+        // which keeps the by-name route there.
         const result: SpecializationResult = this.specializer.specialize(
-            entry, request.type_args, type_arg_displays
+            entry, request.type_args, request.generic_type, &this.trait_checker
         );
         if (!result.success) {
-            const qn_str: string = this.intern_table.resolve(entry.qualified_name);
+            const qn_str: string = this.intern_table.shown(entry.qualified_name);
             mut args_str: string = "";
             for (mut ai: i64 = 0; ai < type_arg_displays.length; ai++) {
-                if (ai > 0) { args_str = format("%s,%s", args_str, type_arg_displays[ai]); }
+                if (ai > 0) { args_str = fmt::format("%s,%s", args_str, type_arg_displays[ai]); }
                 else        { args_str = type_arg_displays[ai]; }
             }
             this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("specialization failed for %s<%s>: %s",
+                fmt::format("specialization failed for %s<%s>: %s",
                         qn_str, args_str, result.error_message)));
             return false;
         }
@@ -433,17 +454,33 @@ type struct Monomorphizer {
         // Build the *qualified* specialized name for the arena.
         const qualified_spec_sym: SymbolStr = this.qualify_spec_name(entry, result.spec_name);
 
+        // A function's copy is the instance it was made for: what a call to
+        // the instance is pinned by, and what its registration files the
+        // copy's entry under.
+        if (entry.node_kind == NodeKind::FunctionDeclaration && result.specialized_ast != null
+                && result.specialized_ast.kind == NodeKind::FunctionDeclaration) {
+            (result.specialized_ast as declaration::FunctionDeclNode*).instance = request.generic_type;
+        }
+
         // Create concrete type in arena based on node kind
         const subst: TypeSubstitution = TypeSubstitution::from_params(
-            entry.param_type_ids, request.type_args
+            entry.param_types, request.type_args
         );
+
+        // The declaration's own `where` clause, checked here because every
+        // instantiation passes through this one place with the template and
+        // its arguments in hand.  An unsatisfied bound is E0306 and the
+        // build is refused on it; the specialization still proceeds, as a
+        // call whose bound fails still proceeds, so one wrong instantiation
+        // reports once rather than as every body that would have used it.
+        this.refuse_unsatisfied_type_bounds(entry, &subst, type_arg_displays);
 
         // Drop impls and methods whose where-bounds aren't satisfied for this
         // substitution.  Removing them here means resolve_specialized_ast never
         // sees an uncompilable body and DI never indexes a junk signature.
         this.trait_spec.filter_bounds_violating_methods(result.specialized_ast, &subst);
         const kept_impl_asts: ASTNode*[] = this.trait_spec.filter_bounds_violating_impls(
-            result.impl_asts, &subst);
+            result.impl_asts, &request.type_args);
 
         // Determine the concrete aggregate kind for this template.  Function
         // templates (`is_named == false`) produce no arena type.
@@ -462,19 +499,17 @@ type struct Monomorphizer {
         // Human-readable display name ("Pair<i32, string>"), computed from the
         // still-unresolved InstantiatedType wrapper (valid whether or not we take
         // the swap path below).
-        mut display_name: string = "";
+        mut display_name: DeclName = DeclName::empty();
         if (request.generic_type.is_valid()) {
-            const inst_for_name: Type* = this.arena.lookup(request.generic_type.id);
-            if (inst_for_name != null) { display_name = this.arena.format_display(inst_for_name); }
+            const inst_for_name: Type* = this.arena.lookup(request.generic_type);
+            if (inst_for_name != null) { display_name = this.arena.display_of_instantiation(inst_for_name); }
         }
 
         // SWAP-RELOCATE identity path: a named generic whose request carries a
         // valid, still-unresolved InstantiatedType wrapper reuses THAT wrapper's
         // arena id for the concrete, so `wrapper.id == concrete.id` (one id per
-        // semantic type).  Reserve the spec names against the wrapper NOW - a spec
-        // body can reference itself by its bare/qualified spec name, and that must
-        // resolve to the concrete's eventual id during resolve_specialized_ast.
-        // The slot is flipped from wrapper to concrete at populate time (below).
+        // semantic type).  The slot is flipped from wrapper to concrete at
+        // populate time (below).
         // For a named generic this is the ONLY construction route for a concrete;
         // the missing-wrapper case is an internal error (see the else branch).
         // Function templates are not `is_named` and never reach here - they get a
@@ -483,12 +518,11 @@ type struct Monomorphizer {
         mut concrete_type: TypeRef = TypeRef::invalid();
         mut swap_path: boolean = false;
         if (is_named) {
-            const w_t: Type* = this.arena.lookup(request.generic_type.id);
+            const w_t: Type* = this.arena.lookup(request.generic_type);
             if (request.generic_type.is_valid() && w_t != null
                     && w_t.kind == TypeKind::InstantiatedType) {
                 concrete_type = request.generic_type;
                 swap_path = true;
-                this.arena.reserve_spec_names(concrete_type, qualified_spec_sym, spec_name_sym, target_kind);
             } else {
                 // INVARIANT (one id per semantic type): a named generic reaches
                 // here only via the swap path above, so `wrapper.id == concrete.id`.
@@ -521,24 +555,20 @@ type struct Monomorphizer {
                 // file's other `intern_table.resolve` sites - formatter results
                 // live in a shared static buffer, so sibling display calls inside
                 // one `format()` can clobber each other.
-                const tmpl_name: string = this.intern_table.resolve(entry.qualified_name);
+                const tmpl_name: string = this.intern_table.shown(entry.qualified_name);
                 mut ice_args: string = "";
                 for (mut ii: i64 = 0; ii < type_arg_displays.length; ii++) {
-                    if (ii > 0) { ice_args = format("%s, %s", ice_args, type_arg_displays[ii]); }
+                    if (ii > 0) { ice_args = fmt::format("%s, %s", ice_args, type_arg_displays[ii]); }
                     else        { ice_args = type_arg_displays[ii]; }
                 }
                 this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    format("named generic `%s<%s>` (instantiation id %llu) reached monomorphization without an unresolved InstantiatedType wrapper, so its concrete type cannot reuse the wrapper's arena id (one id per semantic type)",
-                        tmpl_name, ice_args, key)));
+                    fmt::format("named generic `%s<%s>` (instantiation id %llu) reached monomorphization without an unresolved InstantiatedType wrapper, so its concrete type cannot reuse the wrapper's arena id (one id per semantic type)",
+                        tmpl_name, ice_args,
+                        this.arena.create_instantiation(request.base_type, request.type_args).key())));
                 this.state.error_count += 1;
                 concrete_type = this.create_concrete_type(entry, qualified_spec_sym, &subst);
-                // Register the bare spec name as an alias so resolve_body_locals()
-                // can find the type (the substituter rewrites to bare names).
-                if (concrete_type.is_valid() && !spec_name_sym.equals(qualified_spec_sym)) {
-                    this.arena.add_name_alias(spec_name_sym, concrete_type);
-                }
-                if (concrete_type.is_valid() && display_name.length() > 0) {
-                    const ct: Type* = this.arena.lookup(concrete_type.id);
+                if (concrete_type.is_valid() && display_name.is_valid()) {
+                    const ct: Type* = this.arena.lookup(concrete_type);
                     if (ct != null) {
                         if (ct.kind == TypeKind::Struct)     { (ct as StructType*).set_display_name(display_name); }
                         else if (ct.kind == TypeKind::Enum)  { (ct as EnumType*).set_display_name(display_name); }
@@ -556,13 +586,17 @@ type struct Monomorphizer {
         // resolver's scope state is process-global; bailing leaves the wrong scope
         // active for every subsequent specialization.
         mut saved_scope: u64 = 0;
-        if (this.type_resolver.name_resolver != null && entry.module_name.is_valid()) {
-            const mod_name: string = this.intern_table.resolve(entry.module_name);
-            saved_scope = this.type_resolver.name_resolver.get_current_scope_id();
-            const template_scope: u64 = this.type_resolver.name_resolver.find_module_scope(mod_name);
+        mut saved_module: ModulePath = ModulePath::none();
+        if (this.type_resolver.name_resolver != null && entry.declared_in.is_valid()) {
+            const template_scope: u64 =
+                this.type_resolver.name_resolver.find_module_scope(entry.declared_in);
+            // The guard asks whether the module was ever ENTERED;
+            // `find_module_scope` answers without creating one, so a module
+            // nobody entered is left alone instead of being given an empty
+            // scope to be switched into.  Only a switch is restored below.
             if (template_scope > 0) {
-                this.type_resolver.name_resolver.set_module_with_scope(
-                    entry.module_name, template_scope);
+                saved_scope = this.type_resolver.name_resolver.get_current_scope_id();
+                saved_module = this.type_resolver.name_resolver.set_module(entry.declared_in);
             }
         }
 
@@ -573,6 +607,18 @@ type struct Monomorphizer {
         } else {
             concrete_type
         };
+        // Each cloned impl head is FOR the concrete type from here on: the
+        // cloner withholds the template's stamp (a specialization is not a
+        // definition), and the walk below asks the head what it targets -
+        // to register its methods, to pin the calls in their bodies - before
+        // the pass-level placement records the same owner.  Recorded now, by
+        // arena id, so no reader between here and there has to read the
+        // target off a spelling.
+        for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
+            if (kept_impl_asts[ri] != null && concrete_type.is_valid()) {
+                (kept_impl_asts[ri] as declaration::ImplBlockNode*).spec_owner = concrete_type;
+            }
+        }
         // Compile-time `static match` arm pruning.  Runs AFTER substitution but
         // BEFORE resolve_specialized_ast, so dead arms are removed first.
         this.ast_resolver.prune_static_match_arms(result.specialized_ast, entry.node_kind, entry, &subst);
@@ -580,8 +626,47 @@ type struct Monomorphizer {
             this.ast_resolver.prune_static_match_arms(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst);
         }
         this.ast_resolver.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry, &subst, this_type_for_methods);
+        // An impl block is resolved under its own parameters, bound through
+        // its head, not under the template's.
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
-            this.ast_resolver.resolve_specialized_ast(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst, this_type_for_methods);
+            mut head: TypeSubstitution = this.trait_spec.head_bindings(
+                kept_impl_asts[ri] as declaration::ImplBlockNode*, &request.type_args);
+            this.ast_resolver.resolve_specialized_ast(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &head, this_type_for_methods);
+        }
+
+        // A specialized TYPE is a declaration this pass writes, and it is
+        // registered where its identity is decided: here, under the
+        // qualified spec name this function minted (the name the arena
+        // carries once the wrapper slot is flipped below - it cannot be
+        // asked of the arena yet), with the id stamped on the clone - the
+        // clone's one writer, as the type-declaration stage is a source
+        // declaration's.  It has to precede the nested-call walk below: that
+        // walk materializes generic METHODS on this receiver and registers
+        // each by the type, and a type the index cannot name yet leaves every
+        // one unregistered.  What the clone CARRIES is registered here too -
+        // its own methods and its impl blocks' - since their signatures are
+        // typed by now and the type they hang off is in the index; a generic
+        // method materialized on this receiver later registers itself at
+        // the walk.  The pass that places the entry registers nothing the
+        // index keys by the type.  A function template has no named type,
+        // and its clone registers as a declaration with the module that
+        // places it.
+        if (concrete_type.is_valid()) {
+            // An instantiation is registered beside its template, in the
+            // template's parent, under the specialization's own leaf.
+            const spec_def: DefId = this.decl_index.defs.register(
+                this.decl_index.defs.parent_of(this.decl_index.registered_def(entry.base_type)),
+                spec_name_sym, DefKind::Instance, SourceSpan::none());
+            this.decl_index.register_type(spec_def, concrete_type,
+                Monomorphizer::node_is_public(result.specialized_ast));
+            Monomorphizer::stamp_def(result.specialized_ast, spec_def);
+            this.register_carried_methods(result.specialized_ast, concrete_type);
+            for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
+                if (kept_impl_asts[ri] == null) { continue; }
+                const ib: declaration::ImplBlockNode* = kept_impl_asts[ri] as declaration::ImplBlockNode*;
+                this.decl_index.register_methods(
+                    concrete_type, ib.methods, this.intern_table, this.arena, "mono/placed spec impl methods");
+            }
         }
 
         // Register the spec entry into `state.spec_entries` BEFORE specializing the
@@ -600,14 +685,11 @@ type struct Monomorphizer {
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
             walk_impls.push(kept_impl_asts[ri]);
         }
-        const origin: SymbolStr = this.current_module;
         const spec_entry: SpecializationEntry = SpecializationEntry {
             specialized_type:  concrete_type,
-            specialized_name:  spec_name_sym,
             ast_node:          result.specialized_ast,
             impl_nodes:        kept_impl_asts,
-            origin_module:     origin,
-            template_module:   entry.module_name,
+            template_module:   entry.declared_in,
             instantiated_type: request.generic_type,
             injected:          false,
             owner_source:      SymbolStr::empty(),
@@ -641,12 +723,12 @@ type struct Monomorphizer {
         if (concrete_type.is_valid()) {
             if (swap_path) {
                 this.arena.swap_wrapper_to_concrete(concrete_type, qualified_spec_sym,
-                    entry.module_name, target_kind, is_union_kind, display_name);
+                    entry.declared_in, target_kind, is_union_kind, display_name);
             }
-            this.type_populator.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst, entry);
+            this.type_populator.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst, entry, &walk_impls);
 
             if (!swap_path) {
-                const inst_t: Type* = this.arena.lookup(request.generic_type.id);
+                const inst_t: Type* = this.arena.lookup(request.generic_type);
                 if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
                     (inst_t as InstantiatedType*).set_resolved_type(concrete_type);
                     // Record the concrete's intrinsic generic-instantiation identity:
@@ -682,15 +764,13 @@ type struct Monomorphizer {
             // keyed, deliberately SHARED across functions).  The one-id-per-type
             // invariant applies to TYPES - a function specialization is a code
             // artifact, not a type; its type is its signature, and that already has
-            // canonical single-id identity through the interner.  `reserve_spec_names`
-            // reinforces this: it writes only the struct/class/enum caches, so a
-            // function spec has nothing to reserve.  Function specs are bound
+            // canonical single-id identity through the interner.  Function specs are bound
             // downstream by MANGLED NAME, not by arena id, and
             // `SpecializationEntry.specialized_type` is deliberately invalid for
             // them - every consumer guards on `is_valid()`.
             const func_type: TypeRef = this.type_populator.build_function_type_from_ast(result.specialized_ast);
             if (func_type.is_valid()) {
-                const inst_t: Type* = this.arena.lookup(request.generic_type.id);
+                const inst_t: Type* = this.arena.lookup(request.generic_type);
                 if (inst_t != null) {
                     // `set_signature`, NOT `set_resolved_type`: this records the
                     // spec's SIGNATURE, it does not claim the wrapper collapsed
@@ -702,8 +782,7 @@ type struct Monomorphizer {
 
         // Restore the Resolver's scope.  END SCOPE-SWITCHED REGION.
         if (saved_scope > 0 && this.type_resolver.name_resolver != null) {
-            this.type_resolver.name_resolver.set_module_with_scope(
-                this.current_module, saved_scope);
+            this.type_resolver.name_resolver.restore_scope(saved_module, saved_scope);
         }
 
         // Mark as monomorphized
@@ -737,16 +816,16 @@ type struct Monomorphizer {
                          subst: TypeSubstitution*) -> TypeRef {
         return match (entry.node_kind) {
             NodeKind::StructDeclaration => {
-                this.arena.create_struct(spec_name, entry.module_name)
+                this.arena.create_struct(spec_name, entry.declared_in)
             }
             NodeKind::UnionDeclaration => {
-                this.arena.create_union(spec_name, entry.module_name)
+                this.arena.create_union(spec_name, entry.declared_in)
             }
             NodeKind::EnumDeclaration => {
-                this.arena.create_enum(spec_name, entry.module_name)
+                this.arena.create_enum(spec_name, entry.declared_in)
             }
             NodeKind::ClassDeclaration => {
-                this.arena.create_class(spec_name, entry.module_name)
+                this.arena.create_class(spec_name, entry.declared_in)
             }
             NodeKind::FunctionDeclaration => {
                 // Generic functions don't create arena types; they just produce
@@ -755,7 +834,7 @@ type struct Monomorphizer {
                 TypeRef::invalid()
             }
             _ => {
-                this.arena.create_struct(spec_name, entry.module_name)
+                this.arena.create_struct(spec_name, entry.declared_in)
             }
         };
     }
@@ -766,21 +845,108 @@ type struct Monomorphizer {
     /// Build a qualified specialized name from the template's qualified name and
     /// the bare specialized name.  E.g. "BattleTest::Pair" + "Pair_string" ->
     /// "BattleTest::Pair_string".  Bare spec name when the template has no namespace.
-    qualify_spec_name(&this, entry: TemplateEntry*, spec_name: string) -> SymbolStr {
-        const qualified_str: string = this.intern_table.resolve(entry.qualified_name);
-        const bare_str: string = this.intern_table.resolve(entry.name);
-
-        const q_len: i64 = qualified_str.length() as i64;
-        const b_len: i64 = bare_str.length() as i64;
-        if (q_len <= b_len) {
-            return this.intern_table.intern(spec_name);
+    /// Whether `subst` satisfies every `where` bound the type declaration
+    /// `entry` names; E0306 at the bound as declared, naming the
+    /// instantiation, for the first that fails.  The door behind sema's
+    /// check at a written annotation (`TypeResolver::resolve_generic`):
+    /// an instantiation demanded with no span of its own - a literal, a
+    /// static call, a clone's concretized argument - is refused here, at
+    /// the one place every instantiation passes with the template and its
+    /// arguments in hand.  A bound whose argument is still abstract is
+    /// deferred to the concrete instantiation.
+    refuse_unsatisfied_type_bounds(mut &this, entry: TemplateEntry*, subst: TypeSubstitution*,
+                                   type_arg_displays: &string[]) -> boolean {
+        if (entry == null || entry.ast_node == null) { return true; }
+        // The four aggregates carry a `where` clause; a function template's
+        // bounds are checked at its call, and nothing else has one.
+        const none: TraitBound[] = [];
+        mut bounds: &TraitBound[] = &none;
+        match (entry.node_kind) {
+            NodeKind::StructDeclaration => { bounds = &(entry.ast_node as declaration::StructDeclNode*).where_bounds; }
+            NodeKind::UnionDeclaration  => { bounds = &(entry.ast_node as declaration::UnionDeclNode*).where_bounds; }
+            NodeKind::ClassDeclaration  => { bounds = &(entry.ast_node as declaration::ClassDeclNode*).where_bounds; }
+            NodeKind::EnumDeclaration   => { bounds = &(entry.ast_node as declaration::EnumDeclNode*).where_bounds; }
+            _ => { return true; }
         }
-
-        const prefix_len: i64 = q_len - b_len;
-        const prefix: string = qualified_str.substr(0, prefix_len);
-        return this.intern_table.intern(prefix + spec_name);
+        mut concrete: TypeRef = TypeRef::invalid();
+        const tref: TraitRef* = this.trait_checker.unsatisfied_trait_ref(bounds, subst, &concrete);
+        if (tref == null) { return true; }
+        const trait_str: string = this.intern_table.resolve(tref.path[tref.path.length - 1]);
+        const concrete_t: Type* = this.arena.lookup(concrete);
+        const concrete_str: string = if (concrete_t != null) { this.arena.format_display(concrete_t) } else { "?" };
+        mut args_str: string = "";
+        for (mut ai: i64 = 0; ai < type_arg_displays.length; ai++) {
+            if (ai > 0) { args_str = args_str + ", "; }
+            args_str = args_str + type_arg_displays[ai];
+        }
+        const tmpl_str: string = entry.display_name(this.intern_table);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+            fmt::format("the trait bound `%s: %s` is not satisfied by `%s<%s>`",
+                concrete_str, trait_str, tmpl_str, args_str));
+        diag = diag.at_with_label(tref.span, fmt::format("required by this bound on `%s`", tmpl_str));
+        diag = diag.with_note(fmt::format("the trait `%s` is not implemented for `%s`", trait_str, concrete_str));
+        diag = diag.help(fmt::format(
+            "implement `%s` for `%s`, or instantiate `%s` with a type that does",
+            trait_str, concrete_str, tmpl_str));
+        this.diagnostics.emit(diag);
+        return false;
     }
 
+    /// The path of a named template's specialization: its template's
+    /// module and the specialization's minted identifier, composed as every
+    /// declaration's path is (`ModulePath::qualified`); the identifier alone
+    /// for a template no module declares.  A generated template's copy is
+    /// spelled in the generated name space, as the template is.
+    qualify_spec_name(&this, entry: TemplateEntry*, spec_name: string) -> SymbolStr {
+        const leaf: SymbolStr = this.intern_table.intern(
+            DefTable::spelled_in(this.arena.defs.origin_of(entry.def), spec_name));
+        if (!entry.declared_in.is_valid()) { return leaf; }
+        return entry.declared_in.qualified(leaf, this.intern_table);
+    }
+
+
+    /// Stamp the id a specialized type declaration registered under.  The
+    /// cloner leaves the field invalid (a clone has its own registration,
+    /// never its template's), so this is the clone's one writer.
+    static stamp_def(node: ASTNode*, d: DefId) -> void {
+        if (node == null) { return; }
+        if (node.kind == NodeKind::StructDeclaration) { (node as declaration::StructDeclNode*).def = d; return; }
+        if (node.kind == NodeKind::UnionDeclaration)  { (node as declaration::UnionDeclNode*).def = d; return; }
+        if (node.kind == NodeKind::ClassDeclaration)  { (node as declaration::ClassDeclNode*).def = d; return; }
+        if (node.kind == NodeKind::EnumDeclaration)   { (node as declaration::EnumDeclNode*).def = d; return; }
+        if (node.kind == NodeKind::TraitDeclaration)  { (node as declaration::TraitDeclNode*).def = d; return; }
+        if (node.kind == NodeKind::TypeAliasDeclaration) { (node as declaration::TypeAliasDeclNode*).def = d; return; }
+    }
+
+    /// Register the methods a specialized type declaration carries inline,
+    /// under the type.  An enum's methods live in its impl blocks; a kind
+    /// with no method list carries nothing.
+    register_carried_methods(mut &this, node: ASTNode*, spec_type: TypeRef) -> void {
+        if (node == null) { return; }
+        if (node.kind == NodeKind::StructDeclaration) {
+            this.decl_index.register_methods(spec_type, (node as declaration::StructDeclNode*).methods,
+                this.intern_table, this.arena, "mono/placed spec struct methods");
+        } else if (node.kind == NodeKind::UnionDeclaration) {
+            this.decl_index.register_methods(spec_type, (node as declaration::UnionDeclNode*).methods,
+                this.intern_table, this.arena, "mono/placed spec union methods");
+        } else if (node.kind == NodeKind::ClassDeclaration) {
+            this.decl_index.register_methods(spec_type, (node as declaration::ClassDeclNode*).methods,
+                this.intern_table, this.arena, "mono/placed spec class methods");
+        }
+    }
+
+    /// The visibility a specialized type declaration carries: its template's,
+    /// which the cloner copied onto the node.  A kind without a modifier is
+    /// public.
+    static node_is_public(node: ASTNode*) -> boolean {
+        if (node == null) { return true; }
+        if (node.kind == NodeKind::StructDeclaration) { return (node as declaration::StructDeclNode*).is_public; }
+        if (node.kind == NodeKind::UnionDeclaration)  { return (node as declaration::UnionDeclNode*).is_public; }
+        if (node.kind == NodeKind::ClassDeclaration)  { return (node as declaration::ClassDeclNode*).is_public; }
+        if (node.kind == NodeKind::EnumDeclaration)   { return (node as declaration::EnumDeclNode*).is_public; }
+        return true;
+    }
 
     // Batch compilation support
 
@@ -823,6 +989,18 @@ type struct Monomorphizer {
         this.injection_cursor = this.state.spec_entries.length;
     }
 
+    /// Bind the calls walked before the instantiation they name was minted
+    /// and registered; see `MonoCallSpecializer::bind_queued_calls`.
+    bind_queued_calls(mut &this) -> void {
+        this.call_specializer.bind_queued_calls();
+    }
+
+    /// Report the walked calls nothing binds; see
+    /// `MonoCallSpecializer::report_unbound_calls`.
+    report_unbound_calls(mut &this) -> void {
+        this.call_specializer.report_unbound_calls();
+    }
+
 
     // Cache helpers (orchestrator-private)
 
@@ -846,16 +1024,16 @@ type struct Monomorphizer {
     /// immutable COPY of each key and never re-derives it from the (mutated)
     /// node, so `(base, args)` still resolves to the same id after
     /// `swap_wrapper_to_concrete` installs the concrete in that slot.
-    make_key(&this, request: &MonomorphRequest) -> u64 {
+    make_key(&this, request: &MonomorphRequest) -> TypeKey {
         return this.make_key_for(request.base_type, request.type_args);
     }
 
-    make_key_for(&this, base: TypeRef, type_args: &TypeRef[]) -> u64 {
-        return this.arena.create_instantiation(base, type_args).id;
+    make_key_for(&this, base: TypeRef, type_args: &TypeRef[]) -> TypeKey {
+        return this.arena.create_instantiation(base, type_args).table_key();
     }
 
     /// Check if a key is already in the specialization cache.
-    is_cached(&this, key: u64) -> boolean {
+    is_cached(&this, key: TypeKey) -> boolean {
         return this.spec_index.get(&key).is_some();
     }
 
@@ -863,7 +1041,7 @@ type struct Monomorphizer {
     /// concrete type.  Sema creates a fresh InstantiatedType per call site, so a
     /// later module revisiting an already-specialized pair stays unresolved unless
     /// we explicitly propagate.
-    propagate_cached_resolution(mut &this, key: u64, request: &MonomorphRequest) -> void {
+    propagate_cached_resolution(mut &this, key: TypeKey, request: &MonomorphRequest) -> void {
         const idx_opt: Option<i64> = this.spec_index.get(&key);
         if (!idx_opt.is_some()) { return; }
         const idx: i64 = idx_opt.unwrap();
@@ -877,7 +1055,7 @@ type struct Monomorphizer {
         // request carries the default-expanded 2-arg `type_args` but references
         // the original 1-arg `generic_type`.  Without this, that receiver stays
         // unresolved after mono (E0900).
-        const inst_t: Type* = this.arena.lookup(request.generic_type.id);
+        const inst_t: Type* = this.arena.lookup(request.generic_type);
         if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
             (inst_t as InstantiatedType*).set_resolved_type(entry.specialized_type);
             this.arena.set_type_generic_origin(entry.specialized_type, request.generic_type);

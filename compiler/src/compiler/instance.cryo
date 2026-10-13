@@ -8,39 +8,86 @@
 /// Mode-specific behavior comes from CompileMode policy methods queried
 /// by individual passes, not from flags on this struct.
 
-namespace Compiler::Instance;
+namespace compiler::instance;
 
-import Compiler::{
-    CompileMode, CompilationContext, Diag, Artifacts, ModuleGraph,
-    ModuleLoader, ProjectConfig, BuildManifest, Codegen, Lex
+import compiler::{
+    compile_mode, compilation_context, diag, artifacts, module_graph,
+    module_loader, project_config, build_manifest, codegen, lex
 };
-import Compiler::Passes::{
-    PassID, PassRegistry, Specialization
+import compiler::passes::{
+    pass_id, pass_registry, specialization
 };
-import Compiler::Codegen::{
-    LLVMTypes, Passes, TestMainCodegen, TypeMap
+import compiler::codegen::{ llvm, llvm_types, passes, test_main_codegen, type_map };
+import compiler::resolver::{
+    intern_table, symbol_str, mangled_name
 };
-import Compiler::Resolver::{
-    InternTable, SymbolStr, MangledName
-};
-import Compiler::AST::{ Node, Dumper };
-import Compiler::Deps::DepResolver;
-import Compiler::Deps::Lockfile;
-import Compiler::Vendor::AutoVendor;
-import Compiler::Diag::Diagnostic;
-import Compiler::Lex::Lexer;
-import Utils;
-import Utils::Logger;
+import compiler::resolver::res;
+import compiler::resolver::name_resolution::{ NameResolutionPass };
+import compiler::resolver::stamp_check;
+import compiler::resolver::stamp_check::{ StampCheck };
+import compiler::ast::{ node, declaration, dumper, NodeKind };
+import compiler::deps::dep_resolver;
+import compiler::deps::dep_resolver::{ DepResolver, ResolveMode, ResolveOutcome };
+import compiler::deps::lockfile;
+import compiler::deps::lockfile::{ LockedVendor, Lockfile };
+import compiler::vendor::auto_vendor;
+import compiler::vendor::auto_vendor::{ AutoVendor };
+import compiler::diag::diagnostic;
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::snapshot;
+import compiler::diag::snapshot::{ DiagnosticSnapshot };
+import compiler::lex::lexer;
+import utils;
+import utils::logger;
+import utils::logger::{ cdebug, LOG_DEBUG, LogComponent, set_compiler_debug };
 import std::fmt;
 import std::fs::metadata;
+import std::fs::metadata::{ metadata };
 import std::fs::path;
+import std::fs::path::{ Path };
 import std::env;
 import std::thread;
 import std::time::clock;
+import std::time::clock::{ Instant };
 import std::collections::string;
+import std::collections::string::{ String };
 import std::collections::str;
+import std::collections::str::{ Str };
 import std::core::hash;
+import std::core::hash::{ Fnv128Hasher };
 import std::core::mem;
+import std::ffi::libc;
+import compiler::artifacts::{ ASTOutput, IROutput, TokenStream };
+import compiler::ast::declaration::{ ImportDeclNode };
+import compiler::ast::dumper::{ ASTDumper };
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::codegen::llvm_types::{ LContext, LModule, LTargetMachine };
+import compiler::codegen::passes::{
+    codegen_emit_job, CodegenPasses, emit_worker_entry, EmitJob, EmitTarget, EmitWorkerCtx
+};
+import compiler::codegen::test_main_codegen::{ TestMainCodegen };
+import compiler::compilation_context::{
+    BuildOptions, CompilationContext, HeapBackend, OutputKind, OutputOverride, PanicMode,
+    Runtime, SourceOverride
+};
+import compiler::compile_mode::{ CompileMode };
+import compiler::diag::{ ErrorCode };
+import compiler::module_graph::{ ModuleInfo, ModuleOrigin };
+import compiler::module_loader::{ ModuleLoader };
+import compiler::passes::pass_id::{ PassID, PassResult, Provision, ProvisionSet };
+import compiler::passes::pass_registry::{ PassRegistry };
+import compiler::passes::specialization::{ SpecializationPasses };
+import compiler::project_config::{
+    BinTarget, LibTarget, PanicStrategy, ProjectConfig, TargetType
+};
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
+import compiler::types::generic_registry;
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangModule };
+import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
 
 // Default codegen worker count: the online CPU count.  Object emission is
 // parallelized by fanning each module out to a child `cryo __emit-obj` PROCESS
@@ -54,7 +101,7 @@ function codegen_default_threads() -> u32 { return thread::available_parallelism
 
 // Below this module count the bitcode round-trip + child-process spawn cost
 // outweighs the parallel-emit win, so codegen stays serial + in-process.
-const CODEGEN_MULTIPROC_MIN_MODULES: u32 = 16u32;
+const CODEGEN_MULTIPROC_MIN_MODULES: u32 = 16;
 
 type struct CompilerConfig {
     debug:              boolean;
@@ -99,7 +146,7 @@ type struct CompilerConfig {
     /// 0..3). `-1` means "unset" => fall back to cryoconfig `[compiler]
     /// optimize`. Takes priority over the cryoconfig value so a single
     /// project can be built optimized or debuggable without editing the
-    /// file. Read in `compile_project_with_ctx`.
+    /// file. Read in `run_project`.
     opt_level_override:  i32;
     /// `-g` / `--debug-info`: emit DWARF debug info (source file/line +
     /// per-function scopes) so gdb/lldb can show file:line backtraces.
@@ -157,6 +204,10 @@ type struct CompilerConfig {
     /// Object bytes are independent of the worker count, so this only trades
     /// build speed vs. cores - never output.
     codegen_threads_override: i32;
+    /// The project's `[compiler] test_plant_unanswered_name`: the name
+    /// layer's exit check resets the first identifier it walks to
+    /// unanswered.  A test switch, never set by a real build.
+    plant_unanswered_name: boolean;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -180,6 +231,7 @@ type struct CompilerConfig {
             panic:               PanicStrategy::Unspecified,
             locked:              false,
             codegen_threads_override: -1,
+            plant_unanswered_name: false,
         };
     }
 
@@ -205,6 +257,7 @@ type struct CompilerConfig {
             panic:               PanicStrategy::Unspecified,
             locked:              false,
             codegen_threads_override: -1,
+            plant_unanswered_name: false,
         };
     }
 }
@@ -220,7 +273,8 @@ type struct CompilationResult {
     /// runtime's compile-fail helpers. Empty for `--no-std` builds.
     stdlib_root:   string;
 
-    static ok(output_path: string) -> CompilationResult {
+    static ok(output_path_text: string) -> CompilationResult {
+        const output_path: string = output_path_text;
         return CompilationResult {
             success:       true,
             error_count:   0,
@@ -230,7 +284,8 @@ type struct CompilationResult {
         };
     }
 
-    static ok_with_warnings(output_path: string, warnings: u32) -> CompilationResult {
+    static ok_with_warnings(output_path_text: string, warnings: u32) -> CompilationResult {
+        const output_path: string = output_path_text;
         return CompilationResult {
             success:       true,
             error_count:   0,
@@ -249,6 +304,13 @@ type struct CompilationResult {
             stdlib_root:   "",
         };
     }
+}
+
+/// A compile's result and the context it ran in, which the caller owns;
+/// `ctx` is null when the build failed before a context was made.
+type struct ProjectBuild {
+    result: CompilationResult;
+    ctx:    CompilationContext*;
 }
 
 
@@ -348,7 +410,8 @@ type struct CompilerInstance {
     /// Run a pipeline on a context, handling AST dump, diagnostics, and
     /// result construction.  All single-file compile_* methods delegate here.
     run_pipeline(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                 output_path: string) -> CompilationResult {
+                 output_path_text: string) -> CompilationResult {
+        const output_path: string = output_path_text;
         pipeline.set_verbose(this.config.verbose_passes);
 
         if (!pipeline.validate()) {
@@ -360,7 +423,7 @@ type struct CompilerInstance {
 
         // Write .ll text file when --emit-llvm is set (single-file mode).
         if (this.config.emit_llvm && ctx.artifacts.ir.is_valid()) {
-            const ll_path: string = format("%s.ll", output_path);
+            const ll_path: string = fmt::format("%s.ll", output_path);
             mut ll_err: i8* = null;
             const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
                 ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
@@ -391,7 +454,7 @@ type struct CompilerInstance {
         // to stderr would (a) try to read source from disk via the
         // diag span's `file:` URI path and (b) print colour codes that
         // confuse the editor's log capture.
-        const skip_flush: boolean = match (ctx.mode) {
+        const skip_flush: boolean = match (ctx.options.mode) {
             CompileMode::Lsp => { true }
             _                => { false }
         };
@@ -415,9 +478,9 @@ type struct CompilerInstance {
         LOG_DEBUG(LogComponent::General, "[Compiler] Finished: %s (%u errors, %u warnings)",
             ctx.source_file, ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
 
-        if (success) {
+        if (success && !ctx.diagnostics.has_errors()) {
             return CompilationResult::ok_with_warnings(
-                output_path, ctx.diagnostics.warning_count);
+                output_path_text, ctx.diagnostics.warning_count);
         }
         return CompilationResult::failed(
             ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
@@ -444,7 +507,8 @@ type struct CompilerInstance {
     /// mirror of the linked executable, lands at PATH (see
     /// `run_object_emission` / `run_linking`).  `--no-std` opts out of
     /// the stdlib entirely for freestanding single files.
-    compile_file(&this, source: string) -> CompilationResult {
+    compile_file(&this, source_text: string) -> CompilationResult {
+        const source: string = source_text;
         LOG_DEBUG(LogComponent::General, "[Compiler] compile_file: %s", source);
         if (this.config.debug) {
             LOG_DEBUG(LogComponent::General, "[Compiler] Compiling: %s (mode: single-file)", source);
@@ -471,10 +535,10 @@ type struct CompilerInstance {
         // file it belongs to.
         if (config.project_root.length() > 0
                 && !config.project_root.eq(".")) {
-            config.output_dir = format("%s/build", config.project_root);
+            config.output_dir = fmt::format("%s/build", config.project_root);
         }
         // CLI `--target=TRIPLE`; `--opt-level` / `-g` / profile flags
-        // flow through `this.config` inside compile_project_with_ctx,
+        // flow through `this.config` inside run_project,
         // exactly as they do for a cryoconfig build.
         if (this.config.target_triple_override.length() > 0) {
             config.target_triple = this.config.target_triple_override;
@@ -493,7 +557,8 @@ type struct CompilerInstance {
     }
 
     /// Compile a single source file in raw mode (no stdlib, no prelude).
-    compile_raw(&this, source: string) -> CompilationResult {
+    compile_raw(&this, source_text: string) -> CompilationResult {
+        const source: string = source_text;
         if (this.config.debug) {
             LOG_DEBUG(LogComponent::General, "[Compiler] Compiling: %s (mode: raw)", source);
         }
@@ -503,19 +568,21 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
 
-        mut ctx: CompilationContext = CompilationContext::new(CompileMode::Raw, source);
-        ctx.debug_mode = this.config.debug;
-        ctx.target_triple = this.config.target_triple_override;
-        ctx.output_path_override = this.config.output_path_override;
-        ctx.output_kind          = this.config.output_kind;
+        mut options: BuildOptions = BuildOptions::defaults(CompileMode::Raw);
+        options.verbose = this.config.debug;
+        options.target_triple = LTargetMachine::resolve_effective_triple(
+            this.config.target_triple_override);
+        options.output = OutputOverride::from_cli(this.config.output_kind,
+                                                  this.config.output_path_override);
+        mut ctx: CompilationContext = CompilationContext::new(options, source, null);
         // Raw mode runs full codegen (IRGen/ObjectEmission), so it shares the
         // process-wide (TypeRef.id -> LLVMTypeRef) cache. TypeArena.next_id
         // resets to 1 per compile, so a prior compile's entries would alias
         // unrelated types here. Every other codegen entry resets it
-        // (compile_project_with_ctx, compile_for_lsp_content_into); raw was the
+        // (run_project, compile_for_lsp_content); raw was the
         // one that didn't.
-        Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
-        Compiler::Codegen::AstArena::cryo_ast_arena_reset();
+        compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
+        compiler::codegen::ast_arena::cryo_ast_arena_reset();
         mut pipeline: PassRegistry = PassRegistry::build_raw_pipeline();
         return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
     }
@@ -528,14 +595,15 @@ type struct CompilerInstance {
     /// every warning including the unknown-directive warning.
     ///
     /// This routes through the SAME multi-module project driver as
-    /// `compile_file` / `cryo build` (via `compile_project_with_ctx`), differing
+    /// `compile_file` / `cryo build` (via `run_project`), differing
     /// only in `CompileMode::Check`, which gates codegen off after TypeLowering.
     /// The earlier single-file frontend pipeline (`build_frontend_pipeline` over
     /// one module) never loaded the imported stdlib modules, so a reference to a
     /// stdlib type like `String`/`Str`/`Array` failed to resolve (a spurious
     /// E0203/E0233 that a real build did not report).  Loading the whole module
     /// graph the way a build does makes `check` agree with `build`.
-    compile_for_check(&this, source: string) -> CompilationResult {
+    compile_for_check(&this, source_text: string) -> CompilationResult {
+        const source: string = source_text;
         if (!metadata::exists(Path::from(source))) {
             fmt::eprintln(f"error: file not found: {source}");
             return CompilationResult::failed(1, 0);
@@ -561,65 +629,38 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
 
-        // Heap-allocate the context (it is large) exactly as
-        // `compile_project_with_config` does; `compile_project_with_ctx` is a
-        // supported direct entry (the LSP uses it too) and resolves the stdlib
-        // root itself from `this.config.stdlib_path_override`.
-        const _box_ctx: Box<CompilationContext> = Box<CompilationContext>::new(
-            CompilationContext::new(CompileMode::Check, root_path));
-        mut ctx: CompilationContext* = _box_ctx.leak();
-        ctx.debug_mode = this.config.debug;
-        return this.compile_project_with_ctx(ctx, config);
+        return this.compile_project_to_context(config, CompileMode::Check, Option::None).result;
     }
 
-    /// Compile for LSP: frontend + semantic analysis, no codegen.
-    compile_for_lsp(&this, source: string) -> CompilationResult {
-        if (!metadata::exists(Path::from(source))) {
-            return CompilationResult::failed(1, 0);
-        }
 
-        MangledName::set_lsp_safe(true);
-        mut ctx: CompilationContext = CompilationContext::new(CompileMode::Lsp, source);
-        mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
-        return this.run_pipeline(&ctx, &pipeline, "");
-    }
-
-    /// Compile for LSP from in-memory content (no file on disk).
-    compile_for_lsp_content(&this, virtual_path: string, content: string) -> CompilationResult {
-        MangledName::set_lsp_safe(true);
-        mut ctx: CompilationContext = CompilationContext::new(CompileMode::Lsp, virtual_path);
-        ctx.artifacts.tokens = TokenStream::new([], virtual_path, content);
-        mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
-        return this.run_pipeline(&ctx, &pipeline, "");
-    }
-
-    /// Compile for LSP into a caller-owned context.
+    /// Compile for LSP, returning the context to the caller.
     /// Single-file mode: parses + type-checks just the one file the
     /// editor is showing, with no project context.  Cross-file
     /// references resolve to invalid TypeRefs; in LSP-safe mode the
     /// mangler emits a poison sentinel instead of panicking, so this
     /// path can run post-NameResolution passes without crashing the
     /// daemon.  Used as a fallback when we can't find a cryoconfig.
-    /// For real diagnostics, route through `compile_for_lsp_project_into`.
-    compile_for_lsp_content_into(&this, ctx: CompilationContext*,
-                                 virtual_path: string, content: string) -> CompilationResult {
-        MangledName::set_lsp_safe(true);
+    /// For real diagnostics, route through `compile_for_lsp_project`.
+    compile_for_lsp_content(&this, virtual_path_text: string,
+                            content_text: string) -> ProjectBuild {
+        mangled_name::set_lsp_safe(true);
+        const _box_ctx: Box<CompilationContext> = Box::<CompilationContext>::new(
+            CompilationContext::new(BuildOptions::defaults(CompileMode::Lsp),
+                                    virtual_path_text, null));
+        mut ctx: CompilationContext* = _box_ctx.leak();
         // Same risk as the multi-target build path: TypeArena.next_id
         // resets every compile, so without clearing the (TypeRef.id ->
         // LLVMTypeRef) cache between LSP recompiles every fresh TypeRef
         // would alias a stale entry from a prior keystroke's compile.
-        Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
+        compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
         // NB: the arena is NOT reset here.  The LSP session owns the arena
-        // lifecycle - it resets + activates routing before constructing `ctx`
-        // (so this single-file path's whole container heap - intern strings,
-        // resolver maps, type tables, decl index - is arena-backed and bulk
-        // reclaimed by the next recompile, instead of leaking to libc every
-        // keystroke as it did when this path reset but never activated routing)
-        // and deactivates on return.  Resetting here would free the just-built,
-        // session-owned `ctx` out from under this compile.
-        ctx.artifacts.tokens = TokenStream::new([], virtual_path, content);
+        // lifecycle - it resets + activates routing before calling this, so
+        // `ctx` and its whole container heap are arena-backed and reclaimed by
+        // the next recompile.  Resetting here would free them mid-compile.
+        ctx.artifacts.tokens = TokenStream::new([], virtual_path_text, content_text);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
-        return this.run_pipeline(ctx, &pipeline, "");
+        const result: CompilationResult = this.run_pipeline(ctx, &pipeline, "");
+        return ProjectBuild { result: result, ctx: ctx };
     }
 
     /// Compile a whole project for the LSP, with one module's source
@@ -633,14 +674,13 @@ type struct CompilerInstance {
     /// The LSP uses this for diagnostics, hover, go-to-def, and
     /// completion.  Codegen is gated off via `CompileMode::Lsp` so
     /// no LLVM IR is emitted; everything stops cleanly at TypeLowering.
-    compile_for_lsp_project_into(&this, ctx: CompilationContext*,
-                                 config_path: string,
-                                 override_path: string,
-                                 override_content: string) -> CompilationResult {
-        MangledName::set_lsp_safe(true);
-        ctx.lsp_override_path    = override_path;
-        ctx.lsp_override_content = override_content;
-        mut config: ProjectConfig = ProjectConfig::parse(config_path);
+    compile_for_lsp_project(&this, config_path_text: string,
+                            override_path_text: string,
+                            override_content_text: string) -> ProjectBuild {
+        const override_content: string = override_content_text;
+        const override_path: string = override_path_text;
+        mangled_name::set_lsp_safe(true);
+        mut config: ProjectConfig = ProjectConfig::parse(config_path_text);
         if (this.config.output_dir_override != ""
                 && this.config.output_dir_override.length() > 0) {
             config.output_dir = this.config.output_dir_override;
@@ -663,9 +703,9 @@ type struct CompilerInstance {
         //   3. Else use the first `[[bin]]`.
         // Single-target configs fall through unchanged.
         if (config.is_multi_target()) {
-            mut chosen: int = -1;
-            for (mut bi: int = 0; bi < config.bins.length; bi++) {
-                const bin_full: string = format("%s/%s",
+            mut chosen: i64 = -1;
+            for (mut bi: i64 = 0; bi < config.bins.length; bi++) {
+                const bin_full: string = fmt::format("%s/%s",
                     config.project_root, config.bins[bi].entry_point);
                 if (bin_full.eq(override_path)) {
                     chosen = bi;
@@ -684,7 +724,8 @@ type struct CompilerInstance {
                 config = CompilerInstance::make_bin_view(config, sel);
             }
         }
-        return this.compile_project_with_ctx(ctx, config);
+        return this.compile_project_to_context(config, CompileMode::Lsp,
+            Option::Some(SourceOverride { path: override_path, content: override_content }));
     }
 
     /// Switch to a module AND load its AST from the local buffers.
@@ -701,7 +742,7 @@ type struct CompilerInstance {
                 // Borrow the stored ModuleInfo; a value copy would shallow-alias
                 // its owning arrays and double-free them at scope exit.
                 const info: ModuleInfo* = &ctx.module_graph.modules[mod_idx];
-                const ns: string = intern.resolve(info.namespace_name);
+                const ns: string = intern.shown(info.namespace_path().decl_name());
                 ctx.artifacts.ast = ASTOutput {
                     root: ast,
                     namespace_name: ns,
@@ -710,30 +751,15 @@ type struct CompilerInstance {
         }
     }
 
-    /// Like load_module but also restores saved scope from scope_buf.
-    static load_module_with_scope(ctx: CompilationContext*, intern: InternTable*,
-                                   ast_buf: void*, scope_buf: void*,
-                                   mod_idx: u32, mod_count: u32) -> void {
-        CompilerInstance::load_module(ctx, intern, ast_buf, mod_idx, mod_count);
-        // Restore saved scope
-        if (scope_buf != null && mod_idx < mod_count && ctx.resolver != null) {
-            const sc_slot: u64* = (scope_buf as u64*) + mod_idx;
-            const saved_scope: u64 = *sc_slot;
-            if (saved_scope > 0) {
-                const info: ModuleInfo* = &ctx.module_graph.modules[mod_idx];
-                ctx.resolver.set_module_with_scope(info.name, saved_scope);
-            }
-        }
-    }
-
     /// Compile a multi-module project using whole-program multi-pass.
     /// Parses cryoconfig, discovers all modules, then runs each pipeline
     /// stage across ALL modules before advancing to the next stage.
-    compile_project(&this, config_path: string) -> CompilationResult {
+    compile_project(&this, config_path_text: string) -> CompilationResult {
+        const config_path: string = config_path_text;
         LOG_DEBUG(LogComponent::General, "[Compiler] compile_project: %s", config_path);
 
         // Project configuration
-        mut config: ProjectConfig = ProjectConfig::parse(config_path);
+        mut config: ProjectConfig = ProjectConfig::parse(config_path_text);
         if (config.error_count > 0) {
             // ProjectConfig::parse already wrote diagnostics to stderr;
             // bail before any module discovery / codegen runs against
@@ -769,6 +795,9 @@ type struct CompilerInstance {
         // has to be able to select abort as well as unwind.  `pick` keeps the
         // project's answer when the CLI said nothing.
         config.panic = PanicStrategy::pick(config.panic, this.config.panic);
+        if (config.test_plant_unanswered_name) {
+            this.config.plant_unanswered_name = true;
+        }
 
         // Mirror cryoconfig `debug = true` into the global compiler debug
         // gate so the [Tag] trace printfs fire.  Only flips it ON; CLI
@@ -810,7 +839,7 @@ type struct CompilerInstance {
         // compiler `[lib]`).  Rather than run a second full `[lib]` compile,
         // the FIRST bin derives `lib<lib.name>.a` from its own object set
         // (minus its entry module) after it links - see
-        // `bundle_lib_from_bin` and `compile_project_with_ctx`.  The bin's
+        // `bundle_lib_from_bin` and `run_project`.  The bin's
         // compile is unchanged, so the executable stays byte-identical; only
         // the redundant lib pass is dropped.  A `[lib]` with no `[[bin]]`
         // (library-only project) still gets its own full compile below.
@@ -825,7 +854,7 @@ type struct CompilerInstance {
             if (!r.success) { return r; }
         }
 
-        for (mut i: int = 0; i < base.bins.length; i++) {
+        for (mut i: i64 = 0; i < base.bins.length; i++) {
             cdebug("[Compiler] Multi-target: building bin '%s' from %s\n",
                 base.bins[i].name, base.bins[i].entry_point);
             // Clone `base` per iteration; make_bin_view consumes its first arg.
@@ -847,7 +876,7 @@ type struct CompilerInstance {
         // A fresh CompilationContext per member (in compile_project_with_config)
         // isolates the module graph, so members with disjoint namespaces do not
         // interfere; each member's name keys its own archive + incremental state.
-        for (mut i: int = 0; i < base.libs.length; i++) {
+        for (mut i: i64 = 0; i < base.libs.length; i++) {
             cdebug("[Compiler] Workspace: building lib '%s' from %s\n",
                 base.libs[i].name, base.libs[i].source_dir);
             // Clone `base` per iteration; make_lib_member_view consumes its first arg.
@@ -870,10 +899,11 @@ type struct CompilerInstance {
     /// back SHORT is different, and raises `out_short` - the widened key would
     /// then be missing inputs exactly like an unresolvable dependency name,
     /// and the caller declines to serve those modules from cache.
-    mark_implicit_closure(&this, ctx: CompilationContext*, ns: string, n: u32,
+    mark_implicit_closure(&this, ctx: CompilationContext*, m: LangModule, n: u32,
                           out: boolean[]*, out_short: boolean*) -> void {
         if (ctx == null || out == null) { return; }
-        const idx: i64 = ctx.module_graph.find_module_index(ctx.intern_table.intern(ns));
+        const idx: i64 = ctx.module_graph.find_module_index(
+            ctx.module_graph.lang_module(m, ctx.intern_table));
         if (idx < 0 || idx >= n as i64) { return; }
         mut short_walk: boolean = false;
         const clos: boolean[] =
@@ -929,149 +959,41 @@ type struct CompilerInstance {
                 _                   => { CompileMode::MultiModule }
             }
         };
-        // Heap-allocate CompilationContext to avoid stack overflow.
-        // The struct is very large (InternTable, ModuleGraph, DiagnosticSink, etc.)
-        // and keeping it on the stack alongside phase locals exhausts the default 8MB limit.
-        const _box_ctx: Box<CompilationContext> = Box<CompilationContext>::new(
-            CompilationContext::new(mode, root_path));
-        mut ctx: CompilationContext* = _box_ctx.leak();
-        mut result: CompilationResult = this.compile_project_with_ctx(ctx, config);
+        const build: ProjectBuild = this.compile_project_to_context(config, mode, Option::None);
+        mut result: CompilationResult = build.result;
         // Per-target teardown.  Copy the survivor strings out of any
         // context-owned (interned) storage FIRST, then reclaim this target's
         // heap so a multi-target (`[lib]` + `[[bin]]`) build does not stack
         // both contexts into peak RSS.  Ordering matters: the dup must run
         // while the interned bytes are still valid, before the teardown frees
-        // them.  The LSP entry (`compile_project_with_ctx`) bypasses this
-        // method and keeps its context alive.
+        // them.  The LSP keeps its context alive and never comes through here.
         result.output_path = CompilerInstance::dup_survivor(result.output_path);
         result.stdlib_root = CompilerInstance::dup_survivor(result.stdlib_root);
-        ctx.release_per_target();
+        if (build.ctx != null) {
+            mem::drop(Box::<CompilationContext>::from_raw(build.ctx));
+        }
         // Release this target's arena chunks back to the OS (the bulk of the
         // per-target heap) so the next target builds from a low baseline
         // instead of climbing on top of the prior target's retained arena.
-        Compiler::Codegen::AstArena::cryo_ast_arena_release();
+        compiler::codegen::ast_arena::cryo_ast_arena_release();
         return result;
     }
 
-    /// Drive the multi-module orchestration against a caller-provided
-    /// context.  Lets the language server compile the whole project
-    /// (every module, every phase) while keeping the resulting `ctx`
-    /// alive afterwards so hover / definition / completion handlers
-    /// can walk the populated AST + resolver + type arena.
-    ///
-    /// The caller is responsible for:
-    ///   - Allocating `ctx` (heap, via `Box::leak`) with the correct
-    ///     `CompileMode`: `Lsp` for the language server entry,
-    ///     whatever `compile_project_with_config` picks for CLI builds.
-    ///   - Setting `ctx.lsp_override_path` + `ctx.lsp_override_content`
-    ///     before this call when the editor buffer should win over
-    ///     the on-disk version of one of the discovered modules.
-    compile_project_with_ctx(&this, ctx: CompilationContext*,
-                             mut config: ProjectConfig) -> CompilationResult {
-        // Drop any cached (TypeRef.id -> LLVMTypeRef) entries from a prior
-        // compile in this process.  TypeArena.next_id resets to 1 every
-        // compile, so without this every fresh TypeRef would alias a
-        // stale cache entry from the previous run.
-        Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
-        // Reclaim the previous target's AST nodes (parse trees + monomorphized
-        // clones) in bulk.  Each target uses its own heap-leaked
-        // CompilationContext, so the prior target's `preserved_asts` /
-        // `spec_entries` are never read again - only the arena memory needs
-        // releasing, and only here.  No-op on the first target.  NB: if the
-        // context ever becomes shared across targets, those node-pointer arrays
-        // would dangle after this reset and must be cleared here too.
-        //
-        // LSP EXCEPTION: the language server owns the arena lifecycle at the
-        // session level - it resets the arena and activates routing BEFORE
-        // constructing the `ctx` it passes here (so the ctx + its sub-components
-        // are arena-backed), and deactivates on return.  Running the reset here
-        // would free that session-owned ctx mid-compile, and deactivating here
-        // would push discovery/frontend allocations back to libc (the very leak
-        // this arrangement fixes).  So both are gated to the non-LSP build path.
-        const lsp_owns_arena: boolean = match (ctx.mode) {
-            CompileMode::Lsp => { true }
-            _                => { false }
-        };
-        if (!lsp_owns_arena) {
-            Compiler::Codegen::AstArena::cryo_ast_arena_reset();
-            // Defensive: guarantee this target STARTS with arena routing OFF, so
-            // its survivor construction (below, pre-activation) always lands in
-            // libc - even on the impossible-by-construction path where a prior
-            // target leaked the active flag.  The bracket re-enables it at Frontend.
-            Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
-        }
-        // Same defensive reset for the LLVM context: dispose any leftover from
-        // a prior target so this target starts on the global-context fallback
-        // until its own context is published at Frontend.
-        Compiler::Codegen::LLVMTypes::dispose_codegen_context();
-
-        // CRYO_TIMINGS phase profiling.  All marks are captured regardless;
-        // the report only prints (success path) when the env var is set, so
-        // the overhead on a normal build is a handful of `clock_gettime`s.
-        const tm_on: boolean = CompilerInstance::timing_enabled();
-        const tm_entry:        i64 = Instant::now().as_nanos();
-        mut tm_discovery_end:  i64 = 0;
-        mut tm_frontend_end:   i64 = 0;
-        mut tm_mono_end:       i64 = 0;
-        mut tm_sema_end:       i64 = 0;
-        mut tm_codegen_end:    i64 = 0;
-        mut tm_link_end:       i64 = 0;
-
-        const root_path: string = config.discovery_root_path();
-        ctx.debug_mode = this.config.debug;
-
-        // Single-file `-o PATH` redirect.  compile_file sets these on
-        // the CompilerConfig; cryoconfig project builds leave them
-        // empty.  ObjectEmission applies the override to the ENTRY
-        // module's artifact and Linking mirrors the executable to the
-        // override path (Exe) or skips the link entirely (Object /
-        // Asm / IRText).
-        ctx.output_path_override = this.config.output_path_override;
-        ctx.output_kind          = this.config.output_kind;
-
-        // Resolve the build profile. Precedence: CLI `--release`/`--dev`/
-        // `--profile=NAME` > cryoconfig `[profile] default` > built-in
-        // `release`. The selected name flows into `config.profile` BEFORE the
-        // clone below, so the per-profile cache subtree
-        // (`<output_dir>/target/<profile>/`) is consistent across codegen,
-        // linking, and the manifest.
+    /// Resolve the build's options from the CLI and `config`, make the
+    /// context from them, and run the whole project in it.  The context is
+    /// returned so the language server can walk it after the compile; it is
+    /// null when the build failed before one was made.
+    compile_project_to_context(&this, mut config: ProjectConfig, mode: CompileMode,
+                               source_override: Option<SourceOverride>) -> ProjectBuild {
+        // Precedence: CLI `--release`/`--dev`/`--profile=NAME` > cryoconfig
+        // `[profile] default` > built-in `release`.  Set before the clone
+        // below, so the per-profile cache subtree is the same everywhere.
         if (this.config.profile_override.length() > 0) {
             config.profile = this.config.profile_override;
         }
 
-        // Optimization level. Base comes from the profile (debug => O0,
-        // release => O2); an explicit `[compiler] optimize` wins over the
-        // profile, and `--opt-level=N` wins over everything.
-        ctx.opt_level = ProjectConfig::profile_base_opt_level(config.profile);
-        if (config.opt_level_explicit) {
-            ctx.opt_level = config.opt_level;
-        }
-        if (this.config.opt_level_override >= 0) {
-            mut lvl: i32 = this.config.opt_level_override;
-            if (lvl > 3) { lvl = 3; }
-            ctx.opt_level = lvl as u32;
-        }
-        // Debug info: base from the profile (debug => on), forced on by
-        // `-g` / `--debug-info` regardless of profile.
-        ctx.emit_debug_info = ProjectConfig::profile_base_debug_info(config.profile)
-            || this.config.emit_debug_info;
-        ctx.project_no_std = config.no_std;
-        ctx.project_no_runtime = config.no_runtime;
-        ctx.project_panic_unwind = config.resolve_panic_unwind();
-        ctx.target_triple = config.target_triple;
-        // Distribution-only static link (see CompilerConfig.release_static).
-        // Consumed at link time; has no effect on emitted IR.
-        ctx.release_static = this.config.release_static;
-
-        // Box an independent clone so the local `config` stays usable for the
-        // rest of this function (stdlib resolution, dep scan, loader setup);
-        // the leaked box owns the copy that lives for `ctx`'s lifetime.
-        const _box_config: Box<ProjectConfig> = Box<ProjectConfig>::new(config.clone());
-        ctx.set_project_config(_box_config.leak());
-
-        // Resolve stdlib root.  See resolve_stdlib_root above for the
-        // full priority chain (CLI -> $CRYO_STDLIB -> $CRYO_HOME ->
-        // binary-relative -> cryoconfig stdlib_root -> legacy fallbacks).
+        // Priority: CLI -> $CRYO_STDLIB -> $CRYO_HOME -> binary-relative ->
+        // cryoconfig stdlib_root -> legacy fallbacks.
         mut stdlib_root: string = "";
         if (!config.no_std) {
             mut tried: string[] = [];
@@ -1098,10 +1020,100 @@ type struct CompilerInstance {
                 fmt::eprintf("    export CRYO_HOME=/path/to/install        (install root; stdlib at $CRYO_HOME/stdlib)\n");
                 fmt::eprintf("    [project] stdlib_root = \"...\"            (in cryoconfig; relative to project_root)\n");
                 fmt::eprintf("    --no-std                                 (build without the standard library)\n");
-                return CompilationResult::failed(1, 0);
+                return ProjectBuild { result: CompilationResult::failed(1, 0), ctx: null };
             }
         }
-        ctx.stdlib_root = stdlib_root;
+
+        mut options: BuildOptions = BuildOptions::defaults(mode);
+        options.verbose = this.config.debug;
+        options.output = OutputOverride::from_cli(this.config.output_kind,
+                                                  this.config.output_path_override);
+        // Base from the profile (debug => O0, release => O2); an explicit
+        // `[compiler] optimize` wins over it, and `--opt-level=N` over both.
+        options.opt_level = ProjectConfig::profile_base_opt_level(config.profile);
+        if (config.opt_level_explicit) {
+            options.opt_level = config.opt_level;
+        }
+        if (this.config.opt_level_override >= 0) {
+            mut lvl: i32 = this.config.opt_level_override;
+            if (lvl > 3) { lvl = 3; }
+            options.opt_level = lvl as u32;
+        }
+        options.debug_info = ProjectConfig::profile_base_debug_info(config.profile)
+            || this.config.emit_debug_info;
+        options.no_std = config.no_std;
+        options.runtime = if (config.no_runtime) { Runtime::Freestanding } else { Runtime::Hosted };
+        options.panic = if (config.resolve_panic_unwind()) { PanicMode::Unwind } else { PanicMode::Abort };
+        options.heap = if (config.native_alloc) { HeapBackend::Native } else { HeapBackend::Libc };
+        options.stdlib_root = stdlib_root;
+        options.target_triple = LTargetMachine::resolve_effective_triple(
+            config.target_triple);
+        options.static_link = this.config.release_static;
+        options.source_override = source_override;
+
+        // An independent clone, so the local `config` stays usable below.
+        const _box_config: Box<ProjectConfig> = Box::<ProjectConfig>::new(config.clone());
+        const _box_ctx: Box<CompilationContext> = Box::<CompilationContext>::new(
+            CompilationContext::new(options, config.discovery_root_path(), _box_config.leak()));
+        mut ctx: CompilationContext* = _box_ctx.leak();
+        const result: CompilationResult = this.run_project(ctx, config);
+        return ProjectBuild { result: result, ctx: ctx };
+    }
+
+    /// Drive the multi-module orchestration in `ctx`, made from `config`.
+    run_project(&this, ctx: CompilationContext*,
+                mut config: ProjectConfig) -> CompilationResult {
+        // Drop any cached (TypeRef.id -> LLVMTypeRef) entries from a prior
+        // compile in this process.  TypeArena.next_id resets to 1 every
+        // compile, so without this every fresh TypeRef would alias a
+        // stale cache entry from the previous run.
+        compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
+        // Reclaim the previous target's AST nodes (parse trees + monomorphized
+        // clones) in bulk.  Each target uses its own heap-leaked
+        // CompilationContext, so the prior target's node-pointer arrays
+        // (`spec_entries` among them) are never read again - only the arena memory needs
+        // releasing, and only here.  No-op on the first target.  NB: if the
+        // context ever becomes shared across targets, those node-pointer arrays
+        // would dangle after this reset and must be cleared here too.
+        //
+        // LSP EXCEPTION: the language server owns the arena lifecycle at the
+        // session level - it resets the arena and activates routing BEFORE
+        // constructing the `ctx` it passes here (so the ctx + its sub-components
+        // are arena-backed), and deactivates on return.  Running the reset here
+        // would free that session-owned ctx mid-compile, and deactivating here
+        // would push discovery/frontend allocations back to libc (the very leak
+        // this arrangement fixes).  So both are gated to the non-LSP build path.
+        const lsp_owns_arena: boolean = match (ctx.options.mode) {
+            CompileMode::Lsp => { true }
+            _                => { false }
+        };
+        if (!lsp_owns_arena) {
+            compiler::codegen::ast_arena::cryo_ast_arena_reset();
+            // Defensive: guarantee this target STARTS with arena routing OFF, so
+            // its survivor construction (below, pre-activation) always lands in
+            // libc - even on the impossible-by-construction path where a prior
+            // target leaked the active flag.  The bracket re-enables it at Frontend.
+            compiler::codegen::ast_arena::cryo_alloc_arena_set_active(false);
+        }
+        // Same defensive reset for the LLVM context: dispose any leftover from
+        // a prior target so this target starts on the global-context fallback
+        // until its own context is published at Frontend.
+        compiler::codegen::llvm_types::dispose_codegen_context();
+
+        // CRYO_TIMINGS phase profiling.  All marks are captured regardless;
+        // the report only prints (success path) when the env var is set, so
+        // the overhead on a normal build is a handful of `clock_gettime`s.
+        const tm_on: boolean = CompilerInstance::timing_enabled();
+        const tm_entry:        i64 = Instant::now().as_nanos();
+        mut tm_discovery_end:  i64 = 0;
+        mut tm_frontend_end:   i64 = 0;
+        mut tm_mono_end:       i64 = 0;
+        mut tm_sema_end:       i64 = 0;
+        mut tm_codegen_end:    i64 = 0;
+        mut tm_link_end:       i64 = 0;
+
+        const root_path: string = config.discovery_root_path();
+        const stdlib_root: string = ctx.options.stdlib_root;
 
         // NB (LSP): the language server owns the per-recompile arena lifecycle at
         // the SESSION level (`CompilerSession::recompile`): it resets the arena
@@ -1122,7 +1134,7 @@ type struct CompilerInstance {
         // The loader appends each to project_root and pre-scans them so
         // imports targeting the dep's namespaces resolve.
         mut effective_roots: string[] = [];
-        for (mut ip: int = 0; ip < config.source_paths.length; ip++) {
+        for (mut ip: i64 = 0; ip < config.source_paths.length; ip++) {
             effective_roots.push(config.source_paths[ip]);
         }
         // Build mode: read the lockfile, materialize any missing git
@@ -1137,7 +1149,7 @@ type struct CompilerInstance {
         if (dep_outcome.failed) {
             return CompilationResult::failed(1, 0);
         }
-        for (mut dr: int = 0; dr < dep_outcome.roots.length; dr++) {
+        for (mut dr: i64 = 0; dr < dep_outcome.roots.length; dr++) {
             effective_roots.push(dep_outcome.roots[dr].path);
             cdebug("[Compiler] Dependency scan root: %s (%s)\n",
                 dep_outcome.roots[dr].path, dep_outcome.roots[dr].name);
@@ -1173,9 +1185,9 @@ type struct CompilerInstance {
         // *now*, not whatever's on disk.  Without this, a freshly
         // typed `import std::collections::str` is invisible to the
         // discovery walk and `Str::from` fails to resolve.
-        if (ctx.lsp_override_path.length() > 0) {
-            loader.set_lsp_override(
-                ctx.lsp_override_path, ctx.lsp_override_content);
+        match (ctx.options.source_override) {
+            Option::Some(o) => { loader.set_lsp_override(o.path, o.content); }
+            Option::None    => { }
         }
 
         const discovery_ok: boolean = loader.discover_project(
@@ -1193,7 +1205,7 @@ type struct CompilerInstance {
             // LSP mode owns stdout for JSON-RPC, so we skip rendering
             // there and let the LSP's diagnostic-publish path surface
             // the same diagnostics through `textDocument/publishDiagnostics`.
-            const skip_flush_disc: boolean = match (ctx.mode) {
+            const skip_flush_disc: boolean = match (ctx.options.mode) {
                 CompileMode::Lsp => { true }
                 _                => { false }
             };
@@ -1212,7 +1224,7 @@ type struct CompilerInstance {
             // Deactivate the arena in case LSP mode activated it early (above);
             // no-op on the build path, which activates only at ~1396.  Keeps the
             // active flag from leaking past this pre-frontend early return.
-            Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+            compiler::codegen::ast_arena::cryo_alloc_arena_set_active(false);
             return CompilationResult::failed(ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
 
@@ -1241,7 +1253,7 @@ type struct CompilerInstance {
         // auto-imports are enabled.  Module discovery runs before AutoImport
         // injects the synthetic `import std::prelude`, so prelude submodules
         // wouldn't otherwise be discovered.
-        if (ctx.mode.auto_imports_enabled() && !config.no_std && stdlib_root.length() > 0) {
+        if (ctx.options.mode.auto_imports_enabled() && !config.no_std && stdlib_root.length() > 0) {
             const prelude_path: string = stdlib_root + "/prelude.cryo";
             if (metadata::exists(Path::from(prelude_path))) {
                 loader.discover_module(
@@ -1256,12 +1268,12 @@ type struct CompilerInstance {
         // would never reach them.  We scan first to populate `ns_map`,
         // then discover each file.  Also force-discover the runtime
         // entry points (`std::env`, `std::test::runner`) so they reach the
-        // DI; the synthesized test main calls them by mangled name and
-        // `lookup_mangled_name` returns invalid otherwise.
-        if (ctx.mode.skip_user_main()) {
-            const tests_dir: string = format("%s/tests", config.project_root);
+        // DI; the synthesized test main names them by their index entry,
+        // which does not exist otherwise.
+        if (ctx.options.mode.skip_user_main()) {
+            const tests_dir: string = fmt::format("%s/tests", config.project_root);
             if (metadata::exists(Path::from(tests_dir))) {
-                loader.scan_all_project_files(tests_dir, this.config.debug);
+                loader.scan_all_project_files(ctx.intern_table, tests_dir, this.config.debug);
                 loader.discover_tests_directory(
                     ctx.intern_table, ctx.module_graph, ctx.diagnostics,
                     tests_dir, this.config.debug);
@@ -1271,13 +1283,13 @@ type struct CompilerInstance {
                     tests_dir);
             }
             if (!config.no_std && stdlib_root.length() > 0) {
-                const env_path: string = format("%s/env/_module.cryo", stdlib_root);
+                const env_path: string = fmt::format("%s/env/_module.cryo", stdlib_root);
                 if (metadata::exists(Path::from(env_path))) {
                     loader.discover_module(
                         ctx.intern_table, ctx.module_graph, ctx.diagnostics,
                         env_path, this.config.debug);
                 }
-                const runner_path: string = format("%s/test/runner.cryo", stdlib_root);
+                const runner_path: string = fmt::format("%s/test/runner.cryo", stdlib_root);
                 if (metadata::exists(Path::from(runner_path))) {
                     loader.discover_module(
                         ctx.intern_table, ctx.module_graph, ctx.diagnostics,
@@ -1299,7 +1311,7 @@ type struct CompilerInstance {
         // for symbol visibility; this (gated on the same usage) puts the
         // module in the graph so it links, since the injection happens after
         // discovery.
-        if (ctx.mode.auto_imports_enabled() && !config.no_std
+        if (ctx.options.mode.auto_imports_enabled() && !config.no_std
                 && stdlib_root.length() > 0
                 && ctx.module_graph.uses_fstring) {
             const interp_path: string = stdlib_root + "/fmt/interp.cryo";
@@ -1312,7 +1324,7 @@ type struct CompilerInstance {
 
         cdebug("[Compiler] After discovery: module_count=%u, modules.length=%u\n",
             ctx.module_graph.module_count(), ctx.module_graph.modules.length);
-        cdebug("[Compiler] name_index.length=%u\n", ctx.module_graph.name_index.length());
+        ctx.module_graph.resolve_edges();
 
         // Classify each discovered module's origin from its file_path so
         // codegen and the build manifest route object/IR output into the
@@ -1327,7 +1339,7 @@ type struct CompilerInstance {
             } else {
                 ""
             };
-        for (mut mci: u32 = 0; mci < ctx.module_graph.modules.length; mci++) {
+        for (mut mci: u32 = 0; mci < ctx.module_graph.module_count(); mci++) {
             const mci_info: ModuleInfo* = &ctx.module_graph.modules[mci];
             const fpath: string = mci_info.file_path;
             // Vendored bindings the loader copied into `<profile_dir>/vendor/
@@ -1337,6 +1349,9 @@ type struct CompilerInstance {
             if (vendor_root.length() > 0 && fpath.is_under(vendor_root)) {
                 mci_info.origin = ModuleOrigin::Vendor;
                 mci_info.origin_name = fpath.parent_dir().basename();
+                // Warnings pointing into a generated binding are not the
+                // consuming author's to act on; the sink drops them from here on.
+                ctx.diagnostics.mark_vendor_file(fpath);
                 continue;
             }
             if (!config.no_std && stdlib_root.length() > 0
@@ -1346,14 +1361,14 @@ type struct CompilerInstance {
                 continue;
             }
             mut matched_dep: boolean = false;
-            for (mut drc: int = 0; drc < dep_outcome.roots.length; drc++) {
+            for (mut drc: i64 = 0; drc < dep_outcome.roots.length; drc++) {
                 const dr_path: string = dep_outcome.roots[drc].path;
                 const dr_base: string =
                     if (config.project_root.length() == 0
                         || config.project_root.eq(".")) {
                         dr_path
                     } else {
-                        format("%s/%s", config.project_root, dr_path)
+                        fmt::format("%s/%s", config.project_root, dr_path)
                     };
                 if (fpath.is_under(dr_base)) {
                     mci_info.origin = ModuleOrigin::Dep;
@@ -1368,20 +1383,76 @@ type struct CompilerInstance {
             }
         }
 
-        // Feed per-module import lists into the DeclarationIndex so
-        // `resolve_qualified_scoped` can disambiguate same-leaf names by the use
-        // site's imports.  Keyed on namespace (ModuleInfo.name == namespace_name
-        // == the declared namespace; dependencies are also namespace names).
-        // decl_index stores these as resolved SymbolStr ids rather than reaching
-        // a ModuleGraph* back-pointer: Cryo forbids the resulting import cycle
-        // (module_graph.cryo already imports DeclIndex).  Done once here, after
-        // discovery, where every module's namespace + dependency edges are known
-        // and before any pass calls the resolver.
-        ctx.decl_index.seed_prelude_namespaces(ctx.intern_table);
-        for (mut imi: u32 = 0; imi < ctx.module_graph.modules.length; imi++) {
+        // Give each module the list of modules it can see through its imports,
+        // which answers whether a use site's module reaches another
+        // (`ModuleGraph::imports`).  Done once here, after discovery, where
+        // every module's namespace and dependency edges are known and before
+        // any pass calls the resolver.
+        // Prelude re-export set, DERIVED from `stdlib/prelude.cryo`'s
+        // `public module` declarations rather than transcribed into a constant.
+        // The loader records each declaration's resolved namespace on the
+        // declaring module (`ModuleInfo.submodules`), so the prelude's own
+        // entry in the graph already carries exactly the set the source spells.
+        //
+        // Two things this fixes beyond the sync hazard: the list can no longer
+        // drift from the file it mirrors, and under `--no-std` it now comes out
+        // EMPTY - the old constant registered 12 std namespaces as "prelude"
+        // even when no prelude was loaded.
+        ctx.decl_index.register_prelude_namespaces(ctx.module_graph.prelude_set(ctx.intern_table));
+        // Modules carrying at least one `export`.  Collected once so the
+        // closure below scans only re-exporters instead of the whole graph per
+        // visible namespace; on a program that writes no `export` this list is
+        // empty and the closure costs nothing.
+        mut reexporters: u32[] = [];
+        for (mut rxi: u32 = 0; rxi < ctx.module_graph.module_count(); rxi++) {
+            if (ctx.module_graph.modules[rxi].reexports.length > 0) {
+                reexporters.push(rxi);
+            }
+        }
+        for (mut imi: u32 = 0; imi < ctx.module_graph.module_count(); imi++) {
             const imi_info: ModuleInfo* = &ctx.module_graph.modules[imi];
-            ctx.decl_index.register_module_imports(
-                imi_info.namespace_name, &imi_info.dependencies);
+            // What a module can SEE is its dependency edges PLUS the brace-list
+            // items, which are deliberately not dependencies (they would create
+            // false cycles in `compute_order`); with only `dependencies`, a
+            // module would not reach what its brace items name.
+            mut imi_visible: ModulePath[] = [];
+            for (mut di: i64 = 0; di < imi_info.dependencies.length; di++) {
+                imi_visible.push(imi_info.dependencies[di]);
+            }
+            for (mut vi: i64 = 0; vi < imi_info.imported_namespaces.length; vi++) {
+                imi_visible.push(imi_info.imported_namespaces[vi]);
+            }
+            // Re-export closure: importing a module grants what that module
+            // re-exports, and what THAT one re-exports, without limit.
+            //
+            // `imi_visible` is both the worklist and the visited set - a
+            // namespace already present is never appended again - which is what
+            // terminates the walk.  It cannot terminate on the graph being
+            // acyclic, because mutual re-export is legal by design.
+            //
+            // Every file sharing a namespace is consulted, not the first match:
+            // a namespace can span files, and "whichever the graph enumerated
+            // first" is the directory-order defect this spec exists to remove.
+            mut wi: i64 = 0;
+            while (wi < imi_visible.length) {
+                const via: ModulePath = imi_visible[wi];
+                wi = wi + 1;
+                for (mut ri: i64 = 0; ri < reexporters.length; ri++) {
+                    const src: ModuleInfo* =
+                        &ctx.module_graph.modules[reexporters[ri]];
+                    if (!src.path().equals(via)) { continue; }
+                    for (mut si: i64 = 0; si < src.reexports.length; si++) {
+                        const re_ns: ModulePath = src.reexports[si];
+                        if (re_ns.equals(imi_info.path())) { continue; }
+                        mut re_seen: boolean = false;
+                        for (mut qi: i64 = 0; qi < imi_visible.length; qi++) {
+                            if (imi_visible[qi].equals(re_ns)) { re_seen = true; }
+                        }
+                        if (!re_seen) { imi_visible.push(re_ns); }
+                    }
+                }
+            }
+            ctx.module_graph.set_visible_modules(imi as i64, imi_visible);
         }
 
         // Experimental gate: consuming a C++ vendor library (binding_source
@@ -1396,7 +1467,7 @@ type struct CompilerInstance {
         // intentionally not gated - it runs without a project cryoconfig.
         if (ctx.project_config != null && !ctx.project_config.cxx_ffi) {
             mut cxx_gated: boolean = false;
-            for (mut gi: u32 = 0; gi < ctx.module_graph.modules.length; gi++) {
+            for (mut gi: u32 = 0; gi < ctx.module_graph.module_count(); gi++) {
                 const ginfo: ModuleInfo* = &ctx.module_graph.modules[gi];
                 const is_vendor: boolean = match (ginfo.origin) {
                     ModuleOrigin::Vendor => { true }
@@ -1408,7 +1479,7 @@ type struct CompilerInstance {
                 if (vidx < 0) { continue; }
                 if (!loader.vendor_registry.entries[vidx].is_cxx()) { continue; }
                 ctx.emit_error(ErrorCode::E0505_EXPERIMENTAL_FEATURE,
-                    format("`import vendor::%s` uses the experimental C++ binding generator",
+                    fmt::format("`import vendor::%s` uses the experimental C++ binding generator",
                         ginfo.origin_name));
                 cxx_gated = true;
             }
@@ -1431,8 +1502,30 @@ type struct CompilerInstance {
         // Compute topological order
         cdebug("[Compiler] Calling compute_order()...\n");
         if (!ctx.module_graph.compute_order()) {
-            ctx.emit_error(ErrorCode::E0501_CIRCULAR_IMPORT,
-                "circular module dependency detected; cannot determine compilation order");
+            // Name the modules that could not be placed.  Without this the
+            // user saw only "Project compilation failed (1 errors, ...)" with
+            // no diagnostic at all: the cycle listing went to the debug
+            // channel, and the E0501 below was buffered but never flushed.
+            mut cyc: string = "";
+            const unplaced: &u32[] = &ctx.module_graph.topo_unplaced;
+            for (mut ui: i64 = 0; ui < unplaced.length; ui++) {
+                const uinfo: ModuleInfo* =
+                    &ctx.module_graph.modules[unplaced[ui]];
+                const uname: string = ctx.intern_table.shown(uinfo.path().decl_name());
+                if (cyc.length() > 0) { cyc = cyc + ", "; }
+                cyc = cyc + uname;
+            }
+            const cyc_msg: string = if (cyc.length() > 0) {
+                fmt::format("circular module dependency detected; cannot determine "
+                       "compilation order. Modules in the cycle: %s", cyc)
+            } else {
+                "circular module dependency detected; cannot determine compilation order"
+            };
+            ctx.emit_error(ErrorCode::E0501_CIRCULAR_IMPORT, cyc_msg);
+            // Diagnostics are buffered until flush(); an early return that
+            // skips it silently discards the error (same defect the E0505
+            // path above documents).
+            ctx.diagnostics.flush();
             return CompilationResult::failed(ctx.diagnostics.error_count, 0);
         }
 
@@ -1444,7 +1537,7 @@ type struct CompilerInstance {
         for (mut i: u32 = 0; i < n; i++) {
             const info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
             cdebug("  [%u] %s (%s)\n", i,
-                ctx.intern_table.resolve(info.name), info.file_path);
+                ctx.intern_table.shown(info.path().decl_name()), info.file_path);
         }
 
         // Incremental whole-build fingerprint + short-circuit.
@@ -1463,9 +1556,9 @@ type struct CompilerInstance {
         // could otherwise report "up to date" while the user's deleted
         // or stale `-o` output is never regenerated.
         const do_incremental: boolean =
-            this.config.incremental && ctx.mode.codegen_enabled()
+            this.config.incremental && ctx.options.mode.codegen_enabled()
             && this.config.output_path_override.length() == 0;
-        mut mod_entries: BuildManifest::ModuleEntry[] = [];
+        mut mod_entries: build_manifest::ModuleEntry[] = [];
         mut manifest_artifacts: string[] = [];
         mut manifest_stdlib_archive: string = "";
         mut build_fp_hex: string = "";
@@ -1483,15 +1576,20 @@ type struct CompilerInstance {
         if (do_incremental) {
             for (mut i: u32 = 0; i < n; i++) {
                 const minfo: ModuleInfo* = &ctx.module_graph.modules[order[i]];
-                mod_entries.push(BuildManifest::ModuleEntry {
-                    namespace_name: ctx.intern_table.resolve(minfo.name),
+                mod_entries.push(build_manifest::ModuleEntry {
+                    namespace_name: ctx.intern_table.shown(minfo.path().decl_name()),
                     source_path:    minfo.file_path,
                     origin_subdir:  ModuleInfo::origin_subdir(minfo.origin, minfo.origin_name),
                     origin_kind:    ModuleInfo::origin_kind_label(minfo.origin),
                 });
             }
             if (!config.no_std && stdlib_root.length() > 0) {
-                manifest_stdlib_archive = format("%s/.bin/libcryo.a", stdlib_root);
+                // Same per-target resolution the link uses, so the
+                // freshness dependency names the archive that will actually
+                // be linked rather than a flat path another target may own.
+                manifest_stdlib_archive = CodegenPasses::stdlib_archive_path(
+                    stdlib_root,
+                    ctx.options.target_triple);
             }
             // Final artifact path(s) this build will produce.  For
             // executables, require BOTH the hoisted build-root binary (index
@@ -1513,15 +1611,15 @@ type struct CompilerInstance {
             } else {
                 const archive_name: string = match (config.target_type) {
                     TargetType::Stdlib => { "libcryo.a" }
-                    _                  => { format("lib%s.a", config.project_name) }
+                    _                  => { fmt::format("lib%s.a", config.project_name) }
                 };
                 manifest_artifacts.push(ctx.project_config.lib_archive_path(archive_name));
             }
-            const manifest: BuildManifest::Manifest = Compiler::BuildManifest::Manifest::new(
-                ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
+            const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
+                ctx.project_config, ctx.options.opt_level, ctx.options.debug_info,
                 manifest_stdlib_archive);
             const build_fp: u128 = manifest.compute_fingerprint(&mod_entries);
-            build_fp_hex = Compiler::BuildManifest::Manifest::hex128(build_fp);
+            build_fp_hex = compiler::build_manifest::Manifest::hex128(build_fp);
 
             if (manifest.is_up_to_date(build_fp_hex, &manifest_artifacts)) {
                 // Nothing changed and the artifact still exists: skip
@@ -1533,7 +1631,7 @@ type struct CompilerInstance {
                 };
                 fmt::println(f"{config.project_name} is up to date ({config.profile})");
                 mut utd_result: CompilationResult = CompilationResult::ok(up_to_date_out);
-                utd_result.stdlib_root = ctx.stdlib_root;
+                utd_result.stdlib_root = ctx.options.stdlib_root;
                 return utd_result;
             }
         }
@@ -1546,10 +1644,10 @@ type struct CompilerInstance {
         // heap-leaked CompilationContext.  Placed AFTER the up-to-date
         // short-circuit and every pre-pass error return (those stay inactive)
         // and AFTER the cross-reset survivors are built (the ProjectConfig
-        // clone at ~844, ctx.stdlib_root at ~879).  Deactivated before result
+        // clone at ~844, ctx.options.stdlib_root at ~879).  Deactivated before result
         // construction below (success) and in `project_failure_release` (every
         // pass-failure path), so the active flag never leaks past a target.
-        Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(true);
+        compiler::codegen::ast_arena::cryo_alloc_arena_set_active(true);
 
         // -- Per-target LLVM context: CREATE -----------------------------
         // Publish a fresh LLVMContextRef for this target's codegen.  All leaf
@@ -1568,19 +1666,17 @@ type struct CompilerInstance {
         // pages (RSS never drops), so an editing session climbs even though the
         // context is logically freed each compile.  Skipping the create avoids
         // that entirely; the null disposes downstream are no-ops.
-        match (ctx.mode) {
+        match (ctx.options.mode) {
             CompileMode::Lsp => { }
-            _ => { Compiler::Codegen::LLVMTypes::set_codegen_context_new(); }
+            _ => { compiler::codegen::llvm_types::set_codegen_context_new(); }
         }
 
         // Allocate local buffers for per-module ASTs and scopes.
         // Using local variables avoids deep nested struct field assignment
         // (ctx.module_graph.field = x) which the codegen may not persist.
         const buf_size: u64 = n as u64 * 8;
-        const ast_buf: void* = intrinsics::malloc(buf_size);
-        mem::zero<u8>(ast_buf as u8*, buf_size);
-        const scope_buf: void* = intrinsics::malloc(buf_size);
-        mem::zero<u8>(scope_buf as u8*, buf_size);
+        const ast_buf: void* = libc::malloc(buf_size);
+        mem::zero::<u8>(ast_buf as u8*, buf_size);
 
         mut pipeline: PassRegistry = PassRegistry::new();
         pipeline.set_verbose(this.config.verbose_passes);
@@ -1588,23 +1684,23 @@ type struct CompilerInstance {
         // Run each stage across ALL modules before advancing to the next; see
         // the stage-driver block below for why the ordering is load-bearing.
         if (!this.run_frontend(ctx, &pipeline, ast_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.run_module_resolution(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.run_module_resolution(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.collect_type_declarations(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.collect_type_declarations(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
 
-        if (!this.register_templates(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.register_templates(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.expand_defaults_and_signatures(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.expand_defaults_and_signatures(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.resolve_types(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.resolve_types(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
 
         tm_frontend_end = Instant::now().as_nanos();
@@ -1613,20 +1709,20 @@ type struct CompilerInstance {
         // directives (layout flags) -> body typecheck (mono-after-sema) ->
         // monomorphization.  Each must complete for EVERY module before the
         // next begins (see the stage-driver block for the invariants).
-        if (!this.process_directives(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.process_directives(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.typecheck_bodies(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.typecheck_bodies(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.monomorphize(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.monomorphize(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
 
         // Spec routing: deferred injection of the specs mono created, before
         // semantic analysis so the DI is fully populated for sema.
-        if (!this.route_specializations(ctx, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.route_specializations(ctx, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
 
         // Soundness assertion: every specialization must have been routed to an
@@ -1638,17 +1734,10 @@ type struct CompilerInstance {
             if (orphaned > 0) {
                 ctx.diagnostics.emit(Diagnostic::error(
                     ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    format("spec routing left %d specialization(s) unowned (no module matched their owner key)",
+                    fmt::format("spec routing left %d specialization(s) unowned (no module matched their owner key)",
                         orphaned)));
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
+                return this.project_failure_release(ctx, ast_buf);
             }
-        }
-
-        // End bootstrap mode: the DI is now fully populated from TypeResolution
-        // and Specialization (spec routing registered all specializations).
-        // TypeResolver will no longer fall back to arena lookups (steps 4/4a).
-        if (ctx.type_resolver != null) {
-            ctx.type_resolver.end_bootstrap();
         }
 
         // Invariant: every queued specialization must be drained before
@@ -1664,9 +1753,9 @@ type struct CompilerInstance {
             const remaining: i64 = ctx.monomorphizer.pending_count();
             ctx.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("monomorphizer worklist not drained between monomorphization and semantic analysis (%d pending)",
+                fmt::format("monomorphizer worklist not drained between monomorphization and semantic analysis (%d pending)",
                     remaining)));
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+            return this.project_failure_release(ctx, ast_buf);
         }
 
         tm_mono_end = Instant::now().as_nanos();
@@ -1692,14 +1781,14 @@ type struct CompilerInstance {
             mut pm_src_h: u128[] = [];
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
-                pm_src_h.push(Compiler::BuildManifest::Manifest::module_source_hash(
-                    ctx.intern_table.resolve(mi.name),
+                pm_src_h.push(compiler::build_manifest::Manifest::module_source_hash(
+                    ctx.intern_table.shown(mi.path().decl_name()),
                     ModuleInfo::origin_subdir(mi.origin, mi.origin_name),
                     mi.file_path));
             }
 
-            const pm_tool_fp: u128 = Compiler::BuildManifest::Manifest::toolchain_fingerprint(
-                ctx.project_config, ctx.opt_level, ctx.emit_debug_info);
+            const pm_tool_fp: u128 = compiler::build_manifest::Manifest::toolchain_fingerprint(
+                ctx.project_config, ctx.options.opt_level, ctx.options.debug_info);
 
             // Spec ownership.  A spec whose owner can't be attributed to a
             // module would let a stale .o win, so disable the cache (full
@@ -1725,12 +1814,9 @@ type struct CompilerInstance {
                 // DOWNSTREAM module's spec demand reaches (`Logger` -> `Stderr::write<Str>`
                 // in `io::stdio`) is misclassified as a leaf, its stale object (which
                 // predates the spec) is reused, and the definition is missing at link.
-                const mc: i64 = ctx.monomorphizer.spec_owner_module_count();
+                const mc: i64 = ctx.monomorphizer.spec_owner_file_count();
                 for (mut s: i64 = 0; s < mc; s++) {
-                    const key: SymbolStr = ctx.monomorphizer.spec_owner_module_at(s);
-                    if (!key.is_valid()) { pm_active = false; continue; }
-                    const src: SymbolStr = ctx.module_graph.source_file_for_owner_key(
-                        key, ctx.intern_table);
+                    const src: SymbolStr = ctx.monomorphizer.spec_owner_file_at(s);
                     if (!src.is_valid()) { pm_active = false; continue; }
                     const midx: i64 = ctx.module_graph.find_module_by_path(
                         ctx.intern_table.resolve(src));
@@ -1750,8 +1836,8 @@ type struct CompilerInstance {
             }
             const pm_global: u128 = pm_global_h.finish128();
 
-            const pm_prior: BuildManifest::ModuleKeyTable =
-                Compiler::BuildManifest::ModuleKeyTable::read_module_keys(ctx.project_config.module_keys_path());
+            const pm_prior: build_manifest::ModuleKeyTable =
+                compiler::build_manifest::ModuleKeyTable::read_module_keys(ctx.project_config.module_keys_path());
 
             // Per-module key (indexed by module index, parallel arrays).
             // `pm_closure_ok` clears for any module whose import closure came
@@ -1778,17 +1864,17 @@ type struct CompilerInstance {
             mut pm_implicit: boolean[] = [];
             for (mut i: u32 = 0; i < n; i++) { pm_implicit.push(false); }
             mut pm_implicit_short: boolean = false;
-            if (ctx.mode.auto_imports_enabled() && !config.no_std) {
-                this.mark_implicit_closure(ctx, "std::prelude", n,
+            if (ctx.options.mode.auto_imports_enabled() && !config.no_std) {
+                this.mark_implicit_closure(ctx, LangModule::Prelude, n,
                                            &pm_implicit, &pm_implicit_short);
                 if (ctx.module_graph.uses_fstring) {
-                    this.mark_implicit_closure(ctx, "std::fmt::interp", n,
+                    this.mark_implicit_closure(ctx, LangModule::Interp, n,
                                                &pm_implicit, &pm_implicit_short);
                 }
             }
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
-                const ns: string = ctx.intern_table.resolve(mi.name);
+                const ns: string = ctx.intern_table.shown(mi.path().decl_name());
                 mut k: Fnv128Hasher = Fnv128Hasher::new();
                 k.fold(pm_tool_fp);
                 if (pm_owns_spec[m as i64]) {
@@ -1816,7 +1902,7 @@ type struct CompilerInstance {
                     if (pm_implicit_short) { pm_closure_ok[m as i64] = false; }
                 }
                 pm_key_names.push(ns);
-                pm_key_hex.push(Compiler::BuildManifest::Manifest::hex128(k.finish128()));
+                pm_key_hex.push(compiler::build_manifest::Manifest::hex128(k.finish128()));
             }
 
             // Cached if the prior key matches AND the .o is still on disk.
@@ -1827,10 +1913,10 @@ type struct CompilerInstance {
                     const prior_k: string = pm_prior.lookup(pm_key_names[m as i64]);
                     if (prior_k == "") { continue; }
                     if (prior_k != pm_key_hex[m as i64]) { continue; }
-                    const objp: string = format("%s/%s.o",
+                    const objp: string = fmt::format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(mi.origin, mi.origin_name)),
-                        Compiler::BuildManifest::Manifest::path_module(ctx.intern_table.resolve(mi.name)));
+                        compiler::build_manifest::Manifest::path_module(ctx.intern_table.shown(mi.path().decl_name())));
                     if (metadata::exists(Path::from(objp))) {
                         pm_cached[m as i64] = true;
                     }
@@ -1842,14 +1928,14 @@ type struct CompilerInstance {
         // Codegen preparation.  Now that every module has been monomorphized and
         // specialized ASTs injected, GenericValidation can safely walk the
         // entire arena without false positives from not-yet-monomorphized
-        // modules.  FunctionBodyTypeCheck already ran in `typecheck_bodies`
-        // (before mono); this stage is post-mono validation only.
+        // modules.  Bodies are type-checked once, before monomorphization
+        // (`typecheck_bodies`), and a copy carries what that check and
+        // monomorphization decided; nothing types it again here.
         // BodiesTypeChecked is an INCOMING
         // provision here (sema provided it earlier) so MoveCheck's requirement
         // is satisfied.
         pipeline.set_passes([
             PassID::GenericValidation,
-            PassID::FunctionBodyTypeCheck,
             PassID::MoveCheck,
             PassID::DeadCodeAnalysis,
             PassID::DropInsertion,
@@ -1875,7 +1961,7 @@ type struct CompilerInstance {
             // downstream (cross-module descriptors, other modules' codegen,
             // linking) reads a cached module's lowered AST.
             if (pm_active && pm_cached[order[i] as i64]) { continue; }
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -1936,7 +2022,7 @@ type struct CompilerInstance {
                 if (forked > 0) {
                     ctx.diagnostics.emit(Diagnostic::error(
                         ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                        format("canonical type identity violated: %d interned entr(ies) do not resolve to themselves by their own key (type identity has forked)",
+                        fmt::format("canonical type identity violated: %d interned entr(ies) do not resolve to themselves by their own key (type identity has forked)",
                             forked)));
                     phase6_failed = true;
                 } else {
@@ -1946,32 +2032,19 @@ type struct CompilerInstance {
             Option::None => { }
         }
 
-        // Build cross-module function descriptors from front-end data.
-        // This populates ModuleGraph.cross_module_fns so codegen can create
-        // extern declarations without re-scanning ASTs or type arenas.
-        if (!phase6_failed) {
-            for (mut i: u32 = 0; i < n; i++) {
-                const mod_idx: u32 = order[i];
-                const mod_info: ModuleInfo* = &ctx.module_graph.modules[mod_idx];
-                const mod_sym: SymbolStr = ctx.intern(mod_info.file_path);
-                ModuleGraph::build_cross_module_descriptors(
-                    ctx.module_graph, mod_sym, ctx.decl_index, ctx.type_arena);
-            }
-        }
-
         // Codegen: per-module IR generation, optimization, object emission.
-        // Each module gets its own LLVM module. Cross-module references use extern
-        // declarations from ModuleGraph.cross_module_fns.
+        // Each module gets its own LLVM module. Cross-module references are
+        // resolved through SymbolResolver.
         cdebug("[Compiler] Codegen gate: phase6_failed=%d, codegen_enabled=%d, errors=%u\n",
-            phase6_failed as int, ctx.mode.codegen_enabled() as int, ctx.diagnostics.error_count);
-        if (!phase6_failed && ctx.mode.codegen_enabled()) {
+            phase6_failed as int, ctx.options.mode.codegen_enabled() as int, ctx.diagnostics.error_count);
+        if (!phase6_failed && ctx.options.mode.codegen_enabled()) {
             cdebug("[Compiler] Codegen: %u modules\n", n);
 
             // Concise per-package build summary.  Codegen only runs on a real
             // (non-short-circuited) build and never under LSP, so this is safe
             // to print to stdout.  Test mode owns its own runner output, so
             // skip the summary there to keep `cryo test` output clean.
-            if (!ctx.mode.skip_user_main()) {
+            if (!ctx.options.mode.skip_user_main()) {
                 mut n_std: u32 = 0;
                 mut n_local: u32 = 0;
                 mut n_dep: u32 = 0;
@@ -2057,7 +2130,7 @@ type struct CompilerInstance {
             // `cg_threads` workers.  Default mode is IN-PROCESS THREADED: each
             // module has its own `LLVMContext` + target machine, so a
             // thread-enabled libLLVM emits them concurrently with no shared
-            // mutable state (the recipe rustc/ThinLTO use).  Two alternates via
+            // mutable state (the recipe ThinLTO uses).  Two alternates via
             // `CRYO_CODEGEN_MODE`:
             //   * "process" - each object compiled by a child `cryo __emit-obj`
             //     from bitcode (full process isolation; costs a bitcode
@@ -2085,7 +2158,7 @@ type struct CompilerInstance {
             // The per-TARGET codegen context (published before sema/mono) is
             // superseded by per-MODULE contexts below; dispose it up front so
             // the first `set_codegen_context_new_keep_prior` doesn't orphan it.
-            Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+            compiler::codegen::llvm_types::dispose_codegen_context();
 
             // Per-topo-position object path to hand the linker ("" = nothing to
             // register: a cached hit records its own path, an IRText/Asm/-o
@@ -2107,17 +2180,27 @@ type struct CompilerInstance {
             mut cg_pos:  u32[] = [];
 
             for (mut i: u32 = 0; i < n; i++) {
+                // An error reported while generating an earlier module fails
+                // the build and says why.  Every later module would skip IR
+                // generation on that error and come back empty, so going on
+                // reports each of them as a codegen failure of its own - a
+                // line per module, none of them true, printed ahead of the
+                // one error that is.
+                if (ctx.diagnostics.has_errors()) {
+                    cg_failed = true;
+                    break;
+                }
                 const _mi: ModuleInfo* = &ctx.module_graph.modules[order[i]];
-                const _mn: string = ctx.intern_table.resolve(_mi.name);
+                const _mn: string = ctx.intern_table.shown(_mi.path().decl_name());
                 cdebug("[Compiler] Codegen: module %u/%u (%s)\n", i, n, _mn);
                 // Cached module: reuse the on-disk object instead of
                 // regenerating IR + emitting it.  Recorded at this topo
                 // position; registered with everything else below.
                 if (pm_active && pm_cached[order[i] as i64]) {
-                    cg_obj[i as i64] = format("%s/%s.o",
+                    cg_obj[i as i64] = fmt::format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)),
-                        Compiler::BuildManifest::Manifest::path_module(_mn));
+                        compiler::build_manifest::Manifest::path_module(_mn));
                     cdebug("[Compiler] Codegen: reused cached object %s\n", cg_obj[i as i64]);
                     continue;
                 }
@@ -2130,11 +2213,11 @@ type struct CompilerInstance {
                 // `.o` is self-contained (types re-declared per module), so
                 // per-module contexts leave objects byte-identical - the
                 // selfhost byte-identity gate is the arbiter.
-                Compiler::Codegen::LLVMTypes::set_codegen_context_new_keep_prior();
-                Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
+                compiler::codegen::llvm_types::set_codegen_context_new_keep_prior();
+                compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
 
-                CompilerInstance::load_module_with_scope(
-                    ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+                CompilerInstance::load_module(
+                    ctx, ctx.intern_table, ast_buf, order[i], n);
                 ctx.provisions.clear();
                 ctx.provisions.mark(Provision::Tokens);
                 ctx.provisions.mark(Provision::AST);
@@ -2155,23 +2238,27 @@ type struct CompilerInstance {
 
                 if (!ctx.artifacts.ir.is_valid()) {
                     // IR generation failed for this module.  The fresh context
-                    // has no module to emit; reclaim it now.
-                    fmt::eprintln(f"error: codegen failed for module {i}");
+                    // has no module to emit; reclaim it now.  An error this
+                    // module reported already names the failure; the line is
+                    // for a module that came back empty without one.
+                    if (!ctx.diagnostics.has_errors()) {
+                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
+                    }
                     cg_failed = true;
-                    Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+                    compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
                     continue;
                 }
 
                 const mod_info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
-                const mod_name: string = ctx.intern_table.resolve(mod_info.name);
+                const mod_name: string = ctx.intern_table.shown(mod_info.path().decl_name());
 
                 // Invariant guard (gated by CRYO_CTX_AUDIT): every module must be
                 // self-contained in its own context for the zero-copy threaded
                 // emitter to be safe.  Off by default; zero cost when unset.
                 match (env::var(Str::new("CRYO_CTX_AUDIT"))) {
                     Option::Some(_) => {
-                        Compiler::Codegen::Passes::ctx_audit_module(
+                        compiler::codegen::passes::ctx_audit_module(
                             ctx.artifacts.ir.llvm_module, mod_name);
                     }
                     Option::None => { }
@@ -2193,8 +2280,8 @@ type struct CompilerInstance {
                     // IR tree mirrors the source tree instead of one flat folder
                     // of `__`-joined stems.
                     const ll_rel: string =
-                        Compiler::BuildManifest::Manifest::path_module(mod_name);
-                    const ll_path: string = format("%s/%s.ll", ir_dir, ll_rel);
+                        compiler::build_manifest::Manifest::path_module(mod_name);
+                    const ll_path: string = fmt::format("%s/%s.ll", ir_dir, ll_rel);
                     ProjectConfig::mkdir_p(ll_path.parent_dir());
                     mut ll_err: i8* = null;
                     const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
@@ -2216,7 +2303,7 @@ type struct CompilerInstance {
                     mut lmod0: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
                     lmod0.dispose();
                     ctx.artifacts.ir = IROutput::empty();
-                    Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+                    compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
                     continue;
                 }
@@ -2225,19 +2312,19 @@ type struct CompilerInstance {
                     // Serialize the module to bitcode and dispose it immediately
                     // (one live context at a time - lower peak RSS than the
                     // in-process batch), then hand its path to a child process.
-                    const bc_path: string = format("%s.bc", tgt.emit_path);
+                    const bc_path: string = fmt::format("%s.bc", tgt.emit_path);
                     mut lmbc: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
                     const wrote: boolean = lmbc.write_bitcode(bc_path);
                     lmbc.dispose();
                     ctx.artifacts.ir = IROutput::empty();
-                    Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+                    compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
                     if (wrote) {
                         mp_bc.push(bc_path);
                         mp_obj.push(tgt.emit_path);
                         mp_pos.push(i);
                     } else {
-                        fmt::eprintln(f"error: codegen failed for module {i}");
+                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
                         cg_failed = true;
                     }
                     continue;
@@ -2257,15 +2344,15 @@ type struct CompilerInstance {
                 // identical to a serial build.
                 const cg_tri: string = CodegenPasses::effective_triple(ctx);
                 mut cg_tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-                    cg_tri, ctx.opt_level as i32);
+                    cg_tri, ctx.options.opt_level as i32);
                 cg_jobs.push(EmitJob {
                     llvm_module:     ctx.artifacts.ir.llvm_module,
-                    llvm_context:    Compiler::Codegen::LLVMTypes::current_codegen_context(),
+                    llvm_context:    compiler::codegen::llvm_types::current_codegen_context(),
                     tm:              cg_tm.raw,
                     emit_path:       tgt.emit_path,
                     emit_type:       tgt.emit_type,
                     triple:          cg_tri,
-                    opt_level:       ctx.opt_level,
+                    opt_level:       ctx.options.opt_level,
                     should_register: tgt.should_register,
                     ok:              false,
                     err_msg:         null as string
@@ -2286,16 +2373,16 @@ type struct CompilerInstance {
                             // incremental build the previous build's object is
                             // still on disk and would be archived in its place,
                             // silently, so this has to fail the build.
-                            fmt::eprintln(f"error: codegen wrote no object for module {p}");
+                            fmt::eprintln(f"error: codegen wrote no object for module {CompilerInstance::codegen_module_name(ctx, p)}");
                             cg_failed = true;
                         } else if (cg_jobs[b].ok) {
                             cg_obj[p as i64] = cg_jobs[b].emit_path;
                         } else {
                             const emsg: string = cg_jobs[b].err_msg;
                             if (emsg != null as string) {
-                                fmt::eprintln(f"error: codegen failed for module {p}: {emsg}");
+                                fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}: {emsg}");
                             } else {
-                                fmt::eprintln(f"error: codegen failed for module {p}");
+                                fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}");
                             }
                             cg_failed = true;
                         }
@@ -2315,16 +2402,16 @@ type struct CompilerInstance {
                     const p: u32 = cg_pos[b];
                     if (cg_jobs[b].ok &&
                         !metadata::exists(Path::from(cg_jobs[b].emit_path))) {
-                        fmt::eprintln(f"error: codegen wrote no object for module {p}");
+                        fmt::eprintln(f"error: codegen wrote no object for module {CompilerInstance::codegen_module_name(ctx, p)}");
                         cg_failed = true;
                     } else if (cg_jobs[b].ok) {
                         cg_obj[p as i64] = cg_jobs[b].emit_path;
                     } else {
                         const emsg: string = cg_jobs[b].err_msg;
                         if (emsg != null as string) {
-                            fmt::eprintln(f"error: codegen failed for module {p}: {emsg}");
+                            fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}: {emsg}");
                         } else {
-                            fmt::eprintln(f"error: codegen failed for module {p}");
+                            fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}");
                         }
                         cg_failed = true;
                     }
@@ -2345,17 +2432,17 @@ type struct CompilerInstance {
                     mf_dir = ctx.project_config.deps_dir_for("local");
                 }
                 ProjectConfig::mkdir_p(mf_dir);
-                const manifest: string = format("%s/.cryo_emit_manifest.txt", mf_dir);
+                const manifest: string = fmt::format("%s/.cryo_emit_manifest.txt", mf_dir);
                 const mp_triple: string = CodegenPasses::effective_triple(ctx);
                 const emit_ok: boolean = CodegenPasses::run_multiprocess_emit(
-                    &mp_bc, &mp_obj, mp_triple, ctx.opt_level, cg_threads,
+                    &mp_bc, &mp_obj, mp_triple, ctx.options.opt_level, cg_threads,
                     self_exe, manifest);
                 if (!emit_ok) { cg_failed = true; }
                 for (mut k: i64 = 0; k < mp_pos.length as i64; k++) {
                     if (metadata::exists(Path::from(mp_obj[k]))) {
                         cg_obj[mp_pos[k] as i64] = mp_obj[k];
                     } else {
-                        fmt::eprintln(f"error: codegen failed for module {mp_pos[k]}");
+                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, mp_pos[k])}");
                         cg_failed = true;
                     }
                 }
@@ -2363,7 +2450,7 @@ type struct CompilerInstance {
 
             // The last per-module context was disposed above; NULL the global
             // (do not dispose) before the target-end teardown, or it double-frees.
-            Compiler::Codegen::LLVMTypes::clear_codegen_context_ptr();
+            compiler::codegen::llvm_types::clear_codegen_context_ptr();
 
             // Register every module's object in topo order - link-stable
             // regardless of the order objects finished emitting.
@@ -2379,7 +2466,7 @@ type struct CompilerInstance {
             // Walks the directive registry for `![test]` records, builds
             // a fresh LLVM module containing the descriptor table + main,
             // emits it to disk, and registers it with the linker artifacts.
-            if (!ctx.diagnostics.has_errors() && ctx.mode.skip_user_main()) {
+            if (!ctx.diagnostics.has_errors() && ctx.options.mode.skip_user_main()) {
                 cdebug("[Compiler] test-main synthesis: Synthesizing test main\n");
                 const test_result: PassResult = TestMainCodegen::run_test_main_codegen(ctx);
                 if (!test_result.success) {
@@ -2447,7 +2534,7 @@ type struct CompilerInstance {
                     lib_objs.push(o);
                 }
                 const lib_archive: string = ctx.project_config.lib_archive_path(
-                    format("lib%s.a", config.bundle_lib_from_bin));
+                    fmt::format("lib%s.a", config.bundle_lib_from_bin));
                 ProjectConfig::mkdir_p(ctx.project_config.output_dir);
                 const bres: PassResult = CodegenPasses::bundle_object_list(
                     ctx, lib_archive, &lib_objs);
@@ -2472,7 +2559,45 @@ type struct CompilerInstance {
         // necessarily wired up (the LSP, for one, gets `NULL`).  The
         // language server reads `ctx.diagnostics.diagnostics` directly
         // and emits them as JSON over stdout.
-        const skip_flush: boolean = match (ctx.mode) {
+
+        // A stage required a node's `Res` and no resolver had written one.
+        // That is an internal error rather than a licence to search: the
+        // consumer was handed `Err` and stopped, so whatever was built below it
+        // rests on a refusal nobody diagnosed.
+        //
+        // Raised only when nothing else failed.  A build that already emitted
+        // an error may legitimately have skipped the pass that would have
+        // written the answer, and a second, misleading error would bury the
+        // real one.  It has to precede the flush below, or the diagnostic lands
+        // in a buffer nothing prints.
+        //
+        // Tallies are per-process, so a `require` reached inside a forked
+        // codegen child is not represented here.
+        // Spelled in full because the namespace `compiler::resolver::res` and
+        // the enum `Res` it declares share a spelling, and a bare `Res::`
+        // qualifier binds the type.
+        const pending: u64 = compiler::resolver::res::pending_bug_count();
+        if (!ctx.diagnostics.has_errors() && pending > 0) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("%llu path-bearing node(s) reached a stage requiring name resolution with no `Res` recorded; first required at %s",
+                    pending, compiler::resolver::res::pending_bug_first_site()));
+        }
+
+        // A consumer held a canonical name the declaration index does not
+        // hold.  Raised on the same terms and for the same reason as the
+        // tally above: a name-layer answer is only worth having if the
+        // registration it names exists, and a consumer that quietly looked
+        // elsewhere would turn the defect into a wrong type instead.
+        const unreg: u64 = compiler::resolver::res::unregistered_def_count();
+        if (!ctx.diagnostics.has_errors() && unreg > 0) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("%llu canonical name(s) named no registered declaration; first consumed at %s",
+                    unreg, compiler::resolver::res::unregistered_def_first_site()));
+        }
+
+        CompilerInstance::report_unstamped_decls(ctx);
+
+        const skip_flush: boolean = match (ctx.options.mode) {
             CompileMode::Lsp => { true }
             _                => { false }
         };
@@ -2493,7 +2618,7 @@ type struct CompilerInstance {
         // manifest side-files) land in libc and outlive the next target's
         // reset.  Free/realloc still recognise arena pointers via `owns()`,
         // so this flip never strands a live arena block to libc `free`.
-        Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+        compiler::codegen::ast_arena::cryo_alloc_arena_set_active(false);
 
         // -- Per-target LLVM context: DISPOSE (success path) -------------
         // Codegen + linking are done (linking reads on-disk objects, not LLVM
@@ -2501,7 +2626,7 @@ type struct CompilerInstance {
         // Codegen loop).  Free this target's whole LLVM context now so its
         // type tables don't survive into the next target.  Nothing below
         // touches LLVM (exe_path + manifest are pure string/file work).
-        Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+        compiler::codegen::llvm_types::dispose_codegen_context();
 
         if (ctx.diagnostics.has_errors()) {
             return CompilationResult::failed(
@@ -2527,8 +2652,8 @@ type struct CompilerInstance {
         // Gated on `do_incremental`; the fingerprint locals were computed
         // before the frontend ran. Side files only; no effect on the IR.
         if (do_incremental && ctx.project_config != null) {
-            const manifest: BuildManifest::Manifest = Compiler::BuildManifest::Manifest::new(
-                ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
+            const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
+                ctx.project_config, ctx.options.opt_level, ctx.options.debug_info,
                 manifest_stdlib_archive);
             manifest.write_fingerprint(build_fp_hex);
             manifest.write_manifest(&mod_entries, build_fp_hex, &manifest_artifacts);
@@ -2536,7 +2661,7 @@ type struct CompilerInstance {
             // whenever they were computed: every module not marked cached was
             // just recompiled, so its key now matches its on-disk .o.
             if (pm_key_names.length > 0) {
-                Compiler::BuildManifest::ModuleKeyTable::write_module_keys(
+                compiler::build_manifest::ModuleKeyTable::write_module_keys(
                     ctx.project_config.module_keys_path(),
                     &pm_key_names, &pm_key_hex);
             }
@@ -2573,16 +2698,15 @@ type struct CompilerInstance {
         }
 
         mut ok_result: CompilationResult = CompilationResult::ok(exe_path);
-        ok_result.stdlib_root = ctx.stdlib_root;
-        intrinsics::free(ast_buf);
-        intrinsics::free(scope_buf);
+        ok_result.stdlib_root = ctx.options.stdlib_root;
+        libc::free(ast_buf);
         return ok_result;
     }
 
     // ========================================================================
     // Multi-module stage drivers
     //
-    // `compile_project_with_ctx` runs the pipeline one STAGE at a time across
+    // `run_project` runs the pipeline one STAGE at a time across
     // ALL modules before advancing, rather than one module through all stages.
     // Cross-module invariants force this: e.g. every template must be
     // registered (register_templates) before any module's default-expansion
@@ -2628,14 +2752,26 @@ type struct CompilerInstance {
         return true;
     }
 
-    /// Module resolution: AutoImport, ImportResolution, NameResolution over
-    /// every module.  Saves each module's resolver scope into `scope_buf` for
-    /// later stages to restore.
+    /// Module resolution, in two sweeps over every module: AutoImport +
+    /// ImportResolution + NameDeclaration, then NameResolution.
+    ///
+    /// The sweeps are separate because an import is answered from the declaring
+    /// module's EXPORTS, which exist only once that module has been declared.
+    /// Declaring and walking a module together makes that a property of the
+    /// topological order, and inside an import cycle no order can put every
+    /// declarer first: the module walked first processes its import against a
+    /// partner that has exported nothing, declares no symbol for it, and the
+    /// name stays absent from its scope for the whole compilation.  Declaring
+    /// every module first makes the invariant true by construction - the same
+    /// reason `register_templates` runs across all modules before any
+    /// DefaultExpansion consults the registry.
     run_module_resolution(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                          ast_buf: void*, scope_buf: void*) -> boolean {
+                          ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
-        pipeline.set_passes([PassID::AutoImport, PassID::ImportResolution, PassID::NameResolution]);
+
+        pipeline.set_passes([PassID::AutoImport, PassID::ImportResolution,
+                             PassID::NameDeclaration]);
         {
             mut initial3: ProvisionSet = ProvisionSet::empty();
             initial3.mark(Provision::ASTValidated);
@@ -2651,16 +2787,50 @@ type struct CompilerInstance {
             if (!pipeline.run_all(ctx)) {
                 return false;
             }
-            // Save the resolver's scope to local buffer
-            if (ctx.resolver != null && ctx.active_module_index >= 0) {
-                const scope_val: u64 = ctx.resolver.get_current_scope_id();
-                const sc_idx: u32 = ctx.active_module_index as u32;
-                if (sc_idx < n) {
-                    const sc_slot: u64* = (scope_buf as u64*) + sc_idx;
-                    *sc_slot = scope_val;
-                }
+            pipeline.reset();
+        }
+
+        pipeline.set_passes([PassID::NameResolution]);
+        mut stamps: StampCheck = StampCheck::new(this.config.plant_unanswered_name);
+        {
+            mut initial3b: ProvisionSet = ProvisionSet::empty();
+            initial3b.mark(Provision::ASTValidated);
+            initial3b.mark(Provision::NamesDeclared);
+            pipeline.validate_with_initial(initial3b);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf,
+                                                     order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::ImportsDiscovered);
+            ctx.provisions.mark(Provision::ModulesLoaded);
+            ctx.provisions.mark(Provision::ModuleOrder);
+            ctx.provisions.mark(Provision::NamesDeclared);
+            if (!pipeline.run_all(ctx)) {
+                return false;
             }
             pipeline.reset();
+            if (!ctx.diagnostics.has_errors()) {
+                stamps.check_program(ctx.artifacts.ast.root);
+            }
+        }
+        NameResolutionPass::settle_alias_paths(ctx);
+        // Every written name leaves the name layer answered (stamped, or
+        // refused where it is written).  One left unanswered is the name
+        // layer's defect, and a later stage that met it would either stop
+        // with an error that blames the program or look the spelling up
+        // again; it is reported here, where it happened.  Checked only
+        // while the build is clean: a module that already failed may have
+        // stopped before stamping.
+        if (!ctx.diagnostics.has_errors() && stamps.unanswered > 0) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("%llu written name(s) left name resolution with no answer; first: %s",
+                    stamps.unanswered, stamps.first_site));
+            return false;
         }
         return true;
     }
@@ -2670,9 +2840,12 @@ type struct CompilerInstance {
     /// node.cryo uses ASTVisitor* defined in visitor.cryo, which depends on
     /// node).
     collect_type_declarations(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                              ast_buf: void*, scope_buf: void*) -> boolean {
+                              ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::TypeDeclaration]);
         {
             mut initial4a: ProvisionSet = ProvisionSet::empty();
@@ -2682,7 +2855,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2696,7 +2869,7 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// TemplateRegistration across ALL modules first, so every generic template
@@ -2705,9 +2878,12 @@ type struct CompilerInstance {
     /// (rather than relying on topo order) fixes bare-template rewrites when the
     /// import graph places a consumer before its declarer in `order[]`.
     register_templates(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                       ast_buf: void*, scope_buf: void*) -> boolean {
+                       ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::TemplateRegistration]);
         {
             mut initial4b0: ProvisionSet = ProvisionSet::empty();
@@ -2718,7 +2894,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2733,7 +2909,7 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// DefaultExpansion + FunctionSignature.  With templates globally
@@ -2742,9 +2918,12 @@ type struct CompilerInstance {
     /// one module iteration because signature resolution is guarded by
     /// `!resolved_type.is_valid()`, so a later re-walk would skip them.
     expand_defaults_and_signatures(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                                   ast_buf: void*, scope_buf: void*) -> boolean {
+                                   ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::DefaultExpansion,
                              PassID::FunctionSignature]);
         {
@@ -2757,7 +2936,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2773,14 +2952,17 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// TypeResolution + StructFieldTypeSync over every module.
     resolve_types(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                  ast_buf: void*, scope_buf: void*) -> boolean {
+                  ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::TypeResolution, PassID::StructFieldTypeSync]);
         {
             mut initial5: ProvisionSet = ProvisionSet::empty();
@@ -2793,7 +2975,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2807,7 +2989,53 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        const grants_ok: boolean = CompilerInstance::check_export_grants(ctx);
+        return grants_ok && ctx.diagnostics.errors_since(phase_snap) == 0;
+    }
+
+    /// Report every `export` that names something it cannot grant (E0241):
+    /// an entry naming a declaration the module marks `private`, which the
+    /// name layer recorded on the export where it is written
+    /// (`private_export_entries`).  An entry naming a sub-module grants that
+    /// module, and one the module neither declares, re-exports nor holds as
+    /// a sub-module is the name layer's own refusal (E0502).
+    ///
+    /// Reported here, once every module is resolved, so the reports come in
+    /// one place and one order whatever order the modules resolved in.
+    ///
+    /// Only the brace form can fail this way.  A bare `export A::B;` names a
+    /// module, and a path that names no module is already E0500 at discovery.
+    static check_export_grants(ctx: CompilationContext*) -> boolean {
+        const intern: InternTable* = ctx.intern_table;
+        mut ok: boolean = true;
+        for (mut mi: u32 = 0; mi < ctx.module_graph.module_count(); mi++) {
+            const root: ProgramNode* = ctx.module_graph.get_module_ast(mi);
+            if (root == null) { continue; }
+            for (mut si: i64 = 0; si < root.statements.length; si++) {
+                const stmt: ASTNode* = root.statements[si];
+                if (stmt == null) { continue; }
+                if (stmt.kind != NodeKind::ImportDeclaration) { continue; }
+                const exp: ImportDeclNode* = stmt as ImportDeclNode*;
+                if (!exp.is_export) { continue; }
+                for (mut pi: i64 = 0; pi < exp.private_export_entries.length; pi++) {
+                    const item_str: string = intern.resolve(exp.specific_imports[exp.private_export_entries[pi]]);
+                    mut pdiag: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0241_EXPORT_NOT_GRANTABLE,
+                        fmt::format("`%s` is private in `%s` and cannot be re-exported",
+                               item_str, intern.resolve(exp.module_path)));
+                    if (exp.span.has_location()) {
+                        pdiag = pdiag.at_with_label(exp.span,
+                            "an export cannot widen visibility");
+                    }
+                    pdiag = pdiag.with_note(fmt::format(
+                        "`%s` is declared `private`, so no importer may name it through any number of re-exports",
+                        item_str));
+                    ctx.emit_diagnostic(pdiag);
+                    ok = false;
+                }
+            }
+        }
+        return ok;
     }
 
     /// DirectiveProcessing for ALL modules, before any Monomorphization.  Mono
@@ -2817,9 +3045,12 @@ type struct CompilerInstance {
     /// otherwise be cloned before its (later) template module's directives were
     /// processed, silently dropping the layout onto every instantiation.
     process_directives(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                       ast_buf: void*, scope_buf: void*) -> boolean {
+                       ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::DirectiveProcessing]);
         {
             mut init6ai: ProvisionSet = ProvisionSet::empty();
@@ -2830,7 +3061,7 @@ type struct CompilerInstance {
             pipeline.validate_with_initial(init6ai);
         }
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2846,7 +3077,7 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// FunctionBodyTypeCheck (semantic analysis) for ALL modules, BEFORE
@@ -2855,9 +3086,12 @@ type struct CompilerInstance {
     /// processed (so layout flags are visible) but must precede mono so it, not
     /// mono, resolves generic call return types.
     typecheck_bodies(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                     ast_buf: void*, scope_buf: void*) -> boolean {
+                     ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::FunctionBodyTypeCheck]);
         {
             mut init6sema: ProvisionSet = ProvisionSet::empty();
@@ -2869,7 +3103,7 @@ type struct CompilerInstance {
             pipeline.validate_with_initial(init6sema);
         }
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2886,16 +3120,19 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// Monomorphization + GenericExpressionResolution for ALL modules, now that
     /// every template carries its final layout and sema has resolved the types
     /// mono specializes.
     monomorphize(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                 ast_buf: void*, scope_buf: void*) -> boolean {
+                 ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([
             PassID::Monomorphization,
             PassID::GenericExpressionResolution,
@@ -2911,7 +3148,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2928,7 +3165,9 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        // Every module's calls are walked and its queued binds drained.
+        if (ctx.monomorphizer != null) { ctx.monomorphizer.report_unbound_calls(); }
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// Spec routing: send every specialization mono created to its
@@ -2939,11 +3178,11 @@ type struct CompilerInstance {
     /// ownership stay consistent.  Runs while still in bootstrap mode so spec
     /// registration can fall back to the arena.
     route_specializations(&this, ctx: CompilationContext*,
-                          ast_buf: void*, scope_buf: void*) -> boolean {
+                          ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             if (!SpecializationPasses::route_specializations_to_owners(ctx).success) {
                 return false;
             }
@@ -2952,35 +3191,54 @@ type struct CompilerInstance {
     }
 
     /// Release the per-module AST / scope buffers allocated by
-    /// `compile_project_with_ctx` and forward to `project_failure`.
+    /// `run_project` and forward to `project_failure`.
     /// Used at every failure return inside the orchestrator so the
-    /// LSP daemon (which calls back into `compile_project_with_ctx`
+    /// LSP daemon (which calls back into `run_project`
     /// once per project change) does not leak ~16 bytes per module
     /// per recompile.
     project_failure_release(&this, ctx: CompilationContext*,
-                            ast_buf: void*, scope_buf: void*)
+                            ast_buf: void*)
             -> CompilationResult {
         // Per-target arena: DEACTIVATE (failure path).  This is the single
         // chokepoint for all 12 pass-failure returns in
-        // compile_project_with_ctx, so the active flag never leaks past a
+        // run_project, so the active flag never leaks past a
         // failed target into the next target's survivor construction.
-        Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+        compiler::codegen::ast_arena::cryo_alloc_arena_set_active(false);
         // Dispose this target's LLVM context too (frees any modules/types
         // built before the failure).  Single chokepoint for all 12
         // pass-failure returns, so the context never leaks past a failed target.
-        Compiler::Codegen::LLVMTypes::dispose_codegen_context();
-        intrinsics::free(ast_buf);
-        intrinsics::free(scope_buf);
+        compiler::codegen::llvm_types::dispose_codegen_context();
+        libc::free(ast_buf);
         return this.project_failure(ctx);
     }
 
     /// Helper: build a failure result from context diagnostics.
+    /// A type declaration reached a consumer with no registration stamped
+    /// on it.  NOT gated on the build being otherwise clean, unlike the two
+    /// tallies the success path reports: the stamping stage has no error
+    /// exit before its registration, so no user error can leave a
+    /// declaration unstamped, and the consumers of an unstamped one refuse
+    /// the program with errors that blame it (a method that cannot find
+    /// `this`, a field not on its own type) - gating this on those, or
+    /// reporting it only on the success path, would hide the defect behind
+    /// its own cascade.  The two exits are exclusive (the failure one is
+    /// reached only by a stage's early return, before the success path's
+    /// reports), so the tally is read once per build.
+    static report_unstamped_decls(ctx: CompilationContext*) -> void {
+        const unstamped: u64 = compiler::resolver::res::unstamped_decl_count();
+        if (unstamped > 0) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("%llu type declaration(s) reached a consumer with no registration stamped; first consumed at %s",
+                    unstamped, compiler::resolver::res::unstamped_decl_first_site()));
+        }
+    }
     project_failure(&this, ctx: CompilationContext*) -> CompilationResult {
-        // Same LSP-mode skip as the success path in compile_project_with_ctx:
+        // Same LSP-mode skip as the success path in run_project:
         // the renderer's stderr stream may be `NULL` when the compiler runs
         // as a library inside another process.  The diagnostic array stays
         // populated for the LSP to read and emit as JSON.
-        const skip_flush: boolean = match (ctx.mode) {
+        CompilerInstance::report_unstamped_decls(ctx);
+        const skip_flush: boolean = match (ctx.options.mode) {
             CompileMode::Lsp => { true }
             _                => { false }
         };
@@ -2996,17 +3254,20 @@ type struct CompilerInstance {
     }
 
 
-    static resolve_stdlib_root(cli_override: string,
-                                 cryoconfig_override: string,
-                                 project_root: string,
+    static resolve_stdlib_root(cli_override_text: string,
+                                 cryoconfig_override_text: string,
+                                 project_root_text: string,
                                  tried_out: string[]*) -> string {
+        const cli_override: string = cli_override_text;
+        const cryoconfig_override: string = cryoconfig_override_text;
+        const project_root: string = project_root_text;
         // 0. CLI override.
         if (cli_override.length() > 0) {
             if (metadata::exists(Path::from(cli_override + "/lib.cryo"))) {
                 return cli_override;
             }
             if (tried_out != null) {
-                tried_out.push(format("%s  (--stdlib)", cli_override));
+                tried_out.push(fmt::format("%s  (--stdlib)", cli_override));
             }
         }
 
@@ -3021,7 +3282,7 @@ type struct CompilerInstance {
                     return env_path;
                 }
                 if (tried_out != null) {
-                    tried_out.push(format("%s  ($CRYO_STDLIB)", env_path));
+                    tried_out.push(fmt::format("%s  ($CRYO_STDLIB)", env_path));
                 }
             }
             Option::None => {}
@@ -3044,14 +3305,14 @@ type struct CompilerInstance {
                     return cand_home_simple;
                 }
                 if (tried_out != null) {
-                    tried_out.push(format("%s  ($CRYO_HOME/stdlib)", cand_home_simple));
+                    tried_out.push(fmt::format("%s  ($CRYO_HOME/stdlib)", cand_home_simple));
                 }
                 const cand_home_share: string = home_path + "/share/cryo/stdlib";
                 if (metadata::exists(Path::from(cand_home_share + "/lib.cryo"))) {
                     return cand_home_share;
                 }
                 if (tried_out != null) {
-                    tried_out.push(format("%s  ($CRYO_HOME/share/cryo/stdlib)", cand_home_share));
+                    tried_out.push(fmt::format("%s  ($CRYO_HOME/share/cryo/stdlib)", cand_home_share));
                 }
             }
             Option::None => {}
@@ -3089,14 +3350,14 @@ type struct CompilerInstance {
                     return cand_repo;
                 }
                 if (tried_out != null) {
-                    tried_out.push(format("%s  (binary-relative)", cand_repo));
+                    tried_out.push(fmt::format("%s  (binary-relative)", cand_repo));
                 }
                 const cand_sys: string = bindir + "/../share/cryo/stdlib";
                 if (metadata::exists(Path::from(cand_sys + "/lib.cryo"))) {
                     return cand_sys;
                 }
                 if (tried_out != null) {
-                    tried_out.push(format("%s  (binary-relative share)", cand_sys));
+                    tried_out.push(fmt::format("%s  (binary-relative share)", cand_sys));
                 }
             }
         }
@@ -3114,7 +3375,7 @@ type struct CompilerInstance {
                 return cand_cfg;
             }
             if (tried_out != null) {
-                tried_out.push(format("%s  ([project] stdlib_root)", cand_cfg));
+                tried_out.push(fmt::format("%s  ([project] stdlib_root)", cand_cfg));
             }
         }
 
@@ -3124,7 +3385,7 @@ type struct CompilerInstance {
             return cand_proj;
         }
         if (tried_out != null) {
-            tried_out.push(format("%s  (project-relative)", cand_proj));
+            tried_out.push(fmt::format("%s  (project-relative)", cand_proj));
         }
         // 8. ../stdlib (cwd-relative)
         if (metadata::exists(Path::from("../stdlib/lib.cryo"))) {
@@ -3137,11 +3398,12 @@ type struct CompilerInstance {
     }
 
     /// Path to the lockfile next to a given cryoconfig.
-    static lock_path_for(consumer_root: string) -> string {
+    static lock_path_for(consumer_root_text: string) -> string {
+        const consumer_root: string = consumer_root_text;
         if (consumer_root.length() == 0 || consumer_root.eq(".")) {
             return "cryoconfig.lock";
         }
-        return format("%s/cryoconfig.lock", consumer_root);
+        return fmt::format("%s/cryoconfig.lock", consumer_root);
     }
 
     /// Reconcile `used` (the vendor bindings this build resolved) with the
@@ -3153,8 +3415,9 @@ type struct CompilerInstance {
     ///     content hash drifted.  Returns true when every binding matches.
     /// The packages section is preserved because `read` loads it and `write`
     /// emits it back untouched.
-    static sync_vendor_lock(lock_path: string, used: &LockedVendor[], locked: boolean) -> boolean {
-        mut lock: Lockfile = Lockfile::read(lock_path);
+    static sync_vendor_lock(lock_path_text: string, used: &LockedVendor[], locked: boolean) -> boolean {
+        const lock_path: string = lock_path_text;
+        mut lock: Lockfile = Lockfile::read(lock_path_text);
         mut changed: boolean = false;
         mut drift:   boolean = false;
         for (mut i: i64 = 0; i < used.length; i++) {
@@ -3197,7 +3460,7 @@ type struct CompilerInstance {
         if (locked) {
             return !drift;
         }
-        if (changed && !Lockfile::write(lock_path, &lock)) {
+        if (changed && !Lockfile::write(lock_path_text, &lock)) {
             fmt::eprintf("warning: could not write vendor pins to %s\n", lock_path);
         }
         return true;
@@ -3350,6 +3613,25 @@ type struct CompilerInstance {
     ///     after every worker has joined (`dispose_emit_jobs`).
     ///   * Workers get 64 MiB stacks: LLVM's SelectionDAG recurses deep and
     ///     overflows the ~1 MiB default thread stack.
+    /// The name of the module sitting at `pos` in the topological codegen
+    /// order, for a failure message.
+    ///
+    /// A bare index names nothing the reader can open, and it indexes the
+    /// ORDER rather than the module graph, so it does not agree with any
+    /// numbering the build prints elsewhere - which sends the reader looking
+    /// through whichever module happens to carry that id, usually somebody
+    /// else's. Returns a placeholder rather than failing: this runs only on a
+    /// path that is already reporting an error.
+    static codegen_module_name(ctx: CompilationContext*, pos: u32) -> string {
+        if (ctx == null) { return "<unknown>"; }
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        if (pos as i64 >= order.length) { return "<unknown>"; }
+        const mi: u32 = order[pos as i64];
+        if (mi as i64 >= ctx.module_graph.modules.length) { return "<unknown>"; }
+        const info: ModuleInfo* = &ctx.module_graph.modules[mi as i64];
+        return ctx.intern_table.shown(info.path().decl_name());
+    }
+
     /// `nthreads <= 1` (or a single job) runs the batch inline via
     /// `emit_jobs_serial`, keeping a serial build byte-identical.
     static emit_jobs_threaded(jobs: EmitJob[]*, nthreads: u32) -> void {
@@ -3376,9 +3658,9 @@ type struct CompilerInstance {
         // 64 MiB per-worker stacks (SelectionDAG recursion depth).  No arena
         // pause: the workers are allocation-free (see the doc comment), so the
         // single-threaded arena is untouched while they run.
-        mut s: thread::Scope = thread::Scope::new_with_stack(64u64 * 1024u64 * 1024);
+        mut s: thread::Scope = thread::Scope::new_with_stack(64 * 1024 * 1024);
         for (mut w: u32 = 0; w < nw; w++) {
-            s.spawn<EmitWorkerCtx*>(&wcs[w], emit_worker_entry);
+            s.spawn::<EmitWorkerCtx*>(&wcs[w], emit_worker_entry);
         }
         s.join_all();
 

@@ -3,20 +3,50 @@
 /// Lightweight handle to a symbol in the Resolver's arena.  ID 0 is
 /// reserved as the invalid sentinel.  No arena back-pointer; the
 /// Resolver is always accessed via CompilationContext.
+///
+/// Each id carries the tag of the allocator that made it, and the arena
+/// reads a slot only through `SymbolIds::slot_of`, which refuses an id
+/// another allocator made: a second allocator's ids collide with the
+/// first's numbers, and a colliding number names SOME symbol.
 
-namespace Compiler::Resolver::SymbolID;
+namespace compiler::resolver::symbol_id;
+
+import std::fmt;
+import std::core::hash::{ Hash, Hasher };
+import std::core::cmp::{ Eq };
+
+/// The tag the next `SymbolIds` is made with.  Starts above 0, the invalid
+/// id's tag, so no allocator owns the invalid id.
+mut g_symbol_id_tags: u32 = 0;
 
 type struct SymbolID {
-    id: u64;
+private:
+    /// Position in the allocator's sequence, from 1; 0 for the invalid id.
+    id: u32;
+    /// The tag of the allocator that made this id; 0 for the invalid id.
+    table: u32;
 
-    /// Create an invalid/unresolved symbol ID (id = 0).
-    static invalid() -> SymbolID {
-        return SymbolID { id: 0 };
+    static new(id: u32, table: u32) -> SymbolID {
+        return SymbolID { id: id, table: table };
     }
 
-    /// Create a new symbol ID with the given value.
-    static new(id: u64) -> SymbolID {
-        return SymbolID { id: id };
+public:
+    /// Create an invalid/unresolved symbol ID (id = 0).
+    static invalid() -> SymbolID {
+        return SymbolID { id: 0, table: 0 };
+    }
+
+    /// The number a pass keys its own table of bindings by, and the
+    /// resolver its arena.  A read, one way: nothing outside this module
+    /// turns a number back into an id, so a table keyed by it holds only
+    /// ids the resolver handed out.
+    key(&this) -> u64 {
+        return this.id as u64;
+    }
+
+    /// The key a table keyed by bindings stores this id under.
+    table_key(&this) -> SymbolKey {
+        return SymbolKey { id: this.id as u64 };
     }
 
     /// Whether this refers to a valid symbol (id != 0).
@@ -24,8 +54,68 @@ type struct SymbolID {
         return this.id != 0;
     }
 
-    /// Check equality by ID.
+    /// Check equality by ID and by the allocator that made it.
     equals(&this, other: SymbolID) -> boolean {
+        return this.id == other.id && this.table == other.table;
+    }
+}
+
+/// The key of a table keyed by bindings.  Made only by
+/// `SymbolID::table_key`, so such a table is handed a binding's identity and
+/// never the interned id of the name it was written with.  Hashes as the
+/// id's number does.
+type struct SymbolKey {
+private:
+    id: u64;
+}
+
+implement trait Hash for struct SymbolKey {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.id.hash(hasher);
+    }
+}
+
+implement trait Eq for struct SymbolKey {
+    equals(&this, other: &SymbolKey) -> boolean {
         return this.id == other.id;
+    }
+}
+
+/// The one source of `SymbolID`s: each `next` answers a fresh id, from 1
+/// upward (0 is the invalid id).  The resolver holds the only one a
+/// compilation uses; an id is never built from a number.
+type struct SymbolIds {
+private:
+    next_id: u32;
+    /// This allocator's tag, distinct from every other allocator the
+    /// process made; stamped on each id `next` makes.
+    tag:     u32;
+
+public:
+    static new() -> SymbolIds {
+        g_symbol_id_tags = g_symbol_id_tags + 1;
+        return SymbolIds { next_id: 1, tag: g_symbol_id_tags };
+    }
+
+    next(mut &this) -> SymbolID {
+        const id: SymbolID = SymbolID::new(this.next_id, this.tag);
+        this.next_id += 1;
+        return id;
+    }
+
+    /// The arena slot of `id`, an id this allocator made.  One another
+    /// allocator made, and the invalid id, are refused here: the number
+    /// names a slot in SOME arena, and answering it would read whichever
+    /// symbol sits there.
+    slot_of(&this, id: SymbolID) -> i64 {
+        if (id.table != this.tag || id.id == 0) { SymbolIds::refuse(id.id, id.table, this.tag); }
+        return (id.id - 1) as i64;
+    }
+
+    /// The refusal `slot_of` raises, kept out of the read it guards.
+    static refuse(number: u32, made_by: u32, read_by: u32) -> void {
+        panic(fmt::format(
+            "internal compiler error: symbol id %u made by allocator %u was read against allocator %u (the invalid id carries 0)",
+            number, made_by, read_by), FILE, LINE);
     }
 }

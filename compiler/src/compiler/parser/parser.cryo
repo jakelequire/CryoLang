@@ -3,17 +3,66 @@
 ///! Top-level parser class extending ExprParser with statement and declaration
 ///! parsing.  This is the main entry point for the parsing pass.
 
-namespace Compiler::Parser::Parser;
+namespace compiler::parser::parser;
 
-import Compiler::Lex;
-import Compiler::Diag;
-import Compiler::Diag::{ SourceSpan, Diagnostic, Suggestion };
-import Compiler::AST;
-import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern };
-import Compiler::CompilationContext;
-import Compiler::Resolver::{ SymbolStr, QualifiedName };
-import Compiler::Parser::{ ParserBase, ExprParser };
-import Utils::Logger;
+import compiler::lex;
+import compiler::lex::{ Token, TokenType };
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
+import compiler::ast;
+import compiler::ast::{
+    declaration, expression, ImportStyle, NamedAnnotation, node, NodeKind,
+    pattern, PatternBinding, PatternElement, PrimitiveAnnotation, ReferenceAnnotation,
+    statement, ThisTypeAnnotation, TraitBound, TraitRef, TupleAnnotation, TypeAnnotation,
+    Visibility
+};
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::resolver::{ symbol_str, qualified_name };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, ResSlot };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::parser::{ parser_base, expr_parser };
+import utils::logger;
+import utils::logger::{ LOG_DEBUG, LogComponent };
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::generic_registry;
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import std::ffi::libc;
+import std::fmt;
+import compiler::ast::declaration::{
+    AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureBinding,
+    DestructureDeclNode, EnumDeclNode, EnumVariantNode, ExternBlockNode, FieldDeclNode,
+    FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDeclNode,
+    IntrinsicConstDeclNode, IntrinsicDeclNode, MethodNode, ModuleDeclNode, ReceiverForm,
+    StructDeclNode,
+    TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    CallExprNode, ExpressionNode, IdentifierNode, MemberAccessNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode, StaticAssertItem };
+import compiler::ast::pattern::{
+    DirectiveArg, DirectiveArgKind, DirectiveNode, EnumPatternNode, MatchArmNode,
+    PatternNode, StaticMatchArmNode
+};
+import compiler::ast::statement::{
+    AsmBlockStmtNode, AsmConstraintKind, AsmDialect, AsmOpDir, AsmOperand, AsmPiece,
+    BlockStmtNode, BreakStmtNode, ContinueStmtNode, DeclStmtNode, DoWhileStmtNode,
+    ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
+    StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
+};
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::suggestion::{ Applicability, Suggestion };
+import compiler::parser::expr_parser::{ g_for_in_counter };
+import compiler::parser::parser_base::{ ParserBase };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import utils::keyword::{ Keyword };
 
 
 /// The `static` / `async` run parsed ahead of a method head.
@@ -72,7 +121,7 @@ public:
         mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(bstart));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            const before_pos: int = this.pos;
+            const before_pos: i64 = this.pos;
             if (this.panic_mode) {
                 if (this.check(TokenType::RBrace)) {
                     this.panic_mode = false;
@@ -179,11 +228,6 @@ public:
 
     /// Parse the entire program, producing a ProgramNode.
     parse() -> ProgramNode* {
-        // Module-level names first: the parse is single-pass, but deciding
-        // whether an `ident <` opens type arguments needs to know about
-        // declarations further down the file.
-        this.scan_module_names();
-
         // Skip leading comments/doc comments
         this.collect_doc_comments();
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse() starting parsing...");
@@ -240,6 +284,7 @@ public:
                     }
                 }
                 program.add_statement(node);
+                Parser::hoist_extern_globals(program, node);
             } else if (pending.length > 0) {
                 for (mut i: i64 = 0; i < pending.length; i++) {
                     program.add_statement(pending[i] as ASTNode*);
@@ -362,6 +407,15 @@ public:
             return imp;
         }
 
+        // Export declaration (symbol re-export).
+        if (tok.kind == TokenType::KwExport) {
+            const exp: ImportDeclNode* = this.parse_export_declaration();
+            if (exp != null && doc != "") {
+                exp.set_documentation(doc);
+            }
+            return exp;
+        }
+
         // Extern block, or the C-header import form `extern module name := "C"`.
         if (tok.kind == TokenType::KwExtern) {
             if (this.peek_at(1).kind == TokenType::KwModule) {
@@ -414,7 +468,8 @@ public:
     }
 
     /// Parse a declaration based on the current token.
-    parse_declaration(is_public: boolean, doc: string) -> ASTNode* {
+    parse_declaration(is_public: boolean, doc_text: string) -> ASTNode* {
+        const doc: string = doc_text;
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_declaration() token='%s'", this.current().lexeme);
         const tok: Token = this.current();
 
@@ -422,7 +477,7 @@ public:
         if (tok.kind == TokenType::KwFunction) {
             const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
             if (func != null && doc != "") {
-                func.set_documentation(doc);
+                func.set_documentation(doc_text);
             }
             return func;
         }
@@ -437,7 +492,7 @@ public:
             if (func != null) {
                 func.set_async(true);
                 func.note_modifier_span(async_span);
-                if (doc != "") { func.set_documentation(doc); }
+                if (doc != "") { func.set_documentation(doc_text); }
             }
             return func;
         }
@@ -452,7 +507,7 @@ public:
             }
             const vd: VarDeclNode* = this.parse_variable_declaration();
             if (vd != null) {
-                if (doc != "") { vd.set_documentation(doc); }
+                if (doc != "") { vd.set_documentation(doc_text); }
                 if (this.scope_depth == 0) { vd.set_global(true); }
             }
             return vd;
@@ -466,7 +521,7 @@ public:
                 const sd: StructDeclNode* = this.parse_struct_declaration();
                 if (sd != null) {
                     sd.set_public(is_public);
-                    if (doc != "") { sd.set_documentation(doc); }
+                    if (doc != "") { sd.set_documentation(doc_text); }
                 }
                 return sd;
             }
@@ -474,7 +529,7 @@ public:
                 const ud: UnionDeclNode* = this.parse_union_declaration();
                 if (ud != null) {
                     ud.set_public(is_public);
-                    if (doc != "") { ud.set_documentation(doc); }
+                    if (doc != "") { ud.set_documentation(doc_text); }
                 }
                 return ud;
             }
@@ -482,7 +537,7 @@ public:
                 const cd: ClassDeclNode* = this.parse_class_declaration();
                 if (cd != null) {
                     cd.set_public(is_public);
-                    if (doc != "") { cd.set_documentation(doc); }
+                    if (doc != "") { cd.set_documentation(doc_text); }
                 }
                 return cd;
             }
@@ -490,13 +545,13 @@ public:
                 const ed: EnumDeclNode* = this.parse_enum_declaration();
                 if (ed != null) {
                     ed.set_public(is_public);
-                    if (doc != "") { ed.set_documentation(doc); }
+                    if (doc != "") { ed.set_documentation(doc_text); }
                 }
                 return ed;
             }
             if (next.kind == TokenType::KwTrait) {
                 const td: TraitDeclNode* = this.parse_trait_declaration();
-                if (td != null && doc != "") { td.set_documentation(doc); }
+                if (td != null && doc != "") { td.set_documentation(doc_text); }
                 return td;
             }
 
@@ -512,7 +567,7 @@ public:
             if (func != null) {
                 func.set_static(true);
                 func.note_modifier_span(static_span);
-                if (doc != "") { func.set_documentation(doc); }
+                if (doc != "") { func.set_documentation(doc_text); }
             }
             return func;
         }
@@ -522,11 +577,16 @@ public:
             // Peek ahead: intrinsic const -> IntrinsicConstDecl
             if (this.peek_at(1).kind == TokenType::KwConst) {
                 const ic: IntrinsicConstDeclNode* = this.parse_intrinsic_const_declaration();
-                if (ic != null && doc != "") { ic.set_documentation(doc); }
+                if (ic != null && doc != "") { ic.set_documentation(doc_text); }
                 return ic;
             }
+            if (this.peek_at(1).kind == TokenType::KwFunction && this.peek_at(3).kind == TokenType::LAngle) {
+                const gi: FunctionDeclNode* = this.parse_generic_intrinsic_declaration();
+                if (gi != null && doc != "") { gi.set_documentation(doc_text); }
+                return gi;
+            }
             const intr: IntrinsicDeclNode* = this.parse_intrinsic_declaration();
-            if (intr != null && doc != "") { intr.set_documentation(doc); }
+            if (intr != null && doc != "") { intr.set_documentation(doc_text); }
             return intr;
         }
 
@@ -547,17 +607,12 @@ public:
 
         mut name_tok: Token = this.current();
         if (name_tok.kind == TokenType::Identifier || name_tok.kind.is_keyword()) {
+            this.refuse_declaration_keyword_name(name_tok, "a variable name");
             this.advance();
         } else {
             name_tok = this.consume(TokenType::Identifier, "variable name");
         }
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        // Only inside a function body: at depth 0 this is a module-level
-        // global, which shares a namespace with functions and types and so
-        // says nothing about whether a later `ident <` opens type arguments.
-        if (this.scope_depth > 0) {
-            this.note_local_name(name);
-        }
         mut node: VarDeclNode* = new VarDeclNode(name, this.span_from_token(start));
         node.set_mutable(is_mutable);
         node.set_name_span(this.span_from_token(name_tok));
@@ -645,8 +700,12 @@ public:
                 } else {
                     alias_tok = this.consume(TokenType::Identifier, "rename target");
                 }
+                this.refuse_declaration_keyword_name(alias_tok, "a variable name");
                 local_name = this.intern_lexeme(alias_tok);
                 name_span = this.span_from_token(alias_tok);
+            } else {
+                // The shorthand binds the field's own name as the local.
+                this.refuse_declaration_keyword_name(field_tok, "a variable name");
             }
 
             const entry_span: SourceSpan = this.span_from(entry_start);
@@ -704,8 +763,8 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
-            for (mut i: int = 0; i < gen_params.length; i++) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(true);
+            for (mut i: i64 = 0; i < gen_params.length; i++) {
                 func.add_generic_param(gen_params[i]);
             }
         }
@@ -721,7 +780,7 @@ public:
         // Optional where clause
         if (this.check(TokenType::KwWhere)) {
             const bounds: TraitBound[] = this.parse_trait_bounds();
-            for (mut i: int = 0; i < bounds.length; i++) {
+            for (mut i: i64 = 0; i < bounds.length; i++) {
                 func.add_trait_bound(bounds[i].clone());
             }
         }
@@ -766,7 +825,7 @@ public:
         this.consume(TokenType::LParen, "'('");
         if (!this.check(TokenType::RParen)) {
             const params: VarDeclNode*[] = this.parse_parameter_list();
-            for (mut i: int = 0; i < params.length; i++) {
+            for (mut i: i64 = 0; i < params.length; i++) {
                 func.add_parameter(params[i]);
             }
         }
@@ -788,9 +847,6 @@ public:
         mut params: VarDeclNode*[] = [];
         this.pending_bare_variadic  = false;
         this.pending_named_variadic = false;
-        // Every function and method reaches its body through here, so this is
-        // where the previous one's bindings stop being in scope.
-        this.reset_local_names();
 
         while (true) {
             // Bare variadic: `...` with no preceding name. Common in extern
@@ -803,7 +859,6 @@ public:
 
             const param: VarDeclNode* = this.parse_parameter();
             if (param != null) {
-                this.note_local_name(param.name);
                 params.push(param);
             }
 
@@ -813,6 +868,96 @@ public:
         }
 
         return params;
+    }
+
+    /// The type of a by-reference receiver of the type being parsed: inside a
+    /// struct/class/impl it is `&CurrentType`; inside a trait declaration it
+    /// is `&This`, a placeholder that impl-method resolution rewrites to each
+    /// concrete impl target.  A written `&this` and the receiver given to a
+    /// method that wrote none are typed by this one method.
+    receiver_type_annotation(is_mutable: boolean, span: SourceSpan) -> TypeAnnotation* {
+        mut inner: TypeAnnotation* = null;
+        if (this.current_type_name != "") {
+            const type_name: SymbolStr = this.ctx.intern(this.current_type_name);
+            // The receiver of `implement string { ... }` denotes the
+            // primitive, not a name to look up.  This synthesis runs from
+            // the impl target's TEXT rather than its token, so the token
+            // test that shapes every written annotation cannot be reached
+            // from here; asking the keyword table restores it.  Without
+            // this the receiver is a named annotation no scope can answer,
+            // and it resolves only by falling through a name lookup into
+            // the same primitive table the keyword names directly.
+            if (TokenType::from_keyword(Keyword::new(this.current_type_name)).is_primitive_type()) {
+                const prim_ann: PrimitiveAnnotation* = new PrimitiveAnnotation {
+                    name: type_name,
+                    span: span,
+                };
+                inner = new TypeAnnotation::Primitive(prim_ann);
+            } else if (this.current_type_name == "()") {
+                // The unit target is spelled `()`, which is not a keyword,
+                // so the primitive test above cannot reach it.  A WRITTEN
+                // `()` parses as the empty tuple, and the unit type has no
+                // named form - `ASTTypeSubstituter::rewrite_to_unit` states
+                // the same rule for substitution.  Synthesizing a name here
+                // would give `implement trait Drop for ()` a receiver that
+                // no scope can answer, purely because the receiver is typed
+                // from the target's TEXT rather than its syntax.
+                mut unit_elems: TypeAnnotation*[] = [];
+                const tup_ann: TupleAnnotation* = new TupleAnnotation {
+                    elements: unit_elems,
+                    span:     span,
+                };
+                inner = new TypeAnnotation::Tuple(tup_ann);
+            } else {
+                const named_ann: NamedAnnotation* = new NamedAnnotation {
+                    name: type_name,
+                    span: span,
+                    pre_resolved: TypeRef::invalid(),
+                    res: ResSlot::Pending,
+                };
+                inner = new TypeAnnotation::Named(named_ann);
+            }
+        } else {
+            const tt_ann: ThisTypeAnnotation* = new ThisTypeAnnotation { span: span };
+            inner = new TypeAnnotation::ThisType(tt_ann);
+        }
+        const ref_ann: ReferenceAnnotation* = new ReferenceAnnotation {
+            inner:      inner,
+            is_mutable: is_mutable,
+            span:       span,
+        };
+        return new TypeAnnotation::Reference(ref_ann);
+    }
+
+    /// Give a non-static method the receiver its source did not write.  Every
+    /// instance method takes one - a constructor's is the storage being
+    /// initialized - and a method that writes none takes it by reference, as
+    /// `&this`; synthesizing it here makes that one parameter, declared once,
+    /// instead of a case every later stage re-derives.  Its span is zero-width
+    /// at the method's name: a report about it points at the method, and it
+    /// covers no written text.
+    give_receiver(func: FunctionDeclNode*, is_static: boolean) -> void {
+        if (func == null || is_static) { return; }
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            if (func.parameters[i].is_receiver()) { return; }
+        }
+        const at: SourceSpan = if (func.name_span.has_location()) { func.name_span } else { func.span };
+        const span: SourceSpan = SourceSpan::new(at.file, at.start_line, at.start_col,
+                                                 at.start_line, at.start_col);
+        mut param: VarDeclNode* = new VarDeclNode(this.ctx.intern("&this"), span);
+        param.set_mutable(false);
+        param.set_receiver(ReceiverForm::ByReference);
+        param.set_type_annotation(this.receiver_type_annotation(false, span));
+        func.parameters.insert(0, param);
+    }
+
+    /// `give_receiver` over every method of a type body or an impl block, once
+    /// each method's `static` is known.
+    give_receivers(methods: &MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m != null) { this.give_receiver(m.func, m.is_static); }
+        }
     }
 
     /// Parse a single parameter: [mut] name: Type [= default]
@@ -844,27 +989,11 @@ public:
             const span: SourceSpan = this.span_from(start);
             mut param: VarDeclNode* = new VarDeclNode(pname, span);
             param.set_mutable(is_mutable);
+            // One of the two places the receiver's spelling is read; every
+            // later stage asks the mark.
+            param.set_receiver(ReceiverForm::ByReference);
 
-            mut inner: TypeAnnotation* = null;
-            if (this.current_type_name != "") {
-                const type_name: SymbolStr = this.ctx.intern(this.current_type_name);
-                const named_ann: NamedAnnotation* = new NamedAnnotation {
-                    name: type_name,
-                    span: span,
-                    pre_resolved: TypeRef::invalid(),
-                };
-                inner = new TypeAnnotation::Named(named_ann);
-            } else {
-                const tt_ann: ThisTypeAnnotation* = new ThisTypeAnnotation { span: span };
-                inner = new TypeAnnotation::ThisType(tt_ann);
-            }
-            const ref_ann: ReferenceAnnotation* = new ReferenceAnnotation {
-                inner:      inner,
-                is_mutable: is_mutable,
-                span:       span,
-            };
-            param.set_type_annotation(new TypeAnnotation::Reference(ref_ann));
-
+            param.set_type_annotation(this.receiver_type_annotation(is_mutable, span));
             return param;
         }
 
@@ -873,6 +1002,7 @@ public:
         // are common parameter names that shouldn't be reserved.
         mut name_tok: Token = this.current();
         if (name_tok.kind == TokenType::Identifier || name_tok.kind.is_keyword()) {
+            this.refuse_declaration_keyword_name(name_tok, "a parameter name");
             this.advance();
         } else {
             name_tok = this.consume(TokenType::Identifier, "parameter name");
@@ -880,6 +1010,12 @@ public:
         const pname: SymbolStr = this.intern_lexeme(name_tok);
         mut param: VarDeclNode* = new VarDeclNode(pname, this.span_from_token(name_tok));
         param.set_mutable(is_mutable);
+        // A parameter written `this` is the by-value receiver: `this` is a
+        // keyword, so nothing else can be spelled that way.  The other half of
+        // the read above.
+        if (name_tok.kind == TokenType::KwThis) {
+            param.set_receiver(ReceiverForm::ByValue);
+        }
         param.set_name_span(this.span_from_token(name_tok));
         // If no `mut` keyword was consumed, point kw_span at a zero-width
         // anchor just before the parameter name so a downstream E0218
@@ -932,9 +1068,18 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
-            for (mut i: int = 0; i < gen_params.length; i++) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
+            for (mut i: i64 = 0; i < gen_params.length; i++) {
                 node.add_generic_param(gen_params[i]);
+            }
+        }
+
+        // Optional `where T: Bound` clause on the declaration's own
+        // parameters, after the list that declares them.
+        if (this.check(TokenType::KwWhere)) {
+            const bounds: TraitBound[] = this.parse_trait_bounds();
+            for (mut wi: i64 = 0; wi < bounds.length; wi++) {
+                node.add_where_bound(bounds[wi].clone());
             }
         }
 
@@ -963,9 +1108,18 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
-            for (mut i: int = 0; i < gen_params.length; i++) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
+            for (mut i: i64 = 0; i < gen_params.length; i++) {
                 node.add_generic_param(gen_params[i]);
+            }
+        }
+
+        // Optional `where T: Bound` clause on the declaration's own
+        // parameters, after the list that declares them.
+        if (this.check(TokenType::KwWhere)) {
+            const bounds: TraitBound[] = this.parse_trait_bounds();
+            for (mut wi: i64 = 0; wi < bounds.length; wi++) {
+                node.add_where_bound(bounds[wi].clone());
             }
         }
 
@@ -992,8 +1146,8 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
-            for (mut i: int = 0; i < gen_params.length; i++) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
+            for (mut i: i64 = 0; i < gen_params.length; i++) {
                 node.add_generic_param(gen_params[i]);
             }
         }
@@ -1001,7 +1155,17 @@ public:
         // Optional base class: : BaseClass
         if (this.match_tok(TokenType::Colon)) {
             const base_tok: Token = this.consume(TokenType::Identifier, "base class name");
-            node.set_base_class(this.intern_lexeme(base_tok));
+            node.set_base_class(this.intern_lexeme(base_tok),
+                                this.span_from_token(base_tok));
+        }
+
+        // Optional `where T: Bound` clause on the declaration's own
+        // parameters, after the list that declares them.
+        if (this.check(TokenType::KwWhere)) {
+            const bounds: TraitBound[] = this.parse_trait_bounds();
+            for (mut wi: i64 = 0; wi < bounds.length; wi++) {
+                node.add_where_bound(bounds[wi].clone());
+            }
         }
 
         this.consume(TokenType::LBrace, "'{'");
@@ -1237,9 +1401,13 @@ public:
             // Method: name(params) -> RetType { body }
             // Or field: name: Type;
             // `name` is normally an Identifier, but a keyword may name a
-            // method (`as<T>()`, `type()`); mirrors the keyword-as-member-
-            // name support after `.` and `::`. Keyword *field* names stay
-            // unsupported - only a `(`/`<` after the keyword means method.
+            // method (`as<T>()`, `type()`) or a field (`type: u32;`);
+            // mirrors the keyword-as-member-name support after `.` and `::`.
+            // What follows the name decides which: `(`/`<` means method, `:`
+            // means field.  A C header is free to use `type` as a member name
+            // and the binding generator cannot rename it without breaking the
+            // ABI it exists to preserve, so a member position that rejects
+            // keywords makes such a field unreachable from the language.
             if (this.check(TokenType::Identifier) || this.current().kind.is_keyword()) {
                 // Disambiguate: method vs field
                 // Method pattern: name ( or name < (generic method)
@@ -1257,7 +1425,8 @@ public:
                         if (class_node != null) { class_node.add_method(method); }
                         if (union_node != null) { union_node.add_method(method); }
                     }
-                } else if (this.check(TokenType::Identifier)) {
+                } else if (this.check(TokenType::Identifier)
+                           || next.kind == TokenType::Colon) {
                     if (member_is_async) {
                         this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
                             "only a method can be `async`; a field holds a value, not a computation to suspend",
@@ -1276,8 +1445,8 @@ public:
                         if (union_node != null) { union_node.add_field(field); }
                     }
                 } else {
-                    // Keyword name not followed by `(`/`<`: not a valid
-                    // member (keyword field names are unsupported).
+                    // A keyword followed by neither `(`/`<` nor `:` names no
+                    // member shape that exists.
                     this.error_unexpected();
                     this.advance();
                 }
@@ -1289,6 +1458,9 @@ public:
             this.advance();
         }
 
+        if (struct_node != null) { this.give_receivers(&struct_node.methods); }
+        if (class_node != null)  { this.give_receivers(&class_node.methods); }
+        if (union_node != null)  { this.give_receivers(&union_node.methods); }
     }
 
     /// Parse a constructor: ClassName(params) [: BaseClass(args)] { body }
@@ -1435,8 +1607,8 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
-            for (mut i: int = 0; i < gen_params.length; i++) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(true);
+            for (mut i: i64 = 0; i < gen_params.length; i++) {
                 func.add_generic_param(gen_params[i]);
             }
         }
@@ -1453,7 +1625,7 @@ public:
         // the enclosing impl's generic parameters.
         if (this.check(TokenType::KwWhere)) {
             const bounds: TraitBound[] = this.parse_trait_bounds();
-            for (mut wi: int = 0; wi < bounds.length; wi++) {
+            for (mut wi: i64 = 0; wi < bounds.length; wi++) {
                 func.add_trait_bound(bounds[wi].clone());
             }
         }
@@ -1510,8 +1682,8 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
-            for (mut i: int = 0; i < gen_params.length; i++) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
+            for (mut i: i64 = 0; i < gen_params.length; i++) {
                 node.add_generic_param(gen_params[i]);
             }
         }
@@ -1525,10 +1697,19 @@ public:
             }
         }
 
+        // Optional `where T: Bound` clause on the declaration's own
+        // parameters, after the list that declares them.
+        if (this.check(TokenType::KwWhere)) {
+            const bounds: TraitBound[] = this.parse_trait_bounds();
+            for (mut wi: i64 = 0; wi < bounds.length; wi++) {
+                node.add_where_bound(bounds[wi].clone());
+            }
+        }
+
         this.consume(TokenType::LBrace, "'{'");
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            const before_pos: int = this.pos;
+            const before_pos: i64 = this.pos;
             this.collect_doc_comments();
             if (this.check(TokenType::RBrace)) { break; }
             const doc: string = this.take_documentation();
@@ -1540,7 +1721,7 @@ public:
             }
 
             // Progress guard: parse_enum_variant recovers via non-advancing
-            // consume(), so a stray separator (e.g. a Rust-style `,` between
+            // consume(), so a stray separator (e.g. a `,` between
             // variants, where Cryo expects `;`) parks the cursor on the
             // offending token and the loop would spin forever.  Skip it so
             // the error is reported once and parsing continues.
@@ -1587,7 +1768,7 @@ public:
                 variant.set_explicit_value(sign * v);
             } else {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
-                    format("expected integer literal after '=', found '%s'",
+                    fmt::format("expected integer literal after '=', found '%s'",
                         val_tok.lexeme));
             }
         }
@@ -1610,29 +1791,17 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
-            for (mut i: int = 0; i < gen_params.length; i++) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
+            for (mut i: i64 = 0; i < gen_params.length; i++) {
                 node.add_generic_param(gen_params[i]);
             }
         }
 
-        // Optional base traits: : Trait1, Trait2<T>
+        // Optional supertraits, each a trait reference as a bound writes one:
+        // `: Trait1, path::Trait2<T>`
         if (this.match_tok(TokenType::Colon)) {
             while (true) {
-                const base_tok: Token = this.consume(TokenType::Identifier, "base trait name");
-                const base_name: SymbolStr = this.intern_lexeme(base_tok);
-                mut type_args: TypeAnnotation*[] = [];
-
-                if (this.check(TokenType::LAngle)) {
-                    type_args = this.parse_generic_args();
-                }
-
-                const info: BaseTraitInfo = BaseTraitInfo {
-                    name:            base_name,
-                    type_parameters: type_args,
-                };
-                node.add_base_trait(info);
-
+                node.add_base_trait(this.parse_trait_ref());
                 if (!this.match_tok(TokenType::Comma)) { break; }
             }
         }
@@ -1676,6 +1845,7 @@ public:
                 if (func != null) {
                     if (is_static) { func.set_static(true); }
                     if (trait_mods.is_async) { func.set_async(true); }
+                    this.give_receiver(func, is_static);
                     node.add_method(func);
                 }
             } else {
@@ -1707,7 +1877,7 @@ public:
 
         this.consume(TokenType::Semicolon, "';'");
 
-        mut node: AssocTypeDeclNode* = malloc(sizeof(AssocTypeDeclNode)) as AssocTypeDeclNode*;
+        mut node: AssocTypeDeclNode* = libc::malloc(sizeof(AssocTypeDeclNode)) as AssocTypeDeclNode*;
         *node = AssocTypeDeclNode {
             name:   this.intern_lexeme(name_tok),
             bounds: bounds,
@@ -1726,8 +1896,8 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
-            for (mut gi: int = 0; gi < gen_params.length; gi++) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
+            for (mut gi: i64 = 0; gi < gen_params.length; gi++) {
                 node.add_generic_param(gen_params[gi]);
             }
         }
@@ -1743,8 +1913,22 @@ public:
 
     /// Parse an import declaration (5 styles).
     parse_import_declaration() -> ImportDeclNode* {
-        LOG_DEBUG(LogComponent::Parser, "[Parser] parse_import_declaration()");
-        const start: Token = this.advance(); // consume 'import'
+        return this.parse_import_form(false);
+    }
+
+    /// Parse an export declaration: the import form minus the wildcard.
+    /// `export A::B::{X, Y};`, `export A::B as C;`, `export A::B;`.
+    parse_export_declaration() -> ImportDeclNode* {
+        return this.parse_import_form(true);
+    }
+
+    /// Shared body of `import` and `export`.  They differ in exactly two
+    /// places - whether a `*` form is accepted, and the flag stamped on the
+    /// node - so they share one production rather than drifting as two.
+    parse_import_form(is_export: boolean) -> ImportDeclNode* {
+        LOG_DEBUG(LogComponent::Parser, "[Parser] parse_import_form(is_export=%d)",
+                  is_export as i32);
+        const start: Token = this.advance(); // consume 'import' / 'export'
 
         // Build module path incrementally: A::B::C
         // Accept keywords as path segments (e.g., import collections::string)
@@ -1761,6 +1945,8 @@ public:
         }
         // Intern the first segment to get a heap-pinned copy
         mut path_sym: SymbolStr = this.ctx.intern(first_tok.lexeme);
+        // The path without its last segment, once it has two.
+        mut prefix_sym: SymbolStr = SymbolStr::empty();
 
         // Per-segment tracking for the LSP; each segment's name +
         // span gets stamped on the resulting `ImportDeclNode` so
@@ -1777,9 +1963,26 @@ public:
             if (next.kind == TokenType::Star) {
                 // Wildcard import: import A::B::*
                 this.advance();
-                const pinned: string = this.ctx.resolve_str(path_sym);
-                const star_path: string = format("%s::*", pinned);
-                mut imp: ImportDeclNode* = new ImportDeclNode(star_path, ImportStyle::Wildcard, this.span_from_token(start));
+                if (is_export) {
+                    // Rejected at the grammar, so no later stage has to decide
+                    // what it means.  Under a glob re-export an importer's
+                    // in-scope set changes when a child module gains a
+                    // declaration - a name arriving with neither end having
+                    // written it down.  `M::*` stays legal as a LOCAL import,
+                    // where the blast radius is the one file that wrote it.
+                    this.report_invalid_at(ErrorCode::E0111_INVALID_SYNTAX,
+                        "`export` does not accept `*`; name each item as `export A::B::{ X, Y };`, or re-export the module itself as `export A::B;`",
+                        this.span_from_token(next));
+                    this.consume(TokenType::Semicolon, "';'");
+                    return null;
+                }
+                // The path names a MODULE; that this import takes all of its
+                // exports is `ImportStyle::Wildcard`, recorded beside it.  A
+                // `*` appended here is not part of any module's name, so the
+                // module-graph lookup misses and the import binds nothing -
+                // silently, because a wildcard that binds no names is
+                // indistinguishable from a module that exports none.
+                mut imp: ImportDeclNode* = new ImportDeclNode(path_sym, ImportStyle::Wildcard, this.span_from_token(start));
                 for (mut i: i64 = 0; i < seg_names.length; i++) {
                     imp.add_path_segment(seg_names[i], seg_spans[i]);
                 }
@@ -1790,14 +1993,22 @@ public:
             if (next.kind == TokenType::LBrace) {
                 // Selective import: import A::B::{X, Y}
                 this.advance(); // consume '{'
-                const path: string = this.ctx.resolve_str(path_sym);
-                mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Specific, this.span_from_token(start));
+                mut imp: ImportDeclNode* = new ImportDeclNode(path_sym, ImportStyle::Specific, this.span_from_token(start));
+                imp.is_export = is_export;
                 for (mut i: i64 = 0; i < seg_names.length; i++) {
                     imp.add_path_segment(seg_names[i], seg_spans[i]);
                 }
                 while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
                     const item_tok: Token = this.consume(TokenType::Identifier, "import name");
-                    imp.add_specific_import(this.intern_lexeme(item_tok));
+                    // `parse as toml_parse`: the entry's declaration, bound under
+                    // another name - and, in an `export`, offered under it.
+                    mut item_alias: SymbolStr = SymbolStr::empty();
+                    if (this.check(TokenType::KwAs)) {
+                        this.advance();
+                        const alias_tok: Token = this.consume(TokenType::Identifier, "alias name");
+                        item_alias = this.intern_lexeme(alias_tok);
+                    }
+                    imp.add_specific_import(this.intern_lexeme(item_tok), item_alias);
                     if (!this.match_tok(TokenType::Comma)) { break; }
                 }
                 this.consume(TokenType::RBrace, "'}'");
@@ -1807,14 +2018,40 @@ public:
             }
             // Append "::segment" and intern to pin on the heap
             const prev: string = this.ctx.resolve_str(path_sym);
-            path_sym = this.ctx.intern(format("%s::%s", prev, next.lexeme));
+            prefix_sym = path_sym;
+            path_sym = this.ctx.intern(fmt::format("%s::%s", prev, next.lexeme));
             seg_names.push(this.ctx.intern(next.lexeme));
             seg_spans.push(this.span_from_token(next));
             this.advance();
         }
 
-        const path: string = this.ctx.resolve_str(path_sym);
-        mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Wildcard, this.span_from_token(start));
+        // `import A::B as C;` is read as the entry `B` of `A`, marked as
+        // written in the path: it names an item of `A` or the module `A::B`,
+        // the one question an entry is asked answers which, and naming both
+        // is refused where the import is written.
+        // A one-segment path has no module to hold it, and an `export`
+        // renames nothing, so both stay a whole-module alias below.
+        if (this.check(TokenType::KwAs) && !is_export && seg_names.length >= 2) {
+            this.advance();
+            const entry_alias: Token = this.consume(TokenType::Identifier, "alias name");
+            mut ent: ImportDeclNode* = new ImportDeclNode(
+                prefix_sym, ImportStyle::Specific, this.span_from_token(start));
+            for (mut i: i64 = 0; i < seg_names.length - 1; i++) {
+                ent.add_path_segment(seg_names[i], seg_spans[i]);
+            }
+            ent.add_specific_import(seg_names[seg_names.length - 1], this.intern_lexeme(entry_alias));
+            ent.path_entry = true;
+            this.consume(TokenType::Semicolon, "';'");
+            ent.span = this.span_from(start);
+            return ent;
+        }
+
+        // `import A::B;` names the module and binds nothing from it.  A name
+        // it reaches is either written in braces or spelled through the
+        // qualifier; the path itself stays a module reference, which is what
+        // records the dependency edge and what `B::X` resolves against.
+        mut imp: ImportDeclNode* = new ImportDeclNode(path_sym, ImportStyle::Module, this.span_from_token(start));
+        imp.is_export = is_export;
         for (mut i: i64 = 0; i < seg_names.length; i++) {
             imp.add_path_segment(seg_names[i], seg_spans[i]);
         }
@@ -1983,6 +2220,14 @@ public:
         return if (had_kind_tag) { 2 } else { 1 };
     }
 
+    /// Whether `gp` repeats a parameter of the leading `implement<...>` list.
+    static declares_generic_param(leading: GenericParamNode*[]*, gp: GenericParamNode*) -> boolean {
+        for (mut i: i64 = 0; i < (*leading).length; i++) {
+            if ((*leading)[i].name.equals(gp.name)) { return true; }
+        }
+        return false;
+    }
+
     parse_implementation_block() -> ImplBlockNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_implementation_block()");
         const start: Token = this.advance(); // consume 'implement'
@@ -1991,7 +2236,7 @@ public:
         // for a trait impl head: `implement<T> trait Iter<T> for Range<T>`.
         mut leading_gen_params: GenericParamNode*[] = [];
         if (this.check(TokenType::LAngle)) {
-            leading_gen_params = this.parse_generic_params();
+            leading_gen_params = this.parse_generic_params(true);
         }
 
         // (G1) Optional `trait <Path>[<args>] for`: the trait-impl prefix.
@@ -2021,7 +2266,7 @@ public:
                 diag = diag.with_note("trait impls are written `implement trait <TraitName> for <TypeName> { ... }`; the `trait` keyword distinguishes a trait impl from an inherent impl");
                 diag = diag.with_note("inherent impls (no `for` clause) use `implement <TypeName> { ... }`, optionally with a `struct`/`enum`/`class` kind tag on the target");
                 diag = diag.suggest(Suggestion::replace(sugg_span,
-                    format("trait %s", head),
+                    fmt::format("trait %s", head),
                     "insert `trait` before the trait name"));
                 this.ctx.diagnostics.emit(diag);
                 this.error_count += 1;
@@ -2037,13 +2282,13 @@ public:
                 const name_tok: Token = this.peek_at(1);
                 mut diag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0101_UNEXPECTED_TOKEN,
-                    format("`%s` is not valid before a trait name", tag_tok.lexeme));
+                    fmt::format("`%s` is not valid before a trait name", tag_tok.lexeme));
                 diag = diag.at(tag_span);
-                diag = diag.with_note(format("the `struct`/`enum`/`class` kind tag is only allowed on the *target* type after `for`; on the trait side, use `trait` (you wrote `implement %s %s for ...`)",
+                diag = diag.with_note(fmt::format("the `struct`/`enum`/`class` kind tag is only allowed on the *target* type after `for`; on the trait side, use `trait` (you wrote `implement %s %s for ...`)",
                     tag_tok.lexeme, name_tok.lexeme));
                 diag = diag.with_note("the canonical form is `implement trait <TraitName> for [<KindTag>] <TypeName> { ... }`");
                 diag = diag.suggest(Suggestion::replace(tag_span, "trait",
-                    format("replace `%s` with `trait`", tag_tok.lexeme)));
+                    fmt::format("replace `%s` with `trait`", tag_tok.lexeme)));
                 this.ctx.diagnostics.emit(diag);
                 this.error_count += 1;
                 this.advance(); // skip the spurious kind tag
@@ -2067,52 +2312,68 @@ public:
         //     (e.g. `HashMap<T, ()>` underpinning `HashSet<T>`).
         mut type_tok: Token = this.current();
         mut type_name: SymbolStr = SymbolStr::empty();
+        // Spelling of the target, which is NOT the target token's lexeme for the
+        // unit type: `()` is two tokens and `type_tok` keeps only the `(`.  This
+        // is what types the `&this` receiver below, so taking the lexeme gives
+        // that receiver the name `(`, which names nothing and resolves to an
+        // invalid type - while `()` is a registered type name.
+        mut type_text: string = "";
         if (type_tok.kind == TokenType::LParen
                 && this.peek_at(1).kind == TokenType::RParen) {
             const lparen: Token = this.advance();         // consume '('
             const _rparen: Token = this.advance();         // consume ')'
             type_tok = lparen;
             type_name = this.ctx.intern("()");
+            type_text = "()";
         } else if (type_tok.kind == TokenType::Identifier
                 || type_tok.kind.is_keyword()) {
             this.advance();
             type_name = this.intern_lexeme(type_tok);
+            type_text = type_tok.lexeme;
         } else {
             type_tok = this.consume(TokenType::Identifier, "type name");
             type_name = this.intern_lexeme(type_tok);
+            type_text = type_tok.lexeme;
         }
         mut node: ImplBlockNode* = new ImplBlockNode(type_name, this.span_from_token(start));
         node.set_target_type_span(this.span_from_token(type_tok));
-        this.current_type_name = type_tok.lexeme;
+        this.current_type_name = type_text;
 
         // Attach the trait annotation and the leading generic params (if any)
         // collected before the target name was known.
         if (trait_ann != null) {
             node.set_trait_annotation(trait_ann);
         }
-        for (mut lgi: int = 0; lgi < leading_gen_params.length; lgi++) {
+        for (mut lgi: i64 = 0; lgi < leading_gen_params.length; lgi++) {
             node.add_generic_param(leading_gen_params[lgi]);
         }
 
-        // Optional generic params/args after target name.
-        // For inherent impls (no leading trait annotation), `Name<T>` is the
-        // existing generic-params form; keep populating generic_params.
-        // For trait impls, `Bar<T>` are the target's type args; the binding
-        // already lives in the leading generic_params, so we consume the
-        // tokens but discard the structured args. Sema (Phase B) re-derives
-        // them from the impl's generic_params and the target's declaration.
+        // The `<...>` after the target name is what the head writes for the
+        // target's parameters, and `target_args` carries it for EVERY head.
+        // On a trait impl it is an argument list, each name bound by the
+        // leading `implement<...>`.  On an inherent impl the same list also
+        // DECLARES its names (`implement enum Option<T>` has no leading list
+        // and `T` is in scope in the body), so each name not declared by a
+        // leading list becomes a parameter, and the list is recorded as the
+        // arguments it also is: `implement<T> struct MyVec<T>` declares `T`
+        // once, not twice.
         if (this.check(TokenType::LAngle)) {
             if (trait_ann == null) {
-                const gen_params: GenericParamNode*[] = this.parse_generic_params();
-                for (mut gi: int = 0; gi < gen_params.length; gi++) {
-                    node.add_generic_param(gen_params[gi]);
+                const gen_params: GenericParamNode*[] = this.parse_generic_params(true);
+                mut inherent_args: TypeAnnotation*[] = [];
+                for (mut gi: i64 = 0; gi < gen_params.length; gi++) {
+                    const gp: GenericParamNode* = gen_params[gi];
+                    if (!Parser::declares_generic_param(&leading_gen_params, gp)) { node.add_generic_param(gp); }
+                    const arg: NamedAnnotation* = new NamedAnnotation {
+                        name: gp.name,
+                        span: gp.span,
+                        pre_resolved: TypeRef::invalid(),
+                        res: ResSlot::Pending,
+                    };
+                    inherent_args.push(new TypeAnnotation::Named(arg));
                 }
+                node.set_target_args(inherent_args);
             } else {
-                // The target's type args (e.g. `<T>` in `for Range<T>`).
-                // The binding lives in the leading generic_params; sema
-                // re-derives the structured form, but we keep the args so
-                // `This` in a synthesized default method can be rewritten to
-                // the full Self type `Range<T>` instead of the bare `Range`.
                 node.set_target_args(this.parse_generic_args());
             }
         }
@@ -2120,7 +2381,7 @@ public:
         // (G2) Optional `where T: Bound, ...` clause.
         if (this.check(TokenType::KwWhere)) {
             const bounds: TraitBound[] = this.parse_trait_bounds();
-            for (mut wi: int = 0; wi < bounds.length; wi++) {
+            for (mut wi: i64 = 0; wi < bounds.length; wi++) {
                 node.add_where_bound(bounds[wi].clone());
             }
         }
@@ -2207,6 +2468,7 @@ public:
         }
 
         this.consume(TokenType::RBrace, "'}'");
+        this.give_receivers(&node.methods);
         this.current_type_name = "";
         node.span = this.span_from(start);
         return node;
@@ -2243,13 +2505,30 @@ public:
             }
             if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
 
+            // An imported function is a top-level declaration of this module
+            // and takes the top-level default: public unless `private` opts
+            // it out.  Declared private, `import libc::{ f }` binds nothing
+            // and every use of `f` is reachable only by its bare leaf.
+            mut ext_public: boolean = true;
+            if (this.check(TokenType::KwPrivate)) {
+                this.advance();
+                ext_public = false;
+            }
             if (this.check(TokenType::KwFunction)) {
-                const func: FunctionDeclNode* = this.parse_extern_function();
+                const func: FunctionDeclNode* = this.parse_extern_function(ext_public);
                 if (func != null) {
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         func.add_directive(pending_dirs[pi]);
                     }
                     node.add_function(func);
+                }
+            } else if (this.check(TokenType::KwMut) || this.check(TokenType::KwConst)) {
+                const gvar: VarDeclNode* = this.parse_extern_global();
+                if (gvar != null) {
+                    for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
+                        gvar.add_directive(pending_dirs[pi]);
+                    }
+                    node.add_global(gvar);
                 }
             } else {
                 this.error_unexpected();
@@ -2327,7 +2606,7 @@ public:
                     while (!this.check(TokenType::RAngle)
                             && !this.check(TokenType::RBrace)
                             && !this.is_at_end()) {
-                        sys_path = format("%s%s", sys_path, this.current().lexeme);
+                        sys_path = fmt::format("%s%s", sys_path, this.current().lexeme);
                         this.advance();
                     }
                     if (!this.check(TokenType::RAngle)) {
@@ -2356,9 +2635,48 @@ public:
     }
 
     /// Parse an extern function declaration (no body).
-    parse_extern_function() -> FunctionDeclNode* {
-        const func: FunctionDeclNode* = this.parse_function_declaration(false);
+    parse_extern_function(is_public: boolean) -> FunctionDeclNode* {
+        const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
         return func;
+    }
+
+    /// Parse an imported global inside an `extern "C"` block:
+    ///   `mut errno_value: i32;`  /  `const build_id: u8*;`
+    ///
+    /// The declaration names storage that belongs to another object, which
+    /// rules out both halves of an ordinary global: an initializer would DEFINE
+    /// the symbol here and collide with the library at link time, and the type
+    /// cannot be inferred because there is nothing to infer it from.  `mut` and
+    /// `const` still say what CRYO may do with it - `const` is not a promise
+    /// about the library, which remains free to change the value.
+    parse_extern_global() -> VarDeclNode* {
+        mut node: VarDeclNode* = this.parse_variable_declaration();
+        if (node == null) { return null; }
+        node.is_global = true;
+        node.is_extern_import = true;
+        if (node.initializer != null) {
+            this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                "an imported global cannot have an initializer: its storage is defined by the library being linked, not here");
+        }
+        if (node.type_annotation == null) {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "an imported global needs a type annotation: there is no initializer to infer one from");
+        }
+        return node;
+    }
+
+    /// Move an `extern "C"` block's imported globals into the top-level
+    /// statement stream.  They ARE top-level globals - only their storage lives
+    /// elsewhere - so hoisting lets the declaration index, name resolution, type
+    /// resolution and codegen reach them through the paths that already handle
+    /// globals, instead of each learning to look inside an extern block.
+    static hoist_extern_globals(program: ProgramNode*, node: ASTNode*) -> void {
+        if (program == null || node == null) { return; }
+        if (node.kind != NodeKind::ExternBlock) { return; }
+        const blk: ExternBlockNode* = node as ExternBlockNode*;
+        for (mut i: i64 = 0; i < blk.globals.length; i++) {
+            program.add_statement(blk.globals[i] as ASTNode*);
+        }
     }
 
     /// Parse an intrinsic declaration:
@@ -2378,7 +2696,7 @@ public:
         this.consume(TokenType::LParen, "'('");
         if (!this.check(TokenType::RParen)) {
             const params: VarDeclNode*[] = this.parse_parameter_list();
-            for (mut i: int = 0; i < params.length; i++) {
+            for (mut i: i64 = 0; i < params.length; i++) {
                 const p: VarDeclNode* = params[i];
                 // Detect variadic marker: the `args...` param has no type
                 // annotation (parse_parameter returns it early on `...`).
@@ -2413,6 +2731,38 @@ public:
         return node;
     }
 
+    /// Parse a generic intrinsic declaration:
+    ///   intrinsic function name<T, ..>(params) -> RetType where .. ;
+    /// It is a generic function with no body, and is typed and specialized
+    /// as one; its entries carry the kind its name lowers as.
+    parse_generic_intrinsic_declaration() -> FunctionDeclNode* {
+        const start: Token = this.advance(); // consume 'intrinsic'
+        this.advance(); // consume 'function'
+        const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic name");
+        mut func: FunctionDeclNode* = new FunctionDeclNode(this.intern_lexeme(name_tok), this.span_from_token(start));
+        func.set_name_span(this.span_from_token(name_tok));
+        func.set_intrinsic(true);
+        // Reachable from every module, as every intrinsic declaration is.
+        func.set_public(true);
+        const gen_params: GenericParamNode*[] = this.parse_generic_params(true);
+        for (mut i: i64 = 0; i < gen_params.length; i++) {
+            func.add_generic_param(gen_params[i]);
+        }
+        this.parse_function_param_list_into(func);
+        if (this.match_tok(TokenType::Arrow)) {
+            func.set_return_type_annotation(this.parse_type_annotation());
+        }
+        if (this.check(TokenType::KwWhere)) {
+            const bounds: TraitBound[] = this.parse_trait_bounds();
+            for (mut i: i64 = 0; i < bounds.length; i++) {
+                func.add_trait_bound(bounds[i].clone());
+            }
+        }
+        this.consume(TokenType::Semicolon, "';'");
+        func.span = this.span_from(start);
+        return func;
+    }
+
     /// Parse an intrinsic const declaration: intrinsic const NAME: Type;
     parse_intrinsic_const_declaration() -> IntrinsicConstDeclNode* {
         const start: Token = this.advance(); // consume 'intrinsic'
@@ -2431,10 +2781,17 @@ public:
         return node;
     }
 
-    /// Parse generic type parameters: <T, U: Constraint, A = DefaultType>
-    /// Default annotation (`= Type`) follows any optional constraints and is
-    /// substituted by sema when the param is omitted at instantiation time.
-    parse_generic_params() -> GenericParamNode*[] {
+    /// Parse generic type parameters: <T, U, A = DefaultType>
+    /// A bound is written in a `where` clause, never here, so a `:` in this
+    /// position is a syntax error.
+    /// Default annotation (`= Type`) is substituted by sema when the param is
+    /// omitted at instantiation time.
+    ///
+    /// `where_allowed` says whether the declaration being parsed can carry a
+    /// `where` clause at all.  Only function-shaped declarations and impl
+    /// blocks can, so on a type declaration the bound has no replacement to
+    /// suggest and the diagnostic must not name one.
+    parse_generic_params(where_allowed: boolean) -> GenericParamNode*[] {
         mut params: GenericParamNode*[] = [];
         this.advance(); // consume '<'
 
@@ -2446,13 +2803,38 @@ public:
             const name: SymbolStr = this.intern_lexeme(name_tok);
             mut param: GenericParamNode* = new GenericParamNode(name, this.span_from_token(start));
 
-            // Optional constraints: T: Constraint1 + Constraint2
-            if (this.match_tok(TokenType::Colon)) {
+            // A `:` here is a bound, which is not this production's syntax.
+            // The bound list is consumed rather than left for the caller: the
+            // parameter list would otherwise fall over on the tokens after it
+            // and report the same single mistake two or three more times, with
+            // the useful message nowhere near the front.  `parse_trait_ref`
+            // consumes exactly what a where-clause bound does, qualified paths
+            // included, so recovery lands on the same `,`/`>`/`=` either way.
+            if (this.check(TokenType::Colon)) {
+                const colon_tok: Token = this.current();
+                this.advance();
+                mut discarded: TraitRef[] = [];
                 while (true) {
-                    const constraint_tok: Token = this.consume(TokenType::Identifier, "constraint name");
-                    param.add_constraint(this.intern_lexeme(constraint_tok));
+                    discarded.push(this.parse_trait_ref());
                     if (!this.match_tok(TokenType::Plus)) { break; }
                 }
+                const bound_span: SourceSpan = this.span_from(colon_tok);
+                mut bdiag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0101_UNEXPECTED_TOKEN,
+                    fmt::format("a trait bound cannot be written on the type parameter `%s`",
+                           name_tok.lexeme));
+                bdiag = bdiag.at(bound_span);
+                if (where_allowed) {
+                    bdiag = bdiag.with_note("a bound belongs in a `where` clause after the signature, e.g. `function f<T>(x: &T) -> i32 where T: Display`");
+                    bdiag = bdiag.suggest(Suggestion::remove(bound_span,
+                        "remove the bound here and write it in a `where` clause"));
+                } else {
+                    bdiag = bdiag.with_note("a `where` clause is accepted only on function-shaped declarations, so a bound on a type declaration's parameter currently has no syntax");
+                    bdiag = bdiag.suggest(Suggestion::remove(bound_span,
+                        "remove the bound"));
+                }
+                this.ctx.diagnostics.emit(bdiag);
+                this.error_count += 1;
             }
 
             // Optional default type: T = DefaultType (after constraints, before , or >)
@@ -2514,6 +2896,7 @@ public:
 
             const bound: TraitBound = TraitBound {
                 type_parameter: type_param,
+                subject_sym:    SymbolID::invalid(),
                 subject_type:   subject,
                 trait_refs:     refs,
                 span:           this.span_from(start_tok),
@@ -2549,6 +2932,10 @@ public:
 
         return TraitRef {
             path:      path,
+            // Identity needs the writing module's imports, which the parser
+            // does not have; TypeResolution stamps it.
+            resolved: DefId::invalid(),
+            refused:  false,
             type_args: type_args,
             span:      this.span_from(start),
         };
@@ -2564,7 +2951,7 @@ public:
             return this.advance();
         }
         this.report_error(ErrorCode::E0105_EXPECTED_IDENTIFIER,
-            format("expected directive name, found '%s'", tok.lexeme));
+            fmt::format("expected directive name, found '%s'", tok.lexeme));
         return this.advance();
     }
 
@@ -2577,7 +2964,7 @@ public:
         const start: Token = this.advance(); // consume '!['
 
         const kind_tok: Token = this.consume_directive_name();
-        mut dir: DirectiveNode* = new DirectiveNode(kind_tok.lexeme, this.span_from_token(start));
+        mut dir: DirectiveNode* = new DirectiveNode(Keyword::new(kind_tok.lexeme), this.span_from_token(start));
 
         if (this.check(TokenType::LParen)) {
             this.advance();
@@ -2636,7 +3023,7 @@ public:
             // Nested directive call: name(args...)
             if (this.check(TokenType::LParen)) {
                 mut nested: DirectiveNode* = new DirectiveNode(
-                    id_tok.lexeme, this.span_from_token(id_tok));
+                    Keyword::new(id_tok.lexeme), this.span_from_token(id_tok));
                 this.advance(); // consume '('
                 if (!this.check(TokenType::RParen)) {
                     while (true) {
@@ -2662,7 +3049,7 @@ public:
 
         // Anything else is a syntax error inside a directive arg list.
         this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
-            format("expected directive argument (identifier, literal, or nested call), got '%s'",
+            fmt::format("expected directive argument (identifier, literal, or nested call), got '%s'",
                 start.lexeme));
         this.advance(); // skip the bad token to make progress
         return DirectiveArg::ident(start.lexeme, this.span_from_token(start));
@@ -2712,7 +3099,7 @@ public:
             }
             _ => {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
-                    format("expected literal or identifier after '=' in directive, got '%s'",
+                    fmt::format("expected literal or identifier after '=' in directive, got '%s'",
                         v_tok.lexeme));
             }
         }
@@ -2747,7 +3134,7 @@ public:
             }
             if (!this.check(TokenType::LBrace)) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
-                    format("expected '{' after `![...]` directive in statement position; got '%s'",
+                    fmt::format("expected '{' after `![...]` directive in statement position; got '%s'",
                         this.current().lexeme));
                 return null;
             }
@@ -2857,7 +3244,7 @@ public:
         mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(start));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            const before_pos: int = this.pos;
+            const before_pos: i64 = this.pos;
             if (this.panic_mode) {
                 this.synchronize();
                 if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
@@ -3042,6 +3429,10 @@ public:
     ///         }
     ///     }
     ///
+    /// where `next` is `std::core::iter::Iterator`'s and `Option` is
+    /// `std::core::option::Option`, each named by its definition rather than
+    /// by a spelling the user's scope could answer.
+    ///
     /// Each for-in gets a fresh `N` so nested / sibling loops never alias.
     /// The iterator binding carries `is_auto = true`; sema's existing
     /// initializer-type back-fill (same path used for lambda-bound `const`
@@ -3055,7 +3446,7 @@ public:
 
         // Fresh synthetic name `__cryo_for_iter_N`.
         g_for_in_counter += 1;
-        const iter_str:  string    = format("__cryo_for_iter_%u", g_for_in_counter);
+        const iter_str:  string    = fmt::format("__cryo_for_iter_%u", g_for_in_counter);
         const iter_name: SymbolStr = this.ctx.intern(iter_str);
 
         // `mut __cryo_for_iter_N = collection;`
@@ -3066,23 +3457,25 @@ public:
         const iter_decl_stmt: DeclStmtNode* = new DeclStmtNode(
             iter_decl as DeclarationNode*, full_span);
 
-        // `__cryo_for_iter_N.next()` - match scrutinee.
+        // `__cryo_for_iter_N.next()` - match scrutinee.  The call is
+        // `Iterator::next`: the loop is defined over the language's
+        // `Iterator`, so the member is that trait's, never a method that is
+        // merely spelled `next`.  Sema refuses a scrutinee that does not
+        // implement the trait before this call is bound.
         const iter_ident:  IdentifierNode*    = new IdentifierNode(iter_name, full_span);
         const next_name:   SymbolStr          = this.ctx.intern("next");
-        const next_member: MemberAccessNode*  = new MemberAccessNode(
+        mut next_member:   MemberAccessNode*  = new MemberAccessNode(
             iter_ident as ExpressionNode*, next_name, full_span, full_span);
+        this.ctx.note_lang_ref(next_member as ASTNode*, LangItem::Iterator);
         const next_call:   CallExprNode*      = new CallExprNode(
             next_member as ExpressionNode*, full_span);
 
         // `Option::Some(x) => { body }`
-        const opt_name:  SymbolStr = this.ctx.intern("Option");
-        const some_name: SymbolStr = this.ctx.intern("Some");
-        const none_name: SymbolStr = this.ctx.intern("None");
-
-        mut some_pat: EnumPatternNode* = new EnumPatternNode(iter_span);
-        some_pat.set_enum_name(opt_name);
-        some_pat.set_variant_name(some_name);
-        const pb: PatternBinding* = new PatternBinding { name: user_name, span: iter_span };
+        mut some_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "Some", iter_span);
+        const pb: PatternBinding* = new PatternBinding {
+            name: user_name, span: iter_span, sym_id: SymbolID::invalid(),
+            resolved_type: TypeRef::invalid(), written_mut: false
+        };
         some_pat.add_element(PatternElement::Binding(pb));
 
         mut some_arm: MatchArmNode* = new MatchArmNode(full_span);
@@ -3100,9 +3493,7 @@ public:
         some_arm.set_body(some_body as StatementNode*);
 
         // `Option::None => { break; }`
-        mut none_pat: EnumPatternNode* = new EnumPatternNode(full_span);
-        none_pat.set_enum_name(opt_name);
-        none_pat.set_variant_name(none_name);
+        const none_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "None", full_span);
 
         mut none_arm: MatchArmNode* = new MatchArmNode(full_span);
         none_arm.add_pattern(none_pat as PatternNode*);
@@ -3138,7 +3529,7 @@ public:
         mut match_stmt: MatchStmtNode* = new MatchStmtNode(subject, this.span_from_token(start));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            const before_pos: int = this.pos;
+            const before_pos: i64 = this.pos;
             const arm: MatchArmNode* = this.parse_match_arm();
             if (arm != null) {
                 match_stmt.add_arm(arm);
@@ -3177,7 +3568,7 @@ public:
             scrutinee, this.span_from_token(start));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            const before_pos: int = this.pos;
+            const before_pos: i64 = this.pos;
             const arm: StaticMatchArmNode* = this.parse_static_match_arm();
             if (arm != null) {
                 sm.add_arm(arm);
@@ -3307,7 +3698,7 @@ public:
             const d: DirectiveNode* = pending[i];
             if (d == null) { continue; }
             node.add_directive(d);
-            if (d.directive_kind == "arch") {
+            if (d.directive_kind.as_string() == "arch") {
                 if (d.args.length >= 1 && d.args[0].kind == DirectiveArgKind::Ident) {
                     node.arch = d.args[0].name;
                 }
@@ -3315,7 +3706,7 @@ public:
                     if (d.args[1].name == "intel") { node.dialect = AsmDialect::Intel; }
                     else { node.dialect = AsmDialect::ATT; }
                 }
-            } else if (d.directive_kind == "clobber") {
+            } else if (d.directive_kind.as_string() == "clobber") {
                 for (mut j: i64 = 0; j < d.args.length; j++) {
                     if (d.args[j].kind == DirectiveArgKind::Ident) {
                         node.add_clobber(d.args[j].name);
@@ -3398,7 +3789,7 @@ public:
                         else if (c.lexeme == "r") { ck = AsmConstraintKind::Reg; }
                         else {
                             this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
-                                format("unknown asm operand constraint '%s' (expected r, m, i, or a \"register\")",
+                                fmt::format("unknown asm operand constraint '%s' (expected r, m, i, or a \"register\")",
                                     c.lexeme));
                         }
                     } else {

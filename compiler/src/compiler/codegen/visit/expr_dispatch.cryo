@@ -12,16 +12,29 @@
 /// `expr.accept(visitor)` selects the right `override visit(...)` on
 /// the actual concrete visitor at runtime.
 
-namespace Compiler::Codegen::Visit::ExprDispatch;
+namespace compiler::codegen::visit::expr_dispatch;
 
-import Compiler::Codegen;
-import Compiler::Codegen::{ LLVMTypes, Context };
-import Compiler::Codegen::State::VisitorState;
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Type, Compound };
-import Compiler::AST;
-import Compiler::AST::{ Node, Visitor, Expression, Statement };
-import Compiler::Lex;
+import compiler::codegen;
+import compiler::codegen::{ llvm_types, context };
+import compiler::codegen::state::visitor_state;
+import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::types;
+import compiler::types::{ compound, type_base, type_ref, TypeKind };
+import compiler::ast;
+import compiler::ast::{ expression, node, NodeKind, statement, visitor };
+import utils::logger;
+import utils::logger::{ cdebug };
+import compiler::lex;
+import compiler::lex::{ TokenType };
+import std::ffi::libc;
+import compiler::ast::expression::{
+    ArrayAccessNode, ExpressionNode, IdentifierNode, UnaryExprNode
+};
+import compiler::ast::statement::{ BlockStmtNode, StatementNode };
+import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::context::{ CodegenContext };
+import compiler::codegen::llvm_types::{ LBasicBlock, LType, LValue };
+import compiler::types::type_base::{ Type };
 
 
 type struct ExprDispatch {
@@ -53,7 +66,7 @@ type struct ExprDispatch {
         this.cg.values.push_scope();
         cdebug("[IRGen]         block (%lld stmts) at %s:%d:%d\n",
                block.statements.length, block.span.file,
-               block.span.start_line as i32, block.span.start_col as i32); fflush(null);
+               block.span.start_line as i32, block.span.start_col as i32); libc::fflush(null);
         for (mut i: i64 = 0; i < block.statements.length; i++) {
             const current: LBasicBlock = this.cg.builder.get_insert_block();
             if (current.is_valid() && current.has_terminator()) {
@@ -92,7 +105,7 @@ type struct ExprDispatch {
     /// runtime type calls the right `override visit(SpecificType*)`).
     generate_statement(mut &this, visitor: ASTVisitor*, stmt: StatementNode*) -> void {
         if (stmt == null) { return; }
-        cdebug("[IRGen]           stmt kind=%s\n", stmt.kind.to_string()); fflush(null);
+        cdebug("[IRGen]           stmt kind=%s\n", stmt.kind.to_string()); libc::fflush(null);
         stmt.accept(visitor);
     }
 
@@ -110,13 +123,6 @@ type struct ExprDispatch {
 
     // Value-shape helpers (codegen_expr / codegen_rvalue / codegen_lvalue)
 
-    /// Codegen an expression and return the resulting value.
-    codegen_expr(mut &this, visitor: ASTVisitor*, expr: ExpressionNode*) -> LValue {
-        if (expr == null) { return LValue::null(); }
-        this.generate_expression(visitor, expr);
-        return this.state.last_value;
-    }
-
     /// Codegen an expression, ensuring the result is an rvalue (loaded).
     codegen_rvalue(mut &this, visitor: ASTVisitor*, expr: ExpressionNode*) -> LValue {
         if (expr == null) { return LValue::null(); }
@@ -131,7 +137,7 @@ type struct ExprDispatch {
             // neighbouring bytes), which is wrong.
             if (expr.kind == NodeKind::ArrayAccess) {
                 const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
-                const arr_t: Type* = this.cg.lookup_type_by_id(aa.array.resolved_type.id);
+                const arr_t: Type* = this.cg.arena_type(aa.array.resolved_type);
                 if (arr_t != null && arr_t.kind == TypeKind::String) {
                     const byte: LValue = this.cg.builder.build_load(
                         LType::i8(), this.state.last_value, "charbyte");
@@ -148,7 +154,7 @@ type struct ExprDispatch {
             if (expr.kind == NodeKind::UnaryExpression) {
                 const ue: UnaryExprNode* = expr as UnaryExprNode*;
                 if (ue.op.kind == TokenType::Star) {
-                    const op_t: Type* = this.cg.lookup_type_by_id(ue.operand.resolved_type.id);
+                    const op_t: Type* = this.cg.arena_type(ue.operand.resolved_type);
                     if (op_t != null && op_t.kind == TypeKind::String) {
                         const byte: LValue = this.cg.builder.build_load(
                             LType::i8(), this.state.last_value, "strbyte");
@@ -171,8 +177,8 @@ type struct ExprDispatch {
             // needs `AbiClassifier::forward_va_list` at the call site.
             if (expr.kind == NodeKind::Identifier) {
                 const ident: IdentifierNode* = expr as IdentifierNode*;
-                if (this.cg.expr_ops.current_variadic_arg_id != 0 &&
-                    ident.name.id == this.cg.expr_ops.current_variadic_arg_id) {
+                if (this.cg.expr_ops.variadic_args.is_valid() &&
+                    ident.res.local_sym().equals(this.cg.expr_ops.variadic_args)) {
                     this.state.last_is_lvalue = false;
                     return this.state.last_value;
                 }

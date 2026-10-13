@@ -11,10 +11,11 @@
 /// for terminal output, or an `open_memstream` buffer when rendering a
 /// diagnostic to a string.  Never stdout.
 
-namespace Utils::SyntaxHighlighter;
+namespace utils::syntax_highlighter;
 
-import Utils;
-import Utils::DiagSink;
+import utils;
+import utils::diag_sink;
+import utils::keyword::{ Keyword };
 
 
 // ANSI Color Codes
@@ -22,9 +23,6 @@ import Utils::DiagSink;
 // for diagnostics) without clashing.  The caret line stays the dominant
 // visual anchor; highlighted tokens use slightly muted hues.
 
-// NOTE: use \x1b (hex ESC) rather than \033 (octal).  Cryo's string
-// escape pass does not recognize \033; see compiler/src/compiler/lex
-// /lexer.cryo `process_escape_sequences`.
 const HL_RESET:    string = "\x1b[0m";
 const HL_KEYWORD:  string = "\x1b[35m";    // magenta: control flow / decls
 const HL_TYPE:     string = "\x1b[33m";    // yellow: built-in type names
@@ -41,15 +39,16 @@ const HL_FUNC:     string = "\x1b[36m";    // cyan: ident immediately before '('
 /// emitted verbatim.  `out` is the destination `FILE*` - `g_stderr` for
 /// terminal diagnostics, or an `open_memstream` buffer when the renderer
 /// is producing a string for the language server.
-function print_line(out: void*, line: string, colors: boolean) -> void {
+function print_line(out: void*, line_text: string, colors: boolean) -> void {
+    const line: string = line_text;
     if (line == "") {
         return;
     }
     if (!colors) {
-        DiagSink::emit_raw(out, line);
+        diag_sink::DiagSink::emit_raw(out, line_text);
         return;
     }
-    highlight_stream(out, line);
+    highlight_stream(out, line_text);
 }
 
 
@@ -58,44 +57,45 @@ function print_line(out: void*, line: string, colors: boolean) -> void {
 /// Walk `line` byte-by-byte, classifying each lexeme run and emitting it
 /// with the matching color.  Keeps no state across lines; block comments
 /// only span the visible line.
-function highlight_stream(out: void*, line: string) -> void {
+function highlight_stream(out: void*, line_text: string) -> void {
+    const line: string = line_text;
     const len: i64 = line.length() as i64;
     mut pos: i64 = 0;
 
     while (pos < len) {
-        const ch: char = char_at(line, pos);
+        const ch: char = char_at(line_text, pos);
 
         // Whitespace runs: emit as-is (no escape sequences).
         if (is_space(ch)) {
             const ws_start: i64 = pos;
-            while (pos < len && is_space(char_at(line, pos))) {
+            while (pos < len && is_space(char_at(line_text, pos))) {
                 pos += 1;
             }
-            emit_plain(out, line, ws_start, pos - ws_start);
+            emit_plain(out, line_text, ws_start, pos - ws_start);
             continue;
         }
 
         // Line comment "// ...": colors the rest of the line.
-        if (ch == '/' && pos + 1 < len && char_at(line, pos + 1) == '/') {
-            emit_colored(out, line, pos, len - pos, HL_COMMENT);
+        if (ch == '/' && pos + 1 < len && char_at(line_text, pos + 1) == '/') {
+            emit_colored(out, line_text, pos, len - pos, HL_COMMENT);
             pos = len;
             continue;
         }
 
         // Block comment "/* ... */": terminates at first */ on the line,
         // or end-of-line if unterminated.
-        if (ch == '/' && pos + 1 < len && char_at(line, pos + 1) == '*') {
+        if (ch == '/' && pos + 1 < len && char_at(line_text, pos + 1) == '*') {
             const cm_start: i64 = pos;
             pos += 2;
             while (pos + 1 < len) {
-                if (char_at(line, pos) == '*' && char_at(line, pos + 1) == '/') {
+                if (char_at(line_text, pos) == '*' && char_at(line_text, pos + 1) == '/') {
                     pos += 2;
                     break;
                 }
                 pos += 1;
             }
             if (pos > len) { pos = len; }
-            emit_colored(out, line, cm_start, pos - cm_start, HL_COMMENT);
+            emit_colored(out, line_text, cm_start, pos - cm_start, HL_COMMENT);
             continue;
         }
 
@@ -104,7 +104,7 @@ function highlight_stream(out: void*, line: string) -> void {
             const s_start: i64 = pos;
             pos += 1;
             while (pos < len) {
-                const c: char = char_at(line, pos);
+                const c: char = char_at(line_text, pos);
                 if (c == '\\' && pos + 1 < len) {
                     pos += 2;
                     continue;
@@ -115,7 +115,7 @@ function highlight_stream(out: void*, line: string) -> void {
                 }
                 pos += 1;
             }
-            emit_colored(out, line, s_start, pos - s_start, HL_STRING);
+            emit_colored(out, line_text, s_start, pos - s_start, HL_STRING);
             continue;
         }
 
@@ -124,7 +124,7 @@ function highlight_stream(out: void*, line: string) -> void {
             const c_start: i64 = pos;
             pos += 1;
             while (pos < len) {
-                const c: char = char_at(line, pos);
+                const c: char = char_at(line_text, pos);
                 if (c == '\\' && pos + 1 < len) {
                     pos += 2;
                     continue;
@@ -135,7 +135,7 @@ function highlight_stream(out: void*, line: string) -> void {
                 }
                 pos += 1;
             }
-            emit_colored(out, line, c_start, pos - c_start, HL_STRING);
+            emit_colored(out, line_text, c_start, pos - c_start, HL_STRING);
             continue;
         }
 
@@ -143,10 +143,10 @@ function highlight_stream(out: void*, line: string) -> void {
         if (ch == '@') {
             const a_start: i64 = pos;
             pos += 1;
-            while (pos < len && is_ident_cont(char_at(line, pos))) {
+            while (pos < len && is_ident_cont(char_at(line_text, pos))) {
                 pos += 1;
             }
-            emit_colored(out, line, a_start, pos - a_start, HL_ATTR);
+            emit_colored(out, line_text, a_start, pos - a_start, HL_ATTR);
             continue;
         }
 
@@ -154,27 +154,27 @@ function highlight_stream(out: void*, line: string) -> void {
         // floats with exponent, and integer/float suffixes (u32, f64, ...)
         if (ch.is_digit()) {
             const n_start: i64 = pos;
-            pos = consume_number(line, pos, len);
-            emit_colored(out, line, n_start, pos - n_start, HL_NUMBER);
+            pos = consume_number(line_text, pos, len);
+            emit_colored(out, line_text, n_start, pos - n_start, HL_NUMBER);
             continue;
         }
 
         // Identifier / keyword
         if (is_ident_start(ch)) {
             const id_start: i64 = pos;
-            while (pos < len && is_ident_cont(char_at(line, pos))) {
+            while (pos < len && is_ident_cont(char_at(line_text, pos))) {
                 pos += 1;
             }
             const id_len: i64 = pos - id_start;
-            const cls: i32 = classify_ident(line, id_start, id_len, pos, len);
-            emit_ident(out, line, id_start, id_len, cls);
+            const cls: i32 = classify_ident(line_text, id_start, id_len, pos, len);
+            emit_ident(out, line_text, id_start, id_len, cls);
             continue;
         }
 
         // Punctuation / operator / anything else: pass through one byte
         // uncolored.  Coloring punctuation tends to add visual noise that
         // distracts from the caret, so we leave it default.
-        emit_plain(out, line, pos, 1);
+        emit_plain(out, line_text, pos, 1);
         pos += 1;
     }
 }
@@ -328,98 +328,98 @@ function emit_ident(out: void*, line: string, start: i64, len: i64, cls: i32) ->
 // Keyword tables
 
 /// Returns true when [start, start+len) names a Cryo language keyword.
-/// Mirrors `TokenType::from_keyword` in Compiler::Lex, minus the type keywords
+/// Mirrors `TokenType::from_keyword` in compiler::lex, minus the type keywords
 /// which are reported separately by `is_type_keyword`.
 function is_keyword(line: string, start: i64, len: i64) -> boolean {
     // Control flow.
-    if (lex_eq(line, start, len, "if"))         { return true; }
-    if (lex_eq(line, start, len, "else"))       { return true; }
-    if (lex_eq(line, start, len, "default"))    { return true; }
-    if (lex_eq(line, start, len, "match"))      { return true; }
-    if (lex_eq(line, start, len, "while"))      { return true; }
-    if (lex_eq(line, start, len, "for"))        { return true; }
-    if (lex_eq(line, start, len, "loop"))       { return true; }
-    if (lex_eq(line, start, len, "do"))         { return true; }
-    if (lex_eq(line, start, len, "break"))      { return true; }
-    if (lex_eq(line, start, len, "continue"))   { return true; }
-    if (lex_eq(line, start, len, "return"))     { return true; }
-    if (lex_eq(line, start, len, "yield"))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("if")))         { return true; }
+    if (lex_eq(line, start, len, Keyword::new("else")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("default")))    { return true; }
+    if (lex_eq(line, start, len, Keyword::new("match")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("while")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("for")))        { return true; }
+    if (lex_eq(line, start, len, Keyword::new("loop")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("do")))         { return true; }
+    if (lex_eq(line, start, len, Keyword::new("break")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("continue")))   { return true; }
+    if (lex_eq(line, start, len, Keyword::new("return")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("yield")))      { return true; }
 
     // Declarations.
-    if (lex_eq(line, start, len, "const"))      { return true; }
-    if (lex_eq(line, start, len, "static"))     { return true; }
-    if (lex_eq(line, start, len, "extern"))     { return true; }
-    if (lex_eq(line, start, len, "auto"))       { return true; }
-    if (lex_eq(line, start, len, "function"))   { return true; }
-    if (lex_eq(line, start, len, "class"))      { return true; }
-    if (lex_eq(line, start, len, "struct"))     { return true; }
-    if (lex_eq(line, start, len, "enum"))       { return true; }
-    if (lex_eq(line, start, len, "trait"))      { return true; }
-    if (lex_eq(line, start, len, "type"))       { return true; }
-    if (lex_eq(line, start, len, "namespace"))  { return true; }
-    if (lex_eq(line, start, len, "module"))     { return true; }
-    if (lex_eq(line, start, len, "import"))     { return true; }
-    if (lex_eq(line, start, len, "export"))     { return true; }
-    if (lex_eq(line, start, len, "from"))       { return true; }
-    if (lex_eq(line, start, len, "as"))         { return true; }
-    if (lex_eq(line, start, len, "implement"))  { return true; }
-    if (lex_eq(line, start, len, "intrinsic"))  { return true; }
-    if (lex_eq(line, start, len, "where"))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("const")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("static")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("extern")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("auto")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("function")))   { return true; }
+    if (lex_eq(line, start, len, Keyword::new("class")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("struct")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("enum")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("trait")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("type")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("namespace")))  { return true; }
+    if (lex_eq(line, start, len, Keyword::new("module")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("import")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("export")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("from")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("as")))         { return true; }
+    if (lex_eq(line, start, len, Keyword::new("implement")))  { return true; }
+    if (lex_eq(line, start, len, Keyword::new("intrinsic")))  { return true; }
+    if (lex_eq(line, start, len, Keyword::new("where")))      { return true; }
 
     // Access control & modifiers.
-    if (lex_eq(line, start, len, "public"))     { return true; }
-    if (lex_eq(line, start, len, "private"))    { return true; }
-    if (lex_eq(line, start, len, "protected"))  { return true; }
-    if (lex_eq(line, start, len, "inline"))     { return true; }
-    if (lex_eq(line, start, len, "async"))      { return true; }
-    if (lex_eq(line, start, len, "await"))      { return true; }
-    if (lex_eq(line, start, len, "unsafe"))     { return true; }
-    if (lex_eq(line, start, len, "virtual"))    { return true; }
-    if (lex_eq(line, start, len, "override"))   { return true; }
-    if (lex_eq(line, start, len, "mut"))        { return true; }
+    if (lex_eq(line, start, len, Keyword::new("public")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("private")))    { return true; }
+    if (lex_eq(line, start, len, Keyword::new("protected")))  { return true; }
+    if (lex_eq(line, start, len, Keyword::new("inline")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("async")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("await")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("unsafe")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("virtual")))    { return true; }
+    if (lex_eq(line, start, len, Keyword::new("override")))   { return true; }
+    if (lex_eq(line, start, len, Keyword::new("mut")))        { return true; }
 
     // Special values & operator-keywords.
-    if (lex_eq(line, start, len, "true"))       { return true; }
-    if (lex_eq(line, start, len, "false"))      { return true; }
-    if (lex_eq(line, start, len, "null"))       { return true; }
-    if (lex_eq(line, start, len, "this"))       { return true; }
-    if (lex_eq(line, start, len, "in"))         { return true; }
-    if (lex_eq(line, start, len, "typeof"))     { return true; }
-    if (lex_eq(line, start, len, "sizeof"))     { return true; }
-    if (lex_eq(line, start, len, "alignof"))    { return true; }
-    if (lex_eq(line, start, len, "new"))        { return true; }
-    if (lex_eq(line, start, len, "delete"))     { return true; }
-    if (lex_eq(line, start, len, "with"))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("true")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("false")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("null")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("this")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("in")))         { return true; }
+    if (lex_eq(line, start, len, Keyword::new("typeof")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("sizeof")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("alignof")))    { return true; }
+    if (lex_eq(line, start, len, Keyword::new("new")))        { return true; }
+    if (lex_eq(line, start, len, Keyword::new("delete")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("with")))       { return true; }
 
     return false;
 }
 
 /// Returns true when [start, start+len) names a built-in type keyword.
 function is_type_keyword(line: string, start: i64, len: i64) -> boolean {
-    if (lex_eq(line, start, len, "void"))      { return true; }
-    if (lex_eq(line, start, len, "boolean"))   { return true; }
-    if (lex_eq(line, start, len, "int"))       { return true; }
-    if (lex_eq(line, start, len, "i8"))        { return true; }
-    if (lex_eq(line, start, len, "i16"))       { return true; }
-    if (lex_eq(line, start, len, "i32"))       { return true; }
-    if (lex_eq(line, start, len, "i64"))       { return true; }
-    if (lex_eq(line, start, len, "i128"))      { return true; }
-    if (lex_eq(line, start, len, "uint"))      { return true; }
-    if (lex_eq(line, start, len, "u8"))        { return true; }
-    if (lex_eq(line, start, len, "u16"))       { return true; }
-    if (lex_eq(line, start, len, "u32"))       { return true; }
-    if (lex_eq(line, start, len, "u64"))       { return true; }
-    if (lex_eq(line, start, len, "u128"))      { return true; }
-    if (lex_eq(line, start, len, "unsigned"))  { return true; }
-    if (lex_eq(line, start, len, "float"))     { return true; }
-    if (lex_eq(line, start, len, "f32"))       { return true; }
-    if (lex_eq(line, start, len, "f64"))       { return true; }
-    if (lex_eq(line, start, len, "double"))    { return true; }
-    if (lex_eq(line, start, len, "char"))      { return true; }
-    if (lex_eq(line, start, len, "string"))    { return true; }
-    if (lex_eq(line, start, len, "tuple"))     { return true; }
-    if (lex_eq(line, start, len, "optional"))  { return true; }
-    if (lex_eq(line, start, len, "This"))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("void")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("boolean")))   { return true; }
+    if (lex_eq(line, start, len, Keyword::new("int")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("i8")))        { return true; }
+    if (lex_eq(line, start, len, Keyword::new("i16")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("i32")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("i64")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("i128")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("uint")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("u8")))        { return true; }
+    if (lex_eq(line, start, len, Keyword::new("u16")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("u32")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("u64")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("u128")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("unsigned")))  { return true; }
+    if (lex_eq(line, start, len, Keyword::new("float")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("f32")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("f64")))       { return true; }
+    if (lex_eq(line, start, len, Keyword::new("double")))    { return true; }
+    if (lex_eq(line, start, len, Keyword::new("char")))      { return true; }
+    if (lex_eq(line, start, len, Keyword::new("string")))    { return true; }
+    if (lex_eq(line, start, len, Keyword::new("tuple")))     { return true; }
+    if (lex_eq(line, start, len, Keyword::new("optional")))  { return true; }
+    if (lex_eq(line, start, len, Keyword::new("This")))      { return true; }
 
     return false;
 }
@@ -428,36 +428,40 @@ function is_type_keyword(line: string, start: i64, len: i64) -> boolean {
 // Output helpers
 
 /// Emit `len` bytes of `line` starting at `offset`, uncolored.
-function emit_plain(out: void*, line: string, offset: i64, len: i64) -> void {
+function emit_plain(out: void*, line_text: string, offset: i64, len: i64) -> void {
+    const line: string = line_text;
     if (len <= 0) { return; }
     const start: i8* = (line as i8*) + offset;
-    DiagSink::emit_bytes(out, start as void*, len as u64);
+    diag_sink::DiagSink::emit_bytes(out, start as void*, len as u64);
 }
 
 /// Emit `len` bytes of `line` starting at `offset`, wrapped in
 /// `color`...HL_RESET.
-function emit_colored(out: void*, line: string, offset: i64, len: i64, color: string) -> void {
+function emit_colored(out: void*, line_text: string, offset: i64, len: i64, color_text: string) -> void {
+    const line: string = line_text;
     if (len <= 0) { return; }
     const start: i8* = (line as i8*) + offset;
-    DiagSink::emit_raw(out, color);
-    DiagSink::emit_bytes(out, start as void*, len as u64);
-    DiagSink::emit_raw(out, HL_RESET);
+    diag_sink::DiagSink::emit_raw(out, color_text);
+    diag_sink::DiagSink::emit_bytes(out, start as void*, len as u64);
+    diag_sink::DiagSink::emit_raw(out, HL_RESET);
 }
 
 
 // Byte / char helpers
 
 /// Read the byte at `i` in `line` as a `char`.
-function char_at(line: string, i: i64) -> char {
+function char_at(line_text: string, i: i64) -> char {
+    const line: string = line_text;
     return *(line + i) as char;
 }
 
 /// Compare a slice of `line` against a keyword literal, byte-for-byte.
-function lex_eq(line: string, start: i64, len: i64, kw: string) -> boolean {
+function lex_eq(line_text: string, start: i64, len: i64, kw_text: Keyword) -> boolean {
+    const kw: string = kw_text.as_string();
     const klen: i64 = kw.length() as i64;
     if (klen != len) { return false; }
     for (mut i: i64 = 0; i < len; i += 1) {
-        const a: char = char_at(line, start + i);
+        const a: char = char_at(line_text, start + i);
         const b: char = char_at(kw, i);
         if (a != b) { return false; }
     }

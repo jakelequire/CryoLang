@@ -1,0 +1,87 @@
+///! A destructor never releases a field of `this` by moving it out - that is
+///! E0453 (negative/E0453_destructor_field_move_out.cryo). The shapes it
+///! writes instead must release each field exactly once:
+///!
+///!  - leaving the field alone: field glue releases it after `drop` returns;
+///!  - swapping a replacement in with `mem::swap` and dropping what comes out,
+///!    which releases it where that is written, before the rest of the body;
+///!  - the same swap in an ordinary method, which releases the field at the
+///!    call and leaves nothing for the owner to release again.
+///!
+///! Each `Probe` release appends its tag to a module log, so a test asserts
+///! both how many releases ran and in what order: a second release shows as
+///! a repeated digit.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::DestructorFieldRelease;
+
+import std::core::mem;
+import std::core::result;
+import std::core::result::{ Result };
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+
+mut g_log: i64 = 0;
+function reset() -> void { g_log = 0; }
+
+/// Appends a decimal digit per event, so `123` reads "1, then 2, then 3".
+function note(tag: i64) -> void {
+    g_log = g_log * 10 + tag;
+}
+
+type struct Probe { tag: i64; }
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { note(this.tag); }
+}
+
+/// Body marker: 9.
+type struct LeftAlone { opt: Option<Probe>; }
+implement trait Drop for struct LeftAlone {
+    drop(mut &this) -> void { note(9); }
+}
+
+type struct SwappedOut { opt: Option<Probe>; }
+implement trait Drop for struct SwappedOut {
+    drop(mut &this) -> void {
+        mut closing: Option<Probe> = Option::None;
+        mem::swap(&closing, &this.opt);
+        mem::drop(closing);
+        note(9);
+    }
+}
+
+type struct Holder { opt: Option<Probe>; }
+implement struct Holder {
+    close(mut &this) -> void {
+        mut closing: Option<Probe> = Option::None;
+        mem::swap(&closing, &this.opt);
+        mem::drop(closing);
+    }
+}
+
+![test]
+function field_left_alone_is_released_once_after_the_body() -> Result<(), TestError> {
+    reset();
+    { const v: LeftAlone = LeftAlone { opt: Option::Some(Probe { tag: 1 }) }; }
+    return expect_eq(g_log, 91);
+}
+
+![test]
+function field_swapped_out_is_released_once_where_written() -> Result<(), TestError> {
+    reset();
+    { const v: SwappedOut = SwappedOut { opt: Option::Some(Probe { tag: 1 }) }; }
+    return expect_eq(g_log, 19);
+}
+
+![test]
+function method_swap_releases_at_the_call_and_not_again() -> Result<(), TestError> {
+    reset();
+    {
+        mut h: Holder = Holder { opt: Option::Some(Probe { tag: 1 }) };
+        h.close();
+        note(8);
+    }
+    return expect_eq(g_log, 18);
+}

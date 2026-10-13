@@ -5,7 +5,7 @@
 ///! in the project. Each test runs in its own forked child so a panic
 ///! or `Err` return in one test cannot take down the rest of the suite.
 ///!
-///! Output is cargo-style human-readable; the trailing summary reports
+///! Output is one line per test, human-readable; the trailing summary reports
 ///! counts and overall verdict. The default multi-threaded run streams a
 ///! LIVE feed: each result prints the instant it lands (in completion
 ///! order), and if the feed stalls the runner names the tests still in
@@ -43,29 +43,43 @@
 
 namespace std::test::runner;
 
-import core::intrinsics;
-import core::option;
-import core::result;
-import core::slice;
-import core::drop;
-import core::mem;
-import core::convert;
-import collections::str;
-import collections::string;
-import collections::array;
-import env;
-import io::error;
-import io::stdio;
-import fmt::display;
-import ffi::libc;
-import sys::syscall;
-import process::child;
-import process::command;
-import sync::atomic;
-import sync::mpsc;
-import thread;
-import test::descriptor;
-import test::error;
+import std::core::intrinsics;
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::slice;
+import std::core::slice::{ Slice };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::core::mem;
+import std::core::convert;
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::env;
+import std::io::error;
+import std::io::stdio;
+import std::io::stdio::{ is_tty, Stderr, stderr };
+import std::fmt::display;
+import std::ffi::libc;
+import std::sys::syscall;
+import std::sys::syscall::{ SYSTEM_INFO_PARTIAL };
+import std::process::child;
+import std::process::child::{ ExitStatus, decode_wstatus };
+import std::process::command;
+import std::sync::atomic;
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::sync::mpsc;
+import std::sync::mpsc::{ TryRecvError };
+import std::thread;
+import std::test::descriptor;
+import std::test::descriptor::{ TestDescriptor };
+import std::test::error;
+import std::test::error::{ TestError };
 
 // Output framing (ASCII only). 80-column rules used to set the header and
 // summary apart from the per-test stream.
@@ -156,7 +170,7 @@ type struct RunOptions {
     jobs_explicit: boolean;
     /// Capture each test's stdout+stderr into a per-test buffer instead of
     /// letting it stream to the terminal. On (the default) the buffer is
-    /// replayed only for failing tests (cargo-style), so a green parallel
+    /// replayed only for failing tests, so a green parallel
     /// run stays clean. `--nocapture` (or `CRYO_TEST_NOCAPTURE`) turns this
     /// off: the child inherits the parent's stdio and writes live, the
     /// pre-capture behaviour.
@@ -196,9 +210,7 @@ type struct RunOptions {
 }
 
 implement trait Drop for struct RunOptions {
-    drop(mut &this) -> void {
-        this.filter.drop();
-    }
+    drop(mut &this) -> void { }
 }
 
 // TestOutcome: what happened when one test ran
@@ -244,15 +256,13 @@ type struct TestRun {
     /// partial move out of a `Drop` aggregate (E0453).
     take_captured(mut &this) -> String {
         mut out: String = String::new();
-        mem::swap<String>(&this.captured, &out);
+        mem::swap::<String>(&this.captured, &out);
         return out;
     }
 }
 
 implement trait Drop for struct TestRun {
-    drop(mut &this) -> void {
-        this.captured.drop();
-    }
+    drop(mut &this) -> void { }
 }
 
 // Counters: running tally for the final summary
@@ -473,7 +483,7 @@ function apply_env_defaults(opts: mut &RunOptions) -> void {
         match (nc_opt) {
             Option::Some(mut s) => {
                 opts.capture = false;
-                s.drop();
+                mem::drop(s);
             }
             Option::None => { }
         }
@@ -483,7 +493,7 @@ function apply_env_defaults(opts: mut &RunOptions) -> void {
         match (j_opt) {
             Option::Some(mut s) => {
                 apply_jobs(opts, s.as_str());
-                s.drop();
+                mem::drop(s);
             }
             Option::None => { }
         }
@@ -493,7 +503,7 @@ function apply_env_defaults(opts: mut &RunOptions) -> void {
         match (to_opt) {
             Option::Some(mut s) => {
                 apply_timeout(opts, s.as_str());
-                s.drop();
+                mem::drop(s);
             }
             Option::None => { }
         }
@@ -503,7 +513,7 @@ function apply_env_defaults(opts: mut &RunOptions) -> void {
         match (fmt_opt) {
             Option::Some(mut s) => {
                 apply_format(opts, s.as_str());
-                s.drop();
+                mem::drop(s);
             }
             Option::None => { }
         }
@@ -513,7 +523,7 @@ function apply_env_defaults(opts: mut &RunOptions) -> void {
         match (col_opt) {
             Option::Some(mut s) => {
                 apply_color(opts, s.as_str());
-                s.drop();
+                mem::drop(s);
             }
             Option::None => { }
         }
@@ -525,7 +535,7 @@ function apply_env_defaults(opts: mut &RunOptions) -> void {
         match (no_color) {
             Option::Some(mut s) => {
                 opts.color = ColorMode::Never;
-                s.drop();
+                mem::drop(s);
             }
             Option::None => { }
         }
@@ -737,7 +747,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     mut exe_buf: u8[4096];
     mut exe_path: String = String::with_null(Str::new("/proc/self/exe"));
     const exe_n: i64 = libc::readlink(exe_path.as_ptr(), &exe_buf[0], 4095);
-    exe_path.drop();
+    mem::drop(exe_path);
     if (exe_n <= 0) {
         return TestRun::bare(TestOutcome::RunnerError(libc::errno()));
     }
@@ -781,7 +791,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
         const e: i32 = libc::errno();
         if (rd >= 0) { libc::close(rd); }
         if (wr >= 0) { libc::close(wr); }
-        argv.drop(); child_arg.drop(); timeout_arg.drop();
+        mem::drop(argv); mem::drop(child_arg); mem::drop(timeout_arg);
         return TestRun::bare(TestOutcome::RunnerError(e));
     }
 
@@ -818,14 +828,14 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
         if (rc >= 0) { break; }
         const err: i32 = libc::errno();
         if (err != 4) { // EINTR
-            argv.drop(); child_arg.drop(); timeout_arg.drop();
+            mem::drop(argv); mem::drop(child_arg); mem::drop(timeout_arg);
             return TestRun { outcome: TestOutcome::RunnerError(err), captured: captured };
         }
     }
 
-    argv.drop();
-    child_arg.drop();
-    timeout_arg.drop();
+    mem::drop(argv);
+    mem::drop(child_arg);
+    mem::drop(timeout_arg);
 
     const exit_status: ExitStatus = decode_wstatus(status);
     const outcome: TestOutcome = classify_outcome(exit_status, d.should_panic, timeout_secs);
@@ -868,7 +878,7 @@ function run_child_single(idx: u64, descriptors: TestDescriptor*, count: u64,
                 Result::Ok(_)  => { }
                 Result::Err(_) => { }
             }
-            match (stderr_h.write(Slice<u8>::from_raw("\n", 1))) {
+            match (stderr_h.write(Slice::<u8>::from_raw("\n", 1))) {
                 Result::Ok(_)  => { }
                 Result::Err(_) => { }
             }
@@ -1006,7 +1016,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
                 cap_path   = path;
                 have_cap   = true;
             } else {
-                path.drop();
+                mem::drop(path);
             }
         }
     }
@@ -1033,13 +1043,13 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     };
     const ok: i32 = syscall::CreateProcessA(null, cmd.as_ptr(), null, null,
                                             inherit, 0, null, null, &si, &pi);
-    cmd.drop();
+    mem::drop(cmd);
     if (ok == 0) {
         if (have_cap) {
             syscall::CloseHandle(cap_handle);
             syscall::DeleteFileA(cap_path.as_ptr());
         }
-        cap_path.drop();
+        mem::drop(cap_path);
         return TestRun::bare(TestOutcome::RunnerError(0));
     }
     syscall::CloseHandle(pi.hThread);
@@ -1056,7 +1066,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
             read_capture_file(&cap_path, &cap_to);
             syscall::DeleteFileA(cap_path.as_ptr());
         }
-        cap_path.drop();
+        mem::drop(cap_path);
         return TestRun { outcome: TestOutcome::Timeout(timeout_secs), captured: cap_to };
     }
     mut code: u32 = 0;
@@ -1071,7 +1081,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
         read_capture_file(&cap_path, &captured);
         syscall::DeleteFileA(cap_path.as_ptr());
     }
-    cap_path.drop();
+    mem::drop(cap_path);
 
     // No signals on Windows: a plain normal-exit ExitStatus drives the same
     // classifier the POSIX path uses.
@@ -1113,8 +1123,8 @@ function classify_outcome(exit_status: ExitStatus, should_panic: boolean,
 
 // Per-test framing
 
-/// Print the leading `test NAME ... ` line. Matches cargo's output so
-/// users coming from Rust feel at home. The trailing space lets the
+/// Print the leading `test NAME ... ` line, the name first so a run's
+/// lines read down one column. The trailing space lets the
 /// outcome word land on the same line.
 function print_test_prefix(name: Str) -> void {
     libc::printf("test %.*s ... ", name.length() as i32, name.as_ptr());
@@ -1200,13 +1210,10 @@ type struct ReporterState {
 }
 
 implement trait Drop for struct ReporterState {
-    drop(mut &this) -> void {
-        this.cur_group.drop();
-        this.cur_dots.drop();
-    }
+    drop(mut &this) -> void { }
 }
 
-// ---- Plain reporter (cargo-style, byte-identical to pre-1.0 output) ----
+// ---- Plain reporter (one line per test) ----
 
 /// `test FULL::QUALIFIED::NAME ... ` - the original prefix line. The
 /// trailing space lets the outcome word land on the same line.
@@ -1450,15 +1457,13 @@ type struct WorkerResult {
     /// Move the captured buffer out (swap-based; see `TestRun::take_captured`).
     take_captured(mut &this) -> String {
         mut out: String = String::new();
-        mem::swap<String>(&this.captured, &out);
+        mem::swap::<String>(&this.captured, &out);
         return out;
     }
 }
 
 implement trait Drop for struct WorkerResult {
-    drop(mut &this) -> void {
-        this.captured.drop();
-    }
+    drop(mut &this) -> void { }
 }
 
 /// Everything a pool worker needs, moved into the thread by value. The
@@ -1507,7 +1512,7 @@ function test_worker(ctx: WorkerCtx) -> void {
             idx: idx, kind: WorkerEventKind::Finished,
             outcome: tr.outcome, captured: tr.take_captured()
         };
-        tr.drop();
+        mem::drop(tr);
         match (ctx.sender.send(fin_ev)) {
             Result::Ok(_)  => { }
             Result::Err(_) => { }
@@ -1775,7 +1780,7 @@ type struct TestRunner {
             if (this.should_show(failed) && tr.captured.length() > 0) {
                 this.report_output(d.name, &tr.captured);
             }
-            tr.drop();
+            mem::drop(tr);
 
             if (failed) {
                 this.counts.failed = this.counts.failed + 1;
@@ -1820,17 +1825,17 @@ type struct TestRunner {
 
         const n_runnable: u64 = runnable.length();
         if (n_runnable == 0) {
-            in_flight.drop();
-            runnable.drop();
+            mem::drop(in_flight);
+            mem::drop(runnable);
             return;
         }
 
         // Shared work cursor on the stack; workers borrow it by pointer and we
         // join them all before this frame returns (scoped-thread idiom).
-        mut counter: Atomic<u64> = Atomic<u64>::new(0);
+        mut counter: Atomic<u64> = Atomic::<u64>::new(0);
         const cptr: Atomic<u64>* = &counter;
 
-        mut rx: mpsc::Receiver<WorkerResult> = mpsc::channel<WorkerResult>();
+        mut rx: mpsc::Receiver<WorkerResult> = mpsc::channel::<WorkerResult>();
 
         {
             mut scope: thread::Scope = thread::Scope::new();
@@ -1845,7 +1850,7 @@ type struct TestRunner {
                     capture:      this.opts.capture,
                     sender:       rx.sender(),
                 };
-                scope.spawn<WorkerCtx>(ctx, test_worker);
+                scope.spawn::<WorkerCtx>(ctx, test_worker);
                 w = w + 1;
             }
 
@@ -1889,7 +1894,7 @@ type struct TestRunner {
                                 finished = finished + 1;
                             }
                         }
-                        ev.drop();
+                        mem::drop(ev);
                         // Progress: clear the idle timer and re-arm the report.
                         idle_ms = 0;
                         next_report_ms = STALL_REPORT_MS;
@@ -1916,8 +1921,8 @@ type struct TestRunner {
             scope.join_all();
         }
 
-        in_flight.drop();
-        runnable.drop();
+        mem::drop(in_flight);
+        mem::drop(runnable);
     }
 
     /// Print the framed run header.
@@ -2003,16 +2008,13 @@ type struct TestRunner {
 }
 
 implement trait Drop for struct TestRunner {
-    drop(mut &this) -> void {
-        this.rstate.drop();
-        this.opts.drop();
-    }
+    drop(mut &this) -> void { }
 }
 
 // Entry point: called by the compiler-synthesized test main
 
 /// Run every test in `descriptors` that matches `argc/argv` filtering,
-/// printing cargo-style output. Returns 0 if every selected test
+/// printing a line per test. Returns 0 if every selected test
 /// passed; 1 otherwise.
 ///
 /// `descriptors` is a static array baked into the executable by the

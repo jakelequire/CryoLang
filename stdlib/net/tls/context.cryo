@@ -16,16 +16,24 @@
 
 namespace std::net::tls::context;
 
-import core::option;
-import core::result;
-import collections::str;
-import collections::string;
-import io::error;
-import ffi::libc;
-import ffi::openssl;
-import net::socket::tcp;
-import net::tls::stream;
-import net::tls::future;
+import std::core::option;
+import std::core::result;
+import std::core::result::{ Result };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::io::error;
+import std::io::error::{ IoError, IoErrorKind };
+import std::ffi::libc;
+import std::ffi::openssl;
+import std::net::socket::tcp;
+import std::net::socket::tcp::{ TcpStream };
+import std::net::tls::stream;
+import std::net::tls::stream::{ TlsStream };
+import std::net::tls::future;
+import std::net::tls::future::{ TlsHandshake };
+import std::core::mem;
 
 // ALPN wire form for "h2" then "http/1.1": each name is length-prefixed.
 //   0x02 'h' '2'   0x08 'h' 't' 't' 'p' '/' '1' '.' '1'
@@ -95,11 +103,11 @@ type struct TlsConnector {
         mut inner: TcpStream = stream;
         match (inner.set_nonblocking(true)) {
             Result::Ok(_)  => { }
-            Result::Err(e) => { inner.drop(); return Result::Err(e); }
+            Result::Err(e) => { mem::drop(inner); return Result::Err(e); }
         }
         const ssl: void* = openssl::SSL_new(this.ctx);
         if (ssl == null) {
-            inner.drop();
+            mem::drop(inner);
             return Result::Err(IoError::new(IoErrorKind::Other, 0));
         }
         openssl::SSL_set_fd(ssl, inner.raw_fd());
@@ -110,11 +118,13 @@ type struct TlsConnector {
             openssl::SSL_set1_host(ssl, host_c.as_ptr());
             openssl::SSL_set_verify(ssl, openssl::SSL_VERIFY_PEER, null);
         }
-        host_c.drop();
+        mem::drop(host_c);
         return Result::Ok(TlsHandshake::start(TlsStream::from_parts(ssl, inner),
                                               true, this.verify));
     }
+}
 
+implement trait Drop for struct TlsConnector {
     /// Release the context. Streams already minted keep their own
     /// reference and remain valid.
     drop(mut &this) -> void {
@@ -149,8 +159,8 @@ type struct TlsAcceptor {
                 openssl::SSL_FILETYPE_PEM) != 1) { ok = false; }
         if (ok && openssl::SSL_CTX_check_private_key(ctx) != 1) { ok = false; }
 
-        cert_c.drop();
-        key_c.drop();
+        mem::drop(cert_c);
+        mem::drop(key_c);
 
         if (!ok) {
             openssl::SSL_CTX_free(ctx);
@@ -173,18 +183,20 @@ type struct TlsAcceptor {
         mut inner: TcpStream = stream;
         match (inner.set_nonblocking(true)) {
             Result::Ok(_)  => { }
-            Result::Err(e) => { inner.drop(); return Result::Err(e); }
+            Result::Err(e) => { mem::drop(inner); return Result::Err(e); }
         }
         const ssl: void* = openssl::SSL_new(this.ctx);
         if (ssl == null) {
-            inner.drop();
+            mem::drop(inner);
             return Result::Err(IoError::new(IoErrorKind::Other, 0));
         }
         openssl::SSL_set_fd(ssl, inner.raw_fd());
         return Result::Ok(TlsHandshake::start(TlsStream::from_parts(ssl, inner),
                                               false, false));
     }
+}
 
+implement trait Drop for struct TlsAcceptor {
     drop(mut &this) -> void {
         if (this.ctx != null) {
             openssl::SSL_CTX_free(this.ctx);
@@ -198,7 +210,7 @@ type struct TlsAcceptor {
 /// the process by default; with it ignored, the write returns `EPIPE`
 /// and surfaces as a normal `BrokenPipe` `IoError` instead. Idempotent;
 /// every TLS context sets it on construction (the standard approach,
-/// matching libcurl and rust-openssl).
+/// matching libcurl).
 function ignore_sigpipe() -> void {
     libc::signal(libc::SIGPIPE, libc::SIG_IGN as void*);
 }

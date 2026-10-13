@@ -5,32 +5,96 @@
 /// Delegates to the expression, statement, and declaration codegen
 /// modules for the actual IR construction.
 
-namespace Compiler::Codegen::Visit::IRGenerator;
+namespace compiler::codegen::visit::ir_generator;
 
-import Compiler::Codegen;
-import Compiler::Codegen::{ LLVMTypes, TypeMap, Context, Util };
-import Compiler::Codegen::State::VisitorState;
-import Compiler::Codegen::Ops::{ IRFlowEmitter, IntrinsicsCodegen };
-import Compiler::Codegen::Visit::{
-    ExprDispatch, PatternEmitter, LambdaEmitter, ArrayLitEmitter, EnumVariantEmitter,
-    CallEmitter, NewDeleteEmitter, BinaryUnaryEmitter, PlaceEmitter, DeclVisitEmitter
+import compiler::codegen;
+import compiler::codegen::{ context, llvm, llvm_types, type_map, util };
+import compiler::codegen::state::visitor_state;
+import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::codegen::ops::{ ir_flow_emitter };
+import compiler::codegen::visit::{
+    expr_dispatch, pattern_emitter, lambda_emitter, array_lit_emitter, enum_variant_emitter,
+    call_emitter, new_delete_emitter, binary_unary_emitter, place_emitter, decl_visit_emitter
 };
-import Compiler::CompilationContext;
-import Compiler::DeclIndex;
-import Compiler::ModuleGraph;
-import Compiler::Diag;
-import Compiler::Diag::{ Diagnostic, SourceSpan };
-import Compiler::Types;
-import Compiler::Types::{
-    TypeRef, Type, Arena, Compound, UserDefined, Generic, GenericRegistry, Ownership, Resolver
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::decl_index;
+import compiler::decl_index::{ GlobalEntry };
+import compiler::module_graph;
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, source_span };
+import compiler::types;
+import compiler::types::{
+    arena, compound, generic, generic_registry, ownership, resolver, type_base, type_ref,
+    TypeKind, user_defined
 };
-import Compiler::AST;
-import Compiler::AST::{ Node, Visitor, Expression, Statement, Declaration, Pattern };
-import Compiler::Lex;
-import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName };
-import Utils::Logger;
+import compiler::ast;
+import compiler::ast::{
+    declaration, expression, LiteralKind, MemberPin, node, NodeKind, pattern, statement,
+    TypeAnnotation, visitor
+};
+import compiler::lex;
+import compiler::lex::lexer::{ Lexer };
+import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, Res, ResSlot, SourceLoc };
+import utils::logger;
+import utils::logger::{ cdebug };
 import std::collections::pair;
 import std::fmt::float;
+import std::ffi::libc;
+import std::fmt;
+import compiler::ast::declaration::{
+    ClassDeclNode, DestructureBinding, DestructureDeclNode, FunctionDeclNode,
+    ImplBlockNode, StructDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    CalleePin,
+    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
+    IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
+    ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode, StructLiteralNode,
+    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
+    YieldExprNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::pattern::{ MatchArmNode };
+import compiler::ast::statement::{
+    AsmBlockStmtNode, AsmConstraintKind, AsmDialect, AsmOpDir, AsmOperand, AsmPiece,
+    BlockStmtNode, BreakStmtNode, ContinueStmtNode, DeclStmtNode, DoWhileStmtNode,
+    ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
+    StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
+};
+import compiler::codegen::context::{ CodegenContext };
+import compiler::codegen::llvm_types::{
+    LBasicBlock, LContext, LTargetMachine, LType, LTypeKind, LValue
+};
+import compiler::codegen::ops::ir_flow_emitter::{ ForBlocks, IfBlocks, LoopBlocks };
+import compiler::codegen::util::{ CodegenUtil };
+import compiler::codegen::visit::array_lit_emitter::{ ArrayLitEmitter };
+import compiler::codegen::visit::call_emitter::{ CallEmitter };
+import compiler::codegen::visit::decl_visit_emitter::{ DeclVisitEmitter };
+import compiler::codegen::visit::expr_dispatch::{ ExprDispatch };
+import compiler::codegen::visit::lambda_emitter::{ LambdaEmitter };
+import compiler::codegen::visit::new_delete_emitter::{ NewDeleteEmitter };
+import compiler::codegen::visit::pattern_emitter::{ MatchSubjectInfo, PatternEmitter };
+import compiler::codegen::visit::place_emitter::{ PlaceEmitter };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::compound::{ ArrayType };
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::resolver::{ ResolutionContext };
+import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{
+    ClassType, EnumType, EnumVariantInfo, FieldInfo, StructType
+};
+import compiler::ast::visitor::{ BaseASTVisitor };
+import compiler::codegen::visit::binary_unary_emitter::{ BinaryUnaryEmitter };
+import compiler::codegen::visit::enum_variant_emitter::{ EnumVariantEmitter };
 
 
 // IRGeneratorVisitor
@@ -151,28 +215,6 @@ public:
         return bb.get_parent();
     }
 
-    /// Look up a type in the declaration index.
-    lookup_type(mut &this, name: SymbolStr) -> TypeRef {
-        const ctx_ptr: CompilationContext* = this.cg.ctx;
-        return ctx_ptr.decl_index.lookup_type(name);
-    }
-
-
-    /// Resolve a sizeof/alignof operand TypeAnnotation to a concrete TypeRef
-    /// at codegen time.  Drives the operand through the type_resolver so that
-    /// generic args (e.g., `HashMapEntry<K, V>` after substitution by the
-    /// monomorphizer) are honoured.  Returns invalid if the resolver is
-    /// unavailable or the annotation can't be resolved; callers fall back
-    /// to a name-based lookup.
-    resolve_sizeof_operand_type(mut &this, ann: TypeAnnotation*) -> TypeRef {
-        if (ann == null) { return TypeRef::invalid(); }
-        const ctx_ptr: CompilationContext* = this.cg.ctx;
-        if (ctx_ptr.type_resolver == null) { return TypeRef::invalid(); }
-        mut res_ctx: ResolutionContext = ResolutionContext::new(
-            ctx_ptr.source_file, "");
-        return ctx_ptr.type_resolver.resolve(ann, &res_ctx);
-    }
-
     // Top-level program generation
 
     /// Generate IR for an entire module's program.
@@ -182,19 +224,19 @@ public:
     ///   3. Generate function bodies
     generate_program(mut &this, program: ProgramNode*) -> boolean {
         if (program == null) {
-            cdebug("[IRGen] generate_program: program is null\n"); fflush(null);
+            cdebug("[IRGen] generate_program: program is null\n"); libc::fflush(null);
             return false;
         }
 
-        cdebug("[IRGen] Phase 1: declare_types...\n"); fflush(null);
+        cdebug("[IRGen] Phase 1: declare_types...\n"); libc::fflush(null);
         this.cg.decl.declare_types(program);
-        cdebug("[IRGen] Phase 1: done\n"); fflush(null);
+        cdebug("[IRGen] Phase 1: done\n"); libc::fflush(null);
 
-        cdebug("[IRGen] Phase 2: declare_functions...\n"); fflush(null);
+        cdebug("[IRGen] Phase 2: declare_functions...\n"); libc::fflush(null);
         this.cg.decl.declare_functions(program);
-        cdebug("[IRGen] Phase 2: done\n"); fflush(null);
+        cdebug("[IRGen] Phase 2: done\n"); libc::fflush(null);
 
-        cdebug("[IRGen] Phase 3: generate bodies (%lld stmts)...\n", program.statements.length); fflush(null);
+        cdebug("[IRGen] Phase 3: generate bodies (%lld stmts)...\n", program.statements.length); libc::fflush(null);
         const stmts: &ASTNode*[] = &program.statements;
         for (mut i: i64 = 0; i < stmts.length; i++) {
             const stmt: ASTNode* = stmts[i];
@@ -210,7 +252,8 @@ public:
             stmt.accept(this);
         }
 
-        cdebug("[IRGen] Phase 3: all bodies done\n"); fflush(null);
+        cdebug("[IRGen] Phase 3: all bodies done\n"); libc::fflush(null);
+        this.decl_visit.emit_global_initializers(this);
         return true;
     }
 
@@ -274,7 +317,9 @@ public:
 
     /// Comma-join two constraint fragments (skipping the leading comma when
     /// `a` is empty).  Used to assemble the inline-asm constraint string.
-    asm_join(a: string, b: string) -> string {
+    asm_join(a_text: string, b_text: string) -> string {
+        const a: string = a_text;
+        const b: string = b_text;
         if (a == "") { return b; }
         return a + "," + b;
     }
@@ -291,7 +336,7 @@ public:
         // when the required directive is missing, which sema has already
         // reported (codegen is skipped once diagnostics exist).
         if (node.arch != "") {
-            const _triple: string = LTargetMachine::resolve_effective_triple(this.cg.ctx.target_triple);
+            const _triple: string = this.cg.ctx.options.target_triple;
             if (!_triple.contains(node.arch)) {
                 this.state.last_value = LValue::null();
                 this.state.last_is_lvalue = false;
@@ -339,7 +384,7 @@ public:
             if (piece.is_operand) {
                 mut num: i64 = tmpl_num[piece.operand_index];
                 if (num < 0) { num = 0; }
-                tmpl = tmpl + format("$%d", num as i32);
+                tmpl = tmpl + fmt::format("$%d", num as i32);
             } else {
                 tmpl = tmpl + piece.text;
             }
@@ -381,7 +426,7 @@ public:
             for (mut q: i64 = 0; q < out_idx.length; q++) {
                 if (out_idx[q] == oi) { outpos = q; break; }
             }
-            cons = this.asm_join(cons, format("%d", outpos as i32));
+            cons = this.asm_join(cons, fmt::format("%d", outpos as i32));
         }
         for (mut c: i64 = 0; c < node.clobbers.length; c++) {
             const name: string = node.clobbers[c];
@@ -426,8 +471,8 @@ public:
         mut arg_buf: void* = null;
         mut ptype_buf: void* = null;
         if (nargs > 0) {
-            arg_buf = intrinsics::malloc((nargs * 8) as u64);
-            ptype_buf = intrinsics::malloc((nargs * 8) as u64);
+            arg_buf = libc::malloc((nargs * 8) as u64);
+            ptype_buf = libc::malloc((nargs * 8) as u64);
             const aslots: void** = arg_buf as void**;
             const pslots: void** = ptype_buf as void**;
             for (mut i: i64 = 0; i < nargs; i++) {
@@ -448,14 +493,14 @@ public:
             ret_ty = this.cg.type_mapper.map_type(op.expr.resolved_type);
         } else if (direct_out.length >= 2) {
             const dn: i64 = direct_out.length;
-            const tbuf: void* = intrinsics::malloc((dn * 8) as u64);
+            const tbuf: void* = libc::malloc((dn * 8) as u64);
             const tslots: void** = tbuf as void**;
             for (mut i: i64 = 0; i < dn; i++) {
                 const op: AsmOperand* = node.operands[out_idx[direct_out[i]]];
                 tslots[i] = this.cg.type_mapper.map_type(op.expr.resolved_type).raw;
             }
             ret_ty = LType::literal_struct(tbuf, dn as u32, false);
-            intrinsics::free(tbuf);
+            libc::free(tbuf);
         }
 
         // Build the inline-asm callee and issue the call.
@@ -465,8 +510,8 @@ public:
         const rname: string = if (direct_out.length == 0) { "" } else { "asm" };
         const result: LValue = this.cg.builder.build_call(fn_ty, callee, arg_buf, nargs as u32, rname);
 
-        if (arg_buf != null) { intrinsics::free(arg_buf); }
-        if (ptype_buf != null) { intrinsics::free(ptype_buf); }
+        if (arg_buf != null) { libc::free(arg_buf); }
+        if (ptype_buf != null) { libc::free(ptype_buf); }
 
         // Indirect memory operands (`*m`) pass a pointer; LLVM (opaque
         // pointers) requires an `elementtype(T)` attribute on each such
@@ -650,7 +695,7 @@ public:
         // String subjects need strcmp for pattern comparison, not icmp
         // (strings are i8* at the LLVM level and icmp would compare
         // pointer addresses, not content).
-        const subj_t: Type* = this.cg.lookup_type_by_id(node.subject.resolved_type.id);
+        const subj_t: Type* = this.cg.arena_type(node.subject.resolved_type);
         const is_string_subj: boolean = subj_t != null &&
             subj_t.kind == TypeKind::String;
 
@@ -664,7 +709,7 @@ public:
         // SocketAddr's IpAddr discriminant was neither V4 nor V6).
         mut arm_bbs: LBasicBlock[] = [];
         for (mut i: i64 = 0; i < num_arms; i++) {
-            const name: string = format("match.arm%lld", i);
+            const name: string = fmt::format("match.arm%lld", i);
             arm_bbs.push(LBasicBlock::append(current_fn, name));
         }
         const no_match_bb: LBasicBlock = LBasicBlock::append(current_fn, "match.no_match");
@@ -682,7 +727,7 @@ public:
             // discriminants hit `unreachable` rather than the post-match join.
             mut next_bb: LBasicBlock = no_match_bb;
             if (i + 1 < num_arms) {
-                next_bb = LBasicBlock::append(current_fn, format("match.test%lld", i + 1));
+                next_bb = LBasicBlock::append(current_fn, fmt::format("match.test%lld", i + 1));
             }
 
             // Emit the OR-pattern comparison chain for this arm.  A hit on
@@ -691,7 +736,7 @@ public:
             // full miss falls through to next_bb.
             if (arm.guard != null) {
                 const guard_bb: LBasicBlock = LBasicBlock::append(current_fn,
-                    format("match.guard%lld", i));
+                    fmt::format("match.guard%lld", i));
                 this.patterns.emit_match_arm_comparison(arm, guard_bb, next_bb,
                     minfo, is_string_subj, subject, current_fn, "match");
                 this.emit_guard_block(arm, guard_bb, arm_bbs[i], next_bb, minfo);
@@ -744,11 +789,11 @@ public:
             // `--panic=unwind` (hosted): raise through `__cryo_panic` so the
             // failure unwinds and drops the frame's live locals; the default
             // abort path stays byte-identical.
-            if (this.cg.ctx.project_panic_unwind && !this.cg.intrinsics.no_runtime) {
+            if (this.cg.ctx.options.unwinds() && !this.cg.intrinsics.no_runtime) {
                 this.emit_no_match_raise(node.span, &node.unwind_cleanup);
             } else {
                 mut no_ops: LValue[] = [];
-                this.cg.intrinsics.emit_check_sink("__cryo_panic_no_match",
+                this.cg.intrinsics.emit_check_sink(MangledName::new("__cryo_panic_no_match"),
                                                    node.span, &no_ops);
             }
         }
@@ -813,7 +858,7 @@ public:
         if (has_init) {
             init_val = this.dispatch.codegen_rvalue(this,node.initializer);
         }
-        this.cg.expr_ops.codegen_local_var(node.name, node.resolved_type,
+        this.cg.expr_ops.codegen_local_var(node.name, node.sym_id, node.resolved_type,
                           init_val, has_init, node.span, node.is_drop_flag);
     }
 
@@ -826,7 +871,7 @@ public:
 
         // Pull the struct fields off the resolved type so we can map binding
         // names -> field indices.
-        const ty: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+        const ty: Type* = this.cg.arena_type(node.resolved_type);
         if (ty == null) { return; }
 
         const empty_fields: FieldInfo[] = [];
@@ -863,28 +908,27 @@ public:
             const b: DestructureBinding = node.bindings[i];
             if (!b.resolved_type.is_valid()) { continue; }
 
-            mut field_idx: i64 = -1;
-            for (mut k: i64 = 0; k < fields_arr.length; k++) {
-                if (fields_arr[k].name.id == b.source_field.id) {
-                    field_idx = k;
-                    break;
-                }
-            }
-            if (field_idx < 0) { continue; }
+            const field_idx: i64 = b.field_index;
+            if (field_idx < 0 || field_idx >= fields_arr.length) { continue; }
+            // `fields_arr` is the type's own field list; the body it is read
+            // out of carries a class's vtable slot and inherited fields ahead
+            // of it, and alignment padding between fields.
+            const slot: i64 = this.cg.type_mapper.field_element_index(ty, field_idx);
+            if (slot < 0) { continue; }
 
             mut field_val: LValue = LValue::null();
             if (src_is_struct_value) {
                 field_val = this.cg.builder.build_extract_value(
-                    src_val, field_idx as u32, "destruct.field");
+                    src_val, slot as u32, "destruct.field");
             } else {
                 const field_ptr: LValue = this.cg.builder.build_struct_gep(
-                    struct_lty, src_val, field_idx as u32, "destruct.fieldptr");
+                    struct_lty, src_val, slot as u32, "destruct.fieldptr");
                 const field_lty: LType = this.cg.type_mapper.map_type(b.resolved_type);
                 if (!field_lty.is_valid()) { continue; }
                 field_val = this.cg.builder.build_load(field_lty, field_ptr, "destruct.fieldval");
             }
 
-            this.cg.expr_ops.codegen_local_var(b.local_name, b.resolved_type,
+            this.cg.expr_ops.codegen_local_var(b.local_name, b.sym_id, b.resolved_type,
                               field_val, true, b.span, false);
         }
     }
@@ -917,12 +961,12 @@ public:
             // contexts behave identically to concrete ones.
             mut sign_extend: boolean = true;
             mut is_128: boolean = false;
-            mut sty: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+            mut sty: Type* = this.cg.arena_type(node.resolved_type);
             mut sbd: i32 = 0;
             while (sty != null && sty.kind == TypeKind::InstantiatedType && sbd < 5) {
                 const sinst: InstantiatedType* = sty as InstantiatedType*;
                 if (sinst.has_resolved_type()) {
-                    sty = this.cg.lookup_type_by_id(sinst.resolved_type.id);
+                    sty = this.cg.arena_type(sinst.resolved_type);
                 } else { break; }
                 sbd += 1;
             }
@@ -939,7 +983,7 @@ public:
                 const digits: string = CodegenUtil::int_literal_clean(node.value, &radix);
                 this.state.last_value = LType::const_int_of_string(ty, digits, radix);
             } else {
-                const val: u64 = node.value.parse_int<u64>();
+                const val: u64 = node.value.parse_int::<u64>();
                 this.state.last_value = LType::const_int(ty, val, sign_extend);
             }
         } else if (kind == LiteralKind::Float) {
@@ -951,16 +995,15 @@ public:
             const val: f64 = float::parse_f64(fdigits).unwrap_or(0.0);
             this.state.last_value = LType::const_real(ty, val);
         } else if (kind == LiteralKind::String) {
-            this.state.last_value = this.cg.str_cache.get_or_create(node.value, &this.cg.llvm_module);
+            this.state.last_value = this.cg.str_cache.get_or_create(node.value, node.byte_length, &this.cg.llvm_module);
         } else if (kind == LiteralKind::Char) {
             // Char is stored as i32.  The lexer hands us the raw lexeme between
             // the surrounding quotes; for `'\n'` that's the two-char string
-            // "\\n" (backslash + n), not the resolved 0x0A.  `decode_char_lexeme`
-            // resolves the standard C-style escapes so `'\n' == 10`, `'\0' == 0`,
-            // etc.  Without this, every character-literal escape in cryoc source
-            // is wrong (e.g., `c == '\n'` in skip_whitespace never matches).
+            // "\\n" (backslash + n), not the resolved 0x0A.
+            // `Lexer::char_literal_value` resolves the escapes so `'\n' == 10`,
+            // `'\0' == 0`, `'\u{42}' == 66`.
             this.state.last_value = LType::const_int(LType::i32(),
-                                               CodegenUtil::decode_char_lexeme(node.value), false);
+                                               Lexer::char_literal_value(node.value) as u64, false);
         } else if (kind == LiteralKind::Boolean) {
             const bval: u64 = if (node.value == "true") { 1 } else { 0 };
             this.state.last_value = LType::const_int(LType::i1(), bval, false);
@@ -978,65 +1021,66 @@ public:
 
     /// Look up a named value (local, parameter, or global).
     codegen_identifier(mut &this, node: IdentifierNode*) -> void {
-        // Built-in pseudo-macros: FILE and LINE expand to the source location
-        // of the identifier reference.
-        const name_str: string = this.cg.resolve(node.name);
-        if (name_str.eq("FILE")) {
-            mut filename: string = node.span.file;
-            if (filename == null || filename.length() == 0) {
-                filename = "<unknown>";
+        // A source-location pseudo-constant expands to the location of the
+        // reference itself, which is the node's own span.
+        match (node.res) {
+            ResSlot::Answered(Res::SourceLoc(k)) => {
+                match (k) {
+                    SourceLoc::File => {
+                        mut filename: string = node.span.file;
+                        if (filename == null || filename.length() == 0) {
+                            filename = "<unknown>";
+                        }
+                        this.state.last_value = this.cg.builder.build_global_string_ptr(filename, "FILE.str");
+                    }
+                    SourceLoc::Line => {
+                        const line: u64 = node.span.start_line as u64;
+                        this.state.last_value = LType::const_int(LType::i32(), line, false);
+                    }
+                }
+                this.state.last_is_lvalue = false;
+                return;
             }
-            this.state.last_value = this.cg.builder.build_global_string_ptr(filename, "FILE.str");
-            this.state.last_is_lvalue = false;
-            return;
-        }
-        if (name_str.eq("LINE")) {
-            const line: u64 = node.span.start_line as u64;
-            this.state.last_value = LType::const_int(LType::i32(), line, false);
-            this.state.last_is_lvalue = false;
-            return;
+            _ => { }
         }
 
         // Try local/parameter first.
-        const local: LValue = this.cg.values.get(node.name);
+        const local: LValue = this.cg.values.get(node.res.local_sym());
         if (local.is_valid()) {
             this.state.last_value = local;
             this.state.last_is_lvalue = true;
             return;
         }
-
-        // Try global.
-        const global: LValue = this.cg.resolver.resolve_global(node.name);
-        if (global.is_valid()) {
-            this.state.last_value = global;
-            this.state.last_is_lvalue = true;
-            return;
+        // Neither a local nor a parameter: the stamp names the definition
+        // canonically.  A global is that name's namespace and leaf - two
+        // modules may each declare the same leaf with different values and
+        // types, and a specialized clone emitted into a third module reads
+        // whichever one a leaf-keyed lookup happened to cache first.  A
+        // function is sema's or mono's pin, routed as a call's is.  A name
+        // with neither yields no value; sema has already reported it.
+        const def_id: DefId = match (node.res) {
+            ResSlot::Answered(r) => { r.def_id() }
+            _                    => { DefId::invalid() }
+        };
+        if (def_id.is_valid()) {
+            const global: LValue = this.cg.resolver.resolve_global_of_def(def_id);
+            if (global.is_valid()) {
+                this.state.last_value    = global;
+                this.state.last_is_lvalue = true;
+                return;
+            }
         }
 
-        // Generic function-reference value (`tramp<i32>` used as a value):
-        // the monomorphizer pinned the specialized symbol on `resolved_callee`.
-        // Reference the monomorphized function directly instead of the bare
-        // template (which codegen skips), so taking its address yields the
-        // concrete instantiation's function pointer.
-        if (node.resolved_callee.is_valid()) {
-            const spec_fn: LValue =
-                this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
-            if (spec_fn.is_valid()) {
-                this.state.last_value = spec_fn;
+        if (node.resolved_callee.is_some()) {
+            const func: LValue = this.cg.resolver.resolve_pinned(node.resolved_callee);
+            if (func.is_valid()) {
+                this.state.last_value    = func;
                 this.state.last_is_lvalue = false;
                 return;
             }
         }
 
-        // Try function (for function references / first-class functions).
-        const func: LValue = this.cg.resolver.resolve_function(node.name);
-        if (func.is_valid()) {
-            this.state.last_value = func;
-            this.state.last_is_lvalue = false;
-            return;
-        }
-
-        this.state.last_value = LValue::null();
+        this.state.last_value    = LValue::null();
         this.state.last_is_lvalue = false;
     }
 
@@ -1044,7 +1088,7 @@ public:
     /// Materialize a struct literal `{ field: value, ... }` into a stack alloca
     /// and store each field.  Writes the alloca's address to `this.state.last_value`
     /// with `this.state.last_is_lvalue=true`; rvalue users load through it.
-    codegen_struct_literal(mut &this, struct_type: TypeRef, field_names: SymbolStr[], field_values: LValue[], site_span: SourceSpan) -> void {
+    codegen_struct_literal(mut &this, struct_type: TypeRef, field_names: SymbolStr[], field_pins: MemberPin[], field_values: LValue[], site_span: SourceSpan) -> void {
         const ty: LType = this.cg.type_mapper.map_type(struct_type);
         if (!ty.is_valid()) {
             this.state.last_value = LValue::null();
@@ -1078,12 +1122,18 @@ public:
         // initialized.  All members overlap at offset 0, so bitcast the alloca
         // to the initialized member's type and store there (mirrors union member
         // access).  Returns the alloca as an lvalue, like the struct path.
-        const ult: Type* = this.cg.lookup_type_by_id(struct_type.id);
+        const ult: Type* = this.cg.arena_type(struct_type);
         if (ult != null && ult.kind == TypeKind::Struct) {
             const ust: StructType* = ult as StructType*;
             if (ust.is_union) {
-                if (field_names.length == 1) {
-                    const ufidx: i64 = ust.field_index(field_names[0]);
+                if (field_pins.length == 1) {
+                    // The active member is the one sema pinned on the
+                    // initializer.
+                    mut ufidx: i64 = -1;
+                    match (field_pins[0]) {
+                        MemberPin::Field(_, ui) => { if (ui < ust.fields.length) { ufidx = ui; } }
+                        _                       => { }
+                    }
                     if (ufidx >= 0) {
                         const uft: TypeRef = ust.fields[ufidx].field_type;
                         const uflty: LType = this.cg.type_mapper.map_type(uft);
@@ -1108,53 +1158,27 @@ public:
         // contents, and packaging into a fat pointer.  Without this, the
         // store writes only the first few bytes of the field, leaving the
         // rest uninitialised, and downstream `provisions[k]` reads garbage.
-        const t: Type* = this.cg.lookup_type_by_id(struct_type.id);
-        // Collect the field info and a parallel slot-index map.  Structs are
-        // 1:1 with their LLVM-struct slots (slot = fidx).  Classes are
-        // flattened by `map_class`: slot 0 holds a vtable pointer if any
-        // class in the chain has virtual methods, then every ancestor's
-        // fields precede this class's own fields in root -> derived order.
-        // To support literals that name INHERITED fields (e.g. a `Derived`
-        // literal that writes a field declared on `Base`), we must walk the
-        // chain here, build a unified field list in the SAME order as
-        // `map_class`, and look up each named field across the whole chain.
-        // Without this walk, leaf-only `cls.fields` misses inherited names
-        // and the literal silently drops their initializer stores.
-        mut fields: FieldInfo[] = [];
-        mut field_slot: i64[] = [];  // parallel slot index per fields[i]
+        const t: Type* = this.cg.arena_type(struct_type);
+        // Each initializer carries the coordinates of the field it names -
+        // `(depth, index)`, a base class's field included - and the slot is
+        // computed from them by the routine the body was built from
+        // (`map_class` flattens a class: a vtable slot when any class in the
+        // chain has virtual methods, then every ancestor's fields root ->
+        // derived).  Nothing here searches a field list by the name.
         mut any_virtual: boolean = false;
         mut leaf_cls: ClassType* = null;
-        if (t != null && t.kind == TypeKind::Struct) {
-            const st: StructType* = t as StructType*;
-            for (mut sfi: i64 = 0; sfi < st.fields.length; sfi++) {
-                fields.push(st.fields[sfi]);
-                field_slot.push(sfi);
-            }
-        } else if (t != null && t.kind == TypeKind::Class) {
+        if (t != null && t.kind == TypeKind::Class) {
             const cls: ClassType* = t as ClassType*;
             leaf_cls = cls;
-            // Walk the base chain root-last (chain[0] = leaf, chain[N-1] = root).
-            mut chain: ClassType*[] = [];
             mut walk: ClassType* = cls;
             mut depth: i32 = 0;
             while (walk != null && depth < 16) {
-                chain.push(walk);
                 if (walk.has_virtual_methods) { any_virtual = true; }
                 if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-                const base_t: Type* = this.cg.lookup_type_by_id(walk.base_class.id);
+                const base_t: Type* = this.cg.arena_type(walk.base_class);
                 if (base_t == null || base_t.kind != TypeKind::Class) { break; }
                 walk = base_t as ClassType*;
                 depth += 1;
-            }
-            // Walk root -> derived so slot indices match `map_class:458-468`.
-            mut slot_idx: i64 = if (any_virtual) { 1 } else { 0 };
-            for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
-                const link: ClassType* = chain[ci];
-                for (mut li: i64 = 0; li < link.fields.length; li++) {
-                    fields.push(link.fields[li]);
-                    field_slot.push(slot_idx);
-                    slot_idx += 1;
-                }
             }
         }
 
@@ -1165,8 +1189,8 @@ public:
         // Mirrors the heap-`new` path in `new_delete_emitter.cryo:209-233`.
         if (any_virtual && leaf_cls != null) {
             const intern: InternTable* = this.cg.get_intern();
-            const qname: QualifiedName = QualifiedName::from_symbol(leaf_cls.qualified_name);
-            const vtbl_name: string = MangledName::for_vtable(intern, qname).resolve(intern);
+            const qname: QualifiedName = QualifiedName::from_symbol(leaf_cls.qualified_name.spelling());
+            const vtbl_name: MangledName = MangledName::for_vtable(intern, qname);
             mut vtbl_global: LValue = this.cg.llvm_module.get_named_global(vtbl_name);
             if (!vtbl_global.is_valid()) {
                 // Cross-module reference: declare as an extern.  The
@@ -1185,39 +1209,35 @@ public:
             }
         }
 
-        for (mut i: i64 = 0; i < field_names.length; i++) {
-            mut fidx: i64 = -1;
-            for (mut fi: i64 = 0; fi < fields.length; fi++) {
-                if (fields[fi].name.equals(field_names[i])) {
-                    fidx = fi;
-                    break;
-                }
+        for (mut i: i64 = 0; i < field_pins.length; i++) {
+            mut p_depth: i64 = -1;
+            mut p_index: i64 = -1;
+            match (field_pins[i]) {
+                MemberPin::Field(d, ix) => { p_depth = d; p_index = ix; }
+                _                       => { }
             }
-            if (fidx < 0) {
-                // The literal names a field the resolved struct layout
-                // doesn't carry.  In practice this only happens when
-                // `struct_type` failed to monomorphize to a concrete spec
-                // and resolved to the bare generic template instead (whose
-                // arena `fields` list is empty - fields are only populated
-                // on concrete specializations).  Silently `continue`-ing
-                // here emits the alloca with NO field stores, so the caller
-                // reads uninitialized stack as the field values (a silent
-                // value-corruption miscompile).  Sema already validates
-                // every literal field against the struct, so a miss at
-                // codegen is always an upstream resolution/monomorphization
-                // bug - fail loud instead of corrupting silently.
+            const pin_slot: i64 = this.cg.type_mapper.pinned_element_index(t, p_depth, p_index);
+            const pin_field: FieldInfo* = this.cg.type_mapper.pinned_field(t, p_depth, p_index);
+            if (pin_slot < 0 || pin_field == null) {
+                // The initializer's coordinates name no slot in the resolved
+                // layout: a literal no sema walk answered (the pass that
+                // minted it owes it the pin), or a type that did not
+                // monomorphize to a concrete layout (a bare template's arena
+                // `fields` list is empty).  Silently `continue`-ing here
+                // emits the alloca with NO field stores, so the caller reads
+                // uninitialized stack as the field values - fail loud instead.
                 this.cg.diag.emit_error_at_span(
                     ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
-                    format("codegen: struct literal field '%s' has no slot in the resolved struct type (type did not monomorphize to a concrete layout); upstream monomorphization bug",
+                    fmt::format("codegen: struct literal field '%s' has no slot in the resolved struct type (no field pin from sema, or the type did not monomorphize to a concrete layout)",
                            this.cg.resolve(field_names[i])),
                     site_span);
                 continue;
             }
-            const slot: u32 = field_slot[fidx] as u32;
+            const slot: u32 = pin_slot as u32;
             const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, slot, "field");
             mut val: LValue = field_values[i];
             if (val.is_valid()) {
-                val = this.cg.expr_ops.coerce_fixed_array_to_fat_ptr(val, fields[fidx].field_type);
+                val = this.cg.expr_ops.coerce_fixed_array_to_fat_ptr(val, pin_field.field_type);
                 // Widen/narrow integer literals to the field's declared
                 // width before storing.  `HashMap { len: 0, cap: 0, ... }`
                 // arrives with each `0` as `i32 0` (codegen_literal defaults
@@ -1246,8 +1266,8 @@ public:
                         // fixed ones (the size sentinel was treated as
                         // a positive i64).  Mirrors the local-var fix.
                         mut signed_target: boolean = false;
-                        const field_t: Type* = this.cg.lookup_type_by_id(
-                            fields[fidx].field_type.id);
+                        const field_t: Type* = this.cg.arena_type(
+                            pin_field.field_type);
                         if (field_t != null && field_t.kind == TypeKind::Int) {
                             const ft_int: IntType* = field_t as IntType*;
                             signed_target = ft_int.int_kind.is_signed();
@@ -1331,6 +1351,7 @@ public:
         const obj_is_lvalue: boolean = this.state.last_is_lvalue;
         this.places.codegen_member_access(obj, node.object.resolved_type,
                                           obj_is_lvalue, node.member,
+                                          node.resolved_member, node.pin_carried,
                                           node.span);
     }
 
@@ -1368,8 +1389,8 @@ public:
     }
 
     override visit(mut &this, node: CastExprNode*) -> void {
-        const src_t: Type* = this.cg.lookup_type_by_id(node.expression.resolved_type.id);
-        const dst_t: Type* = this.cg.lookup_type_by_id(node.resolved_target.id);
+        const src_t: Type* = this.cg.arena_type(node.expression.resolved_type);
+        const dst_t: Type* = this.cg.arena_type(node.resolved_target);
         const dst_is_ptr_like: boolean = dst_t != null &&
             (dst_t.kind == TypeKind::Pointer || dst_t.kind == TypeKind::String);
 
@@ -1430,21 +1451,29 @@ public:
         }
     }
 
-    override visit(mut &this, node: SizeofExprNode*) -> void {
-        mut sz_type_ref: TypeRef = this.resolve_sizeof_operand_type(node.type_ann);
-        if (!sz_type_ref.is_valid()) {
-            sz_type_ref = this.lookup_type(node.type_name);
+    /// The operand of a `sizeof`/`alignof` is decided by sema (a body's) or
+    /// type resolution (a constant's, a `static_assert`'s), and read here.  An
+    /// operand nothing decided is a compiler defect, not a size of 0: an
+    /// annotation naming no type is not refused in expression position, and
+    /// this is where that silence would otherwise become a value.
+    layout_operand(mut &this, what: string, operand: TypeRef, span: SourceSpan) -> TypeRef {
+        if (!operand.is_valid()) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("codegen: the operand of `%s` reached codegen with no type decided", what),
+                span);
         }
-        this.state.last_value = this.cg.expr_ops.codegen_sizeof(sz_type_ref);
+        return operand;
+    }
+
+    override visit(mut &this, node: SizeofExprNode*) -> void {
+        this.state.last_value = this.cg.expr_ops.codegen_sizeof(
+            this.layout_operand("sizeof", node.operand_type, node.span));
         this.state.last_is_lvalue = false;
     }
 
     override visit(mut &this, node: AlignofExprNode*) -> void {
-        mut al_type_ref: TypeRef = this.resolve_sizeof_operand_type(node.type_ann);
-        if (!al_type_ref.is_valid()) {
-            al_type_ref = this.lookup_type(node.type_name);
-        }
-        this.state.last_value = this.cg.expr_ops.codegen_alignof(al_type_ref);
+        this.state.last_value = this.cg.expr_ops.codegen_alignof(
+            this.layout_operand("alignof", node.operand_type, node.span));
         this.state.last_is_lvalue = false;
     }
 
@@ -1494,22 +1523,20 @@ public:
     }
 
     override visit(mut &this, node: StructLiteralNode*) -> void {
-        // Use the sema-tagged `resolved_type`; it's the authoritative
-        // TypeRef produced by `lookup_type_by_sym`, which does the full
-        // resolution cascade (current-module qualify, DI direct, scope
-        // chain, arena leaf index).  Cryo objects never have valid
-        // bare-name lookups (only C externs do), so there's no point
-        // in falling back to `decl_index.lookup_type(node.struct_type)`
-        // with the user's source-level identifier.
+        // Use the sema-tagged `resolved_type`: it is the type sema resolved the
+        // literal to from the name layer's stamp, and codegen does not resolve
+        // the spelling again.
         const type_ref: TypeRef = node.resolved_type;
         mut field_names: SymbolStr[] = [];
+        mut field_pins: MemberPin[] = [];
         mut field_values: LValue[] = [];
         for (mut i: i64 = 0; i < node.field_inits.length; i++) {
             const init: FieldInit = node.field_inits[i];
             field_names.push(init.field_name);
+            field_pins.push(init.pin);
             field_values.push(this.dispatch.codegen_rvalue(this,init.value));
         }
-        this.codegen_struct_literal(type_ref, field_names, field_values, node.span);
+        this.codegen_struct_literal(type_ref, field_names, field_pins, field_values, node.span);
     }
 
     /// Array literal: delegate to ArrayLitEmitter, which handles all three
@@ -1527,36 +1554,16 @@ public:
         this.lambda.emit(this, node);
     }
 
+    /// A qualified path in VALUE position: a function taken as a value, an
+    /// enum variant, or a global.  Each answers from what sema recorded on the
+    /// node - the pin, `resolved_type`, the qualifier's stamp - and nothing is
+    /// looked up by the spelling.  A path sema pinned nothing for and that
+    /// names no variant or global yields no value, which is the front end's
+    /// miss reported as the front end's (sema already diagnosed it).
     override visit(mut &this, node: ScopeResolutionNode*) -> void {
-        const intern: InternTable* = this.cg.get_intern();
-
-        // 1. Simple combined lookup (bare scope_name::member_name)
-        const scope_str_bare: string = this.cg.resolve(node.scope_name);
-        const member_str: string     = this.cg.resolve(node.member_name);
-        const combined_bare: string  = format("%s::%s", scope_str_bare, member_str);
-        const sym_bare: SymbolStr    = this.cg.intern_str(combined_bare);
-
-        mut fn_val: LValue = this.cg.resolver.resolve_function(sym_bare);
-        if (fn_val.is_valid()) {
-            this.state.last_value    = fn_val;
-            this.state.last_is_lvalue = false;
-            return;
-        }
-
-        // 2. Qualified scope lookup
-        // Static methods are registered under their fully-qualified owner name
-        // (e.g. `MyNS::Handler::greet_static`).  Resolve the scope name through
-        // the DI type map; the same approach the call-site path uses.
-        const resolved_scope: SymbolStr = this.cg.ctx.resolve_scoped_or(node.scope_name);
-        const scope_str_qual: string    = intern.resolve(resolved_scope);
-        const combined_qual: string     = format("%s::%s", scope_str_qual, member_str);
-        const sym_qual: SymbolStr       = intern.intern(combined_qual);
-
-        if (!sym_qual.equals(sym_bare)) {
-            fn_val = this.cg.functions.get(sym_qual);
-            if (!fn_val.is_valid()) {
-                fn_val = this.cg.resolver.resolve_function(sym_qual);
-            }
+        // 1. A function: sema's pin, routed as a call's pin is.
+        if (node.resolved_callee.is_some()) {
+            const fn_val: LValue = this.cg.resolver.resolve_pinned(node.resolved_callee);
             if (fn_val.is_valid()) {
                 this.state.last_value    = fn_val;
                 this.state.last_is_lvalue = false;
@@ -1564,64 +1571,61 @@ public:
             }
         }
 
-        // 3. Global variable lookups
-        const global: LValue = this.cg.resolver.resolve_global(sym_bare);
-        if (global.is_valid()) {
-            this.state.last_value    = global;
-            this.state.last_is_lvalue = true;
-            return;
-        }
-        // The scope names a MODULE: resolve the global that module declares
-        // before trying the bare leaf below. Two modules may each declare the
-        // same leaf with different values and types (`libc::FIONBIO` is a Linux
-        // ioctl number, `syscall::FIONBIO` the Winsock one), and the bare lookup
-        // cannot tell them apart.
-        const scoped_global: LValue =
-            this.cg.resolver.resolve_global_in_scope(node.member_name, node.scope_name);
-        if (scoped_global.is_valid()) {
-            this.state.last_value    = scoped_global;
-            this.state.last_is_lvalue = true;
-            return;
-        }
-        // Bare-name global lookup. Top-level `const X: T = ...` declarations
-        // register globals under their bare name (e.g. `O_RDWR`); when
-        // referenced as `libc::O_RDWR` from another module the combined-
-        // name lookup misses, so also try the bare member name. Reached only
-        // when no single module matched the scope above.
-        const bare_global: LValue = this.cg.resolver.resolve_global(node.member_name);
-        if (bare_global.is_valid()) {
-            this.state.last_value    = bare_global;
-            this.state.last_is_lvalue = true;
-            return;
+        // 2. An enum variant (`Option::None`, `Key::E`), from sema's
+        // `resolved_type`: it names the enum this path denotes, through any
+        // chain of instantiations, and a member it has no variant for is not
+        // an enum reference at all.
+        if (this.try_emit_enum_variant(node)) { return; }
+
+        // 3. A global: the registration slot sema pinned, read back from
+        // the index by the slot.  Sema found it under the module the
+        // qualifier's stamp names and the member leaf - two modules may each
+        // declare the same leaf (`libc::FIONBIO`, `syscall::FIONBIO`) - and
+        // that answer is carried here rather than derived again.
+        match (node.resolved_member) {
+            MemberPin::Global(slot) => {
+                const global: LValue = this.cg.resolver.resolve_global_at(slot);
+                if (global.is_valid()) {
+                    this.state.last_value    = global;
+                    this.state.last_is_lvalue = true;
+                    return;
+                }
+            }
+            _ => { }
         }
 
-        // 4. Enum variant reference (e.g., Option::None)
-        // Use resolved_type from sema to find the concrete enum type.
-        // Follow InstantiatedType chain (may be multiple levels).
+        this.state.last_value    = LValue::null();
+        this.state.last_is_lvalue = false;
+    }
+
+    /// Emit `Enum::Variant` as its discriminant, or false when this path does
+    /// not name a variant.
+    ///
+    /// The enum comes from sema's `resolved_type`, through any chain of
+    /// instantiations, so a generic enum is answered by the type it was
+    /// instantiated to rather than by its declaration.
+    try_emit_enum_variant(mut &this, node: ScopeResolutionNode*) -> boolean {
         mut real_ref: TypeRef = node.resolved_type;
-        mut real_t: Type* = this.cg.lookup_type_by_id(real_ref.id);
+        mut real_t: Type* = this.cg.arena_type(real_ref);
         mut sr_depth: i32 = 0;
         while (real_t != null && real_t.kind == TypeKind::InstantiatedType && sr_depth < 5) {
             const inst: InstantiatedType* = real_t as InstantiatedType*;
             if (inst.has_resolved_type()) {
                 real_ref = inst.resolved_type;
-                real_t = this.cg.lookup_type_by_id(real_ref.id);
+                real_t = this.cg.arena_type(real_ref);
             } else { break; }
             sr_depth += 1;
         }
-        if (real_t != null && real_t.kind == TypeKind::Enum) {
-            const et: EnumType* = real_t as EnumType*;
-            const variant: EnumVariantInfo* = et.get_variant(node.member_name);
-            if (variant != null) {
-                mut no_args: LValue[] = [];
-                this.state.last_value = this.enum_variant.build(et, variant, real_ref, no_args);
-                this.state.last_is_lvalue = false;
-                return;
-            }
-        }
+        if (real_t == null || real_t.kind != TypeKind::Enum) { return false; }
 
-        this.state.last_value    = LValue::null();
+        const et: EnumType* = real_t as EnumType*;
+        const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, node.resolved_member);
+        if (variant == null) { return false; }
+
+        mut no_args: LValue[] = [];
+        this.state.last_value = this.enum_variant.build(et, variant, real_ref, no_args);
         this.state.last_is_lvalue = false;
+        return true;
     }
 
     /// Match expression: produces a value via phi node.
@@ -1686,7 +1690,7 @@ public:
 
         // String subjects need strcmp (i8* content compare), not icmp
         // (which would compare pointer addresses).
-        const e_subj_t: Type* = this.cg.lookup_type_by_id(node.subject.resolved_type.id);
+        const e_subj_t: Type* = this.cg.arena_type(node.subject.resolved_type);
         const is_string_subj_e: boolean = e_subj_t != null &&
             e_subj_t.kind == TypeKind::String;
 
@@ -1695,7 +1699,7 @@ public:
         // Create basic blocks: one per arm + a no_match trap + merge.
         mut arm_bbs: LBasicBlock[] = [];
         for (mut i: i64 = 0; i < num_arms; i++) {
-            arm_bbs.push(LBasicBlock::append(current_fn, format("mexpr.arm%lld", i)));
+            arm_bbs.push(LBasicBlock::append(current_fn, fmt::format("mexpr.arm%lld", i)));
         }
         // no_match block traps when the discriminant matches no arm; same
         // rationale as visit_match_stmt: without the trap, control silently
@@ -1711,7 +1715,7 @@ public:
 
             mut next_bb: LBasicBlock = default_bb;
             if (i + 1 < num_arms) {
-                next_bb = LBasicBlock::append(current_fn, format("mexpr.test%lld", i + 1));
+                next_bb = LBasicBlock::append(current_fn, fmt::format("mexpr.test%lld", i + 1));
             }
 
             // Emit the OR-pattern comparison chain for this arm (see
@@ -1719,7 +1723,7 @@ public:
             // Guarded arms route a pattern hit through a guard block first.
             if (arm.guard != null) {
                 const guard_bb: LBasicBlock = LBasicBlock::append(current_fn,
-                    format("mexpr.guard%lld", i));
+                    fmt::format("mexpr.guard%lld", i));
                 this.patterns.emit_match_arm_comparison(arm, guard_bb, next_bb,
                     minfo, is_string_subj_e, subject, current_fn, "mexpr");
                 this.emit_guard_block(arm, guard_bb, arm_bbs[i], next_bb, minfo);
@@ -1736,8 +1740,8 @@ public:
         // Generate arm bodies and collect values + end blocks for phi.
         // Allocate num_arms + 1 for the default block entry.
         const result_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
-        mut phi_vals: void* = intrinsics::malloc((num_arms + 1) as u64 * 8);
-        mut phi_blks: void* = intrinsics::malloc((num_arms + 1) as u64 * 8);
+        mut phi_vals: void* = libc::malloc((num_arms + 1) as u64 * 8);
+        mut phi_blks: void* = libc::malloc((num_arms + 1) as u64 * 8);
         const phi_vals_arr: void** = phi_vals as void**;
         const phi_blks_arr: void** = phi_blks as void**;
         mut phi_count: u32 = 0;
@@ -1808,11 +1812,11 @@ public:
         if (!default_bb.has_terminator()) {
             this.cg.builder.position_at_end(default_bb);
             // `--panic=unwind` (hosted): raise + cleanup instead of abort.
-            if (this.cg.ctx.project_panic_unwind && !this.cg.intrinsics.no_runtime) {
+            if (this.cg.ctx.options.unwinds() && !this.cg.intrinsics.no_runtime) {
                 this.emit_no_match_raise(node.span, &node.unwind_cleanup);
             } else {
                 mut no_ops_e: LValue[] = [];
-                this.cg.intrinsics.emit_check_sink("__cryo_panic_no_match",
+                this.cg.intrinsics.emit_check_sink(MangledName::new("__cryo_panic_no_match"),
                                                    node.span, &no_ops_e);
             }
         }
@@ -1828,8 +1832,8 @@ public:
         }
         this.state.last_is_lvalue = false;
 
-        intrinsics::free(phi_vals);
-        intrinsics::free(phi_blks);
+        libc::free(phi_vals);
+        libc::free(phi_blks);
     }
 
     override visit(mut &this, node: TernaryExprNode*) -> void {
@@ -1856,8 +1860,8 @@ public:
         //
         // Coercing after the branch would instead leave `zext`/`sext`/`inttoptr`
         // sitting past the terminator, so the block reads as having none.
-        const vals: void* = intrinsics::malloc(16);
-        const blks: void* = intrinsics::malloc(16);
+        const vals: void* = libc::malloc(16);
+        const blks: void* = libc::malloc(16);
         const vals_arr: void** = vals as void**;
         const blks_arr: void** = blks as void**;
         mut n: u32 = 0;
@@ -1904,8 +1908,8 @@ public:
             // value to produce.
             this.state.last_value = LValue::null();
         }
-        intrinsics::free(vals);
-        intrinsics::free(blks);
+        libc::free(vals);
+        libc::free(blks);
         this.state.last_is_lvalue = false;
     }
 

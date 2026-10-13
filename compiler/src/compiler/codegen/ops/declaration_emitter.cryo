@@ -13,24 +13,103 @@
 /// `CompilationContext`.  Does NOT import the parent Context module to
 /// avoid a module-graph cycle.
 
-namespace Compiler::Codegen::Ops::DeclarationEmitter;
+namespace compiler::codegen::ops::declaration_emitter;
 
-import Compiler::Codegen;
-import Compiler::Codegen::{ LLVMTypes, TypeMap, Abi, Util };
-import Compiler::Codegen::State::{ ValueTable, FunctionRegistry, GlobalRegistry, StringCache, DiagSink };
-import Compiler::Codegen::Ops::{ IRFlowEmitter, SymbolResolver, IntrinsicEmitter, ExprOps };
-import Compiler::CompilationContext;
-import Compiler::DeclIndex;
-import Compiler::Diag;
-import Compiler::Diag::{ Diagnostic, SourceSpan };
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Generic, Ownership };
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration };
-import Compiler::Resolver::{ SymbolStr, InternTable, MangledName, QualifiedName };
+import compiler::codegen;
+import compiler::codegen::{ abi, llvm, llvm_types, type_map, util };
+import compiler::codegen::state::{ value_table, function_registry, global_registry, string_cache, diag_sink };
+import compiler::codegen::ops::{ ir_flow_emitter, symbol_resolver, intrinsic_emitter, expr_ops };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::const_table;
+import compiler::const_table::{ ConstEval };
+import compiler::decl_index;
+import compiler::decl_index::{ DeclarationIndex };
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, source_span };
+import compiler::types;
+import compiler::types::{
+    arena, compound, generic, ownership, type_base, type_ref, TypeKind, user_defined
+};
+import compiler::ast;
+import compiler::ast::{ declaration, LiteralKind, node, NodeKind };
+import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name, res };
+import compiler::decl_index::{ OverloadId };
 import std::collections::pair;
+import std::collections::pair::{ Pair };
 import std::fmt::float;
+import compiler::ast::expression;
+import compiler::ast::expression::{
+    CalleePin,
+    ArrayLiteralNode, BinaryExprNode, CastExprNode, ExpressionNode, LiteralNode,
+    ScopeResolutionNode, StructLiteralNode, UnaryExprNode
+};
+import compiler::types::generic_registry;
+import compiler::types::generic_registry::{ GenericRegistry };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import std::ffi::libc;
+import std::fmt;
+import compiler::ast::declaration::{
+    ClassDeclNode, EnumDeclNode, ExternBlockNode, FunctionDeclNode, ImplBlockNode,
+    IntrinsicDeclNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::lex::{ TokenType };
+import compiler::codegen::abi::{ AbiAttr, AbiClassifier, ArgClass, ParamPlan, SignaturePlan };
+import compiler::codegen::llvm_types::{
+    LBasicBlock, LBuilder, LContext, LLinkage, LModule, LType, LTypeKind, LValue
+};
+import compiler::codegen::ops::expr_ops::{ ExprOps };
+import compiler::codegen::ops::ir_flow_emitter::{ IRFlowEmitter };
+import compiler::codegen::ops::symbol_resolver::{ SymbolResolver };
+import compiler::codegen::state::diag_sink::{ DiagSink };
+import compiler::codegen::state::global_registry::{ GlobalRegistry };
+import compiler::codegen::state::string_cache::{ StringCache };
+import compiler::codegen::state::value_table::{ ValueTable };
+import compiler::codegen::type_map::{ TypeMapper };
+import compiler::codegen::util::{ CodegenUtil, VTableSlot };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name::{ DeclName };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{ FunctionType };
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{
+    ClassType, EnumType, EnumVariantInfo, MethodInfo, StructType
+};
+import compiler::codegen::ops::intrinsic_emitter::{ IntrinsicEmitter };
+import compiler::codegen::state::function_registry::{ FunctionRegistry };
 
+
+/// A module's DWARF builder and file, both null unless `-g`.
+type struct DebugInfoState {
+    builder: void*;
+    file:    void*;
+
+    static off() -> DebugInfoState {
+        return DebugInfoState { builder: null, file: null };
+    }
+
+    is_on(&this) -> boolean {
+        return this.builder != null;
+    }
+}
+
+/// The module's globals whose initializer no constant fold answers, in
+/// declaration order, with the storage each was given.  Their values are
+/// computed when the program starts (`emit_global_initializers`).  Read by
+/// position only.
+type struct StartedGlobals {
+    nodes: VarDeclNode*[];
+    slots: LValue[];
+}
 
 type struct DeclarationEmitter {
     llvm_module: LModule*;
@@ -46,10 +125,13 @@ type struct DeclarationEmitter {
     expr_ops:    ExprOps*;
     intrinsics:  IntrinsicEmitter*;
     diag:        DiagSink*;
+    debug_info:  DebugInfoState*;
     ctx:         CompilationContext*;
+    started:     StartedGlobals;
 
     static null() -> DeclarationEmitter {
         return DeclarationEmitter {
+            started:     StartedGlobals { nodes: [], slots: [] },
             llvm_module: null,
             builder:     null,
             type_mapper: null,
@@ -63,6 +145,7 @@ type struct DeclarationEmitter {
             expr_ops:    null,
             intrinsics:  null,
             diag:        null,
+            debug_info:  null,
             ctx:         null,
         };
     }
@@ -75,7 +158,8 @@ type struct DeclarationEmitter {
          str_cache: StringCache*,
          flow: IRFlowEmitter*, resolver: SymbolResolver*,
          expr_ops: ExprOps*, intrinsics: IntrinsicEmitter*,
-         diag: DiagSink*, ctx: CompilationContext*) -> void {
+         diag: DiagSink*, debug_info: DebugInfoState*,
+         ctx: CompilationContext*) -> void {
         this.llvm_module = llvm_module;
         this.builder     = builder;
         this.type_mapper = type_mapper;
@@ -89,6 +173,7 @@ type struct DeclarationEmitter {
         this.expr_ops    = expr_ops;
         this.intrinsics  = intrinsics;
         this.diag        = diag;
+        this.debug_info  = debug_info;
         this.ctx         = ctx;
     }
 
@@ -111,34 +196,6 @@ type struct DeclarationEmitter {
         return c.decl_index;
     }
 
-    qualify(&this, sym: SymbolStr) -> SymbolStr {
-        const c: CompilationContext* = this.ctx;
-        return c.qualify_symbol_sym(sym);
-    }
-
-    /// Qualified name for a function declaration, honoring a canonical
-    /// (template-derived) namespace stamped on injected generic specs.
-    ///
-    /// Free-function / static-method-generic specializations have no arena
-    /// type to carry a location-independent name (unlike type specs, whose
-    /// methods key off the type's arena qualified name).  Phase 6a stamps the
-    /// spec's TEMPLATE namespace onto the cloned FunctionDeclNode's
-    /// `source_module` field; reading it back here makes the emitted definition
-    /// symbol a function of the template module rather than of whichever module
-    /// emits the body, so callers (who derive the same canonical name via the
-    /// DeclarationIndex) link to it regardless of placement.  Non-spec
-    /// functions have an empty `source_module` and fall back to the ambient
-    /// module namespace.  Must stay in lockstep with the DI registration in
-    /// `TypeResolutionPasses::register_decl_in_index` (FunctionDeclaration).
-    fn_qualified_name(&this, node: FunctionDeclNode*) -> SymbolStr {
-        if (node.source_module != "") {
-            const i: InternTable* = this.get_intern();
-            return i.intern(node.source_module + "::" + i.resolve(node.name));
-        }
-        const c: CompilationContext* = this.ctx;
-        return c.qualify_symbol_sym(node.name);
-    }
-
     resolve(&this, sym: SymbolStr) -> string {
         const i: InternTable* = this.get_intern();
         return i.resolve(sym);
@@ -149,17 +206,9 @@ type struct DeclarationEmitter {
         return i.intern(text);
     }
 
-    lookup_type_by_id(&this, id: u64) -> Type* {
+    arena_type(&this, ty: TypeRef) -> Type* {
         const a: TypeArena* = this.get_arena();
-        return a.lookup(id);
-    }
-
-    int_type_is_signed(&this, ty: TypeRef) -> boolean {
-        const t: Type* = this.lookup_type_by_id(ty.id);
-        if (t == null) { return false; }
-        if (t.kind != TypeKind::Int) { return false; }
-        const it: IntType* = t as IntType*;
-        return it.int_kind.is_signed();
+        return a.lookup(ty);
     }
 
 
@@ -207,8 +256,8 @@ type struct DeclarationEmitter {
             return;
         }
 
-        // Look up the Cryo StructType to get field info.
-        const type_ref: TypeRef = this.ctx.decl_index.lookup_type(node.name);
+        // The declaration's own registration, by the id it stamped.
+        const type_ref: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "codegen/declare struct type");
         if (type_ref.is_invalid()) {
             return;
         }
@@ -224,7 +273,7 @@ type struct DeclarationEmitter {
         if (node.generic_params.length > 0) {
             return;
         }
-        const type_ref: TypeRef = this.ctx.decl_index.lookup_type(node.name);
+        const type_ref: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "codegen/declare union type");
         if (type_ref.is_invalid()) {
             return;
         }
@@ -237,7 +286,7 @@ type struct DeclarationEmitter {
             return;
         }
 
-        const type_ref: TypeRef = this.ctx.decl_index.lookup_type(node.name);
+        const type_ref: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "codegen/declare class type");
         if (type_ref.is_invalid()) {
             return;
         }
@@ -251,7 +300,7 @@ type struct DeclarationEmitter {
             return;
         }
 
-        const type_ref: TypeRef = this.ctx.decl_index.lookup_type(node.name);
+        const type_ref: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "codegen/declare enum type");
         if (type_ref.is_invalid()) {
             return;
         }
@@ -328,19 +377,17 @@ type struct DeclarationEmitter {
     /// weak-external alias, and `x86_64-w64-mingw32-ld` leaves the alias
     /// unresolved - the Windows cross-link failed with "undefined reference" to
     /// symbols that `nm` showed defined in the very object doing the
-    /// referencing.  A COMDAT is how C++ emits inline functions, and it is what
-    /// `IntrinsicEmitter::attach_runtime_comdat` already does for the runtime
-    /// helpers.
+    /// referencing.  A COMDAT is how C++ emits inline functions.
     ///
     /// `main` is exempt: it is the C entry point, must be strong, and is never a
     /// specialization anyway (the guard only documents the invariant).
     apply_spec_linkage(mut &this, fn_val: LValue, node: FunctionDeclNode*,
-                       fn_name: string, is_program_main: boolean) -> void {
+                       fn_name: MangledName, is_program_main: boolean) -> void {
         if (node == null || is_program_main) { return; }
         if (!node.is_specialization || !fn_val.is_valid()) { return; }
         fn_val.set_linkage(LLinkage::WeakODR);
         const comdat: void* = llvm::LLVMGetOrInsertComdat(
-            this.llvm_module.raw, fn_name);
+            this.llvm_module.raw, fn_name.as_string());
         if (comdat != null) { llvm::LLVMSetComdat(fn_val.raw, comdat); }
     }
 
@@ -351,7 +398,7 @@ type struct DeclarationEmitter {
     /// COMDAT).  Caller gates on the presence of a body: these only apply to
     /// definitions, never bodyless externs.
     apply_directive_effects(mut &this, fn_val: LValue, node: FunctionDeclNode*,
-                            fn_name: string) -> void {
+                            fn_name: MangledName) -> void {
         if (node == null || !fn_val.is_valid()) { return; }
         // `![weak]`: weak definition (WeakAny) so a strong definition in
         // another object overrides it - the user-overridable runtime symbols
@@ -362,7 +409,7 @@ type struct DeclarationEmitter {
         if (node.is_weak) {
             fn_val.set_linkage(LLinkage::WeakAny);
             const comdat: void* = llvm::LLVMGetOrInsertComdat(
-                this.llvm_module.raw, fn_name);
+                this.llvm_module.raw, fn_name.as_string());
             if (comdat != null) { llvm::LLVMSetComdat(fn_val.raw, comdat); }
         }
         // `![naked]`: the LLVM `naked` attribute; prologue/epilogue emission is
@@ -376,56 +423,32 @@ type struct DeclarationEmitter {
         }
     }
 
+    /// The LLVM symbol of a free function's declaration: its registered
+    /// entry's.  The declaration and its body derive the symbol through this
+    /// one function, so the body attaches to the function the declaration
+    /// made and never to a same-name neighbour; and registration is the one
+    /// place the symbol is computed, so a declaration the index never
+    /// registered has no symbol here and is not emitted.
+    free_function_symbol(&this, node: FunctionDeclNode*) -> SymbolStr {
+        return this.ctx.decl_index.entry_symbol(node.overload_entry).spelling();
+    }
+
     declare_function(mut &this, node: FunctionDeclNode*) -> void {
-        // Skip generic templates.
-        if (node.generic_params.length > 0) {
+        // Skip generic templates, and a generic intrinsic's specializations:
+        // an intrinsic has no symbol, its calls are rewritten before codegen.
+        if (node.generic_params.length > 0 || node.is_intrinsic) {
             return;
         }
 
-        // Compute this overload's func_type_ref so we can look up the
-        // overload-specific mangled name.  The bare-keyed `lookup_mangled_name`
-        // is last-write-wins: for two `visit(A*)` / `visit(B*)` overloads,
-        // both share the qualified name `Mod::visit` and the second one
-        // overwrites the first's mangled-name entry.  The overload-keyed
-        // table (registered alongside in type_resolution) disambiguates by
-        // (name, func_type_ref).
         const ctx_ptr: CompilationContext* = this.ctx;
         const intern: InternTable* = ctx_ptr.intern_table;
-        const qualified: SymbolStr = this.fn_qualified_name(node);
-        const di: DeclarationIndex* = ctx_ptr.decl_index;
-        const arena: TypeArena* = this.get_arena();
-
-        mut params: TypeRef[] = [];
-        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
-            const param: VarDeclNode* = node.parameters[pi];
-            if (param != null && param.resolved_type.is_valid()) {
-                params.push(param.resolved_type);
-            }
-        }
-        const func_type_ref: TypeRef = arena.get_function(
-            node.resolved_return_type, params, node.is_variadic);
-
-        mut mangled_sym: SymbolStr = di.lookup_overload_mangled(qualified, func_type_ref);
-        if (!mangled_sym.is_valid()) {
-            mangled_sym = di.lookup_mangled_name(qualified);
-        }
-        if (!mangled_sym.is_valid()) {
-            // Compute and register on first use using the mangler.
-            const qname: QualifiedName = QualifiedName::from_symbol(qualified);
-            const computed: MangledName = MangledName::for_free_function(
-                intern, arena, qname, params,
-                node.resolved_return_type, node.is_variadic);
-            mangled_sym = computed.value;
-            di.register_mangled_name(qualified, mangled_sym);
-            di.register_overload_mangled(qualified, func_type_ref, mangled_sym);
-        }
+        const mangled_sym: SymbolStr = this.free_function_symbol(node);
         // The C ABI entry point must be named `main` verbatim; the C
         // runtime's _start references the unmangled symbol.  Override the
-        // mangled name for any free function whose source-level name is
-        // `main` so the linker can find it.
-        const main_sym: SymbolStr = intern.intern("main");
+        // mangled name for the program's entry point - the function the name
+        // layer recorded as it (`ctx.entry_fn`) - so the linker can find it.
         mut fn_name: string = intern.resolve(mangled_sym);
-        const is_program_main: boolean = node.name.equals(main_sym);
+        const is_program_main: boolean = node.def.is_valid() && node.def.equals(this.ctx.entry_fn);
         // Under `--panic=unwind` the user's `main` runs under an internal symbol
         // and a synthesized `main` wrapper (emitted just after this declaration)
         // invokes it inside a catch-all landing pad: an otherwise-uncaught panic
@@ -435,14 +458,14 @@ type struct DeclarationEmitter {
         // `main` exactly as before (byte-identical).  `no_runtime` has no C
         // `main` to wrap.
         const wrap_main_unwind: boolean = is_program_main
-            && this.ctx.project_panic_unwind && !this.ctx.project_no_runtime;
+            && this.ctx.options.unwinds() && !this.ctx.options.freestanding();
         if (is_program_main) {
             fn_name = "main";
             // `cryo test` synthesizes its own `main` that drives every
             // discovered `![test]` function; if we also emitted the user's
             // `main` the linker would see two `main` symbols.  Skip
             // declaration (and therefore body emission) in test mode.
-            if (this.ctx.mode.skip_user_main()) {
+            if (this.ctx.options.mode.skip_user_main()) {
                 return;
             }
             if (wrap_main_unwind) {
@@ -478,7 +501,7 @@ type struct DeclarationEmitter {
         // set_args/set_env prologue below): a freestanding entry is a
         // separate `![naked] _start`, and `main` - if present - keeps its
         // declared signature.
-        if (is_program_main && param_count == 0 && !this.ctx.project_no_runtime) {
+        if (is_program_main && param_count == 0 && !this.ctx.options.freestanding()) {
             // The C ABI entry point is
             // `int main(int argc, char** argv, char** envp)`.  The C
             // runtime always passes all three, and the stdlib reads argv
@@ -493,13 +516,13 @@ type struct DeclarationEmitter {
             const ret_ty: LType = this.map_return_type(node);
             if (!ret_ty.is_valid()) { return; }
             const argv_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
-            const buf: void* = intrinsics::malloc(3 * 8);
+            const buf: void* = libc::malloc(3 * 8);
             const slots: void** = buf as void**;
             slots[0] = LType::i32().raw;
             slots[1] = argv_ty.raw;
             slots[2] = argv_ty.raw;
             fn_type = LType::function_type(ret_ty, buf, 3, false);
-            intrinsics::free(buf);
+            libc::free(buf);
         } else {
             mut params: TypeRef[] = [];
             for (mut i: u32 = 0; i < param_count; i++) {
@@ -525,8 +548,8 @@ type struct DeclarationEmitter {
         }
 
         // Add the function to the LLVM module.
-        const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
-        this.apply_spec_linkage(fn_val, node, fn_name, is_program_main);
+        const fn_val: LValue = this.llvm_module.add_function(MangledName::new(fn_name), fn_type);
+        this.apply_spec_linkage(fn_val, node, MangledName::new(fn_name), is_program_main);
 
         // `--panic=unwind`: `fn_val` is now `__cryo_user_main`; synthesize the
         // `main` wrapper that catches an uncaught panic at the root (see
@@ -584,29 +607,21 @@ type struct DeclarationEmitter {
             }
             // `-g`: keep a frame pointer so `perf record -g` can unwind
             // cheaply and accurately.
-            if (this.ctx.emit_debug_info) {
+            if (this.ctx.options.debug_info) {
                 this.abi.apply_frame_pointer_attribute(fn_val);
             }
             // `![weak]` / `![naked]` / `![section]` linkage-and-placement.
-            this.apply_directive_effects(fn_val, node, fn_name);
+            this.apply_directive_effects(fn_val, node, MangledName::new(fn_name));
         }
 
-        // Register under qualified name (module scope).
-        this.functions.register(qualified, fn_val);
-        // `![no_mangle]` / `![symbol("...")]`: call sites resolve a free
-        // function through its Cryo mangled symbol
-        // (`resolve_function_by_mangled` on `node.resolved_callee`).  With a
-        // link-name override the LLVM definition is named `link_name`, not the
-        // mangled symbol, so also register this fn_val under the mangled key -
-        // mirroring `declare_method`, whose registration under the mangled key
-        // is what makes `![symbol]` "invisible to callers" (see
-        // symbol_resolver.cryo:249).  Without it the by-mangled lookup misses
-        // and synthesizes a phantom extern under the now-nonexistent mangled
-        // name, producing an undefined-reference link error.  Gated on
-        // has_link_name so normal functions are byte-unchanged.
-        if (node.has_link_name) {
-            this.functions.register(mangled_sym, fn_val);
-        }
+        // Held under the Cryo symbol, which is what a caller's pin names.
+        // The LLVM definition may be named otherwise - `main`, the
+        // `--panic=unwind` user-main wrapper, a `![no_mangle]` /
+        // `![symbol("...")]` link name - and the registry is what makes that
+        // invisible to callers: without it a pin to such a function misses
+        // the module's own definition and declares a phantom extern under
+        // the Cryo symbol, an undefined reference at link time.
+        this.functions.register(mangled_sym, fn_val);
     }
 
     /// Declare all methods in an impl block.
@@ -616,34 +631,7 @@ type struct DeclarationEmitter {
             return;
         }
 
-        // Use TypeResolution's canonical-qualified target when available; it
-        // resolves cross-module impl targets (e.g. `implement trait FmtWrite
-        // for struct Stdout` in fmt::write where Stdout lives in io::stdio)
-        // by walking the bare->qualified table, so the impl's methods land
-        // under the same key the type's defining module uses.  Without the
-        // canonical resolution, we'd qualify with the CURRENT module and
-        // produce `fmt::write::Stdout::write_str`, which `declare_method`
-        // can't look up; bodies would be silently dropped and the linker
-        // would surface them as undefined references.
         const ctx_ptr: CompilationContext* = this.ctx;
-        mut qualified_target: SymbolStr = SymbolStr::empty();
-        if (node.qualified_target_name.is_valid()) {
-            qualified_target = node.qualified_target_name;
-        } else {
-            const target_str: string = ctx_ptr.intern_table.resolve(node.target_type);
-            if (target_str.contains("::")) {
-                qualified_target = node.target_type;
-            } else if (ctx_ptr.decl_index.lookup_type(node.target_type).is_valid()) {
-                qualified_target = node.target_type;
-            } else {
-                const resolved: SymbolStr = ctx_ptr.resolve_scoped_or(node.target_type);
-                if (!resolved.equals(node.target_type)) {
-                    qualified_target = resolved;
-                } else {
-                    qualified_target = ctx_ptr.qualify_symbol_sym(node.target_type);
-                }
-            }
-        }
         // Skip impls whose target is a generic template; only the
         // monomorphized spec'd clones should produce LLVM symbols.  Mirrors
         // the `generic_params.length > 0` skip above for `implement<T> Foo<T>`;
@@ -653,51 +641,15 @@ type struct DeclarationEmitter {
         // bodies are codegen'd against the bare-template `this` type, but
         // method registrations live under the spec'd target; so call sites
         // like `this.as_str()` inside the template body fail to resolve.
-        if (ctx_ptr.generic_registry != null) {
-            const greg: GenericRegistry* = ctx_ptr.generic_registry;
-            if (greg.get_template(qualified_target) != null) {
-                return;
-            }
+        const greg: GenericRegistry* = ctx_ptr.generic_registry;
+        if (greg.template_of(node.target_def()) != null) {
+            return;
         }
 
+        const owner: TypeRef = this.ctx.decl_index.impl_owner(node, "codegen/declare impl");
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.declare_method(node.methods[i], qualified_target);
+            this.declare_method(node.methods[i], owner);
         }
-    }
-
-    /// The arena's CANONICAL qualified name for a struct/union/class decl - 
-    /// the key its methods are registered under, and therefore the prefix every
-    /// caller's cross-module reference mangles.
-    ///
-    /// `qualify_symbol_sym` would stamp the EMITTING module's namespace, which
-    /// is only the canonical one by coincidence.  For an injected monomorph the
-    /// two diverge: a spec is placed in the module owning its type argument
-    /// (`Array<u8, GlobalAlloc>` -> `alloc::allocator`), while its canonical
-    /// identity stays with the template (`collections::array::5Array$Lh_...$G`).
-    /// Deriving the name from the emitting module would rename the symbol -
-    /// `raw_buffer::RawBuffer$Lh...::new_in` would become
-    /// `allocator::RawBuffer$Lh...::new_in` - so callers, which mangle the
-    /// canonical form, could not resolve it (E0636 / undefined reference).
-    ///
-    /// The DI lookups only hit when the emitting module happens to be the
-    /// canonical one, so fall through to the arena's bare-name alias, which the
-    /// monomorphizer registers for every spec (`TypeArena::add_name_alias`).
-    canonical_type_ref(mut &this, name: SymbolStr) -> TypeRef {
-        const ctx_ptr: CompilationContext* = this.ctx;
-        const di: DeclarationIndex* = ctx_ptr.decl_index;
-        mut tref: TypeRef = di.lookup_type(ctx_ptr.qualify_symbol_sym(name));
-        if (!tref.is_valid()) { tref = di.lookup_type(name); }
-        if (!tref.is_valid()) { tref = this.get_arena().lookup_by_name(name); }
-        return tref;
-    }
-
-    canonical_type_qname(mut &this, name: SymbolStr) -> SymbolStr {
-        const tref: TypeRef = this.canonical_type_ref(name);
-        if (tref.is_valid()) {
-            const q: SymbolStr = this.get_arena().get_qualified_name(tref);
-            if (q.is_valid()) { return q; }
-        }
-        return this.ctx.qualify_symbol_sym(name);
     }
 
     /// Declare methods defined inline within a struct declaration.
@@ -708,9 +660,9 @@ type struct DeclarationEmitter {
         if (node.methods.length == 0) {
             return;
         }
-        const qualified: SymbolStr = this.canonical_type_qname(node.name);
+        const owner: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "codegen/declare struct methods");
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.declare_method(node.methods[i], qualified);
+            this.declare_method(node.methods[i], owner);
         }
     }
 
@@ -723,9 +675,9 @@ type struct DeclarationEmitter {
         if (node.methods.length == 0) {
             return;
         }
-        const qualified: SymbolStr = this.canonical_type_qname(node.name);
+        const owner: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "codegen/declare union methods");
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.declare_method(node.methods[i], qualified);
+            this.declare_method(node.methods[i], owner);
         }
     }
 
@@ -734,10 +686,9 @@ type struct DeclarationEmitter {
         if (node.generic_params.length > 0) {
             return;
         }
-        const di_ref: TypeRef = this.canonical_type_ref(node.name);
-        const qualified: SymbolStr = this.canonical_type_qname(node.name);
+        const di_ref: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "codegen/declare class methods");
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.declare_method(node.methods[i], qualified);
+            this.declare_method(node.methods[i], di_ref);
         }
 
         // Emit the vtable for classes with virtual methods.  Drive this from
@@ -752,7 +703,7 @@ type struct DeclarationEmitter {
         // and any subclass's vtable guarantees slot N at the same index.
         if (di_ref.is_valid()) {
             const arena: TypeArena* = this.get_arena();
-            const t: Type* = arena.lookup(di_ref.id);
+            const t: Type* = arena.lookup(di_ref);
             if (t != null && t.kind == TypeKind::Class) {
                 const cls: ClassType* = t as ClassType*;
                 if (cls.has_virtual_methods) {
@@ -778,7 +729,7 @@ type struct DeclarationEmitter {
         while (walk != null && depth < 16) {
             chain.push(walk);
             if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-            const base_t: Type* = arena.lookup(walk.base_class.id);
+            const base_t: Type* = arena.lookup(walk.base_class);
             if (base_t == null || base_t.kind != TypeKind::Class) { break; }
             walk = base_t as ClassType*;
             depth += 1;
@@ -824,12 +775,11 @@ type struct DeclarationEmitter {
     /// return the first matching method's LLVM function: the most-derived
     /// override, falling back to the inherited base implementation when
     /// the subclass doesn't override that specific overload.  Resolution
-    /// goes through the overload-specific mangled name so the correct LLVM
+    /// goes through the method's own registered entry so the correct LLVM
     /// function is installed in the slot, not the last-registered one
     /// under `Type::method`.
     find_vtable_slot_impl(mut &this, cls: ClassType*, slot_name: SymbolStr, slot_params: &TypeRef[]) -> LValue {
         const arena: TypeArena* = this.get_arena();
-        const intern: InternTable* = this.get_intern();
         mut walk: ClassType* = cls;
         mut depth: i32 = 0;
         while (walk != null && depth < 16) {
@@ -859,51 +809,21 @@ type struct DeclarationEmitter {
                         continue;
                     }
                 }
-                const type_qname: QualifiedName = QualifiedName::from_symbol(walk.qualified_name);
-                const method_str: string = intern.resolve(slot_name);
-                // Resolve method's full signature for the mangler.
-                mut method_ret: TypeRef = TypeRef::invalid();
-                mut method_variadic: boolean = false;
-                const fn_t: Type* = arena.lookup(m.function_type.id);
-                if (fn_t != null && fn_t.kind == TypeKind::Function) {
-                    const fn_ty: FunctionType* = fn_t as FunctionType*;
-                    method_ret = fn_ty.return_type;
-                    method_variadic = fn_ty.is_variadic;
-                }
-                // MethodInfo.param_types already excludes the receiver.  Default
-                // to ImmutRef receiver for virtual methods; if the method has
-                // a `mut &this` receiver we recover it from the AST node.
-                mut recv_kind: ReceiverKind = ReceiverKind::ImmutRef;
+                // The slot's function is this declaration and nothing else:
+                // an inherited base method the module has not declared yet
+                // is declared extern from its entry.  A lookup by the
+                // combined `Type::method` name would fill the slot with
+                // whichever overload registered first - right only when that
+                // is the slot's own.
+                mut slot_entry: OverloadId = OverloadId::invalid();
                 if (m.ast_node != null) {
-                    const mn: MethodNode* = m.ast_node as MethodNode*;
-                    if (mn != null && mn.func != null) {
-                        recv_kind = DeclarationIndex::method_receiver_kind(mn.func, mn.is_static, intern);
-                    }
+                    const smn: MethodNode* = m.ast_node as MethodNode*;
+                    if (smn != null && smn.func != null) { slot_entry = smn.func.overload_entry; }
                 }
-                const computed: MangledName = MangledName::for_method(
-                    intern, arena, type_qname, slot_name, recv_kind,
-                    m.param_types, method_ret, method_variadic);
-                // Look up the LLVM function by its mangled name directly
-                // in the module.  resolve_function/this.get_function cache by
-                // bare or qualified name, which is last-write-wins for
-                // overloaded virtuals; the cache would hand out whichever
-                // overload was declared most recently regardless of which
-                // slot we're filling, populating every inherited slot with
-                // the same (wrong) function.
-                const mangled_str: string = intern.resolve(computed.value);
-                mut fn_val: LValue = this.llvm_module.get_named_function(mangled_str);
-                if (!fn_val.is_valid()) {
-                    fn_val = this.resolver.resolve_function(computed.value);
-                }
-                if (!fn_val.is_valid()) {
-                    const type_str: string = intern.resolve(walk.qualified_name);
-                    const combined: string = format("%s::%s", type_str, method_str);
-                    fn_val = this.resolver.resolve_function(intern.intern(combined));
-                }
-                return fn_val;
+                return this.resolver.resolve_pinned(CalleePin::Decl(slot_entry));
             }
             if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-            const base_t: Type* = arena.lookup(walk.base_class.id);
+            const base_t: Type* = arena.lookup(walk.base_class);
             if (base_t == null || base_t.kind != TypeKind::Class) { break; }
             walk = base_t as ClassType*;
             depth += 1;
@@ -913,9 +833,9 @@ type struct DeclarationEmitter {
 
     /// Return the vtable slot index of (method_name, param_types) in this
     /// class's layout, or -1 if no matching virtual slot exists.  Called
-    /// from codegen dispatch after sema has identified the exact overload
-    /// via `CallExprNode.resolved_method`; this function just maps that
-    /// declaration to its slot position.
+    /// from codegen dispatch after the call's pin has identified the exact
+    /// overload; this function just maps that declaration to its slot
+    /// position.
     ///
     /// Param-type matching goes through `param_types_equal` (canonical arena-id
     /// compare), the same relation `collect_vtable_slots` used to build the
@@ -965,16 +885,16 @@ type struct DeclarationEmitter {
         const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
         const vtable_ty: LType = LType::array_of(fn_ptr_ty, n);
 
-        const buf: void* = intrinsics::malloc(n as u64 * 8);
+        const buf: void* = libc::malloc(n as u64 * 8);
         const slot_ptrs: void** = buf as void**;
         for (mut i: u32 = 0; i < n; i++) {
             slot_ptrs[i] = llvm::LLVMConstBitCast(impls[i].raw, fn_ptr_ty.raw);
         }
         const init: LValue = LType::const_array(fn_ptr_ty, buf, n);
-        intrinsics::free(buf);
+        libc::free(buf);
 
-        const qname: QualifiedName = QualifiedName::from_symbol(cls.qualified_name);
-        const mangled: string = MangledName::for_vtable(intern, qname).resolve(intern);
+        const qname: QualifiedName = QualifiedName::from_symbol(cls.qualified_name.spelling());
+        const mangled: MangledName = MangledName::for_vtable(intern, qname);
         const global: LValue = this.llvm_module.add_global(vtable_ty, mangled);
         global.set_initializer(init);
         global.set_global_constant(true);
@@ -984,8 +904,17 @@ type struct DeclarationEmitter {
         global.set_linkage(LLinkage::External);
     }
 
+    /// The LLVM symbol of a method's declaration: its registered entry's.
+    /// Empty for a method the index never registered, which is then not
+    /// emitted.
+    method_symbol(&this, node: MethodNode*) -> SymbolStr {
+        return this.ctx.decl_index.entry_symbol(node.func.overload_entry).spelling();
+    }
+
     /// Declare a method.  Methods get a `this` pointer as the first parameter.
-    declare_method(mut &this, node: MethodNode*, target_type: SymbolStr) -> void {
+    /// `owner` is the type the method is on: an impl head's owner or a
+    /// declaration's own type, never re-derived from a name here.
+    declare_method(mut &this, node: MethodNode*, owner: TypeRef) -> void {
         const func: FunctionDeclNode* = node.func;
         if (func == null) { return; }
 
@@ -1003,46 +932,18 @@ type struct DeclarationEmitter {
         }
 
         const intern: InternTable* = this.get_intern();
-        const type_str: string = intern.resolve(target_type);
-        const method_str: string = intern.resolve(func.name);
 
-        // Build the combined DI key.  Always compute the mangled name fresh
-        // from THIS overload's parameter types; the DI cache `lookup_mangled_name`
-        // only stores ONE entry per combined key, so for overloaded methods
-        // (e.g., every `visit(SomeNode*)` in BaseASTVisitor) using the cached
-        // name would map every overload to the first one's mangled name,
-        // collide at LLVM level, and leave all but the first-declared overload
-        // as unnamed declares without bodies.
-        const combined: string = format("%s::%s", type_str, method_str);
-        const combined_sym: SymbolStr = intern.intern(combined);
-        const ctx_ptr: CompilationContext* = this.ctx;
-        const di: DeclarationIndex* = ctx_ptr.decl_index;
-        const arena: TypeArena* = this.get_arena();
-        const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
-        const recv_kind: ReceiverKind = DeclarationIndex::method_receiver_kind(func, node.is_static, intern);
-        const method_param_refs: TypeRef[] = DeclarationIndex::method_non_receiver_params(func, intern);
-        const computed_base: MangledName = MangledName::for_method_or_trait_impl(
-            intern, arena, type_qname, func.origin_trait, func.name, recv_kind,
-            method_param_refs, func.resolved_return_type, func.is_variadic);
-        // Fold in the generic-method spec's type args (`$MG...`) so two specs of one
-        // method whose signature doesn't depend on the method param get distinct
-        // symbols.  Empty for every non-spec method -> byte-unchanged.  Must mirror
-        // the mono pin (call_specializer `mangled_symbol_for_spec_method`) exactly.
-        const computed: MangledName = computed_base.with_method_spec_args(
-            intern, arena, func.spec_type_args);
-        const mangled_sym: SymbolStr = computed.value;
-        // Cache into DI only if this is the first overload; preserves the
-        // existing single-slot behavior for call sites that don't disambiguate.
-        if (!di.lookup_mangled_name(combined_sym).is_valid()) {
-            di.register_mangled_name(combined_sym, mangled_sym);
-        }
+        // The symbol is the registered entry's: registration computed it
+        // once from this node, and every caller's pin names the same entry.
+        const mangled_sym: SymbolStr = this.method_symbol(node);
+        if (!mangled_sym.is_valid()) { return; }
         // `![symbol("sym")]` overrides the LLVM symbol name ONLY (the C++ binding
         // generator uses it to pin a non-virtual C++ method to its mangled
         // Itanium symbol, e.g. `_ZNK5Point3sumEv`).  Cryo call sites resolve the
         // method through the `this.functions` registry below (keyed on
-        // `combined_sym`/`mangled_sym`, both still pointing at this fn_val), so
-        // the override is invisible to callers - it just renames the linked
-        // symbol, exactly like the extern-block path in `declare_extern_block`.
+        // `mangled_sym`, pointing at this fn_val), so the override is invisible
+        // to callers - it just renames the linked symbol, exactly like the
+        // extern-block path in `declare_extern_block`.
         mut fn_name: string = intern.resolve(mangled_sym);
         if (func.has_link_name) { fn_name = func.link_name; }
 
@@ -1072,12 +973,12 @@ type struct DeclarationEmitter {
             // anonymous LLVM literal struct so the signature reads
             // e.g. `{i64, i64}` - matches what `build_llvm_fn_type`
             // produces for free functions taking the same return.
-            const dp_buf: void* = intrinsics::malloc(2 * 8);
+            const dp_buf: void* = libc::malloc(2 * 8);
             const dp_slots: void** = dp_buf as void**;
             dp_slots[0] = ret_plan.llvm_slots[0].raw;
             dp_slots[1] = ret_plan.llvm_slots[1].raw;
             ret_ty = LType::literal_struct(dp_buf, 2, false);
-            intrinsics::free(dp_buf);
+            libc::free(dp_buf);
         } else if (ret_plan.llvm_slots.length > 0) {
             ret_ty = ret_plan.llvm_slots[0];
         } else {
@@ -1087,61 +988,16 @@ type struct DeclarationEmitter {
 
         const is_instance: boolean = !node.is_static;
 
-        // Detect whether the method already declares an explicit self parameter.
-        // Cryo allows three forms: `&this` / `mut &this` (reference, default),
-        // and `this` (by-value).  `&this` is stored in `parameters` with the
-        // literal name "&this"; `this` by-value is stored with the literal name
-        // "this".  In EITHER case we must NOT prepend an extra implicit `this`
-        // slot; the explicit param already accounts for the self argument.
-        // Only when the method has no self-param at all (e.g., some elaborated
-        // methods) should we synthesize the `&this` pointer prefix.
-        mut explicit_self_name: string = "";  // "", "&this", "this", or "typed-this"
-        for (mut pc0: u32 = 0; pc0 < func.parameters.length as u32; pc0++) {
-            const pp0: VarDeclNode* = func.parameters[pc0];
-            if (pp0 == null) { continue; }
-            const pn: string = intern.resolve(pp0.name);
-            if (pn == "&this") {
-                explicit_self_name = "&this";
-                break;
-            }
-            if (pn.eq("this")) {
-                // Distinguish parser-synthesized by-value `this` (no annotation)
-                // from user-written `this: Lexer*` (explicit annotation).  Both
-                // count as "self" so we skip the implicit-prefix synthesis, but
-                // the LLVM param type comes from different sources: bare `this`
-                // uses the struct by value; typed `this` uses the annotation.
-                if (pp0.type_annotation == null) {
-                    explicit_self_name = "this";
-                } else {
-                    explicit_self_name = "typed-this";
-                }
-                break;
-            }
-        }
-
         // Look up the target type.  `&this` forms want `T*`; by-value `this`
-        // wants the struct `T` directly.  If there's no explicit self we'll
-        // synthesize `T*` as the implicit prefix.
+        // wants the struct `T` directly.  Every instance method has its
+        // receiver among its parameters - written, or given to it by the
+        // parser, the async lowering or the closure synthesis - so the slot
+        // comes from that parameter below.
         mut target_mapped: LType = LType::null();
         mut this_ty: LType = LType::null();
         if (is_instance) {
-            mut target_ref: TypeRef = di.lookup_type(target_type);
-            if (!target_ref.is_valid()) {
-                // The unit type `()` isn't in the DeclarationIndex (it's a
-                // primitive owned by the arena, never registered through the
-                // decl-collection pass).  Fall back to the arena's canonical
-                // unit TypeRef so `implement trait Drop for ()` and similar
-                // get a real LLVM declaration.  Detected by the literal `()`
-                // suffix on the qualified target name.
-                const target_str: string = intern.resolve(target_type);
-                const tlen: u64 = target_str.length();
-                if (tlen >= 2 && target_str[tlen - 2] == 0x28 /* '(' */
-                              && target_str[tlen - 1] == 0x29 /* ')' */) {
-                    target_ref = arena.get_unit();
-                }
-            }
-            if (target_ref.is_valid()) {
-                target_mapped = this.type_mapper.map_type(target_ref);
+            if (owner.is_valid()) {
+                target_mapped = this.type_mapper.map_type(owner);
                 if (target_mapped.is_valid()) {
                     this_ty = LType::pointer_to(target_mapped);
                 }
@@ -1151,11 +1007,9 @@ type struct DeclarationEmitter {
             }
         }
 
-        const prepend_implicit_this: boolean = is_instance && explicit_self_name.length() == 0;
-
         // Count user parameters.  `&this` contributes a ptr slot via the
         // existing param; by-value `this` contributes a struct slot via the
-        // existing param; implicit missing self is handled by prepend_implicit_this.
+        // existing param.
         // For variadic methods (`args...`), skip the trailing name-only param;
         // LLVM's `...` marker covers it.
         const fixed_user_count: u32 = CodegenUtil::fixed_param_count(func);
@@ -1193,11 +1047,10 @@ type struct DeclarationEmitter {
                 });
                 continue;
             }
-            const param_name_pre: string = intern.resolve(param.name);
             const is_amp_this: boolean =
-                param_name_pre == "&this" && this_ty.is_valid();
+                param.is_ref_receiver() && this_ty.is_valid();
             const is_val_this: boolean =
-                param_name_pre.eq("this")
+                param.is_value_receiver()
                 && target_mapped.is_valid() && param.type_annotation == null;
             if (is_amp_this) {
                 mut s_amp: LType[] = [];
@@ -1223,7 +1076,7 @@ type struct DeclarationEmitter {
                 // garbage.  The prologue stores the (coerced) param into the
                 // `this` alloca; opaque-pointer stores reinterpret it back to
                 // the struct, exactly as the normal value-param path does.
-                mut recv_tref_v: TypeRef = di.lookup_type(target_type);
+                mut recv_tref_v: TypeRef = owner;
                 if (!recv_tref_v.is_valid()) { recv_tref_v = param.resolved_type; }
                 const pplan_v: ParamPlan = this.abi.classify_param(recv_tref_v);
                 total_user_slots += pplan_v.llvm_slots.length as u32;
@@ -1235,11 +1088,9 @@ type struct DeclarationEmitter {
             }
         }
 
-        const total_params: u32 = total_user_slots
-            + (if (prepend_implicit_this) { 1 } else { 0 } as u32)
-            + sret_inc;
+        const total_params: u32 = total_user_slots + sret_inc;
 
-        const buf: void* = intrinsics::malloc(total_params as u64 * 8);
+        const buf: void* = libc::malloc(total_params as u64 * 8);
         const slots: void** = buf as void**;
 
         // Parallel array tracking the byval pointee for each LLVM
@@ -1254,10 +1105,6 @@ type struct DeclarationEmitter {
         mut idx: u32 = 0;
         if (has_sret_slot) {
             slots[idx] = LType::pointer_to(LType::i8()).raw;
-            idx += 1;
-        }
-        if (prepend_implicit_this) {
-            slots[idx] = this_ty.raw;
             idx += 1;
         }
 
@@ -1304,15 +1151,15 @@ type struct DeclarationEmitter {
         }
 
         if (!params_valid) {
-            intrinsics::free(buf);
+            libc::free(buf);
             return;
         }
 
         const fn_type: LType = LType::function_type(ret_ty, buf, total_params, func.is_variadic);
-        intrinsics::free(buf);
+        libc::free(buf);
 
-        const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
-        this.apply_spec_linkage(fn_val, node.func, fn_name, false);
+        const fn_val: LValue = this.llvm_module.add_function(MangledName::new(fn_name), fn_type);
+        this.apply_spec_linkage(fn_val, node.func, MangledName::new(fn_name), false);
 
         // Attach `sret(%T)` to LLVM param 0 when the classifier promoted
         // the return.  This must match what `build_function_ltype`
@@ -1344,33 +1191,16 @@ type struct DeclarationEmitter {
                 this.abi.apply_noinline_attribute(fn_val);
             }
             // `-g`: keep a frame pointer (see free-function path).
-            if (this.ctx.emit_debug_info) {
+            if (this.ctx.options.debug_info) {
                 this.abi.apply_frame_pointer_attribute(fn_val);
             }
             // `![weak]` / `![section]` on a method (naked is function-only).
-            this.apply_directive_effects(fn_val, func, fn_name);
+            this.apply_directive_effects(fn_val, func, MangledName::new(fn_name));
         }
 
-        // Register under the combined key built above.  Also register against the
-        // (name, total-LLVM-arity) composite so that callers can pick the correct
-        // overload at call sites (e.g., `Array::new()` vs `Array::new(u64)`).
-        // `total_params` matches the arity cross-module externs register with
-        // (the FunctionType's param count), keeping the two registration paths
-        // interoperable.  Finally register under the unique mangled_sym; that's
-        // the key `codegen_method_prologue` uses to look up the right LLVM
-        // function for each overload (combined_sym alone is ambiguous because
-        // overloads share the same `Type::method` form).
-        // The arity tracked in the function registry is the *source-level*
-        // arity (counting any implicit `&this`, but *not* the hidden
-        // sret slot, and *not* counting per-source-param LLVM slot
-        // expansion like DirectPair).  Call-site lookups in
-        // `call_emitter.cryo` count source arguments and need to match
-        // what extern registrations record (`ft.param_types.length` -
-        // also source-level).
-        const registry_arity: u32 = user_param_count
-            + (if (prepend_implicit_this) { 1 } else { 0 } as u32);
-        this.functions.register(combined_sym, fn_val);
-        this.functions.register_with_arity(combined_sym, registry_arity, fn_val);
+        // Held under the Cryo symbol: the key every pin and the body's own
+        // prologue name it by.  The combined `Type::method` form names every
+        // overload at once and is no key here.
         this.functions.register(mangled_sym, fn_val);
     }
 
@@ -1402,17 +1232,14 @@ type struct DeclarationEmitter {
         const fn_type: LType = plan.llvm_fn_type;
 
         // C linkage: use bare name.
-        const fn_val: LValue = this.llvm_module.add_function(name_str, fn_type);
+        const fn_val: LValue = this.llvm_module.add_function(MangledName::new(name_str), fn_type);
 
-        // Register under bare name (for identifier lookups like `malloc(...)`)
-        this.functions.register(node.name, fn_val);
-
-        // Also register under qualified name (for cross-module resolution).
-        const ctx_ptr: CompilationContext* = this.ctx;
-        const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
-        if (!qualified.equals(node.name)) {
-            this.functions.register(qualified, fn_val);
-        }
+        // Held under the symbol its registered entry carries, the key every
+        // pin names it by.  A declaration no registration reached is named
+        // by no pin.
+        const di: DeclarationIndex* = this.get_decl_index();
+        const entry: OverloadId = di.entry_of_def(node.def);
+        if (entry.is_valid()) { this.functions.register(di.entry_symbol(entry).spelling(), fn_val); }
     }
 
     /// Declare extern block functions.
@@ -1444,7 +1271,7 @@ type struct DeclarationEmitter {
                 params, func.resolved_return_type, func.is_variadic);
             if (!plan.llvm_fn_type.is_valid()) {
                 this.diag.emit_warning_at_span(ErrorCode::E0643_RETURN_TYPE_ERROR,
-                    format("codegen: extern function '%s': failed to classify signature", name_str),
+                    fmt::format("codegen: extern function '%s': failed to classify signature", name_str),
                     func.span);
                 continue;
             }
@@ -1452,11 +1279,11 @@ type struct DeclarationEmitter {
 
             // Use the bare source name for C linkage, unless `![symbol("...")]`
             // overrode the linker symbol - then the LLVM declaration is
-            // named for the C library symbol while Cryo callers still
-            // resolve through `func.name` via the registry below.
+            // named for the C library symbol, which is also the symbol the
+            // function's registered entry carries.
             mut link_str: string = name_str;
             if (func.has_link_name) { link_str = func.link_name; }
-            const fn_val: LValue = this.llvm_module.add_function(link_str, fn_type);
+            const fn_val: LValue = this.llvm_module.add_function(MangledName::new(link_str), fn_type);
 
             // Apply sret + byval attributes for any Indirect slots the
             // classifier produced.  Phase 3's `Direct`-with-coercion
@@ -1476,7 +1303,10 @@ type struct DeclarationEmitter {
                 }
             }
 
-            this.functions.register(func.name, fn_val);
+            // Held under the entry's symbol, the key every pin names it by.
+            if (func.overload_entry.is_valid()) {
+                this.functions.register(this.get_decl_index().entry_symbol(func.overload_entry).spelling(), fn_val);
+            }
         }
     }
 
@@ -1489,13 +1319,23 @@ type struct DeclarationEmitter {
         // A C-imported global const mangles under its alias namespace instead,
         // so two extern-module imports in one file each defining the same const
         // name (e.g. `a::FOO` and `b::FOO`) emit distinct symbols.
-        const def_ns: SymbolStr = if (!node.binding_namespace.is_empty()) {
-            node.binding_namespace
+        const def_ns: DeclName = if (node.binding_namespace.is_valid()) {
+            node.binding_namespace.decl_name()
         } else {
-            this.ctx.namespace_str
+            this.ctx.unit_module.decl_name()
         };
-        const mangled: string = MangledName::for_global(
-            this.get_intern(), def_ns, node.name).resolve(this.get_intern());
+        // An IMPORTED global names storage another object owns, so it takes the
+        // bare linker symbol rather than the namespace mangling - the mangling
+        // exists to keep two modules' same-named globals apart, and there is
+        // only ever one `errno`.  `![symbol("...")]` overrides it for a C name
+        // that is not a Cryo identifier.
+        const mangled: MangledName = if (node.is_extern_import) {
+            if (node.link_name.length() > 0) { MangledName::new(node.link_name) }
+            else { MangledName::new(this.get_intern().resolve(node.name)) }
+        } else {
+            MangledName::for_global(
+                this.get_intern(), def_ns, node.name)
+        };
 
         const ty: LType = this.type_mapper.map_type(node.resolved_type);
         if (!ty.is_valid()) {
@@ -1504,12 +1344,38 @@ type struct DeclarationEmitter {
 
         const global: LValue = this.llvm_module.add_global(ty, mangled);
 
+        // Same reason a local's slot is raised: the mapped type reproduces the
+        // WIDTH an `![align(N)]` type declares but not its boundary, so LLVM
+        // places the object on the fields' alignment instead.  A global is an
+        // object placement like any other, and the code generated against the
+        // type already assumes the declared boundary.  Only ever raised -
+        // LLVM's own choice is the floor.
+        const gty: Type* = this.arena_type(node.resolved_type);
+        if (gty != null) {
+            const want_align: u64 = gty.alignment();
+            if (want_align > 0 && want_align > global.alignment() as u64) {
+                global.set_alignment(want_align as u32);
+            }
+        }
+
+        // An imported global is a DECLARATION: leaving it with no initializer is
+        // what makes it external in LLVM.  Giving it one - even the
+        // zeroinitializer every other global falls back to - would define the
+        // symbol here and collide with the library at link time.  It is also
+        // never marked LLVM-constant, including when written `const`: `const`
+        // governs what Cryo may write, while the owning library stays free to
+        // change the value, and promising otherwise would license folding a
+        // stale read.
+        if (node.is_extern_import) {
+            this.globals.register(this.global_cache_slot(node), global);
+            return;
+        }
+
         // Initializer: if the source declaration has a literal initializer
         // (e.g., `const BUCKET_OCCUPIED: u8 = 1`), emit it as the constant
         // initializer typed against the global's own type so consumers see
         // the right value.  LLVM globals require a constant initializer, so
-        // anything more complex than a literal falls back to zeroinitializer
-        // (more involved cases would need a runtime ctor, out of scope here).
+        // what no fold below answers is computed at program start instead.
         mut init: LValue = LValue::null();
         // Peel one layer of cast so initializers like
         // `const HEX_LOWER: u8* = "0123456789abcdef"` route to the
@@ -1535,7 +1401,7 @@ type struct DeclarationEmitter {
                     const digits: string = CodegenUtil::int_literal_clean(lit.value, &radix);
                     init = LType::const_int_of_string(ty, digits, radix);
                 } else {
-                    const ival: u64 = lit.value.parse_int<u64>();
+                    const ival: u64 = lit.value.parse_int::<u64>();
                     init = LType::const_int(ty, ival, true);
                 }
             } else if (lit.literal_kind == LiteralKind::Boolean && tk == LTypeKind::Integer) {
@@ -1553,7 +1419,7 @@ type struct DeclarationEmitter {
                 // `const SOME_TEXT: string = "..."` emits as `null`, which
                 // surfaces as literal "(null)" in any printf/format output
                 // that consumes the constant.
-                init = this.str_cache.get_or_create(lit.value, this.llvm_module);
+                init = this.str_cache.get_or_create(lit.value, lit.byte_length, this.llvm_module);
             }
         }
         // Fold a constant-expression initializer that isn't a bare literal -
@@ -1567,7 +1433,7 @@ type struct DeclarationEmitter {
             const tkf: LTypeKind = LType::kind_of(ty.raw);
             if (tkf == LTypeKind::Float || tkf == LTypeKind::Double) {
                 mut folded: f64 = 0.0;
-                if (DeclarationEmitter::try_fold_const_real(init_expr, &folded)) {
+                if (this.try_fold_const_real(init_expr, &folded)) {
                     init = LType::const_real(ty, folded);
                 }
             } else if (tkf == LTypeKind::Integer) {
@@ -1583,7 +1449,7 @@ type struct DeclarationEmitter {
                 // in LLVMConstInt, which is exact for those types.
                 if (llvm::LLVMGetIntTypeWidth(ty.raw) <= 64) {
                     mut ifold: u64 = 0;
-                    if (DeclarationEmitter::try_fold_const_int(init_expr, &ifold)) {
+                    if (this.try_fold_const_int(init_expr, &ifold)) {
                         init = LType::const_int(ty, ifold, true);
                     }
                 }
@@ -1599,14 +1465,35 @@ type struct DeclarationEmitter {
         if (!init.is_valid() && init_expr != null
             && init_expr.kind == NodeKind::StructLiteral
             && LType::kind_of(ty.raw) == LTypeKind::Struct) {
-            init = DeclarationEmitter::try_const_struct(init_expr as StructLiteralNode*, ty);
+            init = this.try_const_struct(
+                this.type_mapper, gty, init_expr as StructLiteralNode*, ty);
         }
+        // Array-literal const initializer, e.g. `const GAINS: f32[2] = [0.9,
+        // 1.0]`.  Without this an array-typed global has no branch at all and
+        // lands on the zeroinitializer below, so EVERY element reads 0 - a
+        // literal one included, which is what makes the failure look like a
+        // fold that went wrong rather than one that never ran.
+        if (!init.is_valid() && init_expr != null
+            && init_expr.kind == NodeKind::ArrayLiteral
+            && LType::kind_of(ty.raw) == LTypeKind::Array) {
+            init = this.try_const_array(init_expr as ArrayLiteralNode*, ty);
+        }
+        // An initializer none of the folds above answers - a call, a value
+        // read from another global - is computed when the program starts:
+        // the storage holds zero until then, and is never marked constant,
+        // since a store into a constant global is one the optimizer may
+        // read past.
+        const started: boolean = !init.is_valid() && init_expr != null;
         if (!init.is_valid()) {
             init = LType::const_null(ty);
         }
         global.set_initializer(init);
+        if (started) {
+            this.started.nodes.push(node);
+            this.started.slots.push(global);
+        }
 
-        if (!node.is_mutable) {
+        if (!node.is_mutable && !started) {
             global.set_global_constant(true);
         }
 
@@ -1616,18 +1503,79 @@ type struct DeclarationEmitter {
             global.set_thread_local(true);
         }
 
-        // A C-imported const is referenced only as `cit::NAME` (a
-        // ScopeResolution), which `resolve_global` probes under the qualified
-        // key.  `resolve_global` checks this cache before its cross-module
-        // (owned-by-current-module) short-circuit, so register under the
-        // qualified key - the bare key would never be hit and would risk a
-        // last-write-wins collision between two imports' same-named consts.
-        const cache_key: SymbolStr = if (!node.binding_namespace.is_empty()) {
-            this.ctx.qualify_binding_sym(node.name, node.binding_namespace)
-        } else {
-            node.name
-        };
-        this.globals.register(cache_key, global);
+        this.globals.register(this.global_cache_slot(node), global);
+    }
+
+    /// The function that computes the module's started globals, opened with
+    /// the builder at its entry, or an invalid value when the module has
+    /// none.  Internal: each module has its own, under the same name.
+    begin_global_initializer(mut &this) -> LValue {
+        if (this.started.nodes.length == 0) { return LValue::null(); }
+        const fn_ty: LType = LType::function_type(LType::void_type(), null, 0, false);
+        const fn_val: LValue = this.llvm_module.add_function(MangledName::new("__cryo.global_init"), fn_ty);
+        fn_val.set_linkage(LLinkage::Internal);
+        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
+        this.builder.position_at_end(entry_bb);
+        // The function has no source of its own, so no debug location from
+        // the last body emitted may reach it.
+        if (this.debug_info.is_on()) {
+            llvm::LLVMSetCurrentDebugLocation2(this.builder.raw, null);
+        }
+        this.values.push_scope();
+        return fn_val;
+    }
+
+    /// Store `value`, a started global's computed initializer, into the
+    /// storage `codegen_global_var` gave it.
+    store_started_global(mut &this, k: i64, value: LValue) -> void {
+        if (!value.is_valid()) { return; }
+        const node: VarDeclNode* = this.started.nodes[k];
+        const ty: LType = this.type_mapper.map_type(node.resolved_type);
+        this.builder.build_store(this.expr_ops.init_store_value(value, ty, node.resolved_type),
+                                 this.started.slots[k]);
+    }
+
+    /// Close the initializer `begin_global_initializer` opened and have it
+    /// run before `main`.  Its priority is the module's place in the build
+    /// order, so a module's initializer runs after those of the modules it
+    /// depends on, whose globals its own initializers may read.
+    finish_global_initializer(mut &this, fn_val: LValue) -> void {
+        this.values.pop_scope();
+        this.builder.build_ret_void();
+        const pos: i64 = this.ctx.active_order_position;
+        const priority: u64 = 101 + (if (pos < 0) { 0 } else { pos }) as u64;
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const fields: void* = libc::malloc(3 * 8);
+        const field_tys: void** = fields as void**;
+        field_tys[0] = LType::i32().raw;
+        field_tys[1] = ptr_ty.raw;
+        field_tys[2] = ptr_ty.raw;
+        const entry_ty: LType = LType::literal_struct(fields, 3, false);
+        const vals: void* = libc::malloc(3 * 8);
+        const entry_vals: void** = vals as void**;
+        entry_vals[0] = LType::const_int(LType::i32(), priority, false).raw;
+        entry_vals[1] = fn_val.raw;
+        entry_vals[2] = LType::const_pointer_null(ptr_ty).raw;
+        const entry: LValue = LType::const_struct(vals, 3, false);
+        const one: void* = libc::malloc(8);
+        const entries: void** = one as void**;
+        entries[0] = entry.raw;
+        const ctors: LValue = this.llvm_module.add_global(LType::array_of(entry_ty, 1),
+                                                          MangledName::new("llvm.global_ctors"));
+        ctors.set_linkage(LLinkage::Appending);
+        ctors.set_initializer(LType::const_array(entry_ty, one, 1));
+        libc::free(fields);
+        libc::free(vals);
+        libc::free(one);
+    }
+
+    /// The slot a global is cached under for later reference resolution: its
+    /// definition's registration slot, the one key
+    /// `SymbolResolver::resolve_global_entry` reads and writes too, so a
+    /// reader in this module and one in another reach the same value, and
+    /// two imports declaring one leaf (`a::FOO`, `b::FOO`) hold two.
+    global_cache_slot(&this, node: VarDeclNode*) -> i64 {
+        return this.ctx.global_entry_of_def(node.def).slot;
     }
 
     /// Generate the body of a function.  Called from the IRGeneratorVisitor.
@@ -1642,17 +1590,16 @@ type struct DeclarationEmitter {
     /// current debug location to the function's declaration line, scoped
     /// to that subprogram. Called from the prologue once the builder is at
     /// the entry block; every instruction emitted afterward inherits the
-    /// location. No-op unless `-g` populated `ctx.di_builder`. The
-    /// subroutine type carries no parameter list (sufficient for
-    /// function-level file:line backtraces; per-argument types and
-    /// per-statement line granularity are follow-ups).
+    /// location. No-op unless `-g`. The subroutine type carries no
+    /// parameter list (sufficient for function-level file:line backtraces;
+    /// per-argument types and per-statement line granularity are follow-ups).
     emit_debug_subprogram(mut &this, fn_val: LValue, node: FunctionDeclNode*) -> void {
         const ctx_ptr: CompilationContext* = this.ctx;
-        if (!ctx_ptr.emit_debug_info || ctx_ptr.di_builder == null) { return; }
+        if (!this.debug_info.is_on()) { return; }
         if (!fn_val.is_valid()) { return; }
 
-        const dib:  void* = ctx_ptr.di_builder;
-        const file: void* = ctx_ptr.di_file;
+        const dib:  void* = this.debug_info.builder;
+        const file: void* = this.debug_info.file;
 
         mut line: u32 = node.span.start_line;
         if (line == 0) { line = 1; }
@@ -1672,11 +1619,12 @@ type struct DeclarationEmitter {
             const subroutine_ty: void* = llvm::LLVMDIBuilderCreateSubroutineType(
                 dib, file, null, 0, 0);
 
-            // DW_AT_name: module-qualified source name (e.g.
-            // "Compiler::Codegen::State::FunctionRegistry::get") so same-named
+            // DW_AT_name: the function's declaration key (e.g.
+            // "compiler::codegen::state::function_registry::get") so same-named
             // methods are distinguishable in a backtrace, rather than the bare
-            // leaf name.
-            const disp_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+            // leaf name - and the module the linkage name below mangles, which
+            // for a specialization is the template's, not the one emitting it.
+            const disp_sym: SymbolStr = ctx_ptr.decl_fn_key(node.name, node.span.file);
             const name: string = this.resolve(disp_sym);
             const name_len: u64 = name.length();
 
@@ -1692,7 +1640,7 @@ type struct DeclarationEmitter {
             // IsOptimized: reflect the build's opt level so debuggers know to
             // warn about optimized-out locals / reordered code.
             mut is_opt: i32 = 0;
-            if (ctx_ptr.opt_level > 0) { is_opt = 1; }
+            if (ctx_ptr.options.opt_level > 0) { is_opt = 1; }
 
             sp = llvm::LLVMDIBuilderCreateFunction(
                 dib, file, name, name_len, linkage, link_len, file, line,
@@ -1725,12 +1673,11 @@ type struct DeclarationEmitter {
     /// emitting the asm (inline asm is not a terminator; the asm performs the
     /// real control transfer).
     codegen_naked_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
-        const qualified: SymbolStr = this.fn_qualified_name(node);
-        const fn_val: LValue = this.functions.get(qualified);
+        const fn_val: LValue = this.functions.get(this.free_function_symbol(node));
         if (!fn_val.is_valid()) {
             const fname: string = this.resolve(node.name);
             this.diag.emit_warning_at_span(ErrorCode::E0606_FUNCTION_GENERATION_ERROR,
-                format("codegen: naked function '%s' has no LLVM declaration in this module; body skipped.", fname),
+                fmt::format("codegen: naked function '%s' has no LLVM declaration in this module; body skipped.", fname),
                 node.span);
             return LValue::null();
         }
@@ -1740,53 +1687,10 @@ type struct DeclarationEmitter {
     }
 
     codegen_function_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
-        const ctx_ptr: CompilationContext* = this.ctx;
-        const intern: InternTable* = ctx_ptr.intern_table;
-        // Same canonical-namespace resolution as `declare_function` so the
-        // body attaches to the exact LLVM function the signature pass declared
-        // (template-derived for injected free-fn / static-method-generic specs).
-        const qualified: SymbolStr = this.fn_qualified_name(node);
-        const di: DeclarationIndex* = ctx_ptr.decl_index;
-        const arena: TypeArena* = this.get_arena();
-
-        // Body emission must attach to the LLVM function for THIS exact
-        // overload, not whichever one was registered last under the bare
-        // qualified-name cache.  Build the same func_type_ref declare_function
-        // used to derive the mangled name, then fetch by name from the LLVM
-        // module directly.  Falls back to the bare cache for non-overloaded
-        // functions (no overload-keyed entry registered).
-        mut params: TypeRef[] = [];
-        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
-            const param: VarDeclNode* = node.parameters[pi];
-            if (param != null && param.resolved_type.is_valid()) {
-                params.push(param.resolved_type);
-            }
-        }
-        const func_type_ref: TypeRef = arena.get_function(
-            node.resolved_return_type, params, node.is_variadic);
-        const overload_mangled: SymbolStr = di.lookup_overload_mangled(qualified, func_type_ref);
-
-        mut fn_val: LValue = LValue::null();
-        if (overload_mangled.is_valid()) {
-            // `main` is special-cased to keep its unmangled C ABI symbol;
-            // mirror declare_function's override so we look up "main" not
-            // the mangled form.
-            const main_sym: SymbolStr = intern.intern("main");
-            mut ir_name: string = intern.resolve(overload_mangled);
-            if (node.name.equals(main_sym)) {
-                ir_name = "main";
-                // Under `--panic=unwind` declare_function emitted the user body's
-                // function under the internal symbol (the `main` symbol is the
-                // synthesized catch wrapper); attach the body to that same symbol.
-                if (this.ctx.project_panic_unwind && !this.ctx.project_no_runtime) {
-                    ir_name = "__cryo_user_main";
-                }
-            }
-            fn_val = this.llvm_module.get_named_function(ir_name);
-        }
-        if (!fn_val.is_valid()) {
-            fn_val = this.resolver.resolve_function(qualified);
-        }
+        // The body attaches to the function `declare_function` made for THIS
+        // signature, held under the symbol both derive the same way.
+        const mangled_sym: SymbolStr = this.free_function_symbol(node);
+        const fn_val: LValue = this.functions.get(mangled_sym);
         if (!fn_val.is_valid()) {
             // IRGeneration's declare-functions phase should have produced a
             // declare for this function before any body is emitted. When it
@@ -1796,7 +1700,7 @@ type struct DeclarationEmitter {
             // exercised.
             const fname: string = this.resolve(node.name);
             this.diag.emit_warning_at_span(ErrorCode::E0606_FUNCTION_GENERATION_ERROR,
-                format("codegen: function '%s' has no LLVM declaration in this module; body skipped (the declare-functions phase should have produced one). Calls to this function will fail at link time.", fname),
+                fmt::format("codegen: function '%s' has no LLVM declaration in this module; body skipped (the declare-functions phase should have produced one). Calls to this function will fail at link time.", fname),
                 node.span);
             return LValue::null();
         }
@@ -1830,7 +1734,7 @@ type struct DeclarationEmitter {
             if (!param_ty.is_valid()) {
                 const fname: string = this.resolve(node.name);
                 this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
-                    format("codegen: function '%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this function will fail at link time.",
+                    fmt::format("codegen: function '%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this function will fail at link time.",
                         fname, param_name),
                     if (param != null) { param.span } else { node.span });
                 this.values.pop_scope();
@@ -1851,7 +1755,7 @@ type struct DeclarationEmitter {
                 const arg: LValue = LValue {
                     raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx),
                 };
-                this.values.set(param.name, arg);
+                this.values.set(param.sym_id, arg);
                 llvm_idx += 1;
                 continue;
             }
@@ -1879,15 +1783,15 @@ type struct DeclarationEmitter {
                 // GEP at byte offset 8 via i8 base, mirroring the
                 // call-site DirectPair expansion.
                 const i8_ty: LType = LType::i8();
-                const idx_buf: void* = intrinsics::malloc(8);
+                const idx_buf: void* = libc::malloc(8);
                 const idx_slots: void** = idx_buf as void**;
                 const eight: LValue = LType::const_int(LType::i64(), 8, false);
                 idx_slots[0] = eight.raw;
                 const hi_ptr: LValue = this.builder.build_gep(
                     i8_ty, alloca, idx_buf, 1, "param.hi.ptr");
-                intrinsics::free(idx_buf);
+                libc::free(idx_buf);
                 this.builder.build_store(hi_arg, hi_ptr);
-                this.values.set(param.name, alloca);
+                this.values.set(param.sym_id, alloca);
                 llvm_idx += 2;
                 continue;
             }
@@ -1897,7 +1801,7 @@ type struct DeclarationEmitter {
                 raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx),
             };
             this.builder.build_store(arg, alloca);
-            this.values.set(param.name, alloca);
+            this.values.set(param.sym_id, alloca);
             llvm_idx += 1;
         }
 
@@ -1906,7 +1810,12 @@ type struct DeclarationEmitter {
         // a v* variant (vsprintf, vfprintf, etc.).  Without this the `args`
         // identifier has no LLVM value and every forwarding call codegens
         // with a null operand.
-        this.expr_ops.emit_va_start_for_variadic(fn_val, CodegenUtil::variadic_param_name(node));
+        const va_param: VarDeclNode* = CodegenUtil::variadic_param(node);
+        if (va_param != null) {
+            this.expr_ops.emit_va_start_for_variadic(fn_val, va_param.name, va_param.sym_id);
+        } else {
+            this.expr_ops.emit_va_start_for_variadic(fn_val, SymbolStr::empty(), SymbolID::invalid());
+        }
 
         // Program-main prologue: publish argc/argv to the standard library
         // before the user's body runs, so `std::env::args()` returns the
@@ -1914,13 +1823,11 @@ type struct DeclarationEmitter {
         // main's LLVM signature to `i32 (i32, ptr)`; the user's source has
         // no parameters, so we read the synthetic params via LLVMGetParam
         // and forward them through the regular function-resolution path.
-        // `intern` is already bound at the top of this function.
         // Suppressed under `no_runtime`: main's signature was NOT widened
         // (no argc/argv/envp), so there are no synthetic params to publish,
         // and `std::env` is not linked in a freestanding build.
-        const main_sym: SymbolStr = intern.intern("main");
-        if (node.name.equals(main_sym) && CodegenUtil::fixed_param_count(node) == 0
-            && !this.ctx.project_no_runtime) {
+        if (node.def.is_valid() && node.def.equals(this.ctx.entry_fn) && CodegenUtil::fixed_param_count(node) == 0
+            && !this.ctx.options.freestanding()) {
             this.emit_set_args_call(fn_val);
             this.emit_set_env_call(fn_val);
         }
@@ -1930,14 +1837,13 @@ type struct DeclarationEmitter {
 
     /// Emit `std::env::set_args(argc, argv)` at the entry of the program's
     /// main function.  Looks the function up by qualified name so the
-    /// mangled symbol is whatever `MangledName::for_free_function` decides
-    /// No hardcoded mangle.  Silent no-op if the stdlib (or `set_args`
+    /// symbol is whatever its registered entry carries - no hardcoded
+    /// mangle.  Silent no-op if the stdlib (or `set_args`
     /// specifically) isn't available, which keeps `--no-std` builds and
     /// freestanding mains compiling.
     emit_set_args_call(mut &this, main_fn: LValue) -> void {
-        const intern: InternTable* = this.get_intern();
-        const set_args_sym: SymbolStr = intern.intern("std::env::set_args");
-        const set_args_fn: LValue = this.resolver.resolve_function(set_args_sym);
+        const set_args_fn: LValue = this.resolver.resolve_function(
+            this.ctx.generic_registry.wellknown(LangItem::SetArgs));
         if (!set_args_fn.is_valid()) { return; }
 
         const set_args_ty: LType = LType {
@@ -1949,8 +1855,8 @@ type struct DeclarationEmitter {
         const argv: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 1) };
 
         mut args: Pair<LValue, TypeRef>[] = [];
-        args.push(Pair<LValue, TypeRef>::new(argc, TypeRef::invalid()));
-        args.push(Pair<LValue, TypeRef>::new(argv, TypeRef::invalid()));
+        args.push(Pair::<LValue, TypeRef>::new(argc, TypeRef::invalid()));
+        args.push(Pair::<LValue, TypeRef>::new(argv, TypeRef::invalid()));
         mut result: LValue = LValue::null();
         result = this.expr_ops.codegen_call(set_args_fn, set_args_ty, args, "");
     }
@@ -1963,9 +1869,8 @@ type struct DeclarationEmitter {
     /// so `--no-std` and freestanding mains still compile.  The main-widening
     /// branch above gave main a synthetic third `char**` param at index 2.
     emit_set_env_call(mut &this, main_fn: LValue) -> void {
-        const intern: InternTable* = this.get_intern();
-        const set_env_sym: SymbolStr = intern.intern("std::env::set_env");
-        const set_env_fn: LValue = this.resolver.resolve_function(set_env_sym);
+        const set_env_fn: LValue = this.resolver.resolve_function(
+            this.ctx.generic_registry.wellknown(LangItem::SetEnv));
         if (!set_env_fn.is_valid()) { return; }
 
         const set_env_ty: LType = LType {
@@ -1976,7 +1881,7 @@ type struct DeclarationEmitter {
         const envp: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 2) };
 
         mut args: Pair<LValue, TypeRef>[] = [];
-        args.push(Pair<LValue, TypeRef>::new(envp, TypeRef::invalid()));
+        args.push(Pair::<LValue, TypeRef>::new(envp, TypeRef::invalid()));
         mut result: LValue = LValue::null();
         result = this.expr_ops.codegen_call(set_env_fn, set_env_ty, args, "");
     }
@@ -1986,10 +1891,10 @@ type struct DeclarationEmitter {
     /// the stashed panic payload and exit 101.  Called only from the `main`
     /// wrapper's catch pad.
     get_or_decl_panic_finish(mut &this) -> LValue {
-        mut fn: LValue = this.llvm_module.get_named_function("__cryo_panic_finish");
+        mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("__cryo_panic_finish"));
         if (fn.is_valid()) { return fn; }
         const fty: LType = LType::function_type(LType::void_type(), null, 0, false);
-        return this.llvm_module.add_function("__cryo_panic_finish", fty);
+        return this.llvm_module.add_function(MangledName::new("__cryo_panic_finish"), fty);
     }
 
     /// Synthesize the `--panic=unwind` root-catch wrapper.  `user_main` is the
@@ -2011,7 +1916,7 @@ type struct DeclarationEmitter {
     /// first, so destructors execute before the process ends.  The catch is
     /// catch-all + unconditional (the selector is never inspected).
     emit_main_unwind_wrapper(mut &this, user_main: LValue, fn_type: LType) -> void {
-        const wrapper: LValue = this.llvm_module.add_function("main", fn_type);
+        const wrapper: LValue = this.llvm_module.add_function(MangledName::new("main"), fn_type);
         if (!wrapper.is_valid()) { return; }
 
         const pers: LValue = this.expr_ops.get_or_decl_personality();
@@ -2030,7 +1935,7 @@ type struct DeclarationEmitter {
         const nparams: u32 = llvm::LLVMCountParamTypes(fn_type.raw);
         mut arg_buf: void* = null;
         if (nparams > 0) {
-            arg_buf = intrinsics::malloc(nparams as u64 * 8);
+            arg_buf = libc::malloc(nparams as u64 * 8);
             const arg_slots: void** = arg_buf as void**;
             for (mut i: u32 = 0; i < nparams; i++) {
                 arg_slots[i] = wrapper.get_param(i).raw;
@@ -2038,7 +1943,7 @@ type struct DeclarationEmitter {
         }
         const r: LValue = this.builder.build_invoke(
             fn_type, user_main, arg_buf, nparams, cont_bb, lpad_bb, "");
-        if (arg_buf != null) { intrinsics::free(arg_buf); }
+        if (arg_buf != null) { libc::free(arg_buf); }
 
         // Normal exit: return the user main's result (or void).
         this.builder.position_at_end(cont_bb);
@@ -2082,15 +1987,15 @@ type struct DeclarationEmitter {
             mut is_void: boolean = ret_ty.is_invalid();
             mut is_never: boolean = false;
             if (!is_void) {
-                const t: Type* = this.lookup_type_by_id(ret_ty.id);
+                const t: Type* = this.arena_type(ret_ty);
                 is_void = t != null && (t.kind == TypeKind::Void || t.kind == TypeKind::Unit);
                 is_never = t != null && t.kind == TypeKind::Never;
             }
             if (is_void) {
-                this.expr_ops.emit_va_end_if_variadic(CodegenUtil::variadic_param_name(node));
+                this.expr_ops.emit_va_end_if_variadic();
                 this.builder.build_ret_void();
             } else if (is_never) {
-                this.expr_ops.emit_va_end_if_variadic(CodegenUtil::variadic_param_name(node));
+                this.expr_ops.emit_va_end_if_variadic();
                 this.builder.build_unreachable();
             }
             // Other non-void: intentionally leave unterminated. The caller
@@ -2144,39 +2049,21 @@ type struct DeclarationEmitter {
     }
 
     /// Generate function prologue for a method.  Prepends `this` parameter binding.
-    codegen_method_prologue(mut &this, node: MethodNode*, target_type: SymbolStr) -> LValue {
+    /// `owner` as in `declare_method`; its display name serves the diagnostics.
+    codegen_method_prologue(mut &this, node: MethodNode*, owner: TypeRef) -> LValue {
         const func: FunctionDeclNode* = node.func;
         if (func == null) { return LValue::null(); }
 
         const intern: InternTable* = this.get_intern();
-        const type_str: string = intern.resolve(target_type);
+        const type_str: string = if (owner.is_valid()) {
+            this.get_arena().resolve_display_name(owner)
+        } else { "" };
         const method_str: string = intern.resolve(func.name);
-        const combined: string = format("%s::%s", type_str, method_str);
-        const combined_sym: SymbolStr = intern.intern(combined);
 
-        // Recompute the mangled name from THIS overload's parameter types so
-        // overloaded methods (e.g., BaseASTVisitor's 62 `visit(...)` overrides)
-        // resolve to their own LLVM function rather than all mapping to the
-        // first-declared overload via the ambiguous combined key.  Must mirror
-        // the computation in `declare_method` exactly.
-        const arena: TypeArena* = this.get_arena();
-        const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
-        const recv_kind: ReceiverKind = DeclarationIndex::method_receiver_kind(func, node.is_static, intern);
-        const method_param_refs: TypeRef[] = DeclarationIndex::method_non_receiver_params(func, intern);
-        const computed_base: MangledName = MangledName::for_method_or_trait_impl(
-            intern, arena, type_qname, func.origin_trait, func.name, recv_kind,
-            method_param_refs, func.resolved_return_type, func.is_variadic);
-        // Mirror declare_method's `$MG...` spec-args disambiguator exactly.
-        const computed: MangledName = computed_base.with_method_spec_args(
-            intern, arena, func.spec_type_args);
-        const mangled_sym: SymbolStr = computed.value;
-
-        // Prefer mangled_sym for overload-correct lookup; fall back to the
-        // combined key for paths that only registered the non-overloaded form.
-        mut fn_val: LValue = this.resolver.resolve_function(mangled_sym);
-        if (!fn_val.is_valid()) {
-            fn_val = this.resolver.resolve_function(combined_sym);
-        }
+        // The body attaches to the function `declare_method` made, held
+        // under the entry's symbol - the one place both read it from.
+        const mangled_sym: SymbolStr = this.method_symbol(node);
+        const fn_val: LValue = this.functions.get(mangled_sym);
         if (!fn_val.is_valid()) {
             // declare_method should have produced an LLVM declare for this
             // method.  When it didn't (e.g. cross-module trait impls whose
@@ -2187,7 +2074,7 @@ type struct DeclarationEmitter {
             // references at link time, which is the correct visibility
             // outcome until the upstream declare path is fixed.
             this.diag.emit_warning_at_span(ErrorCode::E0619_METHOD_GENERATION_ERROR,
-                format("codegen: method '%s::%s' has no LLVM declaration in this module; body skipped (declare_method should have produced one). Calls to this method will fail at link time.",
+                fmt::format("codegen: method '%s::%s' has no LLVM declaration in this module; body skipped (declare_method should have produced one). Calls to this method will fail at link time.",
                     type_str, method_str),
                 func.span);
             return LValue::null();
@@ -2207,22 +2094,21 @@ type struct DeclarationEmitter {
         const is_sret_method: boolean = this.abi.sret_pointee_of(fn_val).is_valid();
         const sret_off: u32 = if (is_sret_method) { 1 } else { 0 } as u32;
 
-        // Detect which of the three self forms (if any) this method uses.
-        //   `&this` / `mut &this`: param named "&this", semantically a T*
-        //   `this`               : param named "this", semantically a by-value T
-        //   (none)               : implicit `&this`; `declare_method` synthesized
-        //                           a leading T* in the LLVM function signature
+        // Detect which receiver form an instance method has; every one has a
+        // receiver parameter, written or synthesized.
+        //   `&this` / `mut &this`: semantically a T*
+        //   `this`               : semantically a by-value T
+        //   `this: T*`           : a user-typed receiver
         // The LLVM parameter layout depends on which case we're in; matches the
-        // logic in declare_method so named_values and LLVM params line up.
+        // logic in declare_method so the value table and LLVM params line up.
         mut explicit_ref_idx: i64 = -1;    // parameters[i] is "&this"
         mut explicit_val_idx: i64 = -1;    // parameters[i] is bare "this" (by-value self)
         mut explicit_typed_idx: i64 = -1;  // parameters[i] is "this: T*" (user-typed self)
         for (mut pc: i64 = 0; pc < func.parameters.length; pc++) {
             const pp: VarDeclNode* = func.parameters[pc];
             if (pp == null) { continue; }
-            const pn: string = this.resolve(pp.name);
-            if (pn == "&this") { explicit_ref_idx = pc; break; }
-            if (pn.eq("this")) {
+            if (pp.is_ref_receiver()) { explicit_ref_idx = pc; break; }
+            if (pp.is_value_receiver()) {
                 if (pp.type_annotation == null) {
                     explicit_val_idx = pc;
                 } else {
@@ -2241,34 +2127,26 @@ type struct DeclarationEmitter {
         // named-value that's a pointer to the struct; for by-value `this` we
         // alloca+store the struct so member-access GEPs work the same way.
         if (!node.is_static) {
-            const qualified_target: SymbolStr = this.ctx.qualify_symbol_sym(target_type);
-            mut target_ref: TypeRef = this.ctx.decl_index.lookup_type(qualified_target);
+            const target_ref: TypeRef = owner;
             if (target_ref.is_invalid()) {
-                target_ref = this.ctx.decl_index.lookup_type(target_type);
-            }
-            if (target_ref.is_invalid()) {
-                // Unit-target impls (`implement trait Drop for ()`):
-                // unit type lives in the arena, not the DeclarationIndex.
-                // Detected by the literal `()` suffix on the qualified target
-                // name; mirrors the fallback in declare_method.
-                const target_str: string = this.resolve(target_type);
-                const tlen: u64 = target_str.length();
-                if (tlen >= 2 && target_str[tlen - 2] == 0x28 /* '(' */
-                              && target_str[tlen - 1] == 0x29 /* ')' */) {
-                    target_ref = this.get_arena().get_unit();
-                }
-            }
-            if (target_ref.is_invalid()) {
-                const ts: string = this.resolve(target_type);
                 const ms: string = this.resolve(func.name);
                 this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    format("codegen: method '%s::%s': target type '%s' not found in declaration index", ts, ms, ts),
+                    fmt::format("codegen: method '%s::%s': the owner has no type", type_str, ms),
                     func.span);
                 this.values.pop_scope();
                 return LValue::null();
             }
 
-            const this_sym: SymbolStr = this.intern_str("this");
+            // The receiver's binding is its parameter's, which every use of
+            // `this` in the body is stamped with.
+            mut recv_idx: i64 = explicit_ref_idx;
+            if (recv_idx < 0) { recv_idx = explicit_val_idx; }
+            if (recv_idx < 0) { recv_idx = explicit_typed_idx; }
+            const this_bind: SymbolID = if (recv_idx >= 0) {
+                func.parameters[recv_idx].sym_id
+            } else {
+                SymbolID::invalid()
+            };
             // LLVM index for the receiver is `sret_off` (0 normally, 1 when sret).
             const arg0: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, sret_off) };
 
@@ -2288,7 +2166,7 @@ type struct DeclarationEmitter {
                 const target_mapped: LType = this.type_mapper.map_type(target_ref);
                 if (!target_mapped.is_valid()) {
                     this.diag.emit_warning_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
-                        format("codegen: method '%s::%s': could not lower the by-value `this` type to LLVM; body skipped. Calls to this method will fail at link time.",
+                        fmt::format("codegen: method '%s::%s': could not lower the by-value `this` type to LLVM; body skipped. Calls to this method will fail at link time.",
                             type_str, method_str),
                         func.span);
                     this.values.pop_scope();
@@ -2299,7 +2177,7 @@ type struct DeclarationEmitter {
                 if (recv_byval_pointee.is_valid()) {
                     // byval: the LLVM param IS a pointer to the receiver struct;
                     // bind it directly (copy semantics already handled by the ABI).
-                    this.values.set(this_sym, arg0);
+                    this.values.set(this_bind, arg0);
                     recv_slots = 1;
                 } else {
                     const recv_plan: ParamPlan = this.abi.classify_param(target_ref);
@@ -2313,21 +2191,21 @@ type struct DeclarationEmitter {
                             raw: llvm::LLVMGetParam(fn_val.raw, sret_off + 1) };
                         this.builder.build_store(lo_arg, slot);
                         const i8_ty: LType = LType::i8();
-                        const idx_buf: void* = intrinsics::malloc(8);
+                        const idx_buf: void* = libc::malloc(8);
                         const idx_slots: void** = idx_buf as void**;
                         const eight: LValue = LType::const_int(LType::i64(), 8, false);
                         idx_slots[0] = eight.raw;
                         const hi_ptr: LValue = this.builder.build_gep(
                             i8_ty, slot, idx_buf, 1, "this.hi.ptr");
-                        intrinsics::free(idx_buf);
+                        libc::free(idx_buf);
                         this.builder.build_store(hi_arg, hi_ptr);
-                        this.values.set(this_sym, slot);
+                        this.values.set(this_bind, slot);
                         recv_slots = 2;
                     } else {
                         const slot: LValue = this.flow.create_entry_alloca(
                             fn_val, "this", target_mapped);
                         this.builder.build_store(arg0, slot);
-                        this.values.set(this_sym, slot);
+                        this.values.set(this_bind, slot);
                         recv_slots = 1;
                     }
                 }
@@ -2335,11 +2213,11 @@ type struct DeclarationEmitter {
                 // User-typed `this: T*`: LLVM param 0 is whatever the
                 // annotation resolves to (typically a ptr).  Bind `this`
                 // directly to that value, same as the `&this` path.
-                this.values.set(this_sym, arg0);
+                this.values.set(this_bind, arg0);
             } else {
-                // `&this` (explicit or implicit): LLVM param 0 is already a ptr.
-                // Store the raw pointer directly in named_values (no alloca).
-                this.values.set(this_sym, arg0);
+                // `&this`: LLVM param 0 is already a ptr.
+                // Store the raw pointer directly in the value table (no alloca).
+                this.values.set(this_bind, arg0);
             }
 
             param_idx = recv_slots + sret_off;
@@ -2361,7 +2239,7 @@ type struct DeclarationEmitter {
             const param_ty: LType = this.type_mapper.map_type(param.resolved_type);
             if (!param_ty.is_valid()) {
                 this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
-                    format("codegen: method '%s::%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this method will fail at link time.",
+                    fmt::format("codegen: method '%s::%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this method will fail at link time.",
                         type_str, method_str, param_name),
                     if (param != null) { param.span } else { func.span });
                 this.values.pop_scope();
@@ -2376,7 +2254,7 @@ type struct DeclarationEmitter {
                 this.abi.byval_pointee_of_param(fn_val, param_idx);
             if (byval_pointee_m.is_valid()) {
                 const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };
-                this.values.set(param.name, arg);
+                this.values.set(param.sym_id, arg);
                 param_idx += 1;
                 continue;
             }
@@ -2397,15 +2275,15 @@ type struct DeclarationEmitter {
                 };
                 this.builder.build_store(lo_arg, alloca);
                 const i8_ty: LType = LType::i8();
-                const idx_buf: void* = intrinsics::malloc(8);
+                const idx_buf: void* = libc::malloc(8);
                 const idx_slots: void** = idx_buf as void**;
                 const eight: LValue = LType::const_int(LType::i64(), 8, false);
                 idx_slots[0] = eight.raw;
                 const hi_ptr: LValue = this.builder.build_gep(
                     i8_ty, alloca, idx_buf, 1, "param.hi.ptr");
-                intrinsics::free(idx_buf);
+                libc::free(idx_buf);
                 this.builder.build_store(hi_arg, hi_ptr);
-                this.values.set(param.name, alloca);
+                this.values.set(param.sym_id, alloca);
                 param_idx += 2;
                 continue;
             }
@@ -2413,7 +2291,7 @@ type struct DeclarationEmitter {
             const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };
             const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
             this.builder.build_store(arg, alloca);
-            this.values.set(param.name, alloca);
+            this.values.set(param.sym_id, alloca);
             param_idx += 1;
         }
 
@@ -2426,7 +2304,7 @@ type struct DeclarationEmitter {
             return LType::void_type();
         }
 
-        const t: Type* = this.lookup_type_by_id(node.resolved_return_type.id);
+        const t: Type* = this.arena_type(node.resolved_return_type);
         if (t == null || t.kind == TypeKind::Void || t.kind == TypeKind::Unit) {
             return LType::void_type();
         }
@@ -2438,81 +2316,98 @@ type struct DeclarationEmitter {
     // intrinsics (ptr arithmetic, sext/zext, rotates, abort, panic, ...
     // dispatched by name through `try_emit_intrinsic_call`).
 
-    auto_deref_to(mut &this, val: LValue, expected: LType) -> LValue {
-        if (!val.is_valid() || !expected.is_valid()) { return val; }
-        const actual_ty: void* = llvm::LLVMTypeOf(val.raw);
-        if (actual_ty == null) { return val; }
-        if (LType::kind_of(actual_ty) == LTypeKind::Pointer) {
-            return this.builder.build_load(expected, val, "deref");
-        }
-        return val;
+
+    /// Fold a float-typed const initializer to an `f64` constant.
+    ///
+    /// The whole expression is `ConstEval`'s to answer, including the names in
+    /// it: a folder here that knew only literals and arithmetic could not read
+    /// `const D: f64 = A * (1.0 - B);`, and an initializer this position cannot
+    /// fold is not diagnosed - it is emitted as 0.0.  Reading names is the
+    /// constant table's job, and doing it here as well would be a second
+    /// implementation of one question, free to drift from the first.
+    try_fold_const_real(&this, expr: ExpressionNode*, out: f64*) -> boolean {
+        if (expr == null) { return false; }
+        return this.const_eval().fold_real(expr, out);
     }
 
-
-    /// Fold a float-typed const initializer expression to an `f64` constant:
-    /// float/integer literals, unary `-`/`+`, and binary `+ - * /`. Returns
-    /// false for anything outside that set (identifiers, calls, etc.), which the
-    /// caller leaves on the zeroinitializer fallback. Mirrors sema's
-    /// `try_fold_const_i64` but in `f64` (IEEE saturates, so no overflow guards).
-    /// This is what makes `const F64_MIN: f64 = -1.79e308;` carry its real value
-    /// instead of silently becoming 0.0.
-    static try_fold_const_real(expr: ExpressionNode*, out: f64*) -> boolean {
-        if (expr == null) { return false; }
-        const node: ASTNode* = expr as ASTNode*;
-        if (node.kind == NodeKind::Literal) {
-            const lit: LiteralNode* = expr as LiteralNode*;
-            if (lit.literal_kind == LiteralKind::Float) {
-                *out = float::parse_f64(lit.value).unwrap_or(0.0);
-                return true;
-            }
-            if (lit.literal_kind == LiteralKind::Integer) {
-                const iv: u64 = lit.value.parse_int<u64>();
-                *out = iv as f64;
-                return true;
-            }
-            return false;
-        }
-        if (node.kind == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = expr as UnaryExprNode*;
-            mut a: f64 = 0.0;
-            if (!DeclarationEmitter::try_fold_const_real(u.operand, &a)) { return false; }
-            if (u.op.lexeme == "-") { *out = 0.0 - a; return true; }
-            if (u.op.lexeme == "+") { *out = a; return true; }
-            return false;
-        }
-        if (node.kind == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = expr as BinaryExprNode*;
-            mut x: f64 = 0.0;
-            mut y: f64 = 0.0;
-            if (!DeclarationEmitter::try_fold_const_real(b.left, &x)) { return false; }
-            if (!DeclarationEmitter::try_fold_const_real(b.right, &y)) { return false; }
-            const op: string = b.op.lexeme;
-            if (op == "+") { *out = x + y; return true; }
-            if (op == "-") { *out = x - y; return true; }
-            if (op == "*") { *out = x * y; return true; }
-            if (op == "/") { *out = x / y; return true; }
-            return false;
-        }
-        return false;
+    /// The compile-time integer folder, reading names as the module that WROTE
+    /// this initializer sees them.
+    ///
+    const_eval(&this) -> ConstEval {
+        return ConstEval::new(this.ctx.const_table, this.ctx.intern_table,
+                              this.ctx.type_arena);
     }
 
     /// Constant-fold an INTEGER const initializer to its 64-bit two's-complement
     /// bit pattern.  Handles integer/bool literals, unary `-`/`+`/`~`, and the
     /// binary operators that are bit-exact in two's complement regardless of
-    /// signedness (`+ - * << & | ^`).  Sign-dependent operators (`>> / %`) and
-    /// anything else (identifiers, calls) return false, leaving the caller on
-    /// the zeroinitializer fallback - so the folder is correct-or-decline, never
-    /// silently wrong.  Computing in u64 keeps every accepted operation
+    /// signedness (`+ - * << & | ^`).
+    ///
+    /// Arithmetic is computed here, at the global's own width, because that is
+    /// the question this position owns: u64 keeps every accepted operation
     /// well-defined wrapping (codegen emits plain LLVMBuildAdd/Sub/Mul) and
     /// bit-identical to the signed result, which is what makes
     /// `const EOF: i32 = -1;` carry 0xFFFFFFFF instead of silently becoming 0.
-    static try_fold_const_int(expr: ExpressionNode*, out: u64*) -> boolean {
+    ///
+    /// What a NAME denotes, and what a type's `sizeof`/`alignof` is, are not
+    /// this position's questions - they belong to `ConstEval` over the constant
+    /// table and the arena - so they are asked there rather than re-derived
+    /// here.  Declining them locally is not the safe default it reads as: an
+    /// unfolded initializer does not become an error, it becomes the
+    /// zeroinitializer, so a leaf that cannot answer publishes 0 as the
+    /// constant's value.
+    try_fold_const_int(&this, expr: ExpressionNode*, out: u64*) -> boolean {
         if (expr == null) { return false; }
         const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::CastExpression) {
+            // `Enum::Variant as u64`, `SOME_CONST as i32`.  Fold the OPERAND:
+            // the cast's own width is applied by `const_int` when it builds the
+            // constant against the global's type, so a cast chain folds once and
+            // narrows once.  Without this the initializer does not fold at all
+            // and the global lands on the zero fallback below.
+            const ce: CastExprNode* = expr as CastExprNode*;
+            return this.try_fold_const_int(ce.expression, out);
+        }
+        if (node.kind == NodeKind::ScopeResolution) {
+            // `Enum::Variant`: a payload-free variant IS its discriminant.
+            // Naming the enum rather than copying its number is the spelling
+            // that survives a header change, and it is the one that silently
+            // produced 0 at module scope.
+            const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+            mut real_ref: TypeRef = sr.resolved_type;
+            mut real_t: Type* = this.arena_type(real_ref);
+            mut depth: i32 = 0;
+            while (real_t != null && real_t.kind == TypeKind::InstantiatedType && depth < 5) {
+                const inst: InstantiatedType* = real_t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { break; }
+                real_ref = inst.resolved_type;
+                real_t = this.arena_type(real_ref);
+                depth += 1;
+            }
+            if (real_t == null || real_t.kind != TypeKind::Enum) {
+                // The scope does not name an enum, so the path names a
+                // module-qualified CONSTANT (`limits::MAX_PATH`) - a different
+                // referent, answered by the constant table rather than by a
+                // variant tag.
+                mut qv: i64 = 0;
+                if (this.const_eval().fold(expr, &qv)) {
+                    *out = qv as u64;
+                    return true;
+                }
+                return false;
+            }
+            const et: EnumType* = real_t as EnumType*;
+            const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, sr.resolved_member);
+            // A variant carrying a payload is a CONSTRUCTOR, not a constant -
+            // its tag alone is not the value the initializer names.
+            if (variant == null || variant.has_payload()) { return false; }
+            *out = variant.tag_value;
+            return true;
+        }
         if (node.kind == NodeKind::Literal) {
             const lit: LiteralNode* = expr as LiteralNode*;
             if (lit.literal_kind == LiteralKind::Integer) {
-                *out = lit.value.parse_int<u64>();
+                *out = lit.value.parse_int::<u64>();
                 return true;
             }
             if (lit.literal_kind == LiteralKind::Boolean) {
@@ -2521,30 +2416,53 @@ type struct DeclarationEmitter {
             }
             return false;
         }
+        // What a NAME denotes, and what a type's `sizeof`/`alignof` is, are not
+        // this position's questions - they belong to `ConstEval` over the
+        // constant table and the arena - so they are asked there rather than
+        // re-derived here.
+        if (node.kind == NodeKind::Identifier
+            || node.kind == NodeKind::SizeofExpression
+            || node.kind == NodeKind::AlignofExpression) {
+            mut nv: i64 = 0;
+            if (!this.const_eval().fold(expr, &nv)) { return false; }
+            *out = nv as u64;
+            return true;
+        }
         if (node.kind == NodeKind::UnaryExpression) {
             const u: UnaryExprNode* = expr as UnaryExprNode*;
             mut a: u64 = 0;
-            if (!DeclarationEmitter::try_fold_const_int(u.operand, &a)) { return false; }
-            const op: string = u.op.lexeme;
-            if (op == "-") { *out = 0 - a; return true; }
-            if (op == "+") { *out = a;        return true; }
-            if (op == "~") { *out = ~a;       return true; }
+            if (!this.try_fold_const_int(u.operand, &a)) { return false; }
+            const op: TokenType = u.op.kind;
+            if (op == TokenType::Minus) { *out = 0 - a; return true; }
+            if (op == TokenType::Plus) { *out = a;        return true; }
+            if (op == TokenType::Tilde) { *out = ~a;       return true; }
             return false;
         }
         if (node.kind == NodeKind::BinaryExpression) {
             const b: BinaryExprNode* = expr as BinaryExprNode*;
+            const op: TokenType = b.op.kind;
+            // `/ % >>` read their operands as NUMBERS, so their result depends
+            // on a signedness a u64 bit pattern has already discarded.  They
+            // are computed by the folder that works in signed i64 rather than
+            // approximated here; each operator therefore has exactly one
+            // evaluator, and none is left to the zeroinitializer.
+            if (op == TokenType::Slash || op == TokenType::Percent || op == TokenType::GreaterGreater) {
+                mut sv: i64 = 0;
+                if (!this.const_eval().fold(expr, &sv)) { return false; }
+                *out = sv as u64;
+                return true;
+            }
             mut x: u64 = 0;
             mut y: u64 = 0;
-            if (!DeclarationEmitter::try_fold_const_int(b.left, &x)) { return false; }
-            if (!DeclarationEmitter::try_fold_const_int(b.right, &y)) { return false; }
-            const op: string = b.op.lexeme;
-            if (op == "+")  { *out = x + y;  return true; }
-            if (op == "-")  { *out = x - y;  return true; }
-            if (op == "*")  { *out = x * y;  return true; }
-            if (op == "&")  { *out = x & y;  return true; }
-            if (op == "|")  { *out = x | y;  return true; }
-            if (op == "^")  { *out = x ^ y;  return true; }
-            if (op == "<<") { *out = x << y; return true; }
+            if (!this.try_fold_const_int(b.left, &x)) { return false; }
+            if (!this.try_fold_const_int(b.right, &y)) { return false; }
+            if (op == TokenType::Plus)  { *out = x + y;  return true; }
+            if (op == TokenType::Minus)  { *out = x - y;  return true; }
+            if (op == TokenType::Star)  { *out = x * y;  return true; }
+            if (op == TokenType::Amp)  { *out = x & y;  return true; }
+            if (op == TokenType::Pipe)  { *out = x | y;  return true; }
+            if (op == TokenType::Caret)  { *out = x ^ y;  return true; }
+            if (op == TokenType::LessLess) { *out = x << y; return true; }
             return false;
         }
         return false;
@@ -2559,35 +2477,123 @@ type struct DeclarationEmitter {
     /// any non-constant field, or a field-count mismatch (an unexpected shape),
     /// returns an invalid value so the caller declines to the zeroinitializer
     /// fallback - correct-or-decline, never a silently wrong layout.
-    static try_const_struct(sl: StructLiteralNode*, ty: LType) -> LValue {
+    /// `layout` is the Cryo type whose field list `sl` initializes, so a field
+    /// can be placed at the element that actually holds it: a body may carry
+    /// alignment padding elements the field list has no member for.  Padding
+    /// elements are zero-filled.  A body with a DIFFERENT element count than
+    /// fields-plus-padding is an unexpected shape and declines, as before -
+    /// but the count alone can no longer decide, because padding makes a
+    /// correct body wider than its field list.
+    try_const_struct(&this, mapper: TypeMapper*, layout: Type*,
+                     sl: StructLiteralNode*, ty: LType) -> LValue {
         const n: u32 = llvm::LLVMCountStructElementTypes(ty.raw);
-        if (n == 0 || (sl.field_inits.length as u32) != n) { return LValue::null(); }
-        const buf: void* = intrinsics::malloc((n as u64) * 8);
+        if (n == 0 || mapper == null || layout == null) { return LValue::null(); }
+        // Every field initialized, in declaration order - the shape the
+        // importer emits.  A partial literal still declines: filling only some
+        // fields here would silently define the rest as zero.
+        mut field_count: i64 = -1;
+        if (layout.kind == TypeKind::Struct) { field_count = (layout as StructType*).fields.length; }
+        else if (layout.kind == TypeKind::Class) { field_count = (layout as ClassType*).fields.length; }
+        if (field_count < 0 || sl.field_inits.length != field_count) { return LValue::null(); }
+        const buf: void* = libc::malloc((n as u64) * 8);
+        const slots: void** = buf as void**;
+        // Zero every element first, so any padding element is a well-formed
+        // constant even though no field initializer names it.
+        mut ok: boolean = true;
+        for (mut z: u32 = 0; z < n; z++) {
+            const zty: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, z);
+            const zval: LValue = LType::const_null(LType { raw: zty });
+            if (!zval.is_valid()) { ok = false; break; }
+            slots[z as i64] = zval.raw;
+        }
+        for (mut i: u32 = 0; ok && i < sl.field_inits.length as u32; i++) {
+            const elem: i64 = mapper.field_element_index(layout, i as i64);
+            if (elem < 0 || elem as u32 >= n) { ok = false; break; }
+            const fty_raw: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, elem as u32);
+            const fty: LType = LType { raw: fty_raw };
+            const fexpr: ExpressionNode* = sl.field_inits[i as i64].value;
+            const slot: LValue = this.const_element(fty, fexpr);
+            if (!slot.is_valid()) { ok = false; break; }
+            slots[elem] = slot.raw;
+        }
+        if (!ok) { libc::free(buf); return LValue::null(); }
+        const v: LValue = LType::const_named_struct(ty, buf, n);
+        libc::free(buf);
+        return v;
+    }
+
+    /// One constant element of an aggregate initializer, built at the
+    /// element's OWN llvm type.
+    ///
+    /// Shared by the struct and array builders because they ask the same
+    /// question at different positions; two copies of it would be free to
+    /// disagree about which expressions are constant, and the disagreement
+    /// would surface as a zeroed aggregate rather than as an error.
+    ///
+    /// A nested aggregate recurses, so `f32[2][2]` and an array inside a struct
+    /// are built rather than declined.  A struct element declines: building one
+    /// needs its layout to map field order onto element order, which is reached
+    /// from the declaration and not from the llvm type in hand here.
+    const_element(&this, ety: LType, expr: ExpressionNode*) -> LValue {
+        if (expr == null) { return LValue::null(); }
+        const k: LTypeKind = LType::kind_of(ety.raw);
+        if (k == LTypeKind::Integer) {
+            mut iv: u64 = 0;
+            if (this.try_fold_const_int(expr, &iv)) {
+                return LType::const_int(ety, iv, true);
+            }
+            return LValue::null();
+        }
+        if (k == LTypeKind::Float || k == LTypeKind::Double) {
+            mut fv: f64 = 0.0;
+            if (this.try_fold_const_real(expr, &fv)) {
+                return LType::const_real(ety, fv);
+            }
+            return LValue::null();
+        }
+        if (k == LTypeKind::Array && expr.kind == NodeKind::ArrayLiteral) {
+            return this.try_const_array(expr as ArrayLiteralNode*, ety);
+        }
+        return LValue::null();
+    }
+
+    /// Build a constant array from an array-literal initializer, or decline.
+    ///
+    /// The LLVM type is the authority on the LENGTH, never the literal: the
+    /// annotation's size was folded when the type was built, so a repeat form
+    /// (`[v; N]`) fills exactly that many slots without re-folding `N` here -
+    /// one question, answered where it was already answered.  A list whose
+    /// length disagrees with the type is not a constant this position can
+    /// build, and a partial one would define the remainder as zero, which is
+    /// the failure this whole branch exists to remove.
+    try_const_array(&this, al: ArrayLiteralNode*, ty: LType) -> LValue {
+        if (al == null) { return LValue::null(); }
+        const n: u32 = llvm::LLVMGetArrayLength(ty.raw);
+        if (n == 0) { return LValue::null(); }
+        const ety: LType = LType { raw: llvm::LLVMGetElementType(ty.raw) };
+
+        // `[v; N]` carries one element and a count; `[a, b]` carries its
+        // elements and no count.
+        const is_repeat: boolean =
+            al.repeat_count_expr != null || al.repeat_count > 0;
+        if (is_repeat) {
+            if (al.elements.length != 1) { return LValue::null(); }
+        } else if (al.elements.length != n as i64) {
+            return LValue::null();
+        }
+
+        const buf: void* = libc::malloc((n as u64) * 8);
         const slots: void** = buf as void**;
         mut ok: boolean = true;
-        for (mut i: u32 = 0u32; i < n; i++) {
-            const fty_raw: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, i);
-            const fty: LType = LType { raw: fty_raw };
-            const fk: LTypeKind = LType::kind_of(fty_raw);
-            const fexpr: ExpressionNode* = sl.field_inits[i as i64].value;
-            mut slot: LValue = LValue::null();
-            if (fk == LTypeKind::Integer) {
-                mut iv: u64 = 0;
-                if (DeclarationEmitter::try_fold_const_int(fexpr, &iv)) {
-                    slot = LType::const_int(fty, iv, true);
-                }
-            } else if (fk == LTypeKind::Float || fk == LTypeKind::Double) {
-                mut fv: f64 = 0.0;
-                if (DeclarationEmitter::try_fold_const_real(fexpr, &fv)) {
-                    slot = LType::const_real(fty, fv);
-                }
-            }
-            if (!slot.is_valid()) { ok = false; break; }
-            slots[i as i64] = slot.raw;
+        for (mut i: u32 = 0; i < n; i++) {
+            const idx: i64 = if (is_repeat) { 0 } else { i as i64 };
+            const v: LValue = this.const_element(ety, al.elements[idx]);
+            if (!v.is_valid()) { ok = false; break; }
+            slots[i as i64] = v.raw;
         }
-        if (!ok) { intrinsics::free(buf); return LValue::null(); }
-        const v: LValue = LType::const_named_struct(ty, buf, n);
-        intrinsics::free(buf);
-        return v;
+        if (!ok) { libc::free(buf); return LValue::null(); }
+        const out: LValue = LType::const_array(ety, buf, n);
+        libc::free(buf);
+        return out;
     }
 }

@@ -14,18 +14,40 @@
 /// without importing the concrete `IRGeneratorVisitor` type (which
 /// would form a module-graph cycle).
 
-namespace Compiler::Codegen::Visit::LambdaEmitter;
+namespace compiler::codegen::visit::lambda_emitter;
 
-import Compiler::Codegen;
-import Compiler::Codegen::{ LLVMTypes, Context, Util };
-import Compiler::Codegen::State::VisitorState;
-import Compiler::CompilationContext;
-import Compiler::Diag;
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Resolver };
-import Compiler::AST;
-import Compiler::AST::{ Node, Visitor, Expression, Statement, Declaration };
-import Compiler::Resolver::{ SymbolStr, InternTable };
+import compiler::codegen;
+import compiler::codegen::{ context, llvm, llvm_types, util };
+import compiler::codegen::state::visitor_state;
+import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
+import compiler::types;
+import compiler::types::{ type_ref, resolver };
+import compiler::ast;
+import compiler::ast::{ declaration, expression, MemberPin, node, NodeKind, statement, visitor };
+import compiler::resolver::{ symbol_str, intern_table };
+import compiler::types::arena;
+import compiler::types::arena::{ TypeArena };
+import std::ffi::libc;
+import std::fmt;
+import compiler::ast::declaration::{ VarDeclNode };
+import compiler::ast::expression::{
+    ExpressionNode, FieldInit, IdentifierNode, LambdaExprNode, StructLiteralNode
+};
+import compiler::ast::statement::{ BlockStmtNode, StatementNode };
+import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::context::{ CodegenContext };
+import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res;
+import compiler::resolver::res::{ Res };
+import compiler::types::resolver::{ ResolutionContext };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::resolver::mangled_name::{ MangledName };
 
 
 type struct LambdaEmitter {
@@ -91,12 +113,12 @@ type struct LambdaEmitter {
         // linkage), so each visitor instance can start fresh at 0.
         const lam_idx: u64 = this.state.lambda_counter;
         this.state.lambda_counter += 1;
-        const ns_str: string = if (ctx_ptr.has_namespace()) {
-            ctx_ptr.namespace_display()
+        const lam_leaf: string = fmt::format("__lambda_%lld", lam_idx as i64);
+        const lam_name: string = if (ctx_ptr.has_namespace()) {
+            intern.resolve(ctx_ptr.unit_module.qualified(intern.intern(lam_leaf), intern))
         } else {
-            ctx_ptr.source_file
+            ctx_ptr.source_file + "::" + lam_leaf
         };
-        const lam_name: string = format("%s::__lambda_%lld", ns_str, lam_idx as i64);
 
         // Resolve return type
         mut ret_ty: LType = LType::void_type();
@@ -104,9 +126,9 @@ type struct LambdaEmitter {
             // Sema already filled it in.
             const mapped: LType = this.cg.type_mapper.map_type(node.return_type);
             if (mapped.is_valid()) { ret_ty = mapped; }
-        } else if (node.return_type_ann != null && ctx_ptr.type_resolver != null) {
-            mut res_ctx: ResolutionContext = ResolutionContext::new(
-                ctx_ptr.source_file, "");
+        } else if (node.return_type_ann != null) {
+            mut res_ctx: ResolutionContext = ResolutionContext::new("");
+            // Written at the lambda, inside a body, and resolved there.
             const ret_ref: TypeRef = ctx_ptr.type_resolver.resolve(node.return_type_ann, &res_ctx);
             if (ret_ref.is_valid()) {
                 const mapped: LType = this.cg.type_mapper.map_type(ret_ref);
@@ -116,12 +138,12 @@ type struct LambdaEmitter {
 
         // Resolve parameter types
         const param_count: u32 = node.parameters.length as u32;
-        const param_buf: void* = intrinsics::malloc(param_count as u64 * 8);
+        const param_buf: void* = libc::malloc(param_count as u64 * 8);
         const param_slots: void** = param_buf as void**;
         mut params_valid: boolean = true;
 
-        mut res_ctx2: ResolutionContext = ResolutionContext::new(
-            ctx_ptr.source_file, "");
+        mut res_ctx2: ResolutionContext = ResolutionContext::new("");
+        // Same body, same module as the return annotation above.
 
         mut param_refs: TypeRef[] = [];
         for (mut i: u32 = 0; i < param_count; i++) {
@@ -130,7 +152,7 @@ type struct LambdaEmitter {
 
             if (param.resolved_type.is_valid()) {
                 param_ty = this.cg.type_mapper.map_type(param.resolved_type);
-            } else if (param.type_annotation != null && ctx_ptr.type_resolver != null) {
+            } else if (param.type_annotation != null) {
                 const pref: TypeRef = ctx_ptr.type_resolver.resolve(
                     param.type_annotation, &res_ctx2);
                 param_refs.push(pref);
@@ -141,7 +163,7 @@ type struct LambdaEmitter {
 
             if (!param_ty.is_valid()) {
                 this.cg.diag.emit_warning_at_span(ErrorCode::E0600_CODEGEN_FAILED,
-                    format("lambda: cannot resolve type for parameter '%s'; lambda skipped",
+                    fmt::format("lambda: cannot resolve type for parameter '%s'; lambda skipped",
                         intern.resolve(param.name)),
                     param.span);
                 params_valid = false;
@@ -151,7 +173,7 @@ type struct LambdaEmitter {
         }
 
         if (!params_valid) {
-            intrinsics::free(param_buf);
+            libc::free(param_buf);
             this.state.last_value     = LValue::null();
             this.state.last_is_lvalue = false;
             return;
@@ -159,8 +181,8 @@ type struct LambdaEmitter {
 
         // Build LLVM function
         const fn_type: LType  = LType::function_type(ret_ty, param_buf, param_count, false);
-        intrinsics::free(param_buf);
-        const fn_val: LValue  = this.cg.llvm_module.add_function(lam_name, fn_type);
+        libc::free(param_buf);
+        const fn_val: LValue  = this.cg.llvm_module.add_function(MangledName::new(lam_name), fn_type);
         if (!fn_val.is_valid()) {
             this.state.last_value     = LValue::null();
             this.state.last_is_lvalue = false;
@@ -196,7 +218,7 @@ type struct LambdaEmitter {
             const alloca: LValue = this.cg.flow.create_entry_alloca(fn_val, param_name, p_ty);
             const arg:    LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, pi) };
             this.cg.builder.build_store(arg, alloca);
-            this.cg.values.set(param.name, alloca);
+            this.cg.values.set(param.sym_id, alloca);
         }
 
         // Generate the body.  Inline the small generate_block / accept loop
@@ -261,8 +283,8 @@ type struct LambdaEmitter {
     /// initialised from the corresponding captured local in scope.  Built
     /// as a transient `StructLiteralNode` so the normal struct-literal
     /// codegen path handles the alloca + GEP-store sequence; we just
-    /// supply identifier-node initialisers whose lookups land on
-    /// `cg.values.get(<cap_name>)` for the outer function's allocas.
+    /// supply identifier-node initialisers, each stamped with its capture's
+    /// binding, whose lookups land on the outer function's allocas.
     ///
     /// No anonymous function is emitted from this site: the lambda's body
     /// lives on the synthesised `<closure_struct>::__call__` method,
@@ -279,7 +301,7 @@ type struct LambdaEmitter {
         }
 
         const arena: TypeArena* = this.cg.ctx.type_arena;
-        const struct_name: SymbolStr = arena.get_qualified_name(closure_ty);
+        const struct_name: SymbolStr = arena.get_qualified_name(closure_ty).spelling();
 
         mut lit: StructLiteralNode* = new StructLiteralNode(struct_name, node.span);
         lit.set_resolved_type(closure_ty);
@@ -288,11 +310,18 @@ type struct LambdaEmitter {
             const cap_name: SymbolStr = node.captured_names[i];
             const cap_ty:   TypeRef   = node.captured_types[i];
             mut ident: IdentifierNode* = new IdentifierNode(cap_name, node.span);
+            ident.set_res(Res::Local(node.captured_syms[i]));
             ident.set_resolved_type(cap_ty);
+            // The closure struct's fields ARE the captures, in this order
+            // (`LambdaSynth::synthesize_closure_struct`), so the field this
+            // initializer names is the i-th; a literal minted after the last
+            // sema walk carries its own answer.
             const init: FieldInit = FieldInit {
                 field_name: cap_name,
                 value:      ident as ExpressionNode*,
-                span:       node.span,
+                span:        node.span,
+                pin:         MemberPin::Field(0, i),
+                pin_carried: false,
             };
             lit.add_field_init(init);
         }

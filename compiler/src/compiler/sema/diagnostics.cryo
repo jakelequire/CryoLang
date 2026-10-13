@@ -15,21 +15,45 @@
 /// They are ported here when that region is read for the core trio.  emit_free_*
 /// stays with CallResolver.
 
-namespace Compiler::Sema::Diagnostics;
+namespace compiler::sema::diagnostics;
 
-import Compiler::Diag;
-import Compiler::Diag::{ Diagnostic, Suggestion, SourceSpan, EditDistance };
-import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined };
-import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName };
-import Compiler::CompilationContext;
-import Compiler::DeclIndex;
-import Compiler::AST;
-import Compiler::AST::{ Node, Expression };
-import Compiler::Lex;
-import Compiler::Sema::{ State, Helpers, TypeUtils };
+import compiler::diag;
+import compiler::diag::{ diagnostic, edit_distance, ErrorCode, source_span, suggestion };
+import compiler::types::{ type_ref, type_base, arena, compound, user_defined, TypeKind };
+import compiler::resolver::{ symbol_str, intern_table, qualified_name };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::decl_index;
+import compiler::decl_index::{ DeclarationIndex };
+import compiler::ast;
+import compiler::ast::{ expression, LiteralKind, node, NodeKind };
+import compiler::lex;
+import compiler::sema::{ state, helpers, type_utils };
 import std::core::option;
+import std::core::option::{ Option };
 import std::collections::hashmap;
+import std::collections::hashmap::{ HashMapIter };
 import std::fmt;
+import compiler::types::generic;
+import compiler::types::generic::{ InstantiatedType };
+import compiler::ast::expression::{ CallExprNode, ExpressionNode, LiteralNode };
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::edit_distance::{ find_best_candidate };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::suggestion::{ Applicability, Suggestion };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name::{ DeclName };
+import compiler::sema::helpers::{ lexeme_looks_like_number };
+import compiler::sema::state::{ SemaState };
+import compiler::sema::type_utils::{ TypeUtils };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{ PointerType, ReferenceType };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{ ClassType, EnumType, MethodInfo, StructType };
 
 type struct Diagnostics {
     arena:  TypeArena*;
@@ -57,78 +81,28 @@ type struct Diagnostics {
     // Each walks one symbol table and returns bare (non-`::`) names to feed
     // `find_best_candidate` from a typo diagnostic.
 
-    /// Locals in the current function's scope (E0201 did-you-mean).
-    collect_local_names(&this) -> string[] {
-        mut out: string[] = [];
-        mut it: HashMapIter<u32, TypeRef> = this.state.locals.iter();
-        loop {
-            match (it.next()) {
-                Option::Some(pair) => {
-                    const s: string = this.intern.resolve(SymbolStr::from_id(pair.first));
-                    if (s != "" && !s.contains("::")) { out.push(s); }
-                }
-                Option::None => { break; }
-            }
-        }
-        return out;
-    }
-
-    /// Every bare function name in the DeclarationIndex (E0202 did-you-mean).
-    collect_bare_callable_names(&this) -> string[] {
-        mut out: string[] = [];
-        const idx: DeclarationIndex* = this.ctx.decl_index;
-        for (mut i: i64 = 0; i < idx.module_funcs.length; i++) {
-            const name: string = this.intern.resolve(SymbolStr::from_id(idx.module_funcs[i].first));
-            if (name == "")                 { continue; }
-            if (name.contains("::")) { continue; }
-            mut seen: boolean = false;
-            for (mut j: i64 = 0; j < out.length; j++) {
-                if (out[j].eq(name)) { seen = true; break; }
-            }
-            if (!seen) { out.push(name); }
-        }
-        return out;
-    }
-
-    /// Every bare type name in the DeclarationIndex (E0203 did-you-mean).
-    collect_bare_type_names(&this) -> string[] {
-        mut out: string[] = [];
-        const idx: DeclarationIndex* = this.ctx.decl_index;
-        for (mut i: i64 = 0; i < idx.module_types.length; i++) {
-            const name: string = this.intern.resolve(SymbolStr::from_id(idx.module_types[i].first));
-            if (name == "")                 { continue; }
-            if (name.contains("::")) { continue; }
-            mut seen: boolean = false;
-            for (mut j: i64 = 0; j < out.length; j++) {
-                if (out[j].eq(name)) { seen = true; break; }
-            }
-            if (!seen) { out.push(name); }
-        }
-        return out;
-    }
-
     /// Field + method names on a struct/class (E0204 did-you-mean).  Walks past
     /// pointer/reference/instantiation wrappers like the member-access resolver.
     collect_struct_or_class_member_names(&this, obj_type: TypeRef) -> string[] {
         mut out: string[] = [];
         mut walk_ty: TypeRef = obj_type;
-        mut walk_t:  Type*   = this.arena.lookup(walk_ty.id);
+        mut walk_t:  Type*   = this.arena.lookup(walk_ty);
         mut depth: i32 = 0;
         while (walk_t != null && depth < 5) {
             match (walk_t.kind) {
                 TypeKind::Pointer => {
                     walk_ty = (walk_t as PointerType*).pointee;
-                    walk_t  = this.arena.lookup(walk_ty.id);
+                    walk_t  = this.arena.lookup(walk_ty);
                 }
                 TypeKind::Reference => {
                     walk_ty = (walk_t as ReferenceType*).referent;
-                    walk_t  = this.arena.lookup(walk_ty.id);
+                    walk_t  = this.arena.lookup(walk_ty);
                 }
                 TypeKind::InstantiatedType => {
                     const it: InstantiatedType* = walk_t as InstantiatedType*;
                     if (!it.has_resolved_type()) { break; }
                     walk_ty = it.resolved_type;
-                    walk_t  = this.arena.lookup(walk_ty.id);
+                    walk_t  = this.arena.lookup(walk_ty);
                 }
                 _ => { break; }
             }
@@ -139,12 +113,12 @@ type struct Diagnostics {
         match (walk_t.kind) {
             TypeKind::Struct => {
                 const st: StructType* = walk_t as StructType*;
-                for (mut i: i64 = 0; i < st.fields.length; i++)  { out.push(this.intern.resolve(st.fields[i].name)); }
+                for (mut i: i64 = 0; i < st.fields.length; i++)  { out.push(this.intern.shown(st.fields[i].decl_name())); }
                 for (mut i: i64 = 0; i < st.methods.length; i++) { out.push(this.intern.resolve(st.methods[i].name)); }
             }
             TypeKind::Class => {
                 const cl: ClassType* = walk_t as ClassType*;
-                for (mut i: i64 = 0; i < cl.fields.length; i++)  { out.push(this.intern.resolve(cl.fields[i].name)); }
+                for (mut i: i64 = 0; i < cl.fields.length; i++)  { out.push(this.intern.shown(cl.fields[i].decl_name())); }
                 for (mut i: i64 = 0; i < cl.methods.length; i++) { out.push(this.intern.resolve(cl.methods[i].name)); }
             }
             _ => {}
@@ -152,25 +126,10 @@ type struct Diagnostics {
         return out;
     }
 
-    /// Build a `did you mean `<best>`?` help + machine-applicable suggestion, or
-    /// return the diagnostic unchanged when no candidate clears the threshold
-    /// (so callers can chain unconditionally).  `kind` is the help-text noun.
-    attach_did_you_mean(&this, diag: Diagnostic, name: string,
-                        candidates: string[], kind: string,
-                        span: SourceSpan) -> Diagnostic {
-        const best: string = find_best_candidate(name, candidates);
-        if (best == "") { return diag; }
-        mut out: Diagnostic = diag.help(
-            format("a %s with a similar name exists: `%s`", kind, best));
-        out = out.suggest(Suggestion::machine_applicable(span, best,
-            format("did you mean `%s`?", best)));
-        return out;
-    }
-
 
     // -- Mismatched-types builder --
 
-    /// Rich "mismatched types" diagnostic with the rustc-style `expected `<E>`,
+    /// Rich "mismatched types" diagnostic with the `expected `<E>`,
     /// found `<F>`` inline label.  `context_msg` becomes the explanatory note;
     /// `context_span`, when set, attaches an "expected due to this" secondary.
     emit_type_mismatch(mut &this, code: ErrorCode, span: SourceSpan,
@@ -191,16 +150,50 @@ type struct Diagnostics {
 
         mut diag: Diagnostic = Diagnostic::error(code, "mismatched types");
         diag = diag.at_with_label(span,
-            format("expected `%s`, found `%s`", expected_name, found_name));
+            fmt::format("expected `%s`, found `%s`", expected_name, found_name));
         if (context_span.has_location()) {
             diag = diag.also_at(context_span, "expected due to this");
         }
         if (context_msg != "") {
             diag = diag.with_note(context_msg);
         }
+        if (this.kind_or_void(expected) == TypeKind::Bool) {
+            diag = diag.with_note(this.truth_test_hint(found));
+        }
         diag = this.attach_type_coercion_suggestion(diag, span,
-            expected_name, found_name, value_expr);
+            expected, found, expected_name, value_expr);
         this.ctx.emit_diagnostic(diag);
+    }
+
+    /// The kind of type `ty`, or `Void` when it names none.
+    kind_or_void(&this, ty: TypeRef) -> TypeKind {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return TypeKind::Void; }
+        return t.kind;
+    }
+
+    /// How a truth test on a value of type `ty` is written, since no type
+    /// converts to `boolean`: as the comparison the test means.
+    truth_test_hint(&this, ty: TypeRef) -> string {
+        mut t: Type* = this.arena.lookup(ty);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const it: InstantiatedType* = t as InstantiatedType*;
+            if (it.has_resolved_type()) { t = this.arena.lookup(it.resolved_type); }
+        }
+        if (t == null) { return "write the comparison the test means, or `match` on it"; }
+        if (t.kind == TypeKind::Enum && !(t as EnumType*).is_simple_enum()) {
+            return "`match` on it";
+        }
+        return match (t.kind) {
+            TypeKind::Int     => { "compare it explicitly, as in `n != 0`" }
+            TypeKind::Float   => { "compare it explicitly, as in `x != 0.0`" }
+            TypeKind::Char    => { "compare it explicitly, as in `c != '\\0'`" }
+            TypeKind::Pointer => { "compare it with `null` explicitly, as in `p != null`" }
+            TypeKind::String  => { "compare it with `null` explicitly, as in `s != null`" }
+            TypeKind::Enum    => { fmt::format("compare it with one of `%s`'s variants (`==`), or `match` on it",
+                                       this.types.type_display_name(ty)) }
+            _                 => { "write the comparison the test means, or `match` on it" }
+        };
     }
 
     /// Attach a literal-aware quickfix when the (expected, found, value) triple
@@ -208,17 +201,18 @@ type struct Diagnostics {
     /// literal (wrap in quotes), numeric<-numeric-looking string (drop quotes).
     /// All MachineApplicable; returns the diagnostic unchanged when none fit.
     attach_type_coercion_suggestion(&this, diag: Diagnostic, span: SourceSpan,
-                                    expected_name: string, found_name: string,
+                                    expected: TypeRef, found: TypeRef, expected_name: string,
                                     value_expr: ExpressionNode*) -> Diagnostic {
         if (value_expr == null || !span.has_location()) { return diag; }
         const node: ASTNode* = value_expr as ASTNode*;
         if (node.kind != NodeKind::Literal) { return diag; }
 
         const lit: LiteralNode* = value_expr as LiteralNode*;
-        const want_bool: boolean = expected_name.eq("boolean")
-                                || expected_name.eq("bool");
-        const want_string:  boolean = expected_name.eq("string");
-        const found_string: boolean = found_name.eq("string");
+        const want_kind: TypeKind = this.kind_or_void(expected);
+        const want_bool: boolean = want_kind == TypeKind::Bool;
+        const want_string:  boolean = want_kind == TypeKind::String;
+        const want_number:  boolean = want_kind == TypeKind::Int || want_kind == TypeKind::Float;
+        const found_string: boolean = this.kind_or_void(found) == TypeKind::String;
 
         if (want_bool && lit.literal_kind == LiteralKind::String) {
             if (lit.value.eq("true")) {
@@ -244,15 +238,15 @@ type struct Diagnostics {
             (lit.literal_kind == LiteralKind::Integer
              || lit.literal_kind == LiteralKind::Float)) {
             return diag.suggest(Suggestion::machine_applicable(
-                span, format("\"%s\"", lit.value),
+                span, fmt::format("\"%s\"", lit.value),
                 "wrap the literal in quotes to make it a string"));
         }
         if (found_string && !want_bool && !want_string
-            && is_numeric_type_name(expected_name)
+            && want_number
             && lexeme_looks_like_number(lit.value)) {
             return diag.suggest(Suggestion::machine_applicable(
                 span, lit.value,
-                format("drop the quotes to write a `%s`", expected_name)));
+                fmt::format("drop the quotes to write a `%s`", expected_name)));
         }
 
         return diag;
@@ -264,34 +258,36 @@ type struct Diagnostics {
     /// Arity diagnostic (E0215/E0216) for a method / static-method call whose
     /// name resolved but argument count matched no overload.  `expected` < 0 when
     /// candidates disagree on arity (overloaded), giving a generic message.
-    emit_method_arity_error(mut &this, call: CallExprNode*, name: SymbolStr,
-                            kind: string, expected: i64, got: i64) -> void {
+    /// `variadic` names a callee whose `expected` is the count of its declared
+    /// parameters, each required, with an unconstrained tail past them.
+    emit_method_arity_error(mut &this, at: SourceSpan, name: SymbolStr,
+                            kind: string, expected: i64, got: i64, variadic: boolean) -> void {
         const nm: string = this.intern.resolve(name);
         if (expected < 0) {
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0215_TOO_MANY_ARGS,
-                format("no overload of %s `%s` takes %lld argument(s)", kind, nm, got));
-            d = d.at_with_label(call.span, "no matching overload for this argument count");
+                fmt::format("no overload of %s `%s` takes %lld argument(s)", kind, nm, got));
+            d = d.at_with_label(at, "no matching overload for this argument count");
             this.ctx.diagnostics.emit(d);
             return;
         }
         if (got < expected) {
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0216_TOO_FEW_ARGS,
-                format("%s `%s` takes %lld argument(s) but %lld were supplied",
-                       kind, nm, expected, got));
-            d = d.at_with_label(call.span,
-                format("missing %lld argument%s", expected - got,
+                fmt::format("%s `%s` takes %s%lld argument(s) but %lld were supplied",
+                       kind, nm, if (variadic) { "at least " } else { "" }, expected, got));
+            d = d.at_with_label(at,
+                fmt::format("missing %lld argument%s", expected - got,
                     if (expected - got == 1) { "" } else { "s" }));
             this.ctx.diagnostics.emit(d);
             return;
         }
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0215_TOO_MANY_ARGS,
-            format("%s `%s` takes %lld argument(s) but %lld were supplied",
+            fmt::format("%s `%s` takes %lld argument(s) but %lld were supplied",
                    kind, nm, expected, got));
-        d = d.at_with_label(call.span,
-            format("unexpected argument%s", if (got - expected == 1) { "" } else { "s" }));
+        d = d.at_with_label(at,
+            fmt::format("unexpected argument%s", if (got - expected == 1) { "" } else { "s" }));
         this.ctx.diagnostics.emit(d);
     }
 
@@ -316,11 +312,9 @@ type struct Diagnostics {
 
     // -- Method-not-found hints + import-shadow detection --
 
-    /// Closest method name on `type_sym` to `method_name` (edit-distance), or empty.
-    suggest_similar_method(&this, type_sym: SymbolStr, method_name: SymbolStr) -> SymbolStr {
-        if (!type_sym.is_valid() || !method_name.is_valid()) { return SymbolStr::empty(); }
-        const ty_ref: TypeRef = this.types.lookup_type_by_sym(type_sym);
-        if (!ty_ref.is_valid()) { return SymbolStr::empty(); }
+    /// Closest method name on `ty_ref` to `method_name` (edit-distance), or empty.
+    suggest_similar_method(&this, ty_ref: TypeRef, method_name: SymbolStr) -> SymbolStr {
+        if (!ty_ref.is_valid() || !method_name.is_valid()) { return SymbolStr::empty(); }
         const needle: string = this.intern.resolve(method_name);
         const cands: string[] = this.collect_struct_or_class_member_names(ty_ref);
         const best: string = find_best_candidate(needle, cands);
@@ -328,49 +322,65 @@ type struct Diagnostics {
         return this.intern.intern(best);
     }
 
-    /// Other user-defined types whose simple-name matches `simple_name` and that
-    /// own `member_name` (import-shadow detection); `resolved_type` is excluded.
+    /// A refused member access is offered the import that
+    /// would have made its written type name the one meant: the types whose
+    /// last segment is that spelling and which own the member.  The answer is
+    /// each type's path as TEXT, for the diagnostic
+    /// (`attach_shadow_import_suggestions`), and reaches no lookup.
+    ///
+    /// Other user-defined types whose simple-name matches `simple_name` - the
+    /// written type spelling, or with none the last segment of
+    /// `resolved_type`'s own path - and that own `member_name`
+    /// (import-shadow detection); `resolved_type` is excluded.
     /// Capped at 4 candidates.
     find_shadowed_type_candidates(&this, simple_name: SymbolStr, member_name: SymbolStr,
-                                  resolved_type: TypeRef) -> SymbolStr[] {
-        mut results: SymbolStr[] = [];
-        if (!simple_name.is_valid()) { return results; }
-        const needle: string = this.intern.resolve(simple_name);
+                                  resolved_type: TypeRef) -> string[] {
+        const needle: string = if (simple_name.is_valid()) {
+            this.intern.resolve(simple_name)
+        } else {
+            QualifiedName::leaf_of(this.intern.shown(this.arena.get_qualified_name(resolved_type)))
+        };
+        if (needle == "") { return []; }
+        mut results: string[] = [];
         const filter_member: boolean = member_name.is_valid();
         const n: i64 = this.arena.type_count();
         for (mut i: i64 = 0; i < n; i++) {
             const t: Type* = this.arena.types[i];
             if (t == null) { continue; }
-            if (resolved_type.is_valid() && t.id == resolved_type.id) { continue; }
-            mut qname: SymbolStr = SymbolStr::empty();
+            if (resolved_type.is_valid() && t.id == resolved_type.key()) { continue; }
+            mut qname: DeclName = DeclName::empty();
             mut has_member: boolean = !filter_member;
+            const no_methods: MethodInfo[] = [];
+            mut methods: &MethodInfo[] = &no_methods;
             if (t.kind == TypeKind::Struct) {
                 const st: StructType* = t as StructType*;
                 qname = st.qualified_name;
-                if (filter_member) { has_member = st.get_method(member_name) != null; }
+                methods = &st.methods;
             } else if (t.kind == TypeKind::Class) {
                 const ct: ClassType* = t as ClassType*;
                 qname = ct.qualified_name;
-                if (filter_member) { has_member = ct.get_method(member_name) != null; }
+                methods = &ct.methods;
             } else if (t.kind == TypeKind::Enum) {
                 const et: EnumType* = t as EnumType*;
                 qname = et.qualified_name;
-                if (filter_member) {
-                    has_member = et.get_method(member_name) != null || et.get_variant(member_name) != null;
-                }
+                methods = &et.methods;
+                if (filter_member && et.variant_index(member_name) >= 0) { has_member = true; }
             } else {
                 continue;
             }
+            for (mut k: i64 = 0; filter_member && !has_member && k < methods.length; k++) {
+                if (methods[k].name.equals(member_name)) { has_member = true; }
+            }
             if (!qname.is_valid() || !has_member) { continue; }
-            const qstr: string = this.intern.resolve(qname);
+            const qstr: string = this.intern.shown(qname);
             const leaf: string = QualifiedName::leaf_of(qstr);
             if (leaf != needle) { continue; }
             mut dup: boolean = false;
             for (mut j: i64 = 0; j < results.length; j++) {
-                if (results[j].equals(qname)) { dup = true; break; }
+                if (results[j] == qstr) { dup = true; break; }
             }
             if (dup) { continue; }
-            results.push(qname);
+            results.push(qstr);
             if (results.length >= 4) { break; }
         }
         return results;
@@ -396,9 +406,10 @@ type struct Diagnostics {
     }
 
     /// Attach an "import the right type" note + quickfix for each shadowed
-    /// candidate (MachineApplicable for a single candidate, else MaybeIncorrect).
+    /// candidate path `find_shadowed_type_candidates` answered with
+    /// (MachineApplicable for a single candidate, else MaybeIncorrect).
     attach_shadow_import_suggestions(&this, diag: Diagnostic, simple_name_str: string,
-                                     candidates: SymbolStr[]) -> Diagnostic {
+                                     candidates: string[]) -> Diagnostic {
         if (candidates.length == 0) { return diag; }
         mut out: Diagnostic = diag;
         const insert_span: SourceSpan = this.find_import_insertion_span();
@@ -408,17 +419,17 @@ type struct Diagnostics {
             Applicability::MaybeIncorrect
         };
         for (mut i: i64 = 0; i < candidates.length; i++) {
-            const cand_str: string = this.intern.resolve(candidates[i]);
-            out = out.with_note(format("another `%s` exists: `%s`", simple_name_str, cand_str));
+            const cand_str: string = candidates[i];
+            out = out.with_note(fmt::format("another `%s` exists: `%s`", simple_name_str, cand_str));
             const import_path: string = QualifiedName::parent_of(cand_str);
             if (import_path == "") { continue; }
             if (insert_span.has_location()) {
-                const insertion: string = format("\nimport %s;", import_path);
-                const msg: string = format("import `%s`", import_path);
+                const insertion: string = fmt::format("\nimport %s;", import_path);
+                const msg: string = fmt::format("import `%s`", import_path);
                 out = out.suggest(Suggestion::single(insert_span, insertion, msg, apply));
             }
         }
-        out = out.help(format(
+        out = out.help(fmt::format(
             "the unqualified name `%s` resolved to a different type than the one you meant; import the intended module to disambiguate",
             simple_name_str));
         return out;

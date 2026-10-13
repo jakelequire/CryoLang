@@ -13,9 +13,13 @@
 /// parameter.  Methods that only read (leaf, parent, equals, display)
 /// do not.
 
-namespace Compiler::Resolver::QualifiedName;
+namespace compiler::resolver::qualified_name;
 
-import Compiler::Resolver::{ SymbolStr, InternTable };
+import compiler::resolver::{ symbol_str, intern_table };
+import std::ffi::libc;
+import std::fmt;
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
 
 type struct QualifiedName {
     /// The interned segments, e.g. ["std", "collections", "Array"].
@@ -42,19 +46,6 @@ type struct QualifiedName {
         return qn;
     }
 
-    /// Build from pre-interned parts.
-    static from_parts(parts: SymbolStr[]) -> QualifiedName {
-        return QualifiedName { parts: parts };
-    }
-
-    /// Build from raw string segments, interning each one.
-    static from_strings(table: InternTable*, segments: string[]) -> QualifiedName {
-        mut qn: QualifiedName = QualifiedName { parts: [] };
-        for (mut i: i64 = 0; i < segments.length; i++) {
-            qn.parts.push(table.intern(segments[i]));
-        }
-        return qn;
-    }
 
     /// Parse a "::" delimited string into a QualifiedName.
     /// Use this at boundaries where raw strings enter the compiler
@@ -76,7 +67,7 @@ type struct QualifiedName {
             // Check for "::" at position i
             if (i + 1 < len && text[i] == ':' && text[i + 1] == ':') {
                 if (i > start) {
-                    qn.parts.push(table.intern(text.substring(start, i - start)));
+                    qn.parts.push(table.intern(text.substring(start as u32, (i - start) as u32)));
                 }
                 i += 2;
                 start = i;
@@ -87,7 +78,7 @@ type struct QualifiedName {
 
         // Final segment after last "::" (or the whole string if no "::")
         if (start < len) {
-            qn.parts.push(table.intern(text.substring(start, len - start)));
+            qn.parts.push(table.intern(text.substring(start as u32, (len - start) as u32)));
         }
 
         return qn;
@@ -113,20 +104,6 @@ type struct QualifiedName {
         return this.parts[this.parts.length - 1];
     }
 
-    /// Everything except the last segment (the "namespace path").
-    /// e.g. "std::io::println" => "std::io"
-    /// Returns an empty QualifiedName for single-segment names.
-    parent(&this) -> QualifiedName {
-        if (this.parts.length <= 1) {
-            return QualifiedName::empty();
-        }
-        mut parent_parts: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.parts.length - 1; i++) {
-            parent_parts.push(this.parts[i]);
-        }
-        return QualifiedName::from_parts(parent_parts);
-    }
-
     /// Get a specific segment by index.
     /// Returns SymbolStr::empty() for out-of-range indices.
     part_at(&this, index: i64) -> SymbolStr {
@@ -136,111 +113,13 @@ type struct QualifiedName {
         return this.parts[index];
     }
 
-    /// Whether this is a single unqualified name (no "::" in it).
-    is_simple(&this) -> boolean {
-        return this.parts.length == 1;
-    }
 
-    /// Whether this is a multi-part qualified name.
-    is_qualified(&this) -> boolean {
-        return this.parts.length > 1;
-    }
-
-    /// Return a new QualifiedName with an additional segment appended.
-    /// e.g. "std::io".child(intern, "println") => "std::io::println"
-    child(&this, table: InternTable*, text: string) -> QualifiedName {
-        mut new_parts: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.parts.length; i++) {
-            new_parts.push(this.parts[i]);
-        }
-        new_parts.push(table.intern(text));
-        return QualifiedName::from_parts(new_parts);
-    }
-
-    /// Return a new QualifiedName with an already-interned segment appended.
-    child_sym(&this, sym: SymbolStr) -> QualifiedName {
-        mut new_parts: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.parts.length; i++) {
-            new_parts.push(this.parts[i]);
-        }
-        new_parts.push(sym);
-        return QualifiedName::from_parts(new_parts);
-    }
 
     /// Append a segment in place (mutating).
     push(mut &this, table: InternTable*, text: string) -> void {
         this.parts.push(table.intern(text));
     }
 
-    /// Append an already-interned segment in place.
-    push_sym(mut &this, sym: SymbolStr) -> void {
-        this.parts.push(sym);
-    }
-
-    /// Concatenate another QualifiedName onto this one.
-    /// e.g. "std::io".join("IO::println") => "std::io::IO::println"
-    join(&this, other: QualifiedName) -> QualifiedName {
-        mut new_parts: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.parts.length; i++) {
-            new_parts.push(this.parts[i]);
-        }
-        for (mut i: i64 = 0; i < other.parts.length; i++) {
-            new_parts.push(other.parts[i]);
-        }
-        return QualifiedName::from_parts(new_parts);
-    }
-
-    /// O(n) equality where n = number of parts.
-    /// Since each part is a SymbolStr, individual comparisons are O(1).
-    equals(&this, other: &QualifiedName) -> boolean {
-        if (this.parts.length != other.parts.length) {
-            return false;
-        }
-        for (mut i: i64 = 0; i < this.parts.length; i++) {
-            if (!this.parts[i].equals(other.parts[i])) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /// Whether this name starts with the given prefix.
-    /// e.g. "std::io::println".starts_with("std::io") => true
-    starts_with(&this, prefix: QualifiedName) -> boolean {
-        if (prefix.parts.length > this.parts.length) {
-            return false;
-        }
-        for (mut i: i64 = 0; i < prefix.parts.length; i++) {
-            if (!this.parts[i].equals(prefix.parts[i])) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /// Whether this name ends with the given suffix.
-    /// e.g. "std::io::println".ends_with("println") => true
-    /// e.g. "std::io::IO::println".ends_with("IO::println") => true
-    ends_with(&this, suffix: QualifiedName) -> boolean {
-        if (suffix.parts.length > this.parts.length) {
-            return false;
-        }
-        mut offset: i64 = this.parts.length - suffix.parts.length;
-        for (mut i: i64 = 0; i < suffix.parts.length; i++) {
-            if (!this.parts[offset + i].equals(suffix.parts[i])) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /// Whether the leaf (last part) matches the given symbol.
-    leaf_equals(&this, sym: SymbolStr) -> boolean {
-        if (this.parts.length == 0) {
-            return sym.is_empty();
-        }
-        return this.parts[this.parts.length - 1].equals(sym);
-    }
 
     /// Produce the "::" separated display string.
     /// e.g. ["std", "io", "println"] => "std::io::println"
@@ -259,28 +138,33 @@ type struct QualifiedName {
         return result;
     }
 
-    /// Produce the display string for just the parent (namespace) portion.
-    /// e.g. "std::io::println" => "std::io"
-    display_parent(&this, table: InternTable*) -> string {
-        if (this.parts.length <= 1) {
-            return "";
-        }
 
-        mut result: string = table.resolve(this.parts[0]);
-        for (mut i: i64 = 1; i < this.parts.length - 1; i++) {
-            result = result.append("::");
-            result = result.append(table.resolve(this.parts[i]));
+    /// Extract the FIRST segment, before the first "::".  E.g. `I::Item` ->
+    /// `I`, `A::B::C` -> `A`.  Returns the input as-is if no "::" is found.
+    ///
+    /// Distinct from `parent_of`, which splits on the LAST separator: for a
+    /// two-segment name the two agree, and for a longer one they do not.  The
+    /// first segment is what a path's meaning turns on - it is the only one
+    /// resolved in scope, with every later segment resolved within whatever it
+    /// named - so a caller deciding who owns a path needs this one specifically.
+    static head_of(s: string) -> string {
+        const len: i64 = s.length() as i64;
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') {
+                if (i == 0) { return ""; }
+                const buf: i8* = libc::malloc((i + 1) as u64) as i8*;
+                for (mut j: i64 = 0; j < i; j++) {
+                    buf[j] = s[j] as i8;
+                }
+                buf[i] = 0 as i8;
+                return buf as string;
+            }
         }
-        return result;
-    }
-
-    /// Resolve just the leaf segment to a string.
-    display_leaf(&this, table: InternTable*) -> string {
-        return table.resolve(this.leaf());
+        return s;
     }
 
     /// Extract the last segment after the final "::" in a qualified-name
-    /// string.  E.g., "Compiler::AST::Declaration::DeclarationNode" ->
+    /// string.  E.g., "compiler::ast::declaration::DeclarationNode" ->
     /// "DeclarationNode".  Returns the input as-is if no "::" is found.
     /// Operates on the raw-string form (for callers holding a flat name
     /// rather than a structured QualifiedName).
@@ -297,13 +181,32 @@ type struct QualifiedName {
         if (start >= len) { return ""; }
         // Use format("%s") on the tail pointer to create a safe copy
         const tail: string = s + start;
-        return format("%s", tail);
+        return fmt::format("%s", tail);
+    }
+
+    /// How many "::"-separated segments a raw name string has.
+    ///
+    /// A path's head accounts for exactly one of them, so a caller recording
+    /// how much of a path it did NOT finish subtracts what it resolved from
+    /// this.  Empty is zero segments rather than one, so that a name and the
+    /// absence of one do not report the same length.
+    static segment_count(s: string) -> u32 {
+        const len: i64 = s.length() as i64;
+        if (len == 0) { return 0; }
+        mut n: u32 = 1;
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') {
+                n = n + 1;
+                i = i + 1;
+            }
+        }
+        return n;
     }
 
     /// Inverse of `leaf_of`: return everything BEFORE the final "::".
     /// Used when building import suggestions - we want the module path
-    /// that owns the type (`Compiler::Diag::Diagnostic`), not the type's
-    /// own fully-qualified path (`Compiler::Diag::Diagnostic::Diagnostic`).
+    /// that owns the type (`compiler::diag::diagnostic`), not the type's
+    /// own fully-qualified path (`compiler::diag::diagnostic::Diagnostic`).
     /// Returns the empty string when the input has no "::" (single-segment
     /// names like a primitive have no parent path).
     static parent_of(s: string) -> string {
@@ -318,7 +221,7 @@ type struct QualifiedName {
         // Copy the prefix [0, last_sep) into a fresh buffer.  format()
         // doesn't implement the `%.*s` precision spec; build the string
         // manually so the caller owns a stable copy.
-        const buf: i8* = malloc((last_sep + 1) as u64) as i8*;
+        const buf: i8* = libc::malloc((last_sep + 1) as u64) as i8*;
         for (mut i: i64 = 0; i < last_sep; i++) {
             buf[i] = s[i] as i8;
         }
@@ -344,7 +247,7 @@ type struct QualifiedName {
         const len: i64 = s.length() as i64;
         // Worst case the output is the same length as the input (when no
         // qualified path appears) so a single len+1 buffer suffices.
-        const buf: i8* = malloc((len + 1) as u64) as i8*;
+        const buf: i8* = libc::malloc((len + 1) as u64) as i8*;
         mut out_idx: i64 = 0;
         mut i: i64 = 0;
         while (i < len) {

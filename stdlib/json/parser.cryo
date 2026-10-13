@@ -11,14 +11,22 @@
 
 namespace std::json::parser;
 
-import core::option;
-import core::result;
-import collections::array;
-import collections::string;
-import collections::str;
-import json::value;
-import json::error;
-import fmt::float;
+import std::core::option;
+import std::core::result;
+import std::core::result::{ Result };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::json::value;
+import std::json::value::{ JsonNumber, JsonObject, JsonValue };
+import std::json::error;
+import std::json::error::{ JsonError, JsonErrorKind };
+import std::fmt::float;
+import std::ffi::libc;
+import std::core::mem;
 
 /// Maximum nesting depth for arrays + objects, combined.
 const MAX_DEPTH: u64 = 256;
@@ -307,17 +315,17 @@ type struct Parser {
             // numbers; such programs must reset `LC_NUMERIC` to "C" around
             // JSON parsing. A locale-independent `strtod_l`/`_strtod_l`
             // binding is the planned follow-up.
-            const buf: u8* = intrinsics::malloc(literal_len + 1);
+            const buf: u8* = libc::malloc(literal_len + 1);
             if (buf == null) {
                 return Result::Err(this.err_at(
                     JsonErrorKind::OutOfMemory,
                     Str::new("allocation failed while parsing float literal")
                 ));
             }
-            intrinsics::memcpy(buf as void*, (this.src + start) as void*, literal_len);
+            libc::memcpy(buf as void*, (this.src + start) as void*, literal_len);
             buf[literal_len] = 0;
             const v: f64 = float::parse_f64(buf as string).unwrap_or(0.0);
-            intrinsics::free(buf as void*);
+            libc::free(buf as void*);
             return Result::Ok(JsonValue::Number(JsonNumber::Float(v)));
         }
 
@@ -528,7 +536,7 @@ type struct Parser {
             ));
         }
         this.advance();   // consume '['
-        mut arr: Array<JsonValue> = Array<JsonValue>::new();
+        mut arr: Array<JsonValue> = Array::<JsonValue>::new();
         this.skip_ws();
 
         // Empty array fast path.
@@ -681,7 +689,7 @@ function parse(text: Str) -> Result<JsonValue, JsonError> {
         // trailing-data input - a remotely-triggerable leak for a server
         // parsing untrusted JSON.
         mut owned: JsonValue = v;
-        owned.drop();
+        mem::drop(owned);
         return Result::Err(JsonError::new(
             JsonErrorKind::TrailingData,
             p.line, p.column, p.pos,

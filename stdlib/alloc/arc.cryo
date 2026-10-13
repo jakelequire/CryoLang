@@ -14,7 +14,7 @@
 ///!
 ///! The memory-ordering pattern below - `fetch_add(Relaxed)` for clone,
 ///! `fetch_sub(Release)` + `fence(Acquire)` on the last-decrement path
-///! - is the canonical Boost / Rust implementation.  Relaxed is correct
+///! - is the canonical reference-count implementation.  Relaxed is correct
 ///! for the clone bump because the new reference is observed only by
 ///! callers who already share the count with the cloning thread; the
 ///! existing happens-before edge is sufficient.  The release/acquire
@@ -43,14 +43,22 @@
 
 namespace std::alloc::arc;
 
-import core::intrinsics;
-import core::ptr;
-import core::result;
-import core::option;
-import core::drop;
-import alloc::layout;
-import alloc::allocator;
-import sync::atomic;
+import std::core::intrinsics;
+import std::core::ptr;
+import std::core::ptr::{ NonNull };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::alloc::layout;
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator;
+import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
+import std::sync::atomic;
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::core::mem;
 
 /// Heap-resident header shared by every `Arc<T, A>` and `Weak<T, A>` for one
 /// value.  The allocator instance lives here, not in the handles, so all of
@@ -71,7 +79,7 @@ type struct ArcInner<T, A> {
 private function free_arc_inner<T, A>(inner_ptr: ArcInner<T, A>*) -> void
 where A: Allocator {
     mut alloc: A = inner_ptr.alloc;
-    const header: Layout = Layout::of<ArcInner<T, A>>();
+    const header: Layout = Layout::of::<ArcInner<T, A>>();
     alloc.deallocate(NonNull::new(inner_ptr as u8*), header);
 }
 
@@ -84,11 +92,11 @@ where A: Allocator {
     const prev: u64 = inner_ptr.weak.fetch_sub(1, MemoryOrder::Release);
     if (prev == 1) {
         atomic::fence(MemoryOrder::Acquire);
-        free_arc_inner<T, A>(inner_ptr);
+        free_arc_inner::<T, A>(inner_ptr);
     }
 }
 
-type struct Arc<T, A = GlobalAlloc> {
+type struct Arc<T, A = GlobalAlloc> where A: Allocator {
     // Raw (nullable) so each handle's `drop` can null it and stay
     // idempotent.  Non-null while the handle is live; only a post-drop
     // husk holds null.
@@ -119,15 +127,15 @@ type struct Arc<T, A = GlobalAlloc> {
     /// `Err(AllocError)` if the allocator refuses the request.
     static try_new(value: T) -> Result<Arc<T, GlobalAlloc>, AllocError> {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        const header: Layout = Layout::of<ArcInner<T, GlobalAlloc>>();
+        const header: Layout = Layout::of::<ArcInner<T, GlobalAlloc>>();
         const raw: NonNull<u8> = alloc.allocate(header)?;
-        const typed: NonNull<ArcInner<T, GlobalAlloc>> = raw.cast<ArcInner<T, GlobalAlloc>>();
+        const typed: NonNull<ArcInner<T, GlobalAlloc>> = raw.cast::<ArcInner<T, GlobalAlloc>>();
         const inner_ptr: ArcInner<T, GlobalAlloc>* = typed.as_ptr();
-        inner_ptr.strong = Atomic<u64>::new(1);
-        inner_ptr.weak   = Atomic<u64>::new(1);
+        inner_ptr.strong = Atomic::<u64>::new(1);
+        inner_ptr.weak   = Atomic::<u64>::new(1);
         inner_ptr.value  = value;
         inner_ptr.alloc  = alloc;
-        return Result::Ok(Arc<T, GlobalAlloc> { inner: inner_ptr });
+        return Result::Ok(Arc::<T, GlobalAlloc> { inner: inner_ptr });
     }
 
     /// Fallible constructor with a caller-supplied allocator.  The
@@ -135,27 +143,27 @@ type struct Arc<T, A = GlobalAlloc> {
     /// to free the inner when the last reference drops.
     static try_new_in(value: T, alloc: A) -> Result<Arc<T, A>, AllocError> {
         mut a: A = alloc;
-        const header: Layout = Layout::of<ArcInner<T, A>>();
+        const header: Layout = Layout::of::<ArcInner<T, A>>();
         const raw: NonNull<u8> = a.allocate(header)?;
-        const typed: NonNull<ArcInner<T, A>> = raw.cast<ArcInner<T, A>>();
+        const typed: NonNull<ArcInner<T, A>> = raw.cast::<ArcInner<T, A>>();
         const inner_ptr: ArcInner<T, A>* = typed.as_ptr();
-        inner_ptr.strong = Atomic<u64>::new(1);
-        inner_ptr.weak   = Atomic<u64>::new(1);
+        inner_ptr.strong = Atomic::<u64>::new(1);
+        inner_ptr.weak   = Atomic::<u64>::new(1);
         inner_ptr.value  = value;
         inner_ptr.alloc  = a;
-        return Result::Ok(Arc<T, A> { inner: inner_ptr });
+        return Result::Ok(Arc::<T, A> { inner: inner_ptr });
     }
 
     /// Produce another `Arc` pointing at the same value.  The two
     /// handles are interchangeable; the strong count is incremented
-    /// atomically with `Relaxed` ordering - the canonical Boost/Rust
+    /// atomically with `Relaxed` ordering - the canonical reference-count
     /// pattern: the new owner already shares a happens-before with
     /// the cloning thread, so no further synchronization is needed at
     /// clone time.
     clone(&this) -> Arc<T, A> {
         const inner_ptr: ArcInner<T, A>* = this.inner;
         inner_ptr.strong.fetch_add(1, MemoryOrder::Relaxed);
-        return Arc<T, A> { inner: this.inner };
+        return Arc::<T, A> { inner: this.inner };
     }
 
     /// A non-owning `Weak` handle to the same value.  Bumps the weak count
@@ -164,7 +172,7 @@ type struct Arc<T, A = GlobalAlloc> {
     downgrade(&this) -> Weak<T, A> {
         const inner_ptr: ArcInner<T, A>* = this.inner;
         inner_ptr.weak.fetch_add(1, MemoryOrder::Relaxed);
-        return Weak<T, A> { inner: this.inner };
+        return Weak::<T, A> { inner: this.inner };
     }
 
     /// Current strong-reference count.  Reads the atomic with
@@ -228,7 +236,7 @@ type struct Arc<T, A = GlobalAlloc> {
     /// `increment_strong_count`) on an `Arc<T, A>` of this exact type whose
     /// reference has not already been balanced.
     static from_raw(p: ArcInner<T, A>*) -> Arc<T, A> {
-        return Arc<T, A> { inner: p };
+        return Arc::<T, A> { inner: p };
     }
 
     /// Add one to the strong count of an `into_raw`'d header held only as a raw
@@ -245,9 +253,9 @@ type struct Arc<T, A = GlobalAlloc> {
     /// through the handle `Drop`, so the release/acquire teardown ordering is
     /// identical.  Undefined if the reference was already balanced.
     static decrement_strong_count(p: ArcInner<T, A>*) -> void
-    where T: Drop, A: Allocator {
+    where A: Allocator {
         mut a: Arc<T, A> = Arc::from_raw(p);
-        a.drop();
+        mem::drop(a);
     }
 }
 
@@ -262,7 +270,7 @@ type struct Weak<T, A = GlobalAlloc> {
     /// A `Weak` that never upgrades.  Allocates nothing; `upgrade` always
     /// returns `None`.
     static new() -> Weak<T, GlobalAlloc> {
-        return Weak<T, GlobalAlloc> { inner: null };
+        return Weak::<T, GlobalAlloc> { inner: null };
     }
 
     /// Try to obtain a strong `Arc`.  Returns `None` once the last strong
@@ -282,7 +290,7 @@ type struct Weak<T, A = GlobalAlloc> {
             if (n == 0) { return Option::None; }
             match (inner_ptr.strong.compare_exchange(
                        n, n + 1, MemoryOrder::Acquire, MemoryOrder::Relaxed)) {
-                Result::Ok(_)       => { return Option::Some(Arc<T, A> { inner: inner_ptr }); }
+                Result::Ok(_)       => { return Option::Some(Arc::<T, A> { inner: inner_ptr }); }
                 Result::Err(actual) => { n = actual; }
             }
         }
@@ -294,7 +302,7 @@ type struct Weak<T, A = GlobalAlloc> {
             const inner_ptr: ArcInner<T, A>* = this.inner;
             inner_ptr.weak.fetch_add(1, MemoryOrder::Relaxed);
         }
-        return Weak<T, A> { inner: this.inner };
+        return Weak::<T, A> { inner: this.inner };
     }
 
     /// Live strong count, or 0 for a dangling `Weak`.  Advisory.
@@ -304,8 +312,8 @@ type struct Weak<T, A = GlobalAlloc> {
     }
 }
 
-/// Decrement the strong count atomically.  When it reaches zero, run
-/// `T::drop()` on the shared value and release the strong group's shared
+/// Decrement the strong count atomically.  When it reaches zero, release
+/// the shared value in place (`ptr::drop_in_place`) and release the strong group's shared
 /// weak unit; freeing the header falls to whichever weak release is last.
 /// The `Release` on `fetch_sub` plus the `Acquire` fence on the
 /// last-strong path establishes the happens-before edge that synchronizes
@@ -315,7 +323,7 @@ type struct Weak<T, A = GlobalAlloc> {
 /// Ownership obligation: every `Arc` handle must have `drop` called exactly
 /// once before going out of scope.
 implement<T, A> trait Drop for struct Arc<T, A>
-where T: Drop, A: Allocator {
+where A: Allocator {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner_ptr: ArcInner<T, A>* = this.inner;
@@ -328,8 +336,8 @@ where T: Drop, A: Allocator {
             // then release the strong group's shared weak unit (which frees
             // the header if no `Weak` outlives us).
             atomic::fence(MemoryOrder::Acquire);
-            inner_ptr.value.drop();
-            release_weak<T, A>(inner_ptr);
+            ptr::drop_in_place::<T>(&inner_ptr.value);
+            release_weak::<T, A>(inner_ptr);
         }
         this.inner = null;
     }
@@ -340,11 +348,11 @@ where T: Drop, A: Allocator {
 /// released its shared unit, so the value is gone and only the header
 /// remains to reclaim.
 implement<T, A> trait Drop for struct Weak<T, A>
-where T: Drop, A: Allocator {
+where A: Allocator {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner_ptr: ArcInner<T, A>* = this.inner;
-        release_weak<T, A>(inner_ptr);
+        release_weak::<T, A>(inner_ptr);
         this.inner = null;
     }
 }

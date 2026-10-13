@@ -10,19 +10,31 @@
 /// (or `codegen_lvalue` for the address-of / mutation cases); the
 /// arithmetic/logic lowering itself lives on `cg.expr_ops`.
 
-namespace Compiler::Codegen::Visit::BinaryUnaryEmitter;
+namespace compiler::codegen::visit::binary_unary_emitter;
 
-import Compiler::Codegen;
-import Compiler::Codegen::{ LLVMTypes, Context, Util };
-import Compiler::Codegen::State::VisitorState;
-import Compiler::Codegen::Visit::ExprDispatch;
-import Compiler::Diag;
-import Compiler::Diag::Diagnostic;
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Type, Compound };
-import Compiler::AST;
-import Compiler::AST::{ Node, Visitor, Expression };
-import Compiler::Lex;
+import compiler::codegen;
+import compiler::codegen::{ context, llvm, llvm_types, util };
+import compiler::codegen::state::visitor_state;
+import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::codegen::visit::expr_dispatch;
+import compiler::codegen::visit::expr_dispatch::{ ExprDispatch };
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
+import compiler::diag::diagnostic;
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::types;
+import compiler::types::{ compound, IntegerKind, type_base, type_ref, TypeKind };
+import compiler::ast;
+import compiler::ast::{ node, visitor, expression };
+import compiler::lex;
+import compiler::lex::{ TokenType };
+import std::ffi::libc;
+import compiler::ast::expression::{ BinaryExprNode, UnaryExprNode };
+import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::context::{ CodegenContext };
+import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
+import compiler::types::compound::{ PointerType };
+import compiler::types::type_base::{ IntType, Type };
 
 
 type struct BinaryUnaryEmitter {
@@ -71,14 +83,7 @@ type struct BinaryUnaryEmitter {
         // computes the new value; store it back into the left place, mirroring
         // the `=` branch below.
         if (node.desugared_call != null) {
-            const is_compound: boolean =
-                op == TokenType::PlusEqual    || op == TokenType::MinusEqual   ||
-                op == TokenType::StarEqual    || op == TokenType::SlashEqual   ||
-                op == TokenType::PercentEqual ||
-                op == TokenType::AmpEqual     || op == TokenType::PipeEqual    ||
-                op == TokenType::CaretEqual   || op == TokenType::LessLessEqual ||
-                op == TokenType::GreaterGreaterEqual;
-            if (is_compound) {
+            if (op.compound_base() != TokenType::Unknown) {
                 const addr: LValue = this.dispatch.codegen_lvalue(visitor, node.left);
                 const val: LValue = this.dispatch.codegen_rvalue(visitor, node.desugared_call);
                 if (addr.is_valid() && val.is_valid()) {
@@ -127,7 +132,7 @@ type struct BinaryUnaryEmitter {
             // (i.e. the type of `node.left` itself) so this covers
             // String, Pointer-to-i8, and Array-of-i8 in a single check.
             mut store_val: LValue = val;
-            const dest_t: Type* = this.cg.lookup_type_by_id(node.left.resolved_type.id);
+            const dest_t: Type* = this.cg.arena_type(node.left.resolved_type);
             mut needs_chartrunc: boolean = false;
             if (dest_t != null) {
                 if (dest_t.kind == TypeKind::Char) {
@@ -161,12 +166,8 @@ type struct BinaryUnaryEmitter {
         // which calls codegen_rvalue(left) (a load) and codegen_binary
         // with the compound op kind, producing an expression result but
         // never storing it back.
-        if (op == TokenType::PlusEqual    || op == TokenType::MinusEqual ||
-            op == TokenType::StarEqual    || op == TokenType::SlashEqual ||
-            op == TokenType::PercentEqual ||
-            op == TokenType::AmpEqual     || op == TokenType::PipeEqual  ||
-            op == TokenType::CaretEqual   ||
-            op == TokenType::LessLessEqual || op == TokenType::GreaterGreaterEqual) {
+        const base_op: TokenType = op.compound_base();
+        if (base_op != TokenType::Unknown) {
             const addr: LValue = this.dispatch.codegen_lvalue(visitor,node.left);
             if (!addr.is_valid()) {
                 mut diag: Diagnostic = Diagnostic::error(
@@ -190,22 +191,9 @@ type struct BinaryUnaryEmitter {
             }
             const lhs_loaded: LValue = this.cg.builder.build_load(lhs_ty, addr, "compoundlhs");
             const rhs: LValue = this.dispatch.codegen_rvalue(visitor, node.right);
-            const base_op: TokenType = match (op) {
-                TokenType::PlusEqual           => { TokenType::Plus    }
-                TokenType::MinusEqual          => { TokenType::Minus   }
-                TokenType::StarEqual           => { TokenType::Star    }
-                TokenType::SlashEqual          => { TokenType::Slash   }
-                TokenType::PercentEqual        => { TokenType::Percent }
-                TokenType::AmpEqual            => { TokenType::Amp     }
-                TokenType::PipeEqual           => { TokenType::Pipe    }
-                TokenType::CaretEqual          => { TokenType::Caret   }
-                TokenType::LessLessEqual       => { TokenType::LessLess }
-                TokenType::GreaterGreaterEqual => { TokenType::GreaterGreater }
-                _                              => { TokenType::Plus }
-            };
             mut result: LValue = LValue::null();
             result = this.cg.expr_ops.codegen_binary(lhs_loaded, rhs, base_op, node.resolved_type, node.right.resolved_type,
-                visitor, &node.unwind_cleanup, node.span);
+                node.append_entry, visitor, &node.unwind_cleanup, node.span);
             // Narrow-store fix: codegen_binary normalizes operand widths to
             // the wider of lhs/rhs, so when the LHS slot is a narrow int
             // (char / i8 / u8) and the RHS is wider, `result` is wider than
@@ -243,7 +231,7 @@ type struct BinaryUnaryEmitter {
         const rhs: LValue = this.dispatch.codegen_rvalue(visitor, node.right);
         mut result: LValue = LValue::null();
         result = this.cg.expr_ops.codegen_binary(lhs, rhs, op, node.left.resolved_type, node.right.resolved_type,
-            visitor, &node.unwind_cleanup, node.span);
+            node.append_entry, visitor, &node.unwind_cleanup, node.span);
         this.state.last_value = result;
         this.state.last_is_lvalue = false;
     }
@@ -266,7 +254,7 @@ type struct BinaryUnaryEmitter {
             return;
         }
         if (op == TokenType::Star) {
-            const op_t: Type* = this.cg.lookup_type_by_id(node.operand.resolved_type.id);
+            const op_t: Type* = this.cg.arena_type(node.operand.resolved_type);
             mut is_ptr_like: boolean = false;
             if (op_t != null) {
                 is_ptr_like = op_t.kind == TypeKind::Pointer ||
@@ -324,7 +312,15 @@ type struct BinaryUnaryEmitter {
             if (!this.state.last_is_lvalue) {
                 const ty: LType = this.cg.type_mapper.map_type(node.operand.resolved_type);
                 if (ty.is_valid()) {
-                    addr = this.cg.builder.build_alloca(ty, "addrof.tmp");
+                    // The slot is hoisted to the entry block while the store
+                    // stays here, where the value is live.  `f(&g())` in a loop
+                    // body would otherwise allocate a fresh temporary every
+                    // iteration and release none of them, growing the frame
+                    // until it hits the guard page.  One slot serves every
+                    // iteration because the materialized rvalue dies with the
+                    // statement that created it, so the store below always
+                    // precedes the reads that consume it.
+                    addr = this.cg.flow.temp_slot(ty, "addrof.tmp");
                     this.cg.builder.build_store(v, addr);
                 }
             }
@@ -351,7 +347,7 @@ type struct BinaryUnaryEmitter {
             // int` path in expr_ops).  References (`&T`) are NOT here - they
             // are rejected upstream by `check_unary_op` (a reference is an
             // alias, not a reseatable cursor), so they never reach codegen.
-            const op_t: Type* = this.cg.lookup_type_by_id(node.operand.resolved_type.id);
+            const op_t: Type* = this.cg.arena_type(node.operand.resolved_type);
             mut is_ptr: boolean = false;
             mut pointee_lty: LType = LType::i8();
             if (op_t != null) {
@@ -372,12 +368,12 @@ type struct BinaryUnaryEmitter {
                 }
                 const step: i64 = if (op == TokenType::PlusPlus) { 1 } else { -1 };
                 const idx_val: LValue = LType::const_int(LType::i64(), step as u64, true);
-                const buf: void* = intrinsics::malloc(8);
+                const buf: void* = libc::malloc(8);
                 const slots: void** = buf as void**;
                 slots[0] = idx_val.raw;
                 updated = this.cg.builder.build_gep(
                     pointee_lty, old, buf, 1, "incdec.gep");
-                intrinsics::free(buf);
+                libc::free(buf);
             } else {
                 const one: LValue = LType::const_int(ty, 1, false);
                 updated = if (op == TokenType::PlusPlus) {
@@ -453,9 +449,9 @@ type struct BinaryUnaryEmitter {
         const phi: LValue = this.cg.builder.build_phi(LType::i1(), "sc.result");
 
         // Add incoming values.
-        const vals_buf: void* = intrinsics::malloc(16);
+        const vals_buf: void* = libc::malloc(16);
         const vals: void** = vals_buf as void**;
-        const blocks_buf: void* = intrinsics::malloc(16);
+        const blocks_buf: void* = libc::malloc(16);
         const blocks: void** = blocks_buf as void**;
 
         vals[0] = lhs.raw;
@@ -464,8 +460,8 @@ type struct BinaryUnaryEmitter {
         blocks[1] = rhs_end_bb.raw;
         phi.add_incoming(vals_buf, blocks_buf, 2);
 
-        intrinsics::free(vals_buf);
-        intrinsics::free(blocks_buf);
+        libc::free(vals_buf);
+        libc::free(blocks_buf);
 
         this.state.last_value = phi;
         this.state.last_is_lvalue = false;

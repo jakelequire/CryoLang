@@ -4,37 +4,46 @@
 /// ANSI colors, source snippets, caret underlines, secondary spans, child
 /// diagnostics, and suggestions.
 ///
-/// Output goes through `Utils::DiagSink` over `io::Write` (`DiagRenderer::out`
+/// Output goes through `utils::diag_sink` over `io::Write` (`DiagRenderer::out`
 /// is the discriminator).  The default (`out == null`) is the process's stderr,
 /// written unbuffered via fd 2, which keeps stdout clean for LSP/JSON-RPC.
 /// `render_to_string` points `out` at a `String` buffer so the language server
 /// can embed the full rendered report in an LSP diagnostic's `message`.
 
-namespace Compiler::Diag::Renderer;
+namespace compiler::diag::renderer;
 
-import Compiler::Diag;
-import Compiler::Diag::{ Severity, SourceSpan, SpanLabel, Suggestion, Diagnostic };
-import Utils;
-import Utils::SyntaxHighlighter;
-import Utils::DiagSink;
+import compiler::diag;
+import compiler::diag::{ severity, source_span, span_label, suggestion, diagnostic };
+import utils;
+import utils::syntax_highlighter;
+import utils::diag_sink;
+import utils::diag_sink::{ DiagSink };
 import std::core::{ option, slice };
 import std::io::stdio;
 import std::env;
 import std::collections::str;
+import std::collections::str::{ Str };
 import std::fs::file;
 import std::fs::metadata;
+import std::fs::metadata::{ metadata };
 import std::fs::path;
+import std::fs::path::{ Path };
 import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
 import std::collections::string;
+import std::collections::string::{ String };
+import std::ffi::libc;
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::severity::{ Severity };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::span_label::{ SpanLabel };
+import compiler::diag::suggestion::{ Applicability, Suggestion, SuggestionPart };
+import std::core::option::{ Option };
+import std::core::slice::{ Slice };
 
 
 // ANSI Color Codes
 
-// NOTE: use \x1b (hex ESC = 0x1B) rather than \033 (octal).  Cryo's
-// string-literal escape pass only recognizes \n \t \r \\ \' \" \0 \xHH;
-// `\033` is parsed as `\0` + literal "33" and silently truncates the
-// string to a single NUL byte, which is why all color escapes had been
-// no-ops.
 const ANSI_RESET:   string = "\x1b[0m";
 const ANSI_BOLD:    string = "\x1b[1m";
 const ANSI_RED:     string = "\x1b[91m";
@@ -57,7 +66,7 @@ const ANSI_GREY:    string = "\x1b[90m";
 // rendered line", which keeps `^^^^` exactly below the highlighted
 // span no matter what's in the source.
 //
-// Tab stops are 4 cells (rustc convention).  Wide characters (CJK
+// Tab stops are 4 cells.  Wide characters (CJK
 // fullwidth, emoji) are still counted as 1 cell - a proper east-asian-
 // wide width table is a follow-up.
 
@@ -78,13 +87,6 @@ type struct RenderConfig {
     /// surrounding shell output; the LSP virtual-doc renderer uses `""`
     /// so its `.cryo-diag` text is column-zero.
     leading_pad:        string;
-    /// When true, `print_message` keeps the literal backticks around
-    /// inline-code spans rather than stripping them.  Terminal output
-    /// gets bold-via-ANSI styling and the bare prose reads naturally, so
-    /// terminal callers leave this off.  The LSP virtual-doc path turns
-    /// it on so the `.cryo-diag` text retains markdown-style backticks
-    /// for the TextMate grammar to highlight as `markup.inline.raw`.
-    preserve_markup:    boolean;
 
     /// Default config: colors auto-detected, 2 context lines, 50 max errors.
     /// Color is enabled when stderr is a terminal AND `NO_COLOR` is unset,
@@ -96,7 +98,6 @@ type struct RenderConfig {
             max_errors:         50,
             warnings_as_errors: false,
             leading_pad:        " ",
-            preserve_markup:    false,
         };
     }
 
@@ -111,20 +112,6 @@ type struct RenderConfig {
             max_errors:         50,
             warnings_as_errors: false,
             leading_pad:        "",
-            preserve_markup:    true,
-        };
-    }
-
-    /// Force-color config: ignore the TTY/NO_COLOR check.  Reserved for
-    /// callers that have already decided color is wanted.
-    static colored() -> RenderConfig {
-        return RenderConfig {
-            colors:             true,
-            context_lines:      2,
-            max_errors:         50,
-            warnings_as_errors: false,
-            leading_pad:        " ",
-            preserve_markup:    false,
         };
     }
 
@@ -149,7 +136,7 @@ type struct RenderConfig {
 /// `out` is the `DiagSink` discriminator: `null` writes to the process's
 /// stderr (fd 2, unbuffered); a non-null value is the `String*` buffer that
 /// `render_to_string` temporarily points it at.  Every write goes through
-/// `Utils::DiagSink`, which is `io::Write`-based - no `FILE*` involved.
+/// `utils::diag_sink`, which is `io::Write`-based - no `FILE*` involved.
 type struct DiagRenderer {
     config:          RenderConfig;
     cached_files:    string[];
@@ -162,7 +149,7 @@ type struct DiagRenderer {
             config:          config,
             cached_files:    [],
             cached_contents: [],
-            file_index:      HashMap<string, i64>::new(),
+            file_index:      HashMap::<string, i64>::new(),
             out:             null,
         };
     }
@@ -173,8 +160,9 @@ type struct DiagRenderer {
 
     /// Load a source file into the cache.  Returns true if the file was
     /// loaded (or was already cached).
-    load_source(mut &this, filepath: string) -> boolean {
-        if (this.has_source(filepath)) {
+    load_source(mut &this, filepath_text: string) -> boolean {
+        const filepath: string = filepath_text;
+        if (this.has_source(filepath_text)) {
             return true;
         }
 
@@ -197,12 +185,14 @@ type struct DiagRenderer {
     }
 
     /// Check whether a file is already in the source cache.
-    has_source(&this, filepath: string) -> boolean {
+    has_source(&this, filepath_text: string) -> boolean {
+        const filepath: string = filepath_text;
         return this.file_index.contains_key(&filepath);
     }
 
     /// Get the content of a cached source file, or "" if not cached.
-    get_content(&this, filepath: string) -> string {
+    get_content(&this, filepath_text: string) -> string {
+        const filepath: string = filepath_text;
         const opt: Option<i64> = this.file_index.get(&filepath);
         if (opt.is_some()) {
             return this.cached_contents[opt.unwrap()];
@@ -212,8 +202,8 @@ type struct DiagRenderer {
 
     /// Extract a single line (1-indexed) from a cached source file.
     /// Returns "" if the file is not cached or the line doesn't exist.
-    get_line(&this, filepath: string, line_num: u32) -> string {
-        const content: string = this.get_content(filepath);
+    get_line(&this, filepath_text: string, line_num: u32) -> string {
+        const content: string = this.get_content(filepath_text);
         if (content == "") {
             return "";
         }
@@ -322,8 +312,9 @@ type struct DiagRenderer {
     /// span (so the surrounding label keeps its color); pass `""` to
     /// fall back to the default text style.
     print_message(&this, out: void*, message: string, base_color: string) -> void {
-        if (message == null as string) { return; }
-        const len: i64 = message.length() as i64;
+        const msg: string = message;
+        if (msg == null) { return; }
+        const len: i64 = msg.length() as i64;
         if (len == 0) { return; }
 
         const bold:  string = this.color_bold();
@@ -334,7 +325,7 @@ type struct DiagRenderer {
         mut i: i64 = 0;
         mut in_code: boolean = false;
         while (i < len) {
-            const ch: char = message[i];
+            const ch: char = msg[i];
             if (ch == 96) {  // '`'
                 if (!in_code) {
                     if (colors_on) {
@@ -375,11 +366,12 @@ type struct DiagRenderer {
     /// counts cells, not bytes) lines up with what the terminal
     /// actually renders.  The expanded copy is heap-allocated and
     /// freed after the print; the original cached line is untouched.
-    print_source_line(&this, out: void*, line_text: string) -> void {
-        const expanded: string = DiagRenderer::expand_tabs(line_text);
-        SyntaxHighlighter::print_line(out, expanded, this.config.colors);
+    print_source_line(&this, out: void*, line_text_text: string) -> void {
+        const line_text: string = line_text_text;
+        const expanded: string = DiagRenderer::expand_tabs(line_text_text);
+        syntax_highlighter::print_line(out, expanded, this.config.colors);
         if (expanded != line_text) {
-            intrinsics::free(expanded as void*);
+            libc::free(expanded as void*);
         }
     }
 
@@ -400,30 +392,30 @@ type struct DiagRenderer {
     /// Blank gutter (padded, no line number): `<lead><line_width spaces>
     /// <blue>|<reset><tail>`.  `tail` is `" "` before a caret/source line or
     /// `"\n"` for a bare margin.
-    emit_gutter_blank(&this, out: void*, line_width: u32, tail: string) -> void {
+    emit_gutter_blank(&this, out: void*, line_width: u32, tail_text: string) -> void {
         DiagSink::emit_raw(out, this.lead());
         DiagSink::emit_pad(out, line_width as i32);
         DiagSink::emit_raw(out, " ");
         DiagSink::emit_raw(out, this.color_blue());
         DiagSink::emit_raw(out, "|");
         DiagSink::emit_raw(out, this.color_reset());
-        DiagSink::emit_raw(out, tail);
+        DiagSink::emit_raw(out, tail_text);
     }
 
     /// Numbered gutter: `<lead><num_pre><ln right-justified in line_width>
     /// <reset> <blue>|<reset><tail>`.  `num_pre` is the ANSI prefix before the
     /// number - grey for a context line, or bold+severity for the error line.
-    emit_gutter_num(&this, out: void*, num_pre: string, line_width: u32,
-                    ln: u32, tail: string) -> void {
+    emit_gutter_num(&this, out: void*, num_pre_text: string, line_width: u32,
+                    ln: u32, tail_text: string) -> void {
         DiagSink::emit_raw(out, this.lead());
-        DiagSink::emit_raw(out, num_pre);
+        DiagSink::emit_raw(out, num_pre_text);
         DiagSink::emit_uint(out, ln as u64, line_width as i32);
         DiagSink::emit_raw(out, this.color_reset());
         DiagSink::emit_raw(out, " ");
         DiagSink::emit_raw(out, this.color_blue());
         DiagSink::emit_raw(out, "|");
         DiagSink::emit_raw(out, this.color_reset());
-        DiagSink::emit_raw(out, tail);
+        DiagSink::emit_raw(out, tail_text);
     }
 
 
@@ -493,7 +485,7 @@ type struct DiagRenderer {
 
         // 3. Cross-file secondary labels (rendered as separate snippets
         //    since they can't share a margin with the primary).
-        for (mut i: int = 0; i < diag.labels.length; i++) {
+        for (mut i: i64 = 0; i < diag.labels.length; i++) {
             const label: SpanLabel = diag.labels[i];
             if (label.is_primary) { continue; }
             if (!label.span.has_location()) { continue; }
@@ -523,13 +515,13 @@ type struct DiagRenderer {
         }
 
         // 4. Children (notes, helps)
-        for (mut i: int = 0; i < diag.children.length; i++) {
+        for (mut i: i64 = 0; i < diag.children.length; i++) {
             const child: &Diagnostic = &diag.children[i];
             this.render_child(child);
         }
 
         // 5. Suggestions
-        for (mut i: int = 0; i < diag.suggestions.length; i++) {
+        for (mut i: i64 = 0; i < diag.suggestions.length; i++) {
             const sug: &Suggestion = &diag.suggestions[i];
             this.render_suggestion(sug);
         }
@@ -558,7 +550,7 @@ type struct DiagRenderer {
     /// diagnostic's headline so legacy `at(span)` callers keep their
     /// "Header line repeats under the caret" output unchanged.
     primary_label_caption(&this, diag: &Diagnostic) -> string {
-        for (mut i: int = 0; i < diag.labels.length; i++) {
+        for (mut i: i64 = 0; i < diag.labels.length; i++) {
             const lbl: SpanLabel = diag.labels[i];
             if (!lbl.is_primary)             { continue; }
             if (!lbl.span.has_location())    { continue; }
@@ -576,7 +568,7 @@ type struct DiagRenderer {
     /// coherent.
     has_same_file_secondary(&this, diag: &Diagnostic) -> boolean {
         if (!diag.span.has_location()) { return false; }
-        for (mut i: int = 0; i < diag.labels.length; i++) {
+        for (mut i: i64 = 0; i < diag.labels.length; i++) {
             const lbl: SpanLabel = diag.labels[i];
             if (lbl.is_primary) { continue; }
             if (!lbl.span.has_location()) { continue; }
@@ -738,15 +730,15 @@ type struct DiagRenderer {
     /// line preserve their original (push) order.
     collect_same_file_labels(&this, diag: &Diagnostic) -> SpanLabel[] {
         mut out: SpanLabel[] = [];
-        for (mut i: int = 0; i < diag.labels.length; i++) {
+        for (mut i: i64 = 0; i < diag.labels.length; i++) {
             const lbl: SpanLabel = diag.labels[i];
             if (!lbl.span.has_location()) { continue; }
             if (lbl.span.file != diag.span.file) { continue; }
             out.push(lbl);
         }
         // Insertion sort by start_line (small N, stable).
-        for (mut i: int = 1; i < out.length; i++) {
-            for (mut j: int = i; j > 0; j--) {
+        for (mut i: i64 = 1; i < out.length; i++) {
+            for (mut j: i64 = i; j > 0; j--) {
                 if (out[j].span.start_line < out[j - 1].span.start_line) {
                     const tmp: SpanLabel = out[j];
                     out[j] = out[j - 1];
@@ -781,7 +773,7 @@ type struct DiagRenderer {
         // print across every group.
         const ctx: u32 = this.config.context_lines;
         mut max_line: u32 = primary_span.start_line + ctx;
-        for (mut i: int = 0; i < labels.length; i++) {
+        for (mut i: i64 = 0; i < labels.length; i++) {
             const ln: u32 = labels[i].span.start_line + ctx;
             if (ln > max_line) { max_line = ln; }
         }
@@ -811,7 +803,7 @@ type struct DiagRenderer {
         mut group_end:   u32 = 0;
         mut have_group:  boolean = false;
 
-        for (mut i: int = 0; i < labels.length; i++) {
+        for (mut i: i64 = 0; i < labels.length; i++) {
             const lbl: SpanLabel = labels[i];
             const ln: u32 = lbl.span.start_line;
             const want_start: u32 = if (ln > ctx) { ln - ctx } else { 1 };
@@ -845,7 +837,7 @@ type struct DiagRenderer {
     /// For each line in [start_line..end_line]: print the line itself
     /// (bold blue line-number when it carries a label, grey otherwise),
     /// then one underline row per label that anchors on that line.
-    render_line_group(mut &this, severity: Severity, file: string,
+    render_line_group(mut &this, severity: Severity, file_text: string,
                       start_line: u32, end_line: u32,
                       labels: Slice<SpanLabel>, line_width: u32) -> void {
         const blue: string  = this.color_blue();
@@ -855,7 +847,7 @@ type struct DiagRenderer {
         const out: void* = this.out;
 
         for (mut ln: u32 = start_line; ln <= end_line; ln++) {
-            const line_text: string = this.get_line(file, ln);
+            const line_text: string = this.get_line(file_text, ln);
             // get_line returns "" for both empty and out-of-bounds; if
             // we've passed the end of file there's nothing more to do.
             // Detect end-of-file by trying one line further than the
@@ -894,17 +886,17 @@ type struct DiagRenderer {
             DiagSink::emit_raw(out, "\n");
 
             if (has_label) {
-                this.render_labels_for_line(labels, file, ln, severity, line_width);
+                this.render_labels_for_line(labels, file_text, ln, severity, line_width);
             }
         }
     }
 
     /// Render every label whose primary span starts on `line_num`,
-    /// either as one stacked block (two labels = rustc-style side-by-
+    /// either as one stacked block (two labels = side-by-
     /// side carets with a connector + caption row) or as the legacy
     /// one-row-per-label rendering when there's only one or when the
     /// labels are too many to stack cleanly.
-    render_labels_for_line(mut &this, all_labels: Slice<SpanLabel>, file: string,
+    render_labels_for_line(mut &this, all_labels: Slice<SpanLabel>, file_text: string,
                             line_num: u32, severity: Severity,
                             line_width: u32) -> void {
         mut on_line: SpanLabel[] = [];
@@ -939,7 +931,7 @@ type struct DiagRenderer {
         // connector layout problem here.
         if (on_line.length == 2) {
             this.render_stacked_two_labels(on_line[0], on_line[1],
-                file, line_num, severity, line_width);
+                file_text, line_num, severity, line_width);
             return;
         }
 
@@ -959,7 +951,7 @@ type struct DiagRenderer {
     /// labels' colors come from severity/primary-ness; primary wins
     /// when caret ranges overlap.
     render_stacked_two_labels(mut &this, left: SpanLabel, right: SpanLabel,
-                               file: string, line_num: u32,
+                               file_text: string, line_num: u32,
                                severity: Severity, line_width: u32) -> void {
         const cyan:  string = this.color_cyan();
         const reset: string = this.color_reset();
@@ -967,7 +959,7 @@ type struct DiagRenderer {
         const sev_color: string = this.severity_color(severity);
         const out: void* = this.out;
 
-        const line_text: string = this.get_line(file, line_num);
+        const line_text: string = this.get_line(file_text, line_num);
 
         const left_vs: u32 = DiagRenderer::byte_col_to_visual(line_text, left.span.start_col);
         const left_ve: u32 = if (left.span.end_col > left.span.start_col) {
@@ -1426,13 +1418,13 @@ type struct DiagRenderer {
         DiagSink::emit_raw(out, "\n");
 
         if (patched != orig_line) {
-            intrinsics::free(patched as void*);
+            libc::free(patched as void*);
         }
     }
 
     /// Render a multi-line suggestion.  Called from `render_suggestion_part`
-    /// when the replacement contains at least one `\n`.  Layout matches
-    /// rustc's "diff" presentation:
+    /// when the replacement contains at least one `\n`.  Laid out as a
+    /// diff:
     ///
     ///   |
     /// 53 ~     baz: "not a boolean",
@@ -1648,7 +1640,8 @@ type struct DiagRenderer {
     /// in `byte_col_to_visual` cancels the multi-byte cost.  Returns a
     /// freshly allocated string the caller owns; the source-cache copy
     /// is left untouched.
-    static expand_tabs(line: string) -> string {
+    static expand_tabs(line_text: string) -> string {
+        const line: string = line_text;
         if (line == "") { return ""; }
         const len: i64 = line.length() as i64;
 
@@ -1701,7 +1694,8 @@ type struct DiagRenderer {
     /// Convert a 1-indexed byte column on `line` into a 1-indexed cell
     /// column on its rendered (tab-expanded) form.  Result for a column
     /// of 0 is 0; column past EOL clamps to the line's final cell+1.
-    static byte_col_to_visual(line: string, byte_col: u32) -> u32 {
+    static byte_col_to_visual(line_text: string, byte_col: u32) -> u32 {
+        const line: string = line_text;
         if (byte_col == 0)      { return 0; }
         if (line == "")         { return byte_col; }
         const len: i64 = line.length() as i64;
@@ -1734,8 +1728,10 @@ type struct DiagRenderer {
     /// allocated string the caller owns; if no change would be made the
     /// original line is returned unchanged (caller should test pointer
     /// identity before freeing).
-    static splice_replacement(line: string, start_col: u32, end_col: u32,
-                                replacement: string) -> string {
+    static splice_replacement(line_text: string, start_col: u32, end_col: u32,
+                                replacement_text: string) -> string {
+        const line: string = line_text;
+        const replacement: string = replacement_text;
         if (line == "")              { return line; }
         if (start_col == 0)          { return line; }
 
@@ -1783,7 +1779,8 @@ type struct DiagRenderer {
     /// ranges or on allocation failure.  Used by the multi-line suggestion
     /// renderer to split a replacement string on `\n` and to pull leading
     /// whitespace off the anchor line for auto-indenting inserted lines.
-    static substring_bytes(s: string, start: i64, end: i64) -> string {
+    static substring_bytes(s_text: string, start: i64, end: i64) -> string {
+        const s: string = s_text;
         if (s == null as string || s == "") { return ""; }
         if (end <= start) { return ""; }
         const len: i64 = end - start;
@@ -1796,7 +1793,8 @@ type struct DiagRenderer {
     /// bytes off the anchor line, so a fix-it like `,\nbuz: <bool>` lands
     /// at the same column as the existing fields without the emission site
     /// having to compute indent itself.
-    static leading_whitespace_count(line: string) -> i64 {
+    static leading_whitespace_count(line_text: string) -> i64 {
+        const line: string = line_text;
         if (line == null as string || line == "") { return 0; }
         const len: i64 = line.length() as i64;
         mut i: i64 = 0;

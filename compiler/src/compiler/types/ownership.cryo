@@ -25,14 +25,43 @@
 ///! These queries are deliberately structural and trait-registry-based
 ///! rather than driven by attributes on the source type. That keeps the
 ///! `Copy` story honest: the compiler verifies the property; the user
-///! doesn't assert it. Same shape Rust uses for its `Sized` marker.
+///! doesn't assert it.
 
-namespace Compiler::Types::Ownership;
+namespace compiler::types::ownership;
 
-import Compiler::AST::Declaration;
-import Compiler::Types;
-import Compiler::Types::{ Arena, Type, TypeRef, Compound, UserDefined, Generic, GenericRegistry, Substitution };
-import Compiler::Resolver::{ SymbolStr, InternTable };
+import compiler::ast::declaration;
+import compiler::ast::declaration::{
+    ClassDeclNode, FieldDeclNode, ImplBlockNode, MethodNode, StructDeclNode, UnionDeclNode,
+    VarDeclNode
+};
+import compiler::types;
+import compiler::types::{
+    arena, compound, generic, generic_registry, substitution, type_base, type_ref,
+    TypeKind, user_defined
+};
+import compiler::resolver::{ symbol_str, intern_table };
+import compiler::ast;
+import compiler::ast::{ NodeKind };
+import compiler::ast::node;
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::node_locator::{ NodeLocator };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res::{ DefId };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{
+    ArrayType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{
+    ClassType, EnumType, EnumVariantInfo, FieldInfo, StructType, TypeAliasType
+};
 
 
 // OwnershipQuery: namespace struct holding the static predicates
@@ -56,7 +85,7 @@ type struct OwnershipQuery {
                              depth: i32) -> boolean {
         if (depth >= 32) { return false; }
         if (arena == null) { return false; }
-        const t: Type* = arena.lookup(ty.id);
+        const t: Type* = arena.lookup(ty);
         if (t == null) { return false; }
         const k: TypeKind = t.kind;
 
@@ -95,21 +124,17 @@ type struct OwnershipQuery {
                                              tt.elements, depth + 1);
         }
 
-        // User-defined aggregates: Copy if (a) no user-written Drop
-        // (trait impl OR inherent `drop` method) AND (b) every field
-        // is Copy. Stdlib types use the inherent shape, user code may
-        // use either.
+        // User-defined aggregates: Copy if (a) no `Drop` implementation
+        // AND (b) every field is Copy.  A method merely named `drop` is not
+        // a destructor and does not make a type non-Copy.
         if (k == TypeKind::Struct) {
             const st: StructType* = t as StructType*;
             if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
                 return false;
             }
-            if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
-                return false;
-            }
             // A union is an untagged overlay: the active member is unknown, so
             // its fields are never auto-dropped.  It is therefore Copy/POD
-            // regardless of member types (unless it declares its own `drop`,
+            // regardless of member types (unless it implements `Drop`,
             // handled above) -- do NOT recurse into the fields.
             if (st.is_union) {
                 return true;
@@ -122,18 +147,12 @@ type struct OwnershipQuery {
             if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
                 return false;
             }
-            if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
-                return false;
-            }
             return OwnershipQuery::all_fields_copy(arena, registry, intern,
                                                     ct.fields, depth + 1);
         }
         if (k == TypeKind::Enum) {
             const et: EnumType* = t as EnumType*;
             if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
-                return false;
-            }
-            if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
                 return false;
             }
             return OwnershipQuery::all_variants_copy(arena, registry, intern,
@@ -148,16 +167,12 @@ type struct OwnershipQuery {
                                                      al.target, depth + 1);
         }
 
-        // InstantiatedType wrappers route Drop lookup through both
-        // the trait-impl registry (template's canonical base type id) and the
-        // inherent-method walk (which handles the cloned spec's
-        // own `drop` method). Either match marks the type non-Copy.
+        // InstantiatedType wrappers route Drop lookup through the trait-impl
+        // registry (template's canonical base type id); a match marks the
+        // type non-Copy.
         if (k == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t as InstantiatedType*;
             if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
-                return false;
-            }
-            if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
                 return false;
             }
             if (inst.has_resolved_type()) {
@@ -218,7 +233,7 @@ type struct OwnershipQuery {
     // Mirrors the `is_copy` shape but with thread-safety rules:
     //   - Primitives, references, function pointers, raw pointers:
     //     Send + Sync.  Raw pointers being Send+Sync is the
-    //     "weaker-than-Rust" stance Cryo adopts elsewhere (no borrow
+    //     permissive stance Cryo adopts elsewhere (no borrow
     //     checker, refs unchecked): a struct that hides a `T*` field
     //     and reasons about it correctly (Box, Arc, Array, HashMap,
     //     String, ...) doesn't have to fight the type system.  Types
@@ -233,7 +248,7 @@ type struct OwnershipQuery {
     //   - Generic params and unresolved positions: conservative false.
     //
     // Send and Sync currently share the same structural rule.  They are
-    // exposed as separate predicates so future divergence (e.g. Rust's
+    // exposed as separate predicates so future divergence (e.g. a
     // `&T: Send if T: Sync` distinction) can land without an API change.
 
     /// True when a value of `ty` may safely transfer between threads.
@@ -259,7 +274,7 @@ type struct OwnershipQuery {
                                     depth: i32) -> boolean {
         if (depth >= 32) { return false; }
         if (arena == null) { return false; }
-        const t: Type* = arena.lookup(ty.id);
+        const t: Type* = arena.lookup(ty);
         if (t == null) { return false; }
         const k: TypeKind = t.kind;
 
@@ -309,7 +324,7 @@ type struct OwnershipQuery {
         // structural field walk.
         if (k == TypeKind::Struct) {
             const st: StructType* = t as StructType*;
-            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, registry, intern, ty)) {
                 return false;
             }
             return OwnershipQuery::all_fields_thread_safe(arena, registry, intern,
@@ -317,7 +332,7 @@ type struct OwnershipQuery {
         }
         if (k == TypeKind::Class) {
             const ct: ClassType* = t as ClassType*;
-            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, registry, intern, ty)) {
                 return false;
             }
             return OwnershipQuery::all_fields_thread_safe(arena, registry, intern,
@@ -325,7 +340,7 @@ type struct OwnershipQuery {
         }
         if (k == TypeKind::Enum) {
             const et: EnumType* = t as EnumType*;
-            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, registry, intern, ty)) {
                 return false;
             }
             return OwnershipQuery::all_variants_thread_safe(arena, registry, intern,
@@ -343,7 +358,7 @@ type struct OwnershipQuery {
             const inst: InstantiatedType* = t as InstantiatedType*;
             // Deny-list check on the template's canonical identity catches
             // `Rc<T>` even when its type_args[0] is itself thread-safe.
-            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, registry, intern, ty)) {
                 return false;
             }
             if (inst.has_resolved_type()) {
@@ -382,11 +397,11 @@ type struct OwnershipQuery {
         if (depth >= 32) { return false; }
         if (registry == null) { return false; }
         const tmpl: TemplateEntry* =
-            registry.get_template_by_type_id(inst.generic_base.id);
+            registry.template_of_type(inst.generic_base);
         if (tmpl == null) { return false; }
-        if (tmpl.param_type_ids.length != inst.type_args.length) { return false; }
+        if (tmpl.param_types.length != inst.type_args.length) { return false; }
         mut subst: TypeSubstitution =
-            TypeSubstitution::from_params(&tmpl.param_type_ids, &inst.type_args);
+            TypeSubstitution::from_params(&tmpl.param_types, &inst.type_args);
 
         if (tmpl.node_kind == NodeKind::StructDeclaration && tmpl.ast_node != null) {
             const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
@@ -430,7 +445,7 @@ type struct OwnershipQuery {
         if (tmpl.node_kind == NodeKind::EnumDeclaration) {
             // Variant payloads aren't on the AST as resolved TypeRefs (only as
             // annotations); read them off the template's arena enum type.
-            const base_t: Type* = arena.lookup(inst.generic_base.id);
+            const base_t: Type* = arena.lookup(inst.generic_base);
             if (base_t == null || base_t.kind != TypeKind::Enum) { return false; }
             const et: EnumType* = base_t as EnumType*;
             for (mut vi: i64 = 0; vi < et.variants.length; vi++) {
@@ -495,20 +510,26 @@ type struct OwnershipQuery {
     ///     same thread that acquired the lock, so a guard cannot
     ///     cross threads.
     ///
-    /// Keyed on the target's canonical QUALIFIED-NAME identity (via
-    /// `named_qualified_id`, peeling an `InstantiatedType` to its template), NOT
-    /// the bare leaf: a USER type merely NAMED `Rc` must not be denied Send/Sync.
-    /// Conservative direction (a false deny is over-restrictive, not unsound),
-    /// but keyed precisely so only the actual stdlib types are denied.
-    static is_thread_safety_denied(arena: TypeArena*, intern: InternTable*,
-                                   ty: TypeRef) -> boolean {
-        if (arena == null || intern == null) { return false; }
-        const qid: u64 = OwnershipQuery::named_qualified_id(arena, intern, ty);
-        if (qid == 0) { return false; }
-        if (qid == intern.intern("std::alloc::rc::Rc").id as u64) { return true; }
-        if (qid == intern.intern("std::sync::mutex::MutexGuard").id as u64) { return true; }
-        if (qid == intern.intern("std::sync::rwlock::RwLockReadGuard").id as u64) { return true; }
-        if (qid == intern.intern("std::sync::rwlock::RwLockWriteGuard").id as u64) { return true; }
+    /// Keyed on the target's definition (an `InstantiatedType` peeled to
+    /// its template) against the definitions those declarations claimed,
+    /// NOT the bare leaf: a USER type merely NAMED
+    /// `Rc` must not be denied Send/Sync.  Conservative direction (a false
+    /// deny is over-restrictive, not unsound), but keyed precisely so only the
+    /// actual stdlib types are denied.
+    static is_thread_safety_denied(arena: TypeArena*, registry: GenericRegistry*,
+                                   intern: InternTable*, ty: TypeRef) -> boolean {
+        if (arena == null || registry == null || intern == null) { return false; }
+        const base: TypeRef = OwnershipQuery::inst_base_of(arena, ty);
+        const subject: TypeRef = if (base.is_valid()) { base } else { ty };
+        const def: DefId = registry.decls.def_of(subject, arena);
+        if (!def.is_valid()) { return false; }
+        const denied: LangItem[] = [
+            LangItem::Rc, LangItem::MutexGuard, LangItem::RwLockReadGuard, LangItem::RwLockWriteGuard,
+        ];
+        for (mut i: i64 = 0; i < denied.length; i++) {
+            const id: DefId = registry.wellknown(denied[i]);
+            if (id.is_valid() && def.equals(id)) { return true; }
+        }
         return false;
     }
 
@@ -539,7 +560,7 @@ type struct OwnershipQuery {
                                depth: i32) -> boolean {
         if (depth >= 32) { return false; }
         if (arena == null) { return false; }
-        const t: Type* = arena.lookup(ty.id);
+        const t: Type* = arena.lookup(ty);
         if (t == null) { return false; }
         const k: TypeKind = t.kind;
 
@@ -553,10 +574,9 @@ type struct OwnershipQuery {
             return false;
         }
 
-        // A user-written drop (trait impl or inherent method) is
-        // authoritative and self-contained: stop here.
-        if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty) ||
-            OwnershipQuery::type_implements_drop(arena, registry, intern, ty)) {
+        // A `Drop` implementation is authoritative and self-contained: stop
+        // here.
+        if (OwnershipQuery::type_implements_drop(arena, registry, intern, ty)) {
             return true;
         }
 
@@ -667,31 +687,12 @@ type struct OwnershipQuery {
     }
 
     /// Top-level Drop-impl predicate. Reports whether `implement trait Drop for
-    /// <ty> { ... }` was registered, using the PRECISE (collision-proof) type
-    /// identity when available and falling back to the bare-name lookup
-    /// otherwise (see `type_has_drop_impl`).
+    /// <ty> { ... }` was registered for `ty` (see `type_has_drop_impl`).
     static type_implements_drop(arena: TypeArena*, registry: GenericRegistry*,
                                  intern: InternTable*, ty: TypeRef) -> boolean {
         return OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty);
     }
 
-    /// The target's canonical QUALIFIED-NAME identity for a NAMED aggregate
-    /// (struct/class/enum), peeling an `InstantiatedType` to its template via
-    /// `generic_base`.  Returns the interned qualified-name SymbolStr id (a
-    /// module-independent identity that distinguishes same-leaf types like a
-    /// local `Pair` vs stdlib `std::collections::pair::Pair`).  Returns 0 for
-    /// anything else (primitive, pointer, alias, tuple, unresolved) - those
-    /// never carry a user `Drop` we key precisely, and 0 tells the caller to use
-    /// the bare-name fallback.
-    ///
-    /// This keys on the interned qualified NAME rather than the arena TYPE id on
-    /// purpose: the same nominal type can be materialised under several arena
-    /// type ids across passes (a decl entry vs a field-type resolution vs a
-    /// monomorphized spec), so a type-id key registered in one pass MISSES when
-    /// the query in a later pass carries a different id for the same type - an
-    /// allocation-order-dependent false negative that silently drops a real
-    /// `Drop`.  The qualified name is canonical per nominal type, so the
-    /// registration side (type_resolution R1) and every lookup side agree.
     /// The template `ty` is an instantiation of, for BOTH a pre-mono wrapper and
     /// a post-mono concrete (which carries its own base), or invalid.
     ///
@@ -707,279 +708,15 @@ type struct OwnershipQuery {
         return arena.inst_generic_base(ty);
     }
 
-    static named_qualified_id(arena: TypeArena*, intern: InternTable*,
-                              ty: TypeRef) -> u64 {
-        if (arena == null || intern == null || !ty.is_valid()) { return 0; }
-        const t: Type* = arena.lookup(ty.id);
-        if (t == null) { return 0; }
-        const inst_base: TypeRef = OwnershipQuery::inst_base_of(arena, ty);
-        if (inst_base.is_valid()) {
-            return OwnershipQuery::named_qualified_id(arena, intern, inst_base);
-        }
-        if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class ||
-            t.kind == TypeKind::Enum) {
-            const qname: SymbolStr = OwnershipQuery::qualified_name_of(arena, ty);
-            if (!qname.is_valid()) { return 0; }
-            // The qualified-name SymbolStr id is canonical in the single shared
-            // intern table, so it is directly comparable across passes and
-            // between the registration and lookup sides (both reach here).
-            return qname.id as u64;
-        }
-        return 0;
-    }
-
-    /// Precise, collision-proof "does `ty` carry a user `Drop` trait impl?".
-    ///
-    /// When `ty`'s base type is a named aggregate AND its `(Drop, leaf)` pair was
-    /// precisely registered (some type with that leaf has a Drop impl), the
-    /// QUALIFIED-NAME index is authoritative: a hit means Drop, a MISS is a
-    /// genuine negative - this is what stops a user `Pair` from inheriting stdlib
-    /// `Pair<A,B>`'s Drop by bare-name collision.  Otherwise (unresolvable base,
-    /// or a leaf never precisely registered) we fall back to the historical
-    /// bare-name lookup, so a Drop impl can never be MISSED (the fatal
-    /// direction) - the fix only ever REMOVES false positives.
+    /// Whether an `implement trait Drop for <ty>` head is registered for `ty`:
+    /// the language's `Drop`, by identity, selected for the type as any trait
+    /// impl is.  Existence only - the head's where-clause is
+    /// `TraitChecker::type_implements_trait`'s question.
     static type_has_drop_impl(arena: TypeArena*, registry: GenericRegistry*,
                               intern: InternTable*, ty: TypeRef) -> boolean {
         if (arena == null || registry == null || intern == null) { return false; }
-        const drop_name: SymbolStr = intern.intern("Drop");
-        if (!drop_name.is_valid()) { return false; }
-        const leaf: SymbolStr = OwnershipQuery::registry_name_of(arena, intern, ty);
-        const qual_id: u64 = OwnershipQuery::named_qualified_id(arena, intern, ty);
-        if (qual_id != 0 && registry.is_precise_trait_leaf(drop_name, leaf)) {
-            // Authoritative precise path: a miss here is a true negative.
-            return registry.has_trait_impl_typed(drop_name, qual_id);
-        }
-        // Fallback: bare-name lookup (old behaviour, safe/conservative).
-        if (!leaf.is_valid()) { return false; }
-        return OwnershipQuery::has_drop_impl(registry, intern, leaf);
-    }
-
-    /// Precise, collision-proof trait-impl lookup for ANY trait - the general
-    /// form of `type_has_drop_impl`.  Returns the `implement trait <T> for <ty>`
-    /// block, disambiguating same-leaf types (a local `Cell` vs another module's
-    /// `Cell`, both implementing `Clone`) by the target's canonical
-    /// QUALIFIED-NAME identity, and falling back to the historical bare-leaf
-    /// lookup when `ty` is not a precisely-registered named aggregate.
-    ///
-    /// `named_qualified_id` resolves `ty` to the TEMPLATE's qualified name - for a
-    /// pre-mono wrapper and a post-mono concrete alike - so it matches the
-    /// registration key without the caller normalizing anything first.  The trait name is normalized to its LEAF on BOTH sides
-    /// (`leaf_segment` here, and at the type_resolution R1 registration) so a
-    /// qualified `implement trait Mod::Tr` and a bare `implement trait Tr` share
-    /// one key.  Failure mode is a loud compile error (never a UAF), so the
-    /// precise path is authoritative: a miss for a precisely-registered leaf is a
-    /// genuine negative.
-    static resolve_trait_impl_for_type(arena: TypeArena*, registry: GenericRegistry*,
-                                       intern: InternTable*, trait_name: SymbolStr,
-                                       ty: TypeRef) -> ImplBlockNode* {
-        if (arena == null || registry == null || intern == null) { return null; }
-        const trait_leaf: SymbolStr = OwnershipQuery::leaf_segment(intern, trait_name);
-        const leaf: SymbolStr = OwnershipQuery::registry_name_of(arena, intern, ty);
-        if (leaf.is_valid() && trait_leaf.is_valid()
-                && registry.is_precise_trait_leaf(trait_leaf, leaf)) {
-            const qual_id: u64 = OwnershipQuery::named_qualified_id(arena, intern, ty);
-            if (qual_id != 0) {
-                // Authoritative precise path: a miss here is a true negative.
-                return registry.lookup_trait_impl_typed(trait_leaf, qual_id);
-            }
-        }
-        // Fallback: historical bare-leaf lookup (keyed on the ORIGINAL trait
-        // name, matching how `lookup_trait_impl`'s bare index was written).
-        if (!leaf.is_valid()) { return null; }
-        return registry.lookup_trait_impl(trait_name, leaf);
-    }
-
-    /// Internal: true when the trait-impl registry has a `Drop` impl
-    /// keyed under `target`. Used by `is_copy` (Drop => not Copy) and
-    /// the drop-insertion pass. Note: stdlib types currently express
-    /// Drop as an *inherent* `drop(mut &this) -> void` method rather
-    /// than `implement trait Drop for T { ... }`, so this lookup
-    /// only catches user code that opts into the trait shape. The
-    /// inherent-method case is handled directly in `is_copy_at_depth`
-    /// via `has_inherent_drop`.
-    static has_drop_impl(registry: GenericRegistry*, intern: InternTable*,
-                          target: SymbolStr) -> boolean {
-        if (registry == null || intern == null || !target.is_valid()) {
-            return false;
-        }
-        const drop_name: SymbolStr = intern.intern("Drop");
-        if (!drop_name.is_valid()) { return false; }
-        const direct: ImplBlockNode* = registry.lookup_trait_impl(drop_name, target);
-        return direct != null;
-    }
-
-    /// True when a Struct/Class type's AST declares an inherent `drop`
-    /// method. Cryo's stdlib expresses ownership-handoff via inherent
-    /// `drop` rather than `implement trait Drop`, so this is the predicate
-    /// that actually drives Copy/non-Copy classification for stdlib types
-    /// like `Box<T>`, `String`, `Array<T>`, `HashMap<K, V>`. The
-    /// type-arena's `StructType.methods` is currently empty for most
-    /// declarations (methods live only on the AST), so we go through
-    /// the template registry to recover the original `StructDeclNode`
-    /// or `ClassDeclNode` and walk its `methods[]` array.
-    static has_inherent_drop(arena: TypeArena*, registry: GenericRegistry*,
-                              intern: InternTable*, ty: TypeRef) -> boolean {
-        if (arena == null || registry == null || intern == null) { return false; }
-        const drop_sym: SymbolStr = intern.intern("drop");
-        if (!drop_sym.is_valid()) { return false; }
-
-        // For an instantiation - pre-mono wrapper OR post-mono concrete - route to
-        // the template's AST; `registry.get_template` is keyed on the template name.
-        const t: Type* = arena.lookup(ty.id);
-        if (t == null) { return false; }
-        const inst_base: TypeRef = OwnershipQuery::inst_base_of(arena, ty);
-        if (inst_base.is_valid()) {
-            return OwnershipQuery::has_inherent_drop(arena, registry, intern, inst_base);
-        }
-
-        const qname: SymbolStr = OwnershipQuery::qualified_name_of(arena, ty);
-        if (!qname.is_valid()) { return false; }
-
-        // Templated types (e.g. `Box<T>`) live in `entries`. Check
-        // both the inline methods and any `implement` blocks attached
-        // to the template; Box's `drop` is inline, but Enum decls
-        // route inherent methods through impl blocks.
-        const tmpl: TemplateEntry* = registry.get_template(qname);
-        if (tmpl != null) {
-            if (tmpl.ast_node != null &&
-                OwnershipQuery::ast_has_drop(tmpl.ast_node, tmpl.node_kind, drop_sym)) {
-                return true;
-            }
-            if (OwnershipQuery::impl_blocks_have_drop(tmpl, drop_sym)) {
-                return true;
-            }
-        }
-
-        // Non-generic types might be registered as inherent owners only.
-        const owner_ast: ASTNode* = registry.lookup_inherent_owner(qname);
-        if (owner_ast != null &&
-            OwnershipQuery::ast_has_drop(owner_ast, owner_ast.kind, drop_sym)) {
-            return true;
-        }
-        // The inherent `drop` may instead live in a separate
-        // `implement T { ... }` block.  For a non-generic `T` that block
-        // has no TemplateEntry (so the `tmpl` path above misses it) and is
-        // not on the type-decl node (so `lookup_inherent_owner` misses it);
-        // it is recorded in the inherent-impl-block index at registration.
-        if (registry.inherent_impl_has_method(qname, drop_sym)) {
-            return true;
-        }
-        return false;
-    }
-
-    /// Walk a declaration AST node's inline `methods[]` array for a
-    /// method named `drop`. Handles StructDeclNode and ClassDeclNode
-    /// EnumDeclNode methods live on a separate `implement enum Foo`
-    /// impl block, which the caller picks up via the TemplateEntry's
-    /// `impl_blocks` array (see `has_inherent_drop`).
-    static ast_has_drop(node: ASTNode*, kind: NodeKind,
-                         drop_sym: SymbolStr) -> boolean {
-        if (node == null) { return false; }
-        if (kind == NodeKind::StructDeclaration) {
-            const decl: StructDeclNode* = node as StructDeclNode*;
-            for (mut i: i64 = 0; i < decl.methods.length; i++) {
-                const m: MethodNode* = decl.methods[i];
-                if (m == null || m.func == null) { continue; }
-                if (m.func.name.equals(drop_sym)) { return true; }
-            }
-            return false;
-        }
-        if (kind == NodeKind::UnionDeclaration) {
-            const decl: UnionDeclNode* = node as UnionDeclNode*;
-            for (mut i: i64 = 0; i < decl.methods.length; i++) {
-                const m: MethodNode* = decl.methods[i];
-                if (m == null || m.func == null) { continue; }
-                if (m.func.name.equals(drop_sym)) { return true; }
-            }
-            return false;
-        }
-        if (kind == NodeKind::ClassDeclaration) {
-            const decl: ClassDeclNode* = node as ClassDeclNode*;
-            for (mut i: i64 = 0; i < decl.methods.length; i++) {
-                const m: MethodNode* = decl.methods[i];
-                if (m == null || m.func == null) { continue; }
-                if (m.func.name.equals(drop_sym)) { return true; }
-            }
-            return false;
-        }
-        return false;
-    }
-
-    /// Walk all impl_blocks attached to `tmpl`, scanning each for a
-    /// method named `drop`. Used for types whose inherent methods
-    /// live in `implement` blocks rather than inline.
-    static impl_blocks_have_drop(tmpl: TemplateEntry*,
-                                  drop_sym: SymbolStr) -> boolean {
-        if (tmpl == null) { return false; }
-        for (mut i: i64 = 0; i < tmpl.impl_blocks.length; i++) {
-            const ib: ImplBlockNode* = tmpl.impl_blocks[i];
-            if (ib == null) { continue; }
-            for (mut j: i64 = 0; j < ib.methods.length; j++) {
-                const m: MethodNode* = ib.methods[j];
-                if (m == null || m.func == null) { continue; }
-                if (m.func.name.equals(drop_sym)) { return true; }
-            }
-        }
-        return false;
-    }
-
-    /// Pull a registry-keyable bare name out of a TypeRef. Mirrors
-    /// `Monomorphizer::bare_name_of`: primitives return their display
-    /// name; user-defined types return the last `::` segment of the
-    /// qualified name; instantiations route to the TEMPLATE's bare
-    /// name (not the spec) since trait impls are keyed against the
-    /// template.
-    static registry_name_of(arena: TypeArena*, intern: InternTable*,
-                             ty: TypeRef) -> SymbolStr {
-        const t: Type* = arena.lookup(ty.id);
-        if (t == null) { return SymbolStr::empty(); }
-        const k: TypeKind = t.kind;
-        if (k == TypeKind::Int || k == TypeKind::Float || k == TypeKind::Bool ||
-            k == TypeKind::Char || k == TypeKind::String) {
-            return intern.intern(t.display_name());
-        }
-        if (k == TypeKind::Unit || k == TypeKind::Void) {
-            return SymbolStr::empty();
-        }
-        // Walk through the template-base of an instantiation rather
-        // than the resolved spec; `(Drop, Box)` is the registry key,
-        // not `(Drop, Box_i32)`.  Via `inst_base_of` so this holds for a
-        // post-mono concrete too, not just a pre-mono wrapper.
-        const inst_base: TypeRef = OwnershipQuery::inst_base_of(arena, ty);
-        if (inst_base.is_valid()) {
-            return OwnershipQuery::registry_name_of(arena, intern, inst_base);
-        }
-        // For all named user-defined types, take the bare leaf of the
-        // qualified name, matching how trait_impl_key() in the registry
-        // pairs trait + target by their bare-leaf SymbolStr.id.
-        const qname: SymbolStr = OwnershipQuery::qualified_name_of(arena, ty);
-        if (!qname.is_valid()) { return SymbolStr::empty(); }
-        return OwnershipQuery::leaf_segment(intern, qname);
-    }
-
-    /// Get the qualified-name SymbolStr for a Type. Centralises the
-    /// per-kind field access so `registry_name_of` stays compact.
-    static qualified_name_of(arena: TypeArena*, ty: TypeRef) -> SymbolStr {
-        const t: Type* = arena.lookup(ty.id);
-        if (t == null) { return SymbolStr::empty(); }
-        const k: TypeKind = t.kind;
-        if (k == TypeKind::Struct) {
-            const st: StructType* = t as StructType*;
-            return st.qualified_name;
-        }
-        if (k == TypeKind::Class) {
-            const ct: ClassType* = t as ClassType*;
-            return ct.qualified_name;
-        }
-        if (k == TypeKind::Enum) {
-            const et: EnumType* = t as EnumType*;
-            return et.qualified_name;
-        }
-        if (k == TypeKind::TypeAlias) {
-            const al: TypeAliasType* = t as TypeAliasType*;
-            return al.alias_name;
-        }
-        return arena.get_qualified_name(ty);
+        const drop_id: DefId = registry.wellknown(LangItem::Drop);
+        return registry.heads_for(drop_id, ty, intern).length > 0;
     }
 
     /// Does a call to `method` move the receiver out of the caller?
@@ -1014,11 +751,9 @@ type struct OwnershipQuery {
         // parameter NAME (rather than its type) is what makes this precise:
         // a non-receiver first parameter can be any type, including a bare
         // value, so a type-only check would misclassify it.
-        if (intern != null) {
-            if (recv.name.id != intern.intern("this").id) { return false; }
-        }
+        if (!recv.is_value_receiver()) { return false; }
         if (arena == null) { return false; }
-        const t: Type* = arena.lookup(recv.resolved_type.id);
+        const t: Type* = arena.lookup(recv.resolved_type);
         if (t == null) { return false; }
         // Reference / pointer receivers (`&this` / `mut &this`) borrow.
         if (t.kind == TypeKind::Reference || t.kind == TypeKind::Pointer) {
@@ -1026,127 +761,6 @@ type struct OwnershipQuery {
         }
         // A by-value `this` receiver: taken and dropped by the callee.
         return true;
-    }
-
-    /// Receiver-type + method-name fallback for `method_consumes_receiver`,
-    /// used by drop-insertion when a call's `resolved_method` is null (e.g. a
-    /// monomorphized generic method call that sema did not pin).  Looks the
-    /// method up on `recv_ty`'s template / impl-blocks and reports whether
-    /// any matching overload consumes the receiver.  Without this, an
-    /// `![sink]` combinator like `Option<T>::unwrap` fails to mark its
-    /// receiver moved and drop glue double-frees the payload it copied out.
-    ///
-    /// Safe-biased: a false "consumes" only suppresses a glue drop (a leak),
-    /// never adds one (which could double-free).  Overloads where any match
-    /// consumes therefore answer true.
-    static type_method_consumes(arena: TypeArena*, registry: GenericRegistry*,
-                                intern: InternTable*, recv_ty: TypeRef,
-                                method_name: SymbolStr) -> boolean {
-        if (arena == null || registry == null || intern == null) { return false; }
-        if (!method_name.is_valid()) { return false; }
-        const t: Type* = arena.lookup(recv_ty.id);
-        if (t == null) { return false; }
-        // Peel reference / pointer / instantiation to the named type.
-        if (t.kind == TypeKind::Reference) {
-            const rt: ReferenceType* = t as ReferenceType*;
-            return OwnershipQuery::type_method_consumes(arena, registry, intern,
-                                                        rt.referent, method_name);
-        }
-        if (t.kind == TypeKind::Pointer) {
-            const pt: PointerType* = t as PointerType*;
-            return OwnershipQuery::type_method_consumes(arena, registry, intern,
-                                                        pt.pointee, method_name);
-        }
-        // Via `inst_base_of` so a POST-MONO concrete resolves to its template too:
-        // `registry.get_template` / `lookup_inherent_owner` below are keyed on the
-        // template name, so a monomorphized `Option<String>` that answered `Enum`
-        // here used to miss and return false - reporting that `![sink] unwrap`
-        // does NOT consume its receiver.  `drop_insertion` then emits drop glue
-        // for a receiver whose payload was already moved out: a double free.
-        const inst_base: TypeRef = OwnershipQuery::inst_base_of(arena, recv_ty);
-        if (inst_base.is_valid()) {
-            return OwnershipQuery::type_method_consumes(arena, registry, intern,
-                                                        inst_base, method_name);
-        }
-        const qname: SymbolStr = OwnershipQuery::qualified_name_of(arena, recv_ty);
-        if (!qname.is_valid()) { return false; }
-        const tmpl: TemplateEntry* = registry.get_template(qname);
-        if (tmpl != null) {
-            if (tmpl.ast_node != null &&
-                OwnershipQuery::ast_method_consumes(arena, intern, tmpl.ast_node,
-                                                    tmpl.node_kind, method_name)) {
-                return true;
-            }
-            if (OwnershipQuery::impl_blocks_method_consumes(arena, intern, tmpl, method_name)) {
-                return true;
-            }
-        }
-        const owner_ast: ASTNode* = registry.lookup_inherent_owner(qname);
-        if (owner_ast != null &&
-            OwnershipQuery::ast_method_consumes(arena, intern, owner_ast, owner_ast.kind,
-                                                method_name)) {
-            return true;
-        }
-        return false;
-    }
-
-    /// Scan a struct/class decl's inline methods for one named `method_name`
-    /// that consumes its receiver.
-    static ast_method_consumes(arena: TypeArena*, intern: InternTable*,
-                               node: ASTNode*,
-                               kind: NodeKind, method_name: SymbolStr) -> boolean {
-        if (node == null) { return false; }
-        if (kind == NodeKind::StructDeclaration) {
-            const decl: StructDeclNode* = node as StructDeclNode*;
-            for (mut i: i64 = 0; i < decl.methods.length; i++) {
-                const m: MethodNode* = decl.methods[i];
-                if (m == null || m.func == null) { continue; }
-                if (m.func.name.equals(method_name) &&
-                    OwnershipQuery::method_consumes_receiver(arena, intern, m)) { return true; }
-            }
-            return false;
-        }
-        if (kind == NodeKind::UnionDeclaration) {
-            const decl: UnionDeclNode* = node as UnionDeclNode*;
-            for (mut i: i64 = 0; i < decl.methods.length; i++) {
-                const m: MethodNode* = decl.methods[i];
-                if (m == null || m.func == null) { continue; }
-                if (m.func.name.equals(method_name) &&
-                    OwnershipQuery::method_consumes_receiver(arena, intern, m)) { return true; }
-            }
-            return false;
-        }
-        if (kind == NodeKind::ClassDeclaration) {
-            const decl: ClassDeclNode* = node as ClassDeclNode*;
-            for (mut i: i64 = 0; i < decl.methods.length; i++) {
-                const m: MethodNode* = decl.methods[i];
-                if (m == null || m.func == null) { continue; }
-                if (m.func.name.equals(method_name) &&
-                    OwnershipQuery::method_consumes_receiver(arena, intern, m)) { return true; }
-            }
-            return false;
-        }
-        return false;
-    }
-
-    /// Scan all impl-blocks attached to `tmpl` (where enum and many struct
-    /// inherent methods live) for one named `method_name` that consumes its
-    /// receiver.
-    static impl_blocks_method_consumes(arena: TypeArena*, intern: InternTable*,
-                                       tmpl: TemplateEntry*,
-                                       method_name: SymbolStr) -> boolean {
-        if (tmpl == null) { return false; }
-        for (mut i: i64 = 0; i < tmpl.impl_blocks.length; i++) {
-            const ib: ImplBlockNode* = tmpl.impl_blocks[i];
-            if (ib == null) { continue; }
-            for (mut j: i64 = 0; j < ib.methods.length; j++) {
-                const m: MethodNode* = ib.methods[j];
-                if (m == null || m.func == null) { continue; }
-                if (m.func.name.equals(method_name) &&
-                    OwnershipQuery::method_consumes_receiver(arena, intern, m)) { return true; }
-            }
-        }
-        return false;
     }
 
     /// Strip a qualified name down to its bare leaf: the segment after

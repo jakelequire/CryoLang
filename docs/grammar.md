@@ -12,7 +12,7 @@
 Program            ::= Directive* Namespace? TopLevelItem*
 Namespace          ::= "namespace" QualName ";"
 
-TopLevelItem       ::= Import | ModuleDecl | VarDecl | FunctionDecl
+TopLevelItem       ::= Import | Export | ModuleDecl | VarDecl | FunctionDecl
                      | ExternDecl | CHeaderImport | IntrinsicDecl
                      | AggregateDecl | UnionDecl | EnumDecl | TraitDecl
                      | TypeAlias | ImplBlock | StaticAssert
@@ -44,11 +44,45 @@ AsmConstraint      ::= StringLit | "m" | "i" | "r"
 ModuleDecl         ::= "public"? "module" ModulePath ";"
 Import             ::= "import" ImportForm ";"
 ImportForm         ::= ModulePath "::" "*"
-                     | ModulePath "::" "{" Ident ("," Ident)* "}"
+                     | ModulePath "::" "{" ImportEntry ("," ImportEntry)* "}"
                      | ModulePath "as" Ident
                      | ModulePath
+ImportEntry        ::= Ident ("as" Ident)?
+
+(*  `as` binds the declaration an entry names under another name; the
+    alias names the same declaration, never a spelling looked up again.
+    `ModulePath "as" Ident` with one segment names that module.  With two
+    or more it names the item its last segment names in the module the
+    rest of the path names (`import Toml::parse as tp;` binds what
+    `import Toml::{ parse as tp };` binds), or the module registered under
+    the whole path when the rest offers no such item; when it names both,
+    the import is an error (E0244).  A brace entry naming such a pair,
+    aliased or not, is the same error.  A module alias names the module
+    itself: `N::f`, `N::T`, `N::T::make`, `N::E::V` and its sub-modules'
+    paths (`N::Inner::f`) resolve in it.                                 *)
+
+(*  Symbol re-export.  `ExportForm` is `ImportForm` minus the wildcard:
+    a glob re-export is the one form under which an importer's in-scope
+    set changes because a CHILD module gained a declaration, with the
+    new name written down at neither end.  `ModulePath "::" "*"` stays
+    legal as an Import, where its effect is confined to one file.       *)
+Export             ::= "export" ExportForm ";"
+ExportForm         ::= ModulePath "::" "{" ImportEntry ("," ImportEntry)* "}"
+                     | ModulePath "as" Ident
+                     | ModulePath
+
+(*  An export entry's `as` binds the declaration in the exporting module
+    under the alias, as an import's does, and offers it to the module's
+    importers under the alias: `export fmt::{ printf as print };`.
+    `export M as V;` offers the module `M` under `V`.                    *)
+
 ModulePath         ::= Ident ("::" Ident)*
-QualName           ::= Ident ("::" Ident)*
+QualName           ::= PathHead ("::" Ident)*
+PathHead           ::= Ident | "This"
+                       (* `This` is a keyword, so a path that starts with it
+                          (`This::of(..)`, `This::Item`) is spelled out here: it
+                          names the enclosing type, with that type's own
+                          parameters as its arguments.                       *)
 
 (*  Directives use the bang-bracket form `![name(...)]`.  The leading
     `!` is part of a single `![` token produced by the lexer, so no
@@ -69,15 +103,24 @@ VarDecl            ::= ("const" | "mut") Ident ":" Type ("=" Expr)? ";"
     move fields out of a consumed value (see cryo.md S8.3).                *)
 StructDestructure  ::= "{" Ident ("," Ident)* "}"
 
-FunctionDecl       ::= Visibility? "function" Ident Generics?
+FunctionDecl       ::= Visibility? "async"? "function" Ident Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)? Block
 
 ExternDecl         ::= "extern" "function" Ident
                        "(" ParamList? ")" ("->" Type)? ";"
-                     | "extern" StringLit "{" ExternFn* "}"
-ExternFn           ::= "function" Ident
+                     | "extern" StringLit "{" ExternItem* "}"
+ExternItem         ::= ExternFn | ExternGlobal
+(*  An imported function is a top-level declaration of its module and
+    takes the top-level default: public unless `private` opts it out. *)
+ExternFn           ::= "private"? "function" Ident
                        "(" ParamList? ")" ("->" Type)? ";"
+
+(*  An imported global: storage the linked library owns.  The type is
+    required and an initializer is rejected - there is nothing to infer
+    from, and writing one would define the symbol here.  `mut`/`const`
+    say what CRYO may do with it, not what the library may.        *)
+ExternGlobal       ::= ("mut" | "const") Ident ":" Type ";"
 
 (*  C-header import - a named-namespace form of `extern "C"` that
     asks the compiler to invoke clang on the listed headers and pull
@@ -89,7 +132,13 @@ CIncludeLine       ::= "#include" ( "<" /* path */ ">"
 
 IntrinsicDecl      ::= "intrinsic" "function" Ident
                        "(" ParamList? ")" ("->" Type)? (Block | ";")
+                     | "intrinsic" "function" Ident Generics
+                       "(" ParamList? ")" ("->" Type)? ("where" WhereClause)? ";"
                      | "intrinsic" "const" Ident ":" Type ("=" Expr)? ";"
+
+(*  A generic intrinsic has no body: it is typed and specialized as a
+    generic function, and each call to a specialization is lowered by the
+    compiler (`drop_in_place<T>(p: T*)` releases `*p`).                     *)
 
 (*  Compile-time assertion: `cond` is folded after layout; a false or
     non-constant condition is a compile error (E0237).  `cond` may use
@@ -122,6 +171,8 @@ Visibility         ::= "public" | "private" | "protected"
 
 AggregateDecl      ::= "type"? AggregateKind Ident Generics?
                        (":" Ident)?                  (* base class  *)
+                       ("where" WhereClause)?        (* bounds on the declaration's own
+                                                        parameters; checked per instantiation *)
                        "{" Member* "}"
 AggregateKind      ::= "struct" | "class"
 
@@ -131,8 +182,18 @@ Member             ::= Visibility? "static"?
                                                    labels a run of subsequent members. *)
 VisibilityBlock    ::= Visibility ":" (Field | Method | Constructor | Destructor)*
 
-Field              ::= Ident ":" Type ("=" Expr)? ";"
-Method             ::= ("virtual" | "override")? Ident Generics?
+(* A member may be named by a keyword.  A member name is never read as a
+   declaration or an operator - what follows it says which member kind it
+   is (`(` or `<` a method, `:` a field), and after `.` or `::` the token
+   can only be a member name.  This is what lets a bound C struct keep a
+   field called `type`, which the binding generator cannot rename without
+   breaking the ABI.  The exceptions are the keywords a member position
+   reads FIRST: `public`/`private`/`protected` (a visibility label) and
+   `static`/`virtual`/`override`/`async` (a member modifier).             *)
+MemberName         ::= Ident | Keyword
+
+Field              ::= MemberName ":" Type ("=" Expr)? ";"
+Method             ::= ("virtual" | "override" | "async")? MemberName Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)?
                        (Block | ";")
@@ -141,6 +202,7 @@ Constructor        ::= Ident "(" ParamList? ")"
 Destructor         ::= "~" Ident "(" ")" Block
 
 EnumDecl           ::= "type"? "enum" Ident Generics? (":" Type)?
+                       ("where" WhereClause)?
                        "{" (EnumVariant ("," | ";"))* "}"
                        (* the optional ":" Type is the explicit discriminant
                           base type, e.g. `type enum Foo : i32 { ... }` *)
@@ -149,6 +211,7 @@ EnumVariant        ::= Ident
                      | Ident "(" Type ("," Type)* ")"
 
 UnionDecl          ::= "type" "union" Ident Generics?
+                       ("where" WhereClause)?
                        "{" Member* "}"
                        (* An untagged C-style union: every field overlaps at
                           offset 0, so the union's size is its largest member
@@ -169,10 +232,16 @@ TraitDecl          ::= "type" "trait" Ident Generics?
                        (":" TraitBound ("," TraitBound)*)?  (* super-traits *)
                        "{" TraitMember* "}"
 TraitBound         ::= Ident GenericArgs?
-TraitMember        ::= Ident Generics?
+TraitMember        ::= "static"? "async"? Ident Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)?
                        (Block | ";")     (* body = default impl    *)
+                     | AssocTypeDecl
+AssocTypeDecl      ::= "type" Ident (":" TraitBound ("+" TraitBound)*)? ";"
+                       (* `type Item;` or `type Item: Copy;`.  A projection
+                          `T::Item` is answered by `T`'s bounds, including
+                          the traits a bound's trait inherits; one no bound
+                          declares is an error (E0203).                     *)
 
 TypeAlias          ::= "type" Ident Generics? "=" Type ";"
 
@@ -194,16 +263,26 @@ TargetType         ::= QualName GenericArgs?
                      | Primitive
                      | "()"                              (* unit type *)
 
-MethodImpl         ::= ("virtual" | "override")? "static"?
+MethodImpl         ::= ("virtual" | "override")? "static"? "async"?
                        Ident Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)? Block
+                     | "type" Ident "=" Type ";"   (* binds a trait's associated type *)
 
 Generics           ::= "<" GenericParam ("," GenericParam)* ">"
-GenericParam       ::= Ident (":" Ident ("+" Ident)*)? ("=" Type)?
+GenericParam       ::= Ident ("=" Type)?
                        (* the optional "=" Type is a default type argument,
-                          e.g. `<A = GlobalAlloc>` *)
+                          e.g. `<A = GlobalAlloc>`.  A parameter carries no
+                          bound here: a bound is written in a WhereClause, so
+                          `<T: Bound>` is a syntax error. *)
 GenericArgs        ::= "<" Type ("," Type)* ">"
+TurbofishArgs      ::= "::" GenericArgs
+                       (* generic arguments in EXPRESSION position: `<`
+                          opens them only immediately after `::`, and is
+                          the comparison operator anywhere else in an
+                          expression.  `Vec::<i32>::new()`, `f::<T>(x)`,
+                          `o.m::<T>()`, `Pair::<A, B> { .. }`, `f::<T>` as a
+                          value.  Type position uses GenericArgs directly. *)
 
 
 (*  Expressions ================================================ *)
@@ -231,8 +310,8 @@ UnaryOp            ::= "-" | "!" | "&" | "*" | "~" | "++" | "--"
 PostfixExpr        ::= Primary PostfixOp*
 PostfixOp          ::= "(" ArgList? ")"
                      | "[" Expr "]"
-                     | "." Ident GenericArgs?    (* `.` auto-derefs pointers; there is no `->` operator *)
-                     | "::" Ident GenericArgs?
+                     | "." MemberName TurbofishArgs?  (* `.` auto-derefs pointers; there is no `->` operator *)
+                     | "::" MemberName TurbofishArgs?
                      | "?"                              (* error propagation / try *)
                      | "++" | "--"
 
@@ -242,8 +321,8 @@ Primary            ::= Literal
                      | "null" | "this"
                      | Ident
                      | QualName
-                     | Ident GenericArgs ("(" ArgList? ")")?
-                     | QualName GenericArgs ("(" ArgList? ")")?
+                     | Ident TurbofishArgs ("(" ArgList? ")")?
+                     | QualName TurbofishArgs ("(" ArgList? ")")?
                      | StructLit
                      | ArrayLit
                      | NewExpr
@@ -254,10 +333,19 @@ Primary            ::= Literal
                      | Match
                      | StaticMatch
                      | Lambda
-                     | "delete" Expr           (* parsed; see cryo.md section 21 *)
-                     | "await"  Expr           (* parsed; no async semantics yet *)
-                     | "yield"  Expr?          (* parsed; no generator semantics yet *)
+                     | "delete" Expr           (* frees a `new` allocation; see cryo.md section 15.2 *)
+                     | "await"  Expr           (* only inside an `async` body; see cryo.md section 19 *)
+                     | "yield"  Expr?          (* parsed; no generator semantics yet (cryo.md section 22) *)
                      | "(" Expr ")"
+                     | ImplQualPath
+
+ImplQualPath       ::= "(" Type "for" Type ")" "::" MemberName TurbofishArgs?
+                       (* the member of the first Type's (a trait's)
+                          implementation for the second: `(Beta for P)::make`.
+                          The second Type is a name with optional GenericArgs
+                          or a primitive, as an `implement trait ... for`
+                          head's target is.  Decided by the `for` at the
+                          group's own depth, which no expression carries. *)
 
 Lambda             ::= "move"? "(" (LambdaParam ("," LambdaParam)*)? ")" "->" Type
                        Block                     (* function literal; captures
@@ -267,8 +355,11 @@ Lambda             ::= "move"? "(" (LambdaParam ("," LambdaParam)*)? ")" "->" Ty
                                                     move-capture explicit. *)
 LambdaParam        ::= Ident (":" Type)?
 
-StructLit          ::= Ident GenericArgs?
-                       "{" Ident ":" Expr ("," Ident ":" Expr)* ","? "}"
+StructLit          ::= Ident TurbofishArgs?
+                       "{" MemberName ":" Expr ("," MemberName ":" Expr)* ","? "}"
+                       (* The shorthand `{ field }` form takes an Ident only:
+                          it means `{ field: field }`, and a keyword binds no
+                          local for it to name.                              *)
 ArrayLit           ::= "[" (Expr ("," Expr)*)? "]"
                      | "[" Expr ";" Expr "]"
 NewExpr            ::= "new" Type ("(" ArgList? ")")?
@@ -276,6 +367,10 @@ NewExpr            ::= "new" Type ("(" ArgList? ")")?
                      | "new" Type "{" Ident ":" Expr
                                   ("," Ident ":" Expr)* ","? "}"
 IfExpr             ::= "if" Cond "{" Expr "}" "else" "{" Expr "}"
+                       (* exactly two arms: there is no `else if` chain in
+                          expression position.  Nest the second `if` inside
+                          the `else` braces.  The statement form (If) does
+                          take `else if`.                                    *)
 
 
 (*  Control Flow =============================================== *)
@@ -389,15 +484,16 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*   15   *  /  %                                        left       *)
 (*   16   as                                             left       *)
 (*   17   -  !  &  *  ~  ++  --  (prefix)  new  delete   right      *)
-(*   18   ()  []  .  ->  ::  ?  ++  --  (postfix)        left       *)
+(*   18   ()  []  .  ::  ?  ++  --  (postfix)            left       *)
 
 
 (*   Reserved Keywords =========================================    *)
 (*                                                                  *)
 (*  These names are reserved by the lexer and may not be used as    *)
-(*  identifiers.  Some (e.g. `from`, `async`, `await`, `yield`)     *)
-(*  are lexed but not yet wired into the parser - see section 21 of       *)
-(*  `cryo.md` for the reserved-syntax table.                        *)
+(*  identifiers.  Some (e.g. `from`, `yield`, `auto`, `tuple`)      *)
+(*  are lexed but have no semantics yet - see section 22 of         *)
+(*  `cryo.md` for the reserved-syntax table.  `async` and `await`   *)
+(*  are implemented (cryo.md section 19).                           *)
 (*                                                                  *)
 (*  alignof    as         asm        async     auto      await     *)
 (*  boolean    break      char       class     const     continue  *)
@@ -406,10 +502,10 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*  for        from       function   i8        i16       i32       *)
 (*  i64        i128       if         implement import    in        *)
 (*  inline     int        intrinsic  loop      match     module    *)
-(*  move       mut        namespace  new       null      optional  *)
-(*  override   private    protected  public    return    sizeof    *)
-(*  static     string     struct     this      This      trait     *)
-(*  true       tuple      type       typeof    u8        u16       *)
-(*  u32        u64        u128       uint      union     unsafe    *)
-(*  unsigned   virtual    void       where     while     with      *)
-(*  yield                                                          *)
+(*  move       mut        namespace  never     new       null      *)
+(*  optional   override   private    protected public    return    *)
+(*  sizeof     static     string     struct    this      This      *)
+(*  trait      true       tuple      type      typeof    u8        *)
+(*  u16        u32        u64        u128      uint      union     *)
+(*  unsafe     unsigned   virtual    void      where     while     *)
+(*  with       yield                                               *)

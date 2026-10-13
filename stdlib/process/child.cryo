@@ -32,27 +32,43 @@
 
 namespace std::process::child;
 
-import core::intrinsics;
-import core::option;
-import core::result;
-import core::slice;
-import core::drop;
-import core::ptr;
-import core::mem;
-import collections::array;
-import alloc::layout;
-import alloc::allocator;
-import io::error;
-import io::fd;
-import io::traits;
-import ffi::libc;
-import sys::syscall;
-import process::signal;
-import future::poll;
-import future::waker;
-import future::traits;
-import future::reactor;
-import future::blocking;
+import std::core::intrinsics;
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::slice;
+import std::core::slice::{ Slice };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::core::ptr;
+import std::core::ptr::{ NonNull };
+import std::core::mem;
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::alloc::layout;
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator;
+import std::alloc::allocator::{ GlobalAlloc };
+import std::io::error;
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::fd;
+import std::io::traits;
+import std::io::traits::{ Read, Write };
+import std::ffi::libc;
+import std::sys::syscall;
+import std::process::signal;
+import std::process::signal::{ Signal };
+import std::future::poll;
+import std::future::poll::{ Poll };
+import std::future::waker;
+import std::future::waker::{ Context };
+import std::future::traits;
+import std::future::traits::{ Future };
+import std::future::reactor;
+import std::future::reactor::{ INTEREST_READ, Reactor };
+import std::future::blocking;
+import std::future::blocking::{ BlockingJob, BlockingPool, JOB_PENDING };
 
 
 // ---------------------------------------------------------------------------
@@ -381,13 +397,7 @@ public:
     /// sees EOF; this is deadlock-avoidant for children that read all of
     /// stdin before writing to stdout.
     wait(mut &this) -> Result<ExitStatus, IoError> {
-        match (this.stdin) {
-            Option::Some(mut handle) => {
-                handle.drop();
-                this.stdin = Option::None;
-            }
-            Option::None => { }
-        }
+        this.close_stdin();
         const r: Result<ExitStatus, IoError> = os_proc_wait(this.pid, this.handle);
         match (r) {
             Result::Ok(_)  => { this.waited = true; }
@@ -411,13 +421,7 @@ public:
     /// left to fill while this awaits — the same deadlock `wait` can hit, and
     /// the reason `Command::output` drains before it waits.
     async join(mut &this) -> Result<ExitStatus, IoError> {
-        match (this.stdin) {
-            Option::Some(mut handle) => {
-                handle.drop();
-                this.stdin = Option::None;
-            }
-            Option::None => { }
-        }
+        this.close_stdin();
         // `pid` / `handle` are read before the suspension; the future carries
         // its own copies, so nothing borrows the `Child` across the await.
         mut r: Result<ExitStatus, IoError> = await ChildWait::start(this.pid, this.handle);
@@ -454,6 +458,14 @@ public:
         return os_proc_signal(this.pid, this.handle, sig.as_i32());
     }
 
+    /// Close the child's stdin now, if it is still held, so the child sees
+    /// EOF before the parent waits.  Assigning `None` through `&this` would
+    /// not release the handle, so it is swapped out and dropped here.
+    private close_stdin(mut &this) -> void {
+        mut closing: Option<ChildStdin> = Option::None;
+        mem::swap(&closing, &this.stdin);
+        mem::drop(closing);
+    }
 }
 
 /// The block a `ChildWait` hands to the blocking pool: the pool's job header,
@@ -501,7 +513,7 @@ function child_wait_job_free(raw: u8*) -> void {
     mut j: ChildWaitJob* = raw as ChildWaitJob*;
     os_proc_close_dup(j.handle);
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(raw), Layout::of<ChildWaitJob>());
+    alloc.deallocate(NonNull::new(raw), Layout::of::<ChildWaitJob>());
 }
 
 /// Wait for a child to exit without stalling the executor. The machinery behind
@@ -664,8 +676,8 @@ implement trait Future for struct ChildWait {
             }
             mut alloc: GlobalAlloc = GlobalAlloc::new();
             mut j: ChildWaitJob* = null;
-            match (alloc.allocate(Layout::of<ChildWaitJob>())) {
-                Result::Ok(raw) => { j = raw.cast<ChildWaitJob>().as_ptr(); }
+            match (alloc.allocate(Layout::of::<ChildWaitJob>())) {
+                Result::Ok(raw) => { j = raw.cast::<ChildWaitJob>().as_ptr(); }
                 Result::Err(_)  => {
                     os_proc_close_dup(owned);
                     return Poll::Ready(Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)));
@@ -814,9 +826,9 @@ function pipe_drain_job_free(raw: u8*) -> void {
         fd::close_fd(j.fd);
         j.fd = -1;
     }
-    j.buf.drop();
+    ptr::drop_in_place::<Array<u8>>(&j.buf);
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(raw), Layout::of<PipeDrainJob>());
+    alloc.deallocate(NonNull::new(raw), Layout::of::<PipeDrainJob>());
 }
 
 /// Read one captured pipe to EOF without stalling the executor. The machinery
@@ -897,12 +909,12 @@ type struct PipeDrain {
             fd::close_fd(this.fd);
             this.fd = -1;
         }
-        mut b: Array<u8> = Array<u8>::new();
-        mem::swap<Array<u8>>(&b, &this.buf);
+        mut b: Array<u8> = Array::<u8>::new();
+        mem::swap::<Array<u8>>(&b, &this.buf);
         match (result) {
             Result::Ok(_)  => { return Poll::Ready(Result::Ok(b)); }
             Result::Err(e) => {
-                b.drop();
+                mem::drop(b);
                 return Poll::Ready(Result::Err(e));
             }
         }
@@ -959,15 +971,15 @@ implement trait Future for struct PipeDrain {
             }
             mut alloc: GlobalAlloc = GlobalAlloc::new();
             mut j: PipeDrainJob* = null;
-            match (alloc.allocate(Layout::of<PipeDrainJob>())) {
-                Result::Ok(raw) => { j = raw.cast<PipeDrainJob>().as_ptr(); }
+            match (alloc.allocate(Layout::of::<PipeDrainJob>())) {
+                Result::Ok(raw) => { j = raw.cast::<PipeDrainJob>().as_ptr(); }
                 Result::Err(_)  => {
                     return this.finish(Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)));
                 }
             }
             BlockingJob::init(&j.job, pipe_drain_job_run, pipe_drain_job_free);
             j.fd       = this.fd;
-            j.buf      = Array<u8>::new();
+            j.buf      = Array::<u8>::new();
             j.err      = IoError::new(IoErrorKind::Other, 0);
             j.produced = false;
             j.ok       = false;
@@ -1003,8 +1015,8 @@ implement trait Future for struct PipeDrain {
             if (jc.ok) {
                 // Move the bytes out before letting go: `release` may free the
                 // block, and the buffer must not be freed with it.
-                mut b: Array<u8> = Array<u8>::new();
-                mem::swap<Array<u8>>(&b, &jc.buf);
+                mut b: Array<u8> = Array::<u8>::new();
+                mem::swap::<Array<u8>>(&b, &jc.buf);
                 out = Result::Ok(b);
             } else {
                 out = Result::Err(jc.err);
@@ -1026,7 +1038,6 @@ implement trait Drop for struct PipeDrain {
             fd::close_fd(this.fd);
             this.fd = -1;
         }
-        this.buf.drop();
         this.let_go();
     }
 }
@@ -1061,7 +1072,8 @@ implement trait Drop for struct ChildStderr {
     }
 }
 
-/// Close any captured pipe ends and best-effort-reap the child. The
+/// Best-effort-reap the child; any captured pipe ends still held are
+/// closed by their fields when this returns. The
 /// reap is **non-blocking** (`WNOHANG`): if the child has already
 /// exited, its zombie is released here; if it is still running we
 /// cannot block in a destructor, so a still-running child that is
@@ -1070,25 +1082,6 @@ implement trait Drop for struct ChildStderr {
 /// finishes, drop without wait" zombie leak without ever blocking.
 implement trait Drop for struct Child {
     drop(mut &this) -> void {
-        // Drop synthesis releases each `mut handle` at its match-arm
-        // scope exit, which closes the pipe fd before we clear the
-        // field below.
-        match (this.stdin) {
-            Option::Some(mut handle) => { }
-            Option::None => { }
-        }
-        this.stdin = Option::None;
-        match (this.stdout) {
-            Option::Some(mut handle) => { }
-            Option::None => { }
-        }
-        this.stdout = Option::None;
-        match (this.stderr) {
-            Option::Some(mut handle) => { }
-            Option::None => { }
-        }
-        this.stderr = Option::None;
-
         // POSIX: non-blocking reap of an already-exited child (skipped if
         // `wait`/`try_wait` already reaped it). Windows: close the process
         // HANDLE exactly once (always, even after `wait`, which does not

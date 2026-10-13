@@ -1,27 +1,60 @@
 ///! Compilation Context
 ///!
-///! Single shared state container for a compilation session.  Replaces both
-///! PassContext (11 raw pointers) and component ownership on CompilerInstance
-///! (17 unique_ptrs with implicit destruction ordering).
-///!
-///! Components are initialized lazily via init_*() methods called by passes
-///! at the appropriate pipeline stage, not all upfront in a constructor.
+///! The state one compilation shares between its stages: the build's options,
+///! the module the pipeline stands in, and the stores every stage reads.
 
-namespace Compiler::CompilationContext;
+namespace compiler::compilation_context;
 
-import Compiler::{
-    CompileMode, Diag, Artifacts, ModuleGraph, DeclIndex, ConstTable, ProjectConfig
+import compiler::{
+    compile_mode, diag, artifacts, module_graph, decl_index, const_table, project_config
 };
-import Compiler::Diag::{
-    Snapshot, Config, Renderer, Severity, Sink, Diagnostic
-};
-import Compiler::Passes::PassID;
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Arena, Registry, Resolver, GenericRegistry };
-import Compiler::Mono::Monomorphizer;
-import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, Resolver };
-import Utils::Logger;
+import compiler::diag::{ config, diagnostic, ErrorCode, renderer, severity, sink, snapshot };
+import compiler::passes::pass_id;
+import compiler::passes::pass_id::{ ProvisionSet };
+import compiler::types;
+import compiler::types::{ type_ref, arena, resolver, generic_registry };
+import compiler::mono::monomorphizer;
+import compiler::mono::monomorphizer::{ Monomorphizer };
+import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, DefTable, DefKind, FamilyOwner, ResBase };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::{ NamedAnnotation, NodeKind };
+import compiler::ast::declaration::{ FunctionDeclNode, MethodNode };
+import compiler::types::generic_registry::{ TemplateEntry };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import utils::logger;
+import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::env;
+import std::core::mem;
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
+import std::fmt;
+import compiler::artifacts::{ PhaseArtifacts };
+import compiler::compile_mode::{ CompileMode };
+import compiler::const_table::{ ConstantTable };
+import compiler::decl_index::{ DeclarationIndex, GlobalEntry, OverloadId };
+import compiler::diag::config::{ DiagConfig };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::renderer::{ DiagRenderer, RenderConfig };
+import compiler::diag::severity::{ Severity };
+import compiler::diag::sink::{ DiagnosticSink };
+import compiler::module_graph::{ ModuleGraph, ModuleInfo, ModuleSpellingMatch };
+import compiler::project_config::{ ProjectConfig };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::resolver::{ Resolver };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::generic_registry::{ GenericRegistry };
+import compiler::types::resolver::{ TypeResolver };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::passes::directive_processing;
+import compiler::passes::directive_processing::{ DirectiveRegistry };
+import compiler::codegen::llvm_types::{ LTargetMachine };
 
 /// What artifact a single-file build should produce.  Inferred from the
 /// extension of `-o PATH` by the CLI; read by `run_object_emission` to
@@ -39,85 +72,232 @@ type enum OutputKind {
     Exe;
 }
 
-implement enum OutputKind {
-    /// Map the kind to LLVM's `LLVMCodeGenFileType` value where one
-    /// applies (Asm = 0, Object = 1).  Returns -1 for kinds that
-    /// don't go through `LLVMTargetMachineEmitToFile`.
-    llvm_file_type(&this) -> i32 {
-        return match (this) {
-            OutputKind::Asm    => {  0 }
-            OutputKind::Object => {  1 }
-            _                  => { -1 }
+/// A single-file `-o PATH`: the artifact kind comes with its path.
+type enum OutputOverride {
+    Default;
+    Object(string);
+    Asm(string);
+    IRText(string);
+    Exe(string);
+}
+
+implement enum OutputOverride {
+    static from_cli(kind: OutputKind, path_text: string) -> OutputOverride {
+        const path: string = path_text;
+        return match (kind) {
+            OutputKind::None   => { OutputOverride::Default }
+            OutputKind::Object => { OutputOverride::Object(path) }
+            OutputKind::Asm    => { OutputOverride::Asm(path) }
+            OutputKind::IRText => { OutputOverride::IRText(path) }
+            OutputKind::Exe    => { OutputOverride::Exe(path) }
         };
     }
 
-    is_override(&this) -> boolean {
+    /// The path `-o` named; empty for `Default`.
+    path(&this) -> string {
         return match (this) {
-            OutputKind::None => { false }
-            _                => { true  }
+            OutputOverride::Default   => { "" }
+            OutputOverride::Object(p) => { p }
+            OutputOverride::Asm(p)    => { p }
+            OutputOverride::IRText(p) => { p }
+            OutputOverride::Exe(p)    => { p }
+        };
+    }
+
+    is_exe(&this) -> boolean {
+        return match (this) {
+            OutputOverride::Exe(_) => { true }
+            _                      => { false }
+        };
+    }
+
+    /// An object, assembly or IR file written straight by emission, with
+    /// nothing to link.
+    is_unlinked_artifact(&this) -> boolean {
+        return match (this) {
+            OutputOverride::Object(_) => { true }
+            OutputOverride::Asm(_)    => { true }
+            OutputOverride::IRText(_) => { true }
+            _                         => { false }
+        };
+    }
+}
+
+/// How a panic leaves the function that raised it.
+type enum PanicMode {
+    Abort;
+    Unwind;
+}
+
+/// Whether the program runs on the Cryo runtime or stands alone.
+type enum Runtime {
+    Hosted;
+    Freestanding;
+}
+
+/// Where `GlobalAlloc` gets its memory.
+type enum HeapBackend {
+    Libc;
+    Native;
+}
+
+/// Editor-buffer contents that replace one module's file on disk.
+type struct SourceOverride {
+    path:    string;
+    content: string;
+}
+
+/// An injected specialization and the module its template is declared in.
+type struct InjectedOrigin {
+    node:   ASTNode*;
+    module: ModulePath;
+}
+
+/// A node a desugaring wrote naming a language item (its slot holds
+/// `ResSlot::Lang`) before the item was claimed.
+type struct LangRef {
+    node: ASTNode*;
+    item: LangItem;
+}
+
+/// A node another list refers to without owning it.
+type struct AstRef {
+    node: ASTNode*;
+}
+
+/// A reference a C import made to one of its own records: the import's
+/// alias module, the C tag named, and the declaration the importer emitted
+/// for that tag (null when it emitted none, or has not pinned it yet).
+type struct CRecordRef {
+    ann:   NamedAnnotation*;
+    alias: ModulePath;
+    tag:   SymbolStr;
+    decl:  ASTNode*;
+}
+
+/// What the build was asked for: CLI flags merged over cryoconfig, complete
+/// before the context is made and never written after.
+type struct BuildOptions {
+public:
+    mode:          CompileMode;
+    /// `--debug`: the compiler's own trace logging.
+    verbose:       boolean;
+    /// 0 (none) .. 3 (aggressive): the IR pipeline and the backend level.
+    opt_level:     u32;
+    /// `-g`: DWARF debug info.
+    debug_info:    boolean;
+    runtime:       Runtime;
+    panic:         PanicMode;
+    heap:          HeapBackend;
+    no_std:        boolean;
+    /// Where `lib.cryo` lives; empty when no stdlib was resolved.
+    stdlib_root:   string;
+    /// The triple code is generated for, resolved once: the host's when no
+    /// target was asked for, never empty.
+    target_triple: string;
+    /// `--release-static`: link libLLVM and the C++ runtime statically.
+    static_link:   boolean;
+    output:        OutputOverride;
+    /// The LSP's unsaved buffer for one module.
+    source_override: Option<SourceOverride>;
+
+    static defaults(mode: CompileMode) -> BuildOptions {
+        return BuildOptions {
+            mode:            mode,
+            verbose:         false,
+            opt_level:       2,
+            debug_info:      false,
+            runtime:         Runtime::Hosted,
+            panic:           PanicMode::Abort,
+            heap:            HeapBackend::Libc,
+            no_std:          false,
+            stdlib_root:     "",
+            target_triple:   LTargetMachine::get_default_triple(),
+            static_link:     false,
+            output:          OutputOverride::Default,
+            source_override: Option::None,
+        };
+    }
+
+    unwinds(&this) -> boolean {
+        return match (this.panic) {
+            PanicMode::Unwind => { true }
+            PanicMode::Abort  => { false }
+        };
+    }
+
+    freestanding(&this) -> boolean {
+        return match (this.runtime) {
+            Runtime::Freestanding => { true }
+            Runtime::Hosted       => { false }
+        };
+    }
+
+    native_heap(&this) -> boolean {
+        return match (this.heap) {
+            HeapBackend::Native => { true }
+            HeapBackend::Libc   => { false }
         };
     }
 }
 
 type struct CompilationContext {
 public:
-    // -- Configuration (set at creation, read-only thereafter) --
-    mode:              CompileMode;
+    options:           BuildOptions;
+    /// The file of the module the pipeline stands in; moved by
+    /// `switch_to_module`.
     source_file:       string;
-    include_paths:     string[];
-    debug_mode:        boolean;
-    /// LLVM optimization level for this compilation: 0 (none/debuggable)
-    /// .. 3 (aggressive). Drives both the IR pass pipeline
-    /// (`default<O{n}>`, skipped entirely at 0) and the TargetMachine's
-    /// backend codegen level. Defaults to 2; set from cryoconfig
-    /// `[compiler] optimize` (true=>2, false=>0) or a `--opt-level=N`
-    /// CLI override in `compile_project_with_ctx`.
-    opt_level:         u32;
-    /// Emit DWARF debug info (gated by `-g`/--debug-info). Off by default.
-    /// Read by codegen to create a DICompileUnit + per-function
-    /// DISubprograms and attach source locations.
-    emit_debug_info:   boolean;
-    /// DWARF debug-info handles, populated by `run_ir_generation` only when
-    /// `emit_debug_info` is set, and read by the function prologue to attach
-    /// a DISubprogram + debug location. Opaque LLVM metadata (void*); null
-    /// when debug info is off. Per-module (one CompilationContext == one
-    /// LLVM module == one DICompileUnit).
-    di_builder:        void*;
-    di_cu:             void*;
-    di_file:           void*;
-    namespace_str:     SymbolStr;        // interned current namespace (e.g., "Math::Vec2")
+    /// The file the compilation was started on: an executable's entry point,
+    /// a library's root.
+    entry_file:        string;
+    /// The program's entry point: the entry file's module-level `main`,
+    /// recorded once by the name layer when that module is declared;
+    /// invalid when it declares none.
+    entry_fn:          DefId;
+    /// The module the unit being compiled declares: set when the
+    /// orchestrator switches to a module, and, while sema walks a
+    /// specialization placed from another module, that template's module.
+    /// None for a unit declaring no namespace.
+    unit_module:       ModulePath;
 
-    // -- Phase outputs (heap-allocated to keep CompilationContext small) --
     artifacts: PhaseArtifacts*;
 
-    // -- Diagnostics (heap-allocated) --
     diagnostics:   DiagnosticSink*;
     diag_renderer: DiagRenderer*;
-    diag_config:   DiagConfig*;
 
-    // -- Pass tracking --
     provisions: ProvisionSet;
 
-    // -- Multi-module state (heap-allocated) --
     module_graph: ModuleGraph*;
 
-    // -- Interned strings (heap-allocated, lives for the entire compilation) --
     intern_table: InternTable*;
 
-    // -- Declaration index (heap-allocated) --
+    /// The one place a `DefId` is made and its path composed.
+    defs: DefTable*;
+
     decl_index: DeclarationIndex*;
 
-    // -- Folded module-level integer constants (heap-allocated) --
-    // Shared across modules: a fixed array size may name a constant declared
-    // in an imported module, and imports are name-resolved first.
+    /// Folded module-level integer constants, shared across modules: a fixed
+    /// array size may name a constant declared in an imported module.
     const_table: ConstantTable*;
 
-    // -- Injected specialization origin tracking --
-    // Maps ASTNode pointer (as u64) -> template module SymbolStr.id.
-    // Populated by GenericExpressionResolution when injecting specialized ASTs;
-    // queried by sema to switch to the template's module scope.
-    injected_ast_ptrs:    u64[];
-    injected_ast_modules: u32[];
+    /// Injected specializations, with the module each one's template is
+    /// declared in; sema stands in that module to walk them.
+    injected_origins: InjectedOrigin[];
+
+    /// Language-item references a desugaring wrote before the item was
+    /// claimed (`PassRegistry::settle_lang_refs` answers them).
+    lang_refs: LangRef[];
+
+    /// Every type alias declared, and every path whose scope segment names
+    /// one (`NameResolutionPass::settle_alias_paths` answers the paths once
+    /// every module's names are resolved).  Each is an `ASTNode*` held in a
+    /// struct, so the lists own none of the nodes.
+    alias_decls: AstRef[];
+    alias_paths: AstRef[];
+
+    /// References a C import made to its own records before the name layer
+    /// declared anything (`NameDeclarationPass::settle_c_refs` answers them).
+    c_refs: CRecordRef[];
 
     // -- Inactive-region tracking (LSP tooling) --
     // Source spans of top-level declarations, methods, and inline `![dir] { }`
@@ -132,67 +312,13 @@ public:
     // -- Type system (initialized lazily by TypeDeclaration pass) --
     type_arena: TypeArena*;
 
-    // -- Project configuration (multi-module mode) --
+    /// The driver's view of cryoconfig; passes read `options`.  Null for a
+    /// compile with no project.
     project_config:      ProjectConfig*;
-    project_no_std:      boolean;
-    /// `[compiler] no_runtime` (cryoconfig): freestanding build.  Read by
-    /// codegen to suppress the `main`-widening / `set_args`/`set_env`
-    /// prologue and the `@panic` runtime, and by the linker pass to drop
-    /// crt0 / libc / `libcryo.a`.  Also queryable from `![config(no_runtime)]`
-    /// gates via ConfigGating.  Default false.
-    project_no_runtime:  boolean;
-    /// `[compiler] panic = "unwind"` / CLI `--panic=unwind`: select DWARF
-    /// unwinding.  Read by codegen to emit invoke/landingpad cleanup edges and
-    /// attach `__cryo_personality_v0`, and by the linker pass to link the
-    /// `panic/unwind` runtime tier + libunwind instead of `panic/abort`.
-    /// Default false = abort (emitted IR is byte-identical to before).
-    project_panic_unwind:  boolean;
-    /// `[low_level] native_alloc` (cryoconfig): route `GlobalAlloc` through
-    /// the native mmap-backed heap instead of libc malloc.  Read by
-    /// ConfigGating to evaluate `![config(native_alloc)]` gates.  Default
-    /// false => libc-backed (Low-Level Plan Stage 3).  A temporary
-    /// migration switch, deleted once the native heap is proven (the
-    /// `native_syscalls` switch already completed that lifecycle).
-    native_alloc:        boolean;
     active_module_index: i64;
-    /// Resolved stdlib root: where `lib.cryo` lives.  Set by Instance
-    /// after `resolve_stdlib_root` runs; the linker reads
-    /// `<stdlib_root>/.bin/libcryo.a` from here so installed and
-    /// in-repo cryo invocations both link against the right archive.
-    /// Empty string <=> no stdlib (e.g. no_std project, or unresolved).
-    stdlib_root:         string;
-    /// Resolved cross-compilation target triple, or empty string when
-    /// building for the host.  Set by Instance after merging CLI
-    /// `--target=...` over `[project] target = "..."`.  Codegen reads
-    /// this in `run_ir_generation` to call `LLVMSetTarget`; the linker
-    /// pass compares it to the host triple to decide whether to skip
-    /// the `cc` shellout (cross-compile object files cannot be linked
-    /// by the host linker without a target-aware toolchain).
-    target_triple:       string;
-    /// `--release-static`: link statically against libLLVM + a static C++
-    /// runtime so the produced compiler binary has no `libLLVM-20.so` runtime
-    /// dependency.  Distribution-only; default false keeps the dynamic dev
-    /// link.  Read in `CodegenPasses::run_linking`; does not affect IR.
-    release_static:      boolean;
-    /// Single-file `-o PATH` override.  Set by `compile_file` from
-    /// `CompilerConfig::output_path_override`.  Empty string => no
-    /// override (per-origin `target/<profile>/<origin>/deps/<module>.o`).  Read by
-    /// `run_object_emission` to redirect emission and by the
-    /// single-file Exe flow to drive `cc` for final linking.
-    output_path_override: string;
-    /// Single-file output kind selector.  Mirrors
-    /// `CompilerConfig::output_kind`.  `OutputKind::None` <=> no `-o`.
-    output_kind:         OutputKind;
-
-    /// LSP in-memory source override.  When the Lexing pass switches
-    /// to the module whose `source_file` equals `lsp_override_path`,
-    /// it reads from `lsp_override_content` instead of the file on
-    /// disk, letting the language server compile what's currently
-    /// in the editor buffer (which may diverge from what's saved)
-    /// while every OTHER module in the project loads from disk.
-    /// Empty `lsp_override_path` (the default) disables the override.
-    lsp_override_path:    string;
-    lsp_override_content: string;
+    /// Where the active module stands in the build order: every module it
+    /// depends on stands before it.  -1 when the order does not hold it.
+    active_order_position: i64;
 
     // Owned components (initialized lazily by passes that need them).
     // Public because passes across the compiler reach into the context
@@ -202,103 +328,79 @@ public:
     type_resolver:        TypeResolver*;
     generic_registry:     GenericRegistry*;
     monomorphizer:        Monomorphizer*;
-    module_type_registry: ModuleTypeRegistry*;
-    directive_registry:   void*;           // DirectiveRegistry*; typed-erased to break import cycle.
+    directive_registry:   DirectiveRegistry*;
 
-private:
-    type_checker:         TypeChecker*;
-    module_loader:        void*;           // ModuleLoader*; typed-erased to break import cycle.
-    codegen:              void*;           // LLVM C-API handle; typed-erased pending @cImport.
-    linker:               void*;           // LLVM C-API handle; typed-erased pending @cImport.
-
-public:
-    /// Create a new compilation context for the given mode and source file.
-    static new(mode: CompileMode, source_file: string) -> CompilationContext {
-        // Heap-allocate large sub-components to keep CompilationContext small.
-        // Struct construction copies fields by value through the stack, so
-        // an inline-fielded CompilationContext would risk stack overflow.
-        const _box_renderer: Box<DiagRenderer> = Box<DiagRenderer>::new(DiagRenderer::new(RenderConfig::default()));
+    static new(options: BuildOptions, source_file: string,
+               project_config: ProjectConfig*) -> CompilationContext {
+        // Boxed for a stable address: the components point at each other.
+        const _box_renderer: Box<DiagRenderer> = Box::<DiagRenderer>::new(DiagRenderer::new(RenderConfig::default()));
         const renderer: DiagRenderer* = _box_renderer.leak();
 
-        const _box_artifacts: Box<PhaseArtifacts> = Box<PhaseArtifacts>::new(PhaseArtifacts::new());
-        const _box_diag: Box<DiagnosticSink>      = Box<DiagnosticSink>::new(DiagnosticSink::new());
-        const _box_diag_config: Box<DiagConfig>   = Box<DiagConfig>::new(DiagConfig::default());
-        const _box_module_graph: Box<ModuleGraph> = Box<ModuleGraph>::new(ModuleGraph::new());
-        const _box_intern: Box<InternTable>       = Box<InternTable>::new(InternTable::new());
-        const _box_decl: Box<DeclarationIndex>    = Box<DeclarationIndex>::new(DeclarationIndex::new());
-        const _box_consts: Box<ConstantTable>     = Box<ConstantTable>::new(ConstantTable::new());
+        const _box_artifacts: Box<PhaseArtifacts> = Box::<PhaseArtifacts>::new(PhaseArtifacts::new());
+        const _box_diag: Box<DiagnosticSink>      = Box::<DiagnosticSink>::new(DiagnosticSink::new());
+        const _box_intern: Box<InternTable>       = Box::<InternTable>::new(InternTable::new());
+        const intern_ptr: InternTable* = _box_intern.leak();
+        const _box_defs: Box<DefTable>            = Box::<DefTable>::new(DefTable::new(intern_ptr));
+        const defs_ptr: DefTable* = _box_defs.leak();
+        const _box_module_graph: Box<ModuleGraph> = Box::<ModuleGraph>::new(ModuleGraph::new(defs_ptr));
+        const graph_ptr: ModuleGraph* = _box_module_graph.leak();
+        const _box_decl: Box<DeclarationIndex>    = Box::<DeclarationIndex>::new(DeclarationIndex::new(defs_ptr));
+        const decl_ptr: DeclarationIndex* = _box_decl.leak();
+        const _box_consts: Box<ConstantTable>     = Box::<ConstantTable>::new(ConstantTable::new(defs_ptr));
+        const consts_ptr: ConstantTable* = _box_consts.leak();
 
         const diag_ptr: DiagnosticSink* = _box_diag.leak();
-        const diag_config_ptr: DiagConfig* = _box_diag_config.leak();
+
+        const _box_res: Box<Resolver> = Box::<Resolver>::new(Resolver::new(intern_ptr, defs_ptr, graph_ptr));
+        const resolver_ptr: Resolver* = _box_res.leak();
+        const _box_arena: Box<TypeArena> = Box::<TypeArena>::new(TypeArena::new(intern_ptr, defs_ptr));
+        const arena_ptr: TypeArena* = _box_arena.leak();
+        const _box_greg: Box<GenericRegistry> = Box::<GenericRegistry>::new(GenericRegistry::new(arena_ptr, decl_ptr));
+        const greg_ptr: GenericRegistry* = _box_greg.leak();
+        const _box_tr: Box<TypeResolver> = Box::<TypeResolver>::new(TypeResolver::new(
+            arena_ptr, intern_ptr, greg_ptr, resolver_ptr, decl_ptr, consts_ptr, graph_ptr));
+        const type_resolver_ptr: TypeResolver* = _box_tr.leak();
+        type_resolver_ptr.set_diagnostics(diag_ptr);
 
         mut ctx: CompilationContext = CompilationContext {
-            mode:              mode,
+            options:           options,
             source_file:       source_file,
-            include_paths:     [],
-            debug_mode:        false,
-            opt_level:         2,
-            emit_debug_info:   false,
-            di_builder:        null,
-            di_cu:             null,
-            di_file:           null,
-            namespace_str:     SymbolStr::empty(),
+            entry_file:        source_file,
+            entry_fn:          DefId::invalid(),
+            unit_module:       ModulePath::none(),
 
             artifacts:     _box_artifacts.leak(),
             diagnostics:   diag_ptr,
             diag_renderer: renderer,
-            diag_config:   diag_config_ptr,
             provisions:    ProvisionSet::empty(),
-            module_graph:  _box_module_graph.leak(),
-            intern_table:  _box_intern.leak(),
-            decl_index:    _box_decl.leak(),
-            const_table:   _box_consts.leak(),
-            injected_ast_ptrs:    [],
-            injected_ast_modules: [],
+            module_graph:  graph_ptr,
+            intern_table:  intern_ptr,
+            defs:          defs_ptr,
+            decl_index:    decl_ptr,
+            const_table:   consts_ptr,
+            injected_origins:     [],
+            lang_refs:            [],
+            alias_decls:          [],
+            alias_paths:          [],
+            c_refs:               [],
             inactive_spans:       [],
-            type_arena:    null,
+            type_arena:    arena_ptr,
 
-            project_config:      null,
-            project_no_std:      false,
-            project_no_runtime:  false,
-            project_panic_unwind: false,
-            native_alloc:        false,
+            project_config:      project_config,
             active_module_index: -1,
-            stdlib_root:         "",
-            target_triple:       "",
-            release_static:      false,
-            output_path_override: "",
-            output_kind:         OutputKind::None,
+            active_order_position: -1,
 
-            lsp_override_path:    "",
-            lsp_override_content: "",
-
-            resolver:             null,
-            type_resolver:        null,
-            type_checker:         null,
-            generic_registry:     null,
+            resolver:             resolver_ptr,
+            type_resolver:        type_resolver_ptr,
+            generic_registry:     greg_ptr,
             monomorphizer:        null,
-            module_type_registry: null,
-            module_loader:        null,
-            codegen:              null,
-            linker:               null,
             directive_registry:   null,
         };
 
-        // Wire the renderer and config into the sink
         diag_ptr.set_renderer(renderer);
-        // The config box was leaked above, so nothing else will ever drop it;
-        // the sink's copy is the only owner.
-        unsafe { diag_ptr.set_config(*diag_config_ptr); }
+        diag_ptr.set_config(DiagConfig::default());
         return ctx;
     }
-
-    /// Create a debug context with verbose logging.
-    static debug(mode: CompileMode, source_file: string) -> CompilationContext {
-        mut ctx_val: CompilationContext = CompilationContext::new(mode, source_file);
-        ctx_val.debug_mode = true;
-        return ctx_val;
-    }
-
 
     // String interning convenience
 
@@ -315,238 +417,328 @@ public:
     }
 
     /// Get a pointer to the intern table.
-    /// Use this instead of ctx.intern_table when accessing through an
-    /// inherited pointer (e.g. this.ctx in parser subclasses), where field
-    /// access through class hierarchies doesn't resolve correctly.
     get_intern_table(mut &this) -> InternTable* {
         return this.intern_table;
     }
 
     get_resolver(mut &this) -> Resolver* {
-        if (this.resolver == null) {
-            this.init_resolver();
-        }
         return this.resolver;
     }
 
-    /// Returns the GenericRegistry if initialized; otherwise null.
-    /// Does NOT initialize on demand; callers that need it in later passes
-    /// should rely on init_type_system() having already been called.
     get_generic_registry(&this) -> GenericRegistry* {
         return this.generic_registry;
     }
 
+    note_lang_ref(mut &this, node: ASTNode*, item: LangItem) -> void {
+        this.lang_refs.push(LangRef { node: node, item: item });
+    }
+
+    note_alias_decl(mut &this, node: ASTNode*) -> void {
+        this.alias_decls.push(AstRef { node: node });
+    }
+
+    note_alias_path(mut &this, node: ASTNode*) -> void {
+        this.alias_paths.push(AstRef { node: node });
+    }
+
     /// Record that an injected AST node came from a specific template module.
-    register_injected_origin(mut &this, node_ptr: u64, module: SymbolStr) -> void {
-        this.injected_ast_ptrs.push(node_ptr);
-        this.injected_ast_modules.push(module.id);
+    register_injected_origin(mut &this, node: ASTNode*, template_module: ModulePath) -> void {
+        this.injected_origins.push(InjectedOrigin { node: node, module: template_module });
     }
 
     /// Look up the template module for an injected AST node.
-    /// Returns empty SymbolStr if the node wasn't injected.
-    lookup_injected_origin(&this, node_ptr: u64) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.injected_ast_ptrs.length; i++) {
-            if (this.injected_ast_ptrs[i] == node_ptr) {
-                return SymbolStr::from_id(this.injected_ast_modules[i]);
+    /// Returns no module if the node wasn't injected.
+    lookup_injected_origin(&this, node: ASTNode*) -> ModulePath {
+        for (mut i: i64 = 0; i < this.injected_origins.length; i++) {
+            if (this.injected_origins[i].node == node) {
+                return this.injected_origins[i].module;
             }
         }
-        return SymbolStr::empty();
+        return ModulePath::none();
     }
 
 
     // Namespace helpers
 
-    /// Whether a namespace has been set for this compilation unit.
+    /// Whether the unit being compiled declares a module.
     has_namespace(&this) -> boolean {
-        return !this.namespace_str.is_empty();
+        return this.unit_module.is_valid();
     }
 
-    /// Set the namespace for this compilation unit from a dotted/scoped string.
-    set_namespace(mut &this, ns: string) -> void {
-        this.namespace_str = this.intern_table.intern(ns);
-    }
-
-    /// The namespace as a display string (for APIs that need strings).
+    /// The unit's module path as text, for display.
     namespace_display(&this) -> string {
-        return this.intern_table.resolve(this.namespace_str);
+        return this.intern_table.shown(this.unit_module.decl_name());
     }
 
-    /// The use-site module identity (a namespace SymbolStr) for import-scoped
-    /// name resolution: the declared namespace when set (the multi-module
-    /// norm), else the source file interned (single-file mode).  This is the
-    /// identity space shared by qualified type names and ModuleInfo dependencies.
-    current_module_ns(&this) -> SymbolStr {
-        if (this.has_namespace()) { return this.namespace_str; }
-        return this.intern_table.intern(this.source_file);
+    /// Which modules a spelling names, as one file can see them: the module
+    /// graph's answer (`ModuleGraph::modules_written_as`), the one relation
+    /// a scope segment, a segment's prefix and the type layer's account of
+    /// a qualified annotation that named nothing all ask.
+    modules_written_as(&this, spelling: string,
+                       use_module: ModulePath, root: ModulePath) -> ModuleSpellingMatch {
+        if (this.module_graph == null) {
+            return ModuleSpellingMatch {
+                found:   ModulePath::none(),
+                found_def: DefId::invalid(),
+                other:   ModulePath::none(),
+                any:     ModulePath::none(),
+                visible: 0,
+                matched: 0,
+            };
+        }
+        return this.module_graph.modules_written_as(spelling, use_module, root, this.intern_table);
     }
 
-    /// Import-scoped resolution of a bare leaf from the module currently being
-    /// processed.  Import-aware, unlike a context-free lookup;
-    /// see DeclarationIndex::resolve_qualified_scoped.
-    resolve_scoped(&this, bare: SymbolStr) -> ScopeResolution {
-        return this.decl_index.resolve_qualified_scoped(
-            bare, this.current_module_ns(), this.intern_table);
-    }
-
-    /// `resolve_scoped(bare).resolved_or(bare)` - for use at non-authoritative
-    /// call sites (e.g. codegen, which receives already-qualified names).
-    /// Authoritative sites call `resolve_scoped` and diagnose `Ambiguous`
-    /// themselves.
-    resolve_scoped_or(&this, bare: SymbolStr) -> SymbolStr {
-        return this.resolve_scoped(bare).resolved_or(bare);
-    }
-
-    /// True when `bare` resolves to two or more import-visible same-leaf
-    /// candidates from the current module - a hard ambiguity the caller must
-    /// diagnose (E0154) and the author must qualify.  False for the common
-    /// unique/local/miss cases.
-    scope_is_ambiguous(&this, bare: SymbolStr) -> boolean {
-        return this.resolve_scoped(bare).is_ambiguous();
-    }
-
-    /// Temporarily override the active namespace (e.g., for scope switching in sema).
-    /// Returns the previous value so it can be restored.
-    swap_namespace(mut &this, new_ns: SymbolStr) -> SymbolStr {
-        const old: SymbolStr = this.namespace_str;
-        this.namespace_str = new_ns;
+    /// Stand in module `m` (sema, walking a specialization placed from
+    /// another module).  Returns the module replaced, to restore.
+    swap_unit_module(mut &this, m: ModulePath) -> ModulePath {
+        const old: ModulePath = this.unit_module;
+        this.unit_module = m;
         return old;
     }
 
-    /// Build a qualified display string: "Namespace::leaf" or just "leaf".
-    qualify_name(&this, leaf: string) -> string {
-        if (this.namespace_str.is_empty()) {
-            return leaf;
-        }
-        const ns: string = this.intern_table.resolve(this.namespace_str);
-        return ns + "::" + leaf;
-    }
-
-    /// Resolve an interned symbol and qualify it in one step.
-    /// Combines resolve_str() + qualify_name(); the most common pattern in passes.
-    qualify_symbol(&this, sym: SymbolStr) -> string {
-        return this.qualify_name(this.intern_table.resolve(sym));
-    }
-
-    /// Like qualify_symbol() but returns an interned SymbolStr instead of a raw string.
-    /// Use this when the result feeds into the type system (arena, registries).
-    /// Returns "Namespace::name" for types within a namespace, or bare name if
-    /// no namespace is set.
+    /// Prepend the AMBIENT namespace to a bare leaf, interned.  Use this when
+    /// the result feeds the type system (arena, registries).  Returns the leaf
+    /// unchanged when no namespace is set.
+    ///
+    /// An ALREADY-QUALIFIED name is returned unchanged, so this is idempotent.
+    /// Prepending to one mints `<ns>::<a::b::C>`, and nothing in the program
+    /// registers a doubled key, so that form can only miss - which makes
+    /// declining to build it the answer rather than a special case.  Deciding
+    /// it HERE, at the one place the qualifier is applied, is what stops each
+    /// caller needing to know which form it holds.
+    ///
+    /// The separator test is `QualifiedName::segment_count`, the same
+    /// predicate the declaration key is derived with, so the two cannot come
+    /// to disagree about what "already qualified" means.
     qualify_symbol_sym(mut &this, sym: SymbolStr) -> SymbolStr {
-        if (this.namespace_str.is_empty()) {
+        if (QualifiedName::segment_count(this.intern_table.resolve(sym)) > 1) {
             return sym;
         }
-        const ns: string = this.intern_table.resolve(this.namespace_str);
-        const bare: string = this.intern_table.resolve(sym);
-        return this.intern_table.intern(ns + "::" + bare);
-    }
-
-    /// Qualify `sym` under an extern-module binding namespace when
-    /// `binding_namespace` is set, otherwise under the file's ambient
-    /// namespace (`qualify_symbol_sym`).  Used for the struct/enum/typedef
-    /// declarations the C-header import engine synthesizes into an extern
-    /// module's *alias* namespace: a synthesized `LLVMModuleRef` whose
-    /// `binding_namespace` is `llvm` qualifies as `llvm::LLVMModuleRef`,
-    /// exactly as extern functions register under `alias::name`
-    /// (`type_resolution.cryo` ExternBlock branch).  This is deliberately a
-    /// SEPARATE channel from `DeclarationNode.source_module` (which the
-    /// monomorphizer already uses to stamp a spec's template namespace) so
-    /// C-import qualification can never perturb spec registration.
-    qualify_binding_sym(mut &this, sym: SymbolStr, binding_namespace: SymbolStr) -> SymbolStr {
-        if (binding_namespace.is_empty()) {
-            return this.qualify_symbol_sym(sym);
+        if (!this.unit_module.is_valid()) {
+            return sym;
         }
-        const ns: string = this.intern_table.resolve(binding_namespace);
-        const bare: string = this.intern_table.resolve(sym);
-        return this.intern_table.intern(ns + "::" + bare);
+        return this.unit_module.qualified(sym, this.intern_table);
     }
 
-    /// Build a structured QualifiedName: namespace + leaf.
-    qualify(&this, leaf: string) -> QualifiedName {
-        if (this.namespace_str.is_empty()) {
-            return QualifiedName::single(this.intern_table, leaf);
+    /// The qualifier the span's OWN module would mint - the module that WROTE
+    /// the name, not the one the compiler is standing in.
+    ///
+    /// A bare leaf means what it means in the module whose source text
+    /// contains it.  The ambient cursor answers that correctly only while a
+    /// pass walks a module's own declarations in order; a trait default's body
+    /// and a specialized clone are both re-typed with the cursor parked on
+    /// another module, and a name qualified there names nothing.
+    ///
+    /// Falls back to the cursor when the file names no module in the graph
+    /// (a synthesized node, single-file mode) rather than to "no namespace":
+    /// an invalid namespace compares unequal to every real one, so treating
+    /// missing provenance as a distinct module would read "I cannot tell where
+    /// this was written" as "this was written somewhere else".
+    qualify_symbol_sym_home(mut &this, sym: SymbolStr,
+                            span_file: string) -> SymbolStr {
+        // An ALREADY-QUALIFIED name is returned unchanged, as `qualify_symbol_sym`
+        // returns it: a synthesized declaration (a closure struct, a
+        // specialization placed by name) carries the key it was registered
+        // with, and prefixing a module to it mints a doubled key nothing holds.
+        if (QualifiedName::segment_count(this.intern_table.resolve(sym)) > 1) {
+            return sym;
         }
-        // Build from the interned namespace string to avoid QualifiedName method chaining
-        const full: string = this.intern_table.resolve(this.namespace_str) + "::" + leaf;
-        return QualifiedName::parse(this.intern_table, full);
+        const home: ModulePath = this.module_of_file(span_file);
+        if (!home.is_valid()) { return this.qualify_symbol_sym(sym); }
+        return home.qualified(sym, this.intern_table);
     }
 
-
-    // Lazy component initialization
-    // TODO:
-    // Remove later when all components are fully typed and can be initialized in the constructor
-
-    /// Initialize the type system components (TypeArena, TypeChecker, TypeResolver).
-    /// Called by the TypeDeclaration pass.
-    init_type_system(mut &this) -> void {
-        LOG_DEBUG(LogComponent::General, "[CompilationContext] init_type_system()");
-        // Ensure resolver is initialized (symbols live there now)
-        this.init_resolver();
-
-        // Create the TypeArena if it doesn't exist yet
-        if (this.type_arena == null) {
-            const _box_arena: Box<TypeArena> = Box<TypeArena>::new(TypeArena::new(this.intern_table));
-            this.type_arena = _box_arena.leak();
+    /// The key a TYPE DECLARATION is registered under, from what the node
+    /// carries: a C-imported one lives in its alias's module
+    /// (`<mod>::cit::Vec2`, the canonical name); any other is its registered
+    /// name when it was minted qualified (a closure struct, a placed
+    /// specialization), else the module of the file that WROTE it prefixed
+    /// to its leaf.  A reader standing in some other module - a pass
+    /// walking a root that holds injected clones - gets the same key the
+    /// registration used, which the ambient cursor cannot give it.
+    decl_type_key(mut &this, name: SymbolStr, binding_namespace: ModulePath,
+                  span_file: string) -> SymbolStr {
+        if (binding_namespace.is_valid()) {
+            return this.qualify_binding_sym(name, binding_namespace);
         }
+        return this.qualify_symbol_sym_home(name, span_file);
+    }
 
-        // Create the GenericRegistry early so that the TypeResolver can route
-        // generic instantiations through the dedup cache from the very first
-        // pass that resolves type annotations (FunctionSignature).
-        if (this.generic_registry == null) {
-            const _box_greg: Box<GenericRegistry> = Box<GenericRegistry>::new(GenericRegistry::new(this.type_arena));
-            this.generic_registry = _box_greg.leak();
+    /// The key a FUNCTION DECLARATION is registered under: its name under
+    /// the module of the file that WROTE it.  A specialization's clone
+    /// carries the template's span, so its key is the template module's
+    /// whichever module the clone is placed in - which is what lets the
+    /// definition and every caller's cross-module extern name one symbol
+    /// without the clone carrying its module a second way.  The registration,
+    /// the emitted definition's symbol and every reader that walks a root for
+    /// a declaration derive the key here, so they cannot disagree.
+    /// Register a declaration the compiler synthesizes - an async future, a
+    /// closure's struct, the body an `async main` is renamed to - under
+    /// module `m` (invalid parent for no module).  The synthesizer creates
+    /// the declaration, so this is its one registration, and every
+    /// reference it builds copies the id.  Its origin is recorded as
+    /// generated, so its path cannot be one the program wrote.
+    register_in_module(mut &this, m: ModulePath, leaf: SymbolStr, kind: DefKind,
+                       span: SourceSpan) -> DefId {
+        return this.defs.register_generated(this.module_def_of(m), leaf, kind, span);
+    }
+
+    /// Register the method `decl` as a definition whose parent is `owner` -
+    /// the type it is declared on, or the trait declaring it - under `leaf`,
+    /// the name it is declared as, and keep `decl` under the id
+    /// (`DeclarationIndex::method_decl_of`).  Called by the registrar
+    /// holding the declaration: the name layer for a written method, a
+    /// lowering for a method it generates.  A copy of a method - a trait
+    /// default placed in an implementation, a monomorphized clone - is not
+    /// registered.
+    define_method(mut &this, owner: DefId, leaf: SymbolStr, span: SourceSpan,
+                  decl: ASTNode*) -> DefId {
+        const d: DefId = this.defs.register(owner, leaf, DefKind::Method, span);
+        this.decl_index.keep_method_decl(d, decl);
+        return d;
+    }
+
+    /// The definition of module `m`; invalid for no module.
+    module_def_of(&this, m: ModulePath) -> DefId {
+        if (!m.is_valid() || this.module_graph == null) { return DefId::invalid(); }
+        return this.module_graph.module_def(m);
+    }
+
+    /// The module the source file `file` declares; none for a file the
+    /// graph did not load.
+    module_of_file(&this, file: string) -> ModulePath {
+        if (this.module_graph == null) { return ModulePath::none(); }
+        return this.module_graph.module_of_file(file);
+    }
+
+    /// The module this unit's source file declares: what a declaration the
+    /// unit registers - or a synthesizer mints while lowering it - is
+    /// declared in.  None for a unit the graph did not load.
+    current_module(&this) -> ModulePath {
+        return this.module_of_file(this.source_file);
+    }
+
+    /// The module the definition `d` is declared in; none for a definition
+    /// no module the graph holds encloses.
+    declaring_module(&this, d: DefId) -> ModulePath {
+        if (this.module_graph == null) { return ModulePath::none(); }
+        return this.module_graph.declaring_module(d);
+    }
+
+    /// The module the definition `d` IS; none when `d` is not a module.
+    module_of_def(&this, d: DefId) -> ModulePath {
+        if (this.module_graph == null) { return ModulePath::none(); }
+        return this.module_graph.module_of_def(d);
+    }
+
+    /// The global the definition `d` is, from its registration slot, or an
+    /// entry that is not `valid` when `d` names none or is not a global.
+    global_entry_of_def(&this, d: DefId) -> GlobalEntry {
+        return this.decl_index.global_entry_of_def(d);
+    }
+
+    decl_fn_key(mut &this, name: SymbolStr, span_file: string) -> SymbolStr {
+        return this.qualify_symbol_sym_home(name, span_file);
+    }
+
+    /// The overload family owner a function declaration `def` is registered
+    /// under: the definition that encloses it, its module.  The family's
+    /// leaf is the name the declaration is written with.
+    fn_family_of(&this, def: DefId) -> FamilyOwner {
+        return FamilyOwner::Def(this.defs.parent_of(def));
+    }
+
+    /// The module a copy of the definition `copy_of` mangles its symbol
+    /// under: the module that declares what it copies.
+    copy_module_family(&this, copy_of: DefId) -> FamilyOwner {
+        return this.module_family(this.declaring_module(copy_of));
+    }
+
+    /// The template the member `leaf` of `container` is - a generic static
+    /// method on a type, a generic function in a module - read off the
+    /// member-function door's family for that owner: the one entry whose
+    /// definition is a template.  Null when none is, or when several are,
+    /// which only a call's arguments tell apart.  A primitive or a type
+    /// parameter holds no template.
+    member_template(&this, container: ResBase, leaf: SymbolStr) -> TemplateEntry* {
+        const owner: DefId = match (container) {
+            ResBase::Def(d) => { d }
+            _               => { DefId::invalid() }
+        };
+        if (!owner.is_valid() || !leaf.is_valid()) { return null; }
+        const entries: OverloadId[] = this.decl_index.lookup_family_entries(FamilyOwner::Def(owner), leaf);
+        mut found: TemplateEntry* = null;
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const decl: ASTNode* = this.decl_index.entry_decl(entries[i]);
+            if (decl == null) { continue; }
+            mut def: DefId = DefId::invalid();
+            if (decl.kind == NodeKind::MethodDeclaration && (decl as MethodNode*).func != null) {
+                def = (decl as MethodNode*).func.def;
+            } else if (decl.kind == NodeKind::FunctionDeclaration) {
+                def = (decl as FunctionDeclNode*).def;
+            }
+            const t: TemplateEntry* = this.generic_registry.template_of(def);
+            if (t == null || t == found) { continue; }
+            if (found != null) { return null; }
+            found = t;
         }
+        return found;
+    }
 
-        // Create the ModuleTypeRegistry if it doesn't exist yet
-        if (this.module_type_registry == null) {
-            const _box_mtr: Box<ModuleTypeRegistry> = Box<ModuleTypeRegistry>::new(ModuleTypeRegistry::new());
-            this.module_type_registry = _box_mtr.leak();
+    /// The family owner module `m` is: the module's definition, and the
+    /// root for no module.
+    module_family(&this, m: ModulePath) -> FamilyOwner {
+        return FamilyOwner::Def(this.module_def_of(m));
+    }
+
+    /// The `(key, namespace)` a GLOBAL is registered under in the declaration
+    /// index, from what the node carries: its bare leaf under its module's
+    /// namespace - the alias module's for a C-imported one (`FLAG_A` under
+    /// `<mod>::cit`, the namespace the alias's stamp names), the writing
+    /// module's for any other.  Every attribute the index records per
+    /// registration - the type, the thread-local flag, the linker symbol - is
+    /// asked by this pair, so a directive applied after registration and a
+    /// reader standing in another module reach the slot the registration
+    /// wrote, and a same-leaf global of some other module cannot answer for
+    /// it.
+    ///
+    /// Falls back to the cursor when the file names no module in the graph
+    /// (single-file mode), as the type declaration key does and for the same
+    /// reason: an invalid namespace compares unequal to every real one.
+    decl_global_key(mut &this, name: SymbolStr, binding_namespace: ModulePath,
+                    span_file: string, out_module: ModulePath*) -> SymbolStr {
+        if (binding_namespace.is_valid()) {
+            *out_module = binding_namespace;
+            return name;
         }
-
-        // Create the TypeResolver with all required dependencies.
-        // The Resolver (name_resolver) is initialized by the NameResolution pass
-        // which runs before TypeDeclaration, so it should be available here.
-        if (this.type_resolver == null) {
-            const _box_tr: Box<TypeResolver> = Box<TypeResolver>::new(TypeResolver::new(
-                this.type_arena,
-                this.intern_table,
-                this.generic_registry,
-                this.module_type_registry,
-                this.resolver,
-                this.decl_index,
-                this.const_table
-            ));
-            this.type_resolver = _box_tr.leak();
-            this.type_resolver.set_diagnostics(this.diagnostics);
-        }
+        const home: ModulePath = this.module_of_file(span_file);
+        *out_module = if (home.is_valid()) { home } else { this.unit_module };
+        return name;
     }
 
-    /// Initialize the Resolver for name resolution.
-    /// Called by the NameResolution pass.
-    init_resolver(mut &this) -> void {
-        LOG_DEBUG(LogComponent::General, "[CompilationContext] init_resolver()");
-        if (this.resolver == null) {
-            const _box_res: Box<Resolver> = Box<Resolver>::new(Resolver::new(this.intern_table));
-            this.resolver = _box_res.leak();
-        }
+    /// Qualify `sym` under an extern-module alias's canonical namespace.
+    /// Used for the struct/enum/typedef declarations the C-header import
+    /// engine synthesizes into an extern module's alias: a synthesized
+    /// `LLVMModuleRef` whose `binding_namespace` is `<mod>::llvm` qualifies
+    /// as `<mod>::llvm::LLVMModuleRef`, exactly as the block's functions
+    /// register (`type_resolution.cryo` ExternBlock branch).  Every caller
+    /// tests the namespace first; a declaration without one is keyed by
+    /// `decl_type_key` / `decl_global_key`.
+    qualify_binding_sym(mut &this, sym: SymbolStr, binding_namespace: ModulePath) -> SymbolStr {
+        return binding_namespace.qualified(sym, this.intern_table);
     }
 
-    /// Initialize the module loader for import resolution.
-    /// Called by the ImportResolution pass.
-    init_module_loader(mut &this) -> void {
-        // Will create ModuleLoader with include_paths when defined.
+    /// Install the scope walk's outermost tier, the prelude modules.  Called
+    /// by each name-resolving pass on entry, after discovery has derived the
+    /// prelude set.  Re-stated on every call rather than once: the resolver
+    /// outlives a single pass, and a tier that is only correct when
+    /// installation happened to precede the first lookup is a tier nobody
+    /// can reason about.
+    install_prelude_modules(mut &this) -> void {
+        this.resolver.set_prelude_modules(this.decl_index.prelude_namespaces());
     }
 
-    /// Initialize the code generation backend.
-    /// Called by the TypeLowering pass.
-    init_codegen(mut &this) -> void {
-        // Will create LLVM context and module when @cImport is available.
-    }
-
-    /// Initialize the directive registry.
-    /// Called by the DirectiveProcessing pass.
-    init_directives(mut &this) -> void {
-        // Will create DirectiveRegistry when defined.
-    }
 
     /// Record a source span that ConfigGating stripped as inactive for the
     /// target OS (a decl / method / inline block gated to another platform).
@@ -567,10 +759,6 @@ public:
         this.diagnostics.emit(Diagnostic::error(code, message));
     }
 
-    /// Emit a warning diagnostic.
-    emit_warning(mut &this, code: ErrorCode, message: string) -> void {
-        this.diagnostics.emit(Diagnostic::warning(code, message));
-    }
 
     /// Emit an error with source location.
     emit_error_at(mut &this, code: ErrorCode, message: string, span: SourceSpan) -> void {
@@ -589,10 +777,6 @@ public:
         this.diagnostics.emit(diag);
     }
 
-    /// Emit a note diagnostic.
-    emit_note(mut &this, code: ErrorCode, message: string) -> void {
-        this.diagnostics.emit(Diagnostic::note(code, message));
-    }
 
     /// Emit a help message (code E0000, severity Help).
     emit_help(mut &this, message: string) -> void {
@@ -610,7 +794,7 @@ public:
 
     /// Internal compiler error: emit, print help, and abort.
     ice(mut &this, message: string) -> void {
-        const ice_msg: string = format("internal compiler error: %s", message);
+        const ice_msg: string = fmt::format("internal compiler error: %s", message);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR, ice_msg);
         diag = diag.help("please report this bug");
         this.diagnostics.emit(diag);
@@ -621,43 +805,15 @@ public:
         env::process_exit(1);
     }
 
-    /// Whether any errors have been emitted.
-    has_errors(&this) -> boolean {
-        return this.diagnostics.has_errors();
-    }
-
-
-    // Provision tracking
-
-    /// Check whether a provision has been satisfied.
-    /// Provisions are marked exclusively by PassRegistry::run_all() using
-    /// metadata from PassID::metadata(); this is a read-only query.
-    has_provided(&this, p: Provision) -> boolean {
-        return this.provisions.has(p);
-    }
-
-
-    // Module-level reset (stdlib batch mode)
-
-    /// Reset per-module state for the next module in a batch compilation.
-    /// Checks mode.preserve_asts() to decide whether to save the current AST.
-    reset_for_next_module(mut &this, next_source: string) -> void {
-        LOG_DEBUG(LogComponent::General, "[CompilationContext] reset_for_next_module() next='%s'", next_source);
-        // Preserve ASTs if the mode requires it (StdlibBatch)
-        if (this.mode.preserve_asts()) {
-            this.artifacts.preserve_current_ast();
-        }
-
-        // Reset per-module data
-        this.artifacts.reset_for_next_module();
-        this.provisions.clear();
-        this.source_file = next_source;
-        this.namespace_str = SymbolStr::empty();
-
-        // Reset resolver cursor (preserves cross-module state)
-        if (this.resolver != null) {
-            this.resolver.reset_for_next_module();
-        }
+    /// Internal compiler error at a place in the source, reported like any
+    /// other error so the ones a program has are reported together; the
+    /// compilation stops before anything is built from the tree.
+    ice_at(mut &this, message: string, span: SourceSpan) -> void {
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            fmt::format("internal compiler error: %s", message));
+        diag = diag.at(span);
+        diag = diag.help("please report this bug");
+        this.diagnostics.emit(diag);
     }
 
 
@@ -668,12 +824,19 @@ public:
     /// Used by the whole-program multi-pass orchestrator.
     switch_to_module(mut &this, index: i64) -> void {
         if (index < 0 || index >= this.module_graph.module_count() as i64) {
-            this.ice(format("switch_to_module: index %lld out of range (have %u modules)",
+            this.ice(fmt::format("switch_to_module: index %lld out of range (have %u modules)",
                 index, this.module_graph.module_count()));
             return;
         }
 
         this.active_module_index = index;
+        this.active_order_position = -1;
+        for (mut p: i64 = 0; p < this.module_graph.topo_order.length; p++) {
+            if (this.module_graph.topo_order[p] as i64 == index) {
+                this.active_order_position = p;
+                break;
+            }
+        }
         // Borrow the stored ModuleInfo; a value copy would shallow-alias its
         // owning arrays (dependencies/exports/...) and double-free them when
         // the copy drops at scope exit.
@@ -681,12 +844,7 @@ public:
         this.source_file = info.file_path;
 
         // Set namespace from module info
-        const ns_str: string = this.intern_table.resolve(info.namespace_name);
-        if (ns_str.length() > 0) {
-            this.namespace_str = info.namespace_name;
-        } else {
-            this.namespace_str = SymbolStr::empty();
-        }
+        this.unit_module = if (info.declares_namespace()) { info.path() } else { ModulePath::none() };
 
         // NOTE: AST swap is handled by the orchestrator (compile_project) because
         // nested struct assignment (this.artifacts.ast = ...) through mut &this
@@ -694,59 +852,48 @@ public:
         // calls set_active_ast() separately after switch_to_module().
 
         // Update resolver's active module (scope restore handled by orchestrator)
-        if (this.resolver != null) {
-            this.resolver.set_module(info.name);
-        }
+        this.resolver.set_module(info.path());
 
-        if (this.debug_mode) {
+        if (this.options.verbose) {
             LOG_DEBUG(LogComponent::General,
                 "[CompilationContext] switch_to_module(%lld) -> '%s' ns='%s'",
-                index, info.file_path, ns_str);
+                index, info.file_path, this.intern_table.shown(info.namespace_path().decl_name()));
         }
     }
+}
 
-    /// Save the resolver's current scope for the active module.
-    /// Call this after NameResolution completes for each module.
-    save_module_scope(mut &this) -> void {
-        if (this.active_module_index >= 0 && this.resolver != null) {
-            const scope_id: u64 = this.resolver.get_current_scope_id();
-            this.module_graph.save_module_scope(this.active_module_index as u32, scope_id);
+/// Releases what a compilation owns, users before what they use.  Each
+/// component was made as a leaked `Box` (by `new`, or by the stage that first
+/// needed it) for the stable address the others point at, and the project
+/// config is handed to `new`; each is reclaimed here as one.
+///
+/// Every `string` resolved from the intern table dangles afterwards: a caller
+/// copies what must outlive the context first.  Allocations made while the
+/// per-target arena was active are freed as no-ops, so the context must drop
+/// while that arena is still published.  The language server never drops
+/// one: its contexts live in a session arena, released whole.
+implement trait Drop for struct CompilationContext {
+    drop(mut &this) -> void {
+        if (this.monomorphizer != null) {
+            mem::drop(Box::<Monomorphizer>::from_raw(this.monomorphizer));
         }
-    }
-
-    /// Set up the project configuration for multi-module compilation.
-    set_project_config(mut &this, config: ProjectConfig*) -> void {
-        this.project_config = config;
-        if (config != null) {
-            this.project_no_std = config.no_std;
-            this.project_no_runtime = config.no_runtime;
-            this.project_panic_unwind = config.resolve_panic_unwind();
-            this.native_alloc = config.native_alloc;
+        if (this.directive_registry != null) {
+            delete this.directive_registry;
         }
-    }
-
-
-    // Per-target teardown
-
-    /// Reclaim heap owned by this context once the build's survivor strings
-    /// (the returned `CompilationResult`) have been copied out to storage
-    /// independent of the context.  After this call the context is DEAD and
-    /// must never be used again.
-    ///
-    /// A `cryo build` compiles each target (`[lib]`, then each `[[bin]]`)
-    /// with its own context in a single process.  Without this teardown a
-    /// completed target's heap stays resident while the next target builds,
-    /// so a multi-target build's peak RSS stacks both targets instead of
-    /// peaking at the larger one.  Reclaiming the prior context here caps
-    /// the peak near a single target.
-    ///
-    /// NOT called on the LSP path: the language server keeps its context
-    /// alive across requests and reaches this struct directly via
-    /// `compile_project_with_ctx`, never through
-    /// `compile_project_with_config` where this teardown is invoked.
-    release_per_target(mut &this) -> void {
-        if (this.intern_table != null) {
-            this.intern_table.release_strings();
+        mem::drop(Box::<TypeResolver>::from_raw(this.type_resolver));
+        mem::drop(Box::<GenericRegistry>::from_raw(this.generic_registry));
+        mem::drop(Box::<TypeArena>::from_raw(this.type_arena));
+        mem::drop(Box::<Resolver>::from_raw(this.resolver));
+        mem::drop(Box::<ConstantTable>::from_raw(this.const_table));
+        mem::drop(Box::<DeclarationIndex>::from_raw(this.decl_index));
+        mem::drop(Box::<ModuleGraph>::from_raw(this.module_graph));
+        mem::drop(Box::<DefTable>::from_raw(this.defs));
+        mem::drop(Box::<DiagnosticSink>::from_raw(this.diagnostics));
+        mem::drop(Box::<DiagRenderer>::from_raw(this.diag_renderer));
+        mem::drop(Box::<PhaseArtifacts>::from_raw(this.artifacts));
+        if (this.project_config != null) {
+            mem::drop(Box::<ProjectConfig>::from_raw(this.project_config));
         }
+        mem::drop(Box::<InternTable>::from_raw(this.intern_table));
     }
 }

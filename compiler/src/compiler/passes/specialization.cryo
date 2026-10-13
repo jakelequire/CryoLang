@@ -15,129 +15,89 @@
 ///      every InstantiatedType has a resolved concrete type.  Catches
 ///      missed monomorphizations before they reach codegen or type lowering.
 
-namespace Compiler::Passes::Specialization;
+namespace compiler::passes::specialization;
 
-import Compiler::Diag;
-import Compiler::Diag::Snapshot;
-import Compiler::DeclIndex;
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration };
-import Compiler::Passes::{ PassID, TypeResolution };
-import Compiler::CompilationContext;
-import Compiler::ModuleGraph;
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Arena, Type, UserDefined, Generic, Compound, GenericRegistry };
-import Compiler::Mono::{ Monomorphizer, State };
-import Compiler::Resolver::{ InternTable, SymbolStr };
-import Utils::Logger;
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
+import compiler::diag::snapshot;
+import compiler::diag::snapshot::{ DiagnosticSnapshot };
+import compiler::decl_index;
+import compiler::ast;
+import compiler::ast::{ declaration, node, NodeKind, TypeAnnotation };
+import compiler::passes::{ pass_id, type_resolution };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
+import compiler::types;
+import compiler::types::{
+    arena, compound, generic, generic_registry, type_base, type_ref, TypeKind,
+    user_defined
+};
+import compiler::mono::{ monomorphizer, state };
+import compiler::resolver::{ intern_table, res, symbol_str };
+import utils::logger;
+import utils::logger::{ LOG_DEBUG, LogComponent };
+import std::fmt;
+import compiler::ast::declaration::{
+    ClassDeclNode, DeclarationNode, EnumDeclNode, FunctionDeclNode, GenericParamNode,
+    ImplBlockNode, MethodNode, StructDeclNode, TraitDeclNode, TypeAliasDeclNode,
+    UnionDeclNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::mono::monomorphizer::{ Monomorphizer };
+import compiler::mono::state::{ SpecializationEntry };
+import compiler::passes::pass_id::{ PassResult };
+import compiler::passes::type_resolution::{ TypeResolutionPasses };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
 
 
-/// Register a specialized type declaration using the arena type's actual
-/// qualified name for method keys.  Uses the SpecializationEntry's
-/// specialized_name as the key instead of ctx.qualify_symbol_sym to prevent
-/// cross-module specs with the same bare name from overwriting each other.
-/// This is wrapped as a static method (not a free function) to dodge a
-/// codegen issue with parameter visibility inside free functions.
+/// The declaration-index side of placing a specialization.  A NAMED
+/// specialization - a struct, union, class or enum clone with an arena type -
+/// was registered by the monomorphizer when its entry was placed: the type,
+/// its bare-name mapping, the methods it carries and its impl blocks', with
+/// the id stamped on the clone.  Nothing is registered for one here.  This
+/// is wrapped as a static method (not a free function) to dodge a codegen
+/// issue with parameter visibility inside free functions.
 type struct SpecInjector {
-    /// Register a specialized type using the arena type's ACTUAL qualified
-    /// name for method keys.  This prevents cross-module specs with the
-    /// same bare name (e.g. BattleTest::Pair_i32 vs Collections::Pair::Pair_i32)
-    /// from overwriting each other's methods in the DI.
-    static register(node: ASTNode*, spec_name: SymbolStr,
-                    spec_type: TypeRef, owner_mod: SymbolStr,
-                    ctx: CompilationContext*) -> void {
+    /// Register a placed specialization that has NO named type - a function
+    /// template's clone - as an ordinary injected declaration.  A named one
+    /// is already in the index and is left alone: a second registration of
+    /// the same declaration is a second writer of every key it holds.
+    static register(node: ASTNode*, spec_type: TypeRef, ctx: CompilationContext*) -> void {
         if (node == null) { return; }
-        // For function declarations, use the standard path (no naming conflict)
-        if (node.kind == NodeKind::FunctionDeclaration) {
-            SpecInjector::register_injected_decl(node, owner_mod, ctx);
-            return;
-        }
-        if (!spec_type.is_valid()) {
-            SpecInjector::register_injected_decl(node, owner_mod, ctx);
-            return;
-        }
-
-        // Get the arena type's actual qualified name (e.g. "Collections::Pair::Pair_i32")
-        // via TypeArena method that safely handles the pointer cast internally.
-        const arena: TypeArena* = ctx.type_arena;
-        const arena_qname: SymbolStr = arena.get_qualified_name(spec_type);
-        if (!arena_qname.is_valid()) {
-            SpecInjector::register_injected_decl(node, owner_mod, ctx);
-            return;
-        }
-
-        // Owner module for DI ownership: the template's defining module for
-        // relocated type specs (so codegen's define-vs-extern decision matches
-        // where the AST is placed), else the demanding module.  Supplied by the
-        // caller; see `register_spec`.
-        const module_sym: SymbolStr = owner_mod;
-        const local_sym: SymbolStr = ctx.qualify_symbol_sym(spec_name);
-
-        // Register type under BOTH local and arena qualified names.
-        // Local name (e.g. "BattleTest::Pair_i32") for same-module lookups.
-        // Arena name (e.g. "Collections::Pair::Pair_i32") for cross-module lookups.
-        // Skip local registration if the DI already has an entry; prevents a
-        // cross-module spec (Collections::Pair_i32) from overwriting a same-
-        // named local spec (BattleTest::Pair_i32) when both are injected into
-        // the same module.
-        const existing: TypeRef = ctx.decl_index.lookup_type(local_sym);
-        if (!existing.is_valid()) {
-            ctx.decl_index.register_type_with_module(local_sym, spec_type, module_sym);
-        }
-        if (!arena_qname.equals(local_sym)) {
-            ctx.decl_index.register_type_with_module(arena_qname, spec_type, module_sym);
-        }
-
-        // Register a bare->qualified name mapping for the spec.  In-body
-        // calls inside a spec'd method get rewritten by ASTTypeSubstituter
-        // to use the bare-form spec name as their scope (e.g. inside
-        // `Array<u8, GlobalAlloc>::with_capacity`'s body, the call
-        // `Array::try_with_capacity_in(...)` is substituted to
-        // `Array_<spec>::try_with_capacity_in(...)`).  Codegen's
-        // ScopeResolution lookup uses `di.resolve_qualified(scope_name)`
-        // to find the qualified form for the combined-key DI lookup,
-        // and methods are registered under the QUALIFIED arena name.
-        // Without this mapping the substituted bare scope passes through
-        // unchanged and the combined-key lookup misses.
-        if (!arena_qname.equals(spec_name)) {
-            ctx.decl_index.register_name_mapping(spec_name, arena_qname);
-        }
-
-        // Methods registered ONLY under the arena qualified name.
-        // This is the key fix: two specs with the same bare name get
-        // different method keys, so they can't overwrite each other.
-        if (node.kind == NodeKind::StructDeclaration) {
-            const sn: StructDeclNode* = node as StructDeclNode*;
-            ctx.decl_index.register_methods_with_module(
-                arena_qname, sn.methods, module_sym, ctx.intern_table, ctx.type_arena);
-        } else if (node.kind == NodeKind::UnionDeclaration) {
-            const un: UnionDeclNode* = node as UnionDeclNode*;
-            ctx.decl_index.register_methods_with_module(
-                arena_qname, un.methods, module_sym, ctx.intern_table, ctx.type_arena);
-        } else if (node.kind == NodeKind::ClassDeclaration) {
-            const cn: ClassDeclNode* = node as ClassDeclNode*;
-            ctx.decl_index.register_methods_with_module(
-                arena_qname, cn.methods, module_sym, ctx.intern_table, ctx.type_arena);
-        } else if (node.kind == NodeKind::EnumDeclaration) {
-            // Enum methods come from implement blocks, not inline.
-            // Type registration above already covers the enum itself.
-        } else {
-            SpecInjector::register_injected_decl(node, owner_mod, ctx);
+        const named: boolean = spec_type.is_valid()
+            && (node.kind == NodeKind::StructDeclaration
+                || node.kind == NodeKind::UnionDeclaration
+                || node.kind == NodeKind::ClassDeclaration
+                || node.kind == NodeKind::EnumDeclaration);
+        if (!named) {
+            SpecInjector::register_injected_decl(node, ctx);
         }
     }
 
     /// Register a newly injected specialized declaration into the DeclarationIndex
     /// so that sema can look it up without rescanning the AST.
     /// Delegates to the shared TypeResolutionPasses::register_decl_in_index().
-    static register_injected_decl(stmt: ASTNode*, owner_mod: SymbolStr,
-                                    ctx: CompilationContext*) -> void {
+    static register_injected_decl(stmt: ASTNode*, ctx: CompilationContext*) -> void {
         // Injected spec clones, not source decls: pass is_source_decl=false so
         // they are skipped by the cross-module coherence check (their canonical
         // targets recur across every module that instantiates the template).
-        // `owner_mod` sets the spec's DeclarationIndex module ownership to its
-        // template's defining module (where Phase 6a-iii places its AST), so
-        // codegen's define-vs-extern decision agrees with where it is emitted.
-        TypeResolutionPasses::register_decl_in_index(stmt, ctx, false, owner_mod);
+        TypeResolutionPasses::register_decl_in_index(stmt, ctx, false);
     }
 }
 
@@ -160,12 +120,6 @@ type struct SpecializationPasses {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Scanning for generic declarations");
-
-        // Ensure the type system (and GenericRegistry) are initialized.
-        // TypeDeclaration runs before this pass, so this is a safety guard.
-        if (ctx.type_arena == null) {
-            ctx.init_type_system();
-        }
 
         const root: ProgramNode* = ctx.artifacts.ast.root;
         if (root == null) {
@@ -194,20 +148,21 @@ type struct SpecializationPasses {
                     const node: StructDeclNode* = stmt as StructDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::StructDeclaration, true, registry, arena, ctx);
+                            stmt, NodeKind::StructDeclaration, node.def, registry, arena, ctx);
                     }
                     // Static generic methods on non-generic structs (e.g.
                     // `Layout::array<T>`) need their own template entries;
                     // run_template_registration would otherwise miss them.
                     if (!node.is_generic()) {
-                        SpecializationPasses::register_static_method_templates(node.name, node.methods,
+                        SpecializationPasses::register_static_method_templates(node.methods,
                             registry, arena, ctx);
                         // Generic INSTANCE methods on non-generic structs
                         // (e.g. `Response::write_to<W>`) dispatch via receiver
                         // type rather than scope-qualified name; record the
                         // owner AST here so try_infer_method_call can find
                         // its `methods[]` from a receiver TypeRef.
-                        SpecializationPasses::register_inherent_owner(node.name, stmt, registry, ctx);
+                        SpecializationPasses::register_inherent_owner(
+                            ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
                     }
                 }
                 NodeKind::UnionDeclaration => {
@@ -217,52 +172,54 @@ type struct SpecializationPasses {
                     const node: UnionDeclNode* = stmt as UnionDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::UnionDeclaration, true, registry, arena, ctx);
+                            stmt, NodeKind::UnionDeclaration, node.def, registry, arena, ctx);
                     }
                     if (!node.is_generic()) {
-                        SpecializationPasses::register_static_method_templates(node.name, node.methods,
+                        SpecializationPasses::register_static_method_templates(node.methods,
                             registry, arena, ctx);
-                        SpecializationPasses::register_inherent_owner(node.name, stmt, registry, ctx);
+                        SpecializationPasses::register_inherent_owner(
+                            ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
                     }
                 }
                 NodeKind::EnumDeclaration => {
                     const node: EnumDeclNode* = stmt as EnumDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::EnumDeclaration, true, registry, arena, ctx);
+                            stmt, NodeKind::EnumDeclaration, node.def, registry, arena, ctx);
                     }
                 }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::ClassDeclaration, true, registry, arena, ctx);
+                            stmt, NodeKind::ClassDeclaration, node.def, registry, arena, ctx);
                     }
                     if (!node.is_generic()) {
-                        SpecializationPasses::register_static_method_templates(node.name, node.methods,
+                        SpecializationPasses::register_static_method_templates(node.methods,
                             registry, arena, ctx);
-                        SpecializationPasses::register_inherent_owner(node.name, stmt, registry, ctx);
+                        SpecializationPasses::register_inherent_owner(
+                            ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
                     }
                 }
                 NodeKind::FunctionDeclaration => {
                     const node: FunctionDeclNode* = stmt as FunctionDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::FunctionDeclaration, false, registry, arena, ctx);
+                            stmt, NodeKind::FunctionDeclaration, node.def, registry, arena, ctx);
                     }
                 }
                 NodeKind::TraitDeclaration => {
                     const node: TraitDeclNode* = stmt as TraitDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::TraitDeclaration, true, registry, arena, ctx);
+                            stmt, NodeKind::TraitDeclaration, node.def, registry, arena, ctx);
                     }
                 }
                 NodeKind::TypeAliasDeclaration => {
                     const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.alias_name, node.generic_params,
-                            stmt, NodeKind::TypeAliasDeclaration, true, registry, arena, ctx);
+                            stmt, NodeKind::TypeAliasDeclaration, node.def, registry, arena, ctx);
                     }
                 }
                 NodeKind::ImplementationBlock => {
@@ -310,11 +267,10 @@ type struct SpecializationPasses {
         if (mono_ptr != null) {
             // Subsequent module: clear transient state, keep specialization cache
             mono_ptr.reset_for_next_module();
-            mono_ptr.set_current_module(module_sym);
-            mono_ptr.set_current_ns(ctx.current_module_ns());
+            mono_ptr.set_current_source_file(module_sym);
         } else {
             // First module: allocate and store on context
-            const _box_mono: Box<Monomorphizer> = Box<Monomorphizer>::new(
+            const _box_mono: Box<Monomorphizer> = Box::<Monomorphizer>::new(
                 Monomorphizer::new(arena, generic_reg, ctx.intern_table, ctx.diagnostics,
                                    ctx.type_resolver, ctx.decl_index));
             mono_ptr = _box_mono.leak();
@@ -322,18 +278,8 @@ type struct SpecializationPasses {
             // back-pointers must be set AFTER the leak puts it at a stable heap
             // address.
             mono_ptr.wire();
-            mono_ptr.set_current_module(module_sym);
-            mono_ptr.set_current_ns(ctx.current_module_ns());
+            mono_ptr.set_current_source_file(module_sym);
             ctx.monomorphizer = mono_ptr;
-        }
-
-        // Bug C: annotate bound-directed method dispatch (e.g. Display vs
-        // Debug `fmt`) BEFORE process_all clones any template, so every
-        // specialization inherits the disambiguating trait through the
-        // cloner.  Must precede process_all (which materializes specs).
-        const ann_root: ProgramNode* = ctx.artifacts.ast.root;
-        if (ann_root != null) {
-            mono_ptr.annotate_bound_dispatch_in_module(ann_root);
         }
 
         mut success: boolean = mono_ptr.process_all();
@@ -349,7 +295,7 @@ type struct SpecializationPasses {
         // them.)
         //
         // WALK/DRAIN FIXPOINT: re-walking is idempotent (each call is guarded
-        // by its `resolved_callee` / non-generic `resolved_method`), so iterate
+        // by its `resolved_callee`), so iterate
         // walk + drain until no new specialization entries appear.  This is
         // what resolves adapter-chain receivers (`r.map(f).fold()`):
         // the first pass types+specializes `.map(f)`, the next pass sees the
@@ -358,7 +304,7 @@ type struct SpecializationPasses {
         if (root != null) {
             loop {
                 const before_specs: i64 = mono_ptr.spec_count();
-                const before_methods: i64 = mono_ptr.spec_owner_module_count();
+                const before_methods: i64 = mono_ptr.spec_owner_file_count();
                 mono_ptr.specialize_calls_in_module(root);
                 // Drain the pending worklist for any new instantiations queued
                 // by the walk.  We deliberately don't re-enter `process_all`
@@ -371,13 +317,13 @@ type struct SpecializationPasses {
                 // is materializing a generic-METHOD spec (pinning a static
                 // generic-owner call whose owner instantiation drained on the
                 // previous pass, or an adapter-chain receiver) grows
-                // `spec_owner_module_count` but leaves `spec_count` unchanged;
+                // `spec_owner_file_count` but leaves `spec_count` unchanged;
                 // breaking on `spec_count` alone stops before the call that
                 // method spec unblocks gets re-walked.  Both metrics are
                 // monotonic and bounded - each spec is recorded exactly once,
-                // behind the `method_spec_seen` guard - so this terminates.
+                // behind the `method_instance` guard - so this terminates.
                 if (mono_ptr.spec_count() == before_specs
-                        && mono_ptr.spec_owner_module_count() == before_methods) {
+                        && mono_ptr.spec_owner_file_count() == before_methods) {
                     break;
                 }
             }
@@ -417,27 +363,32 @@ type struct SpecializationPasses {
         }
 
         const module_sym: SymbolStr = ctx.intern(ctx.source_file);
-        mono.set_current_module(module_sym);
-        mono.set_current_ns(ctx.current_module_ns());
+        mono.set_current_source_file(module_sym);
 
-        const reg_start: i64 = mono.get_injection_cursor();
-        const reg_end: i64 = mono.spec_count();
-        if (reg_start >= reg_end) {
+        // A call bound to a method of an instantiation is bound once the
+        // instantiation's methods are registered.  Binding one to a generic
+        // method instantiates the method, whose body can mint instantiations
+        // of its own with calls of their own queued, so register, bind and
+        // drain until a round makes nothing new.
+        loop {
+            const reg_start: i64 = mono.get_injection_cursor();
+            const reg_end: i64 = mono.spec_count();
+            for (mut i: i64 = reg_start; i < reg_end; i++) {
+                const entry: SpecializationEntry* = mono.spec_entry_at(i);
+                SpecializationPasses::register_spec(ctx, mono, entry);
+            }
             mono.advance_injection_cursor();
-            return PassResult::ok();
+            const before_methods: i64 = mono.spec_owner_file_count();
+            mono.bind_queued_calls();
+            if (!mono.drain_pending_worklist()) { break; }
+            if (mono.spec_count() == reg_end && mono.spec_owner_file_count() == before_methods) { break; }
         }
-
-        for (mut i: i64 = reg_start; i < reg_end; i++) {
-            const entry: SpecializationEntry* = mono.spec_entry_at(i);
-            SpecializationPasses::register_spec(ctx, mono, entry);
-        }
-        mono.advance_injection_cursor();
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
 
     /// Resolve the module that should own a specialization: the one that owns
-    /// the concrete type argument forcing it.  The Rust rule is that a
+    /// the concrete type argument forcing it.  The rule is that a
     /// monomorphization is emitted where it is instantiated; we cannot use the
     /// literally-demanding module (the monomorphizer materializes its whole
     /// worklist while `ctx` is still loaded to the first module, so every spec
@@ -460,7 +411,7 @@ type struct SpecializationPasses {
     static type_arg_owner_for_spec(ctx: CompilationContext*,
                                    entry: SpecializationEntry*) -> SymbolStr {
         if (!entry.instantiated_type.is_valid()
-                || ctx.type_arena == null || ctx.module_graph == null) {
+                || ctx.module_graph == null) {
             return SymbolStr::empty();
         }
         const arena: TypeArena* = ctx.type_arena;
@@ -505,7 +456,7 @@ type struct SpecializationPasses {
                          depth: i64) -> SymbolStr {
         if (depth > 8 || !tref.is_valid()) { return SymbolStr::empty(); }
         const arena: TypeArena* = ctx.type_arena;
-        const t: Type* = arena.lookup(tref.id);
+        const t: Type* = arena.lookup(tref);
         if (t == null) { return SymbolStr::empty(); }
 
         // Constructors: nothing to name here, so walk straight through.
@@ -557,21 +508,14 @@ type struct SpecializationPasses {
             _ => { }
         }
 
-        const qn: SymbolStr = arena.get_qualified_name(tref);
-        if (!qn.is_valid()) { return SymbolStr::empty(); }
-        const qs: string = ctx.intern_table.resolve(qn);
-        // Parse (splitting on `::`), not `from_symbol` (which keeps the whole
-        // qualified name as one segment) - we need the enclosing namespace to
-        // match against a module's `namespace_name`.
-        const qname: QualifiedName = QualifiedName::parse(ctx.intern_table, qs);
-        const parent_str: string = qname.display_parent(ctx.intern_table);
-        mut fallback: SymbolStr = SymbolStr::empty();
-        if (parent_str != "") {
-            fallback = ctx.module_graph.source_file_for_owner_key(
-                ctx.intern_table.intern(parent_str), ctx.intern_table);
-        }
-        // A source-declared type: its namespace IS the answer.
-        if (!qs.contains("$")) { return fallback; }
+        if (!arena.get_qualified_name(tref).is_valid()) { return SymbolStr::empty(); }
+        // The file of the module the type is declared in, as its record holds
+        // it - a monomorph's record holds its template's module.
+        const fallback: SymbolStr = ctx.module_graph.source_file_of(
+            arena.declared_in(t), ctx.intern_table);
+        // A source-declared type: its module IS the answer.
+        const is_monomorph: boolean = arena.inst_generic_base(tref).is_valid();
+        if (!is_monomorph) { return fallback; }
 
         // A monomorph.  Its name only tells us where the TEMPLATE lives; look
         // inside its type ARGUMENTS for a source-declared type.  Read straight off
@@ -595,12 +539,12 @@ type struct SpecializationPasses {
         const module_sym: SymbolStr = ctx.intern(ctx.source_file);
 
         // Resolve this spec's OWNER module.  Both DI ownership (here) and AST
-        // placement (Phase 6a-iii) key off `owner_source`, so they always
-        // agree: codegen's `owned_by_current_module` matches the module whose
-        // root holds the definition.
+        // placement key off `owner_source`, so they always agree: the
+        // module DI names as owner is the one whose root holds the
+        // definition, and every other module declares the symbol extern.
         //
         // A spec is owned by the module that owns the concrete TYPE ARGUMENT
-        // forcing it - the Rust rule that a monomorphization is codegen'd where
+        // forcing it - the rule that a monomorphization is codegen'd where
         // it is instantiated, expressed through the one piece of the
         // instantiation that is stable and demand-order independent.  (The
         // literally-demanding module is unusable: the monomorphizer materializes
@@ -626,14 +570,11 @@ type struct SpecializationPasses {
         // safe at all:
         //   * TYPE specs (struct/enum/class) are named by the type's arena
         //     qualified name, which is LOCATION-INDEPENDENT.
-        //   * FUNCTION / static-method-generic specs have no arena type, so the
-        //     template namespace is stamped onto the spec's FunctionDeclNode
-        //     (`source_module`, below) and read back at DI registration
-        //     (register_decl_in_index) and at codegen (declare_function /
-        //     codegen_function_prologue).  That makes their definition symbol
-        //     and every caller's cross-module reference both qualify by the
-        //     TEMPLATE module, so relocating the definition never diverges the
-        //     names.
+        //   * FUNCTION / static-method-generic specs have no arena type; their
+        //     key is the spec identifier under the module of the file that
+        //     wrote the template (`decl_fn_key` over the clone's span), which
+        //     the DI registration and codegen's definition both derive, so
+        //     relocating the definition never diverges the names.
         //
         // Fallback, when no type argument names an in-build module (a purely
         // primitive `Option<i64>`, or a FUNCTION spec, which carries no
@@ -646,69 +587,48 @@ type struct SpecializationPasses {
         if (arg_owner.is_valid()) {
             owner_module_sym = arg_owner;
         } else if (entry.template_module.is_valid() && ctx.module_graph != null) {
-            const owner_path: SymbolStr = ctx.module_graph.source_file_for_owner_key(
+            const owner_path: SymbolStr = ctx.module_graph.source_file_of(
                 entry.template_module, ctx.intern_table);
             if (owner_path.is_valid()) { owner_module_sym = owner_path; }
         }
         entry.owner_source = owner_module_sym;
 
-        // Stamp the canonical (template-derived) namespace onto FUNCTION specs
-        // so their definition symbol and every caller reference qualify by the
-        // template module rather than by whichever module emits/demands them.
-        // Type specs get this for free via their arena qualified name; free
-        // functions and static-method generics have no arena type, so the
-        // namespace must ride on the node.  Read back by
-        // `register_decl_in_index` (q_name) and `DeclarationEmitter`
-        // (fn_qualified_name).  Must run BEFORE `SpecInjector::register` below.
-        // `entry.template_module` is the template's namespace (or its source
-        // path for root-namespace templates); either way the stamp is the single
-        // source of truth for the spec's qualifier, so def and callers agree.
-        if (entry.ast_node != null
-                && entry.ast_node.kind == NodeKind::FunctionDeclaration
-                && entry.template_module.is_valid()) {
-            const tmpl_ns: string = ctx.intern_table.resolve(entry.template_module);
-            SpecializationPasses::tag_decl_source_module(entry.ast_node, tmpl_ns);
-        }
-
         // Scope-tag the main AST with its template module origin in the
-        // CompilationContext's node-identity side table. This is kept separate
-        // from the node's `source_module` field on purpose: that field is also
-        // used to stamp ordinary (non-injected) decls with their defining module
-        // (see type_resolution's ImplementationBlock handler), so it can't mark
-        // "this exact node is an injected spec" without conflation. The side
-        // table only ever holds injected specs, which is what `dispatch_top_level`
-        // needs. Physical placement into the owner module's root happens later
-        // in Phase 6a-iii.
+        // CompilationContext's node-identity side table.  A FUNCTION spec's
+        // key needs no stamp on the node: the clone carries the template's
+        // span, and a declaration's key is its name under the module of the
+        // file that wrote it (`decl_fn_key`), so the definition and every
+        // caller's reference qualify by the template module wherever the
+        // clone is placed.  The side table only ever holds injected specs,
+        // which is what `dispatch_top_level` needs.  Physical placement into
+        // the owner module's root happens later in Phase 6a-iii.
         if (entry.ast_node != null) {
             if (entry.template_module.is_valid()) {
                 ctx.register_injected_origin(
-                    entry.ast_node as u64, entry.template_module);
+                    entry.ast_node as ASTNode*, entry.template_module);
             }
         }
         // Scope-tag impl blocks
         for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
             if (entry.template_module.is_valid()) {
                 ctx.register_injected_origin(
-                    entry.impl_nodes[j] as u64, entry.template_module);
+                    entry.impl_nodes[j] as ASTNode*, entry.template_module);
             }
         }
 
-        // Register in DeclarationIndex using the arena type's ACTUAL
-        // qualified name for method keys.  This prevents two specs with
-        // the same bare name (e.g. BattleTest::Pair_i32 and
-        // Collections::Pair::Pair_i32) from overwriting each other.
+        // A named specialization is in the index since its placement; a
+        // function clone registers as a declaration here.
         if (entry.ast_node != null) {
-            SpecInjector::register(entry.ast_node, entry.specialized_name,
-                                   entry.specialized_type, owner_module_sym, ctx);
+            SpecInjector::register(entry.ast_node, entry.specialized_type, ctx);
         }
         // Register the InstantiatedType's TypeRef in type_reverse so
         // that codegen can look up the concrete type's qualified name
         // directly from the expression's resolved_type (which may be
         // the InstantiatedType, not the concrete struct).
         if (entry.instantiated_type.is_valid() && entry.specialized_type.is_valid()) {
-            const conc_qname: SymbolStr = arena.get_qualified_name(entry.specialized_type);
-            if (conc_qname.is_valid()) {
-                ctx.decl_index.register_type_reverse_only(conc_qname, entry.instantiated_type);
+            if (arena.get_qualified_name(entry.specialized_type).is_valid()) {
+                ctx.decl_index.register_type_reverse_only(
+                    ctx.decl_index.registered_def(entry.specialized_type), entry.instantiated_type);
 
                 // For Array specializations, register a mapping from
                 // element TypeRef -> concrete Array_<T> struct name.
@@ -725,23 +645,21 @@ type struct SpecializationPasses {
                 if (arena.inst_type_arg_count(entry.instantiated_type) >= 1) {
                     const inst_base: TypeRef =
                         arena.inst_generic_base(entry.instantiated_type);
-                    const base_qn: SymbolStr = arena.get_qualified_name(inst_base);
-                    if (base_qn.is_valid()) {
-                        const base_str: string = ctx.intern_table.resolve(base_qn);
-                        if (base_str == "std::collections::array::Array") {
-                            ctx.decl_index.register_array_element_type(
-                                arena.inst_type_arg_at(entry.instantiated_type, 0),
-                                conc_qname);
-                        }
+                    const base_def: DefId = ctx.decl_index.registered_def(inst_base);
+                    if (base_def.is_valid() && base_def.equals(ctx.generic_registry.wellknown(LangItem::Array))) {
+                        ctx.decl_index.register_array_element_type(
+                            arena.inst_type_arg_at(entry.instantiated_type, 0),
+                            entry.specialized_type);
                     }
                 }
             }
         }
-        // Register impl block methods under the SAME qualified name as
-        // the type itself (from the arena), not ctx.qualify_symbol_sym
-        // which would use the consuming module's namespace.
+        // Each cloned impl block is rewritten to target the specialization
+        // by its qualified name and recorded as a head under the
+        // specialization's type; its methods were registered under the type
+        // when the entry was placed.
         const impl_qname: SymbolStr = if (entry.specialized_type.is_valid()) {
-            arena.get_qualified_name(entry.specialized_type)
+            arena.get_qualified_name(entry.specialized_type).spelling()
         } else {
             SymbolStr::empty()
         };
@@ -752,24 +670,15 @@ type struct SpecializationPasses {
             // impl reaching here is fully applicable to this spec.
             if (impl_qname.is_valid() && impl_node != null) {
                 impl_node.set_target_type(impl_qname);
-                ctx.decl_index.register_methods_with_module(
-                    impl_qname, impl_node.methods, owner_module_sym, ctx.intern_table, ctx.type_arena);
-                // Re-register trait-impl entries against the *specialized*
-                // target so `traits_implemented_by(spec_name)` finds them.
-                // The original impl was `implement trait Hash for struct
-                // String`, registered under bare `String` at template-
-                // registration time; without this re-register, sema's
-                // method-via-trait lookup for `String<GlobalAlloc>::hash`
-                // bottoms out and emits E0091.
+                impl_node.spec_owner = entry.specialized_type;
+                // The clone under the SPECIALIZATION: a subject that is a type
+                // of its own selects among the clones placed under it.
                 if (impl_node.is_trait_impl()) {
-                    const trait_nm: SymbolStr = SpecializationPasses::extract_root_name(impl_node.trait_annotation);
-                    if (trait_nm.is_valid()) {
-                        ctx.generic_registry.register_trait_impl(
-                            trait_nm, impl_qname, impl_node);
-                    }
+                    ctx.generic_registry.register_trait_impl(
+                        impl_node.trait_def, entry.specialized_type, impl_node);
                 }
             } else {
-                SpecInjector::register_injected_decl(entry.impl_nodes[j], owner_module_sym, ctx);
+                SpecInjector::register_injected_decl(entry.impl_nodes[j], ctx);
             }
         }
     }
@@ -866,31 +775,30 @@ type struct SpecializationPasses {
     }
 
     /// Unified template registration for any generic declaration.
-    /// Extracts generic parameter metadata, qualifies the name, looks up the
-    /// base type in the arena, and registers a TemplateEntry.
+    /// Extracts generic parameter metadata and registers a TemplateEntry
+    /// under the declaration's key.
     ///
     /// `name` and `generic_params` are the common fields every generic
     /// declaration shares.  `ast_node` is the original declaration cast to
     /// ASTNode*.  `node_kind` identifies which declaration type it is.
-    /// `lookup_base` controls whether the base type is looked up in the arena
-    /// (true for types: struct/enum/class/trait) or left invalid (false for
-    /// functions, which have no arena entry).
+    /// `def` is the id the declaration was stamped with - by the
+    /// type-declaration stage for a type, by the name layer for a function -
+    /// and its canonical name is the registry's key.  A type's base type is
+    /// the index's answer for it; a function's is a placeholder.  An
+    /// unstamped declaration is a missed stamp, recorded, and registers
+    /// nothing: no second key is derived for it from the name and the file.
     static register_generic_template(name: SymbolStr, generic_params: &GenericParamNode*[],
                                        ast_node: ASTNode*, node_kind: NodeKind,
-                                       lookup_base: boolean,
+                                       def: DefId,
                                        registry: GenericRegistry*, arena: TypeArena*,
                                        ctx: CompilationContext*) -> void {
         if (generic_params.length == 0) { return; }
 
-        const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(name);
-        // Use the namespace (not file path) as the module name so that
-        // the monomorphizer's ResolutionContext can qualify type lookups
-        // correctly (e.g., "std::core::option" not "./core/option.cryo").
-        const module_sym: SymbolStr = if (ctx.has_namespace()) {
-            ctx.namespace_str
-        } else {
-            ctx.intern(ctx.source_file)
-        };
+        if (!def.is_valid()) {
+            compiler::resolver::res::record_pending_bug("register_generic_template: unstamped declaration");
+            return;
+        }
+        const qualified_sym: SymbolStr = ctx.defs.path_of(def).spelling();
         LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering %s template '%s'",
             node_kind.to_string(), ctx.resolve_str(name));
 
@@ -898,11 +806,13 @@ type struct SpecializationPasses {
         const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
             generic_params, arena);
         mut param_names: SymbolStr[] = [];
-        mut param_type_ids: u64[] = [];
+        mut param_syms: SymbolID[] = [];
+        mut param_types: TypeRef[] = [];
         for (mut i: i64 = 0; i < generic_params.length; i++) {
             const gp: GenericParamNode* = generic_params[i];
             param_names.push(gp.name);
-            param_type_ids.push(refs[i].id);
+            param_syms.push(gp.sym_id);
+            param_types.push(refs[i]);
         }
 
         mut base_type: TypeRef = TypeRef::invalid();
@@ -911,13 +821,15 @@ type struct SpecializationPasses {
             // the GenericRegistry can track instantiations (e.g., identity<int>).
             // Use a FunctionTemplate placeholder instead of a fake StructType.
             base_type = arena.create_function_template(qualified_sym);
-        } else if (lookup_base) {
-            base_type = arena.lookup_by_name(qualified_sym);
+        } else {
+            base_type = ctx.decl_index.type_of_def(def);
         }
 
+        // The module whose scope the template's body resolves in: the unit
+        // writing it.
         const entry: TemplateEntry = TemplateEntry::new(
-            name, qualified_sym, module_sym,
-            param_names, param_type_ids,
+            name, qualified_sym, def, ctx.current_module(),
+            param_names, param_syms, param_types,
             ast_node, node_kind,
             base_type
         );
@@ -936,23 +848,19 @@ type struct SpecializationPasses {
     /// `try_infer_method_call` / `specialize_method`, which dispatches by
     /// receiver type rather than scope-qualified name.
     ///
-    /// Owner-qualified key (`<owner_qualified>::<method>`) avoids collisions
-    /// when two types in the same namespace each declare a static method with
-    /// the same bare name.
-    static register_static_method_templates(owner_name: SymbolStr,
-                                              methods: &MethodNode*[],
+    /// Each is registered under its own definition's path (`<owner>::<method>`),
+    /// which keeps apart two types' static methods of one bare name: the
+    /// method's definition has the owner it is declared on as its parent,
+    /// whichever file the methods were written in.
+    static register_static_method_templates(methods: &MethodNode*[],
                                               registry: GenericRegistry*,
                                               arena: TypeArena*,
                                               ctx: CompilationContext*) -> void {
         if (methods.length == 0) { return; }
 
-        const owner_qsym: SymbolStr = ctx.qualify_symbol_sym(owner_name);
-        const owner_qstr: string = ctx.intern_table.resolve(owner_qsym);
-        const module_sym: SymbolStr = if (ctx.has_namespace()) {
-            ctx.namespace_str
-        } else {
-            ctx.intern(ctx.source_file)
-        };
+        // The module the methods are written in, whose scope their bodies
+        // resolve in - an impl's, which need not be the owner type's.
+        const written_in: ModulePath = ctx.current_module();
 
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
@@ -960,25 +868,25 @@ type struct SpecializationPasses {
             if (!m.is_static) { continue; }
             if (!m.func.is_generic()) { continue; }
 
-            const method_str: string = ctx.intern_table.resolve(m.func.name);
-            const qualified_str: string = owner_qstr + "::" + method_str;
-            const qualified_sym: SymbolStr = ctx.intern_table.intern(qualified_str);
+            const qualified_sym: SymbolStr = ctx.defs.path_of(m.func.def).spelling();
 
             const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
                 m.func.generic_params, arena);
             mut param_names: SymbolStr[] = [];
-            mut param_type_ids: u64[] = [];
+            mut param_syms: SymbolID[] = [];
+            mut param_types: TypeRef[] = [];
             for (mut j: i64 = 0; j < m.func.generic_params.length; j++) {
                 const gp: GenericParamNode* = m.func.generic_params[j];
                 param_names.push(gp.name);
-                param_type_ids.push(refs[j].id);
+                param_syms.push(gp.sym_id);
+                param_types.push(refs[j]);
             }
 
             const base_type: TypeRef = arena.create_function_template(qualified_sym);
 
             const entry: TemplateEntry = TemplateEntry::new(
-                m.func.name, qualified_sym, module_sym,
-                param_names, param_type_ids,
+                m.func.name, qualified_sym, m.func.def, written_in,
+                param_names, param_syms, param_types,
                 m.func as ASTNode*, NodeKind::FunctionDeclaration,
                 base_type
             );
@@ -987,17 +895,11 @@ type struct SpecializationPasses {
     }
 
     /// Register a non-generic struct/class AST as an "inherent owner",
-    /// keyed by both qualified and bare name.  Two consumers:
-    ///
-    /// * The monomorphizer / sema walk the owner's `methods[]` to specialize
-    ///   generic INSTANCE methods (e.g. `Response::write_to<W>`).  Generic
-    ///   STATIC methods take a separate path via
-    ///   `register_static_method_templates`, which keys them by
-    ///   `Owner::method` for ScopeResolution callees.
-    /// * `OwnershipQuery::has_inherent_drop` walks the owner's `methods[]`
-    ///   to detect an inline `drop` so the Copy classifier and the
-    ///   drop-insertion pass treat the type as non-Copy and synthesize
-    ///   scope-exit drops.
+    /// keyed by both qualified and bare name.  The monomorphizer / sema walk
+    /// the owner's `methods[]` to specialize generic INSTANCE methods (e.g.
+    /// `Response::write_to<W>`).  Generic STATIC methods take a separate path
+    /// via `register_static_method_templates`, which keys them by
+    /// `Owner::method` for ScopeResolution callees.
     ///
     /// Registration is unconditional for non-generic owners so the index is
     /// a complete `qualified_name -> AST` map for them; receiver-type lookups
@@ -1006,55 +908,33 @@ type struct SpecializationPasses {
     /// are specialized as part of struct/class monomorphization rather than
     /// per-call.
     static register_inherent_owner(
-            owner_name: SymbolStr, owner_ast: ASTNode*,
-            registry: GenericRegistry*, ctx: CompilationContext*) -> void {
+            owner: TypeRef, owner_ast: ASTNode*,
+            registry: GenericRegistry*) -> void {
         if (owner_ast == null) { return; }
-        const owner_qsym: SymbolStr = ctx.qualify_symbol_sym(owner_name);
-        registry.register_inherent_owner(owner_qsym, owner_ast);
-        // Also register under the bare name so receiver-type lookups that
-        // miss the qualified form (e.g., when the arena returns the bare
-        // name for primitive impls) still find the owner.
-        if (!owner_qsym.equals(owner_name)) {
-            registry.register_inherent_owner(owner_name, owner_ast);
-        }
-    }
-
-    /// Tag an AST node's source_module field with the template's module name.
-    /// struct/class/enum/function/impl decls are all DeclarationNode subclasses and
-    /// `source_module` lives on that shared base, so a single base-pointer write
-    /// covers every kind. (The kind check keeps the cast sound - only declaration
-    /// nodes are written.) Per-leaf concrete casts are not needed here:
-    /// base-pointer field writes on the vtable'd AST hierarchy are correct at both
-    /// O0 and O2.
-    static tag_decl_source_module(node: ASTNode*, module: string) -> void {
-        if (node == null) { return; }
-        const k: NodeKind = node.kind;
-        const is_decl: boolean =
-            k == NodeKind::StructDeclaration || k == NodeKind::UnionDeclaration
-            || k == NodeKind::ClassDeclaration
-            || k == NodeKind::EnumDeclaration || k == NodeKind::FunctionDeclaration
-            || k == NodeKind::ImplementationBlock;
-        if (!is_decl) { return; }
-        const decl: DeclarationNode* = node as DeclarationNode*;
-        decl.source_module = module;
+        // Under the declaration's own type and nothing else: two modules'
+        // same-leaf declarations are two types, so a reader holding a
+        // receiver is never handed some other module's declaration.
+        registry.register_inherent_owner(owner, owner_ast);
     }
 
     static register_impl_block(node: ImplBlockNode*, registry: GenericRegistry*,
                                  ctx: CompilationContext*) -> void {
-        // Qualify the target name so impl blocks use the same key as templates.
-        const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.target_type);
-        if (registry.get_template(qualified_sym) != null) {
-            registry.register_impl_block(qualified_sym, node);
+        // The key a template is registered under is the target's canonical
+        // name, which is the head's stamp.  Qualifying the spelling by the
+        // module the impl was WRITTEN in names the template only when that
+        // module declares the type; every trait implemented for another
+        // module's type (`Display for Option<T>` in `fmt::display`) keyed a
+        // name no template carries and was attached to none.
+        if (registry.template_of(node.target_def()) != null) {
+            registry.register_impl_block(node.target_def(), node);
         } else if (!node.is_trait_impl()) {
             // Non-generic target: there is no TemplateEntry to hang the block
             // on, so an inherent `implement T { ... }` block would otherwise be
-            // invisible to ownership classification.  Record it under both the
-            // qualified and bare names (mirroring `register_inherent_owner`) so
-            // a separately-declared `drop` makes `T` non-Copy and droppable.
-            registry.register_inherent_impl_block(qualified_sym, node);
-            if (!qualified_sym.equals(node.target_type)) {
-                registry.register_inherent_impl_block(node.target_type, node);
-            }
+            // invisible to ownership classification.  Recorded under the
+            // type the head names - a declared type's, a primitive's - which
+            // is what every reader holds as a receiver.
+            registry.register_inherent_impl_block(
+                ctx.decl_index.impl_owner(node, "specialization/inherent impl"), node);
             // A generic static method on a non-generic target needs its own
             // template entry, exactly as when it is written inside the type's
             // body (see the StructDeclaration arm of `run_template_registration`).
@@ -1067,45 +947,20 @@ type struct SpecializationPasses {
             const arena: TypeArena* = ctx.type_arena;
             if (arena != null) {
                 SpecializationPasses::register_static_method_templates(
-                    node.target_type, node.methods, registry, arena, ctx);
+                    node.methods, registry, arena, ctx);
             }
         }
 
-        // Trait impls (`implement trait Foo for Bar`) also go into the
-        // (trait, target) registry so sema/dispatch can find them by trait
-        // name. Inherent impls (`implement Bar { ... }`) skip this branch.
+        // A trait impl goes into the trait-impl registry under the trait's
+        // identity and the target's type, both off the name layer's stamps.
+        // Coherence is not checked here: the single check lives in
+        // TypeResolution, once `canonical_target` is stamped, and covers
+        // same-file and cross-module duplicates uniformly.
         if (node.is_trait_impl()) {
-            const trait_name: SymbolStr = SpecializationPasses::extract_root_name(node.trait_annotation);
-            if (trait_name.is_valid()) {
-                // NOTE: coherence (a trait may be implemented at most once per
-                // type) is NOT checked here.  At this stage (DeclarationCollection)
-                // there is no import-resolved target name, so a key would have to
-                // use bare simple names - which conflate same-named types in
-                // different modules and ignore trait/target type args.  The
-                // single coherence check lives in TypeResolution's
-                // `register_decl_in_index`, after `canonical_target` is stamped;
-                // it covers same-file and cross-module duplicates uniformly,
-                // including generic traits.  This branch only populates the
-                // dispatch registry.
-                registry.register_trait_impl(trait_name, node.target_type, node);
-            }
+            registry.register_trait_impl(
+                TypeAnnotation::trait_def(node.trait_annotation),
+                ctx.decl_index.impl_owner(node, "specialization/trait impl"), node);
         }
-    }
-
-    /// Walk a TypeAnnotation* to its underlying head identifier. Used to pull
-    /// `Foo` out of `Foo`, `Foo<T>`, or `&Foo`. Returns an invalid SymbolStr
-    /// for shapes the trait-impl registry doesn't index (Primitive, ThisType,
-    /// Tuple, Function, Optional, Array). Qualified-path traits are tracked
-    /// only by their leaf name here; full-path indexing is not yet implemented.
-    static extract_root_name(ann: TypeAnnotation*) -> SymbolStr {
-        if (ann == null) { return SymbolStr::empty(); }
-        return match (*ann) {
-            TypeAnnotation::Named(n) => { n.name }
-            TypeAnnotation::Generic(g) => { SpecializationPasses::extract_root_name(g.base) }
-            TypeAnnotation::Reference(r) => { SpecializationPasses::extract_root_name(r.inner) }
-            TypeAnnotation::Pointer(p) => { SpecializationPasses::extract_root_name(p.inner) }
-            _ => { SymbolStr::empty() }
-        };
     }
 
     static run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {
@@ -1160,21 +1015,23 @@ type struct SpecializationPasses {
             unresolved_count += 1;
 
             // All fields accessed below are plain data (u64, i64), no vtable dispatch.
-            const base_id: u64 = inst.generic_base.id;
+            const base_id: u64 = inst.generic_base.key();
             const n_args: i64 = inst.type_args.length;
-            const base_qname: SymbolStr = arena.get_qualified_name(inst.generic_base);
             mut base_name: string = "<no-qname>";
-            if (base_qname.is_valid()) { base_name = ctx.intern_table.resolve(base_qname); }
+            if (arena.get_qualified_name(inst.generic_base).is_valid()) {
+                base_name = ctx.intern_table.shown(arena.get_qualified_name(inst.generic_base));
+            }
             mut args_disp: string = "";
             for (mut ai: i64 = 0; ai < inst.type_args.length; ai++) {
-                const aqn: SymbolStr = arena.get_qualified_name(inst.type_args[ai]);
                 mut an: string = "?";
-                if (aqn.is_valid()) { an = ctx.intern_table.resolve(aqn); }
+                if (arena.get_qualified_name(inst.type_args[ai]).is_valid()) {
+                    an = ctx.intern_table.shown(arena.get_qualified_name(inst.type_args[ai]));
+                }
                 if (ai > 0) { args_disp = args_disp + ", "; }
                 args_disp = args_disp + an;
             }
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("unresolved generic instantiation after monomorphization: '%s<%s>' (inst_id=%lu, base_id=%lu, n_args=%lld)",
+                fmt::format("unresolved generic instantiation after monomorphization: '%s<%s>' (inst_id=%lu, base_id=%lu, n_args=%lld)",
                         base_name, args_disp, inst.id, base_id, n_args));
         }
 

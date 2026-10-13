@@ -9,19 +9,43 @@
 ///   string:   paths, qualified paths, documentation, literal values, and
 ///               other user-visible text that is never used as a lookup key.
 
-namespace Compiler::AST::Declaration;
+namespace compiler::ast::declaration;
 
-import Compiler::Diag;
-import Compiler::Diag::SourceSpan;
-import Compiler::AST;
-import Compiler::AST::{ Node, Expression, Statement, Pattern };
-import Compiler::Types::TypeRef;
-import Compiler::Resolver::SymbolStr;
+import compiler::diag;
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::ast;
+import compiler::ast::{
+    expression, ImportStyle, node, NodeKind, pattern, statement, TraitBound,
+    TraitRef, TypeAnnotation, Visibility
+};
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::arena;
+import compiler::types::arena::{ TypeArena };
+import std::fmt;
+import compiler::resolver::symbol_str;
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, Res, ResSlot };
+import compiler::decl_index::{ OverloadId };
+import compiler::module_graph::{ ModulePath };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::resolver::intern_table;
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::ast::visitor;
+import compiler::ast::visitor::{ ASTVisitor };
+import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::pattern::{ DirectiveArgKind, DirectiveNode };
+import compiler::ast::statement::{ BlockStmtNode };
+import compiler::ast::node::{ ASTNode };
+import utils::keyword::{ Keyword };
 
 type class DeclarationNode : ASTNode {
 public:
     documentation:       string;
-    source_module:       string;
+    source_file:         string;
     name_span:           SourceSpan;
     /// Directives written as `![name(args)]` immediately preceding this
     /// declaration in source order.
@@ -36,19 +60,16 @@ public:
 
     DeclarationNode(kind: NodeKind, span: SourceSpan) : ASTNode(kind, span) {
         this.documentation       = "";
-        this.source_module       = "";
+        this.source_file         = "";
         this.name_span           = SourceSpan::none();
         this.attached_directives = [];
         this.modifier_span       = SourceSpan::none();
     }
 
-    has_documentation() -> boolean { return this.documentation != ""; }
-    is_from_import() -> boolean    { return this.source_module != ""; }
     has_name_span() -> boolean     { return this.name_span.has_location(); }
-    has_directives() -> boolean    { return this.attached_directives.length > 0; }
 
-    set_documentation(doc: string) -> void  { this.documentation = doc; }
-    set_source_module(mod: string) -> void  { this.source_module = mod; }
+    set_documentation(doc_text: string) -> void  { const doc: string = doc_text; this.documentation = doc; }
+    set_source_file(file: string) -> void  { this.source_file = file; }
     set_name_span(span: SourceSpan) -> void { this.name_span = span; }
     add_directive(d: DirectiveNode*) -> void {
         if (d != null) { this.attached_directives.push(d); }
@@ -79,17 +100,17 @@ public:
         return out;
     }
 
-    find_directive(&this, name: string) -> DirectiveNode* {
+    find_directive(&this, name: Keyword) -> DirectiveNode* {
         for (mut i: i64 = 0; i < this.attached_directives.length; i++) {
             const d: DirectiveNode* = this.attached_directives[i];
-            if (d != null && d.directive_kind.eq(name)) {
+            if (d != null && d.directive_kind.as_string().eq(name.as_string())) {
                 return d;
             }
         }
         return null;
     }
 
-    has_directive(&this, name: string) -> boolean {
+    has_directive(&this, name: Keyword) -> boolean {
         return this.find_directive(name) != null;
     }
 
@@ -101,7 +122,7 @@ public:
     /// `![link("lib")]` (a library name) lives on the ExternBlockNode and means
     /// something different (the library to link), so it is never consulted here.
     link_directive_symbol(&this) -> string {
-        const d: DirectiveNode* = this.find_directive("symbol");
+        const d: DirectiveNode* = this.find_directive(Keyword::new("symbol"));
         if (d == null || d.args.length != 1) { return ""; }
         if (d.args[0].kind != DirectiveArgKind::StringLit) { return ""; }
         return d.args[0].str_value;
@@ -114,6 +135,27 @@ public:
 
 
 // Concrete Declaration Nodes
+
+/// Whether a parameter is the method's RECEIVER, and in which form.  The
+/// language names the receiver by its spelling - `&this` for a borrow, `this`
+/// for a by-value one - and the parser is where that spelling is read; every
+/// later stage asks the mark, because a parameter's role is a property of the
+/// declaration and not of the characters it was written with.
+type enum ReceiverForm {
+    NotReceiver;
+    ByReference;
+    ByValue;
+}
+
+implement enum ReceiverForm {
+    is_receiver(&this) -> boolean {
+        return match (&this) {
+            ReceiverForm::NotReceiver => { false }
+            _                         => { true }
+        };
+    }
+}
+
 
 type class VarDeclNode : DeclarationNode {
 public:
@@ -148,12 +190,43 @@ public:
     /// is reachable ONLY through its extern-module alias namespace
     /// (`cit::SOME_CONST`, via the decl_index qualified key) - never bare.
     /// Mirrors StructDeclNode/EnumDeclNode/TypeAliasDeclNode.binding_namespace.
-    /// Empty for ordinary source-level declarations.
-    binding_namespace: SymbolStr;
+    /// None for ordinary source-level declarations.
+    binding_namespace: ModulePath;
     /// `![thread_local]`: emit this global as an LLVM thread-local so each
     /// thread gets its own instance. Only meaningful on globals; codegen
     /// (`codegen_global_var`) and cross-module extern refs read this flag.
     is_thread_local: boolean;
+    /// True for a global DECLARED here but DEFINED in another object - the
+    /// storage belongs to a C library (`extern int errno;`).  Three things
+    /// follow, and none of them can be inferred from a missing initializer
+    /// (an ordinary global may omit one and get zero): the symbol is the bare
+    /// C name rather than the namespace mangling, no initializer may be
+    /// emitted (that would define the symbol here and collide at link time),
+    /// and it is never marked LLVM-constant even when declared `const`, since
+    /// `const` binds what CRYO may write while the owning library remains free
+    /// to change the value under us.
+    is_extern_import: boolean;
+    /// `![symbol("name")]` on an imported global: the linker symbol to bind,
+    /// when it differs from the Cryo identifier.  Empty means "use the name".
+    link_name:        string;
+    /// The binding this declaration introduced, stamped by NameResolution when
+    /// it declared the name.  This is what a use of the name resolves to
+    /// (`Res::Local`), so it is the one key on which a declaration and its uses
+    /// agree: the spelling does not distinguish an inner block's binding from
+    /// the outer one it shadows, and a per-binding rib keyed by the spelling
+    /// therefore gives two bindings one slot.
+    ///
+    /// Invalid on a global (which is a definition reached by canonical name,
+    /// not a binding) and on a declaration no resolver walked.
+    sym_id:           SymbolID;
+    /// The definition a GLOBAL is, stamped by NameDeclaration when it
+    /// declared the name: what a use of the global resolves to (`Res::Def`),
+    /// and the key its registration is filed under.  Invalid on a local or
+    /// a parameter.
+    def:              DefId;
+    /// Whether this parameter is the enclosing method's receiver - see
+    /// `ReceiverForm`.  `NotReceiver` on every local and every other parameter.
+    receiver:         ReceiverForm;
 
     VarDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::VariableDeclaration, span) {
@@ -167,14 +240,48 @@ public:
         this.kw_span          = SourceSpan::none();
         this.is_capture_alias = false;
         this.is_drop_flag     = false;
-        this.binding_namespace = SymbolStr::empty();
+        this.binding_namespace = ModulePath::none();
         this.is_thread_local  = false;
+        this.is_extern_import = false;
+        this.link_name        = "";
+        this.sym_id           = SymbolID::invalid();
+        this.def              = DefId::invalid();
+        this.receiver         = ReceiverForm::NotReceiver;
+    }
+
+    /// Record that this parameter is the enclosing method's receiver.
+    set_receiver(form: ReceiverForm) -> void { this.receiver = form; }
+
+    /// Whether this parameter is the receiver, in either form.
+    is_receiver(&this) -> boolean { return this.receiver.is_receiver(); }
+
+    /// Whether this parameter is a BORROWING receiver (`&this`), as opposed
+    /// to a by-value one (`this`) or no receiver at all.
+    is_ref_receiver(&this) -> boolean {
+        return match (&this.receiver) {
+            ReceiverForm::ByReference => { true }
+            _                         => { false }
+        };
+    }
+
+    /// Whether this parameter is a BY-VALUE receiver (`this`).
+    is_value_receiver(&this) -> boolean {
+        return match (&this.receiver) {
+            ReceiverForm::ByValue => { true }
+            _                     => { false }
+        };
+    }
+
+    /// Rename this declaration.  The receiver mark goes with the spelling:
+    /// a renamed parameter is no longer the one the language named.
+    set_name(n: SymbolStr) -> void {
+        this.name     = n;
+        this.receiver = ReceiverForm::NotReceiver;
     }
 
     has_initializer() -> boolean     { return this.initializer != null; }
     has_type_annotation() -> boolean { return this.type_annotation != null; }
     has_resolved_type() -> boolean   { return this.resolved_type.is_valid(); }
-    has_kw_span() -> boolean         { return this.kw_span.has_location(); }
 
     set_initializer(expr: ExpressionNode*) -> void  { this.initializer = expr; }
     set_mutable(v: boolean) -> void                 { this.is_mutable = v; }
@@ -185,6 +292,10 @@ public:
     set_kw_span(s: SourceSpan) -> void              { this.kw_span = s; }
     set_capture_alias(v: boolean) -> void           { this.is_capture_alias = v; }
     set_drop_flag(v: boolean) -> void               { this.is_drop_flag = v; }
+    /// Record the binding this declaration introduced.  Written once, by the
+    /// resolver that declared the name; a second answer would mean two
+    /// resolvers disagreeing about which binding this is.
+    set_sym_id(s: SymbolID) -> void                 { this.sym_id = s; }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -205,6 +316,13 @@ type struct DestructureBinding {
     span:          SourceSpan;    // span of the whole binding entry
     name_span:     SourceSpan;    // span of just the local name
     resolved_type: TypeRef;       // sema fills from the struct field's type
+    /// The binding the name layer declared for `local_name`: the key a pass
+    /// keeping per-binding state takes, as `VarDeclNode.sym_id` is.
+    sym_id:        SymbolID;
+    /// The position of `source_field` among the type's declared fields, which
+    /// sema pins where it checks the destructure; -1 until then, or for a
+    /// binding it refused.  The same in every specialization of a template.
+    field_index:   i64;
 
     static new(source_field: SymbolStr, local_name: SymbolStr, is_mutable: boolean,
                span: SourceSpan, name_span: SourceSpan) -> DestructureBinding {
@@ -215,6 +333,8 @@ type struct DestructureBinding {
             span:          span,
             name_span:     name_span,
             resolved_type: TypeRef::invalid(),
+            sym_id:        SymbolID::invalid(),
+            field_index:   -1,
         };
     }
 }
@@ -247,7 +367,6 @@ public:
 
     set_initializer(expr: ExpressionNode*) -> void  { this.initializer = expr; }
     set_type_annotation(a: TypeAnnotation*) -> void { this.type_annotation = a; }
-    set_resolved_type(t: TypeRef) -> void           { this.resolved_type = t; }
     set_mutable(v: boolean) -> void                 { this.is_mutable = v; }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -295,6 +414,11 @@ public:
     /// trait-impl fallback - hand-written trait methods reach that point
     /// through their own route and must not be re-specialized there.
     is_synth_default:       boolean;
+    /// `intrinsic function name<T>(..);` was written: a generic intrinsic.
+    /// It has no body and no symbol.  Registration marks its entries with
+    /// the kind its name lowers as, a specialization's too, and a call to it
+    /// is rewritten before codegen; nothing emits it.
+    is_intrinsic:           boolean;
     /// Set on a synthesized trait-default clone whose return type mentions
     /// `This` (e.g. the iterator combinators `map`/`filter`/`take` returning
     /// `MapIter<This, ...>`).  Such methods are self-referential: synthesized
@@ -344,7 +468,14 @@ public:
     /// (`C$tr$<trait>$f<owner>-<method>`); without it two distinct traits
     /// that define a same-named method for the same type mangle identically
     /// and collide at link time.  See `MangledName::for_method_or_trait_impl`.
-    origin_trait:           SymbolStr;
+    origin_trait:           DefId;
+    /// The position, among its trait's associated types, of the associated
+    /// type an `async` TRAIT method's future is bound through (`read` ->
+    /// `ReadFut`), recorded by the desugar that minted it on the trait's
+    /// declaration - the one place the name is made.  -1 on every other
+    /// function.  A reader that needs it reads it here rather than minting
+    /// the name again from the method's leaf.
+    async_fut_slot:         i64;
     /// Concrete type arguments of a generic-METHOD specialization (`m<T>` with
     /// `T = i64`), set by the monomorphizer's `specialize_method` on the cloned
     /// spec.  Empty on every template / non-spec function.  Folded into the
@@ -354,6 +485,14 @@ public:
     /// instead of collapsing onto the first.  See
     /// `MangledName::with_method_spec_args`.
     spec_type_args:         TypeRef[];
+    /// The declaration index entry this declaration's signature is
+    /// registered under - its key, function type and linker symbol - written
+    /// by registration, which is the one place the symbol is computed.  The
+    /// definition is emitted under the entry's symbol, a call sema or mono
+    /// binds to the declaration pins the entry, and a vtable slot names it;
+    /// none of them mangles.  Invalid until registered (a template whose
+    /// signature cannot be resolved, a deferred combinator).
+    overload_entry:         OverloadId;
     /// True on a function/method that the monomorphizer produced by cloning a
     /// generic template (a MONOMORPHIZATION), false on everything hand-written.
     /// Set once, at the single placement funnel
@@ -369,6 +508,27 @@ public:
     /// instantiation into the template's object) would be a multiple-definition
     /// error the moment two modules instantiate the same generic.
     is_specialization:      boolean;
+    /// The definition this declaration is, stamped by the name layer when it
+    /// declares the function - the same id every reference to the function
+    /// resolves to, so a declaration and its uses agree by construction.  A
+    /// reader holding the node asks by this id; it never re-derives the key
+    /// from the name and the file.  A method's is a definition of its owner
+    /// type or trait.  Invalid on a copy - a monomorphized clone, a trait
+    /// default placed in an implementation (neither is a definition) - and
+    /// on a function synthesized after the name layer ran that registered
+    /// none.
+    def:                    DefId;
+    /// The definition this declaration is a copy of: the template a
+    /// monomorphized clone was cloned from, the trait default an
+    /// implementation's copy was made from, carried through every further
+    /// copy.  Invalid on a definition itself.  It registers nothing - a copy
+    /// is still no definition - and says which definition a copy stands for,
+    /// so an owner's copy of a method is found by the method's identity.
+    copy_of:                DefId;
+    /// The instance a monomorphized copy of a generic function was made
+    /// for: the arena instantiation of the template's placeholder with the
+    /// type arguments.  Invalid on anything else.
+    instance:               TypeRef;
 
     FunctionDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::FunctionDeclaration, span) {
@@ -386,6 +546,7 @@ public:
         this.is_implicit            = false;
         this.is_synthesized_body    = false;
         this.is_synth_default       = false;
+        this.is_intrinsic           = false;
         this.is_self_returning_default = false;
         this.is_lazy_self_growing   = false;
         this.link_name              = "";
@@ -395,9 +556,14 @@ public:
         this.link_section           = "";
         this.return_type_annotation = null;
         this.resolved_return_type   = TypeRef::invalid();
-        this.origin_trait           = SymbolStr::empty();
+        this.origin_trait           = DefId::invalid();
+        this.async_fut_slot         = -1;
         this.spec_type_args         = [];
+        this.overload_entry         = OverloadId::invalid();
         this.is_specialization      = false;
+        this.def                    = DefId::invalid();
+        this.copy_of                = DefId::invalid();
+        this.instance               = TypeRef::invalid();
     }
 
     has_body() -> boolean                 { return this.body != null; }
@@ -421,18 +587,18 @@ public:
     set_public(v: boolean) -> void                          { this.is_public = v; }
     set_static(v: boolean) -> void                          { this.is_static = v; }
     set_async(v: boolean) -> void                           { this.is_async = v; }
-    set_inline(v: boolean) -> void                          { this.is_inline = v; }
-    set_noinline(v: boolean) -> void                        { this.is_noinline = v; }
     set_variadic(v: boolean) -> void                        { this.is_variadic = v; }
-    set_implicit(v: boolean) -> void                        { this.is_implicit = v; }
     set_synthesized_body(v: boolean) -> void                { this.is_synthesized_body = v; }
     set_synth_default(v: boolean) -> void                   { this.is_synth_default = v; }
+    set_intrinsic(v: boolean) -> void                       { this.is_intrinsic = v; }
     set_self_returning_default(v: boolean) -> void          { this.is_self_returning_default = v; }
     set_lazy_self_growing(v: boolean) -> void               { this.is_lazy_self_growing = v; }
     set_return_type_annotation(a: TypeAnnotation*) -> void  { this.return_type_annotation = a; }
     set_resolved_return_type(t: TypeRef) -> void             { this.resolved_return_type = t; }
-    set_origin_trait(t: SymbolStr) -> void                   { this.origin_trait = t; }
+    set_origin_trait(t: DefId) -> void                       { this.origin_trait = t; }
+    set_async_fut_slot(s: i64) -> void                       { this.async_fut_slot = s; }
     set_spec_type_args(a: TypeRef[]) -> void                 { this.spec_type_args = a; }
+    set_overload_entry(e: OverloadId) -> void                { this.overload_entry = e; }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -460,10 +626,17 @@ public:
     is_sink:               boolean;
     base_ctor_name:        SymbolStr;
     base_ctor_args:        ExpressionNode*[];
+    /// The generic method this one is a specialization of - its own type
+    /// parameters bound by the monomorphizer - or null for a method written
+    /// or copied from a trait default.  A copy of the block holding the
+    /// template does not carry it: a clone is the same method, not an
+    /// instance of it.
+    spec_of:               MethodNode*;
 
     MethodNode(func: FunctionDeclNode*, span: SourceSpan)
         : DeclarationNode(NodeKind::MethodDeclaration, span) {
         this.func                  = func;
+        this.spec_of               = null;
         this.visibility            = Visibility::Public;
         this.is_constructor        = false;
         this.is_destructor         = false;
@@ -492,6 +665,28 @@ public:
         this.base_ctor_args.push(arg);
     }
 
+    /// Whether the very method `m` is one of the methods `decl` holds: a
+    /// struct's, union's or class's own, or an impl block's.  Compared by
+    /// identity, never by name.
+    static is_method_of(m: MethodNode*, decl: ASTNode*) -> boolean {
+        if (decl == null) { return false; }
+        const empty: MethodNode*[] = [];
+        mut methods: &MethodNode*[] = &empty;
+        if (decl.kind == NodeKind::StructDeclaration) {
+            methods = &(decl as StructDeclNode*).methods;
+        } else if (decl.kind == NodeKind::UnionDeclaration) {
+            methods = &(decl as UnionDeclNode*).methods;
+        } else if (decl.kind == NodeKind::ClassDeclaration) {
+            methods = &(decl as ClassDeclNode*).methods;
+        } else if (decl.kind == NodeKind::ImplementationBlock) {
+            methods = &(decl as ImplBlockNode*).methods;
+        }
+        for (mut k: i64 = 0; k < methods.length; k++) {
+            if (methods[k] == m) { return true; }
+        }
+        return false;
+    }
+
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
     }
@@ -501,6 +696,9 @@ public:
 type class IntrinsicDeclNode : DeclarationNode {
 public:
     name:                    SymbolStr;
+    /// The definition this declaration is, stamped by the name layer when
+    /// it declares the intrinsic, as a function's is.
+    def:                     DefId;
     parameters:              VarDeclNode*[];
     body:                    BlockStmtNode*;
     resolved_return_type:    TypeRef;
@@ -510,6 +708,7 @@ public:
     IntrinsicDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::IntrinsicDeclaration, span) {
         this.name                    = name;
+        this.def                     = DefId::invalid();
         this.parameters              = [];
         this.body                    = null;
         this.resolved_return_type    = TypeRef::invalid();
@@ -540,12 +739,15 @@ public:
     name:            SymbolStr;
     type_annotation: TypeAnnotation*;
     resolved_type:   TypeRef;
+    /// The definition this constant is, stamped by NameDeclaration.
+    def:             DefId;
 
     IntrinsicConstDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::IntrinsicConstDeclaration, span) {
         this.name            = name;
         this.type_annotation = null;
         this.resolved_type   = TypeRef::invalid();
+        this.def             = DefId::invalid();
     }
 
     has_resolved_type() -> boolean        { return this.resolved_type.is_valid(); }
@@ -559,9 +761,16 @@ public:
 
 type class ImportDeclNode : DeclarationNode {
 public:
-    module_path:      string;        // qualified path (e.g., "Compiler::AST")
+    /// The module path as written (`compiler::ast`): a spelling, which the
+    /// name layer turns into the module it names.
+    module_path:      SymbolStr;
     alias:            SymbolStr;     // identifier name for `import ... as Alias`
     specific_imports: SymbolStr[];
+    /// The name each brace entry is bound under, parallel to
+    /// `specific_imports`: `import M::{ parse as toml_parse }` binds the
+    /// declaration `parse` names under `toml_parse`.  Empty when the entry
+    /// has no `as`.
+    specific_aliases: SymbolStr[];
     style:            ImportStyle;
 
     /// Per-segment metadata for `import std::collections::array;`:
@@ -575,22 +784,51 @@ public:
     path_segments:      SymbolStr[];
     path_segment_spans: SourceSpan[];
 
-    ImportDeclNode(module_path: string, style: ImportStyle, span: SourceSpan)
+    /// `export` rather than `import`: the same form, granting the same names,
+    /// but granting them to this module's importers as well as to this module.
+    /// One node kind for both because an export form IS an import form minus
+    /// the wildcard - a second class would duplicate the visitor, cloner,
+    /// dumper and validator arms to say the same thing twice.
+    ///
+    /// The wildcard is rejected in the parser, not represented and filtered
+    /// later: a glob re-export is the one form under which an importer's
+    /// in-scope set changes when a CHILD module gains a declaration, with the
+    /// new name written down at neither end.
+    is_export: boolean;
+
+    /// `import A::B as C;`: the one entry was written as the path's last
+    /// segment rather than in braces, so the path names either an item `B`
+    /// of the module `A` or the module `A::B`, and naming both is refused.
+    /// `import A::{ B as C };` is written for the item.
+    path_entry: boolean;
+
+    /// The positions in `specific_imports` of an `export`'s entries that
+    /// name a declaration the module marks `private` and no sub-module, as
+    /// the name layer found them where the export is written.  E0241 is
+    /// reported from these once the graph is whole.
+    private_export_entries: i64[];
+
+    ImportDeclNode(module_path: SymbolStr, style: ImportStyle, span: SourceSpan)
         : DeclarationNode(NodeKind::ImportDeclaration, span) {
         this.module_path        = module_path;
         this.alias              = SymbolStr::empty();
         this.specific_imports   = [];
+        this.specific_aliases   = [];
         this.style              = style;
         this.path_segments      = [];
         this.path_segment_spans = [];
+        this.is_export          = false;
+        this.path_entry         = false;
+        this.private_export_entries = [];
     }
 
     has_alias() -> boolean { return !this.alias.is_empty(); }
 
     set_alias(a: SymbolStr) -> void { this.alias = a; }
 
-    add_specific_import(name: SymbolStr) -> void {
+    add_specific_import(name: SymbolStr, alias: SymbolStr) -> void {
         this.specific_imports.push(name);
+        this.specific_aliases.push(alias);
     }
 
     add_path_segment(name: SymbolStr, span: SourceSpan) -> void {
@@ -641,7 +879,7 @@ public:
 /// SERIALIZER can render shift/mask or reinterpret accessor methods over the
 /// blob - restoring field access that the opaque-blob lowering otherwise drops.
 /// A dedicated channel kept off the core method list (like binding_namespace,
-/// this is set ONLY by `Compiler::Bindgen`); the inline `extern module := "C"`
+/// this is set ONLY by `compiler::bindgen`); the inline `extern module := "C"`
 /// path ignores it and keeps the blob opaque, so only the vendor path emits
 /// accessors.  Unused per-kind fields stay at their defaults.
 type struct BindingAccessor {
@@ -693,19 +931,33 @@ public:
     repr_packed:      boolean;
     repr_transparent: boolean;
     min_alignment:    u64;
+    /// The index of the field the async lowering stores an `async` method's
+    /// receiver in, on the future struct it mints for that method; -1 on
+    /// every other declaration.  The lowering held the field when it
+    /// minted it, and this is how a reader gets it back - by the slot,
+    /// never by the spelling the lowering happened to give it.
+    async_recv_slot:  i64;
     /// `public` (the default at top level) vs `private`. Drives cross-module
     /// visibility: a `private` type is only nameable within its own module.
     is_public:        boolean;
     /// When set, this struct is qualified under this extern-module *alias*
     /// namespace instead of the importing file's `namespace`.  Set ONLY by
-    /// the C-header import engine (`Compiler::Bindgen`) for a struct/union
+    /// the C-header import engine (`compiler::bindgen`) for a struct/union
     /// synthesized from an `extern module probe := "C" { #include ... }`
     /// block, so it registers as `probe::Point` just like the block's extern
     /// functions register as `probe::fn`.  Empty for every parser-produced
-    /// struct.  A dedicated channel kept separate from `source_module` (which
-    /// the monomorphizer uses for spec namespaces).  See
-    /// CompilationContext::qualify_binding_sym.
-    binding_namespace: SymbolStr;
+    /// struct.  See CompilationContext::qualify_binding_sym.
+    binding_namespace: ModulePath;
+    /// `where T: Bound` constraints on the declaration's own parameters.
+    /// Empty without a where clause.  Checked once per instantiation, where
+    /// the arguments are decided.
+    where_bounds:      TraitBound[];
+    /// The id this declaration registered under, stamped by the type-
+    /// declaration stage (a specialization's by its injector, a synthesized
+    /// declaration's by its synthesizer).  Invalid until then.  A reader
+    /// that holds the node asks the index by this id; it never re-derives
+    /// the key from the name and the file.
+    def:               DefId;
 
     StructDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::StructDeclaration, span) {
@@ -718,8 +970,11 @@ public:
         this.repr_packed       = false;
         this.repr_transparent  = false;
         this.min_alignment     = 0;
+        this.async_recv_slot   = -1;
         this.is_public         = true;
-        this.binding_namespace = SymbolStr::empty();
+        this.binding_namespace = ModulePath::none();
+        this.where_bounds      = [];
+        this.def               = DefId::invalid();
     }
 
     add_accessor(acc: BindingAccessor) -> void {
@@ -727,8 +982,9 @@ public:
     }
 
     is_generic() -> boolean { return this.generic_params.length > 0; }
-    set_name(n: SymbolStr) -> void { this.name = n; }
+    add_where_bound(mut &this, bound: TraitBound) -> void { this.where_bounds.push(bound); }
     set_public(p: boolean) -> void { this.is_public = p; }
+    set_async_recv_slot(slot: i64) -> void { this.async_recv_slot = slot; }
 
     add_generic_param(param: GenericParamNode*) -> void {
         this.generic_params.push(param);
@@ -768,8 +1024,17 @@ public:
     min_alignment:    u64;
     /// `public`/`private` - see StructDeclNode.is_public.
     is_public:        boolean;
-    /// C-import alias namespace - see StructDeclNode.binding_namespace.
-    binding_namespace: SymbolStr;
+    /// C-import alias module - see StructDeclNode.binding_namespace.
+    binding_namespace: ModulePath;
+    /// `where T: Bound` constraints on the declaration's own parameters;
+    /// checked once per instantiation.
+    where_bounds:      TraitBound[];
+    /// The id this declaration registered under, stamped by the type-
+    /// declaration stage (a specialization's by its injector, a synthesized
+    /// declaration's by its synthesizer).  Invalid until then.  A reader
+    /// that holds the node asks the index by this id; it never re-derives
+    /// the key from the name and the file.
+    def:               DefId;
 
     UnionDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::UnionDeclaration, span) {
@@ -782,11 +1047,13 @@ public:
         this.repr_transparent  = false;
         this.min_alignment     = 0;
         this.is_public         = true;
-        this.binding_namespace = SymbolStr::empty();
+        this.binding_namespace = ModulePath::none();
+        this.where_bounds      = [];
+        this.def               = DefId::invalid();
     }
 
     is_generic() -> boolean { return this.generic_params.length > 0; }
-    set_name(n: SymbolStr) -> void { this.name = n; }
+    add_where_bound(mut &this, bound: TraitBound) -> void { this.where_bounds.push(bound); }
     set_public(p: boolean) -> void { this.is_public = p; }
 
     add_generic_param(param: GenericParamNode*) -> void {
@@ -814,6 +1081,17 @@ public:
     fields:         FieldDeclNode*[];
     methods:        MethodNode*[];
     base_class:     SymbolStr;
+    /// What `base_class` refers to, stamped by NameResolution from the scope
+    /// ENCLOSING the class - the class body would shadow the base's own name.
+    ///
+    /// The spelling alone cannot answer: the parser accepts one identifier, so
+    /// a base is always a bare leaf, and the declaration it names may live in a
+    /// module whose own last segment repeats it (`compiler::types::type_base::Type`).
+    /// Only the scope the class was WRITTEN in distinguishes those.
+    base_res:       ResSlot;
+    /// The base spelling's own span, so a diagnostic about it underlines the
+    /// base rather than the whole declaration.
+    base_span:      SourceSpan;
     /// Layout attributes - see StructDeclNode for the full description.
     repr_c:           boolean;
     repr_packed:      boolean;
@@ -821,6 +1099,15 @@ public:
     min_alignment:    u64;
     /// `public`/`private` - see StructDeclNode.is_public.
     is_public:        boolean;
+    /// `where T: Bound` constraints on the declaration's own parameters;
+    /// checked once per instantiation.
+    where_bounds:     TraitBound[];
+    /// The id this declaration registered under, stamped by the type-
+    /// declaration stage (a specialization's by its injector, a synthesized
+    /// declaration's by its synthesizer).  Invalid until then.  A reader
+    /// that holds the node asks the index by this id; it never re-derives
+    /// the key from the name and the file.
+    def:               DefId;
 
     ClassDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::ClassDeclaration, span) {
@@ -829,16 +1116,20 @@ public:
         this.fields           = [];
         this.methods          = [];
         this.base_class       = SymbolStr::empty();
+        this.base_res         = ResSlot::Pending;
+        this.base_span        = SourceSpan::none();
         this.repr_c           = false;
         this.repr_packed      = false;
         this.repr_transparent = false;
         this.min_alignment    = 0;
         this.is_public        = true;
+        this.where_bounds     = [];
+        this.def              = DefId::invalid();
     }
 
     is_generic() -> boolean     { return this.generic_params.length > 0; }
+    add_where_bound(mut &this, bound: TraitBound) -> void { this.where_bounds.push(bound); }
     has_base_class() -> boolean { return this.base_class.is_valid(); }
-    set_name(n: SymbolStr) -> void { this.name = n; }
     set_public(p: boolean) -> void { this.is_public = p; }
 
     add_generic_param(param: GenericParamNode*) -> void {
@@ -853,8 +1144,23 @@ public:
         this.methods.push(method);
     }
 
-    set_base_class(name: SymbolStr) -> void {
+    /// The span is taken with the name so a base cannot be recorded without
+    /// the location a diagnostic about it needs.
+    set_base_class(name: SymbolStr, span: SourceSpan) -> void {
         this.base_class = name;
+        this.base_span  = span;
+    }
+
+    /// Record what the base-class spelling refers to.  First answer wins, for
+    /// the reason every `Res` slot does: it states what the file that WROTE
+    /// the name can see, and a later walk stands in a different module.
+    set_base_res(r: Res) -> void {
+        this.base_res.answer(r);
+    }
+
+    /// What this class's base refers to, for a stage that needs it.
+    require_base_res(&this, site: string) -> Res {
+        return this.base_res.require(site);
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -879,9 +1185,23 @@ public:
     name:           SymbolStr;
     generic_params: GenericParamNode*[];
     methods:        FunctionDeclNode*[];
-    base_traits:    BaseTraitInfo[];
+    /// The supertraits written after the name (`type trait Step : Ord`),
+    /// each stamped with its identity by the name layer where it is written.
+    /// A reader asks `definition()`; the written path is never a key.
+    base_traits:    TraitRef[];
     /// Associated-type members (`type Item;`). Empty for traits without any.
     assoc_types:    AssocTypeDeclNode*[];
+    /// The id this declaration registered under, stamped by the type-
+    /// declaration stage (a specialization's by its injector, a synthesized
+    /// declaration's by its synthesizer).  Invalid until then.  A reader
+    /// that holds the node asks the index by this id; it never re-derives
+    /// the key from the name and the file.
+    def:               DefId;
+    /// The symbol the name layer's declaration pass bound this trait to.
+    /// Name resolution runs before `def` is stamped, and it is what answers
+    /// `This` inside the trait's own body.  Invalid on a declaration no
+    /// resolver walked.
+    sym_id:            SymbolID;
 
     TraitDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::TraitDeclaration, span) {
@@ -890,10 +1210,11 @@ public:
         this.methods        = [];
         this.base_traits    = [];
         this.assoc_types    = [];
+        this.def            = DefId::invalid();
+        this.sym_id         = SymbolID::invalid();
     }
 
     is_generic() -> boolean { return this.generic_params.length > 0; }
-    has_assoc_types() -> boolean { return this.assoc_types.length > 0; }
 
     add_generic_param(param: GenericParamNode*) -> void {
         this.generic_params.push(param);
@@ -903,18 +1224,43 @@ public:
         this.methods.push(method);
     }
 
-    add_base_trait(info: BaseTraitInfo) -> void {
-        this.base_traits.push(info);
+    add_base_trait(base: TraitRef) -> void {
+        this.base_traits.push(base);
     }
 
     add_assoc_type(decl: AssocTypeDeclNode*) -> void {
         this.assoc_types.push(decl);
     }
 
-    /// The associated-type decl named `n`, or null if the trait has none such.
-    lookup_assoc_type(&this, n: SymbolStr) -> AssocTypeDeclNode* {
+    /// An associated type is named by its leaf where a
+    /// projection is written (`I::Item`, `This::Item`), where an
+    /// implementation binds it (`type Item = i32;`), and where a trait's
+    /// `async` method's future is minted; each meets the trait's declaration
+    /// only by that leaf, and this is where the leaf becomes the type's
+    /// position among the trait's associated types, which every later
+    /// reader asks by instead.
+    ///
+    /// The position is what the sugar's positional trait arguments are
+    /// indexed by after the generic parameters.  Answers the first declared
+    /// associated type of the name, or -1 when the trait declares none.
+    assoc_type_index(&this, n: SymbolStr) -> i64 {
         for (mut i: i64 = 0; i < this.assoc_types.length; i++) {
-            if (this.assoc_types[i].name.equals(n)) { return this.assoc_types[i]; }
+            if (this.assoc_types[i] != null && this.assoc_types[i].name.equals(n)) { return i; }
+        }
+        return -1;
+    }
+
+    /// How many positional slots the trait has: its generic parameters, then
+    /// its associated types.
+    slot_count(&this) -> i64 {
+        return this.generic_params.length + this.assoc_types.length;
+    }
+
+    /// The trait's method named `n`, or null if it declares none such; the
+    /// first by declaration order where the trait overloads the leaf.
+    lookup_method(&this, n: SymbolStr) -> FunctionDeclNode* {
+        for (mut i: i64 = 0; i < this.methods.length; i++) {
+            if (this.methods[i] != null && this.methods[i].name.equals(n)) { return this.methods[i]; }
         }
         return null;
     }
@@ -933,7 +1279,13 @@ public:
     resolved_target:   TypeRef;
     /// See StructDeclNode.binding_namespace: set only for a C-imported typedef
     /// synthesized into an extern module's alias namespace.
-    binding_namespace: SymbolStr;
+    binding_namespace: ModulePath;
+    /// The id this declaration registered under, stamped by the type-
+    /// declaration stage (a specialization's by its injector, a synthesized
+    /// declaration's by its synthesizer).  Invalid until then.  A reader
+    /// that holds the node asks the index by this id; it never re-derives
+    /// the key from the name and the file.
+    def:               DefId;
 
     TypeAliasDeclNode(alias_name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::TypeAliasDeclaration, span) {
@@ -941,7 +1293,8 @@ public:
         this.generic_params    = [];
         this.target_annotation = null;
         this.resolved_target   = TypeRef::invalid();
-        this.binding_namespace = SymbolStr::empty();
+        this.binding_namespace = ModulePath::none();
+        this.def               = DefId::invalid();
     }
 
     is_generic() -> boolean          { return this.generic_params.length > 0; }
@@ -951,7 +1304,6 @@ public:
         this.generic_params.push(param);
     }
     set_target_annotation(a: TypeAnnotation*) -> void  { this.target_annotation = a; }
-    set_resolved_target(t: TypeRef) -> void            { this.resolved_target = t; }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -979,7 +1331,16 @@ public:
     is_public:        boolean;
     /// See StructDeclNode.binding_namespace: set only for a C-imported enum
     /// synthesized into an extern module's alias namespace.
-    binding_namespace: SymbolStr;
+    binding_namespace: ModulePath;
+    /// `where T: Bound` constraints on the declaration's own parameters;
+    /// checked once per instantiation.
+    where_bounds:      TraitBound[];
+    /// The id this declaration registered under, stamped by the type-
+    /// declaration stage (a specialization's by its injector, a synthesized
+    /// declaration's by its synthesizer).  Invalid until then.  A reader
+    /// that holds the node asks the index by this id; it never re-derives
+    /// the key from the name and the file.
+    def:               DefId;
 
     EnumDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::EnumDeclaration, span) {
@@ -990,12 +1351,13 @@ public:
         this.repr_c                  = false;
         this.min_alignment           = 0;
         this.is_public               = true;
-        this.binding_namespace       = SymbolStr::empty();
+        this.binding_namespace       = ModulePath::none();
+        this.where_bounds            = [];
+        this.def                     = DefId::invalid();
     }
 
     is_generic() -> boolean { return this.generic_params.length > 0; }
-    has_discriminant_annotation(&this) -> boolean { return this.discriminant_annotation != null; }
-    set_name(n: SymbolStr) -> void { this.name = n; }
+    add_where_bound(mut &this, bound: TraitBound) -> void { this.where_bounds.push(bound); }
     set_public(p: boolean) -> void { this.is_public = p; }
 
     add_generic_param(param: GenericParamNode*) -> void {
@@ -1008,6 +1370,47 @@ public:
 
     set_discriminant_annotation(mut &this, ann: TypeAnnotation*) -> void {
         this.discriminant_annotation = ann;
+    }
+
+    /// A compile-time constant written `E::V` is
+    /// folded off the enum's declaration, which is what the constant table
+    /// holds, and meets the variant only by the leaf written past the
+    /// enum's path; this is where that leaf becomes the variant's position
+    /// among the declared variants, the index `variant_tags` answers by.
+    ///
+    /// The position of the first declared variant named `leaf`, or -1.
+    variant_position(&this, leaf: SymbolStr) -> i64 {
+        for (mut i: i64 = 0; i < this.variants.length; i++) {
+            const v: EnumVariantNode* = this.variants[i];
+            if (v != null && v.name.id == leaf.id) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /// The discriminant of each variant, by variant index.
+    ///
+    /// C semantics: an explicit `= N` sets that variant's tag and reseeds the
+    /// running counter to `N + 1`, and unannotated variants increment from
+    /// there.  That is what lets `Foo { A = 4; B; }` produce tags 4 and 5.
+    ///
+    /// One home, because two readers need the same answer and they run in
+    /// different passes: the type arena stores a tag on every variant, and a
+    /// compile-time constant fold reads one through `Enum::Variant`.  A null
+    /// slot keeps its index without consuming a tag.
+    variant_tags(&this) -> i64[] {
+        mut tags: i64[] = [];
+        mut next_tag: i64 = 0;
+        for (mut i: i64 = 0; i < this.variants.length; i++) {
+            const v: EnumVariantNode* = this.variants[i];
+            if (v == null) { tags.push(0); continue; }
+            mut tag: i64 = next_tag;
+            if (v.has_value) { tag = v.explicit_value; }
+            next_tag = tag + 1;
+            tags.push(tag);
+        }
+        return tags;
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -1045,18 +1448,40 @@ public:
     }
 }
 
-
 type class ImplBlockNode : DeclarationNode {
 public:
     target_type:    SymbolStr;
-    /// The qualified target name as DI/sema registered it (e.g. `i32` ->
-    /// `std::core::hash::i32` for an impl in `namespace std::core::hash`,
-    /// or `std::collections::array::Array_i32` for spec'd structs).  Set
-    /// by the TypeResolution pass when registering the impl in the DI.
-    /// Used by the monomorphizer when registering newly-created spec
-    /// methods, so the spec's DI keys line up with the keys sema-time
-    /// registration used for the template.  Empty until stamped.
-    qualified_target_name: SymbolStr;
+    /// What `target_type` names, stamped by NameResolution from the scope the
+    /// impl head was written in.  An impl head names one type outright, so
+    /// there is no trailing segment and `TypeRelative` never appears here.
+    ///
+    /// A clone does NOT inherit it: specialization rebinds WHICH type the
+    /// head is for, so a stamp naming the template, beside a `target_type`
+    /// the monomorphizer rewrote to the instantiation, would bind the head
+    /// back to the template.  On a clone `spec_owner` carries which
+    /// specialization the head is for.
+    ///
+    /// A written primitive target IS answered, as `PrimTy`.  It names no
+    /// declaration - a primitive owns members without being declared
+    /// anywhere - so a consumer gets an answer it must match rather than a
+    /// name it can look up, and the spelling is the registration key.
+    res:            ResSlot;
+    /// The SPECIALIZATION a cloned head is for, by arena id, recorded by the
+    /// monomorphizer when it places the clone's methods under the
+    /// instantiation.  The stamp beside it is withheld on a clone (above),
+    /// so this is the carrier of which instantiation the head means - the
+    /// same fact `target_type` is rewritten to spell, without the round trip
+    /// through a name.  Invalid on every head no monomorphizer placed.
+    spec_owner:     TypeRef;
+    /// The definition of the trait this block implements, off the head's
+    /// stamp when the methods' `origin_trait` is stamped.  Invalid on an
+    /// inherent impl, and until stamped.
+    ///
+    /// This is the trait's IDENTITY, and the only sound basis for asking
+    /// whether two impls provide the same trait: two traits may share a leaf,
+    /// and one trait may be spelled two ways.  The trait registries are asked
+    /// by it.
+    trait_def: DefId;
     generic_params: GenericParamNode*[];
     /// The target type's own type arguments as written after `for`
     /// (the `<T>` in `implement<T> trait Iterator<T> for Range<T>`).
@@ -1066,6 +1491,22 @@ public:
     /// non-generic targets and inherent impls.
     target_args:    TypeAnnotation*[];
     methods:        MethodNode*[];
+    /// The trait's methods as this block provides them, by position: entry
+    /// `s` is the index in `methods` of the method that answers the trait's
+    /// `s`-th declared method - written here, or the copy of its default -
+    /// and -1 where the block provides none.  Filled the first time the
+    /// block is asked (`GenericRegistry::trait_item_method`), the one place
+    /// a trait's method is matched to an implementation's by name.  Empty
+    /// until then, and on an inherent impl; a copy of the block starts
+    /// empty and fills its own.
+    trait_item_methods: i64[];
+    /// The trait's arguments as this head writes them, resolved in the
+    /// block's own parameters (`[i32]` for `implement trait Conv<i32> for
+    /// S`); a specialization's clone holds them substituted.  They are part
+    /// of each method's link symbol, so one type implementing a trait at
+    /// two arguments links two methods.  Empty for a trait that takes none,
+    /// and for an inherent block.
+    trait_arg_types: TypeRef[];
     /// The trait being implemented. Null = inherent impl (existing form).
     /// Non-null = `implement [<T>] trait <Path>[<args>] for <Target>` form.
     /// Holds the trait reference as a TypeAnnotation so the trait's own
@@ -1094,6 +1535,10 @@ public:
     /// an unresolved `Named("A")` that would reject the spec (E0636).  Empty on
     /// template impls and on impls whose element is already a struct parameter.
     derived_param_names: SymbolStr[];
+    /// The symbol each derived parameter was declared as, index-aligned
+    /// with the names; what a body's stamped `A` is matched by.  The name
+    /// beside it mints the arena's parameter type and nothing else.
+    derived_param_syms:  SymbolID[];
     derived_param_types: TypeRef[];
 
     /// Associated-type bindings this impl provides for the trait, as written
@@ -1103,22 +1548,33 @@ public:
     ///     generic params and 1 associated type, `implement Iterator<A> for X`
     ///     binds `Item := A` (see the desugar in TypeResolution).
     /// `TypeAnnotation::Projection(This::Item)` resolves through these.
+    /// A binding is read by its position among the trait's associated types
+    /// (`assoc_binding_slots`): a written one is placed through the
+    /// `assoc-type` door the first time the block is asked, and a writer that
+    /// already holds the position records it with no name.  -1 is unplaced.
     assoc_binding_names:       SymbolStr[];
+    assoc_binding_slots:       i64[];
     assoc_binding_annotations: TypeAnnotation*[];
 
     ImplBlockNode(target_type: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::ImplementationBlock, span) {
         this.target_type           = target_type;
-        this.qualified_target_name = SymbolStr::empty();
+        this.res                   = ResSlot::Pending;
+        this.spec_owner            = TypeRef::invalid();
+        this.trait_def             = DefId::invalid();
         this.generic_params        = [];
         this.target_args           = [];
         this.methods               = [];
+        this.trait_item_methods    = [];
+        this.trait_arg_types       = [];
         this.trait_annotation      = null;
         this.where_bounds          = [];
         this.target_type_span      = SourceSpan::none();
         this.derived_param_names   = [];
+        this.derived_param_syms    = [];
         this.derived_param_types   = [];
         this.assoc_binding_names       = [];
+        this.assoc_binding_slots       = [];
         this.assoc_binding_annotations = [];
     }
 
@@ -1128,7 +1584,69 @@ public:
 
     is_generic() -> boolean { return this.generic_params.length > 0; }
     is_trait_impl(&this) -> boolean { return this.trait_annotation != null; }
+
+    /// The method this block provides for its trait's `slot`-th declared
+    /// method, or null when it provides none or the table is not filled.
+    trait_item_method(&this, slot: i64) -> MethodNode* {
+        if (slot < 0 || slot >= this.trait_item_methods.length) { return null; }
+        const at: i64 = this.trait_item_methods[slot];
+        if (at < 0 || at >= this.methods.length) { return null; }
+        return this.methods[at];
+    }
     set_target_type(n: SymbolStr) -> void { this.target_type = n; }
+
+    /// The definition the head's target names, off its stamp; invalid for a
+    /// primitive (declared nowhere) and for a monomorphized clone (whose
+    /// head carries no stamp - a specialization is not a definition).
+    target_def(&this) -> DefId {
+        return match (this.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(d) => { d }
+                    _           => { DefId::invalid() }
+                }
+            }
+            _ => { DefId::invalid() }
+        };
+    }
+
+    /// The name the target is registered under, and so the key every
+    /// registry keyed by a type's name answers to - what codegen declares
+    /// this block's methods under and what it emits their bodies against,
+    /// which must be one name or the methods are declared under one key and
+    /// defined under another.
+    ///
+    /// Three answers and no fourth: the stamp's canonical name for a declared
+    /// type (which puts a cross-module impl under the DEFINING module's key:
+    /// `implement trait FmtWrite for struct Stdout` written in `fmt::write`
+    /// belongs to `io::stdio::Stdout`); a primitive's own spelling (a
+    /// primitive is declared nowhere, so its spelling is its key); and, for a
+    /// head the name layer did not stamp - a monomorphized clone, whose
+    /// cloner withholds `res` because a specialization is not a definition
+    /// and no `Res` can name one - the specialization the monomorphizer
+    /// placed it under, by arena id (`spec_owner`), resolved to its
+    /// registered name.  A head with none of the three names nothing; there
+    /// is no spelling to fall back to, because a spelling looked up by the
+    /// module the compiler is standing in is the ambient-cursor defect.
+    target_key(&this, arena: TypeArena*) -> SymbolStr {
+        mut answer: SymbolStr = SymbolStr::empty();
+        mut stamped: boolean = false;
+        match (this.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(d)    => { answer = arena.defs.path_of(d).spelling(); stamped = true; }
+                    Res::PrimTy(n) => { answer = n; stamped = true; }
+                    _              => { }
+                }
+            }
+            _ => { }
+        }
+        if (!stamped && this.spec_owner.is_valid() && arena != null) {
+            answer = arena.get_qualified_name(this.spec_owner).spelling();
+        }
+        return answer;
+    }
+
 
     set_target_type_span(mut &this, sp: SourceSpan) -> void {
         this.target_type_span = sp;
@@ -1136,6 +1654,11 @@ public:
 
     add_generic_param(param: GenericParamNode*) -> void {
         this.generic_params.push(param);
+    }
+
+    /// Record what the impl head's target type name refers to.  First wins.
+    set_res(mut &this, r: Res) -> void {
+        this.res.answer(r);
     }
 
     set_target_args(mut &this, args: TypeAnnotation*[]) -> void {
@@ -1156,19 +1679,41 @@ public:
 
     /// Record a concrete trait-element binding recovered at impl-spec time.
     /// See `derived_param_names` / `derived_param_types`.
-    add_derived_param(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+    add_derived_param(mut &this, sym: SymbolID, name: SymbolStr, ty: TypeRef) -> void {
+        this.derived_param_syms.push(sym);
         this.derived_param_names.push(name);
         this.derived_param_types.push(ty);
     }
 
-    /// Concrete element type previously cached for `name`, or invalid.
-    lookup_derived_param(&this, name: SymbolStr) -> TypeRef {
-        for (mut i: i64 = 0; i < this.derived_param_names.length; i++) {
-            if (this.derived_param_names[i].equals(name)) {
+    /// Concrete element type previously cached for the parameter `sym`, or
+    /// invalid.
+    lookup_derived_param(&this, sym: SymbolID) -> TypeRef {
+        for (mut i: i64 = 0; i < this.derived_param_syms.length; i++) {
+            if (this.derived_param_syms[i].equals(sym)) {
                 return this.derived_param_types[i];
             }
         }
         return TypeRef::invalid();
+    }
+
+    /// The head as written, `Trait<Args> for Target<Args>`, for a diagnostic
+    /// that names this implementation beside another; the where-clause is
+    /// not part of it, because a head is what selects and a bound only
+    /// narrows.  Shapes `TypeAnnotation::spell` does not spell read as `..`.
+    spell_head(&this, intern: InternTable*) -> string {
+        mut out: string = if (this.trait_annotation != null) {
+            TypeAnnotation::spell(this.trait_annotation, intern) + " for "
+        } else { "" };
+        out = out + intern.resolve(this.target_type);
+        if (this.target_args.length > 0) {
+            out = out + "<";
+            for (mut i: i64 = 0; i < this.target_args.length; i++) {
+                if (i > 0) { out = out + ", "; }
+                out = out + TypeAnnotation::spell(this.target_args[i], intern);
+            }
+            out = out + ">";
+        }
+        return out;
     }
 
     /// Record an associated-type binding (`type Item = T;` or desugared from
@@ -1176,17 +1721,59 @@ public:
     /// resolved against the impl's generic params during type resolution.
     add_assoc_binding(mut &this, name: SymbolStr, ann: TypeAnnotation*) -> void {
         this.assoc_binding_names.push(name);
+        this.assoc_binding_slots.push(-1);
         this.assoc_binding_annotations.push(ann);
     }
 
-    /// The annotation bound for associated type `name`, or null if unbound.
-    lookup_assoc_binding(&this, name: SymbolStr) -> TypeAnnotation* {
-        for (mut i: i64 = 0; i < this.assoc_binding_names.length; i++) {
-            if (this.assoc_binding_names[i].equals(name)) {
-                return this.assoc_binding_annotations[i];
+    /// Record a binding for the trait's `slot`-th associated type, by a
+    /// writer that holds the position (the positional header, a lowering
+    /// that minted the type).
+    bind_assoc_slot(mut &this, slot: i64, ann: TypeAnnotation*) -> void {
+        this.assoc_binding_names.push(SymbolStr::empty());
+        this.assoc_binding_slots.push(slot);
+        this.assoc_binding_annotations.push(ann);
+    }
+
+    /// The annotation this block binds `tdecl`'s `slot`-th associated type
+    /// to, or null when it binds none.  `tdecl` is the block's trait; a
+    /// written binding is placed through the `assoc-type` door here, and one
+    /// naming no associated type of the trait stays unplaced - the trait may
+    /// still gain the type it names (an `async` method's future is declared
+    /// on the trait by a later desugar).
+    assoc_binding_at(mut &this, tdecl: TraitDeclNode*, slot: i64) -> TypeAnnotation* {
+        if (tdecl == null || slot < 0) { return null; }
+        for (mut i: i64 = 0; i < this.assoc_binding_slots.length; i++) {
+            if (this.assoc_binding_slots[i] < 0 && this.assoc_binding_names[i].is_valid()) {
+                this.assoc_binding_slots[i] = tdecl.assoc_type_index(this.assoc_binding_names[i]);
             }
+            if (this.assoc_binding_slots[i] == slot) { return this.assoc_binding_annotations[i]; }
         }
         return null;
+    }
+
+    /// The annotation this impl gives `tdecl`'s positional slot `slot`: the
+    /// trait's generic parameters first, then its associated types in
+    /// declaration order - the order a bound's trait arguments are written in
+    /// (`where I: Iterator<A>` names `Item` at slot 0).  An associated slot is
+    /// the header's argument when the header writes one (`Iterator<i32>`),
+    /// else the body's `type Item = i32;`; both are the one binding, spelled
+    /// in either of the two places the language allows.  Reading the header
+    /// alone left a body-bound impl with no answer, so an adapter over it
+    /// (`TakeIter<Count>`) derived nothing and was never specialized.
+    trait_slot_annotation(mut &this, tdecl: TraitDeclNode*, slot: i64) -> TypeAnnotation* {
+        if (tdecl == null || slot < 0) { return null; }
+        if (this.trait_annotation != null) {
+            match (*this.trait_annotation) {
+                TypeAnnotation::Generic(g) => {
+                    if (slot < g.args.length) { return g.args[slot]; }
+                }
+                _ => {}
+            }
+        }
+        const assoc_idx: i64 = slot - tdecl.generic_params.length;
+        if (assoc_idx < 0 || assoc_idx >= tdecl.assoc_types.length) { return null; }
+        if (tdecl.assoc_types[assoc_idx] == null) { return null; }
+        return this.assoc_binding_at(tdecl, assoc_idx);
     }
 }
 
@@ -1195,6 +1782,16 @@ type class ExternBlockNode : DeclarationNode {
 public:
     linkage_type:    string;
     namespace_alias: SymbolStr;
+    /// The canonical namespace of a C-import block's alias: the declaring
+    /// module's, with the alias under it (`<mod>::cit`).  The alias is a
+    /// binding of the module that wrote it - two modules each writing
+    /// `extern module libc as cit;` get two namespaces, as two `extern crate
+    /// x as y` do - and every declaration the block brings in (its
+    /// functions, and the types and constants the import engine
+    /// synthesizes, through their `binding_namespace`) is keyed under this
+    /// one.  Written once, by the import engine, before any name is
+    /// declared; none on a block that is not a C import.
+    binding_namespace: ModulePath;
     include_paths:   string[];
     /// Parallel to `include_paths`: true for an angle-bracket system
     /// include (`#include <stdio.h>`, resolved via the C preprocessor's
@@ -1202,14 +1799,28 @@ public:
     /// "foo.h"`, resolved relative to the importing file's directory).
     include_is_system: boolean[];
     functions:       FunctionDeclNode*[];
+    /// Imported globals declared in this block (`mut errno: i32;`).  Held here
+    /// so the block owns what it declared, but HOISTED into the top-level
+    /// statement stream by the parser: they are globals whose storage lives in
+    /// another object, and every later pass already knows how to handle a
+    /// top-level global.  Teaching each of those passes to also look inside an
+    /// extern block would be the same rule written several times.
+    globals:         VarDeclNode*[];
 
     ExternBlockNode(linkage_type: string, span: SourceSpan)
         : DeclarationNode(NodeKind::ExternBlock, span) {
         this.linkage_type    = linkage_type;
         this.namespace_alias = SymbolStr::empty();
+        this.binding_namespace = ModulePath::none();
         this.include_paths   = [];
         this.include_is_system = [];
         this.functions       = [];
+        this.globals         = [];
+    }
+
+    /// Record an imported global declared inside this block.
+    add_global(mut &this, node: VarDeclNode*) -> void {
+        this.globals.push(node);
     }
 
     /// Whether this is a CImport block (extern module name := "C" { #include ... })
@@ -1264,7 +1875,6 @@ public:
 
     has_default_value() -> boolean   { return this.default_value != null; }
     has_type_annotation() -> boolean { return this.type_annotation != null; }
-    has_resolved_type() -> boolean   { return this.resolved_type.is_valid(); }
 
     set_visibility(v: Visibility) -> void           { this.visibility = v; }
     set_default_value(v: ExpressionNode*) -> void   { this.default_value = v; }
@@ -1280,7 +1890,11 @@ public:
 type class GenericParamNode : DeclarationNode {
 public:
     name:               SymbolStr;
-    constraints:        SymbolStr[];
+    /// The symbol the name layer bound this parameter to, and the payload of
+    /// every `Res::GenericParam` stamped on a reference to it.  Invalid until
+    /// the declaration is resolved; a clone carries its template's, because
+    /// the clone's syntax is the template's and a `Res` names a definition.
+    sym_id:             SymbolID;
     /// Default type annotation for `<T, A = DefaultType>`. Null when no
     /// default is provided. Sema substitutes this when the param is omitted
     /// at instantiation time. Lifetime parallels the rest of the AST node.
@@ -1289,12 +1903,12 @@ public:
     GenericParamNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::GenericParamDeclaration, span) {
         this.name               = name;
-        this.constraints        = [];
+        this.sym_id             = SymbolID::invalid();
         this.default_annotation = null;
     }
 
-    add_constraint(c: SymbolStr) -> void {
-        this.constraints.push(c);
+    set_sym_id(mut &this, id: SymbolID) -> void {
+        this.sym_id = id;
     }
 
     has_default_annotation(&this) -> boolean {

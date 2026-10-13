@@ -56,24 +56,32 @@
 
 namespace std::future::reactor;
 
-import core::result;
-import core::ptr;
-import core::drop;
-import alloc::layout;
-import alloc::allocator;
-import sync::atomic;
-import ffi::libc;
-import sys::syscall;
-import core::mem;
-import future::waker;
-import time::clock;
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::ptr;
+import std::core::ptr::{ NonNull };
+import std::core::drop;
+import std::alloc::layout;
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator;
+import std::alloc::allocator::{ GlobalAlloc };
+import std::sync::atomic;
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::ffi::libc;
+import std::ffi::libc::{ EpollOp };
+import std::sys::syscall;
+import std::core::mem;
+import std::future::waker;
+import std::future::waker::{ Waker };
+import std::time::clock;
+import std::time::clock::{ Instant };
 
 
 /// Interest/readiness bits. One `register` call arms exactly one direction;
 /// a descriptor may have both armed at once (by two futures, or one future
 /// waiting on each half of a socket).
-const INTEREST_READ:  u32 = 1u32;
-const INTEREST_WRITE: u32 = 2u32;
+const INTEREST_READ:  u32 = 1;
+const INTEREST_WRITE: u32 = 2;
 
 /// Registration hash buckets. A power of two: the bucket index is `fd & 63`,
 /// which is near-perfect for descriptors (small, densely allocated integers).
@@ -154,8 +162,8 @@ type struct Reactor {
     static start() -> Reactor* {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut rt: Reactor* = null;
-        match (alloc.allocate(Layout::of<Reactor>())) {
-            Result::Ok(raw) => { rt = raw.cast<Reactor>().as_ptr(); }
+        match (alloc.allocate(Layout::of::<Reactor>())) {
+            Result::Ok(raw) => { rt = raw.cast::<Reactor>().as_ptr(); }
             Result::Err(_)  => { panic("Reactor::start: allocation failed", FILE, LINE); }
         }
         if (rt_mtx_init(&rt.mtx[0]) != 0) {
@@ -165,7 +173,7 @@ type struct Reactor {
         rt.poll_h   = -1;
         rt.kick_h   = -1;
         rt.aux_h    = -1;
-        rt.shutdown = Atomic<u8>::new(0);
+        rt.shutdown = Atomic::<u8>::new(0);
         rt.thread   = 0;
         rt.timers    = null;
         rt.timer_seq = 0;
@@ -210,8 +218,8 @@ type struct Reactor {
                 mut ww: Waker = Waker::take(&reg.write_waker);
                 reg.interest = 0;
                 rt.remove(reg);
-                wr.drop();
-                ww.drop();
+                mem::drop(wr);
+                mem::drop(ww);
             }
         }
         // Same shape for the deadline chain: unlink and free each block before
@@ -223,8 +231,8 @@ type struct Reactor {
             rt.timers = t.next;
             mut tw: Waker = Waker::take(&t.waker);
             mut alloc: GlobalAlloc = GlobalAlloc::new();
-            alloc.deallocate(NonNull::new(t as u8*), Layout::of<Timer>());
-            tw.drop();
+            alloc.deallocate(NonNull::new(t as u8*), Layout::of::<Timer>());
+            mem::drop(tw);
         }
         rt_backend_close(rt);
     }
@@ -235,7 +243,7 @@ type struct Reactor {
         if (rt == null) { return; }
         rt_mtx_destroy(&rt.mtx[0]);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(rt as u8*), Layout::of<Reactor>());
+        alloc.deallocate(NonNull::new(rt as u8*), Layout::of::<Reactor>());
     }
 
     /// The reactor driving the current thread's polls, or null if this thread is
@@ -366,8 +374,8 @@ type struct Reactor {
     register_timer(mut &this, deadline: i64, w: Waker) -> u64 {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut t: Timer* = null;
-        match (alloc.allocate(Layout::of<Timer>())) {
-            Result::Ok(raw) => { t = raw.cast<Timer>().as_ptr(); }
+        match (alloc.allocate(Layout::of::<Timer>())) {
+            Result::Ok(raw) => { t = raw.cast::<Timer>().as_ptr(); }
             Result::Err(_)  => { panic("Reactor::register_timer: allocation failed", FILE, LINE); }
         }
         t.deadline = deadline;
@@ -416,7 +424,7 @@ type struct Reactor {
         rt_mtx_unlock(&this.mtx[0]);
         if (found != null) {
             mut alloc: GlobalAlloc = GlobalAlloc::new();
-            alloc.deallocate(NonNull::new(found as u8*), Layout::of<Timer>());
+            alloc.deallocate(NonNull::new(found as u8*), Layout::of::<Timer>());
         }
         // `taken` drops here, outside the lock.
     }
@@ -461,7 +469,7 @@ type struct Reactor {
             rt_mtx_unlock(&this.mtx[0]);
             if (expired == null) { return; }
             mut alloc: GlobalAlloc = GlobalAlloc::new();
-            alloc.deallocate(NonNull::new(expired as u8*), Layout::of<Timer>());
+            alloc.deallocate(NonNull::new(expired as u8*), Layout::of::<Timer>());
             w.wake();
             // `w` drops at the end of this iteration, outside the lock.
         }
@@ -514,8 +522,8 @@ type struct Reactor {
     private insert(mut &this, fd: i32) -> Registration* {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut reg: Registration* = null;
-        match (alloc.allocate(Layout::of<Registration>())) {
-            Result::Ok(raw) => { reg = raw.cast<Registration>().as_ptr(); }
+        match (alloc.allocate(Layout::of::<Registration>())) {
+            Result::Ok(raw) => { reg = raw.cast::<Registration>().as_ptr(); }
             Result::Err(_)  => { panic("Reactor::register: registration allocation failed", FILE, LINE); }
         }
         reg.fd            = fd;
@@ -554,7 +562,7 @@ type struct Reactor {
         }
         rt_disarm(&this, reg);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(reg as u8*), Layout::of<Registration>());
+        alloc.deallocate(NonNull::new(reg as u8*), Layout::of::<Registration>());
     }
 }
 
@@ -918,7 +926,7 @@ private function rt_backend_close(rt: Reactor*) -> void {
                 break;
             }
             if (removed == 0) { break; }
-            for (mut i: u32 = 0u32; i < removed; i = i + 1) {
+            for (mut i: u32 = 0; i < removed; i = i + 1) {
                 const e:   u8* = &entries[0] + ((i as i64) * 32);
                 const ovl: u8* = *((e + 8) as u64*) as u8*;
                 if (ovl != null) { afd_op_free(ovl as AfdOp*); }
@@ -932,7 +940,7 @@ private function rt_backend_close(rt: Reactor*) -> void {
 ![target(windows)]
 private function afd_op_free(op: AfdOp*) -> void {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(op as u8*), Layout::of<AfdOp>());
+    alloc.deallocate(NonNull::new(op as u8*), Layout::of::<AfdOp>());
 }
 
 /// Arm `reg` by issuing one AFD poll for its current interest. Any poll already
@@ -956,11 +964,11 @@ private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
 
     mut alloc: GlobalAlloc = GlobalAlloc::new();
     mut op: AfdOp* = null;
-    match (alloc.allocate(Layout::of<AfdOp>())) {
-        Result::Ok(raw) => { op = raw.cast<AfdOp>().as_ptr(); }
+    match (alloc.allocate(Layout::of::<AfdOp>())) {
+        Result::Ok(raw) => { op = raw.cast::<AfdOp>().as_ptr(); }
         Result::Err(_)  => { return false; }
     }
-    mem::zero<AfdOp>(op, 1);
+    mem::zero::<AfdOp>(op, 1);
     op.fd = reg.fd;
 
     // AFD_POLL_INFO { i64 Timeout; u32 NumberOfHandles; u32 Exclusive;
@@ -1026,7 +1034,7 @@ private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
         return 0;   // timed out, or the port reported an error: just wait again
     }
     mut out: i32 = 0;
-    for (mut i: u32 = 0u32; i < removed; i = i + 1) {
+    for (mut i: u32 = 0; i < removed; i = i + 1) {
         const e:   u8* = &entries[0] + ((i as i64) * 32);
         const ovl: u8* = *((e + 8) as u64*) as u8*;
         if (ovl == null) { continue; }        // the kick

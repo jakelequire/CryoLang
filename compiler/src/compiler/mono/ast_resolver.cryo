@@ -1,10 +1,9 @@
-/// Mono AST Resolver  (Compiler::Mono::AstResolver)
+/// Mono AST Resolver  (compiler::mono::ast_resolver)
 ///
 /// Post-clone re-resolution of a specialized AST: after `ASTSpecializer` clones a
 /// template and `ASTTypeSubstituter` rewrites its annotations to concrete names,
-/// every `resolved_type` field is invalid.  This collaborator fills them - 
-/// resolving fields, method signatures, and body locals against a resolution
-/// context built from the template's module - and performs compile-time
+/// every `resolved_type` field is invalid.  This collaborator fills them -
+/// resolving fields, method signatures, and body locals - and performs compile-time
 /// `static match` arm pruning (selecting the single live arm for the concrete
 /// substitution).
 ///
@@ -16,15 +15,50 @@
 /// types + report static-match errors) and a `MonoTraitSpecializer*` (for
 /// where-bound derivation + associated-type projection reduction).
 
-namespace Compiler::Mono::AstResolver;
+namespace compiler::mono::ast_resolver;
 
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration, Statement, Expression, Pattern };
-import Compiler::Types::{ Generic, UserDefined, Compound, Type, Arena, TypeRef, Substitution, Resolver };
-import Compiler::Diag;
-import Compiler::Diag::{ Sink, Diagnostic, SourceSpan };
-import Compiler::Resolver::{ InternTable, SymbolStr };
-import Compiler::Mono::{ State, TraitSpecializer };
+import compiler::ast;
+import compiler::ast::{
+    declaration, expression, node, NodeKind, pattern, statement, TypeAnnotation
+};
+import compiler::types::{
+    generic, user_defined, compound, type_base, arena, type_ref, substitution, resolver, TypeKind
+};
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
+import compiler::resolver::{ intern_table, symbol_str };
+import compiler::mono::{ state, trait_specializer };
+import compiler::types::generic_registry;
+import compiler::types::generic_registry::{ TemplateEntry };
+import std::fmt;
+import compiler::ast::declaration::{
+    ClassDeclNode, DeclarationNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
+    MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    ArrayAccessNode, BinaryExprNode, CallExprNode, CastExprNode, ExpressionNode,
+    IfExprNode, MatchExprNode, MemberAccessNode, StaticMatchExprNode, TernaryExprNode,
+    UnaryExprNode
+};
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
+import compiler::ast::statement::{
+    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
+    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
+    UnsafeBlockStmtNode, WhileStmtNode
+};
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::sink::{ DiagnosticSink };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::mono::state::{ MonoState };
+import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::resolver::{ ResolutionContext, TypeResolver };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
 
 
 type struct MonoAstResolver {
@@ -59,41 +93,37 @@ type struct MonoAstResolver {
 
 
     /// Walk the specialized AST and resolve all type annotations into concrete
-    /// TypeRefs.  Uses the template entry's module name to build a resolution
-    /// context so cross-module and user-defined types resolve through the scope chain.
+    /// TypeRefs.
     resolve_specialized_ast(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
                             entry: TemplateEntry*, subst: TypeSubstitution*,
                             this_type: TypeRef) -> void {
         if (ast_node == null || this.type_resolver == null) { return; }
 
-        mut module_name: string = "";
-        if (entry != null && entry.module_name.is_valid()) {
-            module_name = this.intern_table.resolve(entry.module_name);
-        }
-        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
-        // The template's own module owns every annotation in this AST; the
-        // ambient scope chain still points at whichever module demanded the
-        // specialization.
-        res_ctx.set_home_module(module_name);
+        // A bare leaf in this clone carries the stamp it was given in the file
+        // that WROTE it, and the MANGLED SPEC NAMES the substituter writes into
+        // the clone carry a `pre_resolved` TypeRef that `TypeResolver::resolve`
+        // returns before it consults the context, so the context holds only
+        // the bindings and `This`.
+        mut res_ctx: ResolutionContext = ResolutionContext::new("");
 
         match (node_kind) {
             NodeKind::StructDeclaration => {
                 const decl: StructDeclNode* = ast_node as StructDeclNode*;
                 if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
-                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
+                this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
             NodeKind::UnionDeclaration => {
                 const decl: UnionDeclNode* = ast_node as UnionDeclNode*;
                 if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
-                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
+                this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
             NodeKind::ClassDeclaration => {
                 const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
                 if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
-                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
+                this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
             NodeKind::EnumDeclaration => {
                 // Enum variants use SymbolStr names; resolution handled in
@@ -103,7 +133,7 @@ type struct MonoAstResolver {
                 const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
                 if (decl == null) { return; }
                 // Free functions have no `this`.
-                this.resolve_func_and_body(decl, &res_ctx, subst, TypeRef::invalid());
+                this.resolve_func_and_body(decl, &res_ctx, TypeRef::invalid());
             }
             NodeKind::ImplementationBlock => {
                 const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
@@ -131,7 +161,7 @@ type struct MonoAstResolver {
                 // BODIES so a struct literal `Pair<A, A>{..}` becomes concrete before
                 // body resolution.  Run before resolve_methods.
                 this.trait_spec.substitute_derived_params_in_method_bodies(decl);
-                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
+                this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
             _ => {}
         }
@@ -144,11 +174,15 @@ type struct MonoAstResolver {
     prune_static_match_arms(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
                             entry: TemplateEntry*, subst: TypeSubstitution*) -> void {
         if (ast_node == null || this.type_resolver == null) { return; }
-        mut module_name: string = "";
-        if (entry != null && entry.module_name.is_valid()) {
-            module_name = this.intern_table.resolve(entry.module_name);
-        }
-        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
+        mut res_ctx: ResolutionContext = ResolutionContext::new("");
+        // Scoped per body below, not here.  Both kinds of name a `static match`
+        // resolves - the arm patterns the author wrote and the scrutinee the
+        // substituter rewrote to the concrete binding - were written wherever
+        // the BODY was, and a cloned trait default's body lives in the trait's
+        // file while `entry` names the implementing type's module.  The same
+        // walk reached through `prune_static_match_in_block` from the call
+        // specializer is scoped that way already; this entry is the one that
+        // was not, so the two disagreed about the same question.
 
         match (node_kind) {
             NodeKind::StructDeclaration => {
@@ -259,7 +293,7 @@ type struct MonoAstResolver {
             }
             NodeKind::ForStatement => {
                 const fs: ForStmtNode* = stmt as ForStmtNode*;
-                if (fs.init != null) { this.prune_static_match_in_stmt(fs.init, res_ctx); }
+                if (fs.init != null) { this.prune_static_match_in_stmt(fs.init as StatementNode*, res_ctx); }
                 this.prune_static_match_in_expr(fs.condition, res_ctx);
                 this.prune_static_match_in_expr(fs.update, res_ctx);
                 this.prune_static_match_in_stmt(fs.body, res_ctx);
@@ -400,10 +434,10 @@ type struct MonoAstResolver {
             const only: StaticMatchArmNode* = arms[0];
             if (only == null || only.type_patterns.length == 0) { return -1; }
             if (this.arm_matches_scrutinee(only, scrut, res_ctx)) { return -1; }
-            const tn0: string = this.arena.format_display(this.arena.lookup(scrut.id));
+            const tn0: string = this.arena.format_display(this.arena.lookup(scrut));
             this.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0645_NO_STATIC_MATCH_ARM,
-                format("no `static match` arm matches type `%s`", tn0))
+                fmt::format("no `static match` arm matches type `%s`", tn0))
                 .at(span)
                 .with_note("add an arm for this type or a `_` default arm"));
             this.state.error_count += 1;
@@ -425,10 +459,10 @@ type struct MonoAstResolver {
                 } else {
                     // A second arm matching the same TypeID: ambiguous.  Keep the
                     // deterministic first-wins selection but surface the ambiguity.
-                    const dn: string = this.arena.format_display(this.arena.lookup(scrut.id));
+                    const dn: string = this.arena.format_display(this.arena.lookup(scrut));
                     this.diagnostics.emit(Diagnostic::error(
                         ErrorCode::E0645_NO_STATIC_MATCH_ARM,
-                        format("ambiguous `static match`: multiple arms match type `%s`", dn))
+                        fmt::format("ambiguous `static match`: multiple arms match type `%s`", dn))
                         .at(span)
                         .with_note("remove the duplicate arm"));
                     this.state.error_count += 1;
@@ -439,10 +473,10 @@ type struct MonoAstResolver {
         if (match_idx >= 0) { return match_idx; }
         if (wildcard_idx >= 0) { return wildcard_idx; }
 
-        const ty_name: string = this.arena.format_display(this.arena.lookup(scrut.id));
+        const ty_name: string = this.arena.format_display(this.arena.lookup(scrut));
         this.diagnostics.emit(Diagnostic::error(
             ErrorCode::E0645_NO_STATIC_MATCH_ARM,
-            format("no `static match` arm matches type `%s`", ty_name))
+            fmt::format("no `static match` arm matches type `%s`", ty_name))
             .at(span)
             .with_note("add an arm for this type or a `_` default arm"));
         this.state.error_count += 1;
@@ -459,7 +493,7 @@ type struct MonoAstResolver {
                           res_ctx: ResolutionContext*) -> boolean {
         for (mut p: i64 = 0; p < arm.type_patterns.length; p++) {
             const arm_ty: TypeRef = this.type_resolver.resolve(arm.type_patterns[p], res_ctx);
-            if (arm_ty.is_valid() && arm_ty.id == scrut.id) { return true; }
+            if (arm_ty.is_valid() && arm_ty.equals(scrut)) { return true; }
         }
         return false;
     }
@@ -467,7 +501,7 @@ type struct MonoAstResolver {
     /// Resolve signatures on an array of methods; delegates core signature
     /// resolution to TypeResolver, then resolves body locals.
     resolve_methods(mut &this, methods: &MethodNode*[], res_ctx: ResolutionContext*,
-                    subst: TypeSubstitution*, this_type: TypeRef) -> void {
+                    this_type: TypeRef) -> void {
         // Share `nested_visited` across all methods in this impl block so repeated
         // return types only produce a single monomorphization request per impl.
         this.state.nested_visited = [];
@@ -495,12 +529,12 @@ type struct MonoAstResolver {
                     const gp: GenericParamNode* = method.func.generic_params[j];
                     if (gp == null) { continue; }
                     const gp_ref: TypeRef = this.arena.create_generic_param(
-                        gp.name, j as u64);
-                    method_ctx.add_binding(gp.name, gp_ref);
+                        gp.sym_id, gp.name, j as u64);
+                    method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
-                this.resolve_func_and_body(method.func, &method_ctx, subst, m_this);
+                this.resolve_func_and_body(method.func, &method_ctx, m_this);
             } else {
-                this.resolve_func_and_body(method.func, res_ctx, subst, m_this);
+                this.resolve_func_and_body(method.func, res_ctx, m_this);
             }
         }
     }
@@ -510,9 +544,12 @@ type struct MonoAstResolver {
     ///
     /// Sema typed the body and stashed every generic call; MonoCallSpecializer
     /// consumes the stash.  Only local-decl resolution + return-type nested
-    /// discovery remain here.
+    /// discovery remain here.  The signature's annotations were rewritten by
+    /// the substituter before this runs, so a parameter left in one names a
+    /// declaration the clone cannot see, and there is no second context to
+    /// try it under.
     resolve_func_and_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*,
-                          subst: TypeSubstitution*, this_type: TypeRef) -> void {
+                          this_type: TypeRef) -> void {
         // Spec'd method clones have their `&this` parameter annotated as
         // `Reference(ThisType)`; thread `this_type` onto a per-call copy of the
         // context so `&this` resolves to `Reference(<spec'd_owner>)`.
@@ -526,58 +563,16 @@ type struct MonoAstResolver {
         // annotation (the parser leaves `type_annotation` null on the implicit
         // receiver).  `&this` -> `Pointer(this_type)`; bare `this` -> the owner type.
         if (this_type.is_valid()) {
-            const this_amp: SymbolStr = this.intern_table.intern("&this");
-            const this_val: SymbolStr = this.intern_table.intern("this");
             for (mut bp: i64 = 0; bp < func.parameters.length; bp++) {
                 const param: VarDeclNode* = func.parameters[bp];
                 if (param == null || param.resolved_type.is_valid()) { continue; }
-                if (param.name.equals(this_amp)) {
+                if (param.is_ref_receiver()) {
                     param.resolved_type = this.arena.get_pointer_to(this_type);
-                } else if (param.name.equals(this_val)) {
+                } else if (param.is_value_receiver()) {
                     param.resolved_type = this_type;
                 }
             }
         }
-        // Fallback resolution with substitution-derived bindings.  The
-        // ASTTypeSubstituter doesn't always reach every spot (virtual-dispatch gaps
-        // and some annotation kinds - Function, nested Generic - aren't walked), so
-        // a post-substitution annotation can still read `T` and the empty res_ctx
-        // can't resolve it.  Build a `gen_ctx` mapping every original generic-param
-        // SymbolStr to its concrete replacement and re-resolve still-invalid slots.
-        if (subst != null) {
-            mut gen_ctx: ResolutionContext = res_ctx.clone();
-            if (this_type.is_valid()) { gen_ctx.set_this_type(this_type); }
-            for (mut si: i64 = 0; si < subst.param_ids.length; si++) {
-                const param_t: Type* = this.arena.lookup(subst.param_ids[si]);
-                if (param_t != null && param_t.kind == TypeKind::GenericParam) {
-                    const gp: GenericParamType* = param_t as GenericParamType*;
-                    gen_ctx.add_binding(gp.param_name, subst.replacements[si]);
-                }
-            }
-            // Return type fallback.
-            if (!func.has_resolved_return_type() && func.return_type_annotation != null) {
-                const resolved: TypeRef = this.type_resolver.resolve(
-                    func.return_type_annotation, &gen_ctx);
-                if (resolved.is_valid()) {
-                    func.resolved_return_type = resolved;
-                }
-            }
-            // Param fallback: every still-unresolved explicitly-annotated parameter
-            // gets one more shot via the concrete-binding context.  Skips `&this`/
-            // `this` (back-filled above from `this_type`).
-            for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
-                const param: VarDeclNode* = func.parameters[pi];
-                if (param == null) { continue; }
-                if (param.resolved_type.is_valid()) { continue; }
-                if (param.type_annotation == null) { continue; }
-                const ptype: TypeRef = this.type_resolver.resolve(
-                    param.type_annotation, &gen_ctx);
-                if (ptype.is_valid()) {
-                    param.resolved_type = ptype;
-                }
-            }
-        }
-
         // Reduce concrete-base associated-type projections in the spec signature
         // (`P::Item` under `P := IntSeq` -> `i32`) so the signature is fully
         // concrete before it is registered/mangled.

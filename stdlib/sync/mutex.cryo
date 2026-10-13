@@ -33,14 +33,23 @@
 
 namespace std::sync::mutex;
 
-import core::intrinsics;
-import core::ptr;
-import core::result;
-import core::drop;
-import alloc::layout;
-import alloc::allocator;
-import ffi::libc;
-import sys::syscall;
+import std::core::intrinsics;
+import std::core::ptr;
+import std::core::ptr::{ NonNull };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::alloc::layout;
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator;
+import std::alloc::allocator::{ AllocError, AllocErrorKind, Allocator, GlobalAlloc };
+import std::ffi::libc;
+import std::ffi::libc::{
+    pthread_mutex_destroy, pthread_mutex_init, pthread_mutex_lock, pthread_mutex_trylock,
+    pthread_mutex_unlock
+};
+import std::sys::syscall;
 
 
 // Per-OS lock primitives.  The backing object differs between platforms
@@ -126,7 +135,7 @@ implement<T, A> trait Drop for struct MutexGuard<T, A> {
 }
 
 
-type struct Mutex<T, A = GlobalAlloc> {
+type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
     inner: MutexInner<T, A>*;
 
     /// Construct a `Mutex<T>` initialized to hold `value`, using
@@ -159,10 +168,10 @@ type struct Mutex<T, A = GlobalAlloc> {
     /// caller never leaks on the error path.
     static try_new(value: T) -> Result<Mutex<T, GlobalAlloc>, AllocError> {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        const header: Layout = Layout::of<MutexInner<T, GlobalAlloc>>();
+        const header: Layout = Layout::of::<MutexInner<T, GlobalAlloc>>();
         const raw: NonNull<u8> = alloc.allocate(header)?;
         const typed: NonNull<MutexInner<T, GlobalAlloc>> =
-            raw.cast<MutexInner<T, GlobalAlloc>>();
+            raw.cast::<MutexInner<T, GlobalAlloc>>();
         const inner_ptr: MutexInner<T, GlobalAlloc>* = typed.as_ptr();
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
         const rc: i32 = mutex_init_raw(buf_ptr);
@@ -172,14 +181,14 @@ type struct Mutex<T, A = GlobalAlloc> {
         }
         inner_ptr.value = value;
         inner_ptr.alloc = alloc;
-        return Result::Ok(Mutex<T, GlobalAlloc> { inner: inner_ptr });
+        return Result::Ok(Mutex::<T, GlobalAlloc> { inner: inner_ptr });
     }
 
     static try_new_in(value: T, alloc: A) -> Result<Mutex<T, A>, AllocError> {
         mut a: A = alloc;
-        const header: Layout = Layout::of<MutexInner<T, A>>();
+        const header: Layout = Layout::of::<MutexInner<T, A>>();
         const raw: NonNull<u8> = a.allocate(header)?;
-        const typed: NonNull<MutexInner<T, A>> = raw.cast<MutexInner<T, A>>();
+        const typed: NonNull<MutexInner<T, A>> = raw.cast::<MutexInner<T, A>>();
         const inner_ptr: MutexInner<T, A>* = typed.as_ptr();
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
         const rc: i32 = mutex_init_raw(buf_ptr);
@@ -189,7 +198,7 @@ type struct Mutex<T, A = GlobalAlloc> {
         }
         inner_ptr.value = value;
         inner_ptr.alloc = a;
-        return Result::Ok(Mutex<T, A> { inner: inner_ptr });
+        return Result::Ok(Mutex::<T, A> { inner: inner_ptr });
     }
 
     /// Acquire the lock, blocking the current thread until it is
@@ -203,7 +212,7 @@ type struct Mutex<T, A = GlobalAlloc> {
         if (rc != 0) {
             core::panic("Mutex::lock: mutex_lock_raw failed", FILE, LINE);
         }
-        return MutexGuard<T, A> { inner: this.inner };
+        return MutexGuard::<T, A> { inner: this.inner };
     }
 
     /// Non-blocking lock attempt.  Returns `Some(guard)` when the
@@ -213,7 +222,7 @@ type struct Mutex<T, A = GlobalAlloc> {
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
         const rc: i32 = mutex_trylock_raw(buf_ptr);
         if (rc == 0) {
-            return Option::Some(MutexGuard<T, A> { inner: this.inner });
+            return Option::Some(MutexGuard::<T, A> { inner: this.inner });
         }
         return Option::None;
     }
@@ -231,15 +240,15 @@ type struct Mutex<T, A = GlobalAlloc> {
 /// when this fires - a guard that outlives its mutex will unlock a
 /// destroyed pthread buffer, which is undefined behavior.
 implement<T, A> trait Drop for struct Mutex<T, A>
-where T: Drop, A: Allocator {
+where A: Allocator {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner_ptr: MutexInner<T, A>* = this.inner;
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
         mutex_destroy_raw(buf_ptr);
-        inner_ptr.value.drop();
+        ptr::drop_in_place::<T>(&inner_ptr.value);
         mut alloc: A = inner_ptr.alloc;
-        const header: Layout = Layout::of<MutexInner<T, A>>();
+        const header: Layout = Layout::of::<MutexInner<T, A>>();
         alloc.deallocate(NonNull::new(this.inner as u8*), header);
         this.inner = null;
     }

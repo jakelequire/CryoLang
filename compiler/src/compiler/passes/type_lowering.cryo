@@ -16,18 +16,40 @@
 ///   - TypeAlias: delegates to target type.
 ///   - InstantiatedType: delegates to resolved concrete type.
 
-namespace Compiler::Passes::TypeLowering;
+namespace compiler::passes::type_lowering;
 
-import Compiler::Passes::PassID;
-import Compiler::Diag;
-import Compiler::Diag::{ Diagnostic, Snapshot };
-import Compiler::CompilationContext;
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Arena };
-import Compiler::AST;
-import Compiler::AST::{ Node, Expression };
-import Utils::Logger;
+import compiler::passes::pass_id;
+import compiler::passes::pass_id::{ PassResult };
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, snapshot };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::types;
+import compiler::types::{ arena, type_ref, TypeKind };
+import compiler::ast;
+import compiler::ast::{ node, expression };
+import compiler::const_table;
+import compiler::const_table::{ ConstEval };
+import utils::logger;
+import utils::logger::{ cdebug };
 import std::math;
+import compiler::types::compound;
+import compiler::types::compound::{ ArrayType, OptionalType, TupleType };
+import compiler::types::generic;
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::type_base;
+import compiler::types::type_base::{ Type };
+import compiler::types::user_defined;
+import compiler::types::user_defined::{
+    ClassType, EnumType, EnumVariantInfo, StructType, TypeAliasType
+};
+import std::fmt;
+import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::node::{ ProgramNode, StaticAssertItem };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::snapshot::{ DiagnosticSnapshot };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::type_ref::{ TypeRef };
 
 
 // TypeLoweringPasses: public entry point
@@ -44,7 +66,7 @@ type struct TypeLoweringPasses {
             return PassResult::ok();
         }
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug("[TypeLowering] Computing layouts for %lld types\n", arena.type_count());
         }
 
@@ -80,7 +102,7 @@ type struct TypeLoweringPasses {
             }
         }
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug("[TypeLowering] Computed layouts for %lld types\n", computed);
         }
 
@@ -107,7 +129,7 @@ type struct TypeLoweringPasses {
             }
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0236_RECURSIVE_TYPE,
-                format("recursive type `%s` has infinite size", tname));
+                fmt::format("recursive type `%s` has infinite size", tname));
             diag = diag.help(
                 "break the cycle with a pointer or `Box` indirection (store the self-referential field behind a `*`)");
             ctx.emit_diagnostic(diag);
@@ -127,7 +149,7 @@ type struct TypeLoweringPasses {
             if (!TypeLoweringPasses::has_unresolved_layout_child(arena, uty)) { continue; }
             ctx.emit_diagnostic(Diagnostic::error(
                 ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("type lowering: a member type of type #%lld did not resolve in the type arena (internal inconsistency)",
+                fmt::format("type lowering: a member type of type #%lld did not resolve in the type arena (internal inconsistency)",
                        uty.id as i64)));
         }
 
@@ -135,24 +157,28 @@ type struct TypeLoweringPasses {
         // final layout. The `sizeof`/`alignof` operand types were resolved in
         // TypeResolution; fold the condition to a constant and fail the build
         // (E0237) if it is false or not a compile-time constant.
+        //
+        // This is the one position that can consult layouts, so it is the only
+        // one that passes the arena; the rest of what it accepts is what any
+        // compile-time integer position accepts.
         const sa_root: ProgramNode* = ctx.artifacts.ast.root;
         if (sa_root != null) {
             for (mut si: i64 = 0; si < sa_root.static_asserts.length; si++) {
                 const sa: StaticAssertItem* = sa_root.static_asserts[si];
                 if (sa == null) { continue; }
+                const ev: ConstEval = ConstEval::new(ctx.const_table, ctx.intern_table, arena);
                 mut result: i64 = 0;
-                const ok: boolean = TypeLoweringPasses::fold_static_assert(
-                    sa.cond as ExpressionNode*, arena, &result);
+                const ok: boolean = ev.fold(sa.cond as ExpressionNode*, &result);
                 if (!ok) {
                     mut d1: Diagnostic = Diagnostic::error(
                         ErrorCode::E0237_STATIC_ASSERT_FAILED,
-                        "static_assert condition is not a compile-time constant (allowed: integer/boolean literals, sizeof/alignof, and arithmetic/comparison/logical operators)");
+                        "static_assert condition is not a compile-time constant (a compile-time constant is an integer or boolean literal, a named constant, an enum variant, `sizeof`/`alignof`, or arithmetic over them)");
                     d1 = d1.at_with_label(sa.span, "in this static_assert");
                     ctx.emit_diagnostic(d1);
                 } else if (result == 0) {
                     mut msg: string = "static assertion failed";
                     if (sa.message != "") {
-                        msg = format("static assertion failed: %s", sa.message);
+                        msg = fmt::format("static assertion failed: %s", sa.message);
                     }
                     mut d2: Diagnostic = Diagnostic::error(
                         ErrorCode::E0237_STATIC_ASSERT_FAILED, msg);
@@ -165,118 +191,6 @@ type struct TypeLoweringPasses {
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
 
-    /// Fold a `static_assert` condition to an i64 (0 = false, non-zero = true)
-    /// using fully-resolved type layouts. Returns false if the expression is
-    /// not a compile-time constant of the supported shape. Supported: integer /
-    /// boolean literals, `sizeof(T)` / `alignof(T)`, unary `-`/`+`/`~`/`!`, and
-    /// binary arithmetic / comparison / logical / bitwise operators.
-    static fold_static_assert(expr: ExpressionNode*, arena: TypeArena*, out: i64*) -> boolean {
-        if (expr == null) { return false; }
-        const node: ASTNode* = expr as ASTNode*;
-        if (node.kind == NodeKind::Literal) {
-            const lit: LiteralNode* = expr as LiteralNode*;
-            if (lit.literal_kind == LiteralKind::Integer) {
-                return TypeLoweringPasses::sa_parse_int(lit.value, out);
-            }
-            if (lit.literal_kind == LiteralKind::Boolean) {
-                *out = if (lit.value == "true") { 1 } else { 0 };
-                return true;
-            }
-            return false;
-        }
-        if (node.kind == NodeKind::SizeofExpression) {
-            const s: SizeofExprNode* = expr as SizeofExprNode*;
-            if (!s.resolved_type.is_valid()) { return false; }
-            const t: Type* = arena.lookup(s.resolved_type.id);
-            if (t == null) { return false; }
-            *out = t.size_bytes() as i64;
-            return true;
-        }
-        if (node.kind == NodeKind::AlignofExpression) {
-            const a: AlignofExprNode* = expr as AlignofExprNode*;
-            if (!a.resolved_type.is_valid()) { return false; }
-            const t: Type* = arena.lookup(a.resolved_type.id);
-            if (t == null) { return false; }
-            *out = t.alignment() as i64;
-            return true;
-        }
-        if (node.kind == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = expr as UnaryExprNode*;
-            mut a: i64 = 0;
-            if (!TypeLoweringPasses::fold_static_assert(u.operand, arena, &a)) { return false; }
-            const op: string = u.op.lexeme;
-            if (op == "-") { *out = 0 - a; return true; }
-            if (op == "+") { *out = a; return true; }
-            if (op == "~") { *out = ~a; return true; }
-            if (op == "!") { *out = if (a == 0) { 1 } else { 0 }; return true; }
-            return false;
-        }
-        if (node.kind == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = expr as BinaryExprNode*;
-            mut x: i64 = 0;
-            mut y: i64 = 0;
-            if (!TypeLoweringPasses::fold_static_assert(b.left, arena, &x))  { return false; }
-            if (!TypeLoweringPasses::fold_static_assert(b.right, arena, &y)) { return false; }
-            const op: string = b.op.lexeme;
-            if (op == "+")  { *out = x + y; return true; }
-            if (op == "-")  { *out = x - y; return true; }
-            if (op == "*")  { *out = x * y; return true; }
-            if (op == "/")  { if (y == 0) { return false; } *out = x / y; return true; }
-            if (op == "%")  { if (y == 0) { return false; } *out = x % y; return true; }
-            if (op == "==") { *out = if (x == y) { 1 } else { 0 }; return true; }
-            if (op == "!=") { *out = if (x != y) { 1 } else { 0 }; return true; }
-            if (op == "<")  { *out = if (x < y)  { 1 } else { 0 }; return true; }
-            if (op == "<=") { *out = if (x <= y) { 1 } else { 0 }; return true; }
-            if (op == ">")  { *out = if (x > y)  { 1 } else { 0 }; return true; }
-            if (op == ">=") { *out = if (x >= y) { 1 } else { 0 }; return true; }
-            if (op == "&&") { *out = if (x != 0 && y != 0) { 1 } else { 0 }; return true; }
-            if (op == "||") { *out = if (x != 0 || y != 0) { 1 } else { 0 }; return true; }
-            if (op == "&")  { *out = x & y; return true; }
-            if (op == "|")  { *out = x | y; return true; }
-            if (op == "^")  { *out = x ^ y; return true; }
-            return false;
-        }
-        return false;
-    }
-
-    /// Parse an integer literal lexeme (decimal, or `0x`/`0o`/`0b` prefixed,
-    /// with `_` separators and an optional trailing type suffix) to i64.
-    /// Mirrors `parse_int_literal_u64`; inlined to keep this pass free of a
-    /// Sema dependency. Strings are NUL-terminated, so length is a NUL scan.
-    static sa_parse_int(s: string, out: i64*) -> boolean {
-        if (s == null) { return false; }
-        mut len: i64 = 0;
-        while (s[len] != 0) { len = len + 1; }
-        if (len == 0) { return false; }
-        mut i: i64 = 0;
-        mut radix: u64 = 10;
-        if (len >= 2 && s[0] == '0') {
-            const c1: char = s[1];
-            if (c1 == 'x' || c1 == 'X')      { radix = 16; i = 2; }
-            else if (c1 == 'b' || c1 == 'B') { radix = 2;  i = 2; }
-            else if (c1 == 'o' || c1 == 'O') { radix = 8;  i = 2; }
-        }
-        mut acc: u64 = 0;
-        mut saw: boolean = false;
-        while (i < len) {
-            const c: char = s[i];
-            if (c == '_') { i = i + 1; continue; }
-            mut d: u64 = 0;
-            if (c >= '0' && c <= '9')      { d = (c - '0') as u64; }
-            else if (c >= 'a' && c <= 'f') { d = (c - 'a' + 10) as u64; }
-            else if (c >= 'A' && c <= 'F') { d = (c - 'A' + 10) as u64; }
-            else { break; }   // type suffix (`i64`/`u8`/...)
-            if (d >= radix) { return false; }
-            saw = true;
-            acc = acc * radix + d;
-            i = i + 1;
-        }
-        if (!saw) { return false; }
-        *out = acc as i64;
-        return true;
-    }
-
-
     /// Resolve `ty` past type aliases and instantiated-type wrappers to the
     /// underlying concrete type.  Depth-guarded against malformed chains.
     static lowering_resolve_concrete(arena: TypeArena*, ty: Type*) -> Type* {
@@ -285,12 +199,12 @@ type struct TypeLoweringPasses {
         while (c != null && d < 16) {
             if (c.kind == TypeKind::TypeAlias) {
                 const al: TypeAliasType* = c as TypeAliasType*;
-                if (al.has_target()) { c = arena.lookup(al.target.id); d += 1; continue; }
+                if (al.has_target()) { c = arena.lookup(al.target); d += 1; continue; }
                 return c;
             }
             if (c.kind == TypeKind::InstantiatedType) {
                 const it: InstantiatedType* = c as InstantiatedType*;
-                if (it.has_resolved_type()) { c = arena.lookup(it.resolved_type.id); d += 1; continue; }
+                if (it.has_resolved_type()) { c = arena.lookup(it.resolved_type); d += 1; continue; }
                 return c;
             }
             return c;
@@ -304,7 +218,7 @@ type struct TypeLoweringPasses {
     /// break the chain (a pointer to a type is finite-size).
     static by_value_child_reaches(arena: TypeArena*, child_ref: TypeRef,
                                     target_id: u64, depth: i32) -> boolean {
-        const child: Type* = TypeLoweringPasses::lowering_resolve_concrete(arena, arena.lookup(child_ref.id));
+        const child: Type* = TypeLoweringPasses::lowering_resolve_concrete(arena, arena.lookup(child_ref));
         if (child == null) { return false; }
         if (child.kind == TypeKind::Pointer || child.kind == TypeKind::Reference) {
             return false;
@@ -494,7 +408,7 @@ type struct TypeLoweringPasses {
             mut u_align: u64 = 1;
             if (!st.repr_packed && st.min_alignment > u_align) { u_align = st.min_alignment; }
             for (mut i: i64 = 0; i < st.fields.length; i++) {
-                const field_ty: Type* = arena.lookup(st.fields[i].field_type.id);
+                const field_ty: Type* = arena.lookup(st.fields[i].field_type);
                 if (field_ty == null) { continue; }
                 const f_size:  u64 = field_ty.size_bytes();
                 const f_align: u64 = field_ty.alignment();
@@ -523,7 +437,7 @@ type struct TypeLoweringPasses {
         if (!packed && st.min_alignment > max_align) { max_align = st.min_alignment; }
 
         for (mut i: i64 = 0; i < st.fields.length; i++) {
-            const field_ty: Type* = arena.lookup(st.fields[i].field_type.id);
+            const field_ty: Type* = arena.lookup(st.fields[i].field_type);
             if (field_ty == null) { continue; }
 
             const f_size:  u64 = field_ty.size_bytes();
@@ -555,7 +469,7 @@ type struct TypeLoweringPasses {
             mut inner_size:  u64 = 0;
             mut inner_align: u64 = 1;
             for (mut k: i64 = 0; k < st.fields.length; k++) {
-                const ft: Type* = arena.lookup(st.fields[k].field_type.id);
+                const ft: Type* = arena.lookup(st.fields[k].field_type);
                 if (ft == null) { continue; }
                 const sz: u64 = ft.size_bytes();
                 if (sz == 0) { continue; }
@@ -581,58 +495,68 @@ type struct TypeLoweringPasses {
     static compute_class_layout(cl: ClassType*, arena: TypeArena*) -> boolean {
         if (cl.computed_align > 0) { return false; }
 
-        mut offset: u64 = 0;
-        mut max_align: u64 = 8;  // Classes always at least pointer-aligned
-        // `![align(N)]` raises the minimum alignment further; the 8-byte
-        // floor is preserved because of the vtable-pointer convention.
+        // One flat object: a single vtable pointer at offset 0 iff any class in
+        // the inheritance chain declares virtual methods, then every class's
+        // fields root-to-derived in one sequence, each at the lowest offset
+        // satisfying its natural alignment.  This is the object codegen emits
+        // (`TypeMapper::map_class`), so it is the only layout `sizeof` may
+        // report: charging a vtable pointer per level, or restarting the
+        // derived fields after the base's *padded* size, describes an object
+        // that does not exist and overruns anything sized from it.
+        //
+        // chain[0] is this class; chain[N-1] is the root.  The depth cap
+        // mirrors the mapper's, so a pathological chain truncates identically
+        // on both sides rather than disagreeing.
+        mut chain: ClassType*[] = [];
+        mut any_virtual: boolean = false;
+        mut walk: ClassType* = cl;
+        mut depth: i32 = 0;
+        while (walk != null && depth < 16) {
+            chain.push(walk);
+            if (walk.has_virtual_methods) { any_virtual = true; }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const base_t: Type* = arena.lookup(walk.base_class);
+            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+            walk = base_t as ClassType*;
+            depth += 1;
+        }
+
+        mut offset:    u64 = 0;
+        mut max_align: u64 = 1;
+        if (any_virtual) {
+            offset    = 8;
+            max_align = 8;
+        }
+        // `![align(N)]` raises the minimum alignment.
         if (cl.min_alignment > max_align) { max_align = cl.min_alignment; }
 
-        // If this class has virtual methods, reserve 8 bytes for vtable pointer
-        if (cl.has_virtual_methods) {
-            offset = 8;
-        }
+        for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+            const link: ClassType* = chain[ci];
+            for (mut i: i64 = 0; i < link.fields.length; i++) {
+                const field_ty: Type* = arena.lookup(link.fields[i].field_type);
+                if (field_ty == null) { continue; }
 
-        // If there's a base class, include its size first
-        if (cl.has_base && cl.base_class.is_valid()) {
-            const base_ty: Type* = arena.lookup(cl.base_class.id);
-            if (base_ty != null) {
-                const base_size:  u64 = base_ty.size_bytes();
-                const base_align: u64 = base_ty.alignment();
-                if (base_size == 0 && TypeLoweringPasses::needs_layout(base_ty)) { return false; }
-                // Base class fields start after vtable pointer (if any)
-                // For simplicity, we add base size directly (base already has its own vptr accounted for)
-                if (base_align > max_align) { max_align = base_align; }
-                offset = math::align_up(offset, base_align) + base_size;
+                const f_size:  u64 = field_ty.size_bytes();
+                const f_align: u64 = field_ty.alignment();
+
+                // Defer until every member type is laid out.  Empty markers
+                // (size 0, align 1) are settled; don't defer on those.
+                if (f_size == 0 && TypeLoweringPasses::needs_layout(field_ty)
+                        && !TypeLoweringPasses::layout_settled(field_ty)) {
+                    return false;
+                }
+
+                if (f_align > 0) {
+                    offset = math::align_up(offset, f_align);
+                    if (f_align > max_align) { max_align = f_align; }
+                }
+
+                // Only this class's own field offsets are ours to record; an
+                // ancestor records its own, and does so from the same start,
+                // which is what makes an upcast pointer a no-op.
+                if (ci == 0) { cl.set_field_offset(i, offset); }
+                offset += f_size;
             }
-        }
-
-        // Lay out own fields
-        for (mut i: i64 = 0; i < cl.fields.length; i++) {
-            const field_ty: Type* = arena.lookup(cl.fields[i].field_type.id);
-            if (field_ty == null) { continue; }
-
-            const f_size:  u64 = field_ty.size_bytes();
-            const f_align: u64 = field_ty.alignment();
-
-            if (f_size == 0 && TypeLoweringPasses::needs_layout(field_ty)) { return false; }
-
-            if (f_align > 0) {
-                offset = math::align_up(offset, f_align);
-                if (f_align > max_align) { max_align = f_align; }
-            }
-
-            cl.set_field_offset(i, offset);
-            offset += f_size;
-        }
-
-        if (cl.fields.length == 0 && !cl.has_base) {
-            // Empty class with no base: just vtable or minimum size
-            if (cl.has_virtual_methods) {
-                cl.set_layout(8, 8);
-            } else {
-                cl.set_layout(0, 1);
-            }
-            return true;
         }
 
         const total: u64 = math::align_up(offset, max_align);
@@ -663,7 +587,7 @@ type struct TypeLoweringPasses {
             mut tag_size:  u64 = ENUM_TAG_SIZE;
             mut tag_align: u64 = ENUM_TAG_ALIGN;
             if (en.discriminant_type.is_valid()) {
-                const dt: Type* = arena.lookup(en.discriminant_type.id);
+                const dt: Type* = arena.lookup(en.discriminant_type);
                 if (dt != null && dt.kind == TypeKind::Int && dt.size_bytes() > 0) {
                     tag_size  = dt.size_bytes();
                     tag_align = dt.alignment();
@@ -692,7 +616,7 @@ type struct TypeLoweringPasses {
             // which then silently mis-sizes every enum nesting IT, because the
             // payload sizing below reads that 0 as a real width.
             for (mut j: i64 = 0; j < variant.payload_types.length; j++) {
-                const pt: Type* = arena.lookup(variant.payload_types[j].id);
+                const pt: Type* = arena.lookup(variant.payload_types[j]);
                 if (pt == null) { continue; }
                 if (!TypeLoweringPasses::layout_settled(pt)) { return false; }
             }
@@ -737,7 +661,7 @@ type struct TypeLoweringPasses {
         mut max_align: u64 = 1;
 
         for (mut i: i64 = 0; i < tup.elements.length; i++) {
-            const elem_ty: Type* = arena.lookup(tup.elements[i].id);
+            const elem_ty: Type* = arena.lookup(tup.elements[i]);
             if (elem_ty == null) { continue; }
 
             const e_size:  u64 = elem_ty.size_bytes();
@@ -763,7 +687,7 @@ type struct TypeLoweringPasses {
     static compute_optional_layout(opt: OptionalType*, arena: TypeArena*) -> boolean {
         if (opt.computed_align > 0) { return false; }
 
-        const inner: Type* = arena.lookup(opt.wrapped.id);
+        const inner: Type* = arena.lookup(opt.wrapped);
         if (inner == null) {
             // Wrapped type not found; give it a minimal layout (tag only)
             opt.set_layout(1, 1);
@@ -794,7 +718,7 @@ type struct TypeLoweringPasses {
     static compute_fixed_array_layout(arr: ArrayType*, arena: TypeArena*) -> boolean {
         if (arr.computed_align > 0) { return false; }
 
-        const elem: Type* = arena.lookup(arr.element.id);
+        const elem: Type* = arena.lookup(arr.element);
         if (elem == null) {
             arr.set_layout(0, 1);
             return true;
@@ -823,7 +747,7 @@ type struct TypeLoweringPasses {
         if (alias.computed_align > 0) { return false; }
         if (!alias.has_target()) { return false; }
 
-        const target: Type* = arena.lookup(alias.target.id);
+        const target: Type* = arena.lookup(alias.target);
         if (target == null) { return false; }
 
         const t_size:  u64 = target.size_bytes();
@@ -853,16 +777,16 @@ type struct TypeLoweringPasses {
         if (ty.kind == TypeKind::Struct) {
             const st: StructType* = ty as StructType*;
             for (mut i: i64 = 0; i < st.fields.length; i++) {
-                if (arena.lookup(st.fields[i].field_type.id) == null) { return true; }
+                if (arena.lookup(st.fields[i].field_type) == null) { return true; }
             }
             return false;
         }
         if (ty.kind == TypeKind::Class) {
             const cl: ClassType* = ty as ClassType*;
             if (cl.has_base && cl.base_class.is_valid()
-                    && arena.lookup(cl.base_class.id) == null) { return true; }
+                    && arena.lookup(cl.base_class) == null) { return true; }
             for (mut i: i64 = 0; i < cl.fields.length; i++) {
-                if (arena.lookup(cl.fields[i].field_type.id) == null) { return true; }
+                if (arena.lookup(cl.fields[i].field_type) == null) { return true; }
             }
             return false;
         }
@@ -871,7 +795,7 @@ type struct TypeLoweringPasses {
             for (mut i: i64 = 0; i < en.variants.length; i++) {
                 const variant: EnumVariantInfo* = &en.variants[i];
                 for (mut j: i64 = 0; j < variant.payload_types.length; j++) {
-                    if (arena.lookup(variant.payload_types[j].id) == null) { return true; }
+                    if (arena.lookup(variant.payload_types[j]) == null) { return true; }
                 }
             }
             return false;
@@ -879,27 +803,27 @@ type struct TypeLoweringPasses {
         if (ty.kind == TypeKind::Tuple) {
             const tt: TupleType* = ty as TupleType*;
             for (mut i: i64 = 0; i < tt.elements.length; i++) {
-                if (arena.lookup(tt.elements[i].id) == null) { return true; }
+                if (arena.lookup(tt.elements[i]) == null) { return true; }
             }
             return false;
         }
         if (ty.kind == TypeKind::Optional) {
             const opt: OptionalType* = ty as OptionalType*;
-            return arena.lookup(opt.wrapped.id) == null;
+            return arena.lookup(opt.wrapped) == null;
         }
         if (ty.kind == TypeKind::Array) {
             const arr: ArrayType* = ty as ArrayType*;
-            if (arr.is_fixed()) { return arena.lookup(arr.element.id) == null; }
+            if (arr.is_fixed()) { return arena.lookup(arr.element) == null; }
             return false;
         }
         if (ty.kind == TypeKind::TypeAlias) {
             const al: TypeAliasType* = ty as TypeAliasType*;
-            if (al.has_target()) { return arena.lookup(al.target.id) == null; }
+            if (al.has_target()) { return arena.lookup(al.target) == null; }
             return false;
         }
         if (ty.kind == TypeKind::InstantiatedType) {
             const it: InstantiatedType* = ty as InstantiatedType*;
-            if (it.has_resolved_type()) { return arena.lookup(it.resolved_type.id) == null; }
+            if (it.has_resolved_type()) { return arena.lookup(it.resolved_type) == null; }
             return false;
         }
         return false;
@@ -912,7 +836,7 @@ type struct TypeLoweringPasses {
         if (inst.computed_align > 0) { return false; }
         if (!inst.has_resolved_type()) { return false; }
 
-        const resolved: Type* = arena.lookup(inst.resolved_type.id);
+        const resolved: Type* = arena.lookup(inst.resolved_type);
         if (resolved == null) { return false; }
 
         const r_size:  u64 = resolved.size_bytes();

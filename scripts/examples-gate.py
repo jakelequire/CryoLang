@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Build every examples/*/ project and fail if any of them does not compile.
+
+Why this is a script rather than a shell loop
+---------------------------------------------
+The loop used to live in the Makefile, POSIX-only, and the Windows branch
+printed "run it from WSL" and exited 0.  A gate that exits 0 having done
+nothing is worse than no gate: it is counted as evidence.  A rename that
+wrongly rewrote every examples/ project passed the whole local suite because
+this target swept nothing on the host it ran on.
+
+So the sweep must be able to say what it covered.  Three refusals, all of
+which exit non-zero rather than reporting success:
+
+  * the compiler binary is missing               -> cannot sweep
+  * no examples/*/cryoconfig was discovered      -> swept nothing
+  * fewer projects than --min (the shipped 14)   -> swept less than expected
+
+and the summary line states the population, so a reader sees "14 projects"
+instead of inferring it from an exit code.
+"""
+import argparse, os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def discover(examples_dir):
+    out = []
+    if not os.path.isdir(examples_dir):
+        return out
+    for name in sorted(os.listdir(examples_dir)):
+        d = os.path.join(examples_dir, name)
+        if os.path.isfile(os.path.join(d, "cryoconfig")):
+            out.append(d)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cryo", required=True, help="compiler binary to sweep with")
+    # A floor of 1 is not a floor.  It refuses only the total collapse of
+    # discovery, and passes a sweep that found one project out of fourteen -
+    # which is the shape of every real failure here (a rename, a moved
+    # directory, a cryoconfig that stopped parsing), not the shape of an empty
+    # examples/.  Pinned to the shipped set; raise it when examples are added.
+    ap.add_argument("--min", type=int, default=14,
+                    help="fail if fewer than this many projects are discovered")
+    ap.add_argument("--stdlib", default=os.path.join(ROOT, "stdlib"))
+    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 1,
+                    help="projects built at once (default: the CPU count; 1 "
+                         "builds them one after another).  Each project owns "
+                         "its build directory, and results print in project "
+                         "order at any job count")
+    args = ap.parse_args()
+
+    # Resolved before any chdir: each project is built with cwd set to its own
+    # directory, so a relative binary or stdlib path would silently vanish.
+    args.cryo = os.path.abspath(args.cryo)
+    # Forward slashes on every host: objects embed stdlib source paths as the
+    # root is spelled (panic locations), and `abspath` alone would turn
+    # `C:/...` into `C:\...` on Windows, compiling the same source to
+    # different bytes than the object comparison's builds.
+    args.stdlib = os.path.abspath(args.stdlib).replace("\\", "/")
+
+    if not os.path.isfile(args.cryo):
+        print("examples-gate: FAIL -- compiler binary not found: %s" % args.cryo)
+        print("examples-gate: refusing to report success without sweeping anything")
+        return 2
+
+    projects = discover(os.path.join(ROOT, "examples"))
+    if len(projects) < args.min:
+        print("examples-gate: FAIL -- discovered %d project(s), expected at least %d"
+              % (len(projects), args.min))
+        print("examples-gate: refusing to report success without sweeping anything")
+        return 2
+
+    env = dict(os.environ)
+    env["CRYO_STDLIB"] = args.stdlib
+
+    def build(d):
+        return subprocess.run([args.cryo, "build", "."], cwd=d, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        results = list(pool.map(build, projects))
+
+    failed = []
+    for d, r in zip(projects, results):
+        rel = os.path.relpath(d, ROOT).replace(os.sep, "/")
+        if r.returncode == 0:
+            print("  ok    %s" % rel)
+        else:
+            failed.append(rel)
+            print("  FAIL  %s" % rel)
+            tail = r.stdout.decode("utf-8", "replace").splitlines()[-25:]
+            for ln in tail:
+                print("        | %s" % ln)
+
+    if failed:
+        print("examples-gate: FAIL -- %d of %d project(s) did not build: %s"
+              % (len(failed), len(projects), " ".join(failed)))
+        return 1
+
+    print("examples-gate: OK -- %d project(s) built" % len(projects))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

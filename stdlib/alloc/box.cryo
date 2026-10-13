@@ -11,16 +11,23 @@
 
 namespace std::alloc::box;
 
-import core::intrinsics;
-import core::ptr;
-import core::result;
-import core::drop;
-import core::clone;
-import core::ops;
-import alloc::layout;
-import alloc::allocator;
+import std::core::intrinsics;
+import std::core::ptr;
+import std::core::ptr::{ NonNull };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::core::clone;
+import std::core::clone::{ Clone };
+import std::core::ops;
+import std::core::ops::{ Deref };
+import std::alloc::layout;
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator;
+import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
 
-type struct Box<T, A = GlobalAlloc> {
+type struct Box<T, A = GlobalAlloc> where A: Allocator {
     // Raw (nullable) so `drop` can null it and stay idempotent: a
     // double drop is a no-op rather than a double free. Non-null for the
     // whole live lifetime; only the post-drop husk holds null.
@@ -63,12 +70,12 @@ type struct Box<T, A = GlobalAlloc> {
     /// the issue without giving up the allocator-generic surface.
     static try_new(value: T) -> Result<Box<T, GlobalAlloc>, AllocError> {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        const block: Layout = Layout::of<T>();
+        const block: Layout = Layout::of::<T>();
         const raw: NonNull<u8> = alloc.allocate(block)?;
-        const typed: NonNull<T> = raw.cast<T>();
+        const typed: NonNull<T> = raw.cast::<T>();
         const typed_ptr: T* = typed.as_ptr();
         *typed_ptr = value;
-        return Result::Ok(Box<T, GlobalAlloc> { ptr: typed_ptr, alloc: alloc });
+        return Result::Ok(Box::<T, GlobalAlloc> { ptr: typed_ptr, alloc: alloc });
     }
 
     /// Fallible constructor with a caller-supplied allocator.  The
@@ -76,12 +83,12 @@ type struct Box<T, A = GlobalAlloc> {
     /// to free the storage on drop.
     static try_new_in(value: T, alloc: A) -> Result<Box<T, A>, AllocError> {
         mut a: A = alloc;
-        const block: Layout = Layout::of<T>();
+        const block: Layout = Layout::of::<T>();
         const raw: NonNull<u8> = a.allocate(block)?;
-        const typed: NonNull<T> = raw.cast<T>();
+        const typed: NonNull<T> = raw.cast::<T>();
         const typed_ptr: T* = typed.as_ptr();
         *typed_ptr = value;
-        return Result::Ok(Box<T, A> { ptr: typed_ptr, alloc: a });
+        return Result::Ok(Box::<T, A> { ptr: typed_ptr, alloc: a });
     }
 
     /// Re-wrap a pointer previously produced by `into_raw` (or `leak`).
@@ -95,7 +102,7 @@ type struct Box<T, A = GlobalAlloc> {
         if (raw == null) {
             core::panic("Box::from_raw called with a null pointer", FILE, LINE);
         }
-        return Box<T, GlobalAlloc> {
+        return Box::<T, GlobalAlloc> {
             ptr:   raw,
             alloc: GlobalAlloc::new()
         };
@@ -146,9 +153,10 @@ type struct Box<T, A = GlobalAlloc> {
 
 }
 
-/// Release the heap storage.  Calls `T::drop()` on the owned value first
-/// so that any resources held by `T` (heap buffers, file descriptors,
-/// etc.) are released before the allocation is returned via
+/// Release the heap storage.  Releases the owned value in place first
+/// (`ptr::drop_in_place`: its `Drop` implementation, its fields' glue, or
+/// nothing for a `Copy` value), so that any resources held by `T` (heap
+/// buffers, file descriptors, etc.) are released before the allocation is returned via
 /// `this.alloc.deallocate(...)`.  The allocator instance itself lives in
 /// the `Box` struct (caller's stack), not in the heap allocation we're
 /// freeing.
@@ -160,15 +168,15 @@ type struct Box<T, A = GlobalAlloc> {
 /// the allocation to the caller, so T's drop is NOT called for those
 /// paths.
 implement<T, A> trait Drop for struct Box<T, A>
-where T: Drop, A: Allocator {
+where A: Allocator {
     drop(mut &this) -> void {
         // Idempotent: a second drop of the same Box is a no-op rather
         // than a double free (matches the rest of the stdlib, whose Drop
         // impls all null their pointer). `into_raw`/`leak` consume the
         // Box so this path doesn't run after them.
         if (this.ptr == null) { return; }
-        (*this.ptr).drop();
-        const block: Layout = Layout::of<T>();
+        ptr::drop_in_place::<T>(this.ptr);
+        const block: Layout = Layout::of::<T>();
         this.alloc.deallocate(NonNull::new(this.ptr as u8*), block);
         this.ptr = null;
     }
@@ -176,7 +184,7 @@ where T: Drop, A: Allocator {
 
 /// Deep copy: allocate a fresh box and clone the owned value into it, so
 /// the two boxes own independent heap storage. Requires `T: Clone`.
-implement<T> trait Clone for struct Box<T>
+implement<T> trait Clone for struct Box<T, GlobalAlloc>
 where T: Clone {
     clone(&this) -> Box<T> {
         return Box::new((*this.ptr).clone());

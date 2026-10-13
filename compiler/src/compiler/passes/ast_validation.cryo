@@ -9,16 +9,32 @@
 /// only that the tree is well-formed: no null children where a child is
 /// required, no empty names on declarations, no orphaned methods, etc.
 
-namespace Compiler::Passes::ASTValidation;
+namespace compiler::passes::ast_validation;
 
-import Compiler::Diag;
-import Compiler::Diag::{ Snapshot, SourceSpan, Diagnostic };
-import Compiler::AST;
-import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern };
-import Compiler::Passes::PassID;
-import Compiler::CompilationContext;
-import Compiler::Resolver::SymbolStr;
-import Utils::Logger;
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, snapshot, source_span };
+import compiler::ast;
+import compiler::ast::{ declaration, expression, node, NodeKind, pattern, statement };
+import compiler::passes::pass_id;
+import compiler::passes::pass_id::{ PassResult };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::resolver::symbol_str;
+import compiler::resolver::symbol_str::{ SymbolStr };
+import utils::logger;
+import utils::logger::{ cdebug };
+import std::fmt;
+import compiler::ast::declaration::{
+    ClassDeclNode, EnumDeclNode, EnumVariantNode, ExternBlockNode, FieldDeclNode,
+    FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDeclNode, IntrinsicDeclNode,
+    MethodNode, StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode,
+    VarDeclNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::statement::{ BlockStmtNode, DeclStmtNode };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::snapshot::{ DiagnosticSnapshot };
+import compiler::diag::source_span::{ SourceSpan };
 
 
 // ASTValidator: walks the tree checking structural invariants
@@ -64,7 +80,7 @@ type struct ASTValidator {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) {
                 this.emit_no_span(ErrorCode::E0050_NULL_AST_NODE,
-                    format("null top-level statement at index %lld", i));
+                    fmt::format("null top-level statement at index %lld", i));
                 continue;
             }
             this.validate_top_level(stmt);
@@ -115,7 +131,7 @@ type struct ASTValidator {
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             if (func.parameters[i] == null) {
                 this.emit(ErrorCode::E0053_NULL_PARAMETER,
-                    format("null parameter at index %lld in function '%s'",
+                    fmt::format("null parameter at index %lld in function '%s'",
                         i, this.ctx.resolve_str(func.name)),
                     func.span);
             }
@@ -142,7 +158,7 @@ type struct ASTValidator {
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             if (node.fields[i] == null) {
                 this.emit(ErrorCode::E0054_NULL_FIELD,
-                    format("null field at index %lld in struct '%s'", i, name),
+                    fmt::format("null field at index %lld in struct '%s'", i, name),
                     node.span);
             }
         }
@@ -167,14 +183,14 @@ type struct ASTValidator {
 
         if (node.fields.length == 0) {
             this.emit(ErrorCode::E0054_NULL_FIELD,
-                format("union '%s' must declare at least one field", name),
+                fmt::format("union '%s' must declare at least one field", name),
                 node.span);
         }
 
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             if (node.fields[i] == null) {
                 this.emit(ErrorCode::E0054_NULL_FIELD,
-                    format("null field at index %lld in union '%s'", i, name),
+                    fmt::format("null field at index %lld in union '%s'", i, name),
                     node.span);
             }
         }
@@ -198,7 +214,7 @@ type struct ASTValidator {
             }
             if (dup) {
                 this.emit(ErrorCode::E0356_DUPLICATE_FIELD,
-                    format("duplicate field `%s` in `%s`",
+                    fmt::format("duplicate field `%s` in `%s`",
                         this.ctx.resolve_str(f.name), container),
                     f.span);
             } else {
@@ -219,7 +235,7 @@ type struct ASTValidator {
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             if (node.fields[i] == null) {
                 this.emit(ErrorCode::E0054_NULL_FIELD,
-                    format("null field at index %lld in class '%s'", i, name),
+                    fmt::format("null field at index %lld in class '%s'", i, name),
                     node.span);
             }
         }
@@ -240,13 +256,13 @@ type struct ASTValidator {
 
         if (node.variants.length == 0) {
             this.emit(ErrorCode::E0057_EMPTY_ENUM_VARIANTS,
-                format("enum '%s' has no variants", name), node.span);
+                fmt::format("enum '%s' has no variants", name), node.span);
         }
 
         for (mut i: i64 = 0; i < node.variants.length; i++) {
             if (node.variants[i] == null) {
                 this.emit(ErrorCode::E0058_NULL_ENUM_VARIANT,
-                    format("null variant at index %lld in enum '%s'", i, name),
+                    fmt::format("null variant at index %lld in enum '%s'", i, name),
                     node.span);
             }
         }
@@ -284,13 +300,13 @@ type struct ASTValidator {
                 }
                 mut diag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0064_DUPLICATE_ENUM_DISCRIMINANT,
-                    format("variant `%s` shares discriminant %lld with `%s` in enum `%s`",
+                    fmt::format("variant `%s` shares discriminant %lld with `%s` in enum `%s`",
                         this.ctx.resolve_str(v.name), tag,
                         this.ctx.resolve_str(seen_names[clash_idx]), name));
                 diag = diag.at_with_label(v.span,
-                    format("duplicate discriminant %lld", tag));
+                    fmt::format("duplicate discriminant %lld", tag));
                 if (found_free) {
-                    diag = diag.help(format(
+                    diag = diag.help(fmt::format(
                         "give `%s` a unique tag (e.g. `= %lld`) or remove the conflicting `= %lld` on the earlier variant",
                         this.ctx.resolve_str(v.name), free_tag, tag));
                 }
@@ -316,7 +332,7 @@ type struct ASTValidator {
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             if (node.methods[i] == null) {
                 this.emit(ErrorCode::E0055_NULL_METHOD,
-                    format("null method at index %lld in trait '%s'", i, name),
+                    fmt::format("null method at index %lld in trait '%s'", i, name),
                     node.span);
             } else {
                 this.validate_function(node.methods[i]);
@@ -334,7 +350,7 @@ type struct ASTValidator {
 
         if (node.target_annotation == null) {
             this.emit(ErrorCode::E0061_TYPE_ALIAS_MISSING_TARGET,
-                format("type alias '%s' has no target type",
+                fmt::format("type alias '%s' has no target type",
                     this.ctx.resolve_str(node.alias_name)),
                 node.span);
         }
@@ -353,7 +369,7 @@ type struct ASTValidator {
     }
 
     validate_import(mut &this, node: ImportDeclNode*) -> void {
-        if (node.module_path == "" || node.module_path == null) {
+        if (!node.module_path.is_valid()) {
             this.emit(ErrorCode::E0063_IMPORT_MISSING_PATH,
                 "import declaration has no module path", node.span);
         }
@@ -363,7 +379,7 @@ type struct ASTValidator {
         for (mut i: i64 = 0; i < node.functions.length; i++) {
             if (node.functions[i] == null) {
                 this.emit(ErrorCode::E0050_NULL_AST_NODE,
-                    format("null function at index %lld in extern block", i),
+                    fmt::format("null function at index %lld in extern block", i),
                     node.span);
             } else {
                 this.validate_function(node.functions[i]);
@@ -388,7 +404,7 @@ type struct ASTValidator {
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             if (node.parameters[i] == null) {
                 this.emit(ErrorCode::E0053_NULL_PARAMETER,
-                    format("null parameter at index %lld in intrinsic '%s'",
+                    fmt::format("null parameter at index %lld in intrinsic '%s'",
                         i, this.ctx.resolve_str(node.name)),
                     node.span);
             }
@@ -403,13 +419,13 @@ type struct ASTValidator {
             const method: MethodNode* = methods[i];
             if (method == null) {
                 this.emit(ErrorCode::E0055_NULL_METHOD,
-                    format("null method at index %lld in '%s'", i, owner),
+                    fmt::format("null method at index %lld in '%s'", i, owner),
                     owner_span);
                 continue;
             }
             if (method.func == null) {
                 this.emit(ErrorCode::E0056_METHOD_MISSING_FUNC,
-                    format("method at index %lld in '%s' has null function node",
+                    fmt::format("method at index %lld in '%s' has null function node",
                         i, owner),
                     method.span);
                 continue;
@@ -424,7 +440,7 @@ type struct ASTValidator {
         for (mut i: i64 = 0; i < params.length; i++) {
             if (params[i] == null) {
                 this.emit(ErrorCode::E0050_NULL_AST_NODE,
-                    format("null generic parameter at index %lld in '%s'",
+                    fmt::format("null generic parameter at index %lld in '%s'",
                         i, owner),
                     owner_span);
             }
@@ -437,7 +453,7 @@ type struct ASTValidator {
         for (mut i: i64 = 0; i < block.statements.length; i++) {
             if (block.statements[i] == null) {
                 this.emit(ErrorCode::E0059_NULL_BLOCK_STATEMENT,
-                    format("null statement at index %lld in block", i),
+                    fmt::format("null statement at index %lld in block", i),
                     block.span);
             }
         }
@@ -456,7 +472,7 @@ type struct ASTValidationPass {
         mut validator: ASTValidator = ASTValidator::new(ctx);
         validator.validate(root);
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             if (validator.error_count == 0) {
                 cdebug("[ASTValidation] AST structure is valid\n");
             } else {

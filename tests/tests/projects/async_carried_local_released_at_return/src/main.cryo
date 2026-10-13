@@ -1,0 +1,88 @@
+namespace AsyncCarriedLocalReleasedAtReturn::Main;
+
+import std::core::drop::{ Drop };
+import std::future::ready::{ PendingThenReady };
+import std::future::traits::{ Future };
+import std::future::poll::{ Poll };
+import std::future::waker::{ Context, Waker };
+
+/// Appends a digit to `*log` on each release, so the exit value spells the
+/// order of events.
+type struct Ticker {
+    base: i64;
+    log: i64*;
+}
+
+implement trait Drop for Ticker {
+    drop(mut &this) -> void {
+        *this.log = *this.log * 10 + 1;
+    }
+}
+
+type trait Read {
+    async read(&this, n: i64) -> i64;
+}
+
+implement trait Read for Ticker {
+    async read(&this, n: i64) -> i64 {
+        const bump: i64 = await PendingThenReady::<i64>::new(1, this.base);
+        return bump + n;
+    }
+}
+
+type trait Drain {
+    async drain(mut &this, n: i64) -> i64;
+}
+
+type struct Holder<S> {
+    inner: S;
+    seen:  i64;
+}
+
+implement<S> trait Drain for struct Holder<S> {
+    async drain(mut &this, n: i64) -> i64 where S: Read {
+        const v: i64 = await this.inner.read(n);
+        this.seen = this.seen + v;
+        return v;
+    }
+}
+
+/// `h` is held across both suspends, so the state machine carries it in the
+/// future.  The value it returns reads a field of `h`, a generic owner's
+/// instantiation; `h` is released at this `return`, as it would be in a
+/// function that never suspends - not later, when the finished future is
+/// dropped.
+async function hold_and_drain<S>(s: S, log: i64*) -> i64
+where S: Read {
+    mut h: Holder<S> = Holder::<S> { inner: s, seen: 0 };
+    const a: i64 = await h.drain(3);
+    const b: i64 = await h.drain(a);
+    *log = *log * 10 + 2;
+    return b * 100 + h.seen;
+}
+
+/// Polls to completion, appending 3 when the future reports Ready - while the
+/// future is still alive, before it is dropped on the way out.
+function drive<F, R>(fut: F, log: i64*) -> R
+where F: Future<R> {
+    mut f:  F       = fut;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (f.poll(&cx)) {
+            Poll::Ready(v) => { *log = *log * 10 + 3; return v; }
+            Poll::Pending  => { }
+        }
+    }
+}
+
+function main() -> i32 {
+    mut log: i64 = 0;
+    const lp: i64* = &log;
+    const v: i64 = drive(hold_and_drain::<Ticker>(Ticker { base: 4, log: lp }, lp), lp);
+    // read(3) = 7 (seen 7); read(7) = 11 (seen 18).
+    if (v != 1118) { return 1; }
+    // 2 the body returned, 1 the ticker released, 3 the future reported Ready.
+    // 231 is the release deferred to the future's own drop.
+    if (log != 213) { return 2; }
+    return 0;
+}

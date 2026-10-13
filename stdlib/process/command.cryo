@@ -8,7 +8,6 @@
 ///! cmd.stdout(Stdio::Piped);
 ///! mut child: Child = cmd.spawn().unwrap();
 ///! // read from child.stdout, wait, etc.
-///! cmd.drop();
 ///! ```
 ///!
 ///! Under the hood: fork(), adjust fds and env in the child, execvp.
@@ -17,28 +16,43 @@
 
 namespace std::process::command;
 
-import core::intrinsics;
-import core::option;
-import core::result;
-import core::slice;
-import core::drop;
-import core::mem;
-import io::error;
-import io::fd;
-import io::traits;
-import collections::array;
-import collections::raw_buffer;
-import collections::str;
-import collections::string;
-import alloc::allocator;
-import ffi::libc;
-import sys::syscall;
-import alloc::layout;
-import process::child;
-import future::poll;
-import future::waker;
-import future::traits;
-import future::combinator;
+import std::core::intrinsics;
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::slice;
+import std::core::slice::{ Slice };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::core::mem;
+import std::io::error;
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::fd;
+import std::io::traits;
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::collections::raw_buffer;
+import std::collections::raw_buffer::{ RawBuffer };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::alloc::allocator;
+import std::alloc::allocator::{ AllocError };
+import std::ffi::libc;
+import std::sys::syscall;
+import std::sys::syscall::{ SECURITY_ATTRIBUTES, STARTUPINFOA, PROCESS_INFORMATION };
+import std::alloc::layout;
+import std::process::child;
+import std::process::child::{
+    Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus, PipeDrain
+};
+import std::future::poll;
+import std::future::waker;
+import std::future::traits;
+import std::future::combinator;
+import std::future::combinator::{ Futures };
 
 // ArgvBuf: owned grow-on-push buffer of `u8*` for execvp's argv.
 //
@@ -70,9 +84,10 @@ type struct ArgvBuf {
     as_ptr(&this) -> u8** {
         return this.buf.ptr();
     }
+}
 
+implement trait Drop for struct ArgvBuf {
     drop(mut &this) -> void {
-        this.buf.drop();
         this.length = 0;
     }
 }
@@ -236,8 +251,8 @@ type struct Command {
         // second time. The placeholders left behind own nothing.
         mut r_out: Result<Array<u8>, IoError> = Result::Err(IoError::new(IoErrorKind::Other, 0));
         mut r_err: Result<Array<u8>, IoError> = Result::Err(IoError::new(IoErrorKind::Other, 0));
-        mem::swap<Result<Array<u8>, IoError>>(&r_out, &drained.0);
-        mem::swap<Result<Array<u8>, IoError>>(&r_err, &drained.1);
+        mem::swap::<Result<Array<u8>, IoError>>(&r_out, &drained.0);
+        mem::swap::<Result<Array<u8>, IoError>>(&r_err, &drained.1);
 
         mut out_buf: Array<u8> = Array::new();
         mut err_buf: Array<u8> = Array::new();
@@ -255,8 +270,8 @@ type struct Command {
         // leaked on the error path.
         match (failed) {
             Option::Some(e) => {
-                out_buf.drop();
-                err_buf.drop();
+                mem::drop(out_buf);
+                mem::drop(err_buf);
                 return Result::Err(e);
             }
             Option::None => { }
@@ -272,8 +287,8 @@ type struct Command {
                 });
             }
             Result::Err(e) => {
-                out_buf.drop();
-                err_buf.drop();
+                mem::drop(out_buf);
+                mem::drop(err_buf);
                 return Result::Err(e);
             }
         }
@@ -715,33 +730,18 @@ function close_pipe(pair: &PipePair) -> void {
 }
 
 implement trait Drop for struct EnvEntry {
-    drop(mut &this) -> void {
-        this.key.drop();
-        this.value.drop();
-    }
+    drop(mut &this) -> void { }
 }
 
 /// `Array<T>::drop` iterates elements via `where T: Drop`, so the
-/// args/envs arrays release their owned `String`/`EnvEntry` contents
-/// through their own drop calls.
+/// args/envs arrays, released by their fields after this body, release
+/// their owned `String`/`EnvEntry` contents through their own drop calls.
 implement trait Drop for struct Command {
-    drop(mut &this) -> void {
-        this.program.drop();
-        this.args.drop();
-        this.envs.drop();
-        match (this.cwd) {
-            Option::Some(mut path) => { }
-            Option::None => { }
-        }
-        this.cwd = Option::None;
-    }
+    drop(mut &this) -> void { }
 }
 
 implement trait Drop for struct Output {
-    drop(mut &this) -> void {
-        this.stdout.drop();
-        this.stderr.drop();
-    }
+    drop(mut &this) -> void { }
 }
 
 /// PipePair carries raw fds; the parent/child sides each close their
@@ -970,7 +970,10 @@ type struct WinStdio {
     extra_close:  u8*;   // child pipe end the parent must close post-spawn, or null
     close_fd:     i32;   // caller CRT fd to close post-spawn (Stdio::Fd ownership), or -1
     ok:           boolean;
+}
 
+![target(windows)]
+implement trait Drop for struct WinStdio {
     drop(mut &this) -> void { }
 }
 
@@ -1139,12 +1142,12 @@ function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinS
             if (is_input) {
                 // child reads `rd` (inheritable); parent writes `wr`.
                 syscall::SetHandleInformation(wr, syscall::HANDLE_FLAG_INHERIT, 0);
-                const f: i32 = _open_osfhandle(wr as i64, 0);
+                const f: i32 = libc::_open_osfhandle(wr as i64, 0);
                 return WinStdio { child_handle: rd, parent_fd: f, extra_close: rd, close_fd: -1, ok: true };
             }
             // child writes `wr` (inheritable); parent reads `rd`.
             syscall::SetHandleInformation(rd, syscall::HANDLE_FLAG_INHERIT, 0);
-            const f: i32 = _open_osfhandle(rd as i64, 0);
+            const f: i32 = libc::_open_osfhandle(rd as i64, 0);
             return WinStdio { child_handle: wr, parent_fd: f, extra_close: wr, close_fd: -1, ok: true };
         }
         Stdio::Null => {
@@ -1174,9 +1177,9 @@ function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinS
             // Recover the Win32 HANDLE backing the caller's CRT fd and
             // duplicate it as an inheritable handle for the child.  We never
             // mutate the caller's handle flags (DuplicateHandle is the robust
-            // path, matching Rust); the duplicate is closed post-spawn and the
+            // path); the duplicate is closed post-spawn and the
             // original fd is closed too, since `Stdio::Fd` transfers ownership.
-            const src: i64 = _get_osfhandle(raw);
+            const src: i64 = libc::_get_osfhandle(raw);
             if (src == -1) {
                 return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, close_fd: -1, ok: false };
             }
@@ -1297,7 +1300,7 @@ function win_drain(fd_no: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>) 
 // ERROR_BROKEN_PIPE) or the fd can't be peeked.  Drives the interleaved drain.
 ![target(windows)]
 function win_peek_avail(fd_no: i32) -> i64 {
-    const h: i64 = _get_osfhandle(fd_no);
+    const h: i64 = libc::_get_osfhandle(fd_no);
     if (h == -1) { return -1; }
     mut avail: u32 = 0;
     const r: i32 = syscall::PeekNamedPipe(h as u8*, null, 0, null, &avail, null);

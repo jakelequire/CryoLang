@@ -24,24 +24,34 @@
 ///! triple (host build) is normalized to the literal "host" on both the write
 ///! and resolve sides so it survives as a directory-name component.
 
-namespace Compiler::Vendor::Registry;
+namespace compiler::vendor::registry;
 
-import ffi::libc;
+import std::ffi::libc;
 import std::process;
-import sys::syscall;
-import Compiler::Deps::Cache;
-import Compiler::ProjectConfig;
-import Utils::Logger;
+import std::sys::syscall;
+import compiler::deps::cache;
+import compiler::deps::cache::{ Cache };
+import compiler::project_config;
+import compiler::project_config::{ ProjectConfig };
+import utils::logger;
 import std::fs::dir;
 import std::fs::file;
+import std::fs::file::{ File, OpenOptions };
 import std::fs::metadata;
+import std::fs::metadata::{ metadata };
 import std::fs::path;
+import std::fs::path::{ Path };
 import std::fmt;
 import std::thread;
 import std::collections::string;
+import std::collections::string::{ String };
 import std::collections::str;
+import std::collections::str::{ Str };
 import std::core::option;
+import std::core::option::{ Option };
 import std::json::{ value, parser, serializer };
+import std::json::value::{ JsonObject, JsonValue };
+import std::core::mem;
 
 const VENDOR_SCHEMA_VERSION: i64 = 1;
 
@@ -109,7 +119,8 @@ type struct VendorEntry {
     }
 
     /// The generated bindings path for `triple`, or "" if not yet cached.
-    cache_file_for(&this, triple: string) -> string {
+    cache_file_for(&this, triple_text: string) -> string {
+        const triple: string = triple_text;
         for (mut i: i64 = 0; i < this.cache.length; i++) {
             if (this.cache[i].triple == triple) {
                 return this.cache[i].file;
@@ -156,19 +167,19 @@ type struct VendorRegistry {
 
     /// `<cache_root>/vendor`: the vendor subtree of the shared cache.
     static vendor_root() -> string {
-        const root: string = format("%s/vendor", Cache::cache_root());
+        const root: string = fmt::format("%s/vendor", Cache::cache_root());
         dir::create_dir_all(Path::from(root));
         return root;
     }
 
     /// `<vendor_root>/registry.json`.
     static registry_path() -> string {
-        return format("%s/registry.json", VendorRegistry::vendor_root());
+        return fmt::format("%s/registry.json", VendorRegistry::vendor_root());
     }
 
     /// `<vendor_root>/<key>/<triple>`: per-(library, triple) cache dir.
     static cache_dir_for(key: string, triple: string) -> string {
-        const d: string = format("%s/%s/%s", VendorRegistry::vendor_root(), key,
+        const d: string = fmt::format("%s/%s/%s", VendorRegistry::vendor_root(), key,
                                   VendorRegistry::normalize_triple(triple));
         dir::create_dir_all(Path::from(d));
         return d;
@@ -176,7 +187,8 @@ type struct VendorRegistry {
 
     /// A host build carries an empty target triple; map it to "host" so it
     /// survives as a path component and matches on the resolve side.
-    static normalize_triple(triple: string) -> string {
+    static normalize_triple(triple_text: string) -> string {
+        const triple: string = triple_text;
         if (triple.length() == 0) { return "host"; }
         return triple;
     }
@@ -214,6 +226,17 @@ type struct VendorRegistry {
     remove(mut &this, lib: string) -> boolean {
         const idx: i64 = this.find_index(lib);
         if (idx < 0) { return false; }
+        return this.remove_at(idx);
+    }
+
+    /// Remove the entry at `idx`.  A caller that already knows which entry it
+    /// means must delete by index rather than by name: `find_index` resolves a
+    /// string against every entry's import namespace before any key, so a key
+    /// that collides with another library's namespace would delete that other
+    /// library.  Removing shifts the tail down, so a caller deleting several
+    /// entries has to walk indices downwards.
+    remove_at(mut &this, idx: i64) -> boolean {
+        if (idx < 0 || idx >= this.entries.length) { return false; }
         // `remove` moves the element out and shifts the tail down; binding it
         // lets the owned entry drop at scope exit (no double free).
         const _gone: VendorEntry = this.entries.remove(idx as u64);
@@ -237,7 +260,7 @@ type struct VendorRegistry {
         }
         mut root: JsonValue = match (parser::parse(Str::from(content))) {
             Result::Ok(v)      => { v }
-            Result::Err(mut e) => { e.drop(); return VendorRegistry::empty(); }
+            Result::Err(e)     => { mem::drop(e); return VendorRegistry::empty(); }
         };
 
         mut reg: VendorRegistry = VendorRegistry::empty();
@@ -255,7 +278,7 @@ type struct VendorRegistry {
             }
             Option::None => { }
         }
-        root.drop();
+        mem::drop(root);
         return reg;
     }
 
@@ -274,7 +297,7 @@ type struct VendorRegistry {
         mut root: JsonObject = JsonObject::new();
         root.put("schema_version", JsonValue::int_value(VENDOR_SCHEMA_VERSION));
 
-        mut libs: Array<JsonValue> = Array<JsonValue>::new();
+        mut libs: Array<JsonValue> = Array::<JsonValue>::new();
         for (mut i: i64 = 0; i < this.entries.length; i++) {
             libs.push(VendorRegistry::entry_to_json(&this.entries[i]));
         }
@@ -282,15 +305,15 @@ type struct VendorRegistry {
 
         mut doc: JsonValue = JsonValue::Object(root);
         mut text: String = serializer::stringify_pretty(&doc);
-        doc.drop();
+        mem::drop(doc);
 
-        const tmp: string = format("%s.tmp.%d", path, process::id());
+        const tmp: string = fmt::format("%s.tmp.%d", path, process::id());
         text.push_byte(10 as u8);        // trailing newline (matches prior fputs)
         match (file::write(Path::from(tmp), text.as_bytes())) {
             Result::Ok(_)  => {}
-            Result::Err(_) => { text.drop(); return false; }
+            Result::Err(_) => { mem::drop(text); return false; }
         }
-        text.drop();
+        mem::drop(text);
         if (!VendorRegistry::replace_file_atomic(tmp, path)) {
             dir::remove_file(Path::from(tmp));   // leave no stray temp file on a failed swap
             return false;
@@ -307,11 +330,15 @@ type struct VendorRegistry {
     /// `MoveFileExA` with `MOVEFILE_REPLACE_EXISTING` (0x1) is the atomic-replace
     /// equivalent.  Returns true on success.
     ![target(windows)]
-    static replace_file_atomic(tmp: string, path: string) -> boolean {
+    static replace_file_atomic(tmp_text: string, path_text: string) -> boolean {
+        const path: string = path_text;
+        const tmp: string = tmp_text;
         return syscall::MoveFileExA(tmp, path, 0x1) != 0;
     }
     ![target(unix)]
-    static replace_file_atomic(tmp: string, path: string) -> boolean {
+    static replace_file_atomic(tmp_text: string, path_text: string) -> boolean {
+        const path: string = path_text;
+        const tmp: string = tmp_text;
         match (dir::rename(Path::from(tmp), Path::from(path))) {
             Result::Ok(_)  => { return true; }
             Result::Err(_) => { return false; }
@@ -391,7 +418,7 @@ type struct VendorRegistry {
     static jstr(parent: JsonValue*, key: string, def: string) -> string {
         match (parent.get(Str::from(key))) {
             Option::Some(vp) => {
-                match (vp.as<Str>()) {
+                match (vp.as::<Str>()) {
                     Option::Some(vs) => { return VendorRegistry::dup_cstr(vs); }
                     Option::None     => { return def; }
                 }
@@ -409,7 +436,7 @@ type struct VendorRegistry {
                 for (mut i: u64 = 0; i < n; i++) {
                     match (arrp.at(i)) {
                         Option::Some(ep) => {
-                            match (ep.as<Str>()) {
+                            match (ep.as::<Str>()) {
                                 Option::Some(es) => { out.push(VendorRegistry::dup_cstr(es)); }
                                 Option::None     => { }
                             }
@@ -503,7 +530,7 @@ type struct VendorRegistry {
         link.put("static_unix",    JsonValue::string_array(&entry.link.static_unix));
         obj.put("link", JsonValue::Object(link));
 
-        mut cache: Array<JsonValue> = Array<JsonValue>::new();
+        mut cache: Array<JsonValue> = Array::<JsonValue>::new();
         for (mut i: i64 = 0; i < entry.cache.length; i++) {
             mut c: JsonObject = JsonObject::new();
             c.put("triple", JsonValue::from(entry.cache[i].triple));
@@ -542,7 +569,7 @@ type struct VendorLock {
     /// a handle; the caller does not branch on success - it just calls `release`
     /// when the critical section ends (a no-op if the lock was not acquired).
     static acquire() -> VendorLock {
-        const lpath: string = format("%s/registry.lock", VendorRegistry::vendor_root());
+        const lpath: string = fmt::format("%s/registry.lock", VendorRegistry::vendor_root());
         // `create_new` => O_CREAT|O_EXCL: the open succeeds for exactly one
         // racer (the file's creator) and fails with EEXIST for the rest.  Going
         // through `std::fs::file` keeps the flag values correct on Windows too
@@ -551,10 +578,10 @@ type struct VendorLock {
         opts = opts.write(true).create_new(true);
         for (mut tries: i32 = 0; tries < 50; tries++) {
             match (File::open_with(Path::from(lpath), &opts)) {
-                Result::Ok(mut fh) => {
+                Result::Ok(fh) => {
                     // The lock token is the file's existence; we don't write to
                     // it.  Close the fd now (the file stays until `release`).
-                    fh.drop();
+                    mem::drop(fh);
                     return VendorLock { path: lpath, held: true };
                 }
                 Result::Err(_) => {

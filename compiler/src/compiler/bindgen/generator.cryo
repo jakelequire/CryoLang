@@ -3,7 +3,7 @@
 /// Drives the
 /// existing libclang cursor-walk engine (`Importer`) to build the same decl
 /// nodes the inline `extern module := "C"` path produces, then SERIALIZES them
-/// back to `.cryo` SOURCE TEXT (approach A, the rust-bindgen model) under a
+/// back to `.cryo` SOURCE TEXT (approach A, generated source) under a
 /// real `namespace <Name>;`.  `cryo vendor` writes that text to the per-triple
 /// cache; it then flows through the unmodified parser -> sema -> codegen -> LSP
 /// pipeline like any other module.
@@ -19,31 +19,54 @@
 ///     manifest's `-I<include_dir>` / `-D<define>` args), accumulates the decls
 ///     into a throwaway context, and returns the serialized source.
 
-namespace Compiler::Bindgen::Generator;
+namespace compiler::bindgen::generator;
 
-import Compiler::Bindgen::Importer;
-import Compiler::Bindgen::Importer::{ ImportReport };
-import Compiler::Bindgen::Clang;
-import Compiler::Lex::{ TokenType };
-import Compiler::Bindgen::Clang::{ CXString };
-import Compiler::BuildManifest;
-import Compiler::CompilationContext;
-import Compiler::CompileMode;
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration };
-import Compiler::AST::Expression;
-import Compiler::AST::Statement;
-import Compiler::Resolver::{ SymbolStr, InternTable };
-import Compiler::Diag::{ SourceSpan };
-import Utils::Logger;
+import compiler::bindgen::importer;
+import compiler::bindgen::importer::{ Importer, ImportReport };
+import compiler::bindgen::clang;
+import compiler::lex::{ TokenType };
+import compiler::bindgen::clang::{ CXString };
+import compiler::build_manifest;
+import compiler::build_manifest::{ Manifest };
+import compiler::compilation_context;
+import compiler::compilation_context::{ BuildOptions, CompilationContext };
+import compiler::compile_mode;
+import compiler::compile_mode::{ CompileMode };
+import compiler::ast;
+import compiler::ast::{ declaration, LiteralKind, node, NodeKind, TypeAnnotation };
+import compiler::ast::expression;
+import compiler::ast::expression::{
+    CallExprNode, CastExprNode, ExpressionNode, FieldInit, IdentifierNode, LiteralNode,
+    StructLiteralNode
+};
+import compiler::ast::statement;
+import compiler::ast::statement::{ ExprStmtNode, ReturnStmtNode, StatementNode };
+import compiler::resolver::{ symbol_str, intern_table };
+import compiler::diag::{ source_span };
+import utils::logger;
 import std::fs::metadata;
+import std::fs::metadata::{ metadata };
 import std::fs::path;
+import std::fs::path::{ Path };
 import std::fs::file;
 import std::fmt;
 import std::core::primitives;
 import std::core::hash;
+import std::core::hash::{ Fnv128Hasher };
 import std::collections::string;
+import std::collections::string::{ String };
 import std::collections::str;
+import std::collections::str::{ Str };
+import std::core::mem;
+import compiler::ast::declaration::{
+    BindingAccessor, EnumDeclNode, EnumVariantNode, ExternBlockNode, FieldDeclNode,
+    FunctionDeclNode, ImplBlockNode, MethodNode, StructDeclNode, TypeAliasDeclNode,
+    UnionDeclNode, VarDeclNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import utils::keyword::{ Keyword };
 
 /// Bump whenever the emitted binding format changes (a new field shape, a
 /// different type mapping, ...).  It participates in the cache key, so an
@@ -76,18 +99,40 @@ import std::collections::str;
 /// (which lowers to a pointer) instead of being skipped - so `*_vappendf`-style
 /// functions BIND and are callable by forwarding a Cryo variadic function's
 /// `args`.  The earlier skip+report is gone.
-const GENERATOR_VERSION: i64 = 15;
+/// 15 -> 16: a tag declared but never defined in the translation unit (an
+/// `typedef union _XEvent XEvent;` whose union is completed only on another
+/// platform) now binds as a zero-field opaque record instead of being dropped.
+/// Dropping it emitted a typedef, parameter and return type naming a record that
+/// was never declared, so the generated module did not compile.
+/// 16 -> 17: object-like macro constants are recovered two ways they were lost.
+/// (a) The macro filter now accepts any header the library included, not the
+/// entry file alone - an umbrella entry header (`#include <SDL3/SDL.h>`) defines
+/// almost nothing itself, so every constant one level down was invisible AND
+/// unreported.  (b) A body no token walk can fold - a macro invocation such as
+/// `SDL_UINT32_C(0x20)`, the portable way to pin a constant's width - is folded
+/// by clang and bound to its value.
+/// 17 -> 18: `extern` C globals bind.  A header's file-scope variables produced
+/// nothing at all before - not even a report line - which rules out every
+/// loader-shaped C API (volk and its kind expose each entry point as a global
+/// function pointer, not a prototype).
+/// 18 -> 19: a `static const` global binds as a VALUE const.  It is not a
+/// symbol - each translation unit gets its own copy - but it is how a C API
+/// states a constant too wide for an enum, which is what Vulkan's 64-bit flag
+/// bits are; 309 of them were reported unbound in a vulkan_core.h run.
+const GENERATOR_VERSION: i64 = 19;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
     ctx:   CompilationContext*;
-    /// The namespace the bindings live under (e.g. "RayLib"); also the alias
-    /// the importer qualified type references with, so it is the prefix the
-    /// serializer strips off Named annotations.
-    ns:    string;
     /// Borrowed output buffer (owned by `render`'s caller frame), so the
     /// serializer struct owns no droppable field and can be discarded freely.
     out:   String*;
+    /// Borrowed honesty-report accumulator, or null when the caller wants no
+    /// report.  A decl the importer bound and this serializer then failed to
+    /// write has no later trace at all - the use site fails with `cannot find
+    /// value` and nothing connects that to generation - so the drop is counted
+    /// here rather than being taken in silence.
+    report: ImportReport*;
 
     /// Render the full binding file for `root` (top-level type decls) plus
     /// `extern_node` (the C functions) under `namespace ns`.
@@ -96,21 +141,30 @@ type struct BindingSerializer {
                   report: ImportReport*) -> string {
         mut buf: String = String::new();
         mut s: BindingSerializer = BindingSerializer {
-            ctx: ctx, ns: ns, out: &buf,
+            ctx: ctx, out: &buf, report: report,
         };
         s.out.push("/// Auto-generated by `cryo vendor` from C headers. DO NOT EDIT.\n");
-        s.out.push(format("/// Regenerate with: cryo vendor rebuild %s\n\n", ns));
-        s.out.push(format("namespace %s;\n\n", ns));
+        s.out.push(fmt::format("/// Regenerate with: cryo vendor rebuild %s\n\n", ns));
+        s.out.push(fmt::format("namespace %s;\n\n", ns));
 
         // Type declarations, in emission order, deduped by name (a type can be
         // visited once per header across a multi-header library).
         mut seen: string[] = [];
+        mut ext_globals: VarDeclNode*[] = [];
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const node: ASTNode* = root.statements[i];
             if (node == null) { continue; }
             const nm: string = BindingSerializer::decl_name(s.ctx, node);
             if (nm.length() == 0 || BindingSerializer::contains(&seen, nm)) { continue; }
             seen.push(nm);
+            // An imported global is a MEMBER of the `extern "C"` block rendered
+            // below, not a standalone declaration.  Gathering it here rather
+            // than in a second sweep lets it inherit this loop's dedup.
+            if (node.kind == NodeKind::VariableDeclaration
+                    && (node as VarDeclNode*).is_extern_import) {
+                ext_globals.push(node as VarDeclNode*);
+                continue;
+            }
             s.render_decl(node);
         }
 
@@ -122,10 +176,13 @@ type struct BindingSerializer {
         // same-name function whose linker symbol DIFFERS (a genuine distinct
         // function being lost, not a benign re-declaration of the same symbol),
         // record it in the honesty report instead of dropping it silently.
-        if (extern_node.functions.length > 0) {
+        if (extern_node.functions.length > 0 || ext_globals.length > 0) {
             mut seen_fn:  string[] = [];
             mut seen_sym: string[] = [];   // parallel: kept symbol per seen name
             s.out.push("extern \"C\" {\n");
+            for (mut gi: i64 = 0; gi < ext_globals.length; gi++) {
+                s.render_extern_global(ext_globals[gi]);
+            }
             for (mut i: i64 = 0; i < extern_node.functions.length; i++) {
                 const fnode: FunctionDeclNode* = extern_node.functions[i];
                 const fnm: string = s.ctx.intern_table.resolve(fnode.name);
@@ -144,16 +201,16 @@ type struct BindingSerializer {
                         // the next free suffix.  Reported as reduced-fidelity so the
                         // caller learns the name to call.
                         mut n: i64 = 2;
-                        mut alias: string = format("%s_%lld", fnm, n);
+                        mut alias: string = fmt::format("%s_%lld", fnm, n);
                         while (BindingSerializer::contains(&seen_fn, alias)) {
                             n += 1;
-                            alias = format("%s_%lld", fnm, n);
+                            alias = fmt::format("%s_%lld", fnm, n);
                         }
                         seen_fn.push(alias);
                         seen_sym.push(sym);
                         s.render_function_named(fnode, alias, sym);
                         if (report != null) {
-                            report.approx(format(
+                            report.approx(fmt::format(
                                 "function `%s` renamed to `%s` (C++ overload or cross-namespace leaf collision; binds `%s`)",
                                 fnm, alias, sym));
                         }
@@ -187,7 +244,7 @@ type struct BindingSerializer {
         } else if (k == NodeKind::ImplementationBlock) {
             // A synthetic key so an impl block isn't dropped by the empty-name
             // skip, and so a class re-visited across headers dedups by target.
-            return format("impl:%s",
+            return fmt::format("impl:%s",
                 ctx.intern_table.resolve((node as ImplBlockNode*).target_type));
         }
         return "";
@@ -218,13 +275,13 @@ type struct BindingSerializer {
     render_struct(mut &this, node: StructDeclNode*) -> void {
         if (node.repr_c) { this.out.push("![repr(C)]\n"); }
         if (node.min_alignment > 0) {
-            this.out.push(format("![align(%llu)]\n", node.min_alignment));
+            this.out.push(fmt::format("![align(%llu)]\n", node.min_alignment));
         }
-        this.out.push(format("type struct %s {\n",
+        this.out.push(fmt::format("type struct %s {\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.name))));
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             const f: FieldDeclNode* = node.fields[i];
-            this.out.push(format("    %s: %s;\n",
+            this.out.push(fmt::format("    %s: %s;\n",
                 BindingSerializer::ident(this.ctx.intern_table.resolve(f.name)),
                 this.render_type(f.type_annotation)));
         }
@@ -242,13 +299,13 @@ type struct BindingSerializer {
     render_union(mut &this, node: UnionDeclNode*) -> void {
         if (node.repr_c) { this.out.push("![repr(C)]\n"); }
         if (node.min_alignment > 0) {
-            this.out.push(format("![align(%llu)]\n", node.min_alignment));
+            this.out.push(fmt::format("![align(%llu)]\n", node.min_alignment));
         }
-        this.out.push(format("type union %s {\n",
+        this.out.push(fmt::format("type union %s {\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.name))));
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             const f: FieldDeclNode* = node.fields[i];
-            this.out.push(format("    %s: %s;\n",
+            this.out.push(fmt::format("    %s: %s;\n",
                 BindingSerializer::ident(this.ctx.intern_table.resolve(f.name)),
                 this.render_type(f.type_annotation)));
         }
@@ -269,23 +326,23 @@ type struct BindingSerializer {
             // The reinterpreted lvalue: at offset 0 a direct cast of the blob's
             // address; at a non-zero (anon-struct) offset, a byte-pointer add.
             const lv: string = if (acc.byte_offset == 0) {
-                format("*((&this.%s) as %s*)", blob, vt)
+                fmt::format("*((&this.%s) as %s*)", blob, vt)
             } else {
-                format("*((((&this.%s) as u8*) + %lld) as %s*)", blob, acc.byte_offset, vt)
+                fmt::format("*((((&this.%s) as u8*) + %lld) as %s*)", blob, acc.byte_offset, vt)
             };
-            this.out.push(format("    %s(&this) -> %s { return %s; }\n", name, vt, lv));
+            this.out.push(fmt::format("    %s(&this) -> %s { return %s; }\n", name, vt, lv));
         } else if (k == BindingAccessor::KIND_UNION_SET()) {
             const lv: string = if (acc.byte_offset == 0) {
-                format("*((&this.%s) as %s*)", blob, vt)
+                fmt::format("*((&this.%s) as %s*)", blob, vt)
             } else {
-                format("*((((&this.%s) as u8*) + %lld) as %s*)", blob, acc.byte_offset, vt)
+                fmt::format("*((((&this.%s) as u8*) + %lld) as %s*)", blob, acc.byte_offset, vt)
             };
-            this.out.push(format(
+            this.out.push(fmt::format(
                 "    %s(mut &this, v: %s) -> void { %s = v; }\n", name, vt, lv));
         } else if (k == BindingAccessor::KIND_BITFIELD_GET()) {
             const b: string = acc.backing;
             // The backing-typed read of the blob.
-            const rd: string = format("*((&this.%s) as %s*)", blob, b);
+            const rd: string = fmt::format("*((&this.%s) as %s*)", blob, b);
             if (acc.is_signed) {
                 // Sign-extend via shifts: move the field's MSB to the backing's
                 // top bit, then arithmetic-right-shift back down.
@@ -293,12 +350,12 @@ type struct BindingSerializer {
                 const nbits: i64 = BindingSerializer::backing_bits(b);
                 const left: i64 = nbits - acc.bit_offset - acc.bit_width;
                 const right: i64 = nbits - acc.bit_width;
-                this.out.push(format(
+                this.out.push(fmt::format(
                     "    %s(&this) -> %s { return (((%s as %s) << %lld%s) >> %lld%s) as %s; }\n",
                     name, vt, rd, sb, left, b, right, b, vt));
             } else {
                 const mask: u64 = BindingSerializer::bit_mask(acc.bit_width);
-                this.out.push(format(
+                this.out.push(fmt::format(
                     "    %s(&this) -> %s { return ((%s >> %lld%s) & %llu%s) as %s; }\n",
                     name, vt, rd, acc.bit_offset, b, mask, b, vt));
             }
@@ -306,7 +363,7 @@ type struct BindingSerializer {
             const b: string = acc.backing;
             const mask: u64 = BindingSerializer::bit_mask(acc.bit_width);
             // *ptr = (*ptr & ~(mask << off)) | ((v as B & mask) << off)
-            this.out.push(format(
+            this.out.push(fmt::format(
                 "    %s(mut &this, v: %s) -> void { mut p: %s* = (&this.%s) as %s*; *p = (*p & ~(%llu%s << %lld%s)) | (((v as %s) & %llu%s) << %lld%s); }\n",
                 name, vt, b, blob, b, mask, b, acc.bit_offset, b, b, mask, b, acc.bit_offset, b));
         }
@@ -342,30 +399,53 @@ type struct BindingSerializer {
         if (node.discriminant_annotation != null) {
             disc = this.render_type(node.discriminant_annotation);
         }
-        this.out.push(format("type enum %s : %s {\n",
+        this.out.push(fmt::format("type enum %s : %s {\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.name)), disc));
         for (mut i: i64 = 0; i < node.variants.length; i++) {
             const v: EnumVariantNode* = node.variants[i];
             const vn: string = BindingSerializer::ident(this.ctx.intern_table.resolve(v.name));
             if (v.has_value) {
-                this.out.push(format("    %s = %lld;\n", vn, v.explicit_value));
+                this.out.push(fmt::format("    %s = %lld;\n", vn, v.explicit_value));
             } else {
-                this.out.push(format("    %s;\n", vn));
+                this.out.push(fmt::format("    %s;\n", vn));
             }
         }
         this.out.push("}\n\n");
     }
 
     render_alias(mut &this, node: TypeAliasDeclNode*) -> void {
-        this.out.push(format("type %s = %s;\n\n",
+        this.out.push(fmt::format("type %s = %s;\n\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.alias_name)),
             this.render_type(node.target_annotation)));
     }
 
+    /// Render an imported global as a member of the `extern "C"` block:
+    /// `    mut vkCreateInstance: (void*) -> i32;`.  A C name that collides with
+    /// a Cryo keyword is escaped by `ident()`, which would otherwise silently
+    /// change the symbol bound - so whenever escaping changed the spelling, the
+    /// original C name is pinned with `![symbol("...")]`.  `link_name` (set on
+    /// the C++ path, where every symbol is mangled) takes precedence.
+    render_extern_global(mut &this, node: VarDeclNode*) -> void {
+        const raw: string = this.ctx.intern_table.resolve(node.name);
+        const name: string = BindingSerializer::ident(raw);
+        const sym: string = if (node.link_name.length() > 0) { node.link_name } else { raw };
+        if (!sym.eq(name)) {
+            this.out.push(fmt::format("    ![symbol(\"%s\")]\n", BindingSerializer::escape(sym)));
+        }
+        const kw: string = if (node.is_mutable) { "mut" } else { "const" };
+        this.out.push(fmt::format("    %s %s: %s;\n",
+            kw, name, this.render_type(node.type_annotation)));
+    }
+
     render_const(mut &this, node: VarDeclNode*) -> void {
         const ty: string = this.render_type(node.type_annotation);
-        const init: ExpressionNode* = node.initializer;
-        if (init == null) { return; }
+        const name: string =
+            BindingSerializer::ident(this.ctx.intern_table.resolve(node.name));
+        mut init: ExpressionNode* = node.initializer;
+        if (init == null) {
+            this.skip_const(name, "no initializer");
+            return;
+        }
         // A struct-literal initializer (a C compound-literal macro the importer
         // lowered, e.g. `#define RAYWHITE CLITERAL(Color){...}`): render
         // `const NAME: Type = Type { field: value, ... };`.
@@ -373,11 +453,27 @@ type struct BindingSerializer {
             this.render_struct_const(node, ty, init as StructLiteralNode*);
             return;
         }
-        if (init.kind != NodeKind::Literal) { return; }
+        // An INTEGER initializer arrives wrapped in a cast to the const's own
+        // declared type, because the importer carries a negative C value as its
+        // unsigned two's-complement decimal and that is out of range for the
+        // declaration as a bare literal.  Source text needs the same cast, and
+        // the integer branch below writes one - so read through the wrapper to
+        // the literal it holds rather than treating the shape as unrenderable.
+        if (init.kind == NodeKind::CastExpression) {
+            init = (init as CastExprNode*).expression;
+            if (init == null) {
+                this.skip_const(name, "cast over an empty initializer");
+                return;
+            }
+        }
+        if (init.kind != NodeKind::Literal) {
+            this.skip_const(name, "initializer is not a literal");
+            return;
+        }
         const lit: LiteralNode* = init as LiteralNode*;
         mut val: string = "";
         if (lit.literal_kind == LiteralKind::String) {
-            val = format("\"%s\"", BindingSerializer::escape(lit.value));
+            val = fmt::format("\"%s\"", BindingSerializer::escape(lit.value));
         } else if (lit.literal_kind == LiteralKind::Float) {
             val = lit.value;
         } else {
@@ -385,10 +481,18 @@ type struct BindingSerializer {
             // cast keeps the source in range - the importer stores a negative C
             // value as its unsigned two's-complement decimal, which would
             // overflow the declared signed type as a bare literal.
-            val = format("%s as %s", lit.value, ty);
+            val = fmt::format("%s as %s", lit.value, ty);
         }
-        this.out.push(format("const %s: %s = %s;\n",
-            BindingSerializer::ident(this.ctx.intern_table.resolve(node.name)), ty, val));
+        this.out.push(fmt::format("const %s: %s = %s;\n", name, ty, val));
+    }
+
+    /// Record a const that bound during import but could not be written as
+    /// source.  Nothing downstream can observe the difference between a
+    /// constant the header never had and one dropped here, so it belongs in
+    /// the same honesty channel as a construct the importer refused.
+    skip_const(mut &this, name: string, why: string) -> void {
+        if (this.report == null) { return; }
+        this.report.skip(fmt::format("const '%s' (%s)", name, why));
     }
 
     /// Render a struct-literal global const (`const NAME: Type = Type { ... };`).
@@ -396,13 +500,13 @@ type struct BindingSerializer {
     /// importer emits them that way); names are keyword-escaped like every other
     /// emitted identifier.
     render_struct_const(mut &this, node: VarDeclNode*, ty: string, sl: StructLiteralNode*) -> void {
-        mut s: string = format("const %s: %s = %s {",
+        mut s: string = fmt::format("const %s: %s = %s {",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.name)), ty, ty);
         for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
             const fi: FieldInit = sl.field_inits[i];
             if (i > 0) { s = s + ","; }
             const fname: string = BindingSerializer::ident(this.ctx.intern_table.resolve(fi.field_name));
-            s = s + format(" %s: %s", fname, BindingSerializer::render_const_scalar(fi.value));
+            s = s + fmt::format(" %s: %s", fname, BindingSerializer::render_const_scalar(fi.value));
         }
         this.out.push(s + " };\n\n");
     }
@@ -431,22 +535,22 @@ type struct BindingSerializer {
     render_function_named(mut &this, node: FunctionDeclNode*,
                           disp_name: string, symbol: string) -> void {
         if (symbol.length() > 0) {
-            this.out.push(format("    ![symbol(\"%s\")]\n", symbol));
+            this.out.push(fmt::format("    ![symbol(\"%s\")]\n", symbol));
         }
-        this.out.push(format("    function %s(", disp_name));
+        this.out.push(fmt::format("    function %s(", disp_name));
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             if (i > 0) { this.out.push(", "); }
             const p: VarDeclNode* = node.parameters[i];
             mut pn: string = this.ctx.intern_table.resolve(p.name);
-            if (pn.length() == 0) { pn = format("arg%lld", i); }
+            if (pn.length() == 0) { pn = fmt::format("arg%lld", i); }
             else                       { pn = BindingSerializer::ident(pn); }
-            this.out.push(format("%s: %s", pn, this.render_type(p.type_annotation)));
+            this.out.push(fmt::format("%s: %s", pn, this.render_type(p.type_annotation)));
         }
         if (node.is_variadic) {
             if (node.parameters.length > 0) { this.out.push(", ..."); }
             else { this.out.push("..."); }
         }
-        this.out.push(format(") -> %s;\n",
+        this.out.push(fmt::format(") -> %s;\n",
             this.render_type(node.return_type_annotation)));
     }
 
@@ -457,14 +561,14 @@ type struct BindingSerializer {
     /// default, so no modifier is emitted; the file's `namespace` qualifies it.
     render_wrapper_function(mut &this, node: FunctionDeclNode*) -> void {
         // Signature (param names keyword-escaped, matching the call args below).
-        mut s: string = format("function %s(", this.ctx.intern_table.resolve(node.name));
+        mut s: string = fmt::format("function %s(", this.ctx.intern_table.resolve(node.name));
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             if (i > 0) { s = s + ", "; }
             const p: VarDeclNode* = node.parameters[i];
             const pn: string = BindingSerializer::ident(this.ctx.intern_table.resolve(p.name));
-            s = s + format("%s: %s", pn, this.render_type(p.type_annotation));
+            s = s + fmt::format("%s: %s", pn, this.render_type(p.type_annotation));
         }
-        s = s + format(") -> %s {\n", this.render_type(node.return_type_annotation));
+        s = s + fmt::format(") -> %s {\n", this.render_type(node.return_type_annotation));
 
         // Body: extract the forwarded call (return-of-call, or a void call).
         const st: StatementNode* = node.body.statements[0];
@@ -478,7 +582,7 @@ type struct BindingSerializer {
             this.ctx.intern_table.resolve((call.callee as IdentifierNode*).name);
 
         s = s + (if (is_ret) { "    return " } else { "    " });
-        s = s + format("%s(", target);
+        s = s + fmt::format("%s(", target);
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             if (i > 0) { s = s + ", "; }
             s = s + BindingSerializer::ident(this.ctx.intern_table.resolve(node.parameters[i].name));
@@ -492,7 +596,7 @@ type struct BindingSerializer {
     /// (`&this` / `mut &this`) is the method's first parameter for an instance
     /// method (encoded by the importer); a static method has none.
     render_impl(mut &this, node: ImplBlockNode*) -> void {
-        this.out.push(format("implement %s {\n",
+        this.out.push(fmt::format("implement %s {\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.target_type))));
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.render_method(node.methods[i]);
@@ -504,11 +608,11 @@ type struct BindingSerializer {
     render_method(mut &this, m: MethodNode*) -> void {
         const func: FunctionDeclNode* = m.func;
         if (func.has_link_name) {
-            this.out.push(format("    ![symbol(\"%s\")]\n", func.link_name));
+            this.out.push(fmt::format("    ![symbol(\"%s\")]\n", func.link_name));
         }
         mut s: string = "    public ";
         if (m.is_static) { s = s + "static "; }
-        s = s + format("%s(", BindingSerializer::ident(this.ctx.intern_table.resolve(func.name)));
+        s = s + fmt::format("%s(", BindingSerializer::ident(this.ctx.intern_table.resolve(func.name)));
         // For an instance method the first parameter is the synthetic receiver
         // (its NAME is the literal `&this`/`mut &this` token, type_annotation
         // null) - rendered verbatim, not as `name: type`.
@@ -521,16 +625,16 @@ type struct BindingSerializer {
                 s = s + this.ctx.intern_table.resolve(p.name);   // `&this` / `mut &this`
             } else {
                 mut pn: string = this.ctx.intern_table.resolve(p.name);
-                if (pn.length() == 0) { pn = format("arg%lld", i); }
+                if (pn.length() == 0) { pn = fmt::format("arg%lld", i); }
                 else                       { pn = BindingSerializer::ident(pn); }
-                s = s + format("%s: %s", pn, this.render_type(p.type_annotation));
+                s = s + fmt::format("%s: %s", pn, this.render_type(p.type_annotation));
             }
         }
         if (func.is_variadic) {
             if (!first) { s = s + ", "; }
             s = s + "...";
         }
-        s = s + format(") -> %s;\n", this.render_type(func.return_type_annotation));
+        s = s + fmt::format(") -> %s;\n", this.render_type(func.return_type_annotation));
         this.out.push(s);
     }
 
@@ -554,7 +658,7 @@ type struct BindingSerializer {
                     this.ctx.intern_table.resolve(n.name)));
             }
             TypeAnnotation::Array(a) => {
-                return format("%s[%lld]", this.render_type(a.element), a.size);
+                return fmt::format("%s[%lld]", this.render_type(a.element), a.size);
             }
             TypeAnnotation::Function(f) => {
                 mut s: string = "(";
@@ -577,7 +681,7 @@ type struct BindingSerializer {
     /// the consumer simply uses the suffixed name.  Reuses the lexer's own
     /// keyword table (single source of truth) so it can never drift.
     static ident(name: string) -> string {
-        if (TokenType::from_keyword(name) != TokenType::Unknown) {
+        if (TokenType::from_keyword(Keyword::new(name)) != TokenType::Unknown) {
             return name + "_";
         }
         return name;
@@ -601,7 +705,8 @@ type struct BindingSerializer {
     }
 
     /// Escape a decoded byte string for embedding in a Cryo `"..."` literal.
-    static escape(s: string) -> string {
+    static escape(s_text: string) -> string {
+        const s: string = s_text;
         const n: u64 = s.length();
         mut out: String = String::new();
         for (mut i: u64 = 0; i < n; i++) {
@@ -638,7 +743,7 @@ type struct VendorGenerator {
                     include_dirs: &string[], defines: &string[],
                     out_inputs: string[]*, language: string, cpp_std: string) -> string {
         mut ctx: CompilationContext = CompilationContext::new(
-            CompileMode::SingleFile, "<vendor-bindgen>");
+            BuildOptions::defaults(CompileMode::SingleFile), "<vendor-bindgen>", null);
         // The importer pushes top-level type decls into the AST root; give it a
         // fresh program node to collect into.
         mut root: ProgramNode* = new ProgramNode(SourceSpan::none());
@@ -654,10 +759,10 @@ type struct VendorGenerator {
         mut extra: u8*[] = [];
         for (mut i: i64 = 0; i < include_dirs.length; i++) {
             const inc: string = VendorGenerator::join(source_path, include_dirs[i]);
-            extra.push(format("-I%s", inc) as u8*);
+            extra.push(fmt::format("-I%s", inc) as u8*);
         }
         for (mut i: i64 = 0; i < defines.length; i++) {
-            extra.push(format("-D%s", defines[i]) as u8*);
+            extra.push(fmt::format("-D%s", defines[i]) as u8*);
         }
 
         // Accumulate every header's skipped/approximated constructs so the
@@ -697,11 +802,11 @@ type struct VendorGenerator {
     /// invalidates the cache.  The CXString's C buffer is interned (copied) so
     /// the returned `string` outlives the disposed CXString.
     static clang_version() -> string {
-        const s: CXString = Clang::clang_getClangVersion();
-        const cstr: u8* = Clang::clang_getCString(s);
+        const s: CXString = clang::clang_getClangVersion();
+        const cstr: u8* = clang::clang_getCString(s);
         mut out: string = "";
         if (cstr != null) { out = String::from_string(cstr as string).into_raw(); }
-        Clang::clang_disposeString(s);
+        clang::clang_disposeString(s);
         return out;
     }
 
@@ -723,12 +828,15 @@ type struct VendorGenerator {
     /// upgrading does not spuriously invalidate a cache whose `GENERATOR_VERSION`
     /// already matched (the version bump to 6 is what forces the one-time
     /// regeneration that installs the sidecar).
-    static provenance_key(source_path: string, headers: &string[],
+    static provenance_key(source_path_text: string, headers: &string[],
                           include_dirs: &string[], defines: &string[],
-                          triple: string, cache_file: string, lang: string) -> string {
+                          triple_text: string, cache_file_text: string, lang_text: string) -> string {
+        const cache_file: string = cache_file_text;
+        const lang: string = lang_text;
+        const triple: string = triple_text;
         mut h: Fnv128Hasher = Fnv128Hasher::new();
         const depfile: string = if (cache_file.length() > 0) {
-            format("%s.deps", cache_file)
+            fmt::format("%s.deps", cache_file)
         } else {
             ""
         };
@@ -739,7 +847,7 @@ type struct VendorGenerator {
             // Fallback (fresh register / pre-sidecar cache): entry headers only.
             for (mut i: i64 = 0; i < headers.length; i++) {
                 const hp: string = VendorGenerator::resolve_header(
-                    source_path, include_dirs, headers[i]);
+                    source_path_text, include_dirs, headers[i]);
                 if (hp.length() == 0) {
                     // A missing header still perturbs the key (distinct marker +
                     // the requested name) so it can't masquerade as unchanged.
@@ -756,6 +864,19 @@ type struct VendorGenerator {
         // touching any header) MUST invalidate the cache.  Distinct markers
         // keep the two lists from aliasing each other, and the per-element
         // order is the manifest order (stable across regenerations).
+        //
+        // The entry-header LIST is one of those knobs, and folding the include
+        // graph does not cover it: a header added to the manifest whose bytes
+        // the graph never reached leaves the digest untouched, so the addition
+        // reads as a cache hit and its declarations silently never appear.  It
+        // decides which file is the MAIN file too, which is what governs macro
+        // import.  The length is folded so that removing a header - or moving a
+        // name boundary, `["a","b"]` against `["ab"]` - also misses.
+        h.fold("<headers>");
+        h.fold(headers.length as u64);
+        for (mut i: i64 = 0; i < headers.length; i++) {
+            h.fold(headers[i]);
+        }
         h.fold("<include_dirs>");
         for (mut i: i64 = 0; i < include_dirs.length; i++) {
             h.fold(include_dirs[i]);
@@ -781,7 +902,8 @@ type struct VendorGenerator {
     /// listed file that has since been deleted perturbs the key with a distinct
     /// marker (so it can't masquerade as unchanged -> forces a regeneration that
     /// rebuilds the graph).  Blank lines are skipped.
-    static fold_depfile(h: Fnv128Hasher*, depfile: string) -> void {
+    static fold_depfile(h: Fnv128Hasher*, depfile_text: string) -> void {
+        const depfile: string = depfile_text;
         mut content: string = "";
         match (file::read_to_string(Path::from(depfile))) {
             Result::Ok(s)  => { content = s.into_raw(); }
@@ -813,8 +935,9 @@ type struct VendorGenerator {
     /// per line, in the order `generate` accumulated them.  Best-effort - a
     /// write failure just means the next cache check falls back to the
     /// entry-header key (a possible spurious regeneration, never a stale cache).
-    static write_depfile(cryo_path: string, inputs: &string[]) -> void {
-        const dpath: string = format("%s.deps", cryo_path);
+    static write_depfile(cryo_path_text: string, inputs: &string[]) -> void {
+        const cryo_path: string = cryo_path_text;
+        const dpath: string = fmt::format("%s.deps", cryo_path);
         mut text: String = String::new();
         for (mut i: i64 = 0; i < inputs.length; i++) {
             text.push(Str::new(inputs[i]));
@@ -826,7 +949,7 @@ type struct VendorGenerator {
             Result::Ok(_)  => {}
             Result::Err(_) => {}
         }
-        text.drop();
+        mem::drop(text);
     }
 
     /// De-duplicate a path list in place, preserving first-seen order (so the
@@ -845,25 +968,29 @@ type struct VendorGenerator {
     }
 
     /// `<base>/<rel>` (or `rel` when already absolute-ish).
-    static join(base: string, rel: string) -> string {
+    static join(base_text: string, rel_text: string) -> string {
+        const base: string = base_text;
+        const rel: string = rel_text;
         if (rel.length() == 0) { return base; }
         if (rel[0] == '/' || rel[0] == '\\'
             || (rel.length() > 1 && rel[1] == ':')) {
             return rel;   // already absolute (POSIX or Windows drive)
         }
-        return format("%s/%s", base, rel);
+        return fmt::format("%s/%s", base, rel);
     }
 
     /// Resolve a manifest header name to an existing file: try each include dir
     /// under source_path, then source_path itself, then the name verbatim.
-    static resolve_header(source_path: string, include_dirs: &string[],
-                          header: string) -> string {
+    static resolve_header(source_path_text: string, include_dirs: &string[],
+                          header_text: string) -> string {
+        const header: string = header_text;
+        const source_path: string = source_path_text;
         for (mut i: i64 = 0; i < include_dirs.length; i++) {
-            const cand: string = format("%s/%s/%s",
+            const cand: string = fmt::format("%s/%s/%s",
                 source_path, include_dirs[i], header);
             if (metadata::exists(Path::from(cand))) { return cand; }
         }
-        const direct: string = format("%s/%s", source_path, header);
+        const direct: string = fmt::format("%s/%s", source_path, header);
         if (metadata::exists(Path::from(direct))) { return direct; }
         if (metadata::exists(Path::from(header))) { return header; }
         return "";

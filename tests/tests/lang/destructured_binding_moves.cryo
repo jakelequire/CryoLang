@@ -1,0 +1,89 @@
+///! A field bound by a destructure is tracked as an owned local: given away
+///! once it is released once, by its new owner, and never again at scope exit.
+///!
+///! The refusals - a destructured field given away twice, a destructure's
+///! source used after its fields were taken - are the two `E0452_destructure*`
+///! negatives.  These tests pin the other side: tracking the bindings must not
+///! refuse a program that gives each value away exactly once, including in a
+///! loop body (a fresh binding each iteration, not one carried across the
+///! back-edge) and on one branch only.  Each counts releases.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::DestructuredBindingMoves;
+
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+
+mut g_dropped: i32 = 0;
+function reset() -> void { g_dropped = 0; }
+function dropped() -> i32 { return g_dropped; }
+
+type struct Res {
+    tag: i32;
+}
+implement trait Drop for struct Res {
+    drop(mut &this) -> void { g_dropped = g_dropped + 1; }
+}
+
+type struct Pair {
+    a: Res;
+    b: Res;
+}
+
+function consume(r: Res) -> i32 {
+    return r.tag;
+}
+
+function take_apart(p: Pair) -> i32 {
+    const {a, b}: Pair = p;                   // the parameter is taken whole
+    return consume(a) + b.tag;
+}
+
+![test]
+function each_field_given_away_once_is_released_once() -> Result<(), TestError> {
+    reset();
+    {
+        const {a, b}: Pair = Pair { a: Res { tag: 1 }, b: Res { tag: 2 } };
+        const _x: i32 = consume(a);
+        const _y: i32 = consume(b);
+    }
+    return expect_eq(dropped(), 2);
+}
+
+![test]
+function destructure_in_a_loop_body_is_fresh_each_iteration() -> Result<(), TestError> {
+    reset();
+    for (mut i: i32 = 0; i < 3; i++) {
+        const {a, b}: Pair = Pair { a: Res { tag: i }, b: Res { tag: 10 + i } };
+        const _x: i32 = consume(a);
+    }
+    return expect_eq(dropped(), 6);
+}
+
+![test]
+function field_given_away_on_one_branch_is_released_once() -> Result<(), TestError> {
+    reset();
+    {
+        const {a, b}: Pair = Pair { a: Res { tag: 1 }, b: Res { tag: 2 } };
+        if (b.tag == 2) {
+            const _x: i32 = consume(a);
+        }
+    }
+    return expect_eq(dropped(), 2);
+}
+
+![test]
+function destructured_parameter_is_released_once() -> Result<(), TestError> {
+    reset();
+    const n: i32 = take_apart(Pair { a: Res { tag: 3 }, b: Res { tag: 4 } });
+    match (expect_eq(n, 7)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(dropped(), 2);
+}

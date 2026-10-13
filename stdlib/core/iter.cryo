@@ -21,10 +21,13 @@
 
 namespace std::core::iter;
 
-import core::option;
-import core::clone;
-import core::cmp;
-import collections::pair;
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::clone;
+import std::core::cmp;
+import std::core::cmp::{ Ord };
+import std::collections::pair;
+import std::collections::pair::{ Pair };
 
 type trait Iterator {
     /// The element type this iterator yields. Each implementor binds it once
@@ -93,8 +96,9 @@ type trait Iterator {
     }
 
     /// Yield only the elements for which `pred` returns `true`. `pred` must be
-    /// a non-capturing function.
-    filter(this, pred: (This::Item) -> boolean) -> FilterIter<This> {
+    /// a non-capturing function.  It BORROWS each element: the element it
+    /// keeps is the one yielded, so it cannot also be handed to `pred`.
+    filter(this, pred: (&This::Item) -> boolean) -> FilterIter<This> {
         return FilterIter::new(this, pred);
     }
 
@@ -146,8 +150,9 @@ type trait Iterator {
     }
 
     /// The first element for which `pred` holds, or `None`. Consumes
-    /// elements up to and including the match.
-    find(mut &this, pred: (This::Item) -> boolean) -> Option<This::Item> {
+    /// elements up to and including the match.  `pred` borrows each element,
+    /// since the one it accepts is returned.
+    find(mut &this, pred: (&This::Item) -> boolean) -> Option<This::Item> {
         loop {
             match (this.next()) {
                 Option::Some(value) => {
@@ -160,8 +165,8 @@ type trait Iterator {
 
     /// The smallest element by `Ord`, or `None` for an empty iterator.
     /// Consumes the iterator. On ties the FIRST minimal element wins (only a
-    /// strictly smaller element displaces the running best), matching Rust's
-    /// `Iterator::min`. Available only where the element type is `Ord` - the
+    /// strictly smaller element displaces the running best), so `min` and
+    /// `max` of equal elements differ. Available only where the element type is `Ord` - the
     /// `where This::Item: Ord` associated-type projection bound; adapters whose
     /// element is never `Ord` (e.g. `enumerate`/`zip`, which yield `Pair`) do
     /// not carry it.
@@ -184,8 +189,8 @@ type trait Iterator {
 
     /// The largest element by `Ord`, or `None` for an empty iterator.
     /// Consumes the iterator. On ties the LAST maximal element wins (an
-    /// equal-or-greater element displaces the running best), matching Rust's
-    /// `Iterator::max`.
+    /// equal-or-greater element displaces the running best), the mirror of
+    /// `min`.
     max(mut &this) -> Option<This::Item> where This::Item: Ord {
         match (this.next()) {
             Option::None => { return Option::None; }
@@ -210,7 +215,7 @@ type struct TakeIter<I> {
     remaining: u64;
 
     static new(inner: I, n: u64) -> TakeIter<I> {
-        return TakeIter<I> { inner: inner, remaining: n };
+        return TakeIter::<I> { inner: inner, remaining: n };
     }
 }
 
@@ -233,7 +238,7 @@ type struct SkipIter<I> {
     remaining: u64;
 
     static new(inner: I, n: u64) -> SkipIter<I> {
-        return SkipIter<I> { inner: inner, remaining: n };
+        return SkipIter::<I> { inner: inner, remaining: n };
     }
 }
 
@@ -264,12 +269,12 @@ where I: Iterator<A> {
 /// to the receiver's concrete element, leaving `map`'s `B` unbindable.  A
 /// distinct name keeps the default's generic independent of the adapter's
 /// parameter.
-type struct MapIter<I, O> {
+type struct MapIter<I, O> where I: Iterator {
     inner: I;
     f:     (I::Item) -> O;
 
     static new(inner: I, f: (I::Item) -> O) -> MapIter<I, O> {
-        return MapIter<I, O> { inner: inner, f: f };
+        return MapIter::<I, O> { inner: inner, f: f };
     }
 }
 
@@ -284,22 +289,25 @@ where I: Iterator {
 }
 
 /// Adapter yielding only the elements of `inner` for which `pred` holds.
-type struct FilterIter<I> {
+type struct FilterIter<I> where I: Iterator {
     inner: I;
-    pred:  (I::Item) -> boolean;
+    pred:  (&I::Item) -> boolean;
 
-    static new(inner: I, pred: (I::Item) -> boolean) -> FilterIter<I> {
-        return FilterIter<I> { inner: inner, pred: pred };
+    static new(inner: I, pred: (&I::Item) -> boolean) -> FilterIter<I> {
+        return FilterIter::<I> { inner: inner, pred: pred };
     }
 }
 
 implement<I> trait Iterator<I::Item> for struct FilterIter<I>
 where I: Iterator {
     next(mut &this) -> Option<I::Item> {
+        // Called through a local: a call through the field itself leaves its
+        // argument unclassified, which the move checker reads as a transfer.
+        const pred: (&I::Item) -> boolean = this.pred;
         loop {
             match (this.inner.next()) {
                 Option::Some(value) => {
-                    if (this.pred(value)) {
+                    if (pred(value)) {
                         return Option::Some(value);
                     }
                 }
@@ -318,7 +326,7 @@ type struct ChainIter<I, J> {
     first_done: boolean;
 
     static new(first: I, second: J) -> ChainIter<I, J> {
-        return ChainIter<I, J> { first: first, second: second, first_done: false };
+        return ChainIter::<I, J> { first: first, second: second, first_done: false };
     }
 }
 
@@ -343,7 +351,7 @@ type struct EnumerateIter<I> {
     index: u64;
 
     static new(inner: I) -> EnumerateIter<I> {
-        return EnumerateIter<I> { inner: inner, index: 0 };
+        return EnumerateIter::<I> { inner: inner, index: 0 };
     }
 }
 
@@ -354,7 +362,7 @@ where I: Iterator {
             Option::Some(value) => {
                 const i: u64 = this.index;
                 this.index = this.index + 1;
-                return Option::Some(Pair<u64, I::Item> { first: i, second: value });
+                return Option::Some(Pair::<u64, I::Item> { first: i, second: value });
             }
             Option::None => { return Option::None; }
         }
@@ -370,7 +378,7 @@ type struct ZipIter<I, J> {
     second: J;
 
     static new(first: I, second: J) -> ZipIter<I, J> {
-        return ZipIter<I, J> { first: first, second: second };
+        return ZipIter::<I, J> { first: first, second: second };
     }
 }
 
@@ -381,7 +389,7 @@ where I: Iterator<A>, J: Iterator<O> {
             Option::Some(a) => {
                 match (this.second.next()) {
                     Option::Some(b) => {
-                        return Option::Some(Pair<A, O> { first: a, second: b });
+                        return Option::Some(Pair::<A, O> { first: a, second: b });
                     }
                     Option::None => { return Option::None; }
                 }

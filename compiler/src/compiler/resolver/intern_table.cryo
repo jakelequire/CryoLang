@@ -11,7 +11,7 @@
 /// mid-compilation.  In stdlib-batch mode the table persists across
 /// modules so cross-module SymbolStr values remain valid.
 
-namespace Compiler::Resolver::InternTable;
+namespace compiler::resolver::intern_table;
 // Per-target arena routing for the interned-string byte copies.  When the
 // compiler driver activates the arena (Phase 2), `alloc` routes
 // these copies into the arena instead of libc, so `cryo_ast_arena_release()`
@@ -20,10 +20,15 @@ namespace Compiler::Resolver::InternTable;
 // in every other program -> plain libc, no change.
 import std::alloc::allocator;
 
-import Compiler::Resolver::SymbolStr;
+import compiler::resolver::symbol_str;
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name;
+import compiler::resolver::decl_name::{ DeclName };
 import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
 
 type struct InternTable {
+private:
     /// The interned strings, indexed by (SymbolStr.id).
     /// Entry 0 is always "".
     strings: string[];
@@ -31,11 +36,12 @@ type struct InternTable {
     /// Fast dedup index: string -> SymbolStr ID.
     lookup: HashMap<string, u32>;
 
+public:
     /// Create a new table with the empty string pre-seeded at index 0.
     static new() -> InternTable {
         mut table: InternTable = InternTable {
             strings: [],
-            lookup:  HashMap<string, u32>::new(),
+            lookup:  HashMap::<string, u32>::new(),
         };
         // Seed index 0 = "" so SymbolStr::empty() always resolves.
         table.strings.push("");
@@ -43,6 +49,10 @@ type struct InternTable {
         return table;
     }
 
+    /// Text becomes a `SymbolStr` here and nowhere else; a
+    /// `SymbolStr` is still a spelling, so what it may be looked up in is
+    /// the other doors' question, not this one's.
+    ///
     /// Intern a string.  Returns the existing SymbolStr if the text was
     /// already interned, or allocates a new entry and returns it.
     intern(mut &this, text: string) -> SymbolStr {
@@ -75,50 +85,37 @@ type struct InternTable {
         return SymbolStr::from_id(id);
     }
 
+    /// The text of a definition's name, for a message or a mangled symbol.
+    /// What it returns is still the definition's name: sema refuses it, or
+    /// anything computed from it, as a door's argument or a table's key.
+    shown(&this, name: DeclName) -> string {
+        return this.resolve(name.spelling());
+    }
+
     /// Resolve a SymbolStr back to its character data.
     /// Returns "" for out-of-range IDs (defensive, should not happen).
     resolve(&this, sym: SymbolStr) -> string {
-        if (sym.id >= this.strings.length) {
+        if ((sym.id as i64) >= this.strings.length) {
             return "";
         }
         return this.strings[sym.id];
     }
 
-    /// Check whether a string has already been interned (without
-    /// inserting it if absent).
-    contains(&this, text: string) -> boolean {
-        return this.lookup.contains_key(&text);
-    }
+}
 
-    /// Look up a string without inserting.  Returns SymbolStr::empty()
-    /// if the text has not been interned.
-    lookup(&this, text: string) -> SymbolStr {
-        const opt: Option<u32> = this.lookup.get(&text);
-        if (opt.is_some()) {
-            return SymbolStr::from_id(opt.unwrap());
-        }
-        return SymbolStr::empty();
-    }
-
-    /// Total number of unique strings interned (including the empty string).
-    count(&this) -> u32 {
-        return this.strings.length as u32;
-    }
-
-    /// Free every heap-allocated interned string.  Every entry at index
-    /// >= 1 was `alloc`'d in `intern`; index 0 is the `""`
-    /// string literal (static storage) and must NOT be freed.  The
-    /// `lookup` map's keys alias these same pointers, so after this call
-    /// the table is left dangling: callers MUST treat the InternTable as
-    /// dead and never intern/resolve again.  Used to reclaim the per-target
-    /// intern heap when a compilation context is torn down between targets.
-    ///
-    /// Frees through `free` (not raw `intrinsics::free`): copies
-    /// made while the arena was active are arena-owned and `free`
-    /// no-ops them (the bulk `cryo_ast_arena_release()` reclaims them); copies
-    /// made before activation are libc-owned and freed here.  Routing an
-    /// arena pointer to `intrinsics::free` would corrupt the heap.
-    release_strings(mut &this) -> void {
+/// Frees every interned string.  Every entry at index >= 1 was `alloc`'d in
+/// `intern`; index 0 is the `""` literal (static storage) and must NOT be
+/// freed.  The `lookup` map's keys alias these same pointers and are not
+/// freed again.  Every `string` resolved from the table dangles afterwards,
+/// so a caller keeps what must outlive it by copying first.
+///
+/// Frees through `free` (not raw `intrinsics::free`): copies made while the
+/// arena was active are arena-owned and `free` no-ops them (the bulk
+/// `cryo_ast_arena_release()` reclaims them); copies made before activation
+/// are libc-owned and freed here.  The table must therefore drop while its
+/// arena is still published.
+implement trait Drop for struct InternTable {
+    drop(mut &this) -> void {
         for (mut i: i64 = 1; i < this.strings.length; i++) {
             allocator::free(this.strings[i] as void*, 1);
         }

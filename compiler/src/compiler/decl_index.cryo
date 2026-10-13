@@ -13,160 +13,343 @@
 /// Each registration method is idempotent; re-registering a name with a
 /// new TypeRef simply overwrites the old entry.
 
-namespace Compiler::DeclIndex;
+namespace compiler::decl_index;
 
-import Compiler::AST::Declaration;
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Type, Compound, Arena };
-import Compiler::Resolver::{ SymbolStr, InternTable, MangledName, QualifiedName };
+import compiler::ast::{ NodeKind, TypeAnnotation };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::declaration;
+import compiler::ast::declaration::{ FunctionDeclNode, ImplBlockNode, MethodNode, VarDeclNode };
+import compiler::types;
+import compiler::types::{ arena, compound, type_base, type_ref, TypeKind };
+import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DeclVisibility, DefId, DefKind, FamilyOwner, Res, ResSlot, DefTable };
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
 import std::core::option;
+import std::core::option::{ Option };
 import std::collections::{ hashmap, pair };
+import std::fmt;
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName, ReceiverKind };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name::{ DeclName };
+import compiler::module_graph;
+import compiler::module_graph::{ ModuleKey, ModulePath };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{ FunctionType };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import std::collections::hashmap::{ HashMap };
+import std::collections::pair::{ Pair };
+import compiler::intrinsic_kind;
+import compiler::intrinsic_kind::{ IntrinsicKind };
+import std::core::hash::{ Hash, Hasher };
+import std::core::cmp::{ Eq };
+import compiler::types::type_ref::{ TypeKey };
+import compiler::types::user_defined;
+import compiler::types::user_defined::{ ClassType, EnumType, MethodInfo, StructType };
 
 
-/// Outcome of import-scoped bare-leaf name resolution
-/// (`DeclarationIndex::resolve_qualified_scoped`).  Distinguishes a clean
-/// unique resolution, a same-module (local) definition, a genuine
-/// import-visible ambiguity (a hard error the caller must diagnose), and a
-/// clean miss.  `Ambiguous` carries no payload; the caller re-fetches the
-/// candidate set via `lookup_qualified_alternatives` for the diagnostic.
-type enum ScopeResolution {
-    NotFound;
-    Unique(SymbolStr);
-    SameModule(SymbolStr);
-    Ambiguous;
+/// One global's registration slot, read by value: the key the slot is
+/// under (its leaf and the module that declared it), the global's type as
+/// that module declared it, the source file that declared it, the linker
+/// symbol when another object owns the storage, and whether it is
+/// thread-local.
+/// A reader holding one asks it, and asks the index nothing further by
+/// name; `valid` is false for a slot that does not exist.
+type struct GlobalEntry {
+    valid:         boolean;
+    /// The registration slot this entry was read from: the coordinate a
+    /// node carries (`MemberPin::Global`) so codegen reads the slot back
+    /// with `global_entry_at` and asks nothing by name.  -1 when not `valid`.
+    slot:          i64;
+    leaf:          SymbolStr;
+    declared_in:   ModulePath;
+    type_ref:      TypeRef;
+    source_file:   SymbolStr;
+    extern_symbol: SymbolStr;
+    thread_local:  boolean;
+
+    static none() -> GlobalEntry {
+        return GlobalEntry {
+            valid: false, slot: -1, leaf: SymbolStr::empty(), declared_in: ModulePath::none(),
+            type_ref: TypeRef::invalid(), source_file: SymbolStr::empty(),
+            extern_symbol: SymbolStr::empty(), thread_local: false,
+        };
+    }
 }
 
-implement enum ScopeResolution {
-    /// The resolved qualified name for a clean/local resolution, or `bare`
-    /// unchanged on a miss or ambiguity.  Lets call sites that only want a
-    /// name stay one-liners; ambiguity is surfaced separately via
-    /// `is_ambiguous` at the authoritative
-    /// (type-resolution / sema) sites that own the diagnostic.
-    resolved_or(&this, bare: SymbolStr) -> SymbolStr {
-        match (&this) {
-            ScopeResolution::Unique(q)     => { return q; }
-            ScopeResolution::SameModule(q) => { return q; }
-            _                              => { return bare; }
-        }
+
+/// The tag the next `DeclarationIndex` is made with.  Starts above 0, the
+/// invalid id's tag, so no index owns the invalid id.
+mut g_overload_index_tags: u32 = 0;
+
+/// A signature's position in the index's function registry: the identity of
+/// one registered declaration signature, which a call pins and codegen reads
+/// the symbol and signature off.  Minted only here, by `register_signature`,
+/// and read only here: the position is private to this module, so an id
+/// cannot be built from a number anywhere else - an in-range position would
+/// silently name whichever entry sits there.  It carries the tag of the
+/// index that made it, and the index reads its registry only through
+/// `slot_of`, which refuses an id another index made: a second index's
+/// positions start at 0 too, so a position alone names SOME entry in any
+/// index.
+type struct OverloadId {
+private:
+    /// Position in the registry's parallel arrays; `0xFFFFFFFF` for none.
+    pos: u32;
+    /// The tag of the index that made this id; 0 for the invalid id.
+    table: u32;
+
+    /// The id of the entry at registry position `pos` of the index tagged
+    /// `table`.  Registration's mint.
+    static at_position(pos: u32, table: u32) -> OverloadId {
+        return OverloadId { pos: pos, table: table };
     }
 
-    is_ambiguous(&this) -> boolean {
-        match (&this) {
-            ScopeResolution::Ambiguous => { return true; }
-            _                          => { return false; }
-        }
+public:
+    /// The id naming no entry, for a slot that must hold one before an
+    /// answer exists.
+    static invalid() -> OverloadId {
+        return OverloadId { pos: 4294967295, table: 0 };
     }
 
-    is_found(&this) -> boolean {
-        match (&this) {
-            ScopeResolution::NotFound => { return false; }
-            _                         => { return true; }
-        }
+    is_valid(&this) -> boolean {
+        return this.pos != 4294967295;
+    }
+
+    equals(&this, other: OverloadId) -> boolean {
+        return this.pos == other.pos && this.table == other.table;
+    }
+
+    /// The key a table keyed by entries stores this one under.
+    table_key(&this) -> OverloadKey {
+        return OverloadKey { packed: ((this.table as u64) << 32) | (this.pos as u64) };
+    }
+}
+
+/// The key of a table keyed by overload entries.  Made only by
+/// `OverloadId::table_key`.
+type struct OverloadKey {
+private:
+    packed: u64;
+}
+
+implement trait Hash for struct OverloadKey {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.packed.hash(hasher);
+    }
+}
+
+implement trait Eq for struct OverloadKey {
+    equals(&this, other: &OverloadKey) -> boolean {
+        return this.packed == other.packed;
+    }
+}
+
+/// The key a family is stored under: the owner's definition and the member
+/// leaf, packed.  Made only by `family_slot`, the member-function door's
+/// key, so a family table is handed nothing a caller composed.  `none()`
+/// (0) is the key of no family: an owner this index never registered.
+type struct FamilySlot {
+private:
+    packed: u64;
+
+public:
+    static none() -> FamilySlot {
+        return FamilySlot { packed: 0 };
+    }
+
+    is_none(&this) -> boolean {
+        return this.packed == 0;
+    }
+}
+
+implement trait Hash for struct FamilySlot {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.packed.hash(hasher);
+    }
+}
+
+implement trait Eq for struct FamilySlot {
+    equals(&this, other: &FamilySlot) -> boolean {
+        return this.packed == other.packed;
+    }
+}
+
+/// The key of an owner's copy of a method definition: the owner type and
+/// the definition's slot, packed.  Made only by `copy_key`.
+type struct CopyKey {
+private:
+    packed: u64;
+}
+
+implement trait Hash for struct CopyKey {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.packed.hash(hasher);
+    }
+}
+
+implement trait Eq for struct CopyKey {
+    equals(&this, other: &CopyKey) -> boolean {
+        return this.packed == other.packed;
+    }
+}
+
+/// The key of an implicit conversion: the argument type and the return
+/// type, packed.  Made only by `converter_key`.
+type struct ConversionKey {
+private:
+    packed: u64;
+}
+
+implement trait Hash for struct ConversionKey {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.packed.hash(hasher);
+    }
+}
+
+implement trait Eq for struct ConversionKey {
+    equals(&this, other: &ConversionKey) -> boolean {
+        return this.packed == other.packed;
     }
 }
 
 
 type struct DeclarationIndex {
-    // Function name -> return type
-    func_returns:   HashMap<u32, TypeRef>;
+    /// The compilation's definitions, for a definition's path.  Borrowed;
+    /// set by `CompilationContext`, which owns it.
+    defs: DefTable*;
+    // Family slot (`family_slot`) -> the last signature registered in it
+    private func_type_refs: HashMap<FamilySlot, TypeRef>;
 
-    // Function name -> FunctionType TypeRef (full signature in the arena)
-    func_type_refs: HashMap<u32, TypeRef>;
+    // Reverse: a type -> the definition it was registered as, made by the
+    // registration; a type's name is read off the definition.
+    type_reverse:   HashMap<TypeKey, DefId>;
 
-    // Packed(type_id, method_id) -> return type
-    method_returns: HashMap<u64, TypeRef>;
+    // The definition's slot in `defs` -> the type it was registered as;
+    // invalid for a slot no type registration reached.
+    def_types:      TypeRef[];
 
-    // Type name -> TypeRef (for struct, class, enum, trait lookups)
-    type_map:       HashMap<u32, TypeRef>;
+    // The definition's slot in `defs` -> the entry its signature was
+    // registered as; invalid for a slot no function registration reached.
+    def_entries:    OverloadId[];
 
-    // Global variable name -> TypeRef
-    global_vars:    HashMap<u32, TypeRef>;
+    // A type definition's slot in `defs` -> the family its constructors
+    // are registered in (`family_slot`); 0 for a type that registered none.
+    ctor_families:  FamilySlot[];
 
-    // Reverse: TypeRef.id -> SymbolStr.id (for looking up a type's name)
-    type_reverse:   HashMap<u64, u32>;
+    // The definition's slot in `defs` -> the declaration the name layer
+    // registered it for: a method's `MethodNode`, or a trait's declared
+    // method's `FunctionDeclNode`; null for a slot that is no method.
+    method_decls:   ASTNode*[];
 
-    // Per-module declaration ownership.
-    // Used by codegen to enumerate "all functions/types defined in Module X".
-    // The global maps above remain the fast-path for lookup during sema;
-    // these arrays are the slow-path for per-module enumeration.
-    module_funcs:        Pair<u32, u32>[];    // .first = SymbolStr.id of function, .second = SymbolStr.id of module
-    module_types:        Pair<u32, u32>[];    // .first = SymbolStr.id of type, .second = SymbolStr.id of module
-    module_global_keys:       u32[];  // SymbolStr.id of global variable
-    module_global_modules:    u32[];  // SymbolStr.id of defining module (source_file)
-    module_global_namespaces: u32[];  // SymbolStr.id of defining namespace (e.g.,
-                                      // "std::collections::hashmap"). Used by
-                                      // codegen to mangle definitions and cross-
-                                      // module references with a module-qualified
-                                      // path so two modules can each declare the
-                                      // same private `const NAME = ...` without
+    // (owner type << 32 | a method definition's slot in `defs`) -> the
+    // entry of the owner's copy of that method: an instance's clone of its
+    // template's method, a type's copy of a trait's default.
+    copy_entries:   HashMap<CopyKey, OverloadId>;
+
+    // A generic function's instance - the arena instantiation of its
+    // template's placeholder with the type arguments - -> the entry its copy
+    // registered.
+    instance_entries: HashMap<TypeKey, OverloadId>;
+
+    // A global definition's slot in `defs` -> its registration slot in the
+    // `module_global_*` arrays; -1 for a slot no global registration reached.
+    def_globals:              i64[];
+    private module_global_leaves:     u32[];  // SymbolStr.id of the global's own name
+    module_global_files:      u32[];  // SymbolStr.id of the defining source file
+    module_global_declared_in: ModulePath[];  // the defining module
+                                      // (`std::collections::hashmap`).  Codegen
+                                      // mangles definitions and cross-module
+                                      // references under its path, so two
+                                      // modules can each declare the same
+                                      // private `const NAME = ...` without
                                       // colliding at link time.
-    module_global_types:      TypeRef[];  // parallel to module_global_keys: the
-                                      // global's type AS DECLARED IN THAT module.
-                                      // `global_vars` is keyed by bare name and is
-                                      // last-write-wins, so it cannot answer "the
-                                      // `FIONBIO` declared in `sys::syscall`" when
-                                      // another module declares that leaf too.
-    module_global_threadlocal: boolean[];  // parallel to module_global_keys:
+    module_global_types:      TypeRef[];  // parallel to module_global_leaves: the
+                                      // global's type as its declaration has it.
+    module_global_threadlocal: boolean[];  // parallel to module_global_leaves:
                                       // whether the global is `![thread_local]`,
                                       // so a cross-module extern reference is
                                       // marked thread-local too (else it would
                                       // reference a TLS symbol with a non-TLS
                                       // relocation and fail to link).
+    private module_global_extern_syms: u32[];  // parallel to module_global_leaves: the
+                                      // linker symbol of a global whose storage
+                                      // another object owns (an `extern` C
+                                      // global), 0 for one Cryo defines.  An
+                                      // imported global binds ONE symbol
+                                      // program-wide - the one the C library
+                                      // exports - and a reader mangling the
+                                      // reference `C$<ns>.<name>` as it does for
+                                      // a Cryo definition asks the linker for a
+                                      // symbol nobody emits (`errno`).
 
-    // Qualified function name -> mangled LLVM symbol name.
-    // Computed once at registration time so codegen never mangles.
-    mangled_names:       HashMap<u32, u32>;
-
-    // Array element TypeRef.id -> concrete Array_<T> qualified name SymbolStr.id.
+    // Array element type -> the concrete `Array<T>` instantiation.
     // Populated by the specialization pass so codegen can resolve T[].method()
     // to the monomorphized Array_T struct without name reconstruction.
-    array_elem_to_type:  HashMap<u64, u32>;
+    array_elem_to_type:  HashMap<TypeKey, TypeRef>;
 
     // Implicit-conversion registry: Packed(arg_type_id, return_type_id) ->
-    // Packed(type_name_id << 32 | method_name_id).  Populated in
-    // DirectiveProcessing from `![implicit]` single-param non-generic
-    // converters: a static method `Type::method` (type_name_id != 0) or a
-    // free function (type_name_id == 0, method_name_id = the function name).
-    // Sema reads it at a type-incompatible coercion site (call argument or
-    // typed binding) and synthesizes the converter call (e.g. `string` ->
-    // `Str` via `Str::new`) instead of emitting E0214/E0200.  Keyed on the
-    // resolved canonical arena ids, exactly the ids the use site sees.
-    implicit_converters: HashMap<u64, u64>;
+    // the converter's definition.  Populated in DirectiveProcessing from
+    // `![implicit]` single-param non-generic converters: a static method
+    // or a free function.  Sema reads it at a type-incompatible coercion
+    // site (call argument or typed binding) and synthesizes a call bound to
+    // that definition (e.g. `string` -> `Str` via `Str::new`) instead of
+    // emitting E0214/E0200.  Keyed on the resolved canonical arena ids,
+    // exactly the ids the use site sees.
+    implicit_converters: HashMap<ConversionKey, DefId>;
 
-    // Static-method converters whose owning type is GENERIC (e.g.
-    // `String::from_string` on `String<A>`).  `.first` = owner type-name
-    // SymbolStr.id, `.second` = method-name SymbolStr.id.  The
-    // monomorphizer force-instantiates each for its default type args so a
-    // sema-synthesized `Owner<defaults>::method(arg)` call has a real spec
-    // to link against (a non-generic owner like `Str` needs no such help).
-    generic_converter_methods: Pair<u32, u32>[];
-
-    // Function overload registry: parallel arrays keyed by function
-    // name (SymbolStr.id), storing every registered FunctionType TypeRef
-    // and its overload-specific mangled name.  `func_type_refs` and
-    // `mangled_names` above each keep only the last registration per
-    // name, which collapses overloads like `String::new()` and
-    // `String::new(u64)` to a single entry.  Cross-module extern
-    // declaration needs every overload's signature AND mangled name,
-    // so it walks these arrays instead.
-    overload_func_keys:    u32[];     // SymbolStr.id of function name
-    overload_func_types:   TypeRef[]; // FunctionType TypeRef for this overload
-    overload_func_mangled: u32[];     // SymbolStr.id of mangled LLVM name (0 = unset)
-    overload_func_owner:   u32[];     // SymbolStr.id of the owning declaration's
-                                      // QUALIFIED name (0 = legacy/global claim:
-                                      // extern "C" twins, combined-name and
-                                      // qualified-name registrations).  Lets two
-                                      // same-signature declarations from different
-                                      // modules coexist under one bare leaf
-                                      // (`intrinsics::free` vs `alloc::heap::free`)
-                                      // instead of being merged into a single
-                                      // last-writer-owned entry, and lets the
-                                      // bare-call binder filter candidates by the
-                                      // use site's imports.
-
-    // Bare-name -> all qualified names ever registered for it.
-    // Populated by `register_name_mapping`.
-    bare_alts:           Pair<u32, u32>[];    // .first = bare SymbolStr.id, .second = qualified SymbolStr.id
+    // Function registry: one entry per (family, signature, alias, symbol),
+    // in parallel arrays; an entry's position is its `OverloadId`.  The
+    // family is the owner and leaf every signature of a declaration is
+    // registered under; `func_type_refs` above keeps only the last signature
+    // per family, which collapses overloads like `String::new()` and
+    // `String::new(u64)`.
+    // The symbol is part of the identity: two declarations can share a family
+    // and a signature and be two definitions (`Display::fmt` and
+    // `Debug::fmt` on one type, an inherent method beside a trait's, two
+    // specializations of a generic method whose signature does not mention
+    // its parameter), and a registration carrying a symbol the entry does
+    // not already hold appends rather than restamps.
+    overload_func_types:   TypeRef[]; // FunctionType TypeRef of this entry
+    private overload_func_mangled: u32[];     // SymbolStr.id of the linker symbol
+    overload_func_span:    SourceSpan[]; // where the entry's declaration is written
+    overload_func_decl:    ASTNode*[];   // the declaration the entry was first
+                                      // registered for: a method's MethodNode,
+                                      // a function's FunctionDeclNode; null for
+                                      // an entry registered with no node
+    overload_func_trait:   DefId[];     // SymbolStr.id of the trait a trait-impl
+                                      // method implements, else 0: an inherent
+                                      // method beside a trait's under one key
+                                      // and signature is told apart here, so a
+                                      // `Type::method` path can prefer the
+                                      // inherent one.
+    overload_func_owner_return: TypeRef[]; // the entry's return in its OWNER's
+                                      // parameters: an implement block's method
+                                      // returns in the block's own parameters,
+                                      // bound here to the owner's through the
+                                      // head, because every reader substitutes
+                                      // the owner's arguments into it (a
+                                      // receiver's, a turbofish on the owner).
+                                      // The signature's own return otherwise.
+    private overload_func_family: FamilySlot[]; // the family the entry is registered in
+                                      // (`family_slot`), so a definition's
+                                      // overloads are read off its own entry.
+    overload_func_intrinsic: IntrinsicKind[]; // how a call pinned to the entry
+                                      // lowers: an `intrinsic function` codegen
+                                      // lowers inline (ptr_diff, panic, atomic_*,
+                                      // ...), else `Call`.  The kind is on the
+                                      // ENTRY, read from the declaration where it
+                                      // was registered, so a pin to
+                                      // a function sharing the intrinsic's
+                                      // leaf or its C symbol (`libc::malloc`
+                                      // beside `intrinsics::malloc`) is not
+                                      // mistaken for it: no spelling is
+                                      // compared to decide it.
 
     // --- O(1) indices over the flat arrays above ---------------------------
     // These map a SymbolStr.id key to the position(s) it occupies in the
@@ -174,396 +357,483 @@ type struct DeclarationIndex {
     // linear-scan every function/overload in the whole program.  Maintained
     // in lockstep with each array push.
 
-    // Function name SymbolStr.id -> positions in the `overload_func_*` arrays.
-    overload_index:      HashMap<u32, u32[]>;
-    // Bare name SymbolStr.id -> positions in `bare_alts`.
-    bare_alts_index:     HashMap<u32, u32[]>;
-    // Function SymbolStr.id -> first defining module id (get_function_module
-    // is first-wins) plus a packed (func.id, module.id) membership set used by
-    // is_function_in_module and the per-module registration de-dup.
-    module_func_first:   HashMap<u32, u32>;
-    module_func_pairs:   HashMap<u64, boolean>;
-    // Mangled LLVM name SymbolStr.id -> positions in the `overload_func_*`
-    // arrays (registration order).  Reverse of `overload_func_mangled`, so
-    // `resolve_function_by_mangled` finds an overload by its mangled symbol
-    // without scanning every registered overload in the program (~3% frontend
-    // self-time).  A multimap, not a single slot: a trait-impl method is
-    // registered under both its qualified and bare combined names, which emit
-    // the identical LLVM symbol but only one of which yields a valid extern at
-    // resolve time - the consumer must try each, like the original linear scan.
-    mangled_to_overload_pos: HashMap<u32, u32[]>;
+    // Family slot (`family_slot`) -> positions in the `overload_func_*` arrays.
+    private overload_index:      HashMap<FamilySlot, u32[]>;
 
-    // Leaf-name SymbolStr.id of every `intrinsic function` declaration (the
-    // compiler-lowered ones in `core::intrinsics`: memcpy, ptr_diff, panic,
-    // atomic_*, ...).  Codegen's inline-intrinsic dispatcher matches a call's
-    // leaf name against `IntrinsicKind::is_name`, which is broader than this
-    // set (it also covers pure-magic forms like `rotl32`/`bswap32` that have
-    // NO declaration).  This set lets codegen tell a genuine intrinsic call
-    // from a user/stdlib function that merely shares an intrinsic's leaf name:
-    // a pinned `resolved_callee` whose leaf is NOT in here is a real function
-    // and must NOT be silently replaced by inline IR.  See
-    // `is_intrinsic_decl_name`.
-    intrinsic_names:     HashMap<u32, boolean>;
+    // C symbol -> (key, function type id) of the FIRST `extern "C"` block
+    // declaration carrying it, for W0011: a later extern block declaring the
+    // same symbol with another signature is reported against this one.
+private:
+    extern_symbol_first: HashMap<u32, Pair<u32, u64>>;
+public:
 
-    // Bare C symbol -> owning module/file (intern id) for symbols claimed by an
-    // `extern "C"` block specifically. Lets the resolver warn (W0011) when a
-    // SECOND extern block tries to claim an already-extern-owned bare slot
-    // (e.g. two vendor libs both export `printf`), while staying silent on the
-    // intentional intrinsic-wins / function-wins cases (those never record an
-    // entry here). See type_resolution.cryo extern-block handling.
-    extern_bare_owner:   HashMap<u32, u32>;
-
-    // --- Import-scoped name resolution (resolve_qualified_scoped) -----------
-    // Everything below is keyed on the NAMESPACE identity space (e.g.
-    // `std::alloc::rc`, `CryoTests::Tests::Lang::LeafDispatchA`), the one space
-    // shared by a type's qualified name (namespace = qualified minus leaf),
-    // `ModuleInfo.dependencies` (stored as namespace names), and the use site's
-    // `current_module_name()`.  It is deliberately stored as resolved SymbolStr
-    // ids rather than reached via a ModuleGraph/CompilationContext back-pointer:
-    // Cryo forbids circular imports (the module graph must be a DAG), and both
-    // module_graph.cryo and compilation_context.cryo already import DeclIndex,
-    // so a back-pointer here would be a compile-time module cycle.
-
-    // Use-site namespace SymbolStr.id -> the namespace ids it imports (a copy of
-    // that module's `ModuleInfo.dependencies`).  Populated once per module by
-    // the orchestrator (instance.cryo) after module discovery.
-    module_imports:      HashMap<u32, u32[]>;
-
-    // Namespace SymbolStr.ids re-exported by `std::prelude` (the modules whose
-    // public types - Rc, Box, Option, Range, ... - are auto-in-scope in every
-    // module).  A LOCAL type whose leaf collides with one of these is a hard
-    // conflict (ambiguous), not a silent shadow.  Populated once.
-    prelude_ns:          u32[];
-
-    // Qualified type-name SymbolStr.id -> is_public.  Lets import-scoped
-    // same-leaf resolution (resolve_qualified_scoped) exclude a PRIVATE
-    // cross-module candidate from the visible set so it can't manufacture a
-    // false ambiguity on the E0154 static-call-scope path.  Populated by
-    // `register_decl_in_index` (type_resolution.cryo) alongside
-    // `register_name_mapping`, so every name that can appear as a same-leaf
-    // candidate carries a verdict.  A name absent from this map (single-file /
-    // C-import types, which never enter the alternatives set) is treated as
-    // public (permissive).
-    //
-    // NOTE on the mechanism hierarchy: this is a SECONDARY guard, not the
-    // primary privacy gate.  A bare TYPE NAME is resolved by the NameResolver
-    // first, which today exports types unconditionally (see name_resolution.cryo
-    // declare_type - `private` on a type is not honored there) and owns the
-    // E0203 import-ambiguity diagnostic; the authoritative cross-module privacy
-    // check is the ModuleTypeRegistry (E0503).  So for a pure type-name
-    // collision the NameResolver front-runs this map.  It still does real work
-    // for the import-scoped static-call/template lookups that consult
-    // resolve_qualified_scoped directly, and it makes `is_candidate_public`
-    // honest rather than a permanently-empty stub.
-    type_visibility:     HashMap<u32, boolean>;
+    // --- Module reachability and declaration visibility --------------------
+    // Everything below is keyed by module (`ModulePath`), handed in by the
+    // orchestrator rather than reached through a ModuleGraph back-pointer:
+    // module_graph.cryo already imports this module, so a back-pointer here
+    // would be a compile-time module cycle.
 
 
-    static new() -> DeclarationIndex {
+    // The modules `std::prelude` re-exports (those whose public types - Rc,
+    // Box, Option, Range, ... - are auto-in-scope in every module).  A LOCAL
+    // type whose leaf collides with one of these is a hard conflict
+    // (ambiguous), not a silent shadow.  Populated once.
+    prelude_modules:     ModulePath[];
+
+
+    /// The method families holding a method whose SIGNATURE the name layer
+    /// refused - a parameter or return type naming nothing the writer can
+    /// see - by family slot (`family_slot`: the owner's definition and the
+    /// leaf).  Such a method registers no signature: one with the refused
+    /// parameter dropped is a different method's, and one with no return
+    /// type cannot be mangled.  What the set carries is that the name IS
+    /// declared, so a call to it reports nothing: the defect was reported
+    /// where the type was written, and "no method named" against a
+    /// declaration that exists is a second report of the first, stated as
+    /// something false.  A free function's refusal is recorded on its
+    /// definition (`DefTable::signature_refused`).
+    private refused_methods:     HashMap<FamilySlot, boolean>;
+
+private:
+    /// This index's tag, distinct from every other index the process made;
+    /// stamped on each `OverloadId` it mints and checked by `slot_of`.
+    overload_tag:        u32;
+
+public:
+    static new(defs: DefTable*) -> DeclarationIndex {
+        g_overload_index_tags = g_overload_index_tags + 1;
         return DeclarationIndex {
-            func_returns:        HashMap<u32, TypeRef>::new(),
-            func_type_refs:      HashMap<u32, TypeRef>::new(),
-            method_returns:      HashMap<u64, TypeRef>::new(),
-            type_map:            HashMap<u32, TypeRef>::new(),
-            global_vars:         HashMap<u32, TypeRef>::new(),
-            type_reverse:        HashMap<u64, u32>::new(),
-            array_elem_to_type:  HashMap<u64, u32>::new(),
-            implicit_converters: HashMap<u64, u64>::new(),
-            generic_converter_methods: [],
-            module_funcs:        [],
-            module_types:        [],
-            module_global_keys:       [],
+            defs: defs,
+            func_type_refs:      HashMap::<FamilySlot, TypeRef>::new(),
+            type_reverse:        HashMap::<TypeKey, DefId>::new(),
+            def_types:           [],
+            def_entries:         [],
+            ctor_families:       [],
+            method_decls:        [],
+            copy_entries:        HashMap::<CopyKey, OverloadId>::new(),
+            instance_entries:    HashMap::<TypeKey, OverloadId>::new(),
+            array_elem_to_type:  HashMap::<TypeKey, TypeRef>::new(),
+            implicit_converters: HashMap::<ConversionKey, DefId>::new(),
+            def_globals:              [],
+            module_global_leaves:     [],
             module_global_threadlocal: [],
-            module_global_modules:    [],
-            module_global_namespaces: [],
+            module_global_extern_syms: [],
+            module_global_files:      [],
+            module_global_declared_in: [],
             module_global_types:      [],
-            mangled_names:       HashMap<u32, u32>::new(),
-            overload_func_keys:    [],
             overload_func_types:   [],
             overload_func_mangled: [],
-            overload_func_owner:   [],
-            bare_alts:      [],
-            overload_index:     HashMap<u32, u32[]>::new(),
-            bare_alts_index:    HashMap<u32, u32[]>::new(),
-            module_func_first:  HashMap<u32, u32>::new(),
-            module_func_pairs:  HashMap<u64, boolean>::new(),
-            mangled_to_overload_pos: HashMap<u32, u32[]>::new(),
-            intrinsic_names:    HashMap<u32, boolean>::new(),
-            extern_bare_owner:  HashMap<u32, u32>::new(),
-            module_imports:     HashMap<u32, u32[]>::new(),
-            prelude_ns:         [],
-            type_visibility:    HashMap<u32, boolean>::new(),
+            overload_func_trait:   [],
+            overload_func_span:    [],
+            overload_func_decl:    [],
+            overload_func_owner_return: [],
+            overload_func_family: [],
+            overload_func_intrinsic: [],
+            overload_index:     HashMap::<FamilySlot, u32[]>::new(),
+            extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
+            prelude_modules:    [],
+            refused_methods:    HashMap::<FamilySlot, boolean>::new(),
+            overload_tag:       g_overload_index_tags,
         };
+    }
+
+    /// The registry position of `id`, a valid id this index made.  One
+    /// another index made is refused here: its position names an entry in
+    /// SOME registry, and answering it would read whichever entry sits there.
+    slot_of(&this, id: OverloadId) -> i64 {
+        if (id.table != this.overload_tag) { DeclarationIndex::refuse(id.pos, id.table, this.overload_tag); }
+        return id.pos as i64;
+    }
+
+    /// The refusal `slot_of` raises, kept out of the read it guards.
+    static refuse(pos: u32, made_by: u32, read_by: u32) -> void {
+        panic(fmt::format(
+            "internal compiler error: a signature id made by index %u (position %u) was read against index %u (the invalid id carries 0)",
+            made_by, pos, read_by), FILE, LINE);
     }
 
 
     // Registration (called by TypeResolution & Specialization passes)
 
-    /// Register a function's return type.
-    ///
-    /// Intrinsic durability: once a declared `intrinsic function` owns a
-    /// leaf (see `register_intrinsic_function_type`), a later same-leaf
-    /// regular function must not overwrite the single-slot return type -
-    /// the intrinsic's own registration runs BEFORE it is marked, so this
-    /// guard never blocks the intrinsic itself, and either registration
-    /// order converges on the intrinsic's binding.
-    register_function(mut &this, name: SymbolStr, return_type: TypeRef) -> void {
-        if (this.intrinsic_names.contains_key(&name.id)) { return; }
-        this.func_returns.insert(name.id, return_type);
-    }
-
-    /// Register an implicit-conversion converter `(arg_ty) -> ret_ty`.
-    /// `type_name_id` is the owning type's bare-name SymbolStr.id for a
-    /// static-method converter (`Type::method`), or 0 for a free-function
-    /// converter; `method_name_id` is the static method's / function's bare
-    /// name.  First-wins so a single converter per (arg, ret) pair is
-    /// deterministic regardless of module load order.
-    register_implicit_converter(mut &this, arg_id: u64, ret_id: u64,
-                                type_name_id: u32, method_name_id: u32) -> void {
-        const key: u64 = DeclarationIndex::pack_converter_key(arg_id, ret_id);
+    /// Register `converter`, the definition of a function or static method,
+    /// as the implicit conversion `(arg_ty) -> ret_ty`.  First-wins so a
+    /// single converter per (arg, ret) pair is deterministic regardless of
+    /// module load order.
+    register_implicit_converter(mut &this, arg_ty: TypeRef, ret_ty: TypeRef, converter: DefId) -> void {
+        if (!converter.is_valid()) { return; }
+        const key: ConversionKey = DeclarationIndex::converter_key(arg_ty, ret_ty);
         if (!this.implicit_converters.contains_key(&key)) {
-            const value: u64 =
-                ((type_name_id as u64) << 32) | (method_name_id as u64);
-            this.implicit_converters.insert(key, value);
+            this.implicit_converters.insert(key, converter);
         }
     }
 
-    /// Record a static-method converter on a GENERIC owner type so the
-    /// monomorphizer can force-instantiate it.  De-duplicated by
-    /// (type, method).
-    register_generic_converter_method(mut &this, type_id: u32,
-                                      method_id: u32) -> void {
-        for (mut i: i64 = 0; i < this.generic_converter_methods.length; i++) {
-            const e: &Pair<u32, u32> = &this.generic_converter_methods[i];
-            if (e.first == type_id && e.second == method_id) { return; }
-        }
-        this.generic_converter_methods.push(
-            Pair<u32, u32>::new(type_id, method_id));
-    }
-
-    /// Register a function's FunctionType TypeRef (full signature in the arena).
-    /// `func_type_refs` is a single-slot map (last wins); use the parallel
-    /// overload arrays below when every overload matters (cross-module
-    /// extern declaration).  Legacy entry point: the overload entry is owned
-    /// by nobody (owner 0 = global claim).
-    register_function_type(mut &this, name: SymbolStr, func_type_ref: TypeRef) -> void {
-        this.register_function_type_owned(name, func_type_ref, SymbolStr::empty());
-    }
-
-    /// Drop every overload position previously registered for `name` so the
-    /// next registration is its sole signature. Needed when a declaration's
-    /// signature is rewritten mid-compile (an `async function` becomes a
-    /// constructor returning its Future struct): the stale Output-return
-    /// overload must not shadow the new struct-return one at call sites, where
-    /// overload resolution enumerates `lookup_func_type_overloads`.
-    reset_function_overloads(mut &this, name: SymbolStr) -> void {
-        mut empty: u32[] = [];
-        this.overload_index.insert(name.id, empty);
-    }
-
-    /// Owner-aware variant: `owner` is the declaring function's QUALIFIED
-    /// name, stamped on the overload entry so two same-signature declarations
-    /// from different modules keep separate entries (separate mangled slots),
-    /// and so the bare-call binder can filter candidates by the use site's
-    /// imports.  De-dup is by (name, TypeRef, owner): re-registering the same
-    /// declaration is a no-op; a same-signature declaration from a DIFFERENT
-    /// owner appends its own entry instead of silently adopting (and later
-    /// re-mangling) the first claimant's.
-    register_function_type_owned(mut &this, name: SymbolStr, func_type_ref: TypeRef,
-                                 owner: SymbolStr) -> void {
-        // Intrinsic durability: the single-slot signature of an
-        // intrinsic-owned leaf is not overwritable by regular registrations
-        // (the intrinsic itself writes it in `register_intrinsic_function_type`).
-        if (!this.intrinsic_names.contains_key(&name.id)) {
-            this.func_type_refs.insert(name.id, func_type_ref);
-        }
-        // Also append to the overload list so cross-module extern
-        // declaration can enumerate every overload's signature -- scoped to
-        // this name's positions via the overload_index instead of scanning
-        // every overload in the program.
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    const pos: u32 = (*positions)[k];
-                    if (this.overload_func_types[pos as i64].id == func_type_ref.id
-                        && this.overload_func_owner[pos as i64] == owner.id) {
-                        return;
-                    }
-                    k = k + 1;
-                }
+    /// The slot family `(owner, leaf)` is stored under: the owner's
+    /// definition and the leaf, packed.  The definition is read here - a
+    /// `Def`'s own, a `Type`'s the definition it was registered as - so a
+    /// caller hands over the owner it holds and never composes a key.  Keyed
+    /// by the definition's slot, one above it so the root (no definition)
+    /// keeps its own: two owners written under one path are two owners.  A
+    /// template's own families carry the top bit of the definition's half,
+    /// so they never meet the definition's `Def` families.  0, which no
+    /// family is stored under, for a type this index never registered: it
+    /// owns no family here.
+private:
+    family_slot(&this, owner: FamilyOwner, leaf: SymbolStr) -> FamilySlot {
+        mut template: boolean = false;
+        const d: DefId = match (owner) {
+            FamilyOwner::Def(od) => { od }
+            FamilyOwner::Type(t) => {
+                const td: DefId = this.registered_def(t);
+                if (!td.is_valid()) { return FamilySlot::none(); }
+                td
             }
-            Option::None => { }
-        }
-        const new_pos: u32 = this.overload_func_keys.length as u32;
-        this.overload_func_keys.push(name.id);
-        this.overload_func_types.push(func_type_ref);
-        this.overload_func_mangled.push(0);
-        this.overload_func_owner.push(owner.id);
-        const slot: u32[]* = this.overload_index.get_or_insert(name.id, []);
-        (*slot).push(new_pos);
-    }
-
-    /// Like `register_function_type`, but claims SOLE ownership of the bare
-    /// leaf name for a compiler intrinsic: any previously-registered overload
-    /// (an `extern "C"` libc twin such as `malloc`/`strlen`/`fopen`) is
-    /// dropped from the overload index so the leaf-name dispatcher sees only
-    /// the intrinsic. An intrinsic is never overloaded, so sole ownership is
-    /// correct, and this makes bare-name resolution order-independent: an
-    /// intrinsic must win unqualified resolution even when `ffi::libc`
-    /// topo-sorts ahead of `core::intrinsics` and its extern twin registers
-    /// first (which otherwise strands `malloc`/`strlen`/... at codegen with
-    /// an ambiguous second overload, E0636). The qualified `libc::<name>`
-    /// form registered separately stays available regardless.
-    register_intrinsic_function_type(mut &this, name: SymbolStr, func_type_ref: TypeRef,
-                                     owner: SymbolStr) -> void {
-        // Record the leaf name as a genuine intrinsic declaration so codegen
-        // can distinguish it from a user function that shares the leaf name
-        // (see `is_intrinsic_decl_name` and the inline-dispatch guards in
-        // call_emitter).  From this point on the leaf's single-slot bindings
-        // (func_type_refs / func_returns / mangled_names) are durable: the
-        // intrinsic-durability guards in the register_* methods refuse
-        // non-intrinsic overwrites, so a later same-leaf regular function
-        // (e.g. `alloc::heap::free`) can no longer silently rebind bare
-        // calls program-wide.  `owner` is the intrinsic's qualified name
-        // (`std::core::intrinsics::free`), stamped on the overload entry for
-        // import-scoped candidate reporting.
-        this.intrinsic_names.insert(name.id, true);
-        this.func_type_refs.insert(name.id, func_type_ref);
-        const new_pos: u32 = this.overload_func_keys.length as u32;
-        this.overload_func_keys.push(name.id);
-        this.overload_func_types.push(func_type_ref);
-        this.overload_func_mangled.push(0);
-        this.overload_func_owner.push(owner.id);
-        // Sole bare ownership drops the UNOWNED claimants only: extern "C"
-        // twins (owner 0), whose divergent Cryo signature would otherwise
-        // shadow the intrinsic (see method doc).  OWNED same-leaf regular
-        // functions (`fs::write` vs intrinsic `write`) keep their entries -
-        // they coexist by owner identity and the bare-call binder picks by
-        // signature + use-site imports - which also makes this registration
-        // order-robust when a regular fn's module registered first.
-        mut positions: u32[] = [];
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(prev) => {
-                mut k: i64 = 0;
-                while (k < (*prev).length) {
-                    const pos: u32 = (*prev)[k];
-                    if (this.overload_func_owner[pos as i64] != 0) {
-                        positions.push(pos);
-                    }
-                    k = k + 1;
-                }
+            FamilyOwner::Template(td) => {
+                if (!td.is_valid()) { return FamilySlot::none(); }
+                template = true;
+                td
             }
-            Option::None => { }
-        }
-        positions.push(new_pos);
-        this.overload_index.insert(name.id, positions);
+        };
+        mut at: u64 = if (d.is_valid()) { (this.defs.slot(d) as u64) + 1 } else { 0 };
+        if (template) { at = at | 2147483648; }
+        return FamilySlot { packed: (at << 32) | (leaf.id as u64) };
     }
 
-    /// True if `name`'s leaf was declared as a compiler `intrinsic function`
-    /// (see `register_intrinsic_function_type`).  Codegen uses this to avoid
-    /// silently lowering a user/stdlib function to inline IR just because its
-    /// leaf name collides with an entry in `IntrinsicKind::is_name`: a call
-    /// with a pinned `resolved_callee` whose leaf is NOT a declared intrinsic
-    /// is a real function and must be emitted as a normal call.
-    is_intrinsic_decl_name(&this, name: SymbolStr) -> boolean {
-        return this.intrinsic_names.contains_key(&name.id);
-    }
-
-    /// Record that an `extern "C"` block claimed the bare C symbol `name`,
-    /// owned by `module` (an interned file/module id). Called only when the
-    /// bare slot is actually claimed by an extern block.
-    note_extern_bare_owner(mut &this, name: SymbolStr, module: SymbolStr) -> void {
-        this.extern_bare_owner.insert(name.id, module.id);
-    }
-
-    /// The module/file id that first claimed bare C symbol `name` via an
-    /// `extern "C"` block, or 0 if no extern block owns it (i.e. the bare slot
-    /// is unclaimed or owned by an intrinsic / regular function).
-    extern_bare_owner_of(&this, name: SymbolStr) -> u32 {
-        return match (this.extern_bare_owner.get(&name.id)) {
-            Option::Some(m) => { m }
-            Option::None    => { 0 }
+public:
+    /// The owner's path: a `Def`'s own, a `Type`'s the definition it was
+    /// registered as; empty for the root and for a type never registered.
+    /// Text only: the mangled name a signature is emitted under, and a
+    /// diagnostic that spells the family.  Never a key.
+    family_owner_path(&this, owner: FamilyOwner) -> DeclName {
+        return match (owner) {
+            FamilyOwner::Def(d) | FamilyOwner::Template(d) => { this.defs.path_of(d) }
+            FamilyOwner::Type(t) => { this.defs.path_of(this.registered_def(t)) }
         };
     }
 
-    /// Associate an overload-specific mangled LLVM name with a registered
-    /// (name, func_type_ref) pair.  Cross-module extern declaration uses
-    /// this to emit the right LLVM symbol per overload instead of the
-    /// single mangled name stored in `mangled_names`.
-    register_overload_mangled(mut &this, name: SymbolStr, func_type_ref: TypeRef,
-                               mangled: SymbolStr) -> void {
-        // Legacy (owner-blind) entry point: matches the first entry with this
-        // signature.  Owner-aware callers use `register_overload_mangled_owned`
-        // so a same-signature entry from a different declaration is never
-        // restamped.
-        match (this.overload_index.get_ref(&name.id)) {
+    /// Take entry `e` out of the family it was registered in, so a call can
+    /// no longer bind to it; the family's other overloads stay.  A
+    /// declaration whose signature is rewritten mid-compile (an `async`
+    /// function becomes a constructor returning its future) retires its
+    /// stale entry before registering the new one, or both stay resolvable.
+    retire_entry(mut &this, e: OverloadId) -> void {
+        if (!e.is_valid()) { return; }
+        const pos: u32 = this.slot_of(e) as u32;
+        const slot: FamilySlot = this.overload_func_family[pos as i64];
+        if (slot.is_none()) { return; }
+        match (this.overload_index.get_ref(&slot)) {
             Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    const pos: u32 = (*positions)[k];
-                    if (this.overload_func_types[pos as i64].id == func_type_ref.id) {
-                        const prev: u32 = this.overload_func_mangled[pos as i64];
-                        // Intrinsic durability: never restamp the intrinsic's
-                        // own entry (its mangled IS the leaf name) with a
-                        // different symbol; try the next same-signature entry
-                        // (the caller's own) instead.
-                        if (this.intrinsic_names.contains_key(&name.id)
-                            && prev == name.id && mangled.id != name.id) {
-                            k = k + 1;
-                            continue;
-                        }
-                        this.overload_func_mangled[pos as i64] = mangled.id;
-                        // Record the reverse mapping only when this position
-                        // newly takes this mangled id, so repeated registration
-                        // of the same (pos, mangled) pair never duplicates the
-                        // bucket entry.
-                        if (prev != mangled.id) {
-                            const slot: u32[]* = this.mangled_to_overload_pos.get_or_insert(mangled.id, []);
-                            (*slot).push(pos);
-                        }
+                for (mut k: i64 = 0; k < (*positions).length; k++) {
+                    if ((*positions)[k] == pos) {
+                        (*positions).remove(k as u64);
                         return;
                     }
-                    k = k + 1;
                 }
             }
             Option::None => { }
         }
     }
 
-    /// Owner-aware variant of `register_overload_mangled`: stamps the entry
-    /// matching (name, signature, owner) exactly, so two same-signature
-    /// declarations under one bare leaf each keep their own mangled symbol.
-    register_overload_mangled_owned(mut &this, name: SymbolStr, func_type_ref: TypeRef,
-                                    owner: SymbolStr, mangled: SymbolStr) -> void {
-        match (this.overload_index.get_ref(&name.id)) {
+    /// Register one signature of a declaration: the entry in the family
+    /// `(owner, leaf)` with signature `func_type_ref`, emitted under the
+    /// linker `symbol`, implementing `trait_sym` (empty for anything but a
+    /// trait-impl method).
+    /// Registering the same signature and symbol in one family
+    /// again answers the existing entry; a different symbol under the same
+    /// family and signature is a different definition and appends its own.
+    /// The id is the declaration's identity for every later consumer: the
+    /// registrar stamps it on the node, and a call pins it.  `decl` is that
+    /// node, answered by `entry_decl`; an entry answered again keeps the
+    /// node it was first registered for.  `owner_return` is the return in
+    /// the owner's parameters (`entry_owner_return`), kept the same way.
+    register_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr, func_type_ref: TypeRef,
+                       owner_return: TypeRef, symbol: SymbolStr, trait_sym: DefId,
+                       span: SourceSpan, decl: ASTNode*) -> OverloadId {
+        const slot: FamilySlot = this.family_slot(owner, leaf);
+        if (slot.is_none()) { return OverloadId::invalid(); }
+        this.func_type_refs.insert(slot, func_type_ref);
+        match (this.overload_index.get_ref(&slot)) {
             Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
+                for (mut k: i64 = 0; k < (*positions).length; k++) {
                     const pos: u32 = (*positions)[k];
-                    if (this.overload_func_types[pos as i64].id == func_type_ref.id
-                        && this.overload_func_owner[pos as i64] == owner.id) {
-                        const prev: u32 = this.overload_func_mangled[pos as i64];
-                        this.overload_func_mangled[pos as i64] = mangled.id;
-                        if (prev != mangled.id) {
-                            const slot: u32[]* = this.mangled_to_overload_pos.get_or_insert(mangled.id, []);
-                            (*slot).push(pos);
-                        }
-                        return;
+                    if (this.overload_func_types[pos as i64].equals(func_type_ref)
+                            && this.overload_func_mangled[pos as i64] == symbol.id) {
+                        return OverloadId::at_position(pos, this.overload_tag);
                     }
-                    k = k + 1;
                 }
             }
             Option::None => { }
         }
+        const id: OverloadId = this.file_entry(slot, func_type_ref, owner_return, symbol, trait_sym, span, decl);
+        const positions: u32[]* = this.overload_index.get_or_insert(slot, []);
+        (*positions).push(this.slot_of(id) as u32);
+        return id;
     }
 
-    /// Return every (FunctionType, mangled-name) pair registered under
-    /// the given name.  Parallel arrays: `types[i]` goes with `mangled[i]`.
-    /// A mangled SymbolStr.id of 0 means no overload-specific mangled name
-    /// was registered; callers should fall back to `lookup_mangled_name`.
-    lookup_func_type_overloads(&this, name: SymbolStr) -> TypeRef[] {
+    /// A new entry, recorded as belonging to the family stored under
+    /// `slot` (`FamilySlot::none()` for none); the caller files it in that
+    /// family.
+    file_entry(mut &this, slot: FamilySlot, func_type_ref: TypeRef, owner_return: TypeRef,
+               symbol: SymbolStr, trait_sym: DefId, span: SourceSpan, decl: ASTNode*) -> OverloadId {
+        const new_pos: u32 = this.overload_func_types.length as u32;
+        this.overload_func_types.push(func_type_ref);
+        this.overload_func_mangled.push(symbol.id);
+        this.overload_func_trait.push(trait_sym);
+        this.overload_func_span.push(span);
+        this.overload_func_decl.push(decl);
+        this.overload_func_owner_return.push(owner_return);
+        this.overload_func_family.push(slot);
+        this.overload_func_intrinsic.push(IntrinsicKind::Call);
+        return OverloadId::at_position(new_pos, this.overload_tag);
+    }
+
+    /// Register a copy of a function - a monomorphized instance, a
+    /// closure-argument specialization - under no family.  Nothing looks a
+    /// copy up by owner and leaf: a call reaches it by the pin its minter
+    /// wrote (the entry, or the instance it is recorded under).  Its linker
+    /// symbol is mangled from `home`'s path - the module of what it copies -
+    /// and the name it was minted with, as a declaration's is from its
+    /// family's.
+    register_copy_signature(mut &this, home: FamilyOwner, minted: SymbolStr,
+                            return_type: TypeRef, func_type_ref: TypeRef,
+                            intern: InternTable*, arena: TypeArena*,
+                            span: SourceSpan, decl: ASTNode*) -> OverloadId {
+        const symbol: SymbolStr = this.mangle_function_symbol(home, minted, return_type, func_type_ref, intern, arena);
+        return this.file_entry(FamilySlot::none(), func_type_ref, return_type, symbol, DefId::invalid(), span, decl);
+    }
+
+    /// The trait entry `id`'s declaration implements; empty for an inherent
+    /// method, a free function, or an invalid id.
+    entry_trait(&this, id: OverloadId) -> DefId {
+        if (!id.is_valid()) { return DefId::invalid(); }
+        return this.overload_func_trait[this.slot_of(id)];
+    }
+
+    /// Where entry `id`'s declaration is written; `none()` for an invalid id.
+    entry_span(&this, id: OverloadId) -> SourceSpan {
+        if (!id.is_valid()) { return SourceSpan::none(); }
+        return this.overload_func_span[this.slot_of(id)];
+    }
+
+    /// The declaration entry `id` was registered for - a method's
+    /// `MethodNode`, a function's `FunctionDeclNode` - or null for an
+    /// invalid id or an entry registered with no node.
+    entry_decl(&this, id: OverloadId) -> ASTNode* {
+        if (!id.is_valid()) { return null; }
+        return this.overload_func_decl[this.slot_of(id)];
+    }
+
+    /// The method entry `id` was registered for; null when it names a
+    /// function or no node.
+    entry_method(&this, id: OverloadId) -> MethodNode* {
+        const d: ASTNode* = this.entry_decl(id);
+        if (d == null || d.kind != NodeKind::MethodDeclaration) { return null; }
+        return d as MethodNode*;
+    }
+
+    /// The linker symbol of entry `id`: the name the declaration is known
+    /// by to the backend and the linker, read off the entry.  Empty for an
+    /// invalid id.
+    entry_symbol(&this, id: OverloadId) -> DeclName {
+        if (!id.is_valid()) { return DeclName::empty(); }
+        return DeclName::of(SymbolStr::from_id(this.overload_func_mangled[this.slot_of(id)]));
+    }
+
+    /// The return of entry `id` in its owner's parameters: what a reader
+    /// substituting the owner's arguments - a receiver's, a turbofish on
+    /// the owner - substitutes into.  An implement block's method's own
+    /// signature returns in the block's parameters, which no owner argument
+    /// names.  Invalid for an invalid id.
+    entry_owner_return(&this, id: OverloadId) -> TypeRef {
+        if (!id.is_valid()) { return TypeRef::invalid(); }
+        return this.overload_func_owner_return[this.slot_of(id)];
+    }
+
+    /// The signature of entry `id`; invalid for an invalid id.
+    entry_signature(&this, id: OverloadId) -> TypeRef {
+        if (!id.is_valid()) { return TypeRef::invalid(); }
+        return this.overload_func_types[this.slot_of(id)];
+    }
+
+    /// A member is written as a leaf after an owner
+    /// the name layer already bound, so the question takes the owner's
+    /// identity and the leaf's text; a family is the functions an owner
+    /// declares under one leaf, and overloads are told apart by signature,
+    /// not by name.
+    ///
+    /// Every entry of the family `(owner, leaf)`, in registration order.
+    lookup_family_entries(&this, owner: FamilyOwner, leaf: SymbolStr) -> OverloadId[] {
+        mut result: OverloadId[] = [];
+        const slot: FamilySlot = this.family_slot(owner, leaf);
+        match (this.overload_index.get_ref(&slot)) {
+            Option::Some(positions) => {
+                for (mut k: i64 = 0; k < (*positions).length; k++) {
+                    result.push(OverloadId::at_position((*positions)[k], this.overload_tag));
+                }
+            }
+            Option::None => { }
+        }
+        return result;
+    }
+
+    /// The entry the function or method definition `d`'s signature was
+    /// registered as, or invalid when `d` is invalid or no registration
+    /// reached it (a generic owner's method is registered per instance, and
+    /// an instance is no definition).
+    /// Asked by the definition, not by its parent and leaf: those name the
+    /// family, which holds every overload declared under the leaf.
+    entry_of_def(&this, d: DefId) -> OverloadId {
+        if (!d.is_valid()) { return OverloadId::invalid(); }
+        const slot: i64 = this.defs.slot(d);
+        if (slot >= this.def_entries.length) { return OverloadId::invalid(); }
+        return this.def_entries[slot];
+    }
+
+    /// Every entry of the family the function or method definition `d` is
+    /// registered in - its overloads, `d`'s own among them - in
+    /// registration order; empty when no registration reached `d`.  The
+    /// family is the one `d`'s own entry was registered in, read off the
+    /// entry.
+    family_entries_of_def(&this, d: DefId) -> OverloadId[] {
+        const e: OverloadId = this.entry_of_def(d);
+        if (!e.is_valid()) { return []; }
+        return this.entries_in_family(this.overload_func_family[this.slot_of(e)]);
+    }
+
+    /// Every constructor entry of the type definition `d`, in registration
+    /// order; empty for a type that registered none.
+    constructor_entries_of(&this, d: DefId) -> OverloadId[] {
+        if (!d.is_valid()) { return []; }
+        const slot: i64 = this.defs.slot(d);
+        if (slot >= this.ctor_families.length || this.ctor_families[slot].is_none()) { return []; }
+        return this.entries_in_family(this.ctor_families[slot]);
+    }
+
+    /// The entries registered in the family stored under `slot`.
+    entries_in_family(&this, slot: FamilySlot) -> OverloadId[] {
+        mut result: OverloadId[] = [];
+        match (this.overload_index.get_ref(&slot)) {
+            Option::Some(positions) => {
+                for (mut k: i64 = 0; k < (*positions).length; k++) {
+                    result.push(OverloadId::at_position((*positions)[k], this.overload_tag));
+                }
+            }
+            Option::None => { }
+        }
+        return result;
+    }
+
+    /// Keep `decl` as the declaration the method definition `d` was
+    /// registered for (`CompilationContext::define_method`).
+    keep_method_decl(mut &this, d: DefId, decl: ASTNode*) -> void {
+        const slot: i64 = this.defs.slot(d);
+        while (this.method_decls.length <= slot) { this.method_decls.push(null); }
+        this.method_decls[slot] = decl;
+    }
+
+    /// The entry of `owner`'s method for the method definition `d`: `d`'s
+    /// own when `d` is declared on `owner`, else the owner's copy of it - an
+    /// instance's clone of its template's method, a type's copy of a trait's
+    /// default.  Invalid when `owner` has neither.  Asked by identity, so a
+    /// caller that holds a method's definition never names the method.
+    method_entry_on(&this, owner: TypeRef, d: DefId) -> OverloadId {
+        if (!d.is_valid()) { return OverloadId::invalid(); }
+        if (this.defs.parent_of(d).equals(this.registered_def(owner))) { return this.entry_of_def(d); }
+        return match (this.copy_entries.get(&this.copy_key(owner, d))) {
+            Option::Some(e) => { e }
+            Option::None    => { OverloadId::invalid() }
+        };
+    }
+
+    /// Record `e` as the entry of the generic function instance `inst`.
+    record_instance(mut &this, inst: TypeRef, e: OverloadId) -> void {
+        if (!inst.is_valid() || !e.is_valid()) { return; }
+        this.instance_entries.insert(inst.table_key(), e);
+    }
+
+    /// The entry the copy of the generic function instance `inst` registered;
+    /// invalid before that copy is registered.
+    entry_of_instance(&this, inst: TypeRef) -> OverloadId {
+        if (!inst.is_valid()) { return OverloadId::invalid(); }
+        return match (this.instance_entries.get(&inst.table_key())) {
+            Option::Some(e) => { e }
+            Option::None    => { OverloadId::invalid() }
+        };
+    }
+
+    /// The key of `owner`'s copy of the method definition `d`.
+    copy_key(&this, owner: TypeRef, d: DefId) -> CopyKey {
+        return CopyKey { packed: (owner.key() << 32) | (this.defs.slot(d) as u64) };
+    }
+
+    /// The function of the method definition `d`: a type's or an
+    /// implementation's method, or a trait's declared method, which is
+    /// registered as the function itself.  Null when `d` names no method.
+    method_func_of(&this, d: DefId) -> FunctionDeclNode* {
+        const decl: ASTNode* = this.method_decl_of(d);
+        if (decl == null) { return null; }
+        if (decl.kind == NodeKind::MethodDeclaration) { return (decl as MethodNode*).func; }
+        if (decl.kind == NodeKind::FunctionDeclaration) { return decl as FunctionDeclNode*; }
+        return null;
+    }
+
+    /// The declaration the method definition `d` was registered for, or
+    /// null when `d` is invalid or names no method.
+    method_decl_of(&this, d: DefId) -> ASTNode* {
+        if (!d.is_valid()) { return null; }
+        const slot: i64 = this.defs.slot(d);
+        if (slot >= this.method_decls.length) { return null; }
+        return this.method_decls[slot];
+    }
+
+    /// Refuse a method registered under the family `(owner, leaf)` whose
+    /// definition says otherwise: the name layer registered the definition
+    /// from the declaration where it is written, and this index files the
+    /// method under the type the implementation head or the type body
+    /// resolved to, so the two answer where a method lives independently.
+    /// The definition must be a method of `owner`, under the method's own
+    /// leaf, registered for this very node.  A method with no definition is
+    /// a copy (a trait default placed here, a monomorphized clone) and is
+    /// not checked.
+    check_method_def(&this, owner: TypeRef, method: MethodNode*, intern: InternTable*) -> void {
+        const d: DefId = method.func.def;
+        if (!d.is_valid()) { return; }
+        if (this.defs.kind_of(d) == DefKind::Method
+                && this.defs.parent_of(d).equals(this.registered_def(owner))
+                && this.defs.leaf_of(d).spelling().equals(method.func.name)
+                && this.method_decl_of(d) == method as ASTNode*) {
+            return;
+        }
+        panic(fmt::format(
+            "internal compiler error: method `%s` is registered on `%s`, and its definition says it is `%s` of `%s`",
+            intern.resolve(method.func.name), intern.shown(this.family_owner_path(FamilyOwner::Type(owner))),
+            intern.shown(this.defs.leaf_of(d)),
+            intern.shown(this.family_owner_path(FamilyOwner::Def(this.defs.parent_of(d))))), FILE, LINE);
+    }
+
+    /// Record the kind an `intrinsic function` declaration's entry `id`
+    /// lowers as.  Its leaf is a key in no function table: an intrinsic is
+    /// reached through its module (`intrinsics::free`) like every
+    /// declaration, and its bare spelling is an error where it is declared
+    /// in no scope.  Codegen reads the kind off the pin, so a function
+    /// sharing an intrinsic's leaf is never taken for it.
+    mark_intrinsic(mut &this, id: OverloadId, kind: IntrinsicKind) -> void {
+        if (!id.is_valid()) { return; }
+        this.overload_func_intrinsic[this.slot_of(id)] = kind;
+    }
+
+    /// How a call pinned to entry `id` lowers; `Call` for an invalid id.
+    entry_intrinsic_kind(&this, id: OverloadId) -> IntrinsicKind {
+        if (!id.is_valid()) { return IntrinsicKind::Call; }
+        return this.overload_func_intrinsic[this.slot_of(id)];
+    }
+
+    /// The signature of every entry of the family `(owner, leaf)`, in
+    /// registration order (`lookup_family_entries` gives the entries
+    /// themselves).
+    lookup_func_type_overloads(&this, owner: FamilyOwner, leaf: SymbolStr) -> TypeRef[] {
         mut result: TypeRef[] = [];
-        match (this.overload_index.get_ref(&name.id)) {
+        const slot: FamilySlot = this.family_slot(owner, leaf);
+        match (this.overload_index.get_ref(&slot)) {
             Option::Some(positions) => {
                 mut k: i64 = 0;
                 while (k < (*positions).length) {
@@ -576,302 +846,242 @@ type struct DeclarationIndex {
         return result;
     }
 
-    lookup_overload_mangled(&this, name: SymbolStr, func_type_ref: TypeRef) -> SymbolStr {
-        // Signature match; scans past unmangled entries so a same-signature
-        // pair (possible under a bare leaf since entries became per-owner)
-        // still yields the entry that actually carries a symbol.
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    const pos: u32 = (*positions)[k];
-                    if (this.overload_func_types[pos as i64].id == func_type_ref.id) {
-                        const mid: u32 = this.overload_func_mangled[pos as i64];
-                        if (mid != 0) {
-                            return SymbolStr::from_id(mid);
-                        }
-                    }
-                    k = k + 1;
-                }
+    /// Record an `extern "C"` block's declaration `key` of the C symbol
+    /// `sym` with signature `func_type_ref`.  The first declaration of a
+    /// symbol is what a later one is compared against; a second record is
+    /// not kept, because the record exists for W0011's evidence and not for
+    /// binding - a call binds the declaration its stamp names.
+    note_extern_symbol(mut &this, sym: SymbolStr, key: SymbolStr, func_type_ref: TypeRef) -> void {
+        if (this.extern_symbol_first.contains_key(&sym.id)) { return; }
+        this.extern_symbol_first.insert(sym.id, Pair::<u32, u64>::new(key.id, func_type_ref.key()));
+    }
+
+    /// The key of the extern block declaration first recorded for the C
+    /// symbol `sym` when its signature is not `func_type_ref`, else empty:
+    /// two extern blocks disagreeing about one C name's Cryo signature,
+    /// which W0011 reports.  An identical redeclaration shares the interned
+    /// function type and is not a conflict; an intrinsic reaching the same
+    /// symbol is not an extern block and is not recorded here.
+    extern_symbol_conflict(&this, sym: SymbolStr, func_type_ref: TypeRef) -> SymbolStr {
+        match (this.extern_symbol_first.get_ref(&sym.id)) {
+            Option::Some(first) => {
+                if ((*first).second != func_type_ref.key()) { return SymbolStr::from_id((*first).first); }
             }
             Option::None => { }
         }
         return SymbolStr::empty();
     }
 
-    /// Owner-aware mangled lookup: the entry matching (name, signature,
-    /// owner) exactly, or empty.
-    lookup_overload_mangled_owned(&this, name: SymbolStr, func_type_ref: TypeRef,
-                                  owner: u32) -> SymbolStr {
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    const pos: u32 = (*positions)[k];
-                    if (this.overload_func_types[pos as i64].id == func_type_ref.id
-                        && this.overload_func_owner[pos as i64] == owner) {
-                        const mid: u32 = this.overload_func_mangled[pos as i64];
-                        if (mid != 0) { return SymbolStr::from_id(mid); }
-                        return SymbolStr::empty();
-                    }
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
+    /// The DEFINITION a type names, or an invalid id when the type is not a
+    /// declared one.  The one door from a type to its definition.
+    ///
+    /// For a reader that holds a type rather than a written path - a
+    /// synthesizer building a reference to it, a trait projection asking for
+    /// its trait's declaration - so the id is derived from the type instead
+    /// of looked up from a spelling.
+    ///
+    /// This is a mint because it reads this index rather than a spelling:
+    /// `lookup_type_name` answers only for a type registered here, so a
+    /// caller cannot reach a `DefId` for something never declared.
+    ///
+    /// An instantiation is reduced to the template it instantiates first,
+    /// because a `Res` names a definition and never an instantiation - the
+    /// invariant that lets `ASTCloner` copy one verbatim.  Reading the name
+    /// off `Option<i32>` instead of `Option` would record a per-call-site
+    /// answer for a declaration that has exactly one.
+    def_of(&this, ty: TypeRef, arena: TypeArena*) -> DefId {
+        if (arena == null || !ty.is_valid()) { return DefId::invalid(); }
+        const base: TypeRef = arena.inst_generic_base(ty);
+        if (base.is_valid()) {
+            const bd: DefId = this.registered_def(base);
+            if (bd.is_valid()) { return bd; }
         }
-        return SymbolStr::empty();
+        return this.registered_def(ty);
     }
 
-    /// Every overload entry registered under `name`, with its owning
-    /// declaration's qualified-name id (0 = legacy/global claim) and its
-    /// mangled-symbol id (0 = unset), as three parallel arrays the caller
-    /// indexes together.  The bare-call binder uses the owners to filter
-    /// candidates by the use site's imports and to name candidates in the
-    /// E0154 ambiguity diagnostic.
-    lookup_func_overload_owners(&this, name: SymbolStr) -> u32[] {
-        mut result: u32[] = [];
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    result.push(this.overload_func_owner[(*positions)[k] as i64]);
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        return result;
-    }
-
-    /// The FunctionType of the overload entry that carries this mangled LLVM
-    /// symbol, or invalid.  The pinned `resolved_callee` is ground truth for
-    /// a call's signature: name-based return lookups (`func_returns` bare
-    /// slots) are single-slot and can legitimately belong to a DIFFERENT
-    /// same-leaf declaration (an intrinsic-owned leaf keeps the intrinsic's),
-    /// so a re-resolution of an already-pinned call must read the entry the
-    /// pin actually points at.
-    lookup_func_type_by_mangled(&this, mangled: SymbolStr) -> TypeRef {
-        match (this.mangled_to_overload_pos.get_ref(&mangled.id)) {
-            Option::Some(positions) => {
-                if ((*positions).length > 0) {
-                    return this.overload_func_types[(*positions)[0] as i64];
-                }
-            }
-            Option::None => { }
-        }
-        return TypeRef::invalid();
-    }
-
-    /// Parallel to `lookup_func_type_overloads` / `lookup_func_overload_owners`:
-    /// each entry's mangled-symbol id (0 = unset).
-    lookup_func_overload_mangleds(&this, name: SymbolStr) -> u32[] {
-        mut result: u32[] = [];
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    result.push(this.overload_func_mangled[(*positions)[k] as i64]);
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        return result;
-    }
-
-    /// Register a method's return type on a specific type.
-    register_method(mut &this, type_sym: SymbolStr, method_sym: SymbolStr,
-                    return_type: TypeRef) -> void {
-        const key: u64 = DeclarationIndex::pack_method_key(type_sym, method_sym);
-        this.method_returns.insert(key, return_type);
-    }
-
-    /// Register a named type (struct, class, enum, trait) under its
-    /// qualified name (e.g. "Module::Point").  Callers must qualify the
-    /// name before calling.
-    register_type(mut &this, qualified_name: SymbolStr, ty: TypeRef) -> void {
-        this.type_map.insert(qualified_name.id, ty);
-
-        // Reverse map: TypeRef.id -> qualified name
-        this.type_reverse.insert(ty.id, qualified_name.id);
-    }
-
-    /// Register a mapping from an array element TypeRef to the concrete
-    /// Array_<T> struct's qualified name.  Called by the specialization
-    /// pass after monomorphizing Array<T>.
-    register_array_element_type(mut &this, element: TypeRef, array_struct_name: SymbolStr) -> void {
-        this.array_elem_to_type.insert(element.id, array_struct_name.id);
-    }
-
-    /// Look up the concrete Array_<T> struct name for a given element type.
-    lookup_array_type_name(&this, element: TypeRef) -> SymbolStr {
-        return match (this.array_elem_to_type.get(&element.id)) {
-            Option::Some(val) => { SymbolStr::from_id(val) }
-            Option::None      => { SymbolStr::empty() }
+    /// The definition `ty` was registered as, or an invalid id when it was
+    /// never registered here.
+    registered_def(&this, ty: TypeRef) -> DefId {
+        return match (this.type_reverse.get(&ty.table_key())) {
+            Option::Some(d) => { d }
+            Option::None    => { DefId::invalid() }
         };
     }
 
-    /// Register a reverse-only mapping (TypeRef -> qualified name) without
-    /// touching the forward type_map.  Used to make additional TypeRefs
+    /// Register the named type (struct, class, enum, trait, alias) that the
+    /// definition `def` is, with its visibility verdict.  The verdict is
+    /// recorded here, with the key, so no registered type is ever asked
+    /// about before it has one.
+    ///
+    /// `def` is the id the declaration was given where it was declared - the
+    /// name layer's binding, a synthesizer's registration - and this makes
+    /// none of its own: a second id for one declaration would compare unequal
+    /// to the first.  The type is kept under the definition, for
+    /// `type_of_def`, and nowhere else: a definition's path is display text,
+    /// and two definitions written under one path are two types.
+    register_type(mut &this, def: DefId, ty: TypeRef, is_public: boolean) -> void {
+        this.type_reverse.insert(ty.table_key(), def);
+        this.defs.record_visibility(def, is_public);
+        const slot: i64 = this.defs.slot(def);
+        while (this.def_types.length <= slot) { this.def_types.push(TypeRef::invalid()); }
+        this.def_types[slot] = ty;
+    }
+
+    /// Register the concrete `Array<T>` specialization a dynamic `T[]`
+    /// dispatches through, keyed by its element type: an `ArrayType` is not
+    /// canonical (many TypeRefs describe one `T[]`) but its element is.
+    /// Called by the specialization pass after monomorphizing `Array<T>`.
+    register_array_element_type(mut &this, element: TypeRef, array_struct: TypeRef) -> void {
+        this.array_elem_to_type.insert(element.table_key(), array_struct);
+    }
+
+    /// The concrete `Array<T>` specialization for a given element type; the
+    /// owner a method call on `T[]` resolves against.
+    lookup_array_type(&this, element: TypeRef) -> TypeRef {
+        return match (this.array_elem_to_type.get(&element.table_key())) {
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+    /// The registered name of that specialization.
+    lookup_array_type_name(&this, element: TypeRef) -> SymbolStr {
+        return this.lookup_type_name(this.lookup_array_type(element));
+    }
+
+    /// Register a reverse-only mapping (TypeRef -> definition) without
+    /// touching the definition's own type.  Used to make additional TypeRefs
     /// (e.g., InstantiatedType, ArrayType) resolvable to an already-
     /// registered concrete type's qualified name.
-    register_type_reverse_only(mut &this, qualified_name: SymbolStr, ty: TypeRef) -> void {
-        this.type_reverse.insert(ty.id, qualified_name.id);
+    register_type_reverse_only(mut &this, def: DefId, ty: TypeRef) -> void {
+        this.type_reverse.insert(ty.table_key(), def);
     }
 
-    /// Register a type alias that maps to an existing type without
-    /// overwriting the reverse map.  Use this for aliases like
-    /// "double" -> f64 or "int" -> i32 so that reverse lookup returns
-    /// the canonical name, not the alias.
-    register_type_forward_only(mut &this, alias_name: SymbolStr, ty: TypeRef) -> void {
-        this.type_map.insert(alias_name.id, ty);
-    }
-
-    /// Register a global variable's type.
-    register_global(mut &this, name: SymbolStr, ty: TypeRef) -> void {
-        this.global_vars.insert(name.id, ty);
-    }
-
-    /// Register a global with its defining module so codegen can walk the
-    /// per-module list to emit cross-module externs.  Callers already set
-    /// the shared type map via register_global; this method is additive.
-    /// `namespace` is the namespace this module declares (e.g.
-    /// `std::collections::hashmap`); codegen mangles the global as
-    /// `C$<namespace>.<name>` so two modules with the same private
-    /// `const NAME = ...` don't collide.  Pass an empty SymbolStr when no
-    /// namespace is set (the global stays bare-mangled).
-    register_global_with_module(mut &this, name: SymbolStr, ty: TypeRef,
-                                 module: SymbolStr, namespace: SymbolStr,
-                                 thread_local: boolean) -> void {
-        this.register_global(name, ty);
-        // Dedup so re-processing doesn't grow the list unboundedly.
-        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
-            if (this.module_global_keys[i] == name.id &&
-                this.module_global_modules[i] == module.id) {
-                // Refresh recorded metadata in case the global was first
-                // registered before its namespace / thread-local flag was set.
-                this.module_global_namespaces[i] = namespace.id;
-                this.module_global_threadlocal[i] = thread_local;
-                this.module_global_types[i] = ty;
-                return;
-            }
+    /// Register the global definition `def`, declared as `leaf` by the module
+    /// `declared_in` in `source_file`, under its definition: one slot per
+    /// definition, so a second registration of the same declaration refreshes
+    /// what the first recorded (its module, type and thread-local flag)
+    /// rather than adding a slot.  Codegen mangles the global as
+    /// `C$<module path>.<leaf>`; `declared_in` is none for a unit declaring
+    /// no namespace (the global stays bare-mangled).
+    register_global(mut &this, def: DefId, leaf: SymbolStr, ty: TypeRef,
+                    source_file: SymbolStr, declared_in: ModulePath,
+                    thread_local: boolean) -> void {
+        const i: i64 = this.global_slot_of_def(def);
+        if (i >= 0) {
+            this.module_global_declared_in[i] = declared_in;
+            this.module_global_threadlocal[i] = thread_local;
+            this.module_global_types[i] = ty;
+            return;
         }
-        this.module_global_keys.push(name.id);
-        this.module_global_modules.push(module.id);
-        this.module_global_namespaces.push(namespace.id);
+        const ds: i64 = this.defs.slot(def);
+        while (this.def_globals.length <= ds) { this.def_globals.push(-1); }
+        this.def_globals[ds] = this.module_global_leaves.length;
+        this.module_global_leaves.push(leaf.id);
+        this.module_global_files.push(source_file.id);
+        this.module_global_declared_in.push(declared_in);
         this.module_global_threadlocal.push(thread_local);
+        this.module_global_extern_syms.push(0);
         this.module_global_types.push(ty);
     }
 
-    /// The global `name` as declared by the module whose namespace's LAST
-    /// segment is `scope_leaf` — the module a qualified `scope_leaf::name`
-    /// actually names. `*out_ns` receives that module's namespace so codegen can
-    /// mangle the reference to the matching definition.
+    /// The registration slot of the global definition `def`, or -1 when `def`
+    /// is invalid or no global registration reached it.
+    global_slot_of_def(&this, def: DefId) -> i64 {
+        if (!def.is_valid()) { return -1; }
+        const ds: i64 = this.defs.slot(def);
+        if (ds >= this.def_globals.length) { return -1; }
+        return this.def_globals[ds];
+    }
+
+    /// The global definition `def` is, from its registration slot, or an
+    /// entry that is not `valid`.
+    global_entry_of_def(&this, def: DefId) -> GlobalEntry {
+        return this.global_entry_at(this.global_slot_of_def(def));
+    }
+
+    /// The slot at position `i`, read by value.
+    global_entry_at(&this, i: i64) -> GlobalEntry {
+        if (i < 0) { return GlobalEntry::none(); }
+        return GlobalEntry {
+            valid:         true,
+            slot:          i,
+            leaf:          SymbolStr::from_id(this.module_global_leaves[i]),
+            declared_in:   this.module_global_declared_in[i],
+            type_ref:      this.module_global_types[i],
+            source_file:   SymbolStr::from_id(this.module_global_files[i]),
+            extern_symbol: SymbolStr::from_id(this.module_global_extern_syms[i]),
+            thread_local:  this.module_global_threadlocal[i],
+        };
+    }
+
+    /// A qualified path's member is written as a leaf
+    /// after a module the name layer already bound (`libc::FIONBIO`), so the
+    /// question takes the module's identity and the leaf's text; the leaf
+    /// alone cannot answer, since two modules may each declare it.
     ///
-    /// A qualified reference must never be answered from the bare-name map:
-    /// that map is keyed by leaf and is last-write-wins across every module
-    /// declaring it, so `syscall::FIONBIO` would silently resolve to
-    /// `libc::FIONBIO` — a different value AND a different type.
-    ///
-    /// Returns an invalid TypeRef when no module matches, or when more than one
-    /// does (two namespaces ending in the same segment). Ambiguity is left to
-    /// the caller's existing behaviour rather than guessed at, which keeps this
-    /// lookup strictly additive.
-    find_global_in_scope(&this, name: SymbolStr, scope_leaf: SymbolStr,
-                         intern: InternTable*, out_ns: SymbolStr*,
-                         out_module: SymbolStr*) -> TypeRef {
-        const leaf: string = intern.resolve(scope_leaf);
-        if (leaf == "") { return TypeRef::invalid(); }
-        mut found: TypeRef = TypeRef::invalid();
-        mut hits: i64 = 0;
-        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
-            if (this.module_global_keys[i] != name.id) { continue; }
-            const ns_sym: SymbolStr = SymbolStr::from_id(this.module_global_namespaces[i]);
-            if (!ns_sym.is_valid()) { continue; }
-            const ns: string = intern.resolve(ns_sym);
-            if (ns == "") { continue; }
-            if (!DeclarationIndex::namespace_leaf_is(ns, leaf)) { continue; }
-            hits = hits + 1;
-            if (hits > 1) { return TypeRef::invalid(); }
-            found = this.module_global_types[i];
-            *out_ns = ns_sym;
-            *out_module = SymbolStr::from_id(this.module_global_modules[i]);
+    /// The global the module `m` declares as `leaf`, or an entry that is not
+    /// `valid`.  No module is the root, which a unit with no `namespace`
+    /// declaration registers its globals under.
+    global_in_module(&this, leaf: SymbolStr, m: ModulePath) -> GlobalEntry {
+        for (mut i: i64 = 0; i < this.module_global_leaves.length; i++) {
+            if (this.module_global_leaves[i] != leaf.id) { continue; }
+            if (!this.module_global_declared_in[i].equals(m)) { continue; }
+            return this.global_entry_at(i);
         }
-        if (hits != 1) { return TypeRef::invalid(); }
-        return found;
+        return GlobalEntry::none();
     }
 
-    /// True when `ns`'s last `::` segment equals `leaf` (or `ns` IS `leaf`) —
-    /// how a one-segment scope qualifier names a module. Mirrors the
-    /// module-suffix match `CallResolver` uses for abbreviated namespaces.
-    static namespace_leaf_is(ns: string, leaf: string) -> boolean {
-        const ns_len: i64 = ns.length() as i64;
-        const leaf_len: i64 = leaf.length() as i64;
-        if (ns_len == leaf_len) { return ns.eq(leaf); }
-        if (ns_len <= leaf_len + 1) { return false; }
-        const suffix_start: i64 = ns_len - leaf_len;
-        if (ns[suffix_start - 1] != ':' || ns[suffix_start - 2] != ':') { return false; }
-        return (ns + suffix_start) == leaf;
+    /// Record that the global definition `def` binds linker symbol `sym`.
+    /// A global whose type never resolved has no slot; it was diagnosed at
+    /// the declaration and nothing references it.
+    record_global_extern_symbol(mut &this, def: DefId, sym: SymbolStr) -> void {
+        const i: i64 = this.global_slot_of_def(def);
+        if (i >= 0) { this.module_global_extern_syms[i] = sym.id; }
     }
 
-    /// Whether a registered global is `![thread_local]`. Used by
-    /// `resolve_global` to mark cross-module extern references thread-local.
-    is_global_thread_local(&this, name: SymbolStr) -> boolean {
-        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
-            if (this.module_global_keys[i] == name.id) {
-                return this.module_global_threadlocal[i];
-            }
+    /// Mark the global definition `def` thread-local.  The `![thread_local]`
+    /// directive is applied AFTER TypeResolution registered the global with
+    /// the flag false, so the registration is corrected rather than made.
+    mark_global_thread_local(mut &this, def: DefId) -> void {
+        const i: i64 = this.global_slot_of_def(def);
+        if (i >= 0) { this.module_global_threadlocal[i] = true; }
+    }
+
+
+
+    /// Register a type's inline or impl-block methods under the key the
+    /// type itself is registered under.  The owner is the TYPE: the key is
+    /// read off this index's reverse map, so the caller derives none, and
+    /// a type this index holds no key for is a registration it never saw
+    /// - recorded, nothing registered, because a key guessed here would be
+    /// a second registration under a name no reader asks.
+    register_methods(mut &this, owner: TypeRef, methods: &MethodNode*[],
+                     intern: InternTable*, arena: TypeArena*, site: string) -> void {
+        const no_trait_args: TypeRef[] = [];
+        this.register_methods_through(owner, methods, null, &no_trait_args, intern, arena, site);
+    }
+
+    /// `register_methods` for an implement block's methods.  A return is
+    /// written in the block's own parameters, and every reader of the
+    /// returns this index holds substitutes the OWNER's into it (a
+    /// receiver's arguments, a turbofish on the owner), so each is stored
+    /// with `head` applied - the block's parameters bound to the owner's
+    /// through its head (`TraitChecker::add_head_param_bindings`).  Null or
+    /// empty `head` stores the return as written.  `trait_args` are the
+    /// block's trait arguments, which a trait method's link symbol carries.
+    register_methods_through(mut &this, owner: TypeRef, methods: &MethodNode*[],
+                             head: TypeSubstitution*, trait_args: &TypeRef[],
+                             intern: InternTable*, arena: TypeArena*, site: string) -> void {
+        const type_sym: SymbolStr = this.lookup_type_name(owner);
+        if (!type_sym.is_valid()) {
+            compiler::resolver::res::record_unregistered_def(site);
+            return;
         }
-        return false;
-    }
-
-    /// Mark an already-registered global as thread-local. Called when the
-    /// `![thread_local]` directive is applied, which runs AFTER TypeResolution
-    /// registered the global (so the flag was recorded false at registration).
-    mark_global_thread_local(mut &this, name: SymbolStr) -> void {
-        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
-            if (this.module_global_keys[i] == name.id) {
-                this.module_global_threadlocal[i] = true;
-            }
-        }
-    }
-
-    /// Convenience: register all methods from a MethodNode*[] array on a type.
-    register_methods(mut &this, type_sym: SymbolStr, methods: MethodNode*[]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
-            this.register_method(type_sym, method.func.name,
-                                 method.func.resolved_return_type);
-        }
-    }
-
-    /// Register methods with full per-module visibility.
-    /// This adds each method to the per-module function list under the
-    /// combined key "QualifiedType::method" so that cross-module externs
-    /// can declare them and codegen can find them.
-    register_methods_with_module(mut &this, type_sym: SymbolStr, methods: &MethodNode*[],
-                                  module: SymbolStr, intern: InternTable*,
-                                  arena: TypeArena*) -> void {
-        this.register_methods_with_module_aliased(
-            type_sym, SymbolStr::empty(), methods, module, intern, arena);
-    }
-
-    /// Same as `register_methods_with_module` but also registers a bare-name
-    /// alias for the combined key (e.g. both `std::core::primitives::string::substring`
-    /// AND `string::substring`) in the function/overload registries.  Lets
-    /// callers that only know the bare type name (namely codegen's
-    /// MemberAccess path on primitives) still find the signature.
-    register_methods_with_module_aliased(mut &this,
-                                          type_sym: SymbolStr, bare_alias: SymbolStr,
-                                          methods: &MethodNode*[],
-                                          module: SymbolStr, intern: InternTable*,
-                                          arena: TypeArena*) -> void {
-        const type_str: string = intern.resolve(type_sym);
-        const bare_str: string = if (bare_alias.is_valid()) { intern.resolve(bare_alias) } else { "" };
-        for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
-            if (method == null || method.func == null) { continue; }
+            this.check_method_def(owner, method, intern);
             // Self-returning trait defaults (combinators) are deferred
             // templates with unresolved signatures - they are instantiated
             // lazily at call sites and the concrete spec is registered there
@@ -880,49 +1090,24 @@ type struct DeclarationIndex {
             if (method.func.is_self_returning_default) { continue; }
             const func: FunctionDeclNode* = method.func;
 
-            // Register in method_returns under the qualified type (existing
-            // behavior) AND under the bare alias (so lookup_method_return
-            // works for both forms on primitive impls).
-            this.register_method(type_sym, func.name, func.resolved_return_type);
-            if (bare_alias.is_valid()) {
-                this.register_method(bare_alias, func.name, func.resolved_return_type);
+            // A signature the name layer refused registers nothing under
+            // the key - a call finds the refusal there and stays silent.
+            if (DeclarationIndex::signature_is_refused(func)) {
+                this.mark_method_signature_refused(owner, func.name);
+                continue;
             }
 
-            // Build combined key "QualifiedType::method".
-            const method_str: string = intern.resolve(func.name);
-            const combined: string = format("%s::%s", type_str, method_str);
-            const combined_sym: SymbolStr = intern.intern(combined);
-
-            // Build full FunctionType.  Cryo allows three self forms on
-            // non-static methods:
-            //   `&this` / `mut &this`: stored as a param named "&this",
-            //                             semantically a `T*`
-            //   `this`:                stored as a param named "this",
-            //                             semantically a by-value `T`
-            //   (none):                implicit `&this`; synthesize `T*`
-            // Only synthesize the prefix when the parameter list contains
-            // NEITHER of the explicit forms, otherwise we'd double-count.
-            const this_name: SymbolStr = intern.intern("&this");
-            const this_val_name: SymbolStr = intern.intern("this");
-            mut has_explicit_self: boolean = false;
-            for (mut ps: i64 = 0; ps < func.parameters.length; ps++) {
-                const pps: VarDeclNode* = func.parameters[ps];
-                if (pps == null) { continue; }
-                if (pps.name.equals(this_name) || pps.name.equals(this_val_name)) {
-                    has_explicit_self = true;
-                    break;
-                }
+            mut ret: TypeRef = func.resolved_return_type;
+            if (head != null && head.params.length > 0 && ret.is_valid()) {
+                const owned: TypeRef = head.apply(ret, arena);
+                if (owned.is_valid()) { ret = owned; }
             }
 
+            // Build full FunctionType.  A non-static method's receiver is one
+            // of its parameters, written or synthesized: `&this` /
+            // `mut &this` semantically a `T*`, `this` a by-value `T`.
             mut param_types: TypeRef[] = [];
-            if (!method.is_static && !has_explicit_self) {
-                const target_ref: TypeRef = this.lookup_type(type_sym);
-                if (target_ref.is_valid()) {
-                    const this_ptr_ref: TypeRef = arena.get_pointer_to(target_ref);
-                    param_types.push(this_ptr_ref);
-                }
-            }
-            // Collect all explicit parameter types.  `&this` / `mut &this`
+            // Collect all parameter types.  `&this` / `mut &this`
             // carry a resolved pointer type from type resolution, but a
             // by-value `this` receiver is left WITHOUT a resolved_type;
             // recover it as the target struct by value (`T`) so the
@@ -938,8 +1123,8 @@ type struct DeclarationIndex {
                 if (param == null) { continue; }
                 if (param.resolved_type.is_valid()) {
                     param_types.push(param.resolved_type);
-                } else if (param.name.equals(this_val_name)) {
-                    const recv_ref: TypeRef = this.lookup_type(type_sym);
+                } else if (param.is_value_receiver()) {
+                    const recv_ref: TypeRef = this.type_of_def(this.registered_def(owner));
                     if (recv_ref.is_valid()) {
                         param_types.push(recv_ref);
                     }
@@ -959,11 +1144,7 @@ type struct DeclarationIndex {
             const func_type_ref: TypeRef = arena.get_function(
                 func.resolved_return_type, param_types, func.is_variadic);
 
-            // Register with full signature for cross-module externs.
-            this.register_function(combined_sym, func.resolved_return_type);
-            this.register_function_type(combined_sym, func_type_ref);
-
-            // Compute and store the mangled LLVM symbol name.  The
+            // Compute the mangled LLVM symbol name.  The
             // receiver-kind / non-receiver-params split is shared with the
             // codegen vtable-resolution path (see method_receiver_kind).
             const type_qname: QualifiedName = QualifiedName::from_symbol(type_sym);
@@ -973,8 +1154,8 @@ type struct DeclarationIndex {
                 func, intern);
             const method_sym: SymbolStr = func.name;
             const mangled_base: MangledName = MangledName::for_method_or_trait_impl(
-                intern, arena, type_qname, func.origin_trait, method_sym, receiver_kind,
-                method_param_refs, func.resolved_return_type, func.is_variadic);
+                intern, arena, type_qname, this.defs.path_of(func.origin_trait).spelling(), trait_args,
+                method_sym, receiver_kind, method_param_refs, func.resolved_return_type, func.is_variadic);
             // Fold in a generic-method spec's type args (`$MG...`) so the DI stores
             // the same disambiguated symbol the codegen definition + mono pin use;
             // otherwise a cross-module extern of `name<i64>` vs `name<u64>` (whose
@@ -992,144 +1173,318 @@ type struct DeclarationIndex {
             const eff_mangled: SymbolStr = if (!link_str.eq("")) {
                 intern.intern(link_str)
             } else {
-                mangled.value
+                intern.intern(mangled.as_string())
             };
-            this.register_mangled_name(combined_sym, eff_mangled);
-
-            // Also associate this overload's mangled name with its
-            // FunctionType in the overload registry, so cross-module
-            // extern declaration can emit the right LLVM symbol per
-            // overload (not just the last-registered one).
-            this.register_overload_mangled(combined_sym, func_type_ref, eff_mangled);
-
-            // Bare-name alias.  For impl blocks on primitives (e.g. `implement
-            // string`) the qualified form is `std::core::primitives::string::substring`
-            // but the consumer (sema + codegen MemberAccess path) only has
-            // the bare type name "string".  Mirror the qualified registration
-            // under "string::substring" so resolve_function / resolve_function_with_arity
-            // finds the signature regardless of which form the call site
-            // used.  The LLVM symbol (`mangled.value`) is identical; linking
-            // converges on the one defining module.
-            if (bare_alias.is_valid()) {
-                const bare_combined: string = format("%s::%s", bare_str, method_str);
-                const bare_combined_sym: SymbolStr = intern.intern(bare_combined);
-                if (bare_combined_sym.id != combined_sym.id) {
-                    this.register_function(bare_combined_sym, func.resolved_return_type);
-                    this.register_function_type(bare_combined_sym, func_type_ref);
-                    this.register_mangled_name(bare_combined_sym, eff_mangled);
-                    this.register_overload_mangled(bare_combined_sym, func_type_ref, eff_mangled);
+            // The entry is the declaration's identity: stamped on the node
+            // so every consumer holding the node - the definition emitter,
+            // a call sema or mono binds to it, a vtable slot - reads the
+            // symbol and signature registration wrote, and mangles nothing.
+            const entry: OverloadId = this.keep_def_entry(func.def, this.register_signature(
+                FamilyOwner::Type(owner), func.name, func_type_ref, ret, eff_mangled, func.origin_trait,
+                if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*));
+            func.set_overload_entry(entry);
+            // A constructor's family is its type's: `Node(1)` and `new
+            // Node(1)` name the type, and its constructors are asked by it.
+            if (method.is_constructor && entry.is_valid()) {
+                const td: DefId = this.registered_def(owner);
+                if (td.is_valid()) {
+                    const ts: i64 = this.defs.slot(td);
+                    while (this.ctor_families.length <= ts) { this.ctor_families.push(FamilySlot::none()); }
+                    this.ctor_families[ts] = this.overload_func_family[this.slot_of(entry)];
                 }
             }
-
-            // Add to per-module list.  Skip if this (combined_sym, module)
-            // pair was already added by a prior overload; multiple
-            // overloads of the same method share one per-module entry.
-            const pair_key: u64 =
-                ((combined_sym.id as u64) << 32) | (module.id as u64);
-            if (!this.module_func_pairs.contains_key(&pair_key)) {
-                this.module_funcs.push(Pair<u32, u32>::new(combined_sym.id, module.id));
+            // A copy is the owner's method for the definition it stands for.
+            // A specialization of a generic method is that definition AND
+            // its own type arguments, an instance this table does not hold,
+            // whether or not its symbol carries those arguments.
+            const instance: boolean = method.spec_of != null && method.spec_of.func != null
+                && method.spec_of.func.generic_params.length > 0;
+            if (func.copy_of.is_valid() && func.spec_type_args.length == 0 && !instance && entry.is_valid()) {
+                this.copy_entries.insert(this.copy_key(owner, func.copy_of), entry);
             }
-            this.note_module_func(combined_sym.id, module.id);
         }
+    }
+
+    /// Register a generic type's own methods - written in its declaration or
+    /// in an implement block for it - in families owned by the template's
+    /// definition `template`, so the member-function door answers a member
+    /// asked of the template: inside the generic body, where the receiver is
+    /// the body's own unminted instantiation.  An instance's methods are
+    /// registered on the instance when it is minted; these entries are the
+    /// declarations, with their signatures in the template's parameters, no
+    /// linker symbol, and no definition kept for them, so nothing emits or
+    /// calls them.  Two methods of one signature (an inherent method and a
+    /// trait's, or two traits') are two entries: an entry is its method, and
+    /// registering a method again answers the entry it already has.
+    register_template_methods(mut &this, template: DefId, methods: &MethodNode*[],
+                              arena: TypeArena*) -> void {
+        if (!template.is_valid()) { return; }
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+            const func: FunctionDeclNode* = method.func;
+            if (DeclarationIndex::signature_is_refused(func)) { continue; }
+            const slot: FamilySlot = this.family_slot(FamilyOwner::Template(template), func.name);
+            if (slot.is_none()) { continue; }
+            mut registered: boolean = false;
+            match (this.overload_index.get_ref(&slot)) {
+                Option::Some(positions) => {
+                    for (mut k: i64 = 0; k < (*positions).length; k++) {
+                        if (this.overload_func_decl[(*positions)[k] as i64] == method as ASTNode*) { registered = true; }
+                    }
+                }
+                Option::None => { }
+            }
+            if (registered) { continue; }
+            mut param_types: TypeRef[] = [];
+            for (mut p: i64 = 0; p < func.parameters.length; p++) {
+                const param: VarDeclNode* = func.parameters[p];
+                if (param != null && param.resolved_type.is_valid()) { param_types.push(param.resolved_type); }
+            }
+            const func_type_ref: TypeRef = if (func.resolved_return_type.is_valid()) {
+                arena.get_function(func.resolved_return_type, param_types, func.is_variadic)
+            } else {
+                TypeRef::invalid()
+            };
+            const id: OverloadId = this.file_entry(slot, func_type_ref, func.resolved_return_type,
+                SymbolStr::empty(), func.origin_trait,
+                if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*);
+            const positions: u32[]* = this.overload_index.get_or_insert(slot, []);
+            (*positions).push(this.slot_of(id) as u32);
+        }
+    }
+
+    /// Whether `m` is one of `set`, by identity.
+    static holds_method(set: &MethodNode*[], m: MethodNode*) -> boolean {
+        if (m == null) { return false; }
+        for (mut i: i64 = 0; i < set.length; i++) {
+            if (set[i] == m) { return true; }
+        }
+        return false;
+    }
+
+    /// The methods of the family `(owner, leaf)`, in registration order: the
+    /// member-function door's entries, each read back as the method it was
+    /// registered for.  An entry registered for a free function is not one.
+    methods_named(&this, owner: FamilyOwner, leaf: SymbolStr) -> MethodNode*[] {
+        const entries: OverloadId[] = this.lookup_family_entries(owner, leaf);
+        mut out: MethodNode*[] = [];
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const m: MethodNode* = this.entry_method(entries[i]);
+            if (m != null) { out.push(m); }
+        }
+        return out;
+    }
+
+    /// The method type `ty` holds for its family under `leaf`: the first of
+    /// the type's own method records whose declaration the member-function
+    /// door answers for `(ty, leaf)`, or null.  A struct's, a class's own
+    /// (its bases hold theirs) or an enum's.
+    type_method(&this, ty: TypeRef, leaf: SymbolStr, arena: TypeArena*) -> MethodInfo* {
+        const named: MethodNode*[] = this.methods_named(FamilyOwner::Type(ty), leaf);
+        return this.type_method_among(ty, &named, arena);
+    }
+
+    /// The first of `ty`'s own method records whose declaration is one of
+    /// `named`, or null.
+    type_method_among(&this, ty: TypeRef, named: &MethodNode*[], arena: TypeArena*) -> MethodInfo* {
+        const t: Type* = arena.lookup(ty);
+        if (t == null) { return null; }
+        const no_methods: MethodInfo[] = [];
+        mut methods: &MethodInfo[] = &no_methods;
+        if (t.kind == TypeKind::Struct) {
+            methods = &(t as StructType*).methods;
+        } else if (t.kind == TypeKind::Class) {
+            methods = &(t as ClassType*).methods;
+        } else if (t.kind == TypeKind::Enum) {
+            methods = &(t as EnumType*).methods;
+        } else {
+            return null;
+        }
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            if (DeclarationIndex::holds_method(named, methods[i].ast_node as MethodNode*)) { return &methods[i]; }
+        }
+        return null;
     }
 
 
     // Lookups (called by Sema and future passes)
 
-    /// Look up a function's return type by name.
-    lookup_func_return(&this, name: SymbolStr) -> TypeRef {
-        return match (this.func_returns.get(&name.id)) {
+    /// The signature last registered in the family `(owner, leaf)`.  A
+    /// function's return type is this signature's; there is no second map
+    /// keyed by the same family that could answer differently.
+    lookup_func_type(&this, owner: FamilyOwner, leaf: SymbolStr) -> TypeRef {
+        const slot: FamilySlot = this.family_slot(owner, leaf);
+        return match (this.func_type_refs.get(&slot)) {
             Option::Some(val) => { val }
             Option::None      => { TypeRef::invalid() }
         };
     }
 
-    /// Look up a function's FunctionType TypeRef (full signature).
-    lookup_func_type(&this, name: SymbolStr) -> TypeRef {
-        return match (this.func_type_refs.get(&name.id)) {
-            Option::Some(val) => { val }
-            Option::None      => { TypeRef::invalid() }
+    /// The function type the stamp `r` names, or invalid when it names no
+    /// definition.
+    ///
+    /// Keyed by the `Res` and not by a spelling, because the two do not select
+    /// the same declaration: a canonical name identifies ONE, while the bare
+    /// `func_type_refs` slot is single-slot last-write-wins across every module
+    /// declaring that leaf.  Three modules declare `sleep` with three different
+    /// signatures, so a call to an imported one asked by leaf can be handed
+    /// `libc::sleep`'s - and this type is what expected-type propagation gives
+    /// the arguments.
+    func_type_of_res(&this, r: res::Res) -> TypeRef {
+        return this.func_type_of_def(r.def_id());
+    }
+
+    /// The function type of the definition `d`: the signature its own
+    /// declaration was registered with (`entry_of_def`).  Invalid when `d`
+    /// names none or no registration reached it.  Asked by the definition and
+    /// not by its family - its parent and leaf - because a family holds every
+    /// overload declared under the leaf, and its slot keeps whichever
+    /// registered last.
+    func_type_of_def(&this, d: DefId) -> TypeRef {
+        return this.entry_signature(this.entry_of_def(d));
+    }
+
+    /// The TYPE the stamp `r` names, or invalid when it names no definition
+    /// or the definition is not a type.  Sibling of `func_type_of_res`, for
+    /// the same reason.
+    type_of_res(&this, r: res::Res) -> TypeRef {
+        return this.type_of_def(r.def_id());
+    }
+
+    /// The type an impl head is for, off the head's stamp - the one reader
+    /// of that stamp for every pass that walks an impl block.
+    ///
+    /// One answering path per kind of answer the slot can carry, each an
+    /// exact lookup under the key that kind supplies, never a retry of one
+    /// key under another.  A `Def` is canonical, so the index holds it or the
+    /// declaration never registered - recorded against `site`.  A written
+    /// primitive is `PrimTy` and names no declaration, because a primitive
+    /// owns members without being declared anywhere; the primitive table's
+    /// answer is its identity, and its definition (`DefTable::primitive`) is
+    /// what its type is registered under.  An unanswered slot belongs to the cloner, which
+    /// leaves a specialization alone because a `Res` names a definition and
+    /// a specialization is not one - there the monomorphizer's `spec_owner`,
+    /// the instantiation's own arena id, is the carrier.  Every head a
+    /// synthesizer builds is stamped by that synthesizer.
+    ///
+    /// Nothing else can name a type here: a type parameter, a local and an
+    /// already-failed resolution each name something that is not a
+    /// declaration, so there is no key to look one up under.
+    impl_owner(&this, node: ImplBlockNode*, site: string) -> TypeRef {
+        return match (node.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(q) => {
+                        const found: TypeRef = this.type_of_def(q);
+                        if (!found.is_valid()) { compiler::resolver::res::record_unregistered_def(site); }
+                        found
+                    }
+                    Res::PrimTy(n) => { this.type_of_def(this.defs.primitive(n)) }
+                    _              => { TypeRef::invalid() }
+                }
+            }
+            _ => { node.spec_owner }
         };
     }
 
-    /// Look up a method's return type by (type, method) names.
-    lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
-        const key: u64 = DeclarationIndex::pack_method_key(type_sym, method_sym);
-        return match (this.method_returns.get(&key)) {
-            Option::Some(val) => { val }
-            Option::None      => { TypeRef::invalid() }
+    /// The owner implement block `node` is for: the definition its head
+    /// names, a type's or a primitive's (a template's, whose methods are kept
+    /// under `FamilyOwner::Template` of it, is the caller's to tell apart),
+    /// or, for a specialization's clone, which names none, the instantiation
+    /// it was placed on.
+    impl_family_owner(&this, node: ImplBlockNode*) -> FamilyOwner {
+        return match (node.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(q)    => { FamilyOwner::Def(q) }
+                    Res::PrimTy(n) => { FamilyOwner::Def(this.defs.primitive(n)) }
+                    _              => { FamilyOwner::Def(DefId::invalid()) }
+                }
+            }
+            _ => { FamilyOwner::Type(node.spec_owner) }
         };
+    }
+
+    /// The type of the declaration whose registration stamped `d` on its
+    /// node.  A door, not a lookup with a fallback: the stamp is written by
+    /// the registration that minted it, so an invalid `d` is a node no
+    /// registration reached and a valid one the index does not answer is a
+    /// registration lost after it stamped.  Neither is a licence to ask by
+    /// another key - the only other key is one re-derived from the node,
+    /// which names the wrong module for a trait default's `async` future -
+    /// so both are recorded and the caller gets an invalid type, which stops
+    /// it as a real failure would.
+    type_of_decl(&this, d: DefId, site: string) -> TypeRef {
+        if (!d.is_valid()) {
+            compiler::resolver::res::record_unstamped_decl(site);
+            return TypeRef::invalid();
+        }
+        const found: TypeRef = this.type_of_def(d);
+        if (!found.is_valid()) { compiler::resolver::res::record_unregistered_def(site); }
+        return found;
+    }
+    /// The type the definition `d` was registered as, or invalid when `d`
+    /// names none or no type registration reached it.  Sibling of
+    /// `func_type_of_def`.  Asked by the definition, not by its path: a
+    /// function and a type may share a path, and a lookup by path hands the
+    /// function the type.
+    type_of_def(&this, d: DefId) -> TypeRef {
+        if (!d.is_valid()) { return TypeRef::invalid(); }
+        const slot: i64 = this.defs.slot(d);
+        if (slot >= this.def_types.length) { return TypeRef::invalid(); }
+        return this.def_types[slot];
     }
 
     /// Look up an implicit converter for `(arg_ty) -> ret_ty` by their
-    /// canonical arena ids.  Returns the packed value
-    /// `(type_name_id << 32) | method_name_id`, or 0 if none is registered.
-    /// `type_name_id == 0` denotes a free-function converter; otherwise the
-    /// converter is the static method `type_name::method_name`.
-    lookup_implicit_converter(&this, arg_id: u64, ret_id: u64) -> u64 {
-        const key: u64 = DeclarationIndex::pack_converter_key(arg_id, ret_id);
+    /// canonical arena types: the converter's definition, or an invalid id
+    /// if none is registered.
+    lookup_implicit_converter(&this, arg_ty: TypeRef, ret_ty: TypeRef) -> DefId {
+        const key: ConversionKey = DeclarationIndex::converter_key(arg_ty, ret_ty);
         return match (this.implicit_converters.get(&key)) {
             Option::Some(v) => { v }
-            Option::None    => { 0 }
-        };
-    }
-
-    /// Look up a named type by its SymbolStr.
-    lookup_type(&this, name: SymbolStr) -> TypeRef {
-        return match (this.type_map.get(&name.id)) {
-            Option::Some(val) => { val }
-            Option::None      => { TypeRef::invalid() }
-        };
-    }
-
-    /// Look up a global variable's type by name.
-    lookup_global(&this, name: SymbolStr) -> TypeRef {
-        return match (this.global_vars.get(&name.id)) {
-            Option::Some(val) => { val }
-            Option::None      => { TypeRef::invalid() }
+            Option::None    => { DefId::invalid() }
         };
     }
 
     /// Reverse-lookup: get the SymbolStr for a TypeRef.
     lookup_type_name(&this, ty: TypeRef) -> SymbolStr {
-        return match (this.type_reverse.get(&ty.id)) {
-            Option::Some(val) => { SymbolStr::from_id(val) }
-            Option::None      => { SymbolStr::empty() }
+        return this.defs.path_of(this.registered_def(ty)).spelling();
+    }
+
+    /// Register a free function's signature under its key `name`, emitted
+    /// under `symbol` when one is given (an `extern "C"` declaration's C
+    /// name, a `![symbol]` link name, an intrinsic's bare name) and under
+    /// the Cryo mangling of the signature otherwise.  Answers the entry,
+    /// which the caller stamps on the node, and keeps it under `def`, the
+    /// definition the signature declares, for `entry_of_def`; `def` is
+    /// invalid for a clone or a synthesized function, which declares none of
+    /// its own.
+    register_function_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr,
+                                return_type: TypeRef, func_type_ref: TypeRef,
+                                intern: InternTable*, arena: TypeArena*,
+                                symbol: SymbolStr, span: SourceSpan, def: DefId,
+                                decl: ASTNode*) -> OverloadId {
+        const sym: SymbolStr = if (symbol.is_valid()) {
+            symbol
+        } else {
+            this.mangle_function_symbol(owner, leaf, return_type, func_type_ref, intern, arena)
         };
+        return this.keep_def_entry(def,
+            this.register_signature(owner, leaf, func_type_ref, return_type, sym, DefId::invalid(), span, decl));
     }
 
-
-    // Per-module registration (called alongside global registration)
-
-    /// Maintain the O(1) module-func indices alongside a `module_funcs`
-    /// push: record first-wins module ownership and (func, module)
-    /// membership.  Idempotent, so it is safe to call on every push.
-    note_module_func(mut &this, name_id: u32, module_id: u32) -> void {
-        if (!this.module_func_first.contains_key(&name_id)) {
-            this.module_func_first.insert(name_id, module_id);
-        }
-        const pk: u64 = ((name_id as u64) << 32) | (module_id as u64);
-        this.module_func_pairs.insert(pk, true);
-    }
-
-    /// Register a function with its defining module for per-module enumeration.
-    register_function_with_module(mut &this, name: SymbolStr, return_type: TypeRef,
-                                  module: SymbolStr) -> void {
-        this.register_function(name, return_type);
-        this.module_funcs.push(Pair<u32, u32>::new(name.id, module.id));
-        this.note_module_func(name.id, module.id);
-    }
-
-    /// Register a function type with its defining module for per-module enumeration.
-    /// Also computes and stores the mangled LLVM symbol name.
-    register_function_type_with_module(mut &this, name: SymbolStr,
-                                       return_type: TypeRef, func_type_ref: TypeRef,
-                                       module: SymbolStr, intern: InternTable*,
-                                       arena: TypeArena*) -> void {
-        this.register_function(name, return_type);
-        this.register_function_type(name, func_type_ref);
-
-        // Compute the mangled symbol name including the full signature.
+    /// The Cryo mangling of a free function named `leaf` under `owner`,
+    /// with signature `func_type_ref`: the qualified name it encodes is the
+    /// owner's path and the leaf, as a definition's own path is composed.
+    mangle_function_symbol(&this, owner: FamilyOwner, leaf: SymbolStr, return_type: TypeRef,
+                           func_type_ref: TypeRef, intern: InternTable*, arena: TypeArena*) -> SymbolStr {
+        const owner_path: DeclName = this.family_owner_path(owner);
+        const name: SymbolStr = if (owner_path.is_valid()) {
+            intern.intern(intern.shown(owner_path) + "::" + intern.resolve(leaf))
+        } else {
+            leaf
+        };
         const qname: QualifiedName = QualifiedName::from_symbol(name);
         // Borrow the FunctionType's param list rather than aliasing it into an
         // owning local: a `mut params: TypeRef[] = ...; params = fn_ty.param_types`
@@ -1139,7 +1494,7 @@ type struct DeclarationIndex {
         const empty_params: TypeRef[] = [];
         mut params: &TypeRef[] = &empty_params;
         mut is_variadic: boolean = false;
-        const ft: Type* = arena.lookup(func_type_ref.id);
+        const ft: Type* = arena.lookup(func_type_ref);
         if (ft != null && ft.kind == TypeKind::Function) {
             const fn_ty: FunctionType* = ft as FunctionType*;
             params = &fn_ty.param_types;
@@ -1147,371 +1502,144 @@ type struct DeclarationIndex {
         }
         const mangled: MangledName = MangledName::for_free_function(
             intern, arena, qname, params, return_type, is_variadic);
-        this.register_mangled_name(name, mangled.value);
-        // Pin the mangled name to this exact overload so cross-module extern
-        // declaration can pick the right LLVM symbol when the bare-name slot
-        // has been overwritten by another module's free function (e.g.,
-        // `read` is the intrinsic in std::core::intrinsics AND a free
-        // function in std::fs::file; bare "read" -> mangled-name maps to
-        // whichever was registered last).
-        this.register_overload_mangled(name, func_type_ref, mangled.value);
-
-        this.module_funcs.push(Pair<u32, u32>::new(name.id, module.id));
-        this.note_module_func(name.id, module.id);
+        return intern.intern(mangled.as_string());
     }
 
-    /// Register a type with its defining module for per-module enumeration.
-    register_type_with_module(mut &this, qualified_name: SymbolStr, ty: TypeRef,
-                              module: SymbolStr) -> void {
-        this.register_type(qualified_name, ty);
-        this.module_types.push(Pair<u32, u32>::new(qualified_name.id, module.id));
-    }
-
-
-    /// Store the mangled LLVM symbol name for a function or method.
-    /// Called at registration time so codegen never computes mangling.
-    ///
-    /// Intrinsic durability: a declared intrinsic's bare leaf maps to the
-    /// intrinsic's own C symbol - which IS the leaf name (`free` -> `free`) -
-    /// permanently.  A later same-leaf regular function writing its q-mangled
-    /// symbol into this single slot would silently redirect every blind
-    /// bare-name fallback (codegen `resolve_function`, extern declaration)
-    /// into a module the caller never imported.  The intrinsic's own write
-    /// (mangled == leaf) always passes, so registration order converges.
-    register_mangled_name(mut &this, qualified: SymbolStr, mangled: SymbolStr) -> void {
-        if (this.intrinsic_names.contains_key(&qualified.id)
-            && mangled.id != qualified.id) {
-            return;
+    /// Keep `entry` under the definition `def` for `entry_of_def`, and
+    /// answer it; nothing is kept for an invalid `def` or entry.
+    keep_def_entry(mut &this, def: DefId, entry: OverloadId) -> OverloadId {
+        if (def.is_valid() && entry.is_valid()) {
+            const slot: i64 = this.defs.slot(def);
+            while (this.def_entries.length <= slot) { this.def_entries.push(OverloadId::invalid()); }
+            this.def_entries[slot] = entry;
         }
-        this.mangled_names.insert(qualified.id, mangled.id);
+        return entry;
     }
 
-    /// Look up the pre-computed mangled LLVM symbol name.
-    lookup_mangled_name(&this, qualified: SymbolStr) -> SymbolStr {
-        return match (this.mangled_names.get(&qualified.id)) {
-            Option::Some(val) => { SymbolStr::from_id(val) }
-            Option::None      => { SymbolStr::empty() }
-        };
-    }
-
-    /// Register a bare -> qualified name mapping.
-    /// Called by type_resolution when registering both forms.
-    /// Also records the qualified name in the per-bare alternatives list
-    /// so codegen can detect ambiguous bare-name fallbacks.
-    register_name_mapping(mut &this, bare: SymbolStr, qualified: SymbolStr) -> void {
-        // Append to alternatives list, deduped by (bare, qualified) pair --
-        // scoped to this bare name's positions via bare_alts_index.
-        match (this.bare_alts_index.get_ref(&bare.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    if (this.bare_alts[(*positions)[k] as i64].second == qualified.id) {
-                        return;
-                    }
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        const new_pos: u32 = this.bare_alts.length as u32;
-        this.bare_alts.push(Pair<u32, u32>::new(bare.id, qualified.id));
-        const slot: u32[]* = this.bare_alts_index.get_or_insert(bare.id, []);
-        (*slot).push(new_pos);
-    }
 
     // --- Import-scoped resolution: population + query -----------------------
 
-    /// Record a module's import list (its `ModuleInfo.dependencies`, which are
-    /// namespace names) under its own namespace, for later use-site scoping.
-    /// Called once per module by the orchestrator after module discovery.
-    register_module_imports(mut &this, module_ns: SymbolStr, imports: &SymbolStr[]) -> void {
-        mut ids: u32[] = [];
-        for (mut i: i64 = 0; i < imports.length; i++) {
-            ids.push(imports[i].id);
-        }
-        this.module_imports.insert(module_ns.id, ids);
-    }
-
-    /// Seed the prelude re-export set from the fixed list in
-    /// `stdlib/prelude.cryo`.  These namespaces' public types (Rc, Box, Option,
-    /// Result, Range, Iterator, Array, Slice, ...) are auto-in-scope in every
-    /// module via the injected `import std::prelude`, so a LOCAL same-leaf type
-    /// collides with them.  They arrive as `public module` SUBMODULES of the
-    /// prelude, which the loader does NOT record as dependency edges, so they
-    /// can't be derived from the graph - this mirrors `stdlib/prelude.cryo`
-    /// directly.  KEEP IN SYNC if the prelude's `public module` set changes (it
-    /// is deliberately small and stable).
-    seed_prelude_namespaces(mut &this, intern: InternTable*) -> void {
-        mut ns: SymbolStr[] = [];
-        ns.push(intern.intern("std::core"));
-        ns.push(intern.intern("std::core::option"));
-        ns.push(intern.intern("std::core::result"));
-        ns.push(intern.intern("std::core::primitives"));
-        ns.push(intern.intern("std::core::intrinsics"));
-        ns.push(intern.intern("std::core::varargs"));
-        ns.push(intern.intern("std::collections::array"));
-        ns.push(intern.intern("std::core::slice"));
-        ns.push(intern.intern("std::core::ops"));
-        ns.push(intern.intern("std::core::iter"));
-        ns.push(intern.intern("std::alloc::box"));
-        ns.push(intern.intern("std::alloc::rc"));
-        this.register_prelude_namespaces(ns);
-    }
-
     /// Record the namespaces re-exported by `std::prelude` (deduped).  A local
     /// same-leaf as any type in these namespaces is a hard conflict.
-    register_prelude_namespaces(mut &this, prelude: SymbolStr[]) -> void {
-        for (mut i: i64 = 0; i < prelude.length; i++) {
-            const id: u32 = prelude[i].id;
-            mut seen: boolean = false;
-            for (mut j: i64 = 0; j < this.prelude_ns.length; j++) {
-                if (this.prelude_ns[j] == id) { seen = true; }
-            }
-            if (!seen) { this.prelude_ns.push(id); }
-        }
-    }
-
-    /// Record a type's visibility (keyed by its qualified name) so same-leaf
-    /// resolution can exclude a private cross-module candidate.
-    set_type_visibility(mut &this, qualified: SymbolStr, is_public: boolean) -> void {
-        this.type_visibility.insert(qualified.id, is_public);
-    }
-
-    /// The defining namespace of a qualified name (everything before the leaf),
-    /// re-interned as a SymbolStr in the shared table so its id is comparable
-    /// with the import/prelude/use-site namespace ids.  A bare name (no `::`)
-    /// yields the empty SymbolStr.
-    namespace_of(&this, qualified: SymbolStr, intern: InternTable*) -> SymbolStr {
-        const full: string = intern.resolve(qualified);
-        const qn: QualifiedName = QualifiedName::parse(intern, full);
-        if (qn.depth() <= 1) { return SymbolStr::empty(); }
-        return intern.intern(qn.display_parent(intern));
-    }
-
-    is_prelude_ns(&this, ns: SymbolStr) -> boolean {
-        for (mut i: i64 = 0; i < this.prelude_ns.length; i++) {
-            if (this.prelude_ns[i] == ns.id) { return true; }
-        }
-        return false;
-    }
-
-    /// Whether the module `use_site_ns` imports (depends on) `target_ns`.
-    ns_imports(&this, use_site_ns: SymbolStr, target_ns: SymbolStr) -> boolean {
-        match (this.module_imports.get_ref(&use_site_ns.id)) {
-            Option::Some(ids) => {
-                mut k: i64 = 0;
-                while (k < (*ids).length) {
-                    if ((*ids)[k] == target_ns.id) { return true; }
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        return false;
-    }
-
-    /// Visibility verdict for a candidate; permissive default (see
-    /// `type_visibility`).
-    is_candidate_public(&this, qualified: SymbolStr) -> boolean {
-        return match (this.type_visibility.get(&qualified.id)) {
-            Option::Some(v) => { v }
-            Option::None    => { true }
-        };
-    }
-
-    /// Resolve a bare leaf to the qualified name the USE SITE actually means,
-    /// using its namespace + import list.  This is import-aware: it only
-    /// differs from a context-free lookup when a leaf has MORE THAN ONE
-    /// registered qualified form (a same-leaf collision); a unique leaf
-    /// resolves identically and cheaply.
     ///
-    /// Precedence (a local definition beats imports; a prelude name is special):
-    ///   1. exactly one candidate            -> Unique
-    ///   2. a same-namespace (local) candidate:
-    ///        - also a prelude-name candidate -> Ambiguous  (local vs prelude
-    ///          is a hard conflict; the local must be renamed or qualified)
-    ///        - otherwise                     -> SameModule (local wins)
-    ///   3. no local candidate: keep the public candidates whose namespace is
-    ///      imported (or preluded):
-    ///        - exactly one  -> Unique
-    ///        - two or more  -> Ambiguous  (caller demands qualification)
-    ///        - none visible -> NotFound   (a later "undefined" error owns it)
-    resolve_qualified_scoped(&this, bare: SymbolStr, use_site_ns: SymbolStr,
-                             intern: InternTable*) -> ScopeResolution {
-        const cands: SymbolStr[] = this.lookup_qualified_alternatives(bare);
-        if (cands.length == 0) { return ScopeResolution::NotFound; }
-        if (cands.length == 1) { return ScopeResolution::Unique(cands[0]); }
-
-        mut local:   SymbolStr[] = [];
-        mut visible: SymbolStr[] = [];
-        mut prelude_hit: boolean = false;
-        for (mut i: i64 = 0; i < cands.length; i++) {
-            const c: SymbolStr = cands[i];
-            const c_ns: SymbolStr = this.namespace_of(c, intern);
-            if (c_ns.id == use_site_ns.id) {
-                local.push(c);
-                continue;
+    /// These namespaces' public types (Rc, Box, Option, Result, Range,
+    /// Iterator, Array, Slice, ...) are auto-in-scope in every module via the
+    /// injected `import std::prelude`.
+    ///
+    /// The list is DERIVED from `stdlib/prelude.cryo`'s `public module`
+    /// declarations by the caller (`instance.cryo`), which reads them off the
+    /// module graph.  It arrives as a parameter because `module_graph.cryo`
+    /// already imports this module, so reaching a `ModuleGraph*` back the
+    /// other way is a cycle Cryo forbids.
+    register_prelude_namespaces(mut &this, prelude: ModulePath[]) -> void {
+        for (mut i: i64 = 0; i < prelude.length; i++) {
+            mut seen: boolean = false;
+            for (mut j: i64 = 0; j < this.prelude_modules.length; j++) {
+                if (this.prelude_modules[j].equals(prelude[i])) { seen = true; }
             }
-            const c_prelude: boolean = this.is_prelude_ns(c_ns);
-            if (c_prelude) { prelude_hit = true; }
-            if ((c_prelude || this.ns_imports(use_site_ns, c_ns))
-                && this.is_candidate_public(c)) {
-                visible.push(c);
+            if (!seen) { this.prelude_modules.push(prelude[i]); }
+        }
+    }
+
+    /// Record a function's visibility on its definition: a type's is
+    /// recorded by `register_type`.  A type and a function declared under one
+    /// leaf are two definitions with a verdict each.
+    ///
+    /// It does not gate bare function calls.  A bare `foo()` binds from its
+    /// stamp, and the name layer refuses a private declaration at the import
+    /// that would have bound it; the verdict is read for a QUALIFIED call's
+    /// callee (`hidden_from`), where a module's own private items are never
+    /// refused because the modules are compared first.
+    set_decl_visibility(mut &this, def: DefId, is_public: boolean) -> void {
+        this.defs.record_visibility(def, is_public);
+    }
+
+    /// Record that the family `(owner, method)` holds a method whose
+    /// signature was refused.  A type this index never registered owns no
+    /// family, and records nothing.
+    mark_method_signature_refused(mut &this, owner: TypeRef, method: SymbolStr) -> void {
+        const slot: FamilySlot = this.family_slot(FamilyOwner::Type(owner), method);
+        if (slot.is_none()) { return; }
+        this.refused_methods.insert(slot, true);
+    }
+
+    /// Whether the family `(owner, method)` holds a method whose signature
+    /// was refused.
+    method_signature_refused(&this, owner: TypeRef, method: SymbolStr) -> boolean {
+        const slot: FamilySlot = this.family_slot(FamilyOwner::Type(owner), method);
+        if (slot.is_none()) { return false; }
+        return this.refused_methods.contains_key(&slot);
+    }
+
+    /// Whether `func`'s written signature carries a name the name layer
+    /// refused: its return type, or any parameter's.  Asked only of a slot
+    /// that resolved to no type - a resolved slot was not refused, and
+    /// `refused` reads the annotation's stamp through `require`, which a
+    /// synthesized declaration's annotation may not carry.  A `this`
+    /// receiver has no annotation and is never refused.
+    static signature_is_refused(func: FunctionDeclNode*) -> boolean {
+        if (func == null) { return false; }
+        if (!func.resolved_return_type.is_valid()
+                && TypeAnnotation::refused(func.return_type_annotation)) { return true; }
+        for (mut p: i64 = 0; p < func.parameters.length; p++) {
+            const param: VarDeclNode* = func.parameters[p];
+            if (param == null || param.resolved_type.is_valid()) { continue; }
+            if (TypeAnnotation::refused(param.type_annotation)) { return true; }
+        }
+        return false;
+    }
+
+    /// The namespaces reachable without an import, as recorded.
+    ///
+    /// The visibility relation and the scope walk's outermost tier are the same
+    /// set asked two ways, so both read this one registration; a prelude the
+    /// one accepts and the other does not bind is the gap that sends a name to
+    /// a leaf-index search instead of to its module.
+    prelude_namespaces(&this) -> ModulePath[] {
+        mut out: ModulePath[] = [];
+        for (mut i: i64 = 0; i < this.prelude_modules.length; i++) {
+            out.push(this.prelude_modules[i]);
+        }
+        return out;
+    }
+
+    is_prelude_ns(&this, ns: ModulePath) -> boolean {
+        for (mut i: i64 = 0; i < this.prelude_modules.length; i++) {
+            if (this.prelude_modules[i].equals(ns)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether the definition `d` is private to a module other than
+    /// `use_module`: declared in another module, and recorded as not public
+    /// by its registration.  False for a definition of `use_module` itself,
+    /// or one declared in no module.
+    ///
+    /// Every registration records a verdict (a type's with `register_type`,
+    /// a function's beside its signature), so a definition with none never
+    /// registered - recorded as such, which fails the build; the answer given
+    /// meanwhile is the top-level default rather than a refusal that would
+    /// report a public item as private.
+    hidden_from(&this, d: DefId, use_module: DefId) -> boolean {
+        if (!d.is_valid() || !use_module.is_valid()) { return false; }
+        const home: DefId = this.defs.module_of(d);
+        if (!home.is_valid() || home.equals(use_module)) { return false; }
+        return match (this.defs.visibility_of(d)) {
+            DeclVisibility::Public     => { false }
+            DeclVisibility::Private    => { true }
+            DeclVisibility::Unrecorded => {
+                compiler::resolver::res::record_unregistered_def(
+                    "decl_index: visibility of a definition no registration recorded a verdict for");
+                false
             }
-        }
-
-        if (local.length >= 1) {
-            if (prelude_hit)        { return ScopeResolution::Ambiguous; }
-            if (local.length == 1)  { return ScopeResolution::SameModule(local[0]); }
-            return ScopeResolution::Ambiguous;
-        }
-        if (visible.length == 1) { return ScopeResolution::Unique(visible[0]); }
-        if (visible.length == 0) { return ScopeResolution::NotFound; }
-        return ScopeResolution::Ambiguous;
-    }
-
-    /// Convenience wrapper returning the resolved qualified name, or `bare`
-    /// unchanged on a miss/ambiguity.
-    /// Use at non-authoritative sites (codegen, which receives already-qualified
-    /// names); authoritative sites call `resolve_qualified_scoped` directly so
-    /// they can diagnose `Ambiguous`.
-    resolve_qualified_scoped_or(&this, bare: SymbolStr, use_site_ns: SymbolStr,
-                                intern: InternTable*) -> SymbolStr {
-        return this.resolve_qualified_scoped(bare, use_site_ns, intern).resolved_or(bare);
-    }
-
-    /// Context-FREE canonicalization: fold a bare leaf to its qualified form
-    /// only when that form is UNAMBIGUOUS (exactly one registered candidate);
-    /// otherwise return the input unchanged.  Unlike `resolve_qualified_scoped`,
-    /// this deliberately ignores the use site - it exists for the few consumers
-    /// that need a module-INDEPENDENT identity (cross-module coherence keys in
-    /// `type_name_key` / where-clause keying), where a use-site-dependent answer
-    /// would key the same type differently from different modules and break
-    /// dedup.  A colliding leaf stays bare here (callers fall back to the arena
-    /// type id, which is itself canonical), which is strictly MORE
-    /// module-independent than a last-write-wins pick.
-    canonical_qualified(&this, bare: SymbolStr) -> SymbolStr {
-        const cands: SymbolStr[] = this.lookup_qualified_alternatives(bare);
-        if (cands.length == 1) { return cands[0]; }
-        return bare;
-    }
-
-    /// Return every qualified name registered under the given bare name.
-    /// `length > 1` means dispatching through the bare-name fallback would
-    /// be ambiguous: the overload slot is last-write-wins, so two free
-    /// functions of the same simple name in sibling namespaces collapse
-    /// onto a single LLVM symbol.  Codegen uses this to emit E0154
-    /// (ambiguous call) instead of silently misrouting.
-    lookup_qualified_alternatives(&this, bare: SymbolStr) -> SymbolStr[] {
-        mut result: SymbolStr[] = [];
-        match (this.bare_alts_index.get_ref(&bare.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    result.push(SymbolStr::from_id(this.bare_alts[(*positions)[k] as i64].second));
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        return result;
-    }
-
-    // Per-module queries (used by codegen to enumerate module exports)
-
-    /// Get all function names defined in a specific module.
-    get_functions_in_module(&this, module: SymbolStr) -> SymbolStr[] {
-        mut result: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.module_funcs.length; i++) {
-            if (this.module_funcs[i].second == module.id) {
-                result.push(SymbolStr::from_id(this.module_funcs[i].first));
-            }
-        }
-        return result;
-    }
-
-    /// Get all type names defined in a specific module.
-    get_types_in_module(&this, module: SymbolStr) -> SymbolStr[] {
-        mut result: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.module_types.length; i++) {
-            if (this.module_types[i].second == module.id) {
-                result.push(SymbolStr::from_id(this.module_types[i].first));
-            }
-        }
-        return result;
-    }
-
-    /// Get all global variable names defined in a specific module.
-    get_globals_in_module(&this, module: SymbolStr) -> SymbolStr[] {
-        mut result: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
-            if (this.module_global_modules[i] == module.id) {
-                result.push(SymbolStr::from_id(this.module_global_keys[i]));
-            }
-        }
-        return result;
-    }
-
-    /// Check if a function is defined in a specific module.
-    is_function_in_module(&this, name: SymbolStr, module: SymbolStr) -> boolean {
-        const pk: u64 = ((name.id as u64) << 32) | (module.id as u64);
-        return this.module_func_pairs.contains_key(&pk);
-    }
-
-    /// Get the defining module for a function. Returns empty SymbolStr if not found.
-    get_function_module(&this, name: SymbolStr) -> SymbolStr {
-        return match (this.module_func_first.get(&name.id)) {
-            Option::Some(val) => { SymbolStr::from_id(val) }
-            Option::None      => { SymbolStr::empty() }
         };
     }
 
-    /// Get the defining module for a type. Returns empty SymbolStr if not found.
-    get_type_module(&this, name: SymbolStr) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.module_types.length; i++) {
-            if (this.module_types[i].first == name.id) {
-                return SymbolStr::from_id(this.module_types[i].second);
-            }
-        }
-        return SymbolStr::empty();
-    }
-
-    /// Get the defining module for a global. Returns empty SymbolStr if not found.
-    get_global_module(&this, name: SymbolStr) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
-            if (this.module_global_keys[i] == name.id) {
-                return SymbolStr::from_id(this.module_global_modules[i]);
-            }
-        }
-        return SymbolStr::empty();
-    }
-
-    /// Get the defining namespace for a global. Returns empty SymbolStr if
-    /// not found or if the global was registered without a namespace.
-    /// `resolve_global` uses this to mangle a cross-module extern with the
-    /// same module-qualified name the defining module emits.
-    get_global_namespace(&this, name: SymbolStr) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
-            if (this.module_global_keys[i] == name.id) {
-                return SymbolStr::from_id(this.module_global_namespaces[i]);
-            }
-        }
-        return SymbolStr::empty();
-    }
-
-    /// Combines a type's SymbolStr.id and a method's SymbolStr.id into a single
-    /// u64 key.  Uses the upper 32 bits for the type and lower 32 bits for the
-    /// method name.  Uses bit shift instead of multiply-by-2^32, since the
-    /// literal 4294967296 overflows i32 and silently becomes 0.
-    static pack_method_key(type_sym: SymbolStr, method_sym: SymbolStr) -> u64 {
-        return ((type_sym.id as u64) << 32) | (method_sym.id as u64);
-    }
-
-    /// Pack an implicit-converter registry key from the argument and return
-    /// TypeRef ids.  Mirrors `pack_method_key`'s 32-bit interleave; arena ids
-    /// fit comfortably in 32 bits in practice.
-    static pack_converter_key(arg_id: u64, ret_id: u64) -> u64 {
-        return (arg_id << 32) | (ret_id & 0xFFFFFFFF);
+    /// The implicit-converter registry key of the argument and return
+    /// types: the upper 32 bits the argument's number, the lower 32 the
+    /// return's.
+    static converter_key(arg_ty: TypeRef, ret_ty: TypeRef) -> ConversionKey {
+        return ConversionKey { packed: (arg_ty.key() << 32) | (ret_ty.key() & 0xFFFFFFFF) };
     }
 
 
@@ -1522,28 +1650,25 @@ type struct DeclarationIndex {
     ///   `&this`          -> ImmutRef        (encoded as $s)
     ///   `mut &this`      -> MutRef          (encoded as $m)
     ///   `this` (by value)-> None            (regular first param)
-    ///   no explicit self -> ImmutRef        (implicit `&this` for non-static)
     ///   static method    -> None
     static method_receiver_kind(func: FunctionDeclNode*, is_static: boolean,
                                   intern: InternTable*) -> ReceiverKind {
         if (is_static || func == null) { return ReceiverKind::None; }
 
-        const this_ref_name: SymbolStr = intern.intern("&this");
-        const this_val_name: SymbolStr = intern.intern("this");
-
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
-            if (param.name.equals(this_ref_name)) {
+            if (param.is_ref_receiver()) {
                 if (param.is_mutable) { return ReceiverKind::MutRef; }
                 return ReceiverKind::ImmutRef;
             }
-            if (param.name.equals(this_val_name)) {
+            if (param.is_value_receiver()) {
                 return ReceiverKind::None;
             }
         }
-        // Non-static method with no explicit receiver: implicit `&this`.
-        return ReceiverKind::ImmutRef;
+        // No receiver parameter, so there is no receiver to encode.  Every
+        // non-static method carries one, written or synthesized.
+        return ReceiverKind::None;
     }
 
     /// Collect the non-receiver parameter TypeRefs for use with the
@@ -1554,12 +1679,10 @@ type struct DeclarationIndex {
         mut out: TypeRef[] = [];
         if (func == null) { return out; }
 
-        const this_ref_name: SymbolStr = intern.intern("&this");
-
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null || !param.resolved_type.is_valid()) { continue; }
-            if (param.name.equals(this_ref_name)) { continue; }
+            if (param.is_ref_receiver()) { continue; }
             out.push(param.resolved_type);
         }
         return out;

@@ -44,7 +44,7 @@ yet is tracked as an issue/TODO - it cannot live here as a permanently red test.
 
 The `![config(negative, <CODE>)]` directive alone only checks the code appears
 *somewhere*. To also pin the **message text** and the **source line** - and to
-catch stray cascade diagnostics - annotate the offending lines rustc-style:
+catch stray cascade diagnostics - annotate the offending lines with `//~` comments:
 
 ```cryo
 function main() -> int {

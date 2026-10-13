@@ -18,26 +18,35 @@
 
 namespace std::net::http2::server;
 
-import core::option;
-import core::result;
-import core::mem;
-import io::error;
-import io::traits;
-import io::buf;
-import net::addr::socket_addr;
-import net::socket::tcp;
-import net::http::request;
-import net::http::response;
-import net::http2::connection;
-import future::poll;
-import future::waker;
-import future::traits;
+import std::core::option;
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::mem;
+import std::io::error;
+import std::io::error::{ IoError };
+import std::io::traits;
+import std::io::traits::{ AsyncTransport };
+import std::io::buf;
+import std::io::buf::{ BufStream };
+import std::net::addr::socket_addr;
+import std::net::addr::socket_addr::{ SocketAddr };
+import std::net::socket::tcp;
+import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpListener, TcpStream };
+import std::net::http::request;
+import std::net::http::request::{ Request };
+import std::net::http::response;
+import std::net::http::response::{ Response };
+import std::net::http2::connection;
+import std::net::http2::connection::{ Http2Connection };
+import std::future::poll;
+import std::future::waker;
+import std::future::traits;
 
 /// Serve HTTP/2 over `conn`, dispatching each request to `handler` until the
 /// peer closes or sends GOAWAY. Takes ownership of the connection.
 async function serve<S>(conn: BufStream<S>, handler: (Request) -> Response) -> Result<(), IoError>
 where S: AsyncTransport {
-    mut c: Http2Connection<S> = Http2Connection<S>::new_server(conn);
+    mut c: Http2Connection<S> = Http2Connection::<S>::new_server(conn);
     return await c.serve(handler);
 }
 
@@ -64,7 +73,7 @@ type struct Http2Server {
     async serve_one(mut &this, handler: (Request) -> Response) -> Result<(), IoError> {
         mut stream: TcpStream = (await this.accept_one())?;
         mut conn: Http2Connection<TcpStream> =
-            Http2Connection<TcpStream>::new_server(BufStream<TcpStream>::of(stream));
+            Http2Connection::<TcpStream>::new_server(BufStream::<TcpStream>::of(stream));
         return await conn.serve(handler);
     }
 
@@ -75,7 +84,7 @@ type struct Http2Server {
         loop {
             mut stream: TcpStream = (await this.accept_one())?;
             mut conn: Http2Connection<TcpStream> =
-                Http2Connection<TcpStream>::new_server(BufStream<TcpStream>::of(stream));
+                Http2Connection::<TcpStream>::new_server(BufStream::<TcpStream>::of(stream));
             match (await conn.serve(handler)) {
                 Result::Ok(_)  => { }
                 Result::Err(_) => { }
@@ -89,7 +98,7 @@ type struct Http2Server {
     /// suspension.
     async accept_one(mut &this) -> Result<TcpStream, IoError> {
         mut lent: TcpListener = TcpListener::from_fd(-1);
-        mem::swap<TcpListener>(&lent, &this.listener);
+        mem::swap::<TcpListener>(&lent, &this.listener);
 
         mut acc: TcpAccepted = await TcpAccept::start(lent);
 
@@ -97,13 +106,13 @@ type struct Http2Server {
         // below must leave `this` holding its socket rather than the
         // placeholder.
         mut back: TcpListener = acc.take_listener();
-        mem::swap<TcpListener>(&back, &this.listener);
-        back.drop();                    // the closed placeholder, not a socket
+        mem::swap::<TcpListener>(&back, &this.listener);
+        mem::drop(back);                    // the closed placeholder, not a socket
 
         return acc.take_result();
     }
+}
 
-    drop(mut &this) -> void {
-        this.listener.drop();
-    }
+implement trait Drop for struct Http2Server {
+    drop(mut &this) -> void { }
 }

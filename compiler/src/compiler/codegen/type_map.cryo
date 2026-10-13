@@ -5,17 +5,40 @@
 /// 25 TypeKind variants including recursive struct types (forward-declare
 /// then fill body).
 
-namespace Compiler::Codegen::TypeMap;
+namespace compiler::codegen::type_map;
 
-import Compiler::Codegen;
-import Compiler::Codegen::LLVMTypes;
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Generic };
-import Compiler::Resolver::{ SymbolStr, InternTable, MangledName, QualifiedName };
-import Compiler::Diag;
-import Compiler::Diag::{ Diagnostic, Sink };
+import compiler::codegen;
+import compiler::codegen::llvm_types;
+import compiler::codegen::llvm_types::{ LContext, LModule, LType, LTypeKind };
+import compiler::types;
+import compiler::types::{
+    arena, compound, FloatKind, generic, type_base, type_ref, TypeKind, user_defined
+};
+import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, sink };
 import std::core::option;
+import std::core::option::{ Option };
 import std::collections::{ pair, hashmap };
+import std::ffi::libc;
+import std::fmt;
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::sink::{ DiagnosticSink };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::type_base::{ FloatType, IntType, Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{
+    ClassType, EnumType, EnumVariantInfo, StructType, TypeAliasType
+};
+import std::collections::hashmap::{ HashMap };
 
 
 // Cross-module shared type cache
@@ -49,7 +72,7 @@ type struct TypeMapperCache {
     cache: HashMap<u64, void*>;
 
     static new() -> TypeMapperCache {
-        return TypeMapperCache { cache: HashMap<u64, void*>::new() };
+        return TypeMapperCache { cache: HashMap::<u64, void*>::new() };
     }
 
     lookup(&this, id: u64) -> LType {
@@ -67,7 +90,7 @@ type struct TypeMapperCache {
     /// every call after the first returns the same handle.
     static get_shared_type_cache() -> TypeMapperCache* {
         if (g_shared_type_cache == null) {
-            const _box: Box<TypeMapperCache> = Box<TypeMapperCache>::new(TypeMapperCache::new());
+            const _box: Box<TypeMapperCache> = Box::<TypeMapperCache>::new(TypeMapperCache::new());
             g_shared_type_cache = _box.leak();
         }
         return g_shared_type_cache;
@@ -96,13 +119,253 @@ type struct TypeMapper {
     // an unmappable field fails the compile instead of shipping a corrupt
     // layout.
     diag:   DiagnosticSink*;
+    // The module whose data layout answers "how big is this body?" when a
+    // type's declared size has to be reproduced (see `tail_padding_for`).
+    // Borrowed, set by `wire()` once the owning CodegenContext is at its
+    // stable address; the `LLVMTargetDataRef` itself is re-fetched per query
+    // rather than cached, since it belongs to the module.  Null until wired
+    // (and in any TypeMapper built outside a CodegenContext), which only
+    // costs the padding: the layout audit reports the resulting disagreement.
+    llvm_module: LModule*;
 
     static new(arena: TypeArena*, intern: InternTable*, diag: DiagnosticSink*) -> TypeMapper {
         return TypeMapper {
             arena:  arena,
             intern: intern,
             diag:   diag,
+            llvm_module: null,
         };
+    }
+
+    wire(mut &this, llvm_module: LModule*) -> void {
+        this.llvm_module = llvm_module;
+    }
+
+    // ---- Field index -> LLVM element index -------------------------------
+    //
+    // The ONE place that answers "which element of the emitted body holds
+    // field N".  A body is not a one-to-one image of its field list: a class
+    // prepends a vtable slot and its ancestors' fields, and an over-aligned
+    // member forces an explicit padding element in front of it, because LLVM
+    // sizes and aligns a struct from its elements alone and would otherwise
+    // place that member at its natural offset.  Every GEP into a field, every
+    // constant aggregate, and the body builder itself read their answer here,
+    // so the body and the indices used to address it cannot disagree.
+
+    /// The alignment LLVM gives this type's emitted body, which is the maximum
+    /// over its members and ignores `![align(N)]` at every level: an LLVM
+    /// struct has no alignment of its own, and the filler elements that carry
+    /// a declared alignment are `i8` arrays.  This is the number that decides
+    /// where LLVM would place a member on its own, and so whether a member
+    /// needs an explicit filler in front of it to reach the offset the front
+    /// end assigned.
+    natural_align(&this, ty: TypeRef, depth: i32) -> u64 {
+        if (depth > 8) { return 1; }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return 1; }
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            if (st.repr_packed) { return 1; }
+            mut a: u64 = 1;
+            for (mut i: i64 = 0; i < st.fields.length; i++) {
+                const fa: u64 = this.natural_align(st.fields[i].field_type, depth + 1);
+                if (fa > a) { a = fa; }
+            }
+            return a;
+        }
+        if (t.kind == TypeKind::Class) {
+            const cl: ClassType* = t as ClassType*;
+            mut a: u64 = 1;
+            if (cl.has_virtual_methods || cl.has_base) { a = 8; }
+            for (mut i: i64 = 0; i < cl.fields.length; i++) {
+                const fa: u64 = this.natural_align(cl.fields[i].field_type, depth + 1);
+                if (fa > a) { a = fa; }
+            }
+            return a;
+        }
+        if (t.kind == TypeKind::Array) {
+            const arr: ArrayType* = t as ArrayType*;
+            if (arr.is_fixed()) { return this.natural_align(arr.element, depth + 1); }
+            return 8;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) { return this.natural_align(inst.resolved_type, depth + 1); }
+            return 1;
+        }
+        if (t.kind == TypeKind::TypeAlias) {
+            const al: TypeAliasType* = t as TypeAliasType*;
+            if (al.has_target()) { return this.natural_align(al.target, depth + 1); }
+            return 1;
+        }
+        const a: u64 = t.alignment();
+        if (a == 0) { return 1; }
+        return a;
+    }
+
+    /// Element index of `field_idx` within `st`'s body, and - through
+    /// `gap_out`, when non-null - the filler bytes that must precede it.
+    ///
+    /// A filler is needed ONLY where the front end put a field further along
+    /// than LLVM would place it unaided: LLVM already inserts the ordinary
+    /// alignment padding between, say, a `u32` and an 8-aligned member, and
+    /// counting that as a filler would index past the end of the body.  The
+    /// gap therefore measures the front end's offset against LLVM's own
+    /// placement (`natural_align`), not against the previous field's end - so
+    /// it is non-zero only for a member whose declared alignment exceeds what
+    /// its own members give it.  Unions overlap at offset 0 and packed structs
+    /// are dense; neither can have one.
+    struct_field_slot(&this, st: StructType*, field_idx: i64, gap_out: u64*) -> i64 {
+        if (gap_out != null) { *gap_out = 0; }
+        if (st == null || field_idx < 0 || field_idx >= st.fields.length) { return -1; }
+        if (st.is_union || st.repr_packed) { return field_idx; }
+
+        mut elem: i64 = 0;
+        mut end:  u64 = 0;          // where LLVM would put the next element
+        for (mut i: i64 = 0; i <= field_idx; i++) {
+            const want: u64 = st.fields[i].offset;
+            const fa:   u64 = this.natural_align(st.fields[i].field_type, 0);
+            mut here: u64 = end;
+            if (fa > 1) { here = ((end + fa - 1) / fa) * fa; }
+            mut gap: u64 = 0;
+            if (want > here) { gap = want - here; }
+            if (gap > 0) { elem += 1; }
+            if (i == field_idx) {
+                if (gap_out != null) { *gap_out = gap; }
+                return elem;
+            }
+            elem += 1;
+            const ft: Type* = this.arena.lookup(st.fields[i].field_type);
+            if (ft == null) { return field_idx; }
+            end = want + ft.size_bytes();
+        }
+        return elem;
+    }
+
+    /// Element index of `owner`'s field `local_idx` inside `leaf`'s flattened
+    /// body: one vtable slot when any class in the chain declares virtual
+    /// methods, then every ancestor's fields root-to-derived.  `owner` must be
+    /// `leaf` or one of its ancestors; -1 otherwise.
+    class_field_element_index(&this, leaf: ClassType*, owner: ClassType*, local_idx: i64) -> i64 {
+        if (leaf == null || owner == null || local_idx < 0) { return -1; }
+        mut chain: ClassType*[] = [];
+        mut any_virtual: boolean = false;
+        mut walk: ClassType* = leaf;
+        mut depth: i32 = 0;
+        while (walk != null && depth < 16) {
+            chain.push(walk);
+            if (walk.has_virtual_methods) { any_virtual = true; }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const base_t: Type* = this.arena.lookup(walk.base_class);
+            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+            walk = base_t as ClassType*;
+            depth += 1;
+        }
+        mut slot: i64 = if (any_virtual) { 1 } else { 0 };
+        for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+            const link: ClassType* = chain[ci];
+            if (link.id == owner.id) {
+                if (local_idx >= link.fields.length) { return -1; }
+                return slot + local_idx;
+            }
+            slot += link.fields.length;
+        }
+        return -1;
+    }
+
+    /// Element index of field `field_idx` of `t`, where `field_idx` indexes
+    /// the type's OWN field list.  A tuple and a dynamic-array header answer
+    /// the identity: their element order IS their field order.
+    field_element_index(&this, t: Type*, field_idx: i64) -> i64 {
+        if (t == null || field_idx < 0) { return -1; }
+        if (t.kind == TypeKind::Class) {
+            const cls: ClassType* = t as ClassType*;
+            return this.class_field_element_index(cls, cls, field_idx);
+        }
+        if (t.kind == TypeKind::Struct) {
+            return this.struct_field_slot(t as StructType*, field_idx, null);
+        }
+        return field_idx;
+    }
+
+    /// The class `depth` steps up `leaf`'s base chain (`leaf` itself at 0),
+    /// or null when the chain is shorter.  The arena owns the walk: a base is
+    /// a `TypeRef`, so following the chain is a question only the type store
+    /// can answer.
+    class_at_depth(&this, leaf: ClassType*, depth: i64) -> ClassType* {
+        return this.arena.class_at_depth(leaf, depth);
+    }
+
+    /// The field at `(depth, index)` in `t` - the coordinates sema pinned.
+    pinned_field(&this, t: Type*, depth: i64, index: i64) -> FieldInfo* {
+        return this.arena.pinned_field(t, depth, index);
+    }
+
+    /// Element index in `t`'s body of the field at `(depth, index)` (see
+    /// `pinned_field`).  -1 when the coordinates name nothing in `t`.
+    pinned_element_index(&this, t: Type*, depth: i64, index: i64) -> i64 {
+        if (t == null || depth < 0 || index < 0) { return -1; }
+        if (t.kind == TypeKind::Struct) {
+            if (depth != 0) { return -1; }
+            const st: StructType* = t as StructType*;
+            if (index >= st.fields.length) { return -1; }
+            return this.field_element_index(t, index);
+        }
+        if (t.kind == TypeKind::Class) {
+            const cls: ClassType* = t as ClassType*;
+            const owner: ClassType* = this.class_at_depth(cls, depth);
+            if (owner == null) { return -1; }
+            return this.class_field_element_index(cls, owner, index);
+        }
+        return -1;
+    }
+
+    /// Bytes of tail padding this body needs so the emitted object is the size
+    /// the front end reports.  `![align(N)]` - declared, or inherited from a
+    /// field - rounds a type's size up to a multiple of N, but an LLVM struct
+    /// has no alignment of its own: its size and alignment come only from its
+    /// members.  Without the padding the object is smaller than `sizeof` says,
+    /// and everything sized from the front end (`mem::zero`, an array's
+    /// stride, a by-value copy) runs past its end.
+    ///
+    /// Returns 0 when the two already agree, when the body cannot be measured
+    /// (no module wired, no data layout yet, or a member still opaque), and
+    /// when the front end's size is the SMALLER of the two - that is a
+    /// front-end layout defect, and padding would hide it instead of fixing
+    /// it.
+    tail_padding_for(&this, fe_size: u64, slots: void*, n: u32, packed: boolean) -> u64 {
+        if (this.llvm_module == null || fe_size == 0 || n == 0) { return 0; }
+        const raw: void** = slots as void**;
+        for (mut i: u32 = 0; i < n; i++) {
+            const ft: LType = LType { raw: raw[i] };
+            if (!ft.is_valid()) { return 0; }
+            // An opaque member has no size yet; asking would assert inside
+            // LLVM rather than return a number.
+            if (ft.kind() == LTypeKind::Struct && ft.is_opaque_struct()) { return 0; }
+        }
+        const lit: LType = LType::literal_struct(slots, n, packed);
+        const lit_size: u64 = this.llvm_module.abi_size_of(lit);
+        if (lit_size == 0 || fe_size <= lit_size) { return 0; }
+        return fe_size - lit_size;
+    }
+
+    /// Install `slots[0..n]` as `llvm_ty`'s body, appending `[pad x i8]` when
+    /// the declared size needs it.  One `set_struct_body` call either way: a
+    /// second one on an already-filled identified struct is not allowed.
+    set_body_with_padding(&this, llvm_ty: LType, slots: void*, n: u32,
+                          packed: boolean, pad: u64) -> void {
+        if (pad == 0) {
+            llvm_ty.set_struct_body(slots, n, packed);
+            return;
+        }
+        const total: u32 = n + 1;
+        const buf: void* = libc::malloc(total as u64 * 8);
+        const dst: void** = buf as void**;
+        const src: void** = slots as void**;
+        for (mut i: u32 = 0; i < n; i++) { dst[i] = src[i]; }
+        dst[n] = LType::array_of(LType::i8(), pad as u32).raw;
+        llvm_ty.set_struct_body(buf, total, packed);
+        libc::free(buf);
     }
 
     /// Report that a user-defined type could not be lowered soundly because
@@ -113,7 +376,7 @@ type struct TypeMapper {
     /// into codegen -- i.e. a compiler bug, not user error.
     report_unmappable_fields(&this, struct_name: string, bad_count: u32, first_bad: u32) -> void {
         if (this.diag == null) { return; }
-        const msg: string = format(
+        const msg: string = fmt::format(
             "codegen: type '%s' has %u field(s) whose type could not be lowered to LLVM (first at field index %u); the type was left without a layout. This is a compiler bug -- an un-substituted generic parameter or unresolved type reached codegen. Please report it.",
             struct_name, bad_count, first_bad);
         const sink: DiagnosticSink* = this.diag;
@@ -126,47 +389,23 @@ type struct TypeMapper {
             return LType::null();
         }
 
-        const cached: LType = this.lookup_cache(ty.id);
+        const cached: LType = this.lookup_cache(ty.key());
         if (cached.is_valid()) {
             return cached;
         }
 
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null) {
             return LType::null();
         }
 
         const result: LType = this.map_type_impl(t);
         if (result.is_valid()) {
-            this.store_cache(ty.id, result);
+            this.store_cache(ty.key(), result);
         }
         return result;
     }
 
-    /// Map a Type* directly (for internal use when we already have the pointer).
-    map_type_ptr(mut &this, t: Type*) -> LType {
-        if (t == null) {
-            return LType::null();
-        }
-        const cached: LType = this.lookup_cache(t.id);
-        if (cached.is_valid()) {
-            return cached;
-        }
-        const result: LType = this.map_type_impl(t);
-        if (result.is_valid()) {
-            this.store_cache(t.id, result);
-        }
-        return result;
-    }
-
-    /// Forward-declare a named struct type.  Returns an opaque struct that
-    /// can be referenced by pointer before its body is filled in.
-    forward_declare_struct(mut &this, name: string, type_id: u64) -> LType {
-        const ctx: LContext = LContext::current();
-        const llvm_ty: LType = LType::named_struct(ctx, name);
-        this.store_cache(type_id, llvm_ty);
-        return llvm_ty;
-    }
 
     // Internal dispatch
 
@@ -197,7 +436,6 @@ type struct TypeMapper {
             TypeKind::Trait            => { LType::i8() }
             TypeKind::TypeAlias        => { this.map_type_alias(t as TypeAliasType*) }
             TypeKind::GenericParam     => { LType::null() }
-            TypeKind::BoundedParam     => { LType::null() }
             TypeKind::InstantiatedType => { this.map_instantiated(t as InstantiatedType*) }
             TypeKind::AssocProjection  => { LType::null() }
             TypeKind::FunctionTemplate => { LType::null() }
@@ -280,13 +518,13 @@ type struct TypeMapper {
 
         const elem_ptr: LType = LType::pointer_to(elem);
         const i64_ty: LType = LType::i64();
-        const buf: void* = intrinsics::malloc(24);
+        const buf: void* = libc::malloc(24);
         const slots: void** = buf as void**;
         slots[0] = elem_ptr.raw;
         slots[1] = i64_ty.raw;
         slots[2] = i64_ty.raw;
         const result: LType = LType::literal_struct(buf, 3, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return result;
     }
 
@@ -302,7 +540,7 @@ type struct TypeMapper {
     /// Tuple -> anonymous struct { elem0, elem1, ... }
     map_tuple(mut &this, t: TupleType*) -> LType {
         const n: u32 = t.elements.length as u32;
-        const buf: void* = intrinsics::malloc(n as u64 * 8);
+        const buf: void* = libc::malloc(n as u64 * 8);
         const slots: void** = buf as void**;
         mut has_null: boolean = false;
         for (mut i: u32 = 0; i < n; i++) {
@@ -314,11 +552,11 @@ type struct TypeMapper {
             slots[i] = mapped.raw;
         }
         if (has_null) {
-            intrinsics::free(buf);
+            libc::free(buf);
             return LType::null();
         }
         const result: LType = LType::literal_struct(buf, n, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return result;
     }
 
@@ -327,12 +565,12 @@ type struct TypeMapper {
         const wrapped: LType = this.map_type(t.wrapped);
         if (!wrapped.is_valid()) { return LType::null(); }
         const i1_ty: LType = LType::i1();
-        const buf: void* = intrinsics::malloc(16);
+        const buf: void* = libc::malloc(16);
         const slots: void** = buf as void**;
         slots[0] = wrapped.raw;
         slots[1] = i1_ty.raw;
         const result: LType = LType::literal_struct(buf, 2, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return result;
     }
 
@@ -351,7 +589,7 @@ type struct TypeMapper {
     ///     the field list already produces; layout equivalence to the
     ///     inner field is enforced by `compute_struct_layout`.
     map_struct(mut &this, t: StructType*) -> LType {
-        const mangled: string = MangledName::for_struct_type(this.intern, QualifiedName::from_symbol(t.qualified_name)).resolve(this.intern);
+        const mangled: MangledName = MangledName::for_struct_type(this.intern, QualifiedName::from_symbol(t.qualified_name.spelling()));
 
         // Check if already forward-declared.
         const cached: LType = this.lookup_cache(t.id);
@@ -400,18 +638,25 @@ type struct TypeMapper {
             else if (u_align == 8) { elem = LType::i64(); }
             const count: u32 = (u_size / u_align) as u32;
             const blob: LType = LType::array_of(elem, count);
-            const ubuf: void* = intrinsics::malloc(8);
+            const ubuf: void* = libc::malloc(8);
             const uslots: void** = ubuf as void**;
             uslots[0] = blob.raw;
             llvm_ty.set_struct_body(ubuf, 1, false);
-            intrinsics::free(ubuf);
+            libc::free(ubuf);
             return llvm_ty;
         }
 
-        // Build field type array.
+        // Build the element list: each field, preceded by a `[K x i8]` filler
+        // wherever the front end's offsets leave a gap.  A gap appears only
+        // where a member's declared alignment exceeds what its own members
+        // give it, because LLVM aligns a struct from its elements alone and
+        // would otherwise place that member at its natural offset - and then
+        // `offsetof` would disagree with the layout the front end already
+        // computed, `sizeof`, and every other compiler.  Capacity is 2n+1:
+        // at most one filler per field, plus the tail.
         const n: u32 = t.fields.length as u32;
         if (n > 0) {
-            const buf: void* = intrinsics::malloc(n as u64 * 8);
+            const buf: void* = libc::malloc((n as u64 * 2 + 1) * 8);
             const slots: void** = buf as void**;
             // A field whose type can't be lowered to LLVM means an
             // un-substituted generic or unresolved type reached codegen -- a
@@ -421,22 +666,31 @@ type struct TypeMapper {
             // body without calling set_struct_body, leaving the type opaque.
             mut bad_fields: u32 = 0;
             mut first_bad:  u32 = 0;
+            mut count:      u32 = 0;
             for (mut i: u32 = 0; i < n; i++) {
+                mut gap: u64 = 0;
+                this.struct_field_slot(t, i as i64, &gap);
+                if (gap > 0) {
+                    slots[count as i64] = LType::array_of(LType::i8(), gap as u32).raw;
+                    count += 1;
+                }
                 const ft: LType = this.map_type(t.fields[i].field_type);
                 if (ft.is_valid()) {
-                    slots[i] = ft.raw;
+                    slots[count as i64] = ft.raw;
                 } else {
                     if (bad_fields == 0) { first_bad = i; }
                     bad_fields += 1;
                 }
+                count += 1;
             }
             if (bad_fields > 0) {
-                intrinsics::free(buf);
-                this.report_unmappable_fields(mangled, bad_fields, first_bad);
+                libc::free(buf);
+                this.report_unmappable_fields(mangled.as_string(), bad_fields, first_bad);
                 return LType::null();
             }
-            llvm_ty.set_struct_body(buf, n, packed);
-            intrinsics::free(buf);
+            const pad: u64 = this.tail_padding_for(t.computed_size, buf, count, packed);
+            this.set_body_with_padding(llvm_ty, buf, count, packed, pad);
+            libc::free(buf);
         } else {
             llvm_ty.set_struct_body(null, 0, packed);
         }
@@ -451,7 +705,7 @@ type struct TypeMapper {
     /// A subclass pointer is valid as a base pointer because their struct
     /// layouts share a prefix; no bitcast needed for upcasts.
     map_class(mut &this, t: ClassType*) -> LType {
-        const mangled: string = MangledName::for_struct_type(this.intern, QualifiedName::from_symbol(t.qualified_name)).resolve(this.intern);
+        const mangled: MangledName = MangledName::for_struct_type(this.intern, QualifiedName::from_symbol(t.qualified_name.spelling()));
 
         const cached: LType = this.lookup_cache(t.id);
         if (cached.is_valid()) {
@@ -482,7 +736,7 @@ type struct TypeMapper {
             chain.push(walk);
             if (walk.has_virtual_methods) { any_virtual = true; }
             if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-            const base_t: Type* = this.arena.lookup(walk.base_class.id);
+            const base_t: Type* = this.arena.lookup(walk.base_class);
             if (base_t == null || base_t.kind != TypeKind::Class) { break; }
             walk = base_t as ClassType*;
             depth += 1;
@@ -499,7 +753,7 @@ type struct TypeMapper {
             return llvm_ty;
         }
 
-        const buf: void* = intrinsics::malloc(total as u64 * 8);
+        const buf: void* = libc::malloc(total as u64 * 8);
         const slots: void** = buf as void**;
 
         mut idx: u32 = 0;
@@ -536,13 +790,14 @@ type struct TypeMapper {
         }
 
         if (bad_fields > 0) {
-            intrinsics::free(buf);
-            this.report_unmappable_fields(mangled, bad_fields, first_bad);
+            libc::free(buf);
+            this.report_unmappable_fields(mangled.as_string(), bad_fields, first_bad);
             return LType::null();
         }
 
-        llvm_ty.set_struct_body(buf, total, false);
-        intrinsics::free(buf);
+        const pad: u64 = this.tail_padding_for(t.computed_size, buf, total, false);
+        this.set_body_with_padding(llvm_ty, buf, total, false, pad);
+        libc::free(buf);
 
         return llvm_ty;
     }
@@ -625,13 +880,13 @@ type struct TypeMapper {
         // variant's payload is zero-sized, elem_count=0 keeps the layout
         // as a 2-field struct rather than collapsing to a raw i32.
         const i32_ty: LType = LType::i32();
-        const buf: void* = intrinsics::malloc(16);
+        const buf: void* = libc::malloc(16);
         const slots: void** = buf as void**;
         slots[0] = i32_ty.raw;
         const payload_ty: LType = LType::array_of(elem_ty, elem_count);
         slots[1] = payload_ty.raw;
         const result: LType = LType::literal_struct(buf, 2, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return result;
     }
 

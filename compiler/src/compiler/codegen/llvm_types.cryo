@@ -4,14 +4,22 @@
 /// misuse (e.g., passing a value where a type is expected).  Each
 /// wrapper is a lightweight value type holding a single pointer.
 
-namespace Compiler::Codegen::LLVMTypes;
+namespace compiler::codegen::llvm_types;
 
 import std::env;
 import std::collections::str;
-import Compiler::Codegen;
+import std::collections::str::{ Str };
+import compiler::codegen;
+import compiler::codegen::{ llvm };
 import std::fs::metadata;
+import std::fs::metadata::{ metadata };
 import std::fs::path;
+import std::fs::path::{ Path };
 import std::fmt;
+import std::collections::string;
+import std::collections::string::{ String };
+import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
+import compiler::resolver::mangled_name::{ MangledName };
 
 
 // LLVM-C enum mirrors
@@ -118,13 +126,6 @@ type enum LUnnamedAddr : i32 {
     Global = 2;
 }
 
-/// Mirror of `LLVMVerifierFailureAction` (`llvm-c/Analysis.h`).
-type enum LVerifierAction : i32 {
-    AbortProcess = 0;
-    PrintMessage = 1;
-    ReturnStatus = 2;
-}
-
 /// Mirror of `LLVMCodeGenOptLevel` (`llvm-c/TargetMachine.h`).
 type enum LCodeGenOptLevel : i32 {
     LevelNone       = 0;
@@ -187,24 +188,6 @@ type struct LModule {
         }
     }
 
-    /// Verify the module.  Returns true if valid.
-    verify(&this) -> boolean {
-        mut err_msg: i8* = null;
-        const result: i32 = llvm::LLVMVerifyModule(
-            this.raw, LVerifierAction::ReturnStatus as i32, &err_msg as void*);
-        if (err_msg != null) {
-            llvm::LLVMDisposeMessage(err_msg as void*);
-        }
-        return result == 0;
-    }
-
-    print_to_string(&this) -> string {
-        return llvm::LLVMPrintModuleToString(this.raw) as string;
-    }
-
-    dump(&this) -> void {
-        llvm::LLVMDumpModule(this.raw);
-    }
 
     /// Write this module's bitcode to `path` for the multi-process object
     /// emitter (a child process re-parses it and emits the `.o`).  Returns
@@ -246,7 +229,8 @@ type struct LModule {
     /// Append module-level inline assembly (naked / global `asm { ... }`).
     /// Multiple appends accumulate, each emitted as a top-level
     /// `module asm "..."` block.
-    append_inline_asm(&this, asm_text: string) -> void {
+    append_inline_asm(&this, asm_text_text: string) -> void {
+        const asm_text: string = asm_text_text;
         llvm::LLVMAppendModuleInlineAsm(this.raw, asm_text, asm_text.length());
     }
 
@@ -263,16 +247,39 @@ type struct LModule {
         return llvm::LLVMABISizeOfType(td, ty.raw);
     }
 
-    context(&this) -> LContext {
-        return LContext { raw: llvm::LLVMGetModuleContext(this.raw) };
+    /// ABI alignment in bytes of an LLVM type under this module's data
+    /// layout.  Same ownership rule as `abi_size_of`: the
+    /// `LLVMTargetDataRef` belongs to the module and must not be disposed.
+    /// An LLVM struct carries no over-alignment of its own - its alignment
+    /// is the maximum of its members' - so this is the alignment the
+    /// emitted object has before any `![align(N)]` is applied at the
+    /// allocation site.
+    abi_align_of(&this, ty: LType) -> u64 {
+        if (!ty.is_valid()) { return 0; }
+        const td: void* = llvm::LLVMGetModuleDataLayout(this.raw);
+        if (td == null) { return 0; }
+        return llvm::LLVMABIAlignmentOfType(td, ty.raw) as u64;
     }
 
-    get_named_function(&this, name: string) -> LValue {
-        return LValue { raw: llvm::LLVMGetNamedFunction(this.raw, name) };
+    /// Byte offset of element `idx` within an LLVM struct under this
+    /// module's data layout.  Same ownership rule as `abi_size_of`.  This is
+    /// where the emitted object actually puts that element, so comparing it
+    /// against the front end's `FieldInfo.offset` is the only check that the
+    /// two agree on WHERE a field lives - size and alignment can both match
+    /// while the offsets do not.
+    offset_of_element(&this, ty: LType, idx: u32) -> u64 {
+        if (!ty.is_valid()) { return 0; }
+        const td: void* = llvm::LLVMGetModuleDataLayout(this.raw);
+        if (td == null) { return 0; }
+        return llvm::LLVMOffsetOfElement(td, ty.raw, idx);
     }
 
-    get_named_global(&this, name: string) -> LValue {
-        return LValue { raw: llvm::LLVMGetNamedGlobal(this.raw, name) };
+    get_named_function(&this, name: MangledName) -> LValue {
+        return LValue { raw: llvm::LLVMGetNamedFunction(this.raw, name.as_string()) };
+    }
+
+    get_named_global(&this, name: MangledName) -> LValue {
+        return LValue { raw: llvm::LLVMGetNamedGlobal(this.raw, name.as_string()) };
     }
 
     /// Idempotent: if a function with `name` is already in this module,
@@ -283,16 +290,16 @@ type struct LModule {
     /// particular flow through codegen many times per requesting module,
     /// so a duplicate-add would produce thousands of `.N`-renamed declares
     /// per module.
-    add_function(&this, name: string, fn_type: LType) -> LValue {
-        const existing: void* = llvm::LLVMGetNamedFunction(this.raw, name);
+    add_function(&this, name: MangledName, fn_type: LType) -> LValue {
+        const existing: void* = llvm::LLVMGetNamedFunction(this.raw, name.as_string());
         if (existing != null) {
             return LValue { raw: existing };
         }
-        return LValue { raw: llvm::LLVMAddFunction(this.raw, name, fn_type.raw) };
+        return LValue { raw: llvm::LLVMAddFunction(this.raw, name.as_string(), fn_type.raw) };
     }
 
-    add_global(&this, ty: LType, name: string) -> LValue {
-        return LValue { raw: llvm::LLVMAddGlobal(this.raw, ty.raw, name) };
+    add_global(&this, ty: LType, name: MangledName) -> LValue {
+        return LValue { raw: llvm::LLVMAddGlobal(this.raw, ty.raw, name.as_string()) };
     }
 }
 
@@ -315,10 +322,6 @@ type struct LContext {
         return LContext { raw: llvm::LLVMContextCreate() };
     }
 
-    static global() -> LContext {
-        return LContext { raw: llvm::LLVMGetGlobalContext() };
-    }
-
     /// The context codegen should build into.  When a per-target context is
     /// published (`g_codegen_context`, set by the driver around each target's
     /// pipeline) every leaf type/module/builder factory routes through it, so
@@ -331,14 +334,6 @@ type struct LContext {
             return LContext { raw: g_codegen_context };
         }
         return LContext { raw: llvm::LLVMGetGlobalContext() };
-    }
-
-    static null() -> LContext {
-        return LContext { raw: null };
-    }
-
-    is_valid(&this) -> boolean {
-        return this.raw != null;
     }
 
     dispose(mut &this) -> void {
@@ -406,14 +401,6 @@ type struct LBuilder {
 
     static create() -> LBuilder {
         return LBuilder { raw: llvm::LLVMCreateBuilderInContext(LContext::current().raw) };
-    }
-
-    static null() -> LBuilder {
-        return LBuilder { raw: null };
-    }
-
-    is_valid(&this) -> boolean {
-        return this.raw != null;
     }
 
     dispose(mut &this) -> void {
@@ -650,11 +637,6 @@ type struct LBuilder {
     // the verifier check otherwise); pass the natural alignment of the
     // pointee in bytes (1, 2, 4, or 8).
 
-    /// Emits an LLVM `fence` instruction with the given memory ordering.
-    /// `Name` is unused at the IR level; passes the empty string.
-    build_fence(&this, order: i32) -> LValue {
-        return LValue { raw: llvm::LLVMBuildFence(this.raw, order, 0, "") };
-    }
 
     /// Emits `load atomic Ty, Ptr ordering, align Bytes`.  Used by the
     /// per-type `atomic_load_*` intrinsics; not a substitute for
@@ -691,7 +673,7 @@ type struct LBuilder {
     /// Returns the LLVM `{T, i1}` aggregate; caller uses
     /// `build_extract_value` to pull index 0 (loaded value) and index 1
     /// (success flag).  Higher-level wrappers in
-    /// `Ops::IntrinsicEmitter::try_emit` reshape the aggregate into a
+    /// `ops::IntrinsicEmitter::try_emit` reshape the aggregate into a
     /// Cryo `Pair<T, boolean>`.
     build_atomic_cmpxchg(&this, ptr: LValue, cmp: LValue, new_val: LValue,
                          succ_order: i32, fail_order: i32) -> LValue {
@@ -844,9 +826,11 @@ type struct LValue {
     /// Build an inline-assembly callee value for `asm { ... }` blocks.
     /// The result is passed as the `Fn` operand of `build_call` (it is not
     /// a real `LLVMFunction`).  `dialect` is 0 = ATT, 1 = Intel.
-    static inline_asm(fn_ty: LType, asm_text: string, constraints: string,
+    static inline_asm(fn_ty: LType, asm_text_text: string, constraints_text: string,
                       side_effects: boolean, align_stack: boolean,
                       dialect: i32, can_throw: boolean) -> LValue {
+        const asm_text: string = asm_text_text;
+        const constraints: string = constraints_text;
         return LValue { raw: llvm::LLVMGetInlineAsm(
             fn_ty.raw,
             asm_text, asm_text.length(),
@@ -898,6 +882,14 @@ type struct LValue {
         llvm::LLVMSetAlignment(this.raw, bytes);
     }
 
+    /// The alignment, in bytes, a global or memory instruction currently
+    /// carries.  An `alloca` is born holding the ABI alignment of its LLVM
+    /// type, so reading it back says what LLVM would guarantee unaided -
+    /// which is what a caller raising alignment must not fall below.
+    alignment(&this) -> u32 {
+        return llvm::LLVMGetAlignment(this.raw);
+    }
+
     /// Mark a global as thread-local (each thread gets its own instance). LLVM
     /// picks the default (general-dynamic) TLS model and inserts the TLS
     /// lowering at every reference; the OS/loader provides the per-thread block.
@@ -911,10 +903,6 @@ type struct LValue {
 
     type_of(&this) -> LType {
         return LType { raw: llvm::LLVMTypeOf(this.raw) };
-    }
-
-    dump(&this) -> void {
-        llvm::LLVMDumpValue(this.raw);
     }
 
     /// Add incoming values to this phi node.  `values` and `blocks` are
@@ -1020,22 +1008,23 @@ type struct LType {
         return LType { raw: llvm::LLVMFunctionType(ret.raw, params, param_count, is_var_arg as i32) };
     }
 
-    static named_struct(ctx: LContext, name: string) -> LType {
-        return LType { raw: llvm::LLVMStructCreateNamed(ctx.raw, name) };
+    static named_struct(ctx: LContext, name: MangledName) -> LType {
+        return LType { raw: llvm::LLVMStructCreateNamed(ctx.raw, name.as_string()) };
     }
 
     /// Look up an existing identified struct by name in `ctx`, or an
     /// invalid `LType` if none exists yet. Lets the type mapper reuse a
     /// single LLVM struct per mangled name instead of minting a fresh
     /// `Name.0` when the same Cryo struct arrives under a new type id.
-    static struct_by_name(ctx: LContext, name: string) -> LType {
-        return LType { raw: llvm::LLVMGetTypeByName2(ctx.raw, name) };
+    static struct_by_name(ctx: LContext, name: MangledName) -> LType {
+        return LType { raw: llvm::LLVMGetTypeByName2(ctx.raw, name.as_string()) };
     }
 
     static literal_struct(elements: void*, count: u32, packed: boolean) -> LType {
         return LType { raw: llvm::LLVMStructTypeInContext(
             LContext::current().raw, elements, count, packed as i32) };
     }
+
 
     // ----- Struct body -----
 
@@ -1073,9 +1062,6 @@ type struct LType {
         return LValue { raw: llvm::LLVMConstPointerNull(ty.raw) };
     }
 
-    static const_undef(ty: LType) -> LValue {
-        return LValue { raw: llvm::LLVMGetUndef(ty.raw) };
-    }
 
     static const_struct(values: void*, count: u32, packed: boolean) -> LValue {
         // MUST build in the current per-module context, not the implicit global
@@ -1097,15 +1083,14 @@ type struct LType {
         return LValue { raw: llvm::LLVMConstArray(element_ty.raw, values, count) };
     }
 
-    /// Build a NUL-terminated `[len+1 x i8]` array constant from `text`
-    /// (`c"...\00"`).  `len` is the strlen of the C string, matching what
-    /// `LLVMBuildGlobalStringPtr` measures.  Interns the constant in the
-    /// current per-module context (not the implicit global one) so it stays
-    /// private to that module during parallel emit - same rationale as
-    /// `const_struct`.
-    static const_string(text: string) -> LValue {
+    /// Build a NUL-terminated `[length+1 x i8]` array constant from the
+    /// first `length` bytes of `text` (`c"...\00"`), a NUL among them kept.
+    /// Interns the constant in the current per-module context (not the
+    /// implicit global one) so it stays private to that module during
+    /// parallel emit - same rationale as `const_struct`.
+    static const_string(text: string, length: i64) -> LValue {
         return LValue { raw: llvm::LLVMConstStringInContext(
-            LContext::current().raw, text, text.length() as u32, 0) };
+            LContext::current().raw, text, length as u32, 0) };
     }
 
     /// Typed wrapper around `LLVMGetTypeKind` for raw `LLVMTypeRef` handles
@@ -1144,9 +1129,6 @@ type struct LBasicBlock {
             LContext::current().raw, fn.raw, name) };
     }
 
-    get_terminator(&this) -> LValue {
-        return LValue { raw: llvm::LLVMGetBasicBlockTerminator(this.raw) };
-    }
 
     has_terminator(&this) -> boolean {
         return llvm::LLVMGetBasicBlockTerminator(this.raw) != null;
@@ -1185,10 +1167,10 @@ type struct LTargetMachine {
         return str;
     }
 
-    emit_to_file(&this, module: LModule, filename: string, file_type: LFileType) -> boolean {
+    emit_to_file(&this, llmodule: LModule, filename: string, file_type: LFileType) -> boolean {
         mut err_msg: i8* = null;
         const result: i32 = llvm::LLVMTargetMachineEmitToFile(
-            this.raw, module.raw, filename, file_type as i32, &err_msg as void*);
+            this.raw, llmodule.raw, filename, file_type as i32, &err_msg as void*);
         if (err_msg != null) {
             fmt::println(f"[Codegen] Emit error: {err_msg as string}");
             llvm::LLVMDisposeMessage(err_msg as void*);
@@ -1217,11 +1199,12 @@ type struct LTargetMachine {
 
     /// Like `create_target_machine_for_triple`, but with an explicit backend
     /// codegen optimization level (0=None .. 3=Aggressive; `LCodeGenOptLevel`
-    /// values line up with these). Codegen passes pass `ctx.opt_level` so an
+    /// values line up with these). Codegen passes pass `ctx.options.opt_level` so an
     /// O0/debuggable build gets less aggressive instruction selection and
     /// register allocation than an optimized one. Out-of-range levels clamp
     /// into [0, 3].
-    static create_target_machine_with_opt(triple: string, opt_level: i32) -> LTargetMachine {
+    static create_target_machine_with_opt(triple_text: string, opt_level: i32) -> LTargetMachine {
+        const triple: string = triple_text;
         mut level: i32 = opt_level;
         if (level < 0) { level = 0; }
         if (level > 3) { level = 3; }
@@ -1270,7 +1253,8 @@ type struct LTargetMachine {
         return LTargetMachine { raw: tm };
     }
 
-    static pick_windows_default_triple(raw: string) -> string {
+    static pick_windows_default_triple(raw_text: string) -> string {
+        const raw: string = raw_text;
         // Never return null: the result is cached and re-measured via strlen.
         if (raw == null) { return "x86_64-pc-windows-gnu"; }
         if (!raw.contains("windows-msvc")) { return raw; }
@@ -1286,7 +1270,8 @@ type struct LTargetMachine {
         return "x86_64-pc-windows-gnu";
     }
 
-    static exe_on_path(exe: string) -> boolean {
+    static exe_on_path(exe_text: string) -> boolean {
+        const exe: string = exe_text;
         match (env::var(Str::new("PATH"))) {
             Option::Some(v) => {
                 // Move the owned value into a local so it drops cleanly on every
@@ -1321,7 +1306,8 @@ type struct LTargetMachine {
     /// is non-empty, otherwise the host triple.  Centralizes the precedence
     /// rule so both IR generation and the linker decision read the same
     /// answer.
-    static resolve_effective_triple(requested: string) -> string {
+    static resolve_effective_triple(requested_text: string) -> string {
+        const requested: string = requested_text;
         if (requested == "" || requested.length() == 0) {
             return LTargetMachine::get_default_triple();
         }
@@ -1364,6 +1350,15 @@ type struct LTargetMachine {
         const raw: string = llvm::LLVMGetDefaultTargetTriple() as string;
         g_win_default_triple = LTargetMachine::pick_windows_default_triple(raw);
         return g_win_default_triple;
+    }
+
+    /// The version of the LLVM library this process loaded, `major.minor.patch`.
+    static llvm_version() -> string {
+        mut major: u32 = 0;
+        mut minor: u32 = 0;
+        mut patch: u32 = 0;
+        llvm::LLVMGetVersion(&major, &minor, &patch);
+        return fmt::format("%d.%d.%d", major as i64, minor as i64, patch as i64);
     }
 }
 

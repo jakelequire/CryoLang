@@ -2,15 +2,88 @@
 ///
 /// ExpressionNode base and all 19 concrete expression classes.
 
-namespace Compiler::AST::Expression;
+namespace compiler::ast::expression;
 
-import Compiler::Diag;
-import Compiler::AST;
-import Compiler::Diag::SourceSpan;
-import Compiler::Lex;
-import Compiler::AST::Node;
-import Compiler::Types::TypeRef;
-import Compiler::Resolver::SymbolStr;
+import compiler::diag;
+import compiler::ast;
+import compiler::ast::{ ArgBinding, LiteralKind, MemberPin, NodeKind, TypeAnnotation };
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::lex;
+import compiler::lex::{ Token };
+import compiler::ast::node;
+import compiler::ast::node::{ ASTNode };
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::{ TypeKind };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::type_base::{ Type };
+import compiler::resolver::symbol_str;
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResBase, ResSlot };
+import compiler::decl_index::{ DeclarationIndex, OverloadId };
+import compiler::intrinsic_kind::{ IntrinsicKind };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::ast::declaration;
+import compiler::ast::declaration::{ VarDeclNode };
+import compiler::ast::pattern;
+import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
+import compiler::ast::statement;
+import compiler::ast::statement::{ StatementNode };
+import compiler::ast::visitor;
+import compiler::ast::visitor::{ ASTVisitor };
+
+/// What a call's callee is pinned to once sema or the monomorphizer has
+/// decided it, and by WHICH kind of answer - the two are different keys
+/// into different tables, and a pin that did not say which left codegen
+/// to try one and then the other.
+///
+/// `Decl` is the declaration itself: one entry of the declaration index's
+/// function registry, which carries the linker symbol and the signature.
+/// It is what a stage that selected a signature pins - sema's overload
+/// selection, the monomorphizer's materialized specialization - and it is
+/// read through the index, never re-derived from a name: a symbol is not
+/// a declaration (two entries can share one), and a key is not one either.
+/// `Instance` is a generic function's instance: the arena instantiation of
+/// its template's placeholder with the type arguments, interned on exactly
+/// that pair, written by a stage that has them before the copy exists.  It
+/// resolves to the entry the copy registered for that instantiation.
+type enum CalleePin {
+    None;
+    Decl(OverloadId);
+    Instance(TypeRef);
+}
+
+implement enum CalleePin {
+    /// Whether anything is pinned.
+    is_some(&this) -> boolean {
+        return match (&this) {
+            CalleePin::None => { false }
+            _               => { true }
+        };
+    }
+
+    /// The pinned entry; invalid for an `Instance` pin and for `None`.
+    decl_entry(&this) -> OverloadId {
+        return match (&this) {
+            CalleePin::Decl(e) => { e }
+            _                  => { OverloadId::invalid() }
+        };
+    }
+
+    /// How a call with this pin lowers: the kind an intrinsic's
+    /// registration put on the pinned entry; `Call` for no pin - a call
+    /// through a value is never an intrinsic, whatever the value is named.
+    intrinsic_kind(&this, di: DeclarationIndex*) -> IntrinsicKind {
+        return match (&this) {
+            CalleePin::None         => { IntrinsicKind::Call }
+            CalleePin::Decl(e)      => { di.entry_intrinsic_kind(e) }
+            CalleePin::Instance(i)  => { di.entry_intrinsic_kind(di.entry_of_instance(i)) }
+        };
+    }
+}
 
 type class ExpressionNode : ASTNode {
 public:
@@ -60,11 +133,17 @@ public:
     /// from the lexer's boundary; empty on every synthesized node.
     suffix:       string;
 
+    /// How many bytes a string literal's `value` holds, a NUL among them:
+    /// `"a\0b"` is 3 where its text reads as 1.  The text's own length
+    /// unless the parser says otherwise.
+    byte_length:  i64;
+
     LiteralNode(value: string, literal_kind: LiteralKind, span: SourceSpan)
         : ExpressionNode(NodeKind::Literal, span) {
         this.value        = value;
         this.literal_kind = literal_kind;
         this.suffix       = "";
+        this.byte_length  = if (value == null) { 0 } else { value.length() as i64 };
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -77,6 +156,10 @@ type class IdentifierNode : ExpressionNode {
 public:
     name:                SymbolStr;
     is_global_reference: boolean;
+    /// Whether the parser read this identifier from the keyword `this`.
+    is_this_keyword:     boolean;
+    /// Whether the parser read this identifier from the keyword `This`.
+    is_this_type_keyword: boolean;
 
     /// Turbofish type args on a bare function-reference value, e.g.
     /// `tramp<i32>` used as a value (not called: not followed by `(`).
@@ -87,43 +170,89 @@ public:
     /// template (which is skipped at codegen).
     generic_args:        TypeAnnotation*[];
 
-    /// Specialized callee symbol for a generic function-reference value,
-    /// pinned by the monomorphizer (mirrors `CallExprNode.resolved_callee`).
-    /// Empty for non-generic identifiers.
-    resolved_callee:     SymbolStr;
+    /// The function this identifier names when it is used as a VALUE,
+    /// pinned by sema (a declared function, by its canonical name) or the
+    /// monomorphizer (a generic template's specialization); `None` for an
+    /// identifier that names no function.
+    resolved_callee:     CalleePin;
 
-    /// True when a following `<` was read as opening type arguments on a
-    /// GUESS - the name is not a known local, global, or generic declared in
-    /// this module, so the parser fell back to inspecting the tokens after the
-    /// matching `>`. The same text is also a valid chain of comparisons, so a
-    /// downstream "no such function" is as likely to mean the guess was wrong
-    /// as that the function is missing; diagnostics say so rather than sending
-    /// the reader after a function they never meant to call.
-    generic_angle_guessed: boolean;
+    /// A generic function used as a value: its type arguments, as sema read
+    /// them off the turbofish or inferred them from the expected function
+    /// type, in the template's parameter order.  The instance the value is
+    /// is the template applied to these; empty for any other identifier.
+    value_type_args:     TypeRef[];
+
+    /// The template `value_type_args` apply to: the overload of the name's
+    /// family the type check chose, which is not always the declaration the
+    /// name binds.  Invalid for any other identifier.
+    value_template:      TypeRef;
+
+    /// What this name refers to, stamped by NameResolution from the scope the
+    /// writer stands in.
+    ///
+    /// A bare identifier is a whole path rather than the head of one, so there
+    /// is no trailing segment for the type layer and `TypeRelative` never
+    /// appears here.  The spelling is a leaf while every index a later stage
+    /// consults is keyed canonically, so this slot is the only place the two
+    /// meet without a search.
+    res:                 ResSlot;
 
     IdentifierNode(name: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::Identifier, span) {
         this.name                = name;
         this.is_global_reference = false;
+        this.is_this_keyword     = false;
+        this.is_this_type_keyword = false;
         this.generic_args        = [];
-        this.resolved_callee     = SymbolStr::empty();
-        this.generic_angle_guessed = false;
+        this.resolved_callee     = CalleePin::None;
+        this.value_type_args     = [];
+        this.value_template      = TypeRef::invalid();
+        this.res                 = ResSlot::Pending;
     }
 
-    set_generic_angle_guessed(v: boolean) -> void {
-        this.generic_angle_guessed = v;
+    set_value_instance(template: TypeRef, args: TypeRef[]) -> void {
+        this.value_template  = template;
+        this.value_type_args = args;
     }
 
-    set_global_reference(v: boolean) -> void {
-        this.is_global_reference = v;
+    /// Record what this name refers to.  The first answer wins, for the reason
+    /// `ScopeResolutionNode::set_scope_res` gives: a `Res` states what the file
+    /// that WROTE the name can see.
+    set_res(r: Res) -> void {
+        this.res.answer(r);
+    }
+
+    /// Name a different LOCAL binding than the one this use was answered with.
+    ///
+    /// For a lowering that moves a use into a body where another declaration
+    /// stands for the binding the writer named - the async lowering's `poll`,
+    /// where a parameter is read through a shadow declared from the future's
+    /// field, and a carried local is re-declared in every state that needs it.
+    /// A binding is one declaration's storage, so after the move the use names
+    /// the stand-in; left on the original, it names nothing in the body it now
+    /// lives in.  A use answered with anything but a local is not a binding
+    /// and keeps its answer.
+    rebind_local(sym: SymbolID) -> void {
+        match (this.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Local(_) => { }
+                    _             => { return; }
+                }
+            }
+            ResSlot::Pending  => { }
+            ResSlot::Lang(_)  => { return; }
+            ResSlot::Alias(_) => { return; }
+        }
+        this.res = ResSlot::Answered(Res::Local(sym));
     }
 
     set_generic_args(args: TypeAnnotation*[]) -> void {
         this.generic_args = args;
     }
 
-    set_resolved_callee(name: SymbolStr) -> void {
-        this.resolved_callee = name;
+    set_resolved_callee(pin: CalleePin) -> void {
+        this.resolved_callee = pin;
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -150,6 +279,16 @@ public:
     /// arithmetic / comparison instruction; for compound assignment the
     /// call's result is stored back into the left place.
     desugared_call: ExpressionNode*;
+    /// The desugar was built in a generic body, on a left operand that is a
+    /// type parameter whose bound gives it the operator's trait, or a
+    /// reference to one.  A copy whose operand is not a user type, or a
+    /// reference to one, applies the primitive operator, so monomorphization
+    /// drops the desugar there.
+    desugar_by_bound: boolean;
+    /// For `+` on a string, the standard library's `append` the
+    /// concatenation calls, bound by sema where the `+` is written;
+    /// invalid for any other operator or operand.
+    append_entry: OverloadId;
 
     /// `--panic=unwind` cleanup schedule for the synthesized divide-by-zero /
     /// `INT_MIN / -1` guard (populated only for `/` and `%`), so the guard's
@@ -163,6 +302,8 @@ public:
         this.left  = left;
         this.right = right;
         this.desugared_call = null;
+        this.desugar_by_bound = false;
+        this.append_entry = OverloadId::invalid();
         this.unwind_cleanup = [];
     }
 
@@ -195,6 +336,12 @@ public:
     /// Same discipline as `BinaryExprNode.desugared_call`: type-directed, built
     /// in sema after `check_unary_op` rejects, and delegated to by codegen.
     desugared_call: ExpressionNode*;
+    /// The desugar was built in a generic body, on an operand that is a type
+    /// parameter whose bound gives it the operator's trait.  Which operator a
+    /// copy applies depends on the type the parameter becomes: a copy whose
+    /// operand is not a user type applies the primitive operator, so
+    /// monomorphization drops the desugar there.
+    desugar_by_bound: boolean;
 
     UnaryExprNode(op: Token, operand: ExpressionNode*, span: SourceSpan)
         : ExpressionNode(NodeKind::UnaryExpression, span) {
@@ -203,6 +350,7 @@ public:
         this.is_postfix   = false;
         this.is_synthetic = false;
         this.desugared_call = null;
+        this.desugar_by_bound = false;
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -311,26 +459,67 @@ public:
     callee:       ExpressionNode*;
     arguments:    ExpressionNode*[];
     generic_args: TypeAnnotation*[];
-    /// Sema-resolved method declaration for method calls.  Typed as
-    /// `ASTNode*` to avoid a circular import between Expression and
-    /// Declaration; always downcast to `MethodNode*` at the use site.
-    /// Set by sema after overload resolution picks a specific method;
-    /// null for non-method calls (free functions, scope-resolution,
-    /// function-pointer calls) and for calls sema couldn't resolve.
-    /// Codegen reads this to find the correct vtable slot; the resolved
-    /// declaration uniquely pins (name, param types), which is the slot
-    /// identity.
-    resolved_method: ASTNode*;
+    /// The callee, once sema or the monomorphizer has decided it and by
+    /// which name (see `CalleePin`): a method's or static's mangled symbol,
+    /// a module-qualified free function's canonical name, a generic
+    /// template's specialization (`identity$Li32$G`).  `None` until then,
+    /// and for a call codegen binds from its own structure (a local function
+    /// pointer, a closure).
+    resolved_callee: CalleePin;
 
-    /// Sema-resolved specialized callee symbol for generic free-function
-    /// calls.  When `identity<i32>(42)` or `alloc_entry(map, h, k, v)`
-    /// (with K/V/A inferred from arg types) reaches sema, the bare-name
-    /// `identity` template is renamed to its specialization
-    /// (e.g. `identity$Li32$G`) by the AST specializer.  Sema computes
-    /// that spec symbol here so codegen can look up the concrete
-    /// LLVM function instead of the bare template (which is skipped
-    /// at codegen).  Empty for non-generic free-function calls.
-    resolved_callee: SymbolStr;
+    /// The method definition a call the compiler generated names - a
+    /// method language item - written by the pass that generated it, which
+    /// holds no written name to be resolved.  Monomorphization maps it to
+    /// the receiver's own method by identity, the receiver read from
+    /// `template_recv`; nothing selects such a call by its member's name.
+    /// Invalid on every written call.  Carried by a clone and never cleared.
+    named_method: DefId;
+
+    /// The method a call names, as sema selected it where the call is
+    /// written: in a generic body, an inherent method of the generic type
+    /// the receiver is an unminted instantiation of (`this.len()` inside
+    /// `Array<T>`), or the method a minted receiver has for it
+    /// (`s.length()` on a `Str`); anywhere, a method with type parameters of
+    /// its own (`o.put(1, 2)` for `put<U>(&this, u: U, w: i32)`, and the
+    /// same method named by its path, `Owner::put(&o, 1, 2)`).  The
+    /// definition, not a copy's: the receiver's entry for it is found by
+    /// identity, and for a method with type parameters of its own, that
+    /// entry's instance at the call's type arguments, so the call is never
+    /// selected again by its member's name.  Carried by a clone and never
+    /// cleared; invalid on every other call.
+    template_method: DefId;
+
+    /// The receiver `template_method` was selected on, as sema typed it
+    /// where the call is written: the unminted instantiation
+    /// (`String<A>` for `this.inner.push(s)` inside `PathBuf<A>`) or the
+    /// minted type, with references and pointers unwrapped.  A clone
+    /// carries it and the substitution the clone is made under is applied
+    /// to it, so in each copy of the body it is that copy's receiver, and
+    /// monomorphization reads the receiver from it rather than from the
+    /// receiver expression, whose type a clone does not carry.  Valid
+    /// where `template_method` is; on a call a bound answered where it is
+    /// written: the bounded receiver, whose implementation of the recorded
+    /// trait each copy selects; and where `named_method` is: the receiver
+    /// as the pass that generated the call typed it.
+    template_recv: TypeRef;
+
+    /// On a path call a bound directs to a generic trait's declared method
+    /// (`T::try_from(v)` under `where T: TryFrom<&JsonValue>`): that
+    /// method's parameter types with the bound's arguments substituted in
+    /// (`[&JsonValue]`).  A type implementing the trait several times
+    /// (`u64` implements `TryFrom<i64>` too) is answered by the
+    /// implementation whose method takes exactly these, which is the one the
+    /// bound names.  A clone carries them under the copy's substitution.
+    /// Empty on every other call.
+    bound_params: TypeRef[];
+
+    /// On a member call a bound answered (`t.conv()` under
+    /// `where T: Conv<X>`): the bound's trait arguments (`[X]`), in the
+    /// body's own parameters.  A type implementing the trait at several
+    /// arguments (`Conv<i32>` and `Conv<i64>`) is answered by the
+    /// implementation whose head writes these.  A clone carries them under
+    /// the copy's substitution.  Empty on every other call.
+    bound_trait_args: TypeRef[];
 
     /// Sema-resolved concrete type-arg bindings for a generic free-function
     /// call, parallel to the template's generic-parameter declaration order.
@@ -341,16 +530,16 @@ public:
     /// non-generic free calls and for calls sema deferred.
     resolved_type_args: TypeRef[];
 
-    /// Qualified name of the generic free-function TEMPLATE sema bound this
-    /// call to.  Sema decides this with the caller's import scope in hand;
+    /// The generic free-function TEMPLATE sema bound this call to, by the
+    /// template's own type (`TemplateEntry.base_type`).  Sema decides this with the caller's import scope in hand;
     /// mono has only the consuming module's name and would otherwise re-pick
     /// by bare leaf name, using an arity/namespace-prefix heuristic that ties
     /// whenever two modules define a same-named generic at the same arity
     /// (`alpha::pick` vs `beta::pick`, both called at arity 2 from sibling
     /// modules).  On a tie mono bound every caller to one of them, so the
     /// other module's specialization was never instantiated and its callers
-    /// silently ran the wrong body.  Empty when sema didn't resolve the call.
-    resolved_template: SymbolStr;
+    /// silently ran the wrong body.  Invalid when sema didn't resolve the call.
+    resolved_template: TypeRef;
 
     /// Unwind cleanup schedule for `--panic=unwind`.  The ordered drop
     /// statements for every droppable local live in the enclosing scopes at
@@ -369,10 +558,14 @@ public:
         this.callee             = callee;
         this.arguments          = [];
         this.generic_args       = [];
-        this.resolved_method    = null;
-        this.resolved_callee    = SymbolStr::empty();
+        this.resolved_callee    = CalleePin::None;
+        this.named_method       = DefId::invalid();
+        this.template_method    = DefId::invalid();
+        this.template_recv      = TypeRef::invalid();
+        this.bound_params       = [];
+        this.bound_trait_args   = [];
         this.resolved_type_args = [];
-        this.resolved_template  = SymbolStr::empty();
+        this.resolved_template  = TypeRef::invalid();
         this.unwind_cleanup     = [];
     }
 
@@ -380,31 +573,60 @@ public:
         this.arguments.push(arg);
     }
 
-    /// Replace the argument at `idx` in place.  Used by sema when it
-    /// rewrites a call argument (e.g. wrapping it in an implicit-conversion
-    /// call).  Caller must ensure `idx` is in range.
-    set_argument(idx: i64, arg: ExpressionNode*) -> void {
-        this.arguments[idx] = arg;
+    /// Record how each argument binds to the parameter it lands on.
+    ///
+    /// Two separate answers come out of the same parameter type:
+    ///   - `arg_binding` is the OWNERSHIP answer the move passes need.  A `&T`
+    ///     or `T*` parameter only ever receives an address, so the callee takes
+    ///     no ownership of the pointee; a bare `T` parameter receives the value
+    ///     and drops its own copy.
+    ///   - `autoref` is the narrower CODEGEN directive: take the address of a
+    ///     by-value argument standing in a `&T` slot.  A `T*` parameter needs no
+    ///     such fixup (the argument is already an address), which is why it must
+    ///     not be used to answer the ownership question - doing so classified
+    ///     every pointer-parameter argument as a by-value transfer.
+    ///
+    /// Arguments past the declared parameters (a variadic tail) are left
+    /// unclassified, which the move passes read as a transfer.
+    bind_arguments(arena: TypeArena*, param_types: &TypeRef[]) -> void {
+        const lim: i64 = if (param_types.length < this.arguments.length) {
+            param_types.length
+        } else {
+            this.arguments.length
+        };
+        for (mut j: i64 = 0; j < lim; j++) {
+            const arg: ExpressionNode* = this.arguments[j];
+            if (arg == null) { continue; }
+            const pt: Type* = arena.lookup(param_types[j]);
+            if (pt == null) { continue; }
+            if (pt.kind != TypeKind::Reference && pt.kind != TypeKind::Pointer) {
+                arg.arg_binding = ArgBinding::ByValue;
+                continue;
+            }
+            arg.arg_binding = ArgBinding::Borrowed;
+            if (pt.kind == TypeKind::Reference) {
+                const at: Type* = arena.lookup(arg.resolved_type);
+                if (at == null || (at.kind != TypeKind::Reference && at.kind != TypeKind::Pointer)) {
+                    arg.autoref = true;
+                }
+            }
+        }
     }
 
     set_generic_args(args: TypeAnnotation*[]) -> void {
         this.generic_args = args;
     }
 
-    set_resolved_method(m: ASTNode*) -> void {
-        this.resolved_method = m;
-    }
-
-    set_resolved_callee(name: SymbolStr) -> void {
-        this.resolved_callee = name;
+    set_resolved_callee(pin: CalleePin) -> void {
+        this.resolved_callee = pin;
     }
 
     set_resolved_type_args(args: TypeRef[]) -> void {
         this.resolved_type_args = args;
     }
 
-    set_resolved_template(qualified_name: SymbolStr) -> void {
-        this.resolved_template = qualified_name;
+    set_resolved_template(template_type: TypeRef) -> void {
+        this.resolved_template = template_type;
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -433,20 +655,54 @@ public:
     /// `CallExprNode.unwind_cleanup`.
     unwind_cleanup: ASTNode*[];
 
+    /// What `type_name` names, stamped by NameResolution from the scope the
+    /// expression was written in.  A `new` names one type outright, so there is
+    /// no trailing segment and `TypeRelative` never appears here.
+    res:          ResSlot;
+
+    /// The variant `variant_name` names inside the enum `res` stamps
+    /// (`Variant(ordinal)`), as sema found it; codegen builds the boxed
+    /// variant from it.  `None` on a plain class `new`, and on a variant
+    /// `new` sema refused.
+    resolved_member: MemberPin;
+
+    /// Whether `resolved_member` reached this node through a substituted
+    /// clone rather than from a walk over the node itself - `MemberPin`'s
+    /// carriage rule.
+    pin_carried: boolean;
+
     NewExprNode(type_name: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::NewExpression, span) {
         this.type_name    = type_name;
         this.variant_name = SymbolStr::empty();
+        this.resolved_member = MemberPin::None;
+        this.pin_carried  = false;
         this.generic_args = [];
         this.arguments    = [];
         this.array_size   = null;
         this.struct_init  = null;
         this.unwind_cleanup = [];
+        this.res          = ResSlot::Pending;
+    }
+
+    /// Record what the expression's type name refers to.  First answer wins.
+    set_res(r: Res) -> void {
+        this.res.answer(r);
     }
 
     has_array_size() -> boolean { return this.array_size != null; }
     has_struct_init() -> boolean { return this.struct_init != null; }
     has_variant() -> boolean { return this.variant_name.is_valid(); }
+
+    set_resolved_member(pin: MemberPin) -> void {
+        this.resolved_member = pin;
+        this.pin_carried     = false;
+    }
+
+    /// Keep the pin a clone inherited and mark it carried.
+    carry_resolved_member() -> void {
+        this.pin_carried = this.resolved_member.is_some();
+    }
 
     add_argument(arg: ExpressionNode*) -> void {
         this.arguments.push(arg);
@@ -472,22 +728,26 @@ public:
 
 type class SizeofExprNode : ExpressionNode {
 public:
-    type_name: SymbolStr;
-    type_span: SourceSpan;
-    /// Full type-annotation form (e.g., `HashMapEntry<K, V>`).  Captured
-    /// by the parser so generic args survive cloning/substitution and
-    /// codegen can resolve to the correct specialization.  May be null
-    /// if the AST was built without going through the parser path.
+    /// The operand as written (`HashMapEntry<K, V>`), the one carrier of
+    /// what is measured: the name layer stamps it, the substituter rewrites
+    /// it for a clone, and `operand_type` is resolved from it.
     type_ann: TypeAnnotation*;
 
-    SizeofExprNode(type_name: SymbolStr, type_span: SourceSpan, span: SourceSpan)
+    /// The OPERAND's type - what is being measured - which is a different
+    /// question from `resolved_type`, the type of the expression itself
+    /// (always `u64`).  They are separate fields because they had to be: one
+    /// slot holding both meant whichever pass wrote last decided which one a
+    /// reader got, so the same `sizeof` folded to the operand's size in a
+    /// `static_assert` and to 8 - the width of `u64` - anywhere sema walked.
+    operand_type: TypeRef;
+
+    SizeofExprNode(type_ann: TypeAnnotation*, span: SourceSpan)
         : ExpressionNode(NodeKind::SizeofExpression, span) {
-        this.type_name = type_name;
-        this.type_span = type_span;
-        this.type_ann  = null;
+        this.type_ann     = type_ann;
+        this.operand_type = TypeRef::invalid();
     }
 
-    set_type_ann(ann: TypeAnnotation*) -> void { this.type_ann = ann; }
+    set_operand_type(ty: TypeRef) -> void { this.operand_type = ty; }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -497,20 +757,19 @@ public:
 
 type class AlignofExprNode : ExpressionNode {
 public:
-    type_name: SymbolStr;
-    type_span: SourceSpan;
-    /// Full type-annotation form (e.g., `HashMapEntry<K, V>`).  Same
-    /// rationale as SizeofExprNode.type_ann.
+    /// The operand as written.  Same rationale as SizeofExprNode.type_ann.
     type_ann: TypeAnnotation*;
 
-    AlignofExprNode(type_name: SymbolStr, type_span: SourceSpan, span: SourceSpan)
+    /// The OPERAND's type. Same rationale as SizeofExprNode.operand_type.
+    operand_type: TypeRef;
+
+    AlignofExprNode(type_ann: TypeAnnotation*, span: SourceSpan)
         : ExpressionNode(NodeKind::AlignofExpression, span) {
-        this.type_name = type_name;
-        this.type_span = type_span;
-        this.type_ann  = null;
+        this.type_ann     = type_ann;
+        this.operand_type = TypeRef::invalid();
     }
 
-    set_type_ann(ann: TypeAnnotation*) -> void { this.type_ann = ann; }
+    set_operand_type(ty: TypeRef) -> void { this.operand_type = ty; }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
@@ -549,6 +808,15 @@ type struct FieldInit {
     field_name: SymbolStr;
     value:      ExpressionNode*;
     span:       SourceSpan;
+    /// The field `field_name` names inside the literal's type, as sema
+    /// found it (`Field(depth, index)` - see `MemberPin`); codegen stores
+    /// the value at those coordinates and searches no field table.  `None`
+    /// until a sema walk answers it, or on a literal minted after the last
+    /// walk whose minter did not - which codegen reports.
+    pin:        MemberPin;
+    /// Whether `pin` reached this initializer through a substituted clone
+    /// rather than from a walk over it - `MemberPin`'s carriage rule.
+    pin_carried: boolean;
 }
 
 type class StructLiteralNode : ExpressionNode {
@@ -557,11 +825,39 @@ public:
     generic_args: TypeAnnotation*[];
     field_inits:  FieldInit[];
 
+    /// What `struct_type` names, stamped by NameResolution from the scope the
+    /// literal was written in.  A literal names one type outright, so there is
+    /// no trailing segment and `TypeRelative` never appears here.
+    res:          ResSlot;
+
     StructLiteralNode(struct_type: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::StructLiteral, span) {
         this.struct_type  = struct_type;
         this.generic_args = [];
         this.field_inits  = [];
+        this.res          = ResSlot::Pending;
+    }
+
+    /// Record what the literal's type name refers to.  First answer wins.
+    set_res(r: Res) -> void {
+        this.res.answer(r);
+    }
+
+    /// Record what a SYNTHESIZED literal's type name refers to.
+    ///
+    /// A pass that builds a path-bearing node owes it a `Res`, for the reason
+    /// `ScopeResolutionNode::set_synthesized_ref` gives: name resolution has
+    /// already run by the time the node exists, so the synthesizer is the only
+    /// place the referent is known without a lookup, and a consumer left to
+    /// guess for synthesized nodes keeps the guess alive for written ones too.
+    ///
+    /// `def_name` is the canonical name the pass registered the type under, not
+    /// the spelling it happened to write.  An empty one leaves the slot
+    /// unanswered rather than inventing a base, so the stage that needed the
+    /// answer reports it instead of this absorbing it.
+    set_synthesized_res(def: DefId) -> void {
+        if (!def.is_valid()) { return; }
+        this.set_res(Res::Def(def));
     }
 
     set_generic_args(args: TypeAnnotation*[]) -> void {
@@ -581,28 +877,18 @@ public:
 type class ArrayLiteralNode : ExpressionNode {
 public:
     elements:          ExpressionNode*[];
-    element_type:      string;
     repeat_count:      i64;
     repeat_count_expr: ExpressionNode*;
 
     ArrayLiteralNode(span: SourceSpan)
         : ExpressionNode(NodeKind::ArrayLiteral, span) {
         this.elements          = [];
-        this.element_type      = "";
         this.repeat_count      = 0;
         this.repeat_count_expr = null;
     }
 
     add_element(elem: ExpressionNode*) -> void {
         this.elements.push(elem);
-    }
-
-    set_element_type(t: string) -> void {
-        this.element_type = t;
-    }
-
-    set_repeat_count(count: i64) -> void {
-        this.repeat_count = count;
     }
 
     set_repeat_count_expr(expr: ExpressionNode*) -> void {
@@ -641,12 +927,17 @@ public:
     return_type_ann: TypeAnnotation*;
     body:            StatementNode*;
     // Free variables referenced by the body that resolve to outer-function
-    // locals - parallel arrays populated by Sema::resolve_lambda when the
+    // locals - parallel arrays populated by sema::resolve_lambda when the
     // body references an enclosing-scope binding.  Empty for non-capturing
     // lambdas; the codegen path branches on `captured_names.length == 0`.
     // Spans point at the *use* site that first triggered the capture (for
     // future diagnostics, e.g. non-Copy capture rejection).
     captured_names:  SymbolStr[];
+    // The outer binding each capture names, as the resolver answered the use
+    // that triggered it.  A pass that records the capture as a move keys on
+    // this: a spelling names no binding by itself, and an identifier minted
+    // from `captured_names` alone carries no answer at all.
+    captured_syms:   SymbolID[];
     captured_types:  TypeRef[];
     captured_spans:  SourceSpan[];
     // `move (...) -> T { ... }` opts the closure into capture-by-move
@@ -662,6 +953,7 @@ public:
         this.return_type_ann = null;
         this.body            = null;
         this.captured_names  = [];
+        this.captured_syms   = [];
         this.captured_types  = [];
         this.captured_spans  = [];
         this.is_move         = false;
@@ -684,13 +976,14 @@ public:
     }
 
     /// Record a free-variable use of an outer-scope binding.  Idempotent:
-    /// a name already in `captured_names` is not re-added (the body may
+    /// a binding already in `captured_syms` is not re-added (the body may
     /// reference the same outer local multiple times).
-    add_capture(name: SymbolStr, ty: TypeRef, span: SourceSpan) -> void {
-        for (mut i: i64 = 0; i < this.captured_names.length; i++) {
-            if (this.captured_names[i].id == name.id) { return; }
+    add_capture(name: SymbolStr, sym: SymbolID, ty: TypeRef, span: SourceSpan) -> void {
+        for (mut i: i64 = 0; i < this.captured_syms.length; i++) {
+            if (this.captured_syms[i].equals(sym)) { return; }
         }
         this.captured_names.push(name);
+        this.captured_syms.push(sym);
         this.captured_types.push(ty);
         this.captured_spans.push(span);
     }
@@ -749,33 +1042,77 @@ public:
     /// Empty when the member name has no `<...>` clause.  Carried here so
     /// the call expression that wraps the member access can pick them up.
     generic_args: TypeAnnotation*[];
-    /// Disambiguating trait for this method call when two traits declare a
-    /// same-named method (e.g. `Display::fmt` / `Debug::fmt`) and the
-    /// receiver implements both.  The receiver's concrete type alone can't
-    /// say which the caller meant; the bound (`where T: Debug`) or the
-    /// enclosing trait-impl context can.  Set PRE-monomorphization by
-    /// `annotate_bound_dispatch_in_module` (the bound is only known then)
-    /// and consulted by the monomorphizer's trait-impl method lookups so
-    /// the spec picks the right trait's impl.  Empty when there is no such
-    /// disambiguation to make.
-    resolved_trait: SymbolStr;
+    /// The trait this method call names when its receiver's concrete type
+    /// alone cannot say: two traits declaring a same-named method
+    /// (`Display::fmt` / `Debug::fmt`), or an inherent method of the name
+    /// beside the trait's.  The bound (`where T: Debug`) that answered the
+    /// call in a generic body can.  Set PRE-monomorphization by sema, where
+    /// the bound answers the call, because the bound is gone once the
+    /// parameter is substituted, and consulted by selection
+    /// and the monomorphizer's trait-impl method lookups.  Empty when there
+    /// is no such direction.
+    ///
+    /// The trait's IDENTITY - its canonical qualified name, the same key a
+    /// method's `origin_trait` and an impl head's `trait_def` unwrapped
+    /// carry - never the leaf as written.  Two traits may share a leaf, and
+    /// a leaf here would let whichever registered first answer for both.
+    resolved_trait: DefId;
+
+    /// Which of `resolved_trait`'s declared methods the call names, by its
+    /// position in the trait's declaration; -1 when the stamp names none.
+    /// With the trait and a concrete receiver it selects an implementation
+    /// and that implementation's method (`ImplBlockNode::trait_item_method`)
+    /// without the member's name.
+    resolved_trait_slot: i64;
+
+    /// The FIELD this access names, as sema found it in the receiver's type:
+    /// `Field(depth, index)`, the coordinates codegen addresses the slot by.
+    /// `None` for a method access (a call's callee, answered by the call's
+    /// own pin) and for a node no sema walk reached.  Written by every walk
+    /// that resolves the member, last answer standing: the last walk to reach
+    /// the node is the one codegen reads.
+    resolved_member: MemberPin;
+
+    /// Whether `resolved_member` reached this node through a substituted
+    /// clone rather than from a walk over the node itself - `MemberPin`'s
+    /// carriage rule.
+    pin_carried: boolean;
 
     MemberAccessNode(object: ExpressionNode*, member: SymbolStr,
                      member_span: SourceSpan, span: SourceSpan)
         : ExpressionNode(NodeKind::MemberAccess, span) {
-        this.object         = object;
-        this.member         = member;
-        this.member_span    = member_span;
-        this.generic_args   = [];
-        this.resolved_trait = SymbolStr::empty();
+        this.object          = object;
+        this.member          = member;
+        this.member_span     = member_span;
+        this.generic_args    = [];
+        this.resolved_trait  = DefId::invalid();
+        this.resolved_trait_slot = -1;
+        this.resolved_member = MemberPin::None;
+        this.pin_carried     = false;
     }
 
     set_generic_args(args: TypeAnnotation*[]) -> void {
         this.generic_args = args;
     }
 
-    set_resolved_trait(t: SymbolStr) -> void {
+    set_resolved_trait(t: DefId) -> void {
         this.resolved_trait = t;
+    }
+
+    /// The trait and the position of its declared method the call names.
+    set_resolved_trait_item(t: DefId, slot: i64) -> void {
+        this.resolved_trait      = t;
+        this.resolved_trait_slot = slot;
+    }
+
+    set_resolved_member(pin: MemberPin) -> void {
+        this.resolved_member = pin;
+        this.pin_carried     = false;
+    }
+
+    /// Keep the pin a clone inherited and mark it carried.
+    carry_resolved_member() -> void {
+        this.pin_carried = this.resolved_member.is_some();
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -798,6 +1135,98 @@ public:
     scope_span:         SourceSpan;
     member_span:        SourceSpan;
 
+    /// What the SCOPE segment refers to, stamped by NameResolution when it
+    /// names a module.  `Def(ns)` carries that module's own namespace, which
+    /// is not recoverable from `scope_name`: the source may write any
+    /// whole-segment suffix of it, and several modules can share one suffix.
+    ///
+    /// A segment naming a TYPE is stamped too, as `TypeRelative`: the name
+    /// layer records the type it stopped on and leaves the member segment to
+    /// sema.  The slot is unanswered only when nothing in the program owns the
+    /// segment, where a stamp would assert an ownership no later stage could
+    /// check.
+    scope_res:          ResSlot;
+
+    /// The function this path names when it is used as a VALUE (`Type::static`
+    /// or `Module::fn` as a function pointer), pinned by sema - the mangled
+    /// symbol of a static method, the canonical name of a free function -
+    /// exactly as a `CallExprNode`'s pin is.  `None` when the path names no
+    /// function; a variant or a global is then `resolved_member`'s.
+    resolved_callee:    CalleePin;
+
+    /// The MEMBER this path names when it is not a function: an enum
+    /// variant (`Variant(ordinal)`, inside the enum `resolved_type` names)
+    /// or a global (`Global(slot)`, the declaration index's registration
+    /// slot).  Written by sema; codegen builds the variant or loads the
+    /// global from it and looks nothing up by the member leaf.  `None` on a
+    /// path naming a function (see `resolved_callee`), a type, or nothing.
+    resolved_member:    MemberPin;
+
+    /// Whether `resolved_member` reached this node through a substituted
+    /// clone rather than from a walk over the node itself - `MemberPin`'s
+    /// carriage rule.
+    pin_carried:        boolean;
+
+    /// Whether the scope segment is the keyword `This` (`This::member`), as
+    /// the parser read its token.
+    scope_is_this_type: boolean;
+
+    /// A module's generic function taken as a value (`m::idf`): the type
+    /// arguments the type check read off the turbofish or inferred from the
+    /// expected function type, in the template's parameter order; the value
+    /// is `value_template` applied to these.  A generic METHOD taken as a
+    /// value (`Box::wrap::<i32>`) keeps its own type arguments here, in
+    /// declaration order, beside `template_method` and `spec_owner`.  Empty
+    /// on every other path.
+    value_type_args:    TypeRef[];
+
+    /// The template `value_type_args` apply to: the overload of the module's
+    /// family the type check chose.  Invalid on every other path.
+    value_template:     TypeRef;
+
+    /// The SPECIALIZATION the scope segment denotes, recorded by the
+    /// substituter when it collapses a template's self-reference
+    /// (`Pair<T>::new` inside `Pair<T>`'s own body) into the clone.  The
+    /// stamp beside it still names the template - a `Res` names a
+    /// definition, and the clone's syntax is the template's - so the arena
+    /// id is the only carrier of which instantiation this segment now means,
+    /// exactly as `NamedAnnotation::pre_resolved` carries it for a written
+    /// type.  A generic owner's method taken as a value (`Wrap::get`) records
+    /// here the owner instance the type check chose for it.  Invalid on every
+    /// other node.
+    spec_owner:         TypeRef;
+
+    /// The trait an impl-qualified path names, `(Beta for P)::make`: the
+    /// member is the one THAT trait's implementation for the scope segment's
+    /// type delivers, where the bare path `P::make` would tie between two
+    /// traits providing it.  The target of the head IS the scope segment -
+    /// `scope_name` and `scope_generic_args` carry it, stamped and
+    /// substituted as any `Type::member` path's are - so the trait is the
+    /// only thing the form adds.  Null on a path written without a head.
+    impl_trait:         TypeAnnotation*;
+
+    /// The trait a BOUND directs this path through, `T::make()` under
+    /// `where T: Beta`: the bound's identity, stamped before
+    /// monomorphization erases the parameter, as `MemberAccessNode`'s
+    /// `resolved_trait` is for `t.go()`.  A direction, not a refusal: the
+    /// concrete type's implementation of THAT trait delivers the member
+    /// when it has one.  Empty on a path no bound directs.
+    resolved_trait:     DefId;
+
+    /// The trait's declared method a bound-directed path names when it is
+    /// used as a VALUE (`const f = T::make;`), as `CallExprNode`'s
+    /// `template_method` is for the call `T::make()`: every copy of the body
+    /// binds it on the type the parameter becomes.  Invalid on any other path.
+    template_method:    DefId;
+
+    /// The declaration the MEMBER segment names when the scope segment names
+    /// a module, stamped by the name layer from the binding the module
+    /// offers under that leaf - so `Module::f` is the function the name
+    /// layer bound, never `module + "::" + f` composed again at the use.
+    /// Invalid when the scope is a type (the type layer answers that member)
+    /// and when the module offers nothing under the leaf.
+    member_def:         DefId;
+
     ScopeResolutionNode(scope_name: SymbolStr, member_name: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::ScopeResolution, span) {
         this.scope_name         = scope_name;
@@ -806,11 +1235,114 @@ public:
         this.scope_generic_args = [];
         this.scope_span         = span;
         this.member_span        = span;
+        this.scope_res          = ResSlot::Pending;
+        this.resolved_callee    = CalleePin::None;
+        this.resolved_member    = MemberPin::None;
+        this.pin_carried        = false;
+        this.scope_is_this_type = false;
+        this.value_type_args    = [];
+        this.value_template     = TypeRef::invalid();
+        this.spec_owner         = TypeRef::invalid();
+        this.impl_trait         = null;
+        this.resolved_trait     = DefId::invalid();
+        this.template_method    = DefId::invalid();
+        this.member_def         = DefId::invalid();
+    }
+
+    set_impl_trait(ann: TypeAnnotation*) -> void {
+        this.impl_trait = ann;
+    }
+
+    set_resolved_trait(t: DefId) -> void {
+        this.resolved_trait = t;
+    }
+
+    /// Record the declaration the member segment names.  The first answer
+    /// wins, as the scope segment's does.
+    set_member_def(d: DefId) -> void {
+        if (!this.member_def.is_valid()) { this.member_def = d; }
+    }
+
+    set_resolved_callee(pin: CalleePin) -> void {
+        this.resolved_callee = pin;
+    }
+
+    set_resolved_member(pin: MemberPin) -> void {
+        this.resolved_member = pin;
+        this.pin_carried     = false;
+    }
+
+    /// Keep the pin a clone inherited and mark it carried.
+    carry_resolved_member() -> void {
+        this.pin_carried = this.resolved_member.is_some();
     }
 
     set_segment_spans(scope_span: SourceSpan, member_span: SourceSpan) -> void {
         this.scope_span  = scope_span;
         this.member_span = member_span;
+    }
+
+    /// Record what the scope segment refers to.  The first answer wins: a
+    /// `Res` states what the file that WROTE the path can see, so a later walk
+    /// standing in a different module must not be able to replace it.
+    set_scope_res(r: Res) -> void {
+        this.scope_res.answer(r);
+    }
+
+    /// Claim the scope segment for the type alias `alias`, to be answered
+    /// with the alias's target (`ResSlot::Alias`).  False when the segment
+    /// was already answered.
+    defer_to_alias(alias: DefId) -> boolean {
+        match (this.scope_res) {
+            ResSlot::Pending => { this.scope_res = ResSlot::Alias(alias); return true; }
+            _                => { return false; }
+        }
+    }
+
+    /// Record BOTH answers a synthesized `Type::member` reference has: the type
+    /// it names, and the name-layer `Res` derived from that type.
+    ///
+    /// A pass that builds a path-bearing node owes it a `Res`, because the
+    /// synthesizer is the only place the referent is known without a lookup.
+    /// Carrying only the type pushes every later consumer back to matching the
+    /// bare spelling against an index, which is the re-derivation the slot
+    /// exists to end - and a consumer that has to guess for synthesized nodes
+    /// keeps the guess alive for written ones too.
+    ///
+    /// `def_name` is the DEFINITION's canonical name, which the caller derives
+    /// from `ty` (`CompilationContext::definition_id_of`); it is not read off
+    /// the spelling the node was built with, since a synthesizer holds a bare
+    /// one. The trailing count is 1: the base is what `ty` names and the member
+    /// segment is the type layer's to finish.
+    ///
+    /// An empty `def_name` leaves the slot unanswered rather than inventing a
+    /// base. A synthesized reference to a type that names no declaration is a
+    /// defect in the synthesizer, and an unanswered slot is what reports it -
+    /// against the stage that needed the answer, with a site - instead of being
+    /// absorbed here.
+    set_synthesized_ref(ty: TypeRef, def: DefId) -> void {
+        this.set_resolved_type(ty);
+        this.set_synthesized_res(def);
+    }
+
+    /// The `Res` half alone, for a synthesizer that knows WHAT it is referring
+    /// to before it knows the type - a lowering that names a stdlib type and
+    /// lets the following resolution walk supply the instantiation.
+    set_synthesized_res(def: DefId) -> void {
+        if (def.is_valid()) {
+            this.set_scope_res(Res::TypeRelative(ResBase::Def(def), 1));
+        }
+    }
+
+    /// What this node's scope segment refers to, for a stage that needs it.
+    ///
+    /// `Pending` here means no resolver and no synthesizer claimed a node a
+    /// later stage depends on. It is an internal error in both cases and never
+    /// a licence to search: a node built by a pass owes its own `Res`
+    /// (`set_synthesized_ref`), so "this one was synthesized" is a defect
+    /// report and not an exemption.
+    require_scope_res(&this, site: string) -> Res {
+        return this.scope_res.require(site);
     }
 
     set_generic_args(args: TypeAnnotation*[]) -> void {
@@ -920,8 +1452,6 @@ public:
         this.operand   = operand;
         this.desugared = null;
     }
-
-    has_desugar() -> boolean { return this.desugared != null; }
 
     set_desugared(d: ExpressionNode*) -> void { this.desugared = d; }
 

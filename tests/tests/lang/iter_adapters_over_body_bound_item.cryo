@@ -1,0 +1,100 @@
+// An `Iterator` impl that binds its element type in the BODY
+// (`type Item = i32;`) is the same impl as one that writes it in the head
+// (`implement trait Iterator<i32> for ...`), and every adapter over it builds.
+//
+// The adapters carry their element through a where-bound
+// (`implement<I, A> trait Iterator<A> for struct TakeIter<I> where I: Iterator<A>`),
+// so `A` is read from `I`'s impl at the bound's slot. When only the head was
+// read, a body-bound impl answered nothing there, `TakeIter<Upto>::next` was
+// never specialized, and the program failed to build with E0636 on the
+// adapter's `next` - even when the program called no adapter, because the
+// trait's defaults (`take`, `skip`, ...) are instantiated for every impl.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::IterAdaptersOverBodyBoundItem;
+
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::iter;
+import std::core::iter::{ Iterator };
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+
+type struct Upto {
+    cur: i32;
+    end: i32;
+}
+
+implement trait Iterator for struct Upto {
+    type Item = i32;
+    next(mut &this) -> Option<i32> {
+        if (this.cur >= this.end) { return Option::None; }
+        const v: i32 = this.cur;
+        this.cur = this.cur + 1;
+        return Option::Some(v);
+    }
+}
+
+function dbl(x: i32) -> i32 { return x * 2; }
+
+function drain<I>(mut it: I) -> i32 where I: Iterator<i32> {
+    mut sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None => { break; }
+        }
+    }
+    return sum;
+}
+
+// The method itself: 0, then 1.
+![test]
+function next_on_body_bound_impl() -> Result<(), TestError> {
+    mut it: Upto = Upto { cur: 0, end: 10 };
+    mut t: i32 = 0;
+    match (it.next()) { Option::Some(v) => { t = t + v; } Option::None => { } }
+    match (it.next()) { Option::Some(v) => { t = t + v * 10; } Option::None => { } }
+    return expect_eq(t, 10);
+}
+
+// `take`: 0+1+2 = 3.
+![test]
+function take_over_body_bound_impl() -> Result<(), TestError> {
+    mut it: Upto = Upto { cur: 0, end: 10 };
+    return expect_eq(drain(it.take(3)), 3);
+}
+
+// `skip`: 7+8+9 = 24.
+![test]
+function skip_over_body_bound_impl() -> Result<(), TestError> {
+    mut it: Upto = Upto { cur: 0, end: 10 };
+    return expect_eq(drain(it.skip(7)), 24);
+}
+
+// An adapter over an adapter: skip 2 then take 3 -> 2+3+4 = 9. `A` of the
+// outer `TakeIter` is read from the inner `SkipIter`, whose own `A` is read
+// from `Upto`'s body.
+![test]
+function nested_adapters_over_body_bound_impl() -> Result<(), TestError> {
+    mut it: Upto = Upto { cur: 0, end: 10 };
+    return expect_eq(drain(it.skip(2).take(3)), 9);
+}
+
+// `map` then a terminal default: double 0..4 = 0+2+4+6 = 12.
+![test]
+function map_over_body_bound_impl() -> Result<(), TestError> {
+    mut it: Upto = Upto { cur: 0, end: 4 };
+    return expect_eq(drain(it.map(dbl)), 12);
+}
+
+// `count`, a terminal default on the impl itself: 5.
+![test]
+function count_over_body_bound_impl() -> Result<(), TestError> {
+    mut it: Upto = Upto { cur: 0, end: 5 };
+    return expect_eq(it.count() as i32, 5);
+}

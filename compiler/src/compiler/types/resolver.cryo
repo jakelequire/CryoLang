@@ -10,53 +10,110 @@
 ///! Design note: Reuses the existing TypeAnnotation enum from AST/_module.cryo
 ///! directly, avoiding parallel definitions.
 
-namespace Compiler::Types::Resolver;
+namespace compiler::types::resolver;
 
-import Compiler::Diag;
-import Compiler::Diag::{ Sink, Diagnostic, SourceSpan };
-import Compiler::Types::{ Arena, TypeRef, GenericRegistry, Registry, Inference, Ownership };
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration, Statement, Expression };
-import Compiler::Resolver::{ SymbolStr, InternTable, Resolver };
-import Compiler::DeclIndex;
-import Compiler::ConstTable;
-import Utils::Logger;
-import std::collections::pair;
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
+import compiler::types::{
+    arena, type_ref, generic_registry, inference, ownership, TypeKind, RefMutability
+};
+import compiler::ast;
+import compiler::ast::{
+    ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
+    ImplTraitAnnotation, NamedAnnotation, node, NodeKind, ProjectionAnnotation, statement,
+    TraitBound, TraitRef, TupleAnnotation, TypeAnnotation
+};
+import compiler::resolver::{ symbol_str, intern_table, resolver };
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::decl_index;
+import compiler::decl_index::{ DeclarationIndex };
+import compiler::const_table;
+import compiler::const_table::{ ConstantTable, ConstEval };
+import compiler::module_graph;
+import compiler::module_graph::{ ModuleGraph };
+import utils::logger;
+import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
+import compiler::resolver::scope;
+import compiler::resolver::scope::{ ScopeID };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
+import compiler::types::compound;
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
+import compiler::types::type_base;
+import compiler::types::type_base::{ Type };
+import compiler::types::user_defined;
+import compiler::types::user_defined::{ TypeAliasType };
+import std::fmt;
+import compiler::ast::declaration::{
+    FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
+    TraitDeclNode, TypeAliasDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{ ExpressionNode, StructLiteralNode };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::statement::{ BlockStmtNode, IfStmtNode, ReturnStmtNode, StatementNode };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::sink::{ DiagnosticSink };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::resolver::{ Resolver };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::substitution;
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::trait_checker;
+import compiler::types::trait_checker::{ TraitChecker };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::inference::{ InferCtx };
+import compiler::types::type_ref::{ TypeRef };
 
 
 // ResolutionContext: context for type resolution
 
+/// One type parameter bound to a type, keyed by the parameter's symbol.
+///
+/// The spelling rides along for the one consumer that mints an arena
+/// parameter type from a binding (`cache_derived_trait_params`); it is
+/// never what a binding is looked up by.  Two parameters may share a
+/// spelling - a trait default's own `<U>` and the `implement<U>` its body is
+/// copied under - and only the symbol says which one a written `U` names.
+type struct GenericBinding {
+    sym:  SymbolID;
+    name: SymbolStr;
+    ty:   TypeRef;
+}
+
+/// An associated type of `This` bound to a type, keyed by the trait and the
+/// type's position among that trait's associated types (the `assoc-type`
+/// door's answer).
+type struct AssocBinding {
+    trait_def: DefId;
+    slot:      i64;
+    ty:        TypeRef;
+}
+
 /// Ambient state needed while resolving type annotations.
 type struct ResolutionContext {
-    current_module:   string;
+    /// The module an instantiation resolved through this context is demanded
+    /// for, so per-module codegen emits it there.
     source_file:      string;
-    import_modules:   string[];     // Modules imported by this compilation unit
-    generic_bindings: Pair<SymbolStr, TypeRef>[];  // generic name -> bound TypeRef
+    generic_bindings: GenericBinding[];
+    /// An associated type of `This` bound to a type: `This::Item` in a
+    /// default's body under an impl that binds `Item`.  A separate table
+    /// because an associated type is not a symbol the name layer declares -
+    /// its identity is the trait's and its position there - so it cannot
+    /// share the parameters' key.
+    assoc_bindings:   AssocBinding[];
     /// What `This` resolves to in the current scope.
     /// Inside an impl block: the implementing type (same as `&this` owner).
     /// Inside a trait decl: a synthetic GenericParam("This") placeholder
     /// that downstream substitution rewrites to the impl target.
     /// Invalid outside trait/impl scopes; using `This` there is an error.
     this_type:        TypeRef;
-
-    /// Module namespace the annotation being resolved was WRITTEN in, or "" when
-    /// unknown.
-    ///
-    /// A type annotation is syntax, and a bare leaf in it means whatever that
-    /// leaf means in ITS module - not in whichever module the resolver's ambient
-    /// scope cursor happens to be parked on. Those coincide while a pass walks
-    /// declarations in order, and diverge whenever an annotation is re-resolved
-    /// from somewhere else: sema re-deriving a callee's return type while
-    /// checking a caller, mono re-resolving a template signature while
-    /// specializing. There the ambient cursor names the CALLER's module, and a
-    /// bare leaf both modules define binds to the wrong one - silently, since
-    /// both resolutions succeed.
-    ///
-    /// Set this to the annotation's owning module at any such re-resolution and
-    /// `resolve_named` will prefer that module's own declaration of the leaf.
-    /// Empty means "resolve as before, against the ambient scope chain", so a
-    /// site that does not know its home module keeps today's behavior.
-    home_module:      string;
 
     /// Demand-free (symbolic) resolution mode. When set, `resolve_generic`
     /// builds an arena-only `InstantiatedType` (via `arena.create_instantiation`)
@@ -68,34 +125,50 @@ type struct ResolutionContext {
     /// the registry with type-param-bearing instantiations.
     symbolic_no_demand: boolean;
 
-    static new(current_module: string, source_file: string) -> ResolutionContext {
+    /// A written annotation carries its own answer (the name layer's stamp), so
+    /// a context states no module of its own: what it carries is the generic
+    /// bindings in force, `This`, and the demand mode.
+    static new(source_file: string) -> ResolutionContext {
         return ResolutionContext {
-            current_module:   current_module,
             source_file:      source_file,
-            import_modules:   [],
             generic_bindings: [],
+            assoc_bindings:   [],
             this_type:        TypeRef::invalid(),
-            home_module:      "",
             symbolic_no_demand: false,
         };
     }
 
-    /// Declare which module the annotations resolved through this context were
-    /// written in.  See `home_module`.
-    set_home_module(mut &this, module_ns: string) -> void {
-        this.home_module = module_ns;
+    /// Bind the parameter `sym` was declared as to `bound_type`.  An invalid
+    /// symbol names no parameter - a written arg that is a concrete type, a
+    /// synthesized node nothing stamped - and binds nothing.
+    add_binding(mut &this, sym: SymbolID, name: SymbolStr, bound_type: TypeRef) -> void {
+        if (!sym.is_valid()) { return; }
+        this.generic_bindings.push(GenericBinding { sym: sym, name: name, ty: bound_type });
     }
 
-    /// Add a generic binding (e.g., T -> i32).
-    add_binding(mut &this, name: SymbolStr, bound_type: TypeRef) -> void {
-        this.generic_bindings.push(Pair<SymbolStr, TypeRef>::new(name, bound_type));
-    }
-
-    /// Look up a generic binding by name.
-    lookup_binding(&this, name: SymbolStr) -> TypeRef {
+    /// The type the parameter `sym` is bound to, or invalid.
+    lookup_binding(&this, sym: SymbolID) -> TypeRef {
         for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
-            if (this.generic_bindings[i].first.equals(name)) {
-                return this.generic_bindings[i].second;
+            if (this.generic_bindings[i].sym.equals(sym)) {
+                return this.generic_bindings[i].ty;
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Bind the `slot`-th associated type of the trait `trait_def` to
+    /// `bound_type`.
+    add_assoc_binding(mut &this, trait_def: DefId, slot: i64, bound_type: TypeRef) -> void {
+        this.assoc_bindings.push(AssocBinding { trait_def: trait_def, slot: slot, ty: bound_type });
+    }
+
+    /// The type the `slot`-th associated type of `trait_def` is bound to,
+    /// or invalid.
+    lookup_assoc_binding(&this, trait_def: DefId, slot: i64) -> TypeRef {
+        if (slot < 0) { return TypeRef::invalid(); }
+        for (mut i: i64 = 0; i < this.assoc_bindings.length; i++) {
+            if (this.assoc_bindings[i].slot == slot && this.assoc_bindings[i].trait_def.equals(trait_def)) {
+                return this.assoc_bindings[i].ty;
             }
         }
         return TypeRef::invalid();
@@ -110,19 +183,19 @@ type struct ResolutionContext {
     /// `generic_bindings` buffer between the original and the copy, so a
     /// later `push`/realloc on either invalidates the other and end-of-scope
     /// drop-glue frees one buffer twice (double-free).  This produces an
-    /// independent context with its own `generic_bindings` storage.  The
-    /// element type `Pair<SymbolStr, TypeRef>` is POD (interned ids), so the
-    /// per-element copies are trivial.  `import_modules` is reconstructed as
-    /// `[]` - it is never populated anywhere, matching the prior behavior.
+    /// independent context with its own binding storage.  The element types
+    /// are POD (interned ids), so the per-element copies are trivial.
     clone(&this) -> ResolutionContext {
-        mut out: ResolutionContext =
-            ResolutionContext::new(this.current_module, this.source_file);
+        mut out: ResolutionContext = ResolutionContext::new(this.source_file);
         out.this_type = this.this_type;
-        out.home_module = this.home_module;
         out.symbolic_no_demand = this.symbolic_no_demand;
         for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
-            out.add_binding(this.generic_bindings[i].first,
-                            this.generic_bindings[i].second);
+            out.add_binding(this.generic_bindings[i].sym,
+                            this.generic_bindings[i].name,
+                            this.generic_bindings[i].ty);
+        }
+        for (mut i: i64 = 0; i < this.assoc_bindings.length; i++) {
+            out.assoc_bindings.push(this.assoc_bindings[i]);
         }
         return out;
     }
@@ -133,13 +206,17 @@ type struct TypeResolver {
     arena:            TypeArena*;
     intern_table:     InternTable*;
     generic_registry: GenericRegistry*;
-    module_registry:  ModuleTypeRegistry*;
     name_resolver:    Resolver*;
     decl_index:       DeclarationIndex*;
+    /// File -> declaring namespace, for annotations this resolver re-resolves on
+    /// behalf of syntax it did not itself walk to.  An assoc-type binding comes
+    /// from an `implement` block that may live in neither the trait's nor the
+    /// target type's module, so the owning entity cannot supply the scope and
+    /// only the annotation's own file can.
+    module_graph:     ModuleGraph*;
     /// Folded module-level integer constants, for `T[NAME]` array sizes.
     const_table:      ConstantTable*;
     diagnostics:      DiagnosticSink*;
-    bootstrap_mode:   boolean;     // true during Phase 5 (TypeResolution) when DI is being populated
 
     /// Construct with all required dependencies.
     ///
@@ -148,20 +225,19 @@ type struct TypeResolver {
     /// GenericRegistry and become invisible to the Monomorphizer.
     static new(arena: TypeArena*, intern_table: InternTable*,
                generic_registry: GenericRegistry*,
-               module_registry: ModuleTypeRegistry*,
                name_resolver: Resolver*,
                decl_index: DeclarationIndex*,
-               const_table: ConstantTable*) -> TypeResolver {
+               const_table: ConstantTable*,
+               module_graph: ModuleGraph*) -> TypeResolver {
         return TypeResolver {
             arena:            arena,
             intern_table:     intern_table,
             generic_registry: generic_registry,
-            module_registry:  module_registry,
             name_resolver:    name_resolver,
             decl_index:       decl_index,
             const_table:      const_table,
+            module_graph:     module_graph,
             diagnostics:      null,
-            bootstrap_mode:   true,
         };
     }
 
@@ -169,14 +245,6 @@ type struct TypeResolver {
     set_diagnostics(mut &this, sink: DiagnosticSink*) -> void {
         this.diagnostics = sink;
     }
-
-    /// End bootstrap mode.  After this, resolve_named() uses only the
-    /// DeclarationIndex (step 3) and leaf-index (step 5).  Arena fallback
-    /// (steps 4, 5a) is disabled; all types should be in the DI.
-    end_bootstrap(mut &this) -> void {
-        this.bootstrap_mode = false;
-    }
-
 
     // Main resolve entry point
 
@@ -190,22 +258,25 @@ type struct TypeResolver {
     /// A size that will not fold is reported rather than left pending: a
     /// pending size reaches codegen as an array descriptor with no storage
     /// behind it, and every access through it is then a wild pointer.
-    array_size_of(&this, a: ArrayAnnotation*, ctx: ResolutionContext*) -> i64 {
+    array_size_of(&this, a: ArrayAnnotation*) -> i64 {
         if (a.size != ArrayAnnotation::fixed_pending_size()) { return a.size; }
         if (a.size_expr == null) { return a.size; }
 
-        const module_ns: SymbolStr = if (this.intern_table != null) {
-            this.intern_table.intern(ctx.current_module)
-        } else { SymbolStr::empty() };
-
+        // A bare constant in a size expression is read off its own stamp,
+        // which the resolver wrote with the annotation's file's imports in
+        // hand - not off the ambient cursor, which for a trait default's body
+        // is on the implementing type's module and not the trait's.
+        //
+        // No arena: a size is fixed here, and TypeLowering computes every
+        // layout later, so `sizeof`/`alignof` are not yet constants.
+        const ev: ConstEval = ConstEval::new(this.const_table, this.intern_table, null);
         mut folded: i64 = 0;
-        if (ConstantTable::fold_i64(a.size_expr, this.const_table, module_ns,
-                                     this.intern_table, &folded)) {
+        if (ev.fold(a.size_expr, &folded)) {
             if (folded < 0) {
                 if (this.diagnostics != null) {
                     this.diagnostics.emit(Diagnostic::error(
                         ErrorCode::E0239_NON_CONST_ARRAY_SIZE,
-                        format("array size must not be negative (folded to %ld)",
+                        fmt::format("array size must not be negative (folded to %ld)",
                                folded)).at(a.span));
                 }
                 return 0;
@@ -219,8 +290,8 @@ type struct TypeResolver {
                 ErrorCode::E0239_NON_CONST_ARRAY_SIZE,
                 "array size must be a compile-time integer constant")
                 .at(a.span)
-                .help("only integer literals and named integer constants "
-                      "may size an array"));
+                .help("a compile-time integer constant is an integer literal, "
+                      "a named constant, an enum variant, or arithmetic over them"));
         }
         return 0;
     }
@@ -233,13 +304,9 @@ type struct TypeResolver {
         }
 
         return match (*ann) {
-            TypeAnnotation::Primitive(p) => {
-                this.resolve_primitive(p.name)
-            }
+            TypeAnnotation::Primitive(p) => { this.resolve_primitive(p.name) }
             TypeAnnotation::Named(n) => {
-                if (n.pre_resolved.is_valid()) {
-                    return n.pre_resolved;
-                }
+                if (n.pre_resolved.is_valid()) { return n.pre_resolved; }
                 // Canonicalize a BARE all-default generic name to its default
                 // instantiation (`String` -> `String<GlobalAlloc>`) so a bare
                 // reference shares ONE TypeID with the explicit form - the single
@@ -248,7 +315,8 @@ type struct TypeResolver {
                 // The base of an explicit `String<...>` is resolved directly in
                 // resolve_generic and deliberately bypasses this, so it is NOT
                 // canonicalized here (which would nest as `String<GlobalAlloc><...>`).
-                this.canonicalize_default_generic_type(this.resolve_named(n.name, ctx))
+                this.canonicalize_default_generic_type(
+                    this.resolve_named(n.name, ctx, n.res, n.span))
             }
             TypeAnnotation::Pointer(p) => {
                 mut inner: TypeRef = this.resolve(p.inner, ctx);
@@ -278,7 +346,7 @@ type struct TypeResolver {
                 if (!elem.is_valid()) {
                     return TypeRef::invalid();
                 }
-                return this.arena.get_array_of(elem, this.array_size_of(a, ctx));
+                return this.arena.get_array_of(elem, this.array_size_of(a));
             }
             TypeAnnotation::Function(f) => {
                 this.resolve_function(f, ctx)
@@ -344,8 +412,13 @@ type struct TypeResolver {
 
         match (*proj.base) {
             TypeAnnotation::ThisType(_tt) => {
-                const b: TypeRef = ctx.lookup_binding(proj.member);
-                if (b.is_valid()) { return b; }
+                const owner_decl: TraitDeclNode* = if (this.generic_registry == null) { null } else {
+                    this.generic_registry.get_trait_decl(proj.owner_trait) };
+                if (owner_decl != null) {
+                    const b: TypeRef = ctx.lookup_assoc_binding(
+                        proj.owner_trait, owner_decl.assoc_type_index(proj.member));
+                    if (b.is_valid()) { return b; }
+                }
                 if (ctx.this_type.is_valid()) {
                     return this.project_from_base(ctx.this_type, proj, ctx);
                 }
@@ -364,95 +437,213 @@ type struct TypeResolver {
     /// looks up that type's impl binding (wired in Stage 3b).
     project_from_base(base_ty: TypeRef, proj: ProjectionAnnotation*,
                       ctx: ResolutionContext*) -> TypeRef {
-        return this.project_member(base_ty, proj.member, ctx);
+        return this.project_member(base_ty, proj.member, this.projection_trait(proj), ctx);
     }
 
-    /// Project associated type `member` off a resolved base type, yielding a
-    /// symbolic `AssocProjection`. A generic-param base stays symbolic until
-    /// specialization; a CONCRETE base (e.g. `IntSeq::Item` after `I` is bound
-    /// to `IntSeq` in a spec context) is reduced to the actual member type by
-    /// the monomorphizer's `reduce_projections` (which owns the impl-binding
-    /// lookup via `concrete_trait_args_for`). The resolver itself only forms
-    /// the projection node; it has no impl-instantiation machinery of its own.
+    /// The trait a written projection names: `I::Item` names the one among
+    /// `I`'s bounds that declares `Item`, `This::Item` the trait `This`
+    /// stands for where it was written.  Invalid when the source names none -
+    /// a projection written on a type, or `This` in an inherent impl.
+    projection_trait(&this, proj: ProjectionAnnotation*) -> TypeRef {
+        if (proj == null) { return TypeRef::invalid(); }
+        if (proj.rooted_at.is_valid()) { return this.bound_declaring(proj.rooted_at, proj.member); }
+        if (proj.owner_trait.is_valid()) { return this.trait_declaring(proj.owner_trait, proj.member); }
+        return TypeRef::invalid();
+    }
+
+    /// Project associated type `member` of the trait `owning_trait` off a
+    /// resolved base type; invalid when the projection names no trait or the
+    /// trait declares no `member`. A generic-param
+    /// base stays a symbolic `AssocProjection` carrying the trait, reduced when
+    /// the base is specialized; a CONCRETE base (`IntSeq::Item` after `I` is
+    /// bound to `IntSeq`) is read off the base's impl of that trait here.
+    ///
+    /// `member` is written where the projection is; the `assoc-type` door
+    /// turns it into the type's position in the trait, and nothing after
+    /// asks by the leaf again.
     project_member(&this, base_ty: TypeRef, member: SymbolStr,
-                   ctx: ResolutionContext*) -> TypeRef {
-        const bt: Type* = this.arena.lookup(base_ty.id);
+                   owning_trait: TypeRef, ctx: ResolutionContext*) -> TypeRef {
+        const owner: TraitDeclNode* = this.trait_decl_of(owning_trait);
+        const slot: i64 = if (owner == null) { -1 } else { owner.assoc_type_index(member) };
+        if (slot >= 0) { return this.project_slot(base_ty, owning_trait, slot); }
+        // The source names no trait, or the trait declares no such type: the
+        // name layer refused the projection where it is written, and there
+        // is nothing to project.
+        return TypeRef::invalid();
+    }
+
+    /// Project the `slot`-th associated type of the trait `owning_trait` off a
+    /// resolved base type, as `project_member` does once the door has
+    /// answered.  A generic-param base yields a symbolic projection; a
+    /// concrete one is read off its impl.
+    project_slot(&this, base_ty: TypeRef, owning_trait: TypeRef, slot: i64) -> TypeRef {
+        const bt: Type* = this.arena.lookup(base_ty);
         if (bt == null) { return TypeRef::invalid(); }
-        // Generic / still-symbolic base: keep it a symbolic projection, resolved
-        // when the base is specialized (the monomorphizer reduces it).
-        if (bt.kind == TypeKind::GenericParam || bt.kind == TypeKind::BoundedParam
-                || bt.kind == TypeKind::AssocProjection) {
-            return this.arena.create_assoc_projection(base_ty, member, TypeRef::invalid());
+        const owner: TraitDeclNode* = this.trait_decl_of(owning_trait);
+        if (owner == null || slot < 0 || slot >= owner.assoc_types.length || owner.assoc_types[slot] == null) {
+            return TypeRef::invalid();
         }
         // Concrete base (`IntSeq::Item`, `Range<i32>::Item`): resolve straight
         // to the member type by reading the base's trait-impl binding, so a
         // projection never enters an enclosing instantiation (`Option<i32>`,
         // not `Option<IntSeq::Item>`). Fall back to a symbolic projection if no
         // such impl/binding is found (a later pass diagnoses the real error).
-        const concrete: TypeRef = this.resolve_concrete_member(base_ty, member, ctx);
-        if (concrete.is_valid()) { return concrete; }
-        return this.arena.create_assoc_projection(base_ty, member, TypeRef::invalid());
+        if (bt.kind != TypeKind::GenericParam && bt.kind != TypeKind::AssocProjection) {
+            const concrete: TypeRef = this.concrete_projection(base_ty, slot, owning_trait);
+            if (concrete.is_valid()) { return concrete; }
+        }
+        return this.arena.create_assoc_projection(base_ty, owner.assoc_types[slot].name, owning_trait, slot);
     }
 
-    /// Bare (unqualified) leaf name of a type, for keying the trait-impl
-    /// registry. Generic instantiations key against the TEMPLATE's bare name.
-    /// Mirrors Monomorphizer::bare_name_of.
-    proj_bare_name(&this, ty: TypeRef) -> SymbolStr {
-        const t: Type* = this.arena.lookup(ty.id);
-        if (t == null) { return SymbolStr::empty(); }
-        const k: TypeKind = t.kind;
-        if (k == TypeKind::Int || k == TypeKind::Float || k == TypeKind::Bool ||
-            k == TypeKind::Char || k == TypeKind::String) {
-            return this.intern_table.intern(t.display_name());
-        }
-        // Instantiations key on the TEMPLATE's bare name.  Via `inst_generic_base`
-        // so this holds for a post-mono concrete too - it carries its own base,
-        // and without this a spec would key on its MANGLED name, which no
-        // trait-impl registry holds.
-        const inst_base: TypeRef = this.arena.inst_generic_base(ty);
-        if (inst_base.is_valid()) {
-            return this.proj_bare_name(inst_base);
-        }
-        const qname: SymbolStr = this.arena.get_qualified_name(ty);
-        if (!qname.is_valid()) { return SymbolStr::empty(); }
-        return this.symbol_bare_leaf(qname);
+    /// The registered declaration of the trait `trait_ty`, or null when it
+    /// names none.
+    trait_decl_of(&this, trait_ty: TypeRef) -> TraitDeclNode* {
+        if (this.generic_registry == null || this.decl_index == null) { return null; }
+        return this.generic_registry.get_trait_decl(this.decl_index.def_of(trait_ty, this.arena));
     }
 
-    /// Trailing `::`-separated segment of an interned name (`core::result::Result`
-    /// -> `Result`), or the name itself when unqualified. Shared by the type-side
-    /// key (`proj_bare_name`) and the annotation-side one so a bound written with
-    /// a qualified base compares equal to the type it projects to.
-    symbol_bare_leaf(&this, qname: SymbolStr) -> SymbolStr {
-        if (!qname.is_valid()) { return SymbolStr::empty(); }
-        const qstr: string = this.intern_table.resolve(qname);
-        const qlen: i64 = qstr.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < qlen; i++) {
-            if (qstr[i] == ':' && qstr[i + 1] == ':') { last_sep = i + 2; }
+    /// The `slot`-th associated type of the trait `owning_trait` read off the
+    /// concrete `base_ty`'s impl, or invalid - as it is when `owning_trait`
+    /// is invalid (the projection names no trait) or names no registered
+    /// trait.
+    concrete_projection(&this, base_ty: TypeRef, slot: i64, owning_trait: TypeRef) -> TypeRef {
+        const owner: TraitDeclNode* = this.trait_decl_of(owning_trait);
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        return this.resolve_concrete_member(base_ty, slot, owner, &rc);
+    }
+
+    /// `ty` with each associated-type projection whose base is concrete
+    /// replaced by the member type the base's implementation binds
+    /// (`Option<Range<i32>::Item>` is `Option<i32>`), innermost first, so an
+    /// outer projection's base is built from the reduced inner one.  With
+    /// `memo` the answer is also recorded on the projection type, which then
+    /// reads as concrete to every later question about any type holding it;
+    /// without it nothing already built is changed.
+    reduce_projections(&this, ty: TypeRef, memo: boolean) -> TypeRef {
+        if (!ty.is_valid()) { return ty; }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return ty; }
+        match (t.kind) {
+            TypeKind::AssocProjection => {
+                const proj: AssocProjectionType* = t as AssocProjectionType*;
+                if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
+                const base: TypeRef = this.reduce_projections(proj.base, memo);
+                const reduced: TypeRef = this.concrete_projection(base, proj.slot, proj.owning_trait);
+                if (!reduced.is_valid()) { return ty; }
+                if (memo) { proj.set_resolved_type(reduced); }
+                return reduced;
+            }
+            TypeKind::Pointer => {
+                const p: PointerType* = t as PointerType*;
+                const inner: TypeRef = this.reduce_projections(p.pointee, memo);
+                if (inner.equals(p.pointee)) { return ty; }
+                return this.arena.get_pointer_to(inner);
+            }
+            TypeKind::Reference => {
+                const r: ReferenceType* = t as ReferenceType*;
+                const inner: TypeRef = this.reduce_projections(r.referent, memo);
+                if (inner.equals(r.referent)) { return ty; }
+                return this.arena.get_reference_to(inner, r.mutability);
+            }
+            TypeKind::Array => {
+                const a: ArrayType* = t as ArrayType*;
+                const inner: TypeRef = this.reduce_projections(a.element, memo);
+                if (inner.equals(a.element)) { return ty; }
+                return this.arena.get_array_of(inner, a.size);
+            }
+            TypeKind::Optional => {
+                const o: OptionalType* = t as OptionalType*;
+                const inner: TypeRef = this.reduce_projections(o.wrapped, memo);
+                if (inner.equals(o.wrapped)) { return ty; }
+                return this.arena.get_optional_of(inner);
+            }
+            TypeKind::Function => {
+                const f: FunctionType* = t as FunctionType*;
+                const new_ret: TypeRef = this.reduce_projections(f.return_type, memo);
+                mut changed: boolean = !new_ret.equals(f.return_type);
+                mut new_params: TypeRef[] = [];
+                for (mut i: i64 = 0; i < f.param_types.length; i++) {
+                    const np: TypeRef = this.reduce_projections(f.param_types[i], memo);
+                    new_params.push(np);
+                    if (!np.equals(f.param_types[i])) { changed = true; }
+                }
+                if (!changed) { return ty; }
+                return this.arena.get_function(new_ret, new_params, f.is_variadic);
+            }
+            TypeKind::Tuple => {
+                const tup: TupleType* = t as TupleType*;
+                mut changed_t: boolean = false;
+                mut new_elems: TypeRef[] = [];
+                for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                    const ne: TypeRef = this.reduce_projections(tup.elements[i], memo);
+                    new_elems.push(ne);
+                    if (!ne.equals(tup.elements[i])) { changed_t = true; }
+                }
+                if (!changed_t) { return ty; }
+                return this.arena.get_tuple(new_elems);
+            }
+            TypeKind::InstantiatedType => {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                mut changed_i: boolean = false;
+                mut new_args: TypeRef[] = [];
+                for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                    const na: TypeRef = this.reduce_projections(inst.type_args[i], memo);
+                    new_args.push(na);
+                    if (!na.equals(inst.type_args[i])) { changed_i = true; }
+                }
+                if (!changed_i) { return ty; }
+                return this.arena.create_instantiation(inst.generic_base, new_args);
+            }
+            _ => { return ty; }
         }
-        if (last_sep < 0) { return qname; }
-        return this.intern_table.intern(qstr.substring(last_sep, qlen - last_sep));
+    }
+
+    /// The declaration a written annotation's head names, off its stamp;
+    /// invalid for a primitive, a type parameter or an unstamped head, none
+    /// of which is a template.
+    ann_head_def(&this, ann: TypeAnnotation*) -> DefId {
+        if (ann == null) { return DefId::invalid(); }
+        return match (*ann) {
+            TypeAnnotation::Named(n) => {
+                match (n.res) {
+                    ResSlot::Answered(r) => {
+                        match (r) {
+                            Res::Def(d) => { d }
+                            _           => { DefId::invalid() }
+                        }
+                    }
+                    _ => { DefId::invalid() }
+                }
+            }
+            _ => { DefId::invalid() }
+        };
     }
 
     /// Resolve a concrete `Base::Member` projection to the member's actual type
-    /// by finding the trait (declaring `member`) that `Base` implements and
-    /// reading that impl's binding for `member` (the positional trait arg under
-    /// the sugar, or an explicit `type Item = ...` body binding), instantiated
-    /// against `Base`'s own type arguments. Returns invalid when none applies.
-    resolve_concrete_member(&this, base_ty_in: TypeRef, member: SymbolStr,
-                            ctx: ResolutionContext*) -> TypeRef {
+    /// by reading `Base`'s impl of the trait that declares it (the positional
+    /// trait arg under the sugar, or an explicit `type Item = ...` body
+    /// binding), instantiated against `Base`'s own type arguments.  The
+    /// member is the trait's `slot`-th associated type (the `assoc-type`
+    /// door's answer); -1 has no answer.
+    ///
+    /// `owner` is the trait the projection names - the bound of the parameter
+    /// it was written on, the trait `This` stands for, or the trait a caller
+    /// is asking about - and only that trait answers.  Null means the source
+    /// names none, and then there is no answer: which of `Base`'s traits
+    /// declaring something of that name was meant is not a question a
+    /// search can settle.  Invalid when nothing applies.
+    resolve_concrete_member(&this, base_ty_in: TypeRef, slot: i64,
+                            owner: TraitDeclNode*, ctx: ResolutionContext*) -> TypeRef {
         if (this.generic_registry == null) { return TypeRef::invalid(); }
         // The base is used directly whether it is a pre-mono InstantiatedType
-        // wrapper or a post-mono concrete spec: `proj_bare_name` resolves either to
-        // the TEMPLATE's bare name, and the args below come from the same
-        // representation-neutral views.  (This used to recover the origin carrier
-        // first, because a concrete spec answered with its mangled name and no
-        // type_args.)
+        // wrapper or a post-mono concrete spec: `carries_impl_key` asks the
+        // TEMPLATE for either, and the args below come from the same
+        // representation-neutral views.
         const base_ty: TypeRef = base_ty_in;
-        const bt: Type* = this.arena.lookup(base_ty.id);
+        const bt: Type* = this.arena.lookup(base_ty);
         if (bt == null) { return TypeRef::invalid(); }
-        const bare: SymbolStr = this.proj_bare_name(base_ty);
-        if (!bare.is_valid()) { return TypeRef::invalid(); }
+        if (!this.arena.carries_impl_key(base_ty, this.intern_table)) { return TypeRef::invalid(); }
+        if (owner == null) { return TypeRef::invalid(); }
 
         // Element-wise copy, NOT a by-value array assignment: that would alias the
         // type's owning `type_args` buffer, and dropping the local at function exit
@@ -468,59 +659,48 @@ type struct TypeResolver {
 
         for (mut i: i64 = 0; i < this.generic_registry.trait_decl_nodes.length; i++) {
             const tdecl: TraitDeclNode* = this.generic_registry.trait_decl_nodes[i];
-            if (tdecl == null) { continue; }
-            mut assoc_pos: i64 = -1;
-            for (mut a: i64 = 0; a < tdecl.assoc_types.length; a++) {
-                if (tdecl.assoc_types[a] != null
-                        && tdecl.assoc_types[a].name.equals(member)) {
-                    assoc_pos = a;
-                    break;
-                }
-            }
-            if (assoc_pos < 0) { continue; }
+            if (tdecl != owner) { continue; }
+            const assoc_pos: i64 = slot;
+            if (assoc_pos < 0 || assoc_pos >= tdecl.assoc_types.length) { continue; }
+            // The WRITTEN head, whose positional trait arguments carry the
+            // binding; a placed clone has substituted them away.
             const impl_node: ImplBlockNode* =
-                OwnershipQuery::resolve_trait_impl_for_type(this.arena,
-                    this.generic_registry, this.intern_table, tdecl.name, base_ty);
+                this.generic_registry.template_head_for(
+                    this.generic_registry.trait_decl_keys[i], base_ty, this.intern_table);
             if (impl_node == null) { continue; }
 
-            // The binding annotation: positional trait arg (sugar) at
-            // generic-params + assoc index, else an explicit body binding.
-            mut ann: TypeAnnotation* = null;
-            const idx: i64 = tdecl.generic_params.length + assoc_pos;
-            if (impl_node.trait_annotation != null) {
-                match (*impl_node.trait_annotation) {
-                    TypeAnnotation::Generic(g) => {
-                        if (idx < g.args.length) { ann = g.args[idx]; }
-                    }
-                    _ => {}
-                }
-            }
-            if (ann == null) { ann = impl_node.lookup_assoc_binding(member); }
+            const ann: TypeAnnotation* = impl_node.trait_slot_annotation(
+                tdecl, tdecl.generic_params.length + assoc_pos);
             if (ann == null) { continue; }
 
             // Resolve the binding with the impl's target params bound to the
             // base's concrete args (`T -> i32` for `Range<i32>`); empty for a
             // non-generic base like `IntSeq`.
-            mut bctx: ResolutionContext = ResolutionContext::new("", "");
+            // `ann` is the impl block's own text, so its scope is the file that
+            // block is written in.  Neither the trait nor the target type can
+            // stand in for it: an `implement` block may live in a third module
+            // again, and this context's other input is a type-param binding,
+            // which carries no module at all.
+            mut bctx: ResolutionContext = ResolutionContext::new("");
             if (impl_node.target_args.length == base_args.length) {
                 for (mut ti: i64 = 0; ti < impl_node.target_args.length; ti++) {
                     const ta: TypeAnnotation* = impl_node.target_args[ti];
                     if (ta == null) { continue; }
                     match (*ta) {
-                        TypeAnnotation::Named(n) => { bctx.add_binding(n.name, base_args[ti]); }
+                        TypeAnnotation::Named(n) => { bctx.add_binding(n.param_sym(), n.name, base_args[ti]); }
                         _ => {}
                     }
                 }
             }
             // An adapter whose item is carried only by a where-bound
             // (`implement<I,A> Iterator<A> for TakeIter<I> where I: Iterator<A>`)
-            // names `A` in its `Item` binding, but `A` is not a target param - 
+            // names `A` in its `Item` binding, but `A` is not a target param -
             // it is determined by `I: Iterator<A>` once `I` is concrete. Derive
             // those where-clause generics into `bctx` so the binding resolves.
             this.derive_where_assoc_bindings(impl_node, &bctx);
             const r: TypeRef = this.resolve(ann, &bctx);
             if (r.is_valid()) {
-                const rt: Type* = this.arena.lookup(r.id);
+                const rt: Type* = this.arena.lookup(r);
                 // Guard against returning another unresolved projection.
                 if (rt != null && rt.kind != TypeKind::AssocProjection) {
                     return r;
@@ -528,6 +708,80 @@ type struct TypeResolver {
             }
         }
         return TypeRef::invalid();
+    }
+
+    /// The trait `param`'s `where` clauses bound it by that declares the
+    /// associated type `member`, as the trait's type; invalid when none of
+    /// its bounds does, or when two do and the projection names neither.
+    bound_declaring(&this, param: SymbolID, member: SymbolStr) -> TypeRef {
+        if (this.name_resolver == null) { return TypeRef::invalid(); }
+        const bounds: DefId[] = this.name_resolver.bounds_of_param(param);
+        mut found: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i < bounds.length; i++) {
+            const trait_ty: TypeRef = this.trait_declaring(bounds[i], member);
+            if (!trait_ty.is_valid()) { continue; }
+            if (found.is_valid() && !found.equals(trait_ty)) { return TypeRef::invalid(); }
+            found = trait_ty;
+        }
+        return found;
+    }
+
+    /// The trait among `trait_def` and the traits it inherits that declares
+    /// the associated type `member`, as the trait's type: `Item` asked of a
+    /// `DoubleEnded` that extends `Iterator` is `Iterator`.  Invalid when
+    /// none of them does, or when two different ones do.
+    trait_declaring(&this, trait_def: DefId, member: SymbolStr) -> TypeRef {
+        if (this.decl_index == null || this.generic_registry == null) { return TypeRef::invalid(); }
+        const traits: DefId[] = this.generic_registry.trait_and_supertraits(trait_def);
+        mut found: DefId = DefId::invalid();
+        for (mut i: i64 = 0; i < traits.length; i++) {
+            const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(traits[i]);
+            if (tdecl == null || tdecl.assoc_type_index(member) < 0) { continue; }
+            if (found.is_valid() && !found.equals(traits[i])) { return TypeRef::invalid(); }
+            found = traits[i];
+        }
+        if (!found.is_valid()) { return TypeRef::invalid(); }
+        return this.decl_index.type_of_def(found);
+    }
+
+    /// The concrete trait arguments `subject`'s impl of `trait_id` gives, one
+    /// per trait slot (generic parameters, then associated types in
+    /// declaration order - the order a bound's trait arguments are written
+    /// in), read off the WRITTEN impl with its target parameters bound to the
+    /// subject's arguments and its own where-derived parameters derived.  A
+    /// slot the impl leaves unbound is invalid; empty when `subject` has no
+    /// impl of the trait.  `Count` with `type Item = i32;` in its impl body
+    /// and `Range<i32>` with `Iterator<T>` in its head both answer `[i32]`.
+    concrete_trait_slots(&this, subject: TypeRef, trait_id: DefId) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        if (this.generic_registry == null) { return out; }
+        const impl_node: ImplBlockNode* =
+            this.generic_registry.template_head_for(trait_id, subject, this.intern_table);
+        if (impl_node == null) { return out; }
+        const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(trait_id);
+        if (tdecl == null) { return out; }
+        // `ann` is the impl block's own text; its scope is the file that
+        // block is written in, never the subject's or the asker's.
+        mut bctx: ResolutionContext = ResolutionContext::new("");
+        const nargs: i64 = this.arena.inst_type_arg_count(subject);
+        if (nargs > 0 && impl_node.target_args.length == nargs) {
+            for (mut ti: i64 = 0; ti < nargs; ti++) {
+                const ta: TypeAnnotation* = impl_node.target_args[ti];
+                if (ta == null) { continue; }
+                match (*ta) {
+                    TypeAnnotation::Named(n) => {
+                        bctx.add_binding(n.param_sym(), n.name, this.arena.inst_type_arg_at(subject, ti));
+                    }
+                    _ => {}
+                }
+            }
+            this.derive_where_assoc_bindings(impl_node, &bctx);
+        }
+        for (mut slot: i64 = 0; slot < tdecl.slot_count(); slot++) {
+            const ann: TypeAnnotation* = impl_node.trait_slot_annotation(tdecl, slot);
+            out.push(if (ann == null) { TypeRef::invalid() } else { this.resolve(ann, &bctx) });
+        }
+        return out;
     }
 
     /// Bind impl where-clause-derived generics into `bctx` for projection
@@ -547,28 +801,37 @@ type struct TypeResolver {
         if (impl_node == null) { return; }
         for (mut bi: i64 = 0; bi < impl_node.where_bounds.length; bi++) {
             const bound: TraitBound* = &impl_node.where_bounds[bi];
-            const subject: TypeRef = bctx.lookup_binding(bound.type_parameter);
+            const subject: TypeRef = bctx.lookup_binding(bound.subject_sym);
             if (!subject.is_valid()) { continue; }
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
                 const tdecl: TraitDeclNode* =
-                    this.generic_registry.get_trait_decl(trait_leaf);
+                    this.generic_registry.get_trait_decl(tr.definition());
                 if (tdecl == null) { continue; }
                 const ngp: i64 = tdecl.generic_params.length;
+                // A generic-parameter slot (`A` in `I: Iterator<A>`) is what
+                // the subject's own impl of the trait writes there, itself
+                // derived from that impl's where-clause when it must be - so
+                // a chain of adapters bottoms out at its source.
+                if (ngp > 0 && tr.type_args.length > 0) {
+                    const slots: TypeRef[] = this.concrete_trait_slots(subject, tr.definition());
+                    for (mut gi: i64 = 0; gi < ngp && gi < tr.type_args.length && gi < slots.length; gi++) {
+                        if (tr.type_args[gi] == null || !slots[gi].is_valid()) { continue; }
+                        this.bind_where_arg_into_ctx(tr.type_args[gi], slots[gi], bctx);
+                    }
+                }
                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
                     // Positional args fill generic params first, then assoc
-                    // types; only the assoc-type slots derive a member here.
+                    // types; the assoc-type slots derive a member here.
                     if (ai < ngp) { continue; }
                     const assoc_idx: i64 = ai - ngp;
                     if (assoc_idx >= tdecl.assoc_types.length) { continue; }
                     if (tdecl.assoc_types[assoc_idx] == null) { continue; }
                     const arg_ann: TypeAnnotation* = tr.type_args[ai];
                     if (arg_ann == null) { continue; }
-                    const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
                     const derived: TypeRef =
-                        this.resolve_concrete_member(subject, member, bctx);
+                        this.resolve_concrete_member(subject, assoc_idx, tdecl, bctx);
                     if (derived.is_valid()) {
                         this.bind_where_arg_into_ctx(arg_ann, derived, bctx);
                     }
@@ -588,19 +851,19 @@ type struct TypeResolver {
         if (ta == null || !concrete.is_valid()) { return; }
         match (*ta) {
             TypeAnnotation::Named(n) => {
-                if (!bctx.lookup_binding(n.name).is_valid()) {
-                    bctx.add_binding(n.name, concrete);
+                if (!bctx.lookup_binding(n.param_sym()).is_valid()) {
+                    bctx.add_binding(n.param_sym(), n.name, concrete);
                 }
             }
             TypeAnnotation::Pointer(p) => {
-                const ct: Type* = this.arena.lookup(concrete.id);
+                const ct: Type* = this.arena.lookup(concrete);
                 if (ct != null && ct.kind == TypeKind::Pointer) {
                     this.bind_where_arg_into_ctx(p.inner,
                         (ct as PointerType*).pointee, bctx);
                 }
             }
             TypeAnnotation::Reference(r) => {
-                const ct: Type* = this.arena.lookup(concrete.id);
+                const ct: Type* = this.arena.lookup(concrete);
                 if (ct != null && ct.kind == TypeKind::Reference) {
                     this.bind_where_arg_into_ctx(r.inner,
                         (ct as ReferenceType*).referent, bctx);
@@ -619,7 +882,7 @@ type struct TypeResolver {
     /// each still-unbound assoc-slot param, project the trait's assoc type off the
     /// now-bound subject and fill it, so argument inference alone settles a
     /// return-only / bound-only param without a turbofish or expected-type hint.
-    /// `param_names[i]` MUST align with `ictx.bindings[i]` (the caller builds the
+    /// `param_syms[i]` MUST align with `ictx.bindings[i]` (the caller builds the
     /// InferCtx from the same ordered param list). Index-keyed analogue of the
     /// impl-side `derive_where_assoc_bindings`; an existing binding is kept.
     ///
@@ -645,13 +908,13 @@ type struct TypeResolver {
     /// unspecialized (E0636). Outside the symbolic walk an abstract subject has no
     /// findable impl, so it still derives nothing.
     project_where_bound_params_into(&this, trait_bounds: &TraitBound[],
-                                    param_names: &SymbolStr[], ictx: InferCtx*,
+                                    param_syms: &SymbolID[], ictx: InferCtx*,
                                     source_file: string, symbolic: boolean) -> void {
         if (this.generic_registry == null) { return; }
         for (mut bi: i64 = 0; bi < trait_bounds.length; bi++) {
             const bound: TraitBound* = &trait_bounds[bi];
             if (bound.has_projection_subject()) { continue; }
-            const s: i64 = this.param_name_slot(param_names, bound.type_parameter);
+            const s: i64 = this.param_slot(param_syms, bound.subject_sym);
             if (s < 0 || s >= ictx.bindings.length) { continue; }
             const subject: TypeRef = ictx.bindings[s];
             if (!subject.is_valid()) { continue; }
@@ -660,8 +923,7 @@ type struct TypeResolver {
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
-                const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(trait_leaf);
+                const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(tr.definition());
                 if (tdecl == null) { continue; }
                 const ngp: i64 = tdecl.generic_params.length;
                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
@@ -678,54 +940,57 @@ type struct TypeResolver {
                     // only by destructuring what the projection yields, which
                     // `bind_where_arg_params_from` does below. Both need the same
                     // projection, so decide which case this is, then project once.
-                    const j: i64 = this.where_arg_param_slot(arg_ann, param_names);
+                    const j: i64 = this.where_arg_param_slot(arg_ann, param_syms);
                     if (j >= 0) {
                         if (j >= ictx.bindings.length || ictx.bindings[j].is_valid()) { continue; }
                     } else {
                         // Nothing left to solve in this arg: don't pay for a lookup.
-                        if (!this.where_arg_has_unbound_param(arg_ann, param_names, ictx)) { continue; }
+                        if (!this.where_arg_has_unbound_param(arg_ann, param_syms, ictx)) { continue; }
                     }
-                    mut rc: ResolutionContext = ResolutionContext::new(source_file, "");
-                    const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
+                    mut rc: ResolutionContext = ResolutionContext::new("");
                     if (subject_abstract) {
-                        // `project_member` keeps an abstract base symbolic, giving
+                        // `project_slot` keeps an abstract base symbolic, giving
                         // the projection mono reduces once the base specializes.
                         // Only a bare param can adopt that opaque projection whole;
                         // a compound arg has no structure to pair against until the
                         // base specializes, so it derives nothing here.
                         if (j < 0) { continue; }
-                        const sym_d: TypeRef = this.project_member(subject, member, &rc);
+                        const sym_d: TypeRef = this.project_slot(
+                            subject, this.decl_index.type_of_def(tdecl.def), assoc_idx);
                         if (sym_d.is_valid()) { ictx.bind_slot(j, sym_d); }
                         continue;
                     }
-                    const derived: TypeRef = this.resolve_concrete_member(subject, member, &rc);
+                    const derived: TypeRef = this.resolve_concrete_member(subject, assoc_idx, tdecl, &rc);
                     if (!derived.is_valid() || this.arena.contains_generic_param(derived)) { continue; }
                     if (j >= 0) {
                         ictx.bind_slot(j, derived);
                     } else {
-                        this.bind_where_arg_params_from(arg_ann, param_names, derived, ictx);
+                        this.bind_where_arg_params_from(arg_ann, param_syms, derived, ictx);
                     }
                 }
             }
         }
     }
 
-    /// Index of `name` in an ordered generic-param-name list, or -1. The list,
-    /// the caller's param-id list, and the InferCtx's `bindings` share one index
-    /// space (all built from the same ordered generic params).
-    param_name_slot(&this, param_names: &SymbolStr[], name: SymbolStr) -> i64 {
-        for (mut i: i64 = 0; i < param_names.length; i++) {
-            if (param_names[i].equals(name)) { return i; }
+    /// Index of the parameter `sym` in an ordered generic-param list, or -1.
+    /// The list, the caller's arena param-id list, and the InferCtx's
+    /// `bindings` share one index space (all built from the same ordered
+    /// generic params).  An invalid symbol - a spelling that is no parameter
+    /// of this list's owner - is in no slot.
+    param_slot(&this, param_syms: &SymbolID[], sym: SymbolID) -> i64 {
+        if (!sym.is_valid()) { return -1; }
+        for (mut i: i64 = 0; i < param_syms.length; i++) {
+            if (param_syms[i].equals(sym)) { return i; }
         }
         return -1;
     }
 
     /// The param-list index a where-bound trait arg names, or -1 when it is not a
     /// bare `Named` parameter reference (a wrapped/concrete arg derives nothing).
-    where_arg_param_slot(&this, ta: TypeAnnotation*, param_names: &SymbolStr[]) -> i64 {
+    where_arg_param_slot(&this, ta: TypeAnnotation*, param_syms: &SymbolID[]) -> i64 {
         if (ta == null) { return -1; }
         match (*ta) {
-            TypeAnnotation::Named(n) => { return this.param_name_slot(param_names, n.name); }
+            TypeAnnotation::Named(n) => { return this.param_slot(param_syms, n.param_sym()); }
             _                       => { return -1; }
         }
     }
@@ -735,18 +1000,18 @@ type struct TypeResolver {
     /// `project_where_bound_params_into`: an arg that can bind nothing new must
     /// not pay for the lookup, which keeps the cost of the compound case on the
     /// bounds that actually need it.
-    where_arg_has_unbound_param(&this, ta: TypeAnnotation*, param_names: &SymbolStr[],
+    where_arg_has_unbound_param(&this, ta: TypeAnnotation*, param_syms: &SymbolID[],
                                 ictx: InferCtx*) -> boolean {
         if (ta == null) { return false; }
         match (*ta) {
             TypeAnnotation::Named(n) => {
-                const s: i64 = this.param_name_slot(param_names, n.name);
+                const s: i64 = this.param_slot(param_syms, n.param_sym());
                 if (s < 0 || s >= ictx.bindings.length) { return false; }
                 return !ictx.bindings[s].is_valid();
             }
             TypeAnnotation::Generic(g) => {
                 for (mut i: i64 = 0; i < g.args.length; i++) {
-                    if (this.where_arg_has_unbound_param(g.args[i], param_names, ictx)) { return true; }
+                    if (this.where_arg_has_unbound_param(g.args[i], param_syms, ictx)) { return true; }
                 }
                 return false;
             }
@@ -769,26 +1034,30 @@ type struct TypeResolver {
     /// shape mismatch is a silent no-op rather than an error: this is inference,
     /// and `check_call_where_bounds` is what rejects a bound the subject really
     /// fails to satisfy.
-    bind_where_arg_params_from(&this, ta: TypeAnnotation*, param_names: &SymbolStr[],
+    bind_where_arg_params_from(&this, ta: TypeAnnotation*, param_syms: &SymbolID[],
                                actual: TypeRef, ictx: InferCtx*) -> void {
         if (ta == null || !actual.is_valid()) { return; }
         match (*ta) {
             TypeAnnotation::Named(n) => {
-                const s: i64 = this.param_name_slot(param_names, n.name);
+                const s: i64 = this.param_slot(param_syms, n.param_sym());
                 if (s >= 0) { ictx.bind_slot(s, actual); }
             }
             TypeAnnotation::Generic(g) => {
                 if (g.base == null) { return; }
-                const want: SymbolStr = match (*g.base) {
-                    TypeAnnotation::Named(bn) => { this.symbol_bare_leaf(bn.name) }
-                    _                         => { SymbolStr::empty() }
-                };
+                // The written base and the projected type destructure against
+                // each other only when they are ONE template: the definition
+                // the base's stamp names beside the one the type instantiates,
+                // never their names, which would pair a bound written against
+                // one module's `Result<T, E>` with another module's.
+                if (this.decl_index == null) { return; }
+                const want: DefId = this.ann_head_def(g.base);
                 if (!want.is_valid()) { return; }
-                const got: SymbolStr = this.proj_bare_name(actual);
-                if (!got.is_valid() || !got.equals(want)) { return; }
+                const base_ty: TypeRef = this.arena.inst_generic_base(actual);
+                if (!base_ty.is_valid()) { return; }
+                if (!this.decl_index.def_of(base_ty, this.arena).equals(want)) { return; }
                 if (this.arena.inst_type_arg_count(actual) != g.args.length) { return; }
                 for (mut i: i64 = 0; i < g.args.length; i++) {
-                    this.bind_where_arg_params_from(g.args[i], param_names,
+                    this.bind_where_arg_params_from(g.args[i], param_syms,
                                                     this.arena.inst_type_arg_at(actual, i), ictx);
                 }
             }
@@ -844,6 +1113,25 @@ type struct TypeResolver {
             }
         }
 
+        // A `where` clause's projection subject (`This::Item: Ord`) is
+        // resolved with the signature, in the signature's context: in an
+        // implementation's copy of a trait default that context binds the
+        // implementation's associated types, which no later reader of the
+        // bound holds.  Only a projection that reduced is kept; a copy of the
+        // annotation drops it, so a specialization resolves its own.
+        for (mut b: i64 = 0; b < func.trait_bounds.length; b++) {
+            const bound: TraitBound* = &func.trait_bounds[b];
+            if (!bound.has_projection_subject()) { continue; }
+            match (*bound.subject_type) {
+                TypeAnnotation::Projection(proj) => {
+                    if (proj.resolved.is_valid()) { continue; }
+                    const subject: TypeRef = this.resolve(bound.subject_type, res_ctx);
+                    const st: Type* = this.arena.lookup(subject);
+                    if (st != null && st.kind != TypeKind::AssocProjection) { proj.resolved = subject; }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Infer the concrete type an `implement Trait` return annotation stands for,
@@ -891,10 +1179,17 @@ type struct TypeResolver {
             return TypeRef::invalid();
         }
         const sl: StructLiteralNode* = expr as StructLiteralNode*;
+        // The literal already carries what its own name refers to, so the
+        // annotation synthesized from it inherits that answer instead of
+        // being handed a `Pending` for a name that is in fact resolved.  A
+        // synthesized node has no span to key a side table on and no writing
+        // module of its own, so an answer it does not carry is one no later
+        // consumer can recover.
         const name_ann: NamedAnnotation* = new NamedAnnotation {
             name:         sl.struct_type,
             span:         SourceSpan::none(),
             pre_resolved: TypeRef::invalid(),
+            res:          sl.res,
         };
         mut result_ann: TypeAnnotation* = new TypeAnnotation::Named(name_ann);
         if (sl.generic_args.length > 0) {
@@ -979,17 +1274,15 @@ type struct TypeResolver {
     resolve_method_signatures(&this, methods: &MethodNode*[],
                               res_ctx: ResolutionContext*,
                               owner_type: TypeRef,
-                              owner_qname: SymbolStr) -> void {
-        const this_ref_name: SymbolStr = this.intern_table.intern("&this");
-        const this_val_name: SymbolStr = this.intern_table.intern("this");
-        // Bind `This` to the impl's owner type for the duration of method-
-        // signature resolution. `&This` annotations on parameters/returns
-        // resolve to `owner_type` here; the by-name back-fill at the bottom
-        // of this function still handles the implicit-typed `&this` receiver.
+                              owner_def: DefId,
+                              owner_args: &TypeRef[]) -> void {
+        // Bind `This` for the duration of method-signature resolution; the
+        // back-fill at the bottom of this function still types the
+        // implicit-typed `&this` receiver as `owner_type`.
         if (owner_type.is_valid()) {
-            res_ctx.set_this_type(owner_type);
+            res_ctx.set_this_type(this.owner_this_type(owner_type, owner_args, res_ctx));
         }
-        cdebug("[ResMthSig] count=%lld owner_id=%d\n", methods.length, owner_type.id as i32);
+        cdebug("[ResMthSig] count=%lld owner_id=%d\n", methods.length, owner_type.key() as i32);
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
@@ -1003,7 +1296,7 @@ type struct TypeResolver {
                 for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
                     const gp: GenericParamNode* = method.func.generic_params[j];
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
-                    method_ctx.add_binding(gp.name, gp_ref);
+                    method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
                 this.resolve_func_signature(method.func, &method_ctx);
             } else {
@@ -1017,7 +1310,7 @@ type struct TypeResolver {
             // grows the type args: `Option<T*>`, `Option<T**>`, ...).  Reuse the
             // `is_self_returning_default` path, whose operational meaning is
             // "skip every eager-materialization site, instantiate lazily at the
-            // call site" (MonoCallSpecializer::try_instantiate_self_returning_default
+            // call site" (MonoCallSpecializer::instantiate_deferred
             // materializes the spec'd copy on demand and discovers its return
             // type's instantiation there).  Only the self-growing method is
             // deferred - drop glue and all other methods stay eager, so the
@@ -1025,28 +1318,28 @@ type struct TypeResolver {
             // 0-own-generic instance methods because that is the only shape the
             // lazy call path materializes.
             //
-            // Compared by the owner's QUALIFIED NAME, not a `TypeRef`: for an
+            // Compared by the owner's DEFINITION, not a `TypeRef`: for an
             // `implement enum`/`implement` block the owner `TypeRef` handed in
             // is often invalid at this pass (the receiver is back-filled later),
             // so a TypeRef-identity check would silently never fire.
-            if (owner_qname.is_valid()
+            if (owner_def.is_valid()
                     && !method.func.is_generic()
                     && !method.is_static
                     && !method.func.is_self_returning_default
                     && !method.func.is_lazy_self_growing) {
+                const owner_base: TypeRef = this.decl_index.type_of_def(owner_def);
                 mut grows: boolean = method.func.resolved_return_type.is_valid()
                     && this.arena.is_self_growing_instantiation(
-                           method.func.resolved_return_type, owner_qname);
+                           method.func.resolved_return_type, owner_base);
                 if (!grows) {
                     for (mut gp: i64 = 0; gp < method.func.parameters.length; gp++) {
                         const gparam: VarDeclNode* = method.func.parameters[gp];
                         if (gparam == null || !gparam.resolved_type.is_valid()) { continue; }
                         // Skip the receiver: `&this`/`this` is the owner itself,
                         // never a superterm.
-                        if (gparam.name.equals(this_ref_name)
-                                || gparam.name.equals(this_val_name)) { continue; }
+                        if (gparam.is_receiver()) { continue; }
                         if (this.arena.is_self_growing_instantiation(
-                                gparam.resolved_type, owner_qname)) {
+                                gparam.resolved_type, owner_base)) {
                             grows = true;
                             break;
                         }
@@ -1066,9 +1359,9 @@ type struct TypeResolver {
             for (mut p: i64 = 0; p < method.func.parameters.length; p++) {
                 const param: VarDeclNode* = method.func.parameters[p];
                 if (param == null || param.resolved_type.is_valid()) { continue; }
-                if (param.name.equals(this_val_name)) {
+                if (param.is_value_receiver()) {
                     param.resolved_type = owner_type;
-                } else if (param.name.equals(this_ref_name)) {
+                } else if (param.is_ref_receiver()) {
                     param.resolved_type = this.arena.get_pointer_to(owner_type);
                 }
             }
@@ -1076,28 +1369,12 @@ type struct TypeResolver {
     }
 
     /// Create the arena TypeRef for a `GenericParamNode` at position `index`.
-    /// When the param has constraints (`<T: Eq + Hash>`), each constraint
-    /// name is resolved against the arena's leaf index to produce a trait
-    /// TypeRef and the param is created as a `BoundedParamType`. Constraints
-    /// that don't resolve fall back to a plain `GenericParamType`, which is better
-    /// than ICE'ing during partial-pipeline runs.
+    /// A bound on the param is not carried here: it is written in a `where`
+    /// clause on the enclosing declaration, so the arena entry is the bare
+    /// `GenericParamType` and consumers needing the bound read the clause.
     create_param_type(&this, gp: GenericParamNode*, index: u64) -> TypeRef {
         if (gp == null) { return TypeRef::invalid(); }
-        mut bounds: TypeRef[] = [];
-        for (mut k: i64 = 0; k < gp.constraints.length; k++) {
-            const trait_ref: TypeRef = this.arena.lookup_by_leaf(gp.constraints[k]);
-            if (trait_ref.is_valid()) {
-                bounds.push(trait_ref);
-            }
-        }
-        if (bounds.length > 0) {
-            return this.arena.create_bounded_param(gp.name, index, bounds);
-        }
-        // `bounds` is empty here but still an owning Array; drop it so it is
-        // consumed on this path too (create_bounded_param consumes it on the
-        // other), keeping the move state consistent.
-        bounds.drop();
-        return this.arena.create_generic_param(gp.name, index);
+        return this.arena.create_generic_param(gp.sym_id, gp.name, index);
     }
 
     /// Fill missing trailing args from a TemplateEntry's default annotations.
@@ -1118,15 +1395,46 @@ type struct TypeResolver {
             if (i >= params.length) { return filled; }
             const gp: GenericParamNode* = params[i];
             if (gp == null || !gp.has_default_annotation()) { return filled; }
+            // A default annotation (`struct String<A = GlobalAlloc>`) is syntax
+            // written in the TEMPLATE'S module and carries that module's answer
+            // as its stamp; the caller's context contributes only the bindings
+            // of the arguments resolved so far.
             mut def_ctx: ResolutionContext = ctx.clone();
             for (mut j: i64 = 0; j < filled.length; j++) {
-                def_ctx.add_binding(entry.param_names[j], filled[j]);
+                def_ctx.add_binding(entry.param_syms[j], entry.param_names[j], filled[j]);
             }
             const def_type: TypeRef = this.resolve(gp.default_annotation, &def_ctx);
             if (!def_type.is_valid()) { return filled; }
             filled.push(def_type);
         }
         return filled;
+    }
+
+    /// What `This` names in a method of `owner_type`: the owner itself, or,
+    /// for a generic owner, the owner over `args` - the declaration's own
+    /// parameters, or the arguments an impl head writes after `for`.  That
+    /// is what the owner written out (`Wrap<T>`) resolves to, so a parameter
+    /// typed `&This` is seen through an instance's substitution as
+    /// `&Wrap<i32>`; the bare template has no arguments to substitute and
+    /// matches no instance.
+    owner_this_type(&this, owner_type: TypeRef, args: &TypeRef[],
+                    ctx: ResolutionContext*) -> TypeRef {
+        if (args.length == 0 || this.generic_registry == null) { return owner_type; }
+        const entry: TemplateEntry* = this.generic_registry.template_of_type(owner_type);
+        if (entry == null || entry.param_count <= 0) { return owner_type; }
+        mut filled: TypeRef[] = [];
+        for (mut i: i64 = 0; i < args.length; i++) {
+            if (!args[i].is_valid()) { return owner_type; }
+            filled.push(args[i]);
+        }
+        if (filled.length < entry.param_count) {
+            filled = this.expand_default_type_args(entry, filled, ctx);
+        }
+        if (filled.length != entry.param_count) { return owner_type; }
+        if (ctx.symbolic_no_demand) {
+            return this.arena.create_instantiation(owner_type, &filled);
+        }
+        return this.generic_registry.instantiate(owner_type, filled);
     }
 
     /// Resolve all function signatures (FunctionDeclNode*[]) on a trait.
@@ -1140,11 +1448,8 @@ type struct TypeResolver {
                                     res_ctx: ResolutionContext*) -> void {
         if (!res_ctx.this_type.is_valid()) {
             const this_name: SymbolStr = this.intern_table.intern("This");
-            // Sentinel index well above any plausible real generic-param
-            // count. arena.create_generic_param dedups by (name.id, index),
-            // so every trait shares this canonical `This` placeholder.
-            const this_placeholder: TypeRef =
-                this.arena.create_generic_param(this_name, 0xFFFFFFFF as u64);
+            // Every trait shares the arena's one `This` placeholder.
+            const this_placeholder: TypeRef = this.arena.this_placeholder(this_name);
             res_ctx.set_this_type(this_placeholder);
         }
 
@@ -1157,7 +1462,7 @@ type struct TypeResolver {
                 for (mut j: i64 = 0; j < func.generic_params.length; j++) {
                     const gp: GenericParamNode* = func.generic_params[j];
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
-                    method_ctx.add_binding(gp.name, gp_ref);
+                    method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
                 this.resolve_func_signature(func, &method_ctx);
             } else {
@@ -1168,42 +1473,45 @@ type struct TypeResolver {
 
     /// Resolve a primitive type name to its arena singleton.  Public because
     /// sema reuses it to resolve `new T[n]` element types whose name is a
-    /// primitive keyword (`new int[100]`) - keeping one canonical name table.
+    /// primitive keyword (`new int[100]`).  The name is asked of the fixed
+    /// primitive table, and the position it answers with is the type.
     resolve_primitive(&this, name: SymbolStr) -> TypeRef {
-        LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_primitive() name='%s'", this.intern_table.resolve(name));
-        return match (this.intern_table.resolve(name)) {
-            "void"    => { this.arena.get_void() }
-            "boolean" => { this.arena.get_bool() }
-            "char"    => { this.arena.get_char() }
-            "string"  => { this.arena.get_string() }
-            "never"   => { this.arena.get_never() }
-            "va_list" => { this.arena.get_va_list() }
+        // An alias keyword's lexeme (`int`) reaches here off a keyword
+        // annotation, which carries no stamp; it names the primitive it
+        // folds to, and the fold has one home.
+        mut spelling: string = this.intern_table.resolve(name);
+        const canon: string = ResBase::primitive_of_alias(spelling);
+        if (canon.length() > 0) { spelling = canon; }
+        return this.primitive_at(ResBase::primitive_position(spelling));
+    }
 
-            "i8"      => { this.arena.get_i8() }
-            "i16"     => { this.arena.get_i16() }
-            "i32"     => { this.arena.get_i32() }
-            "i64"     => { this.arena.get_i64() }
-            "i128"    => { this.arena.get_i128() }
-
-            "u8"      => { this.arena.get_u8() }
-            "u16"     => { this.arena.get_u16() }
-            "u32"     => { this.arena.get_u32() }
-            "u64"     => { this.arena.get_u64() }
-            "u128"    => { this.arena.get_u128() }
-
-            "isize"   => { this.arena.get_isize() }
-            "usize"   => { this.arena.get_usize() }
-
-            "f32"     => { this.arena.get_f32() }
-            "f64"     => { this.arena.get_f64() }
-
-            "int"     => { this.arena.get_i32() }
-            "uint"    => { this.arena.get_u32() }
-            "float"   => { this.arena.get_f32() }
-            "double"  => { this.arena.get_f64() }
-
-            _         => { TypeRef::invalid() }
-        }
+    /// The arena singleton of the primitive at `pos` in the fixed primitive
+    /// table (`ResBase::primitive_position`); none for the unit type, which
+    /// is not one, and for a position the table does not hold.
+    primitive_at(&this, pos: i64) -> TypeRef {
+        return match (pos) {
+            1  => { this.arena.get_void() }
+            2  => { this.arena.get_bool() }
+            3  => { this.arena.get_char() }
+            4  => { this.arena.get_string() }
+            5  => { this.arena.get_i8() }
+            6  => { this.arena.get_i16() }
+            7  => { this.arena.get_i32() }
+            8  => { this.arena.get_i64() }
+            9  => { this.arena.get_i128() }
+            10 => { this.arena.get_u8() }
+            11 => { this.arena.get_u16() }
+            12 => { this.arena.get_u32() }
+            13 => { this.arena.get_u64() }
+            14 => { this.arena.get_u128() }
+            15 => { this.arena.get_isize() }
+            16 => { this.arena.get_usize() }
+            17 => { this.arena.get_f32() }
+            18 => { this.arena.get_f64() }
+            19 => { this.arena.get_never() }
+            20 => { this.arena.get_va_list() }
+            _  => { TypeRef::invalid() }
+        };
     }
 
     /// Fold an already-resolved BARE reference to a generic whose parameters
@@ -1228,13 +1536,13 @@ type struct TypeResolver {
     /// defaulted.
     canonicalize_default_generic_type(&this, ty: TypeRef) -> TypeRef {
         if (!ty.is_valid() || this.generic_registry == null) { return ty; }
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null) { return ty; }
         if (t.kind != TypeKind::Struct
                 && t.kind != TypeKind::Class
                 && t.kind != TypeKind::Enum) { return ty; }
         const entry: TemplateEntry* =
-            this.generic_registry.get_template_by_type_id(ty.id);
+            this.generic_registry.template_of_type(ty);
         if (entry == null || entry.param_count <= 0) { return ty; }
         const params: GenericParamNode*[] = entry.get_generic_params();
         if (params.length < entry.param_count) { return ty; }
@@ -1242,11 +1550,33 @@ type struct TypeResolver {
             const gp: GenericParamNode* = params[i];
             if (gp == null || !gp.has_default_annotation()) { return ty; }
         }
-        mut ctx: ResolutionContext = ResolutionContext::new("", "");
+        // The defaults carry their own stamps; this context holds nothing but
+        // the bindings `expand_default_type_args` adds.
+        mut ctx: ResolutionContext = ResolutionContext::new("");
         mut empty: TypeRef[] = [];
         const filled: TypeRef[] = this.expand_default_type_args(entry, empty, &ctx);
         if (filled.length != entry.param_count) { return ty; }
         return this.arena.create_instantiation(ty, &filled);
+    }
+
+    /// The type a dynamic `element[]` is laid out as and whose methods it
+    /// has: `Array<element>` with the template's defaults filled
+    /// (`Array<string, GlobalAlloc>`).  Before monomorphization it is the
+    /// instantiation, whose template's methods a call selects; after, the
+    /// same id holds the specialization.  Arena-only, like the default
+    /// canonicalization above: monomorphization demands `Array<element>`
+    /// for every concrete dynamic array it finds.  Invalid when the build
+    /// has no `Array`.
+    dynamic_array_type(&this, element: TypeRef) -> TypeRef {
+        if (!element.is_valid()) { return TypeRef::invalid(); }
+        const entry: TemplateEntry* = this.generic_registry.template_of(
+            this.generic_registry.wellknown(LangItem::Array));
+        if (entry == null) { return TypeRef::invalid(); }
+        mut ctx: ResolutionContext = ResolutionContext::new("");
+        mut args: TypeRef[] = [element];
+        args = this.expand_default_type_args(entry, args, &ctx);
+        if (args.length != entry.param_count) { return TypeRef::invalid(); }
+        return this.arena.create_instantiation(entry.base_type, &args);
     }
 
 
@@ -1267,7 +1597,7 @@ private:
         mut depth: i32 = 0;
         while (depth < 8) {
             if (!current.is_valid()) { return current; }
-            const t: Type* = this.arena.lookup(current.id);
+            const t: Type* = this.arena.lookup(current);
             if (t == null || t.kind != TypeKind::TypeAlias) { return current; }
             const alias: TypeAliasType* = t as TypeAliasType*;
             if (alias.is_generic) { return current; }
@@ -1278,55 +1608,34 @@ private:
         return current;
     }
 
-    /// Length of `ctx.home_module`, or 0 when the context is absent.
-    home_module_len(&this, ctx: ResolutionContext*) -> i64 {
-        if (ctx == null) { return 0; }
-        return ctx.home_module.length() as i64;
-    }
-
-    /// Scope of the module the annotation was written in, or an invalid scope
-    /// when the context does not name one (or it has no scope of its own).
-    home_scope_of(&this, ctx: ResolutionContext*) -> ScopeID {
-        if (this.home_module_len(ctx) == 0 || this.name_resolver == null) {
-            return ScopeID::invalid();
-        }
-        const sid: u64 = this.name_resolver.find_module_scope(ctx.home_module);
-        if (sid == 0) { return ScopeID::invalid(); }
-        return ScopeID { id: sid };
-    }
-
-    /// Canonical `<module>::<leaf>` for `name`, resolved as the annotation's OWN
-    /// module sees it whenever the context says which module that is.
-    ///
-    /// This is the step that stops annotation resolution depending on where the
-    /// compiler happens to be standing.  The ambient scope chain is consulted
-    /// only when the context cannot say - a site that has not yet been taught
-    /// its home module, which then behaves exactly as it did before.
-    canonical_type_name(&this, name: SymbolStr, ctx: ResolutionContext*) -> SymbolStr {
-        if (this.name_resolver == null) { return SymbolStr::empty(); }
-        const home: ScopeID = this.home_scope_of(ctx);
-        if (home.is_valid()) {
-            const via_home: SymbolStr =
-                this.name_resolver.resolve_type_qualified_name_from(home, name);
-            if (via_home.is_valid()) { return via_home; }
-        }
-        return this.name_resolver.resolve_type_qualified_name(name);
-    }
-
     /// Resolve a named type (user-defined or generic binding).
     ///
-    /// Fallback chain:
-    ///   1. Generic bindings (T -> i32 from enclosing generic context)
-    ///   2. Primitive name check (handles Named("i32") from generic substitution)
-    ///   3. Arena direct lookup by bare name (fast path for same-module types)
-    ///   4. Resolver scope chain + cross-module lookup -> qualified arena lookup
-    ///   5. Module type registry alias resolution (last resort)
-    resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*) -> TypeRef {
+    /// In order:
+    ///   1. Generic bindings (T -> i32 from enclosing generic context), asked
+    ///      by the parameter the stamp names, never by the spelling
+    ///   2. Primitive name check (a primitive spelling that reached Named
+    ///      position carrying no TypeRef of its own)
+    ///   2c. The name layer's stamp on the node - what the written spelling
+    ///      names, decided where its imports were in hand
+    ///
+    /// There is no step past 2c.  A spelling the stamp does not answer is
+    /// unresolved, and the caller diagnoses it: looking the written spelling
+    /// up in the index answers only for a spelling that IS a canonical name,
+    /// which is a synthesized node whose synthesizer holds the definition and
+    /// owes the stamp; resolving a leaf from the index's bare slot or from
+    /// the scope chain at the cursor would answer from what other modules
+    /// happen to exist rather than from what this one wrote.
+    resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*,
+                  slot: ResSlot, span: SourceSpan) -> TypeRef {
         const name_str: string = this.intern_table.resolve(name);
         const name_len: i64 = name_str.length() as i64;
         LOG_DEBUG(LogComponent::TypeChecker, "resolve_named() name='%s'", name_str);
-        // 1. Check generic bindings first (O(1) SymbolStr comparison)
-        mut binding: TypeRef = ctx.lookup_binding(name);
+        // 1. A type parameter, bound in the enclosing generic context.  The
+        //    stamp says WHICH parameter the spelling names; the binding
+        //    table is keyed by that and holds nothing under a spelling, so a
+        //    trait default's own `<U>` copied under an `implement<U>` reads
+        //    its own binding and not the impl's.
+        mut binding: TypeRef = ctx.lookup_binding(slot.generic_param_sym());
         if (binding.is_valid()) {
             return binding;
         }
@@ -1334,10 +1643,11 @@ private:
         // 1b. Associated-type projection on a generic parameter: `I::Item`,
         //     where `I` is a generic parameter in scope. Such a projection is
         //     parsed as a FLAT qualified Named (only `This::Item` becomes a
-        //     Projection node), so detect it here: if the segment before the
-        //     first `::` binds to a type in scope, project the remainder off it.
-        //     A real module-qualified type (`core::iter::Foo`) has a prefix
-        //     (`core`) that is NOT a generic-param binding, so it is unaffected.
+        //     Projection node), and the stamp says the type layer owns the
+        //     rest of a path rooted at that parameter: if the parameter is
+        //     bound, project the remainder off its binding.  A real
+        //     module-qualified type (`core::iter::Foo`) is rooted at no
+        //     parameter, so it is unaffected.
         if (name_len > 2) {
             mut sep: i64 = -1;
             mut k: i64 = 0;
@@ -1346,192 +1656,88 @@ private:
                 k = k + 1;
             }
             if (sep > 0) {
-                const prefix_str: string = name_str.substring(0, sep);
-                const prefix_sym: SymbolStr = this.intern_table.intern(prefix_str);
-                const prefix_ty: TypeRef = ctx.lookup_binding(prefix_sym);
+                const prefix_ty: TypeRef = ctx.lookup_binding(slot.relative_param_sym());
                 if (prefix_ty.is_valid()) {
                     const member_str: string =
-                        name_str.substring(sep + 2, name_len - sep - 2);
+                        name_str.substring((sep + 2) as u32, (name_len - sep - 2) as u32);
                     const member_sym: SymbolStr = this.intern_table.intern(member_str);
-                    const proj: TypeRef = this.project_member(prefix_ty, member_sym, ctx);
-                    if (proj.is_valid()) { return proj; }
+                    // `I::Item` is `Item` of the trait `I` is bounded by, not of
+                    // any trait that declares something spelled `Item`.
+                    const proj: TypeRef = this.project_member(
+                        prefix_ty, member_sym, this.bound_declaring(slot.relative_param_sym(), member_sym), ctx);
+                    if (proj.is_valid()) {
+                        return proj;
+                    }
                 }
             }
         }
 
-        // 2. Check if this is a primitive type name.
-        //    After generic substitution, the ASTTypeSubstituter creates
-        //    Named("i32"), Named("string"), etc. instead of Primitive annotations.
-        //    This fallback ensures they resolve correctly.
+        // 2. A primitive spelling that arrived as a Named annotation.
+        //    Substituting a primitive into a generic does NOT produce one:
+        //    the rewrite replaces the whole annotation with a Primitive node,
+        //    which never enters this cascade.  What does produce one is the
+        //    pointer and array rewrite putting a primitive back into Named
+        //    position - `T = i32*` becomes `Pointer(Named("i32"))` - and every
+        //    such node carries the pointee's TypeRef, so it answers at the
+        //    short-circuit in `resolve` and never reaches here either.
+        //
+        //    This step is therefore the recovery for one case: a mint whose
+        //    carried TypeRef is INVALID, which happens when the unwrap
+        //    supplying it declines.  It answers zero while no unwrap declines.
         const prim: TypeRef = this.resolve_primitive(name);
         if (prim.is_valid()) {
             return prim;
         }
 
-        // 2c. Home-module preference.  A BARE leaf in an annotation means that
-        //     leaf as its OWN module sees it.  Every lookup below this point
-        //     goes through the ambient scope chain / leaf index, both of which
-        //     answer for whatever module the resolver cursor is currently on -
-        //     the caller's, at any re-resolution site.  When the caller told us
-        //     where the annotation actually lives, the module's own declaration
-        //     of the leaf is authoritative and settles the tie before the
-        //     module-blind paths can pick the wrong same-leaf type.
+        // 2c. The stamp.  The annotation was answered for by NameResolution, in
+        //     the scope it was written in, and that answer is read off the
+        //     node: a BARE leaf means that leaf as its OWN module sees it, and
+        //     the module that wrote it had its imports in hand when it
+        //     answered.  Rebuilding a name the node already carries - from a
+        //     home module and the leaf, or from a second walk over the
+        //     writer's imports - would be a second way to ask one question,
+        //     free to disagree with the first.  Read, never re-derived.
         //
-        //     Runs ahead of the ambiguity check: a leaf the HOME module declares
-        //     is not ambiguous just because the module being compiled imports a
-        //     second one under the same name.
-        //
-        //     Only for bare leaves - a written qualifier is handled
-        //     authoritatively by 3a - and only on an exact hit, so a home module
-        //     that does not declare the leaf falls through unchanged.
-        if ((this.home_module_len(ctx) > 0)
-                && this.name_resolver != null
-                && !this.name_resolver.contains_separator(name_str)) {
-            const home_qn: SymbolStr =
-                this.intern_table.intern(ctx.home_module + "::" + name_str);
-            if (this.decl_index != null) {
-                const home_di: TypeRef = this.decl_index.lookup_type(home_qn);
-                if (home_di.is_valid()) {
-                    return this.follow_alias(home_di);
-                }
-            }
-            const home_arena: TypeRef = this.arena.lookup_by_name(home_qn);
-            if (home_arena.is_valid()) {
-                return this.follow_alias(home_arena);
-            }
-        }
-
-        // 2b. Ambiguity check: if this name was imported from multiple
-        //     modules, emit an error telling the user to qualify it.
-        if (this.name_resolver != null && this.name_resolver.is_ambiguous(name)) {
-            const modules: SymbolStr[] = this.name_resolver.get_ambiguous_modules(name);
-            if (modules.length >= 2) {
-                // Re-intern to get heap-safe copies for sprintf
-                const mod_a: string = this.intern_table.resolve(modules[0]);
-                const mod_a_sym: SymbolStr = this.intern_table.intern(mod_a);
-                const mod_a_safe: string = this.intern_table.resolve(mod_a_sym);
-                const mod_b: string = this.intern_table.resolve(modules[1]);
-                const mod_b_sym: SymbolStr = this.intern_table.intern(mod_b);
-                const mod_b_safe: string = this.intern_table.resolve(mod_b_sym);
-
-                const msg: string = format(
-                    "ambiguous type '%s': imported from both '%s' and '%s'. "
-                    "Use a qualified name: '%s::%s' or '%s::%s'",
-                    name_str, mod_a_safe, mod_b_safe,
-                    mod_a_safe, name_str, mod_b_safe, name_str);
-                if (this.diagnostics != null) {
-                    this.diagnostics.emit(
-                        Diagnostic::error(ErrorCode::E0203_UNDEFINED_TYPE, msg));
-                }
-            }
-            return TypeRef::invalid();
-        }
-
-        // 3. DeclarationIndex lookup (canonical post-population path).
-        //    After TypeResolution (order 9) populates the index, this is the
-        //    primary lookup path.  Falls through to arena for types not yet
-        //    registered (e.g., during early resolution phases).
-        //    TypeAlias types are transparent; callers of `resolve_named`
-        //    should never see them in `resolved_type` fields, so the helper
-        //    `follow_alias` unwraps to the alias target before returning.
-        if (this.decl_index != null) {
-            // 3a. Exact qualified literal first.  When `name` is already
-            //     qualified (contains "::"), an exact match against its
-            //     registered name is authoritative.  The canonicalizer below
-            //     (`resolve_type_qualified_name`) resolves only the *leaf*
-            //     segment through the scope chain and discards the prefix, so
-            //     for two same-leaf types in different modules
-            //     (`ModA::Widget` vs `ModB::Widget`) it would bind to
-            //     whichever leaf the scope finds first.  Only fall through to
-            //     leaf canonicalization when the literal isn't registered
-            //     (e.g. a partially-qualified path that still needs expansion
-            //     to the full arena name).
-            if (this.name_resolver != null
-                    && this.name_resolver.contains_separator(name_str)) {
-                const di_literal: TypeRef = this.decl_index.lookup_type(name);
-                if (di_literal.is_valid()) {
-                    return this.follow_alias(di_literal);
-                }
-            }
-            // Try qualified name first, canonicalized against the annotation's
-            // own module when the context names one.
-            if (this.name_resolver != null) {
-                const qualified: SymbolStr = this.canonical_type_name(name, ctx);
-                if (qualified.is_valid()) {
-                    const di_found: TypeRef = this.decl_index.lookup_type(qualified);
-                    if (di_found.is_valid()) {
-                        return this.follow_alias(di_found);
+        //     Asked for EVERY spelling, bare or qualified: how the source
+        //     abbreviated the path does not change what it names.  Runs ahead
+        //     of the ambiguity check, because a leaf the writer's module
+        //     declares is not ambiguous just because the module being compiled
+        //     imports a second one under the same name.  A synthesized
+        //     annotation (a bindgen's, a lowering's) is stamped by its
+        //     synthesizer, and that stamp is the only thing naming its referent.
+        if (this.name_resolver != null) {
+            mut stamp_hit: TypeRef = TypeRef::invalid();
+            mut stamp: DefId = DefId::invalid();
+            match (slot) {
+                ResSlot::Answered(r) => {
+                    match (r) {
+                        Res::Def(q) => { stamp = q; }
+                        // A parameter names itself and a primitive is answered
+                        // above; neither denotes a declaration to look up here.
+                        _           => { }
                     }
                 }
+                _ => { }
             }
-            // Try bare name
-            const di_bare: TypeRef = this.decl_index.lookup_type(name);
-            if (di_bare.is_valid()) {
-                return this.follow_alias(di_bare);
+
+            if (stamp.is_valid() && this.decl_index != null) {
+                // The index holds every registered type under the id the
+                // stamp carries.  A definition it does not hold is an ANSWER:
+                // a declaration that never registered, not a name this step
+                // failed to derive - so it is not retried under another key,
+                // and the arena's written-name map is not a second place to
+                // ask.
+                stamp_hit = this.decl_index.type_of_def(stamp);
             }
+
+            // The leaf resolved in the module that wrote it.
+            if (stamp_hit.is_valid()) { return this.follow_alias(stamp_hit); }
         }
 
-        // 4. Arena lookup: bootstrap-only fallback.
-        //    During Phase 5 (TypeResolution), the DI is being populated, so
-        //    types created earlier in the pass exist only in the arena.
-        //    After bootstrap completes, all types are in the DI and this
-        //    step should never be reached.
-        mut found: TypeRef = TypeRef::invalid();
-        if (this.bootstrap_mode) {
-            found = this.arena.lookup_by_name(name);
-            if (found.is_valid()) {
-                const found_t: Type* = this.arena.lookup(found.id);
-                if (found_t != null && found_t.kind == TypeKind::TypeAlias) {
-                    const alias_t: TypeAliasType* = found_t as TypeAliasType*;
-                    if (alias_t.has_target()) {
-                        return alias_t.target;
-                    }
-                    return found;
-                } else {
-                    return found;
-                }
-            }
-        }
-
-        // 4a. Scope chain + arena lookup: bootstrap-only fallback.
-        //     Uses the Resolver's scope chain to get a qualified name, then
-        //     looks it up in the arena.  Same bootstrap concern as step 4.
-        if (this.bootstrap_mode && this.name_resolver != null) {
-            const qualified: SymbolStr = this.canonical_type_name(name, ctx);
-            if (qualified.is_valid()) {
-                found = this.arena.lookup_by_name(qualified);
-                if (found.is_valid()) {
-                    return found;
-                }
-            }
-        }
-
-        // (Steps 5b and 6 removed; both confirmed dead code:
-        //  5b: ModuleTypeRegistry alias: 0 hits across all builds.
-        //  6:  Compound-name fallback (ptr/array suffix parsing): 0 hits
-        //      after ASTTypeSubstituter fix produces correct annotation kinds.)
-
-        // 5. Leaf-index: O(1) lookup by bare leaf name.
-        //    Load-bearing for circular forward references: e.g., AST node
-        //    files reference ASTVisitor* in accept() methods but can't
-        //    import Compiler::AST::Visitor without creating a cycle.  Also
-        //    handles types from transitive submodule re-exports.
-        //
-        //    No length-based skip.  Step 1 already returned for any name
-        //    that's a generic-param binding (`T`, `K`, `V`, `A`, ...); the
-        //    earlier `name_len > 2` guard was a length-heuristic shortcut
-        //    that silently blocked legitimate short type names (the
-        //    visible casualty was `Rc`, which is prelude-exposed but had
-        //    its arena-leaf fallback disabled, so `Rc<T>::method(...)`
-        //    failed E0233 without an explicit `import alloc::rc;`).
-        //    Generic params are arena-registered only as part of a
-        //    template's param list and are never inserted into the leaf
-        //    index by `register_leaf_name`, so this fallback can't
-        //    misroute a stray `T` into a real type.
-        found = this.arena.lookup_by_leaf(name);
-        if (found.is_valid()) {
-            return found;
-        }
+        // A leaf two imports tie for was refused by the name layer, where the
+        // name was written, and carries `Res::Err`; nothing here asks the
+        // resolver's cursor about it, because the cursor is wherever the
+        // caller left it and the tie belongs to the writer's scope.
 
         // Not found; return invalid (caller should create error)
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_named() FAILED for '%s'", name_str);
@@ -1563,6 +1769,49 @@ private:
         }
         return this.arena.get_tuple(elements);
     }
+    /// Whether `args` satisfy every `where` bound the type declaration
+    /// `entry` names, with E0306 at the written annotation `span` and the
+    /// bound as declared for the first that does not.  A function
+    /// template's bounds are checked at its call; nothing but the four
+    /// aggregates carries a clause.
+    refuse_unsatisfied_type_bounds(&this, entry: TemplateEntry*, args: &TypeRef[],
+                                   span: SourceSpan) -> boolean {
+        if (entry == null || entry.ast_node == null || this.diagnostics == null) { return true; }
+        const none: TraitBound[] = [];
+        mut bounds: &TraitBound[] = &none;
+        match (entry.node_kind) {
+            NodeKind::StructDeclaration => { bounds = &(entry.ast_node as declaration::StructDeclNode*).where_bounds; }
+            NodeKind::UnionDeclaration  => { bounds = &(entry.ast_node as declaration::UnionDeclNode*).where_bounds; }
+            NodeKind::ClassDeclaration  => { bounds = &(entry.ast_node as declaration::ClassDeclNode*).where_bounds; }
+            NodeKind::EnumDeclaration   => { bounds = &(entry.ast_node as declaration::EnumDeclNode*).where_bounds; }
+            _ => { return true; }
+        }
+        if (bounds.length == 0) { return true; }
+        mut arg_copy: TypeRef[] = [];
+        for (mut i: i64 = 0; i < args.length; i++) { arg_copy.push(args[i]); }
+        const subst: TypeSubstitution = TypeSubstitution::from_params(&entry.param_types, &arg_copy);
+        const checker: TraitChecker = TraitChecker::new(
+            this.arena, this.generic_registry, this.intern_table, this.diagnostics);
+        mut concrete: TypeRef = TypeRef::invalid();
+        const tref: TraitRef* = checker.unsatisfied_trait_ref(bounds, &subst, &concrete);
+        if (tref == null) { return true; }
+        const trait_str: string = this.intern_table.resolve(tref.path[tref.path.length - 1]);
+        const concrete_t: Type* = this.arena.lookup(concrete);
+        const concrete_str: string = if (concrete_t != null) { this.arena.format_display(concrete_t) } else { "?" };
+        const tmpl_str: string = entry.display_name(this.intern_table);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+            fmt::format("the trait bound `%s: %s` is not satisfied", concrete_str, trait_str));
+        diag = diag.at(span);
+        diag = diag.also_at(tref.span, fmt::format("required by this bound on `%s`", tmpl_str));
+        diag = diag.with_note(fmt::format("the trait `%s` is not implemented for `%s`", trait_str, concrete_str));
+        diag = diag.help(fmt::format(
+            "implement `%s` for `%s`, or instantiate `%s` with a type that does",
+            trait_str, concrete_str, tmpl_str));
+        this.diagnostics.emit(diag);
+        return false;
+    }
+
 
     /// Resolve a generic type instantiation annotation.
     /// Routes through GenericRegistry for deduplication, ensuring the
@@ -1578,7 +1827,7 @@ private:
         // A bare Named base goes straight through resolve_named, bypassing the
         // canonicalization the `resolve()` Named arm applies to bare uses.
         mut base: TypeRef = match (*g.base) {
-            TypeAnnotation::Named(bn) => { this.resolve_named(bn.name, ctx) }
+            TypeAnnotation::Named(bn) => { this.resolve_named(bn.name, ctx, bn.res, bn.span) }
             _                         => { this.resolve(g.base, ctx) }
         };
 
@@ -1611,7 +1860,7 @@ private:
 
         // Validate arg count matches the template's parameter count.
         // Catches mistakes like Array<i32, string> when Array only takes <T>.
-        const entry: TemplateEntry* = this.generic_registry.get_template_by_type_id(base.id);
+        const entry: TemplateEntry* = this.generic_registry.template_of_type(base);
         if (entry != null) {
             // Default-type-parameter substitution: when the annotation
             // omits trailing args (e.g. `Array<i32>` on a template defined
@@ -1630,6 +1879,15 @@ private:
                 return TypeRef::invalid();
             }
 
+            // The declaration's own `where` clause, at the written
+            // annotation - the one site with a span.  An abstract argument
+            // is deferred (the concrete instantiation checks it), and every
+            // instantiation demanded without an annotation is checked once
+            // more where it is specialized, the door behind this.
+            if (!this.refuse_unsatisfied_type_bounds(entry, &args, g.span)) {
+                return TypeRef::invalid();
+            }
+
             // Generic type alias expansion: instead of creating an
             // InstantiatedType(alias, args) that the Monomorphizer cannot
             // specialize, resolve the alias's target annotation with concrete
@@ -1642,11 +1900,11 @@ private:
                 if (alias_node != null && alias_node.target_annotation != null) {
                     mut alias_ctx: ResolutionContext = ctx.clone();
                     for (mut i: i64 = 0; i < entry.param_count; i++) {
-                        alias_ctx.add_binding(entry.param_names[i], args[i]);
+                        alias_ctx.add_binding(entry.param_syms[i], entry.param_names[i], args[i]);
                     }
                     LOG_DEBUG(LogComponent::TypeChecker,
                         "[TypeResolver] expanding generic alias '%s' with %d args",
-                        this.intern_table.resolve(entry.name), args.length);
+                        entry.display_name(this.intern_table), args.length);
                     return this.resolve(alias_node.target_annotation, &alias_ctx);
                 }
             }
@@ -1662,8 +1920,6 @@ private:
             return this.arena.create_instantiation(base, &args);
         }
 
-        // Track which module requested this instantiation for per-module codegen.
-        const mod_sym: SymbolStr = this.intern_table.intern(ctx.source_file);
-        return this.generic_registry.instantiate_for_module(base, args, mod_sym);
+        return this.generic_registry.instantiate(base, args);
     }
 }

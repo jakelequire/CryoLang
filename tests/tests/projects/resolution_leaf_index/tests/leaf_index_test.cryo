@@ -1,0 +1,78 @@
+/// What a plural leaf means once a bare one no longer guesses.
+///
+/// `Widget` is declared by both `Alpha` and `Omega`. A module that imports
+/// NEITHER names no type by writing it bare, and that half is now an error -
+/// it lives in tests/tests/projects/plural_leaf_gate as a `compile_fail`
+/// asserting E0155. What stays here is the other half: a module that DOES
+/// import a declarer still binds the one it imported, which §4's rib chain
+/// requires and which the rejection must not have broken.
+///
+/// These two are the reason the rejection can be told apart from a blunter
+/// change. A fix that made every bare plural leaf unresolvable everywhere -
+/// rather than only where nothing binds it - passes the gate project and fails
+/// HERE. That is the whole point of keeping them.
+///
+/// ---- WHAT THIS USED TO PIN, AND WHY THE HOST MATTERED -----------------
+///
+/// Before the rejection, the bare leaf in an importing-nothing module resolved
+/// anyway, through the arena's global leaf index. `register_leaf_name` is
+/// first-registration-wins and compares no names, and registration order is
+/// depth-first module discovery seeded by the order the FILESYSTEM enumerates
+/// the directory - so which declarer won was invisible to any reader of the
+/// source, and copying a directory could change what the program compiled to.
+/// Measured with controls.
+///
+/// That is also why the import control below reads `Omega` rather than either:
+/// where the index picked `Alpha`, binding `Omega` here could not be luck.
+/// The index no longer answers, so the expectation is now simply what the
+/// import says, and it no longer depends on the host.
+///
+![config(testing)]
+namespace ResolutionLeafIndex::LeafIndexTest;
+
+import std::core::result;
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+
+/// CONTROL. The leaf really is declared twice, by two distinct types.
+/// Without it the import control below, and the E0155 gate in
+/// plural_leaf_gate, would both be satisfied by a program in which
+/// `Omega::Widget` did not exist or had collapsed into `Alpha`'s - and each
+/// would then be exercising the UNIQUE-leaf case, which is E0240 and a
+/// different rule.
+![test]
+function CONTROL_the_leaf_is_declared_by_two_distinct_types()
+        -> Result<(), TestError> {
+    mut a: ResolutionLeafIndex::Alpha::Widget<i64> =
+        ResolutionLeafIndex::Alpha::Widget::<i64> { v: 17 };
+    mut o: ResolutionLeafIndex::Omega::Widget<i64> =
+        ResolutionLeafIndex::Omega::Widget::<i64> { v: 19 };
+    expect_eq(a.tag(), 1)?;
+    expect_eq(o.tag(), 2)?;
+    expect_eq(a.unwrap(), 17 as i64)?;
+    expect_eq(o.unwrap(), 19 as i64)?;
+    return Result::Ok(());
+}
+
+/// CONTROL, and the one that says what the defect actually is. The SAME plural
+/// leaf, named from a module that imports one declarer, binds THAT declarer.
+/// Where the leaf index picks `Alpha`, `Omega` here cannot be the arbitrary
+/// answer landing correctly by luck; where it picks `Omega`, the two coincide
+/// and this stops discriminating -- see the note in `importer.cryo`
+/// above its return annotation.
+///
+/// It is also the guard on the fix: a change that made `Orphan` an error by
+/// making a bare plural leaf unresolvable everywhere would break this too, and
+/// that is not the specified behavior -- §4's rib chain says an imported
+/// module's export set is in scope.
+![test]
+function CONTROL_an_importing_module_binds_the_module_it_imported()
+        -> Result<(), TestError> {
+    mut w: ResolutionLeafIndex::Omega::Widget<i64> =
+        ResolutionLeafIndex::Importer::Packer::pack(23);
+    expect_eq(w.unwrap(), 23 as i64)?;
+    expect_eq(w.tag(), 2)?;
+    return Result::Ok(());
+}

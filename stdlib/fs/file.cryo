@@ -10,19 +10,31 @@
 
 namespace std::fs::file;
 
-import core::intrinsics;
-import core::option;
-import core::result;
-import core::slice;
-import core::drop;
-import io::error;
-import io::fd;
-import io::traits;
-import collections::string;
-import collections::str;
-import ffi::libc;
-import fs::path;
-import fs::metadata;
+import std::core::intrinsics;
+import std::core::option;
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::slice;
+import std::core::slice::{ Slice };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::io::error;
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::fd;
+import std::io::traits;
+import std::io::traits::{ Read, Seek, SeekFrom, Write };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::ffi::libc;
+import std::fs::path;
+import std::fs::path::{ Path };
+import std::fs::metadata;
+import std::fs::metadata::{ Metadata, metadata };
+import std::core::mem;
 
 // POSIX `open` flags and `lseek` whence values live in `ffi::libc`
 // (`O_RDONLY`/`O_WRONLY`/`O_RDWR`/`O_CREAT`/... and `Whence::SEEK_*`).
@@ -190,11 +202,6 @@ type struct File {
         return Result::Ok(pos as u64);
     }
 
-    /// Current byte offset from the start of the file, without moving.
-    stream_position(mut &this) -> Result<u64, IoError> {
-        return this.seek_cur(0);
-    }
-
 }
 
 /// `Seek` over the file descriptor: routes a `SeekFrom` to the matching
@@ -208,6 +215,12 @@ implement trait Seek for struct File {
             SeekFrom::Current(offset) => { return this.seek_cur(offset); }
             SeekFrom::End(offset)     => { return this.seek_end(offset); }
         }
+    }
+
+    /// Current byte offset from the start of the file, without moving:
+    /// one `lseek`, where the trait's default goes through `seek`.
+    stream_position(mut &this) -> Result<u64, IoError> {
+        return this.seek_cur(0);
     }
 }
 
@@ -255,7 +268,7 @@ function read(p: Path) -> Result<Array<u8>, IoError> {
     loop {
         const n: u64 = file.read(&chunk[0], 4096)?;
         if (n == 0) { break; }
-        out.append(Slice<u8>::from_raw(&chunk[0], n));
+        out.append(Slice::<u8>::from_raw(&chunk[0], n));
     }
     return Result::Ok(out);
 }
@@ -274,7 +287,7 @@ function write(p: Path, bytes: Slice<u8>) -> Result<(), IoError> {
 function read_to_string(p: Path) -> Result<String, IoError> {
     mut data: Array<u8> = read(p)?;
     mut out: String = String::from_str(Str::from(data.as_slice()));
-    data.drop();
+    mem::drop(data);
     return Result::Ok(out);
 }
 
@@ -301,7 +314,7 @@ function copy(from: Path, to: Path) -> Result<u64, IoError> {
     loop {
         const n: u64 = src.read(&chunk[0], 65536)?;
         if (n == 0) { break; }
-        dst.write(Slice<u8>::from_raw(&chunk[0], n))?;
+        dst.write(Slice::<u8>::from_raw(&chunk[0], n))?;
         total = total + n;
     }
 
@@ -309,8 +322,8 @@ function copy(from: Path, to: Path) -> Result<u64, IoError> {
     // mode bits are a libc concept; Windows has no analog (file access
     // is governed by ACLs through a separate API surface), so the
     // Windows side accepts the default attributes the `create` above
-    // produced and returns success.  Same behaviour as
-    // `std::fs::copy` on Rust for Windows: contents copied, ACLs not.
+    // produced and returns success.  On Windows the
+    // contents are copied, the ACLs are not.
     mirror_permissions(&dst, info)?;
     return Result::Ok(total);
 }

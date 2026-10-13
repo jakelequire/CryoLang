@@ -5,20 +5,38 @@
 /// template entries.
 ///
 /// Moved from `AST/specializer.cryo` into the `mono/` subsystem (namespace
-/// `Compiler::Mono::Specializer`): only the Monomorphizer calls it, so it is a
+/// `compiler::mono::specializer`): only the Monomorphizer calls it, so it is a
 /// mono-exclusive collaborator, not a general AST utility.  Content is otherwise a
 /// faithful port (it drives the still-shared `ASTCloner` + `ASTTypeSubstituter`,
 /// which stay in `AST/`).
 
-namespace Compiler::Mono::Specializer;
+namespace compiler::mono::specializer;
 
-import Compiler::Diag;
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration, Cloner, Substituter };
-import Compiler::Types;
-import Compiler::Types::{ Arena, TypeRef, Substitution, GenericRegistry };
-import Compiler::Resolver::{ InternTable, SymbolStr, QualifiedName, MangledName };
+import compiler::diag;
+import compiler::ast;
+import compiler::ast::{ cloner, declaration, node, substituter, TypeAnnotation };
+import compiler::types;
+import compiler::types::{ arena, type_ref, substitution, generic_registry };
+import compiler::resolver::{ intern_table, symbol_str, qualified_name, mangled_name };
 import std::alloc::allocator;
+import std::core::mem::{ swap };
+import std::fmt;
+import compiler::ast::cloner::{ ASTCloner };
+import compiler::ast::declaration::{ ImplBlockNode, MethodNode };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::substituter::{ ASTTypeSubstituter };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::generic_registry::{ TemplateEntry };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::trait_checker::{ TraitChecker };
+import compiler::types::resolver::{ TypeResolver };
 
 
 // SpecializationResult: Output of a single specialization
@@ -59,14 +77,16 @@ type struct SpecializationResult {
 }
 
 type struct ASTSpecializer {
-    arena:        TypeArena*;
-    intern_table: InternTable*;
+    arena:         TypeArena*;
+    intern_table:  InternTable*;
+    type_resolver: TypeResolver*;
 
 
-    static new(arena: TypeArena*, intern_table: InternTable*) -> ASTSpecializer {
+    static new(arena: TypeArena*, intern_table: InternTable*, type_resolver: TypeResolver*) -> ASTSpecializer {
         return ASTSpecializer {
-            arena:        arena,
-            intern_table: intern_table,
+            arena:         arena,
+            intern_table:  intern_table,
+            type_resolver: type_resolver,
         };
     }
 
@@ -81,15 +101,20 @@ type struct ASTSpecializer {
     ///   4. Run ASTTypeSubstituter on the clone
     ///   5. Clone + substitute each impl block
     ///   6. Return result
+    /// `spec_typeref` is the arena id the specialization will occupy, passed
+    /// through to the substituter so an annotation rewritten to the spec name
+    /// carries its own answer.  `TypeRef::invalid()` is legal and means the
+    /// caller has no id yet; see `ASTTypeSubstituter.spec_typeref`.
+    /// `checker` answers which methods belong to the specialization.
     specialize(&this, entry: TemplateEntry*, type_args: &TypeRef[],
-               type_arg_displays: &string[]) -> SpecializationResult {
+               spec_typeref: TypeRef, checker: TraitChecker*) -> SpecializationResult {
         // Validate
         if (entry == null) {
             return SpecializationResult::fail("null template entry");
         }
         if (type_args.length != entry.param_count) {
             return SpecializationResult::fail(
-                format("type argument count mismatch: expected %lld, got %lld",
+                fmt::format("type argument count mismatch: expected %lld, got %lld",
                         entry.param_count, type_args.length)
             );
         }
@@ -100,7 +125,7 @@ type struct ASTSpecializer {
         //    `spec_base_name` folds the owner type's leaf into the bare
         //    name so two methods with the same leaf (e.g. `Request::parse`,
         //    `Response::parse`) don't collapse to identical symbols.
-        const base_sym: SymbolStr = entry.spec_base_name(this.intern_table);
+        const base_sym: SymbolStr = entry.spec_base_name(this.arena.defs, this.intern_table);
         const base_qname: QualifiedName = QualifiedName::from_symbol(base_sym);
         const spec_sym: SymbolStr = MangledName::specialized_identifier(
             this.intern_table, this.arena, base_qname, type_args);
@@ -108,7 +133,7 @@ type struct ASTSpecializer {
 
         // 2. Build substitution (borrows + copies `type_args`).
         const subst: TypeSubstitution = TypeSubstitution::from_params(
-            entry.param_type_ids, type_args
+            entry.param_types, type_args
         );
         const subst_ptr: TypeSubstitution* =
             allocator::alloc(sizeof(TypeSubstitution), 16) as TypeSubstitution*;
@@ -126,51 +151,57 @@ type struct ASTSpecializer {
             return SpecializationResult::fail("AST clone returned null");
         }
 
-        // 4. Build SymbolStr arrays for the substituter.
-        //    entry.name and entry.param_names are already SymbolStr; no re-interning.
-        mut arg_syms: SymbolStr[] = [];
-        for (mut ai: i64 = 0; ai < type_arg_displays.length; ai++) {
-            arg_syms.push(this.intern_table.intern(type_arg_displays[ai]));
-        }
-
-        // Independent copy of `param_names` (SymbolStr is Copy): the
-        // substituter stores and owns this array, so handing it the template
-        // entry's own buffer would double-free `entry.param_names`.
-        mut pn_copy: SymbolStr[] = [];
-        for (mut pi: i64 = 0; pi < entry.param_names.length; pi++) {
-            pn_copy.push(entry.param_names[pi]);
+        // 4. An independent copy of the parameter list (its element type is
+        //    Copy): the substituter stores and owns its array, so handing it
+        //    the template entry's own buffer would double-free it.
+        mut ps_copy: SymbolID[] = [];
+        for (mut pi: i64 = 0; pi < entry.param_syms.length; pi++) {
+            ps_copy.push(entry.param_syms[pi]);
         }
         mut substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
             subst_ptr, this.arena, this.intern_table,
-            entry.name, spec_sym,
-            pn_copy, arg_syms
+            entry.def, spec_sym,
+            ps_copy, spec_typeref
         );
+        substituter.types = this.type_resolver;
         cloned_ast.accept(substituter);
 
         // 5. Renaming is already done by the cloner (step 3).
         //    No post-clone set_name() needed.
 
-        // 6. Clone + substitute each impl block
+        // 6. Clone + substitute each impl block, under the IMPL's own
+        //    parameters.  An `implement` block declares its own parameters
+        //    and writes the owner's arguments in them - `implement<X> trait
+        //    Show for struct Holder<X>` - so its body is stamped with the
+        //    impl's declarations, not the owner's, and only a substituter
+        //    keyed by those rewrites it.  Each parameter the head writes at
+        //    a position is bound to the specialization's argument at that
+        //    position; an argument the head writes as a type (`Box<T,
+        //    GlobalAlloc>`) binds nothing here, because the head was already
+        //    selected against the arguments, and a parameter the head does
+        //    not write (one the where-clause derives) is bound from the
+        //    bounds once the clone is placed.
         mut impl_asts: ASTNode*[] = [];
         for (mut i: i64 = 0; i < entry.impl_blocks.length; i++) {
             const cloned_impl: ASTNode* = cloner.clone_node(entry.impl_blocks[i]);
             if (cloned_impl != null) {
                 const impl_node: ImplBlockNode* = cloned_impl as ImplBlockNode*;
-
-                // Filter out methods whose `this` parameter is a Generic
-                // instantiation of the outer template with modified args
-                // (e.g. `this: Result<T*, E>` on `implement Result<T, E>`).
-                // Such methods apply only to specific outer T; monomorphizing
-                // them for arbitrary T produces invalid code, since the body
-                // uses the modified shape (`*ptr` where ptr is actually T, not
-                // T*).  Our pipeline monomorphizes eagerly, so we skip them
-                // at specialization time based on the structural self-match.
+                mut impl_substituter: ASTTypeSubstituter* =
+                    this.impl_substituter(impl_node, entry, spec_sym, type_args, spec_typeref);
+                // A method whose receiver is written as this template with
+                // other arguments (`this: &Wrapper<i64>` in `implement
+                // Wrapper<T>`) is not a method of this specialization: its
+                // body reads the other shape.  The question is asked of the
+                // template's method, whose receiver type the first pass
+                // resolved and asks the same predicate of; the clone's
+                // methods are the template's, one for one, in order.
+                const template_impl: ImplBlockNode* = entry.impl_blocks[i] as ImplBlockNode*;
                 mut kept: MethodNode*[] = [];
                 for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
                     const mthd: MethodNode* = impl_node.methods[mi];
-                    const is_modified: boolean = this.method_has_modified_self_type(
-                        mthd, entry, type_arg_displays);
-                    if (is_modified) {
+                    const written: MethodNode* = template_impl.methods[mi];
+                    if (written != null && checker.method_receiver_excludes(
+                            written.func, impl_substituter.subst, entry.base_type, type_args)) {
                         continue;
                     }
                     kept.push(mthd);
@@ -184,7 +215,7 @@ type struct ASTSpecializer {
                 // buffer and lets `kept` drop the old (pre-filter) one.
                 swap(&impl_node.methods, &kept);
 
-                cloned_impl.accept(substituter);
+                cloned_impl.accept(impl_substituter);
                 // Rename impl block target to specialized name and
                 // clear generic params; the specialization is concrete.
                 impl_node.set_target_type(spec_sym);
@@ -197,118 +228,52 @@ type struct ASTSpecializer {
         return SpecializationResult::ok(cloned_ast, &impl_asts, spec_name);
     }
 
-
-    /// Detect methods whose `this` parameter is a Generic(base, args) where
-    /// base matches the outer template name AND the args are NOT the identity
-    /// mapping of the template's params, and ALSO not equal to the spec's
-    /// concrete args. Example on `implement Result<T, E>`:
-    ///   `this: Result<T*, E>` while spec'ing Result<i32, string>
-    ///     -> args=[T*, E], spec=[i32, string]: T* is neither bare T nor i32
-    ///     -> modified=true (drop the method)
-    ///   `this: Result<T, E>` while spec'ing Result<i32, string>
-    ///     -> args=[T, E], spec=[i32, string]: each arg matches the bare
-    ///       outer param -> modified=false (keep)
-    ///   `this: Result<T, E>` after DefaultExpansion rewrote bare `Result`
-    ///     to `Result<T, E>` (or `Result<X, Y>` post-substitution) while
-    ///     spec'ing Result<X, Y>: args=[X, Y] match the spec's display
-    ///     names -> modified=false (keep, this is not a real shape change)
-    method_has_modified_self_type(&this, method: MethodNode*, entry: TemplateEntry*,
-                                   type_arg_displays: &string[]) -> boolean {
-        if (method == null || method.func == null) { return false; }
-        const func: FunctionDeclNode* = method.func;
-
-        const this_amp:  SymbolStr = this.intern_table.intern("&this");
-        const this_bare: SymbolStr = this.intern_table.intern("this");
-
-        for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const param: VarDeclNode* = func.parameters[i];
-            if (param == null) { continue; }
-            if (!param.name.equals(this_amp) && !param.name.equals(this_bare)) {
-                continue;
-            }
-            if (param.type_annotation == null) { continue; }
-            if (this.annotation_is_modified_outer(
-                param.type_annotation, entry, type_arg_displays)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /// Recursively unwrap Reference/Pointer and return true if the inner
-    /// annotation is Generic(Named(entry.name), args) where any arg is
-    /// NEITHER the bare outer param in its position NOR equal to the
-    /// corresponding spec type-arg display (or its leaf).
-    annotation_is_modified_outer(&this, ann: TypeAnnotation*, entry: TemplateEntry*,
-                                  type_arg_displays: &string[]) -> boolean {
-        if (ann == null) { return false; }
-        match (*ann) {
-            TypeAnnotation::Reference(ref) => {
-                return this.annotation_is_modified_outer(ref.inner, entry, type_arg_displays);
-            }
-            TypeAnnotation::Pointer(ptr) => {
-                return this.annotation_is_modified_outer(ptr.inner, entry, type_arg_displays);
-            }
-            TypeAnnotation::Generic(gen) => {
-                match (*gen.base) {
-                    TypeAnnotation::Named(named) => {
-                        const matches_bare: boolean = named.name.equals(entry.name);
-                        const matches_qual: boolean = named.name.equals(entry.qualified_name);
-                        if (!matches_bare && !matches_qual) { return false; }
-                        if (gen.args.length != entry.param_count) { return false; }
-                        for (mut i: i64 = 0; i < gen.args.length; i++) {
-                            mut spec_disp: string = "";
-                            if (i < type_arg_displays.length) {
-                                spec_disp = type_arg_displays[i];
-                            }
-                            if (!this.annotation_matches_param_or_spec(
-                                gen.args[i], entry.param_names[i], spec_disp)) {
-                                return true;
-                            }
-                        }
-                        return false;
+    /// The substituter for one impl block of a specialization: the impl's
+    /// parameters, each bound to the specialization's argument at the
+    /// position the head writes it, in the order the head writes them.  A
+    /// head that writes one parameter twice (`Pair<T, T>`) binds it once, at
+    /// its first position; the head was selected against the arguments, so
+    /// the second position holds the same type.  The arena's parameter type
+    /// for each is minted at its head position, which is the identity every
+    /// other consumer of the impl's parameters mints it under.
+    impl_substituter(&this, impl_node: ImplBlockNode*, entry: TemplateEntry*,
+                     spec_sym: SymbolStr, type_args: &TypeRef[],
+                     spec_typeref: TypeRef) -> ASTTypeSubstituter* {
+        mut syms: SymbolID[] = [];
+        mut arena_ids: TypeRef[] = [];
+        mut replacements: TypeRef[] = [];
+        const n: i64 = if (impl_node.target_args.length < type_args.length) {
+            impl_node.target_args.length
+        } else {
+            type_args.length
+        };
+        for (mut ti: i64 = 0; ti < n; ti++) {
+            const ta: TypeAnnotation* = impl_node.target_args[ti];
+            if (ta == null) { continue; }
+            match (*ta) {
+                TypeAnnotation::Named(named) => {
+                    const sym: SymbolID = named.param_sym();
+                    if (!sym.is_valid()) { continue; }
+                    mut seen: boolean = false;
+                    for (mut k: i64 = 0; k < syms.length; k++) {
+                        if (syms[k].equals(sym)) { seen = true; break; }
                     }
-                    _ => { return false; }
+                    if (seen) { continue; }
+                    syms.push(sym);
+                    arena_ids.push(this.arena.create_generic_param(sym, named.name, ti as u64));
+                    replacements.push(type_args[ti]);
                 }
+                _ => {}
             }
-            _ => { return false; }
         }
-    }
-
-    /// True if `ann` is `Named(N)` where N matches either the bare outer
-    /// param name (template identity) OR the spec's type-arg display
-    /// (whole string or its leaf segment after `::`). The spec-display
-    /// match handles the case where DefaultExpansion has already rewritten
-    /// bare `T` annotations into `Named(<concrete-default>)` before the
-    /// specializer runs.
-    annotation_matches_param_or_spec(&this, ann: TypeAnnotation*,
-                                      param_name: SymbolStr,
-                                      spec_disp: string) -> boolean {
-        if (ann == null) { return false; }
-        match (*ann) {
-            TypeAnnotation::Named(named) => {
-                if (named.name.equals(param_name)) { return true; }
-                if (spec_disp.length() == 0) { return false; }
-                const named_str: string = this.intern_table.resolve(named.name);
-                if (named_str.eq(spec_disp)) { return true; }
-                // Match the leaf segment of a qualified spec name.
-                const sd_len: i64 = spec_disp.length() as i64;
-                mut last_sep: i64 = -1;
-                for (mut k: i64 = 0; k + 1 < sd_len; k++) {
-                    if (spec_disp[k] == ':' && spec_disp[k + 1] == ':') {
-                        last_sep = k + 2;
-                    }
-                }
-                if (last_sep > 0) {
-                    // The leaf is the NUL-terminated suffix of `spec_disp` from
-                    // `last_sep`; compare against it directly (was an O(n^2)
-                    // `format("%s%c", ...)` char-by-char rebuild just to `eq` it).
-                    const leaf: string = spec_disp + last_sep;
-                    if (named_str.eq(leaf)) { return true; }
-                }
-                return false;
-            }
-            _ => { return false; }
-        }
+        const subst_ptr: TypeSubstitution* =
+            allocator::alloc(sizeof(TypeSubstitution), 16) as TypeSubstitution*;
+        *subst_ptr = TypeSubstitution::from_params(&arena_ids, &replacements);
+        mut impl_substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
+            subst_ptr, this.arena, this.intern_table,
+            entry.def, spec_sym,
+            syms, spec_typeref);
+        impl_substituter.types = this.type_resolver;
+        return impl_substituter;
     }
 }

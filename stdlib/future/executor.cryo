@@ -53,44 +53,63 @@
 
 namespace std::future::executor;
 
-import core::intrinsics;
-import core::ptr;
-import core::result;
-import core::drop;
-import core::panic_unwind;
-import alloc::layout;
-import alloc::allocator;
-import alloc::arc;
-import sync::atomic;
-import ffi::libc;
-import sys::syscall;
-import collections::array;
-import future::poll;
-import future::waker;
-import future::traits;
-import future::reactor;
-import future::blocking;
+import std::core::intrinsics;
+import std::core::ptr;
+import std::core::ptr::{ NonNull };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::core::panic_unwind;
+import std::core::panic_unwind::{ PanicInfo };
+import std::alloc::layout;
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator;
+import std::alloc::allocator::{ AllocError, GlobalAlloc };
+import std::alloc::arc;
+import std::alloc::arc::{ Arc, ArcInner };
+import std::sync::atomic;
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::ffi::libc;
+import std::ffi::libc::{
+    pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_signal,
+    pthread_cond_wait, pthread_create, pthread_join, pthread_mutex_destroy,
+    pthread_mutex_init, pthread_mutex_lock, pthread_mutex_unlock
+};
+import std::sys::syscall;
+import std::sys::syscall::{ SYSTEM_INFO_PARTIAL };
+import std::collections::array;
+import std::future::poll;
+import std::future::poll::{ Poll };
+import std::future::waker;
+import std::future::waker::{ Context, Waker };
+import std::future::traits;
+import std::future::traits::{ Future };
+import std::future::reactor;
+import std::future::reactor::{ Reactor };
+import std::future::blocking;
+import std::future::blocking::{ BLOCKING_DEFAULT_THREADS, BlockingPool };
 
 
 // Task outcome (published by the executor when a task finishes), read by a
 // joining handle to build its result.
-const OUTCOME_PENDING:   u8 = 0u8;   // not finished
-const OUTCOME_READY:     u8 = 1u8;   // completed; `result` is stored
-const OUTCOME_CANCELLED: u8 = 2u8;   // aborted or unreschedulable; no result
-const OUTCOME_PANICKED:  u8 = 3u8;   // panicked while polling; `panic` is stored
+const OUTCOME_PENDING:   u8 = 0;   // not finished
+const OUTCOME_READY:     u8 = 1;   // completed; `result` is stored
+const OUTCOME_CANCELLED: u8 = 2;   // aborted or unreschedulable; no result
+const OUTCOME_PANICKED:  u8 = 3;   // panicked while polling; `panic` is stored
 
 // Two-actor handshake over the shared block: whoever swaps in last (observing
 // the other side already gone) frees it. Mirrors `thread::spawn`'s state byte.
-const HS_LIVE:        u8 = 0u8;   // task running, handle live
-const HS_TASK_FIN:    u8 = 1u8;   // task finished (outcome published)
-const HS_HANDLE_GONE: u8 = 2u8;   // handle detached/dropped without joining
+const HS_LIVE:        u8 = 0;   // task running, handle live
+const HS_TASK_FIN:    u8 = 1;   // task finished (outcome published)
+const HS_HANDLE_GONE: u8 = 2;   // handle detached/dropped without joining
 
 // Per-task run-state (atomic): governs which worker may poll a task and whether
 // a wake must enqueue it. See the module doc "Concurrent-poll safety".
-const ST_IDLE:      u8 = 0u8;   // not queued, not running
-const ST_SCHEDULED: u8 = 1u8;   // linked in the ready queue
-const ST_RUNNING:   u8 = 2u8;   // a worker is polling it
-const ST_NOTIFIED:  u8 = 3u8;   // woken while RUNNING; reschedule after the poll
+const ST_IDLE:      u8 = 0;   // not queued, not running
+const ST_SCHEDULED: u8 = 1;   // linked in the ready queue
+const ST_RUNNING:   u8 = 2;   // a worker is polling it
+const ST_NOTIFIED:  u8 = 3;   // woken while RUNNING; reschedule after the poll
 
 
 // ---------------------------------------------------------------------------
@@ -185,10 +204,9 @@ function detach_shared<O>(sh: TaskShared<O>*) -> void {
         const outcome: u8 = ctl.outcome.load(MemoryOrder::Acquire);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         if (outcome == OUTCOME_READY) {
-            const rp: O* = &sh.result;
-            rp.drop();
+            ptr::drop_in_place::<O>(&sh.result);
         }
-        alloc.deallocate(NonNull::new(sh as u8*), Layout::of<TaskShared<O>>());
+        alloc.deallocate(NonNull::new(sh as u8*), Layout::of::<TaskShared<O>>());
     }
     // else: task still running; it frees the block when it observes GONE.
 }
@@ -229,7 +247,7 @@ type struct Task {
             shared:     shared,
             next:       null,
             exec:       exec,
-            run_state:  Atomic<u8>::new(ST_SCHEDULED),
+            run_state:  Atomic::<u8>::new(ST_SCHEDULED),
             self_arc:   null,
         };
     }
@@ -412,7 +430,7 @@ type struct ExecInner {
 /// and the wake path (handing the ready queue its own reference) call this; it
 /// pairs one-for-one with `task_decref`.
 private function task_incref(task: Task*) -> void {
-    Arc<Task, GlobalAlloc>::increment_strong_count(task.self_arc);
+    Arc::<Task, GlobalAlloc>::increment_strong_count(task.self_arc);
 }
 
 /// Release one strong reference to `task`'s box. The last release runs
@@ -420,7 +438,7 @@ private function task_incref(task: Task*) -> void {
 /// `task_incref`, the initial `Arc::new` scheduling reference, and each stored
 /// waker.
 private function task_decref(task: Task*) -> void {
-    Arc<Task, GlobalAlloc>::decrement_strong_count(task.self_arc);
+    Arc::<Task, GlobalAlloc>::decrement_strong_count(task.self_arc);
 }
 
 /// `Waker` `clone_fn` for an owning task waker: acquire a reference and return
@@ -557,7 +575,7 @@ function task_drop_thunk<F>(fut_raw: u8*) -> void {
     mut _owned: F;
     unsafe { _owned = *fut; }
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(fut_raw), Layout::of<F>());
+    alloc.deallocate(NonNull::new(fut_raw), Layout::of::<F>());
     // `_owned` drops here, after its storage has been released.
 }
 
@@ -568,11 +586,10 @@ function task_drop_thunk<F>(fut_raw: u8*) -> void {
 function dispose_shared_thunk<O>(shared_raw: u8*, drop_result: u8) -> void {
     const sh: TaskShared<O>* = shared_raw as TaskShared<O>*;
     if (drop_result == 1) {
-        const rp: O* = &sh.result;
-        rp.drop();
+        ptr::drop_in_place::<O>(&sh.result);
     }
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(shared_raw), Layout::of<TaskShared<O>>());
+    alloc.deallocate(NonNull::new(shared_raw), Layout::of::<TaskShared<O>>());
 }
 
 
@@ -674,20 +691,20 @@ where F: Future<O> {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
 
     mut sh: TaskShared<O>* = null;
-    match (alloc.allocate(Layout::of<TaskShared<O>>())) {
-        Result::Ok(raw) => { sh = raw.cast<TaskShared<O>>().as_ptr(); }
+    match (alloc.allocate(Layout::of::<TaskShared<O>>())) {
+        Result::Ok(raw) => { sh = raw.cast::<TaskShared<O>>().as_ptr(); }
         Result::Err(_)  => { panic("Executor::spawn: shared allocation failed", FILE, LINE); }
     }
-    sh.ctl.outcome = Atomic<u8>::new(OUTCOME_PENDING);
-    sh.ctl.hs      = Atomic<u8>::new(HS_LIVE);
-    sh.ctl.cancel  = Atomic<u8>::new(0);
+    sh.ctl.outcome = Atomic::<u8>::new(OUTCOME_PENDING);
+    sh.ctl.hs      = Atomic::<u8>::new(HS_LIVE);
+    sh.ctl.cancel  = Atomic::<u8>::new(0);
     sh.ctl.panic   = PanicInfo { msg: "", file: "", line: 0 };
 
     mut fbox: F* = null;
-    match (alloc.allocate(Layout::of<F>())) {
-        Result::Ok(raw) => { fbox = raw.cast<F>().as_ptr(); }
+    match (alloc.allocate(Layout::of::<F>())) {
+        Result::Ok(raw) => { fbox = raw.cast::<F>().as_ptr(); }
         Result::Err(_)  => {
-            alloc.deallocate(NonNull::new(sh as u8*), Layout::of<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(sh as u8*), Layout::of::<TaskShared<O>>());
             panic("Executor::spawn: future allocation failed", FILE, LINE);
         }
     }
@@ -704,8 +721,8 @@ where F: Future<O> {
     // drop). `self_arc` back-points at the header so `task_incref`/`task_decref`
     // reach the count from any `Task*`.
     mut arc_res: Result<Arc<Task, GlobalAlloc>, AllocError> =
-        Arc::try_new(Task::new(task_poll_thunk<F, O>, task_drop_thunk<F>,
-                               dispose_shared_thunk<O>, fbox as u8*, sh as u8*, inner));
+        Arc::try_new(Task::new(task_poll_thunk::<F, O>, task_drop_thunk::<F>,
+                               dispose_shared_thunk::<O>, fbox as u8*, sh as u8*, inner));
     match (arc_res) {
         Result::Ok(arc) => {
             const ap: ArcInner<Task, GlobalAlloc>* = arc.into_raw();
@@ -715,12 +732,12 @@ where F: Future<O> {
         Result::Err(_)  => {
             // `try_new` dropped the Task value; its `Drop` finished it CANCELLED
             // and dropped the boxed future, so only the shared block remains.
-            alloc.deallocate(NonNull::new(sh as u8*), Layout::of<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(sh as u8*), Layout::of::<TaskShared<O>>());
             panic("Executor::spawn: task allocation failed", FILE, LINE);
         }
     }
 
-    return JoinHandle<O> { shared: sh, exec: inner };
+    return JoinHandle::<O> { shared: sh, exec: inner };
 }
 
 
@@ -762,15 +779,15 @@ type struct JoinHandle<O> {
         if (outcome == OUTCOME_READY) {
             const rptr: O* = &shared.result;
             const out:  O  = *rptr;
-            alloc.deallocate(NonNull::new(shared as u8*), Layout::of<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<TaskShared<O>>());
             return Result::Ok(out);
         }
         if (outcome == OUTCOME_PANICKED) {
             const info: PanicInfo = ctl.panic;
-            alloc.deallocate(NonNull::new(shared as u8*), Layout::of<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<TaskShared<O>>());
             return Result::Err(JoinError::Panicked(info));
         }
-        alloc.deallocate(NonNull::new(shared as u8*), Layout::of<TaskShared<O>>());
+        alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<TaskShared<O>>());
         return Result::Err(JoinError::Cancelled);
     }
 
@@ -779,7 +796,7 @@ type struct JoinHandle<O> {
     detach(mut this) -> void {
         const shared: TaskShared<O>* = this.shared;
         this.shared = null;   // consume: neutralize this handle's Drop
-        detach_shared<O>(shared);
+        detach_shared::<O>(shared);
     }
 
     /// Request that the task be cancelled. It is reclaimed — its `Output` never
@@ -804,7 +821,7 @@ type struct JoinHandle<O> {
 implement<O> trait Drop for struct JoinHandle<O> {
     drop(mut &this) -> void {
         if (this.shared == null) { return; }
-        detach_shared<O>(this.shared);
+        detach_shared::<O>(this.shared);
         this.shared = null;
     }
 }
@@ -844,8 +861,8 @@ type struct Executor {
         if (count == 0) { count = 1; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut inner: ExecInner* = null;
-        match (alloc.allocate(Layout::of<ExecInner>())) {
-            Result::Ok(raw) => { inner = raw.cast<ExecInner>().as_ptr(); }
+        match (alloc.allocate(Layout::of::<ExecInner>())) {
+            Result::Ok(raw) => { inner = raw.cast::<ExecInner>().as_ptr(); }
             Result::Err(_)  => { panic("Executor::new: allocation failed", FILE, LINE); }
         }
         if (exec_mtx_init(&inner.q_mutex[0]) != 0) { panic("Executor: queue mutex init failed", FILE, LINE); }
@@ -877,14 +894,14 @@ type struct Executor {
     /// immediately.
     spawn<F, O>(mut &this, fut: F) -> JoinHandle<O>
     where F: Future<O> {
-        return spawn_on<F, O>(this.inner, fut);
+        return spawn_on::<F, O>(this.inner, fut);
     }
 
     /// Spawn `fut` as fire-and-forget: it runs to completion and its result is
     /// discarded. Sugar for `spawn(fut).detach()`.
     spawn_detached<F, O>(mut &this, fut: F) -> void
     where F: Future<O> {
-        mut h: JoinHandle<O> = spawn_on<F, O>(this.inner, fut);
+        mut h: JoinHandle<O> = spawn_on::<F, O>(this.inner, fut);
         h.detach();
     }
 
@@ -893,7 +910,7 @@ type struct Executor {
     /// could not complete; use `spawn(root).join()` for the `Result`.
     block_on<F, O>(mut &this, root: F) -> O
     where F: Future<O> {
-        mut h: JoinHandle<O> = spawn_on<F, O>(this.inner, root);
+        mut h: JoinHandle<O> = spawn_on::<F, O>(this.inner, root);
         match (h.join()) {
             Result::Ok(v)  => { return v; }
             Result::Err(_) => { panic("Executor::block_on: root future did not complete", FILE, LINE); }
@@ -936,14 +953,13 @@ implement trait Drop for struct Executor {
         inner.shutdown = true;
         exec_mtx_unlock(&inner.q_mutex[0]);
         exec_cond_broadcast(&inner.q_cond[0]);
-        // Join every worker (each exits `take()` once it observes shutdown), then
-        // release the tid buffer. Must follow the shutdown+broadcast above, or the
-        // join would block forever on threads still parked in `take()`.
+        // Join every worker (each exits `take()` once it observes shutdown).
+        // Must follow the shutdown+broadcast above, or the join would block
+        // forever on threads still parked in `take()`.
         const n: i64 = this.worker_tids.length() as i64;
         for (mut i: i64 = 0; i < n; i = i + 1) {
             exec_join_worker(this.worker_tids[i]);
         }
-        this.worker_tids.drop();
         BlockingPool::stop(inner.blocking);
         Reactor::stop(inner.reactor);
         // No workers and no reactor thread remain: safe to reclaim without
@@ -960,7 +976,7 @@ implement trait Drop for struct Executor {
         exec_cond_destroy(&inner.q_cond[0]);
         exec_mtx_destroy(&inner.q_mutex[0]);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(inner as u8*), Layout::of<ExecInner>());
+        alloc.deallocate(NonNull::new(inner as u8*), Layout::of::<ExecInner>());
         this.inner = null;
     }
 }

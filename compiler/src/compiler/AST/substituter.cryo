@@ -10,14 +10,56 @@
 ///   - generic_args [Named("T")] -> [Named("i32")] (via substitute_annotation)
 ///   - generic_params cleared (the specialization is concrete)
 
-namespace Compiler::AST::Substituter;
+namespace compiler::ast::substituter;
 
-import Compiler::Diag;
-import Compiler::AST;
-import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern, Visitor };
-import Compiler::Types;
-import Compiler::Types::{ Arena, Substitution };
-import Compiler::Resolver::{ SymbolStr, InternTable };
+import compiler::diag;
+import compiler::ast;
+import compiler::ast::{
+    ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
+    MemberPin, NamedAnnotation, node, NodeKind, pattern, PatternElement, PatternKind, PointerAnnotation,
+    PrimitiveAnnotation, ProjectionAnnotation, statement, TupleAnnotation, TypeAnnotation,
+    visitor
+};
+import compiler::types;
+import compiler::types::{ arena, substitution, TypeKind };
+import std::fmt;
+import compiler::resolver::{ symbol_str, intern_table };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, ResSlot };
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::ast::declaration::{
+    ClassDeclNode, DestructureDeclNode, EnumDeclNode, EnumVariantNode, FieldDeclNode,
+    FunctionDeclNode, ImplBlockNode, MethodNode, StructDeclNode, TraitDeclNode,
+    TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    CalleePin,
+    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, IdentifierNode, IfExprNode,
+    LambdaExprNode, MatchExprNode, MemberAccessNode, NewExprNode, ScopeResolutionNode,
+    SizeofExprNode, StaticMatchExprNode, StructLiteralNode, TernaryExprNode, TryExprNode,
+    TupleLiteralNode, TypeofExprNode, UnaryExprNode, YieldExprNode
+};
+import compiler::ast::pattern::{
+    EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode
+};
+import compiler::ast::statement::{
+    AsmBlockStmtNode, AsmOperand, BlockStmtNode, DeclStmtNode, DoWhileStmtNode,
+    ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
+    StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
+};
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::types::arena::{ TypeArena };
+import compiler::ast::node::{ ASTNode };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::resolver::{ TypeResolver };
+import compiler::ast::visitor::{ BaseASTVisitor };
 
 
 type class ASTTypeSubstituter : BaseASTVisitor {
@@ -25,23 +67,162 @@ public:
     subst:             TypeSubstitution*;
     arena:             TypeArena*;
     intern_table:      InternTable*;
-    base_name:         SymbolStr;         // "Array"
+    /// The declaration being specialized, or an invalid id when the caller
+    /// specializes none of its own (a method signature re-substituted under
+    /// its owner's arguments, a trait default's bodies).  A written name
+    /// denotes the specialization being built exactly when its stamp names
+    /// this declaration.  Its spelling cannot say so: a generic function may
+    /// share its name with a type, and the function's own signature and body
+    /// then name the TYPE.
+    template:          DefId;
     spec_name:         SymbolStr;         // "Array_i32"
-    param_names:       SymbolStr[];       // ["T"]
-    type_arg_displays: SymbolStr[];       // ["i32"]
+    /// The symbols the parameters were declared as.  A written `T` in the
+    /// cloned body carries its declaration's symbol in its stamp, and it is
+    /// rewritten only when that symbol is one of these: a trait default's
+    /// own `<U>` copied under an `implement<U>` keeps its `U` while the
+    /// impl's is rewritten, which no comparison of spellings can do.
+    param_syms:        SymbolID[];
+    /// The arena id the specialization will occupy, or invalid when the caller
+    /// has none.  Attached as `pre_resolved` to every annotation rewritten to
+    /// `spec_name`, so a synthesized mangled name never has to be re-derived
+    /// through the scope chain - which cannot answer it, because "which module
+    /// is this name written in" is not a question a name the substituter just
+    /// minted has.  Invalid means the annotation keeps today's by-name route.
+    spec_typeref:      TypeRef;
+    /// What reduces a projection in a copied expression's type to the type
+    /// the implementation binds; null where a copy's types are not written.
+    types:             TypeResolver*;
 
     ASTTypeSubstituter(subst: TypeSubstitution*, arena: TypeArena*,
                        intern_table: InternTable*,
-                       base_name: SymbolStr, spec_name: SymbolStr,
-                       param_names: SymbolStr[], type_arg_displays: SymbolStr[])
+                       template: DefId, spec_name: SymbolStr,
+                       param_syms: SymbolID[],
+                       spec_typeref: TypeRef)
         : BaseASTVisitor() {
         this.subst             = subst;
         this.arena             = arena;
         this.intern_table      = intern_table;
-        this.base_name         = base_name;
+        this.template          = template;
         this.spec_name         = spec_name;
-        this.param_names       = param_names;
-        this.type_arg_displays = type_arg_displays;
+        this.param_syms        = param_syms;
+        this.spec_typeref      = spec_typeref;
+        this.types             = null;
+    }
+
+    /// The name a rewritten annotation carries beside its argument's
+    /// TypeRef: the declaration's qualified name, or the arena's display of
+    /// a type that has none.  A label for diagnostics and debug output -
+    /// every annotation carrying it carries the TypeRef too, and the
+    /// resolver answers with that first.
+    arg_label(&this, arg: TypeRef) -> SymbolStr {
+        if (this.arena.lookup(arg) == null) {
+            return this.intern_table.intern(fmt::format("unknown_%llu", arg.key()));
+        }
+        const qname: SymbolStr = this.arena.get_qualified_name(arg).spelling();
+        if (qname.is_valid()) { return qname; }
+        return this.arena.display_label(arg);
+    }
+
+    /// Drop a callee pin, which - unlike a member pin - cannot cross a
+    /// substitution.  A `CalleePin::Family` holds the minted identifier of
+    /// one specialization, and a body cloned from a template carries whichever
+    /// sibling specialized first: `Request::write_to<W>` calls
+    /// `this.headers.write_to(writer)`, the nested `Headers::write_to<W>` is
+    /// pinned to `<TcpStream>` the first time it specializes, and the clone
+    /// takes that pin into `write_to<TlsStream>` - a `TlsStream*` passed to
+    /// the TcpStream implementation.  The symbol is not a coordinate inside a
+    /// declaration the way a field index is; until a pin names the template
+    /// and the substitution instead, dropping it is the only correct answer
+    /// and the monomorphizer's discovery re-infers this body's callee.  A pin
+    /// leaves a clone through this door and no other.
+    ///
+    /// A `CalleePin::Decl` on a call written by name or by path crosses: it is
+    /// the declaration the call was written against, and a call in a template
+    /// calls that declaration in every copy.  Selected again in the copy, it
+    /// could only be selected wrongly.  A method call's declaration belongs
+    /// to its receiver, which the substitution may change; the copy binds it
+    /// again from the definition the call records.
+    drop_stale_callee_pin(&this, node: CallExprNode*) -> void {
+        const callee: ASTNode* = node.callee as ASTNode*;
+        if (node.resolved_callee.decl_entry().is_valid() && callee != null
+                && (callee.kind == NodeKind::Identifier || callee.kind == NodeKind::ScopeResolution)) {
+            return;
+        }
+        node.set_resolved_callee(CalleePin::None);
+    }
+
+    /// Write a copied expression's type: the type its template's expression
+    /// had, which the clone carries, as this copy sees it (`in_copy`).
+    substitute_type(&this, node: ExpressionNode*) -> void {
+        if (this.subst == null || !node.resolved_type.is_valid()) { return; }
+        node.set_resolved_type(this.in_copy(node.resolved_type));
+    }
+
+    /// `t`, written in the template, as this copy sees it: under the copy's
+    /// substitution, each projection that makes concrete reduced (`types`,
+    /// when given).  Nothing already built is changed, and the
+    /// instantiations this builds are not demanded here.
+    in_copy(&this, t: TypeRef) -> TypeRef {
+        const was: boolean = this.arena.symbolic_no_demand_active;
+        this.arena.set_symbolic_no_demand(true);
+        const out: TypeRef = this.reduced(this.subst.apply(t, this.arena));
+        this.arena.set_symbolic_no_demand(was);
+        return out;
+    }
+
+    /// `t` with each projection whose base is concrete reduced to the type
+    /// the implementation binds, when `types` is given; nothing already
+    /// built is changed.
+    reduced(&this, t: TypeRef) -> TypeRef {
+        if (this.types == null) { return t; }
+        return this.types.reduce_projections(t, false);
+    }
+
+    /// The same drop for a path's callee - see the overload above.
+    drop_stale_callee_pin(&this, node: ScopeResolutionNode*) -> void {
+        node.set_resolved_callee(CalleePin::None);
+    }
+
+    /// Whether a written name's stamp answers with the declaration being
+    /// specialized.  An unanswered name names nothing, so it is never the
+    /// template.
+    names_template(&this, slot: ResSlot) -> boolean {
+        if (!this.template.is_valid()) { return false; }
+        return match (slot) {
+            ResSlot::Answered(r) => { r.def_id().equals(this.template) }
+            _                    => { false }
+        };
+    }
+
+    /// Whether a path's scope segment is the declaration being specialized:
+    /// the name layer stopped on it as a type, with only the member left.
+    scope_names_template(&this, slot: ResSlot) -> boolean {
+        if (!this.template.is_valid()) { return false; }
+        match (slot) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    res::Res::TypeRelative(b, trailing) => {
+                        if (trailing != 1) { return false; }
+                        return match (b) {
+                            res::ResBase::Def(d) => { d.equals(this.template) }
+                            _                    => { false }
+                        };
+                    }
+                    _ => { return false; }
+                }
+            }
+            _ => { return false; }
+        }
+    }
+
+    /// The slot of the parameter `sym`, or -1 when it is none of this
+    /// substitution's - including an invalid symbol, which names nothing.
+    param_slot(&this, sym: SymbolID) -> i64 {
+        if (!sym.is_valid()) { return -1; }
+        for (mut i: i64 = 0; i < this.param_syms.length; i++) {
+            if (this.param_syms[i].equals(sym)) { return i; }
+        }
+        return -1;
     }
 
 
@@ -70,7 +251,7 @@ public:
     /// arena to keep `Type*` / `PointerType*` references out of this module.
     unwrap_pointer_pointee(&this, ty: TypeRef) -> TypeRef {
         if (!ty.is_valid()) { return TypeRef::invalid(); }
-        return this.arena.pointer_pointee_of(ty.id);
+        return this.arena.pointer_pointee_of(ty);
     }
 
 
@@ -157,13 +338,15 @@ public:
     substitute_named_annotation(ann: TypeAnnotation*, named: NamedAnnotation*) -> TypeAnnotation* {
         // Associated-type projection on a generic param written as a FLAT
         // qualified name (`I::Item` - only `This::Item` is a Projection node).
-        // If the segment before the first `::` is one of our substituted params,
-        // rewrite the whole thing to a `Projection` over the param's concrete
-        // replacement, so a field/signature type `(I::Item)->O` becomes a real
-        // projection over `IntSeq` that the resolver reduces to the member type.
-        const nm_str: string = this.intern_table.resolve(named.name);
-        const nm_len: i64 = nm_str.length() as i64;
-        if (nm_len > 2) {
+        // The stamp says which parameter the path is rooted at; when it is one
+        // of our substituted params, rewrite the whole thing to a `Projection`
+        // over the param's concrete replacement, so a field/signature type
+        // `(I::Item)->O` becomes a real projection over `IntSeq` that the
+        // resolver reduces to the member type.
+        const pi: i64 = this.param_slot(named.relative_param_sym());
+        if (pi >= 0) {
+            const nm_str: string = this.intern_table.resolve(named.name);
+            const nm_len: i64 = nm_str.length() as i64;
             mut sep: i64 = -1;
             mut k: i64 = 0;
             while (k + 1 < nm_len) {
@@ -171,100 +354,96 @@ public:
                 k = k + 1;
             }
             if (sep > 0) {
-                const pfx: string = nm_str.substring(0, sep);
-                const pfx_sym: SymbolStr = this.intern_table.intern(pfx);
-                for (mut pi: i64 = 0; pi < this.param_names.length; pi++) {
-                    if (pfx_sym.equals(this.param_names[pi])) {
-                        const member_str: string = nm_str.substring(sep + 2, nm_len - sep - 2);
-                        const member_sym: SymbolStr = this.intern_table.intern(member_str);
-                        const base_named: NamedAnnotation* = new NamedAnnotation {
-                            name:         this.type_arg_displays[pi],
-                            span:         named.span,
-                            pre_resolved: this.resolved_arg_typeref(pi),
-                        };
-                        const base_ann: TypeAnnotation* =
-                            new TypeAnnotation::Named(base_named);
-                        const proj: ProjectionAnnotation* = new ProjectionAnnotation {
-                            base:         base_ann,
-                            member:       member_sym,
-                            owning_trait: SymbolStr::empty(),
-                            resolved:     TypeRef::invalid(),
-                            span:         named.span,
-                        };
-                        *ann = TypeAnnotation::Projection(proj);
-                        return ann;
-                    }
-                }
-            }
-        }
-
-        // Check if this named annotation is one of our generic params.
-        for (mut i: i64 = 0; i < this.param_names.length; i++) {
-            if (named.name.equals(this.param_names[i])) {
-                // Instead of blindly setting named.name (which produces
-                // Named("i32"), Named("void*"), Named("Foo[]") that the
-                // resolver must parse), produce the correct annotation kind.
-                const display: string = this.intern_table.resolve(this.type_arg_displays[i]);
-                const display_len: i64 = display.length() as i64;
-
-                // Unit type `()` has no Named form; it must become an empty Tuple
-                // annotation so resolve_tuple produces a valid unit TypeRef.
-                if (display_len == 2 && display[0] == '(' && display[1] == ')') {
-                    ASTTypeSubstituter::rewrite_to_unit(ann, named.span);
-                    return ann;
-                }
-                // Primitive type? -> Primitive annotation
-                if (ASTTypeSubstituter::is_primitive_type_name(display)) {
-                    ASTTypeSubstituter::rewrite_to_primitive(ann, this.type_arg_displays[i], named.span);
-                    return ann;
-                }
-                // Pointer suffix? -> Pointer(Named(inner))
-                if (display_len > 1 && display[display_len - 1] == '*') {
-                    const inner_str: string = display.substr(0, display_len - 1);
-                    const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
-                    // Unwrap one Pointer level off the substitution arg so
-                    // the inner Named gets a pre_resolved TypeRef. Critical
-                    // for sizeof/alignof in spec'd bodies; without it the
-                    // resolver falls back to bare-name lookup and fails for
-                    // any user-defined type not in scope at the spec site.
-                    const inner_pre: TypeRef = this.unwrap_pointer_pointee(
-                        this.resolved_arg_typeref(i));
-                    ASTTypeSubstituter::rewrite_to_pointer(ann, inner_sym, inner_pre, named.span);
-                    return ann;
-                }
-                // Array suffix? -> Array(Named(inner), -1)
-                if (display_len > 2 && display[display_len - 2] == '[' && display[display_len - 1] == ']') {
-                    const inner_str: string = display.substr(0, display_len - 2);
-                    const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
-                    // Unwrap one Array level off the substitution arg so the
-                    // inner Named gets a pre_resolved TypeRef (mirrors the
-                    // Pointer branch above). Without it, a non-bare-name element
-                    // (a pointer, or an out-of-scope user type) resolves to
-                    // invalid and produces an Array<invalid> that ICEs mangling.
-                    const inner_pre: TypeRef = this.arena.array_element_of(
-                        this.resolved_arg_typeref(i).id);
-                    ASTTypeSubstituter::rewrite_to_array(ann, inner_sym, inner_pre, named.span);
-                    return ann;
-                }
-                // User-defined type: keep as Named with new name, and attach
-                // the pre-resolved TypeRef so the resolver doesn't need to
-                // re-derive it from the (potentially very long) mangled spec
-                // name. The substituter owns the answer here: subst.replacements[i]
-                // is the concrete TypeRef the user gave for this generic param.
-                // If it's still wrapped in InstantiatedType, follow through to
-                // the resolved struct/enum/class so resolve_named's caller sees
-                // a usable type immediately.
-                named.name = this.type_arg_displays[i];
-                named.pre_resolved = this.resolved_arg_typeref(i);
+                const member_str: string = nm_str.substring((sep + 2) as u32, (nm_len - sep - 2) as u32);
+                const member_sym: SymbolStr = this.intern_table.intern(member_str);
+                const base_pre: TypeRef = this.resolved_arg_typeref(pi);
+                const base_named: NamedAnnotation* = new NamedAnnotation {
+                    name:         this.arg_label(base_pre),
+                    span:         named.span,
+                    pre_resolved: base_pre,
+                    res: ResSlot::Pending,
+                };
+                const base_ann: TypeAnnotation* =
+                    new TypeAnnotation::Named(base_named);
+                const proj: ProjectionAnnotation* = new ProjectionAnnotation {
+                    base:         base_ann,
+                    member:       member_sym,
+                    rooted_at:    named.relative_param_sym(),
+                    owner_trait:  DefId::invalid(),
+                    resolved:     TypeRef::invalid(),
+                    span:         named.span,
+                    refused:      false,
+                };
+                *ann = TypeAnnotation::Projection(proj);
                 return ann;
             }
         }
 
-        // Rewrite the base type name to the specialized name.
+        // The parameter this annotation names, when it is one of ours.
+        const i: i64 = this.param_slot(named.param_sym());
+        if (i >= 0) {
+            // The annotation's shape is the argument's KIND, read off the
+            // arena.  Its printed text cannot say it: a function type
+            // returning a pointer prints ending in `*` and one returning an
+            // array ending in `[]`, and neither is a pointer or an array.
+            const arg: TypeRef = this.resolved_arg_typeref(i);
+            match (this.arena.kind_of(arg)) {
+                // `()` has no Named form; the empty tuple is the unit.
+                TypeKind::Unit => {
+                    ASTTypeSubstituter::rewrite_to_unit(ann, named.span);
+                    return ann;
+                }
+                TypeKind::Void | TypeKind::Bool | TypeKind::Int | TypeKind::Float
+                | TypeKind::Char | TypeKind::String | TypeKind::Never => {
+                    ASTTypeSubstituter::rewrite_to_primitive(ann, this.arg_label(arg), named.span);
+                    return ann;
+                }
+                // The pointee carries its TypeRef: sizeof/alignof in a
+                // specialized body read it, and the label names nothing the
+                // specializing module can reach.
+                TypeKind::Pointer => {
+                    const pointee: TypeRef = this.unwrap_pointer_pointee(arg);
+                    ASTTypeSubstituter::rewrite_to_pointer(
+                        ann, this.arena.display_label(pointee),
+                        pointee, named.span);
+                    return ann;
+                }
+                _ => {}
+            }
+            // A dynamic array's element carries its TypeRef, as a pointee
+            // does; without it an element that is not a type in scope at the
+            // specialization resolves to nothing and mangling fails.
+            const element: TypeRef = this.arena.dynamic_array_element_of(arg);
+            if (element.is_valid()) {
+                ASTTypeSubstituter::rewrite_to_array(
+                    ann, this.arena.display_label(element),
+                    element, named.span);
+                return ann;
+            }
+            // Anything else stays Named, answered by the argument itself:
+            // the substitution holds the TypeRef the user gave, and the
+            // resolver takes `pre_resolved` before it reads the name.
+            named.name = this.arg_label(arg);
+            named.pre_resolved = arg;
+            return ann;
+        }
+
+        // A name whose stamp is the template denotes the specialization.
         // e.g. `&this` on `Pair<T>` has annotation Reference(Named("Pair"))
         // which must become Reference(Named("Pair_string")) after substitution.
-        if (named.name.equals(this.base_name)) {
+        //
+        // Carries the answer with the name, exactly as the generic-param branch
+        // above does.  `spec_name` is minted here and registered under the
+        // TEMPLATE's module, so resolving it by name later only works while the
+        // resolution context happens to be homed on that module - which makes
+        // the home of every WRITTEN annotation in the clone unmovable.  The id
+        // is the instantiation's own, which the concrete type takes over in
+        // place, so this cannot fork type identity.
+        if (this.names_template(named.res)) {
             named.name = this.spec_name;
+            if (this.spec_typeref.is_valid()) {
+                named.pre_resolved = this.spec_typeref;
+            }
             return ann;
         }
 
@@ -290,7 +469,7 @@ public:
 
     substitute_generic_annotation(ann: TypeAnnotation*, gen: GenericAnnotation*) -> TypeAnnotation* {
         // A Generic is a self-reference to the outer type ONLY when its
-        // base name matches base_name AND its args (BEFORE substitution)
+        // base names the template AND its args (BEFORE substitution)
         // are exactly the outer type's generic param names in declaration
         // order. Without the args check, an inner generic-method's
         // signature like `cast<U> -> NonNull<U>` (declared on `NonNull<T>`)
@@ -324,22 +503,23 @@ public:
         return ann;
     }
 
-    /// True if `args` is a leading prefix of the outer type's param
-    /// names (each `args[i]` is exactly `Named(param_names[i])`). Allows
+    /// True if `args` is a leading prefix of the outer type's parameters
+    /// (each `args[i]` is a `Named` stamped with `param_syms[i]`). Allows
     /// shorter arg lists so generics with defaults like `RawBuffer<T,
     /// A = GlobalAlloc>` recognise `RawBuffer<T>` (one arg) as a
     /// self-reference; the trailing defaulted positions still resolve
     /// to whatever the current spec used. Empty `args` is also a self-
     /// reference (a bare unparameterized name).
     args_are_outer_param_refs(&this, args: &TypeAnnotation*[]) -> boolean {
-        if (args.length > this.param_names.length) { return false; }
+        if (args.length > this.param_syms.length) { return false; }
         for (mut i: i64 = 0; i < args.length; i++) {
             const a: TypeAnnotation* = args[i];
             if (a == null) { return false; }
             mut matched: boolean = false;
             match (*a) {
                 TypeAnnotation::Named(named) => {
-                    matched = named.name.equals(this.param_names[i]);
+                    matched = named.param_sym().is_valid()
+                        && named.param_sym().equals(this.param_syms[i]);
                 }
                 _ => { matched = false; }
             }
@@ -348,12 +528,12 @@ public:
         return true;
     }
 
-    /// Helper: returns true if the annotation is Named(base_name).
+    /// Whether the annotation is a name whose stamp is the template.
     is_named_matching_base(ann: TypeAnnotation*) -> boolean {
         if (ann == null) { return false; }
         match (*ann) {
             TypeAnnotation::Named(named) => {
-                return named.name.equals(this.base_name);
+                return this.names_template(named.res);
             }
             _ => { return false; }
         }
@@ -433,12 +613,11 @@ public:
         // Recurse into body - EXCEPT for self-returning trait defaults
         // (combinators like `take` returning `TakeIter<This>`).  Their bodies
         // are re-cloned and re-resolved per receiver by the monomorphizer's
-        // lazy `try_instantiate_self_returning_default`; the spec'd impl copy
+        // lazy `instantiate_deferred`; the spec'd impl copy
         // here is only used as the clone source.  The base->spec rename would
         // otherwise rewrite the combinator's OWN constructor call
-        // (`TakeIter::new`) when the adapter is implemented for a type whose
-        // base name collides with the adapter's (chaining `TakeIter` over a
-        // `TakeIter`), pinning the constructor to the inner spec and breaking
+        // (`TakeIter::new`) when the adapter is implemented for the adapter
+        // itself (chaining `TakeIter` over a `TakeIter`), pinning the constructor to the inner spec and breaking
         // `r.take(a).take(b)`.  The signature above IS still substituted, so
         // method lookup and the per-receiver re-resolution both see the right
         // return type.
@@ -458,6 +637,16 @@ public:
     }
 
     override visit(node: DestructureDeclNode*) -> void {
+        // The decided types - the destructured value's and each binding's -
+        // as this copy sees them.
+        if (this.subst != null) {
+            if (node.resolved_type.is_valid()) { node.resolved_type = this.in_copy(node.resolved_type); }
+            for (mut i: i64 = 0; i < node.bindings.length; i++) {
+                if (node.bindings[i].resolved_type.is_valid()) {
+                    node.bindings[i].resolved_type = this.in_copy(node.bindings[i].resolved_type);
+                }
+            }
+        }
         if (node.type_annotation != null) {
             node.type_annotation = this.substitute_annotation(node.type_annotation);
         }
@@ -469,6 +658,13 @@ public:
     override visit(node: ImplBlockNode*) -> void {
         if (node.trait_annotation != null) {
             this.substitute_annotation(node.trait_annotation);
+        }
+        if (node.trait_arg_types.length > 0 && this.subst != null) {
+            mut tats: TypeRef[] = [];
+            for (mut i: i64 = 0; i < node.trait_arg_types.length; i++) {
+                tats.push(this.reduced(this.subst.apply(node.trait_arg_types[i], this.arena)));
+            }
+            node.trait_arg_types = tats;
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             node.methods[i].accept(this);
@@ -489,9 +685,13 @@ public:
     }
 
     override visit(node: CastExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         node.expression.accept(this);
         if (node.target_annotation != null) {
             node.target_annotation = this.substitute_annotation(node.target_annotation);
+        }
+        if (this.subst != null && node.resolved_target.is_valid()) {
+            node.set_resolved_target(this.in_copy(node.resolved_target));
         }
     }
 
@@ -499,6 +699,7 @@ public:
     // Expression visitors: rewrite generic_args
 
     override visit(node: CallExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         node.callee.accept(this);
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             node.arguments[i].accept(this);
@@ -506,20 +707,9 @@ public:
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
-        // Specialization changes the concrete types of this call's receiver
-        // and arguments, so a `resolved_callee` / `resolved_method` pinned for
-        // the pre-substitution template (or copied by the cloner from a SIBLING
-        // specialization) is stale for THIS instantiation.  The classic break:
-        // `Request::write_to<W>` calls `this.headers.write_to(writer)`; the
-        // nested `Headers::write_to<W>` got pinned to `<TcpStream>` the first
-        // time `write_to` specialized, and the cloner copies that pin into
-        // every later `write_to<S>` body - so `write_to<TlsStream>` wrongly
-        // calls `Headers::write_to<TcpStream>` (passing a `TlsStream*` to the
-        // TcpStream impl: garbage fd, EBADF, plaintext on the wire).  Clear the
-        // pins so the monomorphizer's discovery re-infers the right spec for
-        // this body; codegen's resolver re-derives any discovery doesn't pin.
-        node.resolved_method = null;
-        node.set_resolved_callee(SymbolStr::empty());
+        // A callee pin crosses a substitution only where `drop_stale_callee_pin`
+        // says.
+        this.drop_stale_callee_pin(node);
         // `resolved_type_args` is sema's stash of this call's generic type-arg
         // bindings, expressed in the TEMPLATE's params (e.g. `H`/`W`).  Unlike
         // the pins above it is NEVER a stale sibling's concrete value (only sema
@@ -535,6 +725,26 @@ public:
             }
             node.set_resolved_type_args(sub_rta);
         }
+        // The receiver a template pin was selected on is written in the
+        // template's parameters too, and is this copy's receiver once they
+        // are substituted.
+        if (node.template_recv.is_valid() && this.subst != null) {
+            node.template_recv = this.reduced(this.subst.apply(node.template_recv, this.arena));
+        }
+        if (node.bound_params.length > 0 && this.subst != null) {
+            mut bps: TypeRef[] = [];
+            for (mut i: i64 = 0; i < node.bound_params.length; i++) {
+                bps.push(this.reduced(this.subst.apply(node.bound_params[i], this.arena)));
+            }
+            node.bound_params = bps;
+        }
+        if (node.bound_trait_args.length > 0 && this.subst != null) {
+            mut btas: TypeRef[] = [];
+            for (mut i: i64 = 0; i < node.bound_trait_args.length; i++) {
+                btas.push(this.reduced(this.subst.apply(node.bound_trait_args[i], this.arena)));
+            }
+            node.bound_trait_args = btas;
+        }
     }
 
     /// Generic function-reference value `name<Args>` used as a value (GAP 1):
@@ -543,17 +753,28 @@ public:
     /// so the monomorphizer's discovery walk can resolve them and pin the
     /// specialized callee. Ordinary identifiers (no turbofish) are untouched.
     override visit(node: IdentifierNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
     }
 
     override visit(node: NewExprNode*) -> void {
-        const is_self: boolean = node.type_name.equals(this.base_name)
+        this.substitute_type(node as ExpressionNode*);
+        const is_self: boolean = this.names_template(node.res)
             && (node.generic_args.length == 0
                 || this.args_are_outer_param_refs(node.generic_args));
-        if (is_self) {
-            node.type_name = this.spec_name;
+        // A self-reference denotes the enclosing specialization, recorded as the
+        // arena id that specialization already has rather than by rewriting the
+        // spelling to the mangled spec name.  `type_name` therefore keeps what
+        // the SOURCE wrote in every phase, so it cannot come to mean something
+        // different from the `res` beside it, which names the DEFINITION and is
+        // copied verbatim by every clone.  The id is a POINTER to the spec
+        // because that is what `new` evaluates to.
+        // A self-reference arriving with no reserved id has nothing left to
+        // denote once the spelling is stable, and is left unresolved.
+        if (is_self && this.spec_typeref.is_valid()) {
+            node.set_resolved_type(this.arena.get_pointer_to(this.spec_typeref));
         }
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             node.arguments[i].accept(this);
@@ -567,21 +788,35 @@ public:
         if (node.struct_init != null) {
             node.struct_init.accept(this);
         }
+        // A variant's ordinal is the same in every instantiation of the enum,
+        // so the pin crosses the substitution; the mark records that the walk
+        // over this clone did not produce it.
+        node.carry_resolved_member();
     }
 
     override visit(node: StructLiteralNode*) -> void {
-        // Only collapse to the spec name when this literal is a true
-        // self-reference: same base, and either no generic args or args
-        // that exactly echo the outer type's params in order. An inner
-        // generic-method literal like `NonNull<U> { ... }` inside a
-        // `cast<U>` on `NonNull<T>` shares the base name but is a
-        // different instantiation; renaming `NonNull` to `NonNull_u8`
-        // would falsely freeze the literal at the outer spec's args.
-        const is_self: boolean = node.struct_type.equals(this.base_name)
+        this.substitute_type(node as ExpressionNode*);
+        // A self-reference denotes the enclosing specialization, and it is
+        // recorded as the arena id that specialization already has - not by
+        // rewriting the spelling to the mangled spec name.  `struct_type`
+        // therefore keeps what the SOURCE wrote in every phase, so it cannot
+        // come to mean something different from the `res` beside it, which
+        // names the DEFINITION and is copied verbatim by every clone.  The id
+        // is the same carrier `pre_resolved` already is for annotations.
+        //
+        // The collapse rule: the stamp names the template, and either no generic
+        // args or args that echo the outer type's params in order.  An inner
+        // generic-method literal like `NonNull<U> { ... }` inside a `cast<U>`
+        // on `NonNull<T>` names the same template but is a different
+        // instantiation, and freezing it at the outer spec's args binds every
+        // later `cast<V>` to the wrong sibling.
+        const is_self: boolean = this.names_template(node.res)
             && (node.generic_args.length == 0
                 || this.args_are_outer_param_refs(node.generic_args));
-        if (is_self) {
-            node.struct_type = this.spec_name;
+        // A self-reference arriving with no reserved id has nothing left to
+        // denote once the spelling is stable, and is left unresolved.
+        if (is_self && this.spec_typeref.is_valid()) {
+            node.set_resolved_type(this.spec_typeref);
         }
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
@@ -591,30 +826,52 @@ public:
             if (val != null) {
                 val.accept(this);
             }
+            // A field's position in its owner is the same in every
+            // instantiation, so the pin crosses the substitution.
+            node.field_inits[i].pin_carried = node.field_inits[i].pin.is_some();
         }
     }
 
     override visit(node: ScopeResolutionNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         // ScopeResolution carries TWO arg lists:
         //   * scope_generic_args: args on the scope (`Pair<T>::method`)
         //   * generic_args:       args on the method (`Pair::method<U>`)
-        // Only the scope args participate in the self-type collapse.
-        const is_self: boolean = node.scope_name.equals(this.base_name)
-            && (node.scope_generic_args.length == 0
-                || this.args_are_outer_param_refs(node.scope_generic_args));
+        // Only the scope args participate in the self-type collapse, and only
+        // when they are written: the template's own parameters as its
+        // arguments (`Pair::<T>::m`, and `This::m`, which the name layer
+        // writes that way) name the copy's own type.  A bare `Pair::m`
+        // infers its arguments from the call, which the type check
+        // recorded on it, and is left for that record to answer.
+        const is_self: boolean = this.scope_names_template(node.scope_res)
+            && node.scope_generic_args.length > 0
+            && this.args_are_outer_param_refs(node.scope_generic_args);
+        // True when the else-branch below retargets the scope segment at a
+        // DIFFERENT declaration (a generic param bound to a concrete type),
+        // which is the one rewrite a carried member pin cannot survive.
+        mut rewrote_owner: boolean = false;
         if (is_self) {
             node.scope_name = this.spec_name;
+            // The id beside the name, as a written annotation gets: the
+            // spelling minted here is registered under the TEMPLATE's module
+            // and names nothing from anywhere else.
+            if (this.spec_typeref.is_valid()) {
+                node.spec_owner = this.spec_typeref;
+            }
         } else {
             // Substitute generic-param scope names too; `T::default()`
             // inside `fn f<T>() where T: Default` becomes `i32::default()`
-            // when monomorphized with T=i32.  Without this, the spec's
-            // body still names `T`, sema's static-call resolver finds
-            // no matching type/trait, and emits E0233.
-            for (mut i: i64 = 0; i < this.param_names.length; i++) {
-                if (node.scope_name.equals(this.param_names[i])) {
-                    node.scope_name = this.type_arg_displays[i];
-                    break;
-                }
+            // when monomorphized with T=i32.  The stamp beside the name
+            // still says `GenericParam` - a `Res` names a definition, and
+            // the clone's syntax is the template's - so the arena id is
+            // recorded as well: it is the only carrier of which type the
+            // segment now means that is not a spelling to be looked up.
+            const si: i64 = this.param_slot(node.scope_res.relative_param_sym());
+            if (si >= 0) {
+                rewrote_owner = true;
+                const arg_ref: TypeRef = this.resolved_arg_typeref(si);
+                node.scope_name = this.arg_label(arg_ref);
+                if (arg_ref.is_valid()) { node.spec_owner = arg_ref; }
             }
         }
         if (node.generic_args.length > 0) {
@@ -623,58 +880,77 @@ public:
         if (node.scope_generic_args.length > 0) {
             node.scope_generic_args = this.substitute_generic_type_args(node.scope_generic_args);
         }
+        // The head's trait is a written type too (`(From<T> for P)::from`).
+        if (node.impl_trait != null) {
+            node.impl_trait = this.substitute_annotation(node.impl_trait);
+        }
+        // The same reason a call's pin is cleared: the scope segment above may
+        // now name a different owner than the one the template's walk pinned
+        // the function for, and sema's walk over this body pins it again.
+        this.drop_stale_callee_pin(node);
+        // The member pin crosses the substitution - a variant's ordinal and a
+        // global's slot are the same in every instantiation - EXCEPT where the
+        // branch above retargeted the scope segment at another declaration
+        // (`T::m` with `T` bound to a concrete type): there the coordinates
+        // belong to the old owner and name nothing in the new one.  That
+        // branch runs, and no path reaching it has ever carried a member pin.
+        if (rewrote_owner) {
+            node.set_resolved_member(MemberPin::None);
+        } else {
+            node.carry_resolved_member();
+        }
     }
 
     override visit(node: SizeofExprNode*) -> void {
-        for (mut i: i64 = 0; i < this.param_names.length; i++) {
-            if (node.type_name.equals(this.param_names[i])) {
-                node.type_name = this.type_arg_displays[i];
-                break;
-            }
-        }
-        if (node.type_name.equals(this.base_name)) {
-            node.type_name = this.spec_name;
-        }
-        // Recursively substitute generic params inside the full type
-        // annotation (e.g., `HashMapEntry<K, V>` -> `HashMapEntry<S, j>`).
+        this.substitute_type(node as ExpressionNode*);
+        // Substitute generic params inside the operand annotation
+        // (e.g., `HashMapEntry<K, V>` -> `HashMapEntry<S, j>`).
         if (node.type_ann != null) {
             this.substitute_annotation(node.type_ann);
+            node.set_operand_type(this.operand_in_copy(node.operand_type));
         }
     }
 
     override visit(node: AlignofExprNode*) -> void {
-        for (mut i: i64 = 0; i < this.param_names.length; i++) {
-            if (node.type_name.equals(this.param_names[i])) {
-                node.type_name = this.type_arg_displays[i];
-                break;
-            }
-        }
-        if (node.type_name.equals(this.base_name)) {
-            node.type_name = this.spec_name;
-        }
+        this.substitute_type(node as ExpressionNode*);
         if (node.type_ann != null) {
             this.substitute_annotation(node.type_ann);
+            node.set_operand_type(this.operand_in_copy(node.operand_type));
         }
+    }
+
+    /// A `sizeof`/`alignof` operand's decided type as this copy sees it.
+    /// Without a substitution the annotation may now name a different type
+    /// than the one decided, so the answer is dropped: a stale size is a
+    /// wrong answer, and a missing one is an error codegen reports.
+    operand_in_copy(&this, t: TypeRef) -> TypeRef {
+        if (this.subst == null || !t.is_valid()) { return TypeRef::invalid(); }
+        return this.in_copy(t);
     }
 
 
     override visit(node: TypeofExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         if (node.operand != null) { node.operand.accept(this); }
     }
 
     override visit(node: DeleteExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         if (node.operand != null) { node.operand.accept(this); }
     }
 
     override visit(node: AwaitExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         if (node.operand != null) { node.operand.accept(this); }
     }
 
     override visit(node: YieldExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         if (node.operand != null) { node.operand.accept(this); }
     }
 
     override visit(node: TryExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         // Monomorphization runs before sema lowers `?`, so only `operand`
         // is populated here; recurse into `desugared` too if a post-sema
         // clone is ever substituted.
@@ -790,6 +1066,7 @@ public:
     // Remaining expression visitors: recurse into children
 
     override visit(node: BinaryExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         node.left.accept(this);
         node.right.accept(this);
         // Rewrite the operator-overload call's stashed type-args (T -> concrete)
@@ -798,17 +1075,20 @@ public:
     }
 
     override visit(node: UnaryExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         node.operand.accept(this);
         if (node.desugared_call != null) { node.desugared_call.accept(this); }
     }
 
     override visit(node: TernaryExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         node.condition.accept(this);
         node.true_expr.accept(this);
         node.false_expr.accept(this);
     }
 
     override visit(node: IfExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         node.condition.accept(this);
         node.then_expr.accept(this);
         if (node.else_expr != null) {
@@ -817,6 +1097,7 @@ public:
     }
 
     override visit(node: MatchExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         node.subject.accept(this);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             this.visit(node.arms[i]);
@@ -824,6 +1105,7 @@ public:
     }
 
     override visit(node: StaticMatchExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         node.scrutinee = this.substitute_annotation(node.scrutinee);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             this.visit(node.arms[i]);
@@ -831,15 +1113,9 @@ public:
     }
 
     override visit(node: ArrayLiteralNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             node.elements[i].accept(this);
-        }
-        // Substitute element_type string (element_type stays string, resolve SymbolStr for comparison)
-        for (mut i: i64 = 0; i < this.param_names.length; i++) {
-            if (node.element_type == this.intern_table.resolve(this.param_names[i])) {
-                node.element_type = this.intern_table.resolve(this.type_arg_displays[i]);
-                break;
-            }
         }
         if (node.repeat_count_expr != null) {
             node.repeat_count_expr.accept(this);
@@ -847,12 +1123,14 @@ public:
     }
 
     override visit(node: TupleLiteralNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             node.elements[i].accept(this);
         }
     }
 
     override visit(node: LambdaExprNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             this.visit(node.parameters[i]);
         }
@@ -862,6 +1140,7 @@ public:
     }
 
     override visit(node: ArrayAccessNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         node.array.accept(this);
         node.index.accept(this);
         // Rewrite the index-overload call's stashed type-args (T -> concrete)
@@ -871,16 +1150,23 @@ public:
     }
 
     override visit(node: MemberAccessNode*) -> void {
+        this.substitute_type(node as ExpressionNode*);
         node.object.accept(this);
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
+        // A field's position in its owner is the same in the template and in
+        // every instantiation of it, so the pin crosses the substitution.
+        node.carry_resolved_member();
     }
 
     override visit(node: EnumPatternNode*) -> void {
-        if (node.enum_name.equals(this.base_name)) {
+        if (this.names_template(node.res)) {
             node.enum_name = this.spec_name;
         }
+        // The enum is the same declaration under another instantiation, so the
+        // variant's ordinal still names the same variant.
+        node.carry_resolved_member();
         // Recurse into nested sub-patterns (`Some(Some(n))`, `Branch(Leaf(x),
         // r)`) so their enum_name is substituted too. Without this, a nested
         // pattern in a generic body kept the unsubstituted (template) name.
@@ -902,6 +1188,9 @@ public:
     }
 
     override visit(node: VarDeclNode*) -> void {
+        if (this.subst != null && node.resolved_type.is_valid()) {
+            node.resolved_type = this.in_copy(node.resolved_type);
+        }
         if (node.type_annotation != null) {
             node.type_annotation = this.substitute_annotation(node.type_annotation);
         }
@@ -919,31 +1208,6 @@ public:
         }
     }
 
-    /// Check if a type name string is a primitive type name.
-    /// Used by the substituter to produce Primitive annotations instead of
-    /// Named("i32") when a generic param is substituted with a primitive.
-    static is_primitive_type_name(name: string) -> boolean {
-        return name.eq("void")
-            || name.eq("boolean")
-            || name.eq("char")
-            || name.eq("string")
-            || name.eq("i8")
-            || name.eq("i16")
-            || name.eq("i32")
-            || name.eq("i64")
-            || name.eq("i128")
-            || name.eq("u8")
-            || name.eq("u16")
-            || name.eq("u32")
-            || name.eq("u64")
-            || name.eq("u128")
-            || name.eq("isize")
-            || name.eq("usize")
-            || name.eq("f32")
-            || name.eq("f64")
-            || name.eq("never");
-    }
-
     /// Rewrite a TypeAnnotation* in-place from Named to Primitive variant.
     static rewrite_to_primitive(ann: TypeAnnotation*, name: SymbolStr, span: SourceSpan) -> void {
         const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: name, span: span };
@@ -952,18 +1216,18 @@ public:
 
     /// Rewrite a TypeAnnotation* in-place from Named to Pointer(Named(inner)).
     /// `inner_pre_resolved` is the inner type's TypeRef when known (the
-    /// substituter has it from `subst.replacements[i]`'s pointee). Without it,
-    /// `resolve_sizeof_operand_type` resolves the inner Named by name with a
-    /// fresh empty ResolutionContext, which fails for any user-defined type
-    /// the call-site can't reach by bare name (e.g. `Entry<K,V>` from inside
-    /// the `Layout::array<Entry<K,V>*>` spec'd body (no scope, no imports),
-    /// and `codegen_sizeof` then falls through to 0.
+    /// substituter has it from `subst.replacements[i]`'s pointee), and it is
+    /// what the inner Named answers with: a rewritten spelling carries no
+    /// stamp, so without it a type the reading module cannot reach by that
+    /// spelling (`Entry<K,V>` inside a `Layout::array<Entry<K,V>*>` clone)
+    /// resolves to nothing.
     static rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr,
                                 inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
         const inner_named: NamedAnnotation* = new NamedAnnotation {
             name: inner_name,
             span: span,
             pre_resolved: inner_pre_resolved,
+            res: ResSlot::Pending,
         };
         const inner_ann: TypeAnnotation* = new TypeAnnotation::Named(inner_named);
         const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner_ann, is_const: false, span: span };
@@ -984,6 +1248,7 @@ public:
             name: inner_name,
             span: span,
             pre_resolved: inner_pre_resolved,
+            res: ResSlot::Pending,
         };
         const inner_ann: TypeAnnotation* = new TypeAnnotation::Named(inner_named);
         const arr: ArrayAnnotation* = new ArrayAnnotation {

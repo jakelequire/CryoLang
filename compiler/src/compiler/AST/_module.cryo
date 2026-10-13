@@ -4,7 +4,7 @@
 /// Uses class inheritance with the visitor pattern: each node type extends
 /// `ASTNode` and dispatches through `accept(visitor)`.
 
-namespace Compiler::AST;
+namespace compiler::ast;
 
 public module Node;
 public module Expression;
@@ -17,10 +17,22 @@ public module Substituter;
 public module Dumper;
 public module NodeLocator;
 
-import Compiler::Diag;
-import Compiler::Diag::SourceSpan;
-import Compiler::Types::TypeRef;
-import Compiler::Resolver::SymbolStr;
+import compiler::diag;
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::resolver::symbol_str;
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, Res, ResSlot };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::resolver::intern_table;
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::ast::expression;
+import compiler::ast::expression::{ ExpressionNode };
+import std::fmt;
 
 /// Discriminator for all AST node types.
 type enum NodeKind {
@@ -212,9 +224,18 @@ implement enum Visibility {
     }
 }
 
+/// What an import BINDS, which is the only question the resolver asks of it.
+///
+/// `Module` names a module and binds nothing from it: the path is reachable as
+/// a qualifier and the dependency edge is recorded, but no name enters scope.
+/// It is a separate variant rather than a flag on `Wildcard` because sharing
+/// one variant is why the single place that decides whether names get bound
+/// could not tell a module path from a glob - and the compiler injects real
+/// globs (the prelude, the f-string runtime) that must keep binding.
 type enum ImportStyle {
     Wildcard;
     Specific;
+    Module;
 }
 
 type enum LiteralKind {
@@ -224,19 +245,6 @@ type enum LiteralKind {
     Char;
     Boolean;
     Null;
-}
-
-implement enum LiteralKind {
-    to_string(&this) -> string {
-        return match (this) {
-            LiteralKind::Integer => { "Integer" }
-            LiteralKind::Float   => { "Float" }
-            LiteralKind::String  => { "String" }
-            LiteralKind::Char    => { "Char" }
-            LiteralKind::Boolean => { "Boolean" }
-            LiteralKind::Null    => { "Null" }
-        };
-    }
 }
 
 type enum PatternKind {
@@ -266,6 +274,59 @@ type enum ArgBinding {
     /// A `&T` or `T*` parameter: only an address crosses the call boundary, so
     /// the callee never takes ownership of the pointee.
     Borrowed;
+}
+
+
+/// What a MEMBER segment resolved to, once sema has decided it: the
+/// coordinates of the member inside the owner the node's type already
+/// names, so no later stage searches the owner's member table by the
+/// spelling again.  A field is `(depth, index)`: `index` into the field
+/// list of the class `depth` steps up the base chain from the receiver's
+/// type (0 for a struct, a tuple element, or a class's own field); the
+/// coordinates are the same in a template and in every instantiation of
+/// it, so a pin written by the pre-mono walk stays right.  A variant is
+/// its ordinal in the enum's variant list; a global is the declaration
+/// index's registration slot.  `None` is a node sema never answered, which
+/// codegen reports rather than answering by the spelling: an unanswered
+/// member here is a node minted after the last sema walk, and the minter
+/// owes it the answer.
+///
+/// CARRIAGE.  A pin survives cloning and substitution, because every
+/// coordinate it holds is instantiation-invariant: a field's position in
+/// its owner, a variant's ordinal in its enum and a global's registration
+/// slot are the same in the template and in every specialization of it.
+/// The node beside it records `pin_carried` when the answer arrived that
+/// way rather than from a walk over the node itself, so "no walk ever
+/// answered this" stays distinguishable from "the post-monomorphization
+/// walk did not re-answer it"; writing a pin clears the mark.  Dropping a
+/// pin is the exception and each site that does says why - the one such
+/// site is a scope segment the substituter RETARGETS at another
+/// declaration (`T::m` with `T` bound to a concrete type), where the
+/// coordinates are the old owner's and mean nothing in the new one.
+///
+/// `RecvSlot` is the receiver slot of a future the async lowering minted
+/// for an `async` method: the field that lowering recorded as its
+/// receiver's (`StructType.async_recv_slot`) on the future and on every
+/// instantiation of it.  The lowering writes it on the access it builds to
+/// re-address an awaited sub-future's receiver, whose type may be a
+/// projection until the body is copied; the position is read off the
+/// future's own type, never found by the field's spelling.
+type enum MemberPin {
+    None;
+    Field(i64, i64);
+    Variant(i64);
+    Global(i64);
+    RecvSlot;
+}
+
+implement enum MemberPin {
+    /// Whether anything is pinned.
+    is_some(&this) -> boolean {
+        return match (&this) {
+            MemberPin::None => { false }
+            _               => { true }
+        };
+    }
 }
 
 
@@ -307,6 +368,118 @@ type enum TypeAnnotation {
 // TypeAnnotation deep-copy
 
 implement enum TypeAnnotation {
+    /// The trait this annotation names, by the identity the module that WROTE
+    /// it resolved the name to, for a trait spelled in annotation position (an
+    /// impl head, an `implement Trait` binding) rather than in a where-clause
+    /// bound.
+    ///
+    /// The leaf a spelling ends in is a search key: folding it back to a
+    /// declaration searches the program, and so answers only while that leaf
+    /// is unique program-wide. The annotation already carries what the name
+    /// refers to, so this reads the answer rather than re-deriving one.
+    static trait_def(ann: TypeAnnotation*) -> DefId {
+        if (ann == null) { return DefId::invalid(); }
+        return match (*ann) {
+            TypeAnnotation::Named(n) => {
+                n.res.require("TypeAnnotation::trait_identity").def_id()
+            }
+            TypeAnnotation::Generic(g)   => { TypeAnnotation::trait_def(g.base) }
+            TypeAnnotation::Reference(r) => { TypeAnnotation::trait_def(r.inner) }
+            TypeAnnotation::Pointer(p)   => { TypeAnnotation::trait_def(p.inner) }
+            _ => { DefId::invalid() }
+        };
+    }
+
+    /// The annotation node a head's NAME lives on, peeled through the
+    /// wrappers a written reference may carry - the node whose `res`
+    /// `trait_identity` reads, so asking it is asking about that name and
+    /// no other.
+    static head_base(ann: TypeAnnotation*) -> TypeAnnotation* {
+        if (ann == null) { return null; }
+        return match (*ann) {
+            TypeAnnotation::Generic(g)   => { TypeAnnotation::head_base(g.base) }
+            TypeAnnotation::Reference(r) => { TypeAnnotation::head_base(r.inner) }
+            TypeAnnotation::Pointer(p)   => { TypeAnnotation::head_base(p.inner) }
+            _ => { ann }
+        };
+    }
+
+    /// Whether a written name anywhere in `ann` was refused by the name
+    /// layer: reported once, where it was written, so a consumer that finds
+    /// the annotation unresolved reports nothing more.  Every written leaf
+    /// is read through `require` - one the name layer never answered is a
+    /// defect, recorded there - except a leaf its synthesizer resolved
+    /// outright, which carries a type and no written name to answer for.
+    static refused(ann: TypeAnnotation*) -> boolean {
+        if (ann == null) { return false; }
+        return match (*ann) {
+            TypeAnnotation::Named(n) => {
+                mut hit: boolean = false;
+                if (!n.pre_resolved.is_valid()) {
+                    match (n.res.require("TypeAnnotation::refused")) {
+                        Res::Err => { hit = true; }
+                        _        => { }
+                    }
+                }
+                hit
+            }
+            TypeAnnotation::Pointer(p)   => { TypeAnnotation::refused(p.inner) }
+            TypeAnnotation::Reference(r) => { TypeAnnotation::refused(r.inner) }
+            TypeAnnotation::Array(a)     => { TypeAnnotation::refused(a.element) }
+            TypeAnnotation::Tuple(t) => {
+                mut hit: boolean = false;
+                for (mut i: i64 = 0; i < t.elements.length; i++) {
+                    if (TypeAnnotation::refused(t.elements[i])) { hit = true; }
+                }
+                hit
+            }
+            TypeAnnotation::Function(f) => {
+                mut hit: boolean = false;
+                for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                    if (TypeAnnotation::refused(f.parameters[i])) { hit = true; }
+                }
+                if (TypeAnnotation::refused(f.return_type)) { hit = true; }
+                hit
+            }
+            TypeAnnotation::Generic(g) => {
+                mut hit: boolean = TypeAnnotation::refused(g.base);
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    if (TypeAnnotation::refused(g.args[i])) { hit = true; }
+                }
+                hit
+            }
+            TypeAnnotation::Projection(pj) => { pj.refused || TypeAnnotation::refused(pj.base) }
+            _ => { false }
+        };
+    }
+
+    /// The source spelling of an annotation, for a diagnostic that proposes
+    /// a rewrite.  Enough for the shapes an impl head or a parameter default
+    /// is written in; a shape this does not spell reads as `..`.
+    static spell(ann: TypeAnnotation*, intern: InternTable*) -> string {
+        if (ann == null) { return ".."; }
+        return match (*ann) {
+            TypeAnnotation::Named(n)      => { intern.resolve(n.name) }
+            TypeAnnotation::Primitive(pr) => { intern.resolve(pr.name) }
+            TypeAnnotation::Pointer(pt)   => {
+                fmt::format("%s*", TypeAnnotation::spell(pt.inner, intern))
+            }
+            TypeAnnotation::Reference(rf) => {
+                fmt::format("&%s", TypeAnnotation::spell(rf.inner, intern))
+            }
+            TypeAnnotation::Generic(g)    => {
+                mut out: string = TypeAnnotation::spell(g.base, intern);
+                out = out + "<";
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    if (i > 0) { out = out + ", "; }
+                    out = out + TypeAnnotation::spell(g.args[i], intern);
+                }
+                out + ">"
+            }
+            _ => { ".." }
+        };
+    }
+
     /// Deep-copy this type annotation tree, allocating fresh nodes.
     clone(&this) -> TypeAnnotation* {
         return match (this) {
@@ -319,6 +492,7 @@ implement enum TypeAnnotation {
                     name: named.name,
                     span: named.span,
                     pre_resolved: named.pre_resolved,
+                    res: named.res,
                 };
                 new TypeAnnotation::Named(n)
             }
@@ -431,9 +605,11 @@ implement enum TypeAnnotation {
                 const pj: ProjectionAnnotation* = new ProjectionAnnotation {
                     base:         TypeAnnotation::clone_ptr(proj.base),
                     member:       proj.member,
-                    owning_trait: proj.owning_trait,
+                    rooted_at:    proj.rooted_at,
+                    owner_trait:  proj.owner_trait,
                     resolved:     TypeRef::invalid(),
                     span:         proj.span,
+                    refused:      proj.refused,
                 };
                 new TypeAnnotation::Projection(pj)
             }
@@ -444,6 +620,17 @@ implement enum TypeAnnotation {
     static clone_ptr(ann: TypeAnnotation*) -> TypeAnnotation* {
         if (ann == null) { return null; }
         return (*ann).clone();
+    }
+
+    /// A one-segment type at `span` that the name layer builds already
+    /// answered with `res`; `name` is only its text.
+    static answered(name: SymbolStr, res: Res, span: SourceSpan) -> TypeAnnotation* {
+        return new TypeAnnotation::Named(new NamedAnnotation {
+            name:         name,
+            span:         span,
+            pre_resolved: TypeRef::invalid(),
+            res:          ResSlot::Answered(res),
+        });
     }
 }
 
@@ -464,6 +651,32 @@ type struct NamedAnnotation {
     /// `std::collections::array::5Array$LN$L...$G$G`) through the scope
     /// chain. Default `TypeRef::invalid()` for parser-produced annotations.
     pre_resolved: TypeRef;
+    /// What the written name refers to, as the module that WROTE it can see.
+    ///
+    /// Distinct from `pre_resolved` in kind, not just in timing: this names a
+    /// definition and that one holds an instantiation, which is why a clone
+    /// copies this verbatim and the substituter may replace that one.
+    ///
+    /// `Pending` means no resolver claimed the name, which for an annotation
+    /// is a routing fact rather than a failure - a name that needs a receiver
+    /// type, or one written in a module whose partner in an import cycle had
+    /// not exported anything yet. It is never a licence to search.
+    res: ResSlot;
+
+    /// The type parameter this name refers to, or an invalid symbol when it
+    /// names anything else.  What a substitution table is asked with: the
+    /// spelling is what the writer typed, and two parameters may share it.
+    param_sym(&this) -> SymbolID {
+        return this.res.generic_param_sym();
+    }
+
+    /// The type parameter a FLAT type-relative spelling (`I::Item`) is
+    /// rooted at, or an invalid symbol.  Only `This::Member` parses as a
+    /// projection node; a parameter's member is a `Named` whose stamp says
+    /// the type layer owns the rest of the path.
+    relative_param_sym(&this) -> SymbolID {
+        return this.res.relative_param_sym();
+    }
 }
 
 type struct PointerAnnotation {
@@ -521,7 +734,7 @@ type struct GenericAnnotation {
 type struct TypeofAnnotation {
     /// The operand expression, stored opaquely as `void*` (really an
     /// `ExpressionNode*`).  The AST root module can't import
-    /// `Compiler::AST::Expression` without a module cycle, so the pointer is
+    /// `compiler::ast::expression` without a module cycle, so the pointer is
     /// kept untyped here; the parser stashes it and sema casts it back to
     /// `ExpressionNode*` to resolve the operand's type.
     operand:  void*;
@@ -544,14 +757,29 @@ type struct ThisTypeAnnotation {
 /// associated-type name (e.g. `Item`). `resolved` caches the concrete type the
 /// projection denotes once the base's trait impl is known - filled by the
 /// TypeResolver (concrete base) or the monomorphizer (generic-param base);
-/// `TypeRef::invalid()` until then. `owning_trait` optionally pins which trait
-/// declares `member` (empty = infer from the base's bounds, the Iterator case).
+/// `TypeRef::invalid()` until then. `rooted_at` is the type parameter the
+/// projection was written on (`I::Item`) when `base` has since been
+/// substituted for it: which trait's `Item` it means is a question about
+/// that parameter's bounds, and the substituted base cannot answer it.
+/// Invalid for `This::Member` and for a projection written on a type.
+/// `owner_trait` is the trait whose member this is, where no bound has to
+/// be asked: for a written `This::Member`, the trait `This` stands for -
+/// the trait whose body holds it, or the one the enclosing `implement
+/// trait` block implements - stamped by the name layer; for a projection a
+/// pass rebuilds from a type, the trait that type's projection carried.
+/// Every clone keeps it, because a default body is specialized for an
+/// implementing type long after the trait around it is out of sight.
+/// Invalid in an inherent impl and for a projection written on a type.
+/// `refused` is set by the name layer when no trait answers the projection
+/// where it is written - it has reported it there - and every clone keeps it.
 type struct ProjectionAnnotation {
     base:         TypeAnnotation*;
     member:       SymbolStr;
-    owning_trait: SymbolStr;
+    rooted_at:    SymbolID;
+    owner_trait:  DefId;
     resolved:     TypeRef;
     span:         SourceSpan;
+    refused:      boolean;
 }
 
 /// `implement Trait + Trait2 + ...` in return / binding position. Each bound
@@ -568,13 +796,6 @@ type struct ImplTraitAnnotation {
     span:     SourceSpan;
 }
 
-/// A generic type parameter declaration (e.g., `T: Default`).
-type struct GenericParam {
-    name:        SymbolStr;
-    constraints: SymbolStr[];
-    span:        SourceSpan;
-}
-
 /// A reference to a trait inside a where clause. `path` holds the segments
 /// of the qualified name (e.g., `["io", "Write"]` for `where W: io::Write`,
 /// or `["Eq"]` for the unqualified form). `type_args` holds optional
@@ -582,19 +803,65 @@ type struct GenericParam {
 /// `where T: TryFrom<&JsonValue>`); empty for non-generic trait references.
 type struct TraitRef {
     path:      SymbolStr[];
+    /// Canonical identity of the trait `path` names, resolved once against the
+    /// module that WROTE the bound and carried from there.
+    ///
+    /// `path` is a spelling, and identity questions cannot be answered from a
+    /// spelling: one trait may be written bare here and qualified there, and
+    /// two unrelated traits in different modules may share a leaf. Recovering
+    /// the qualified form from `path[length - 1]` is a search over the whole
+    /// program, so it answers only while that leaf is unique - a second,
+    /// unrelated declaration of the same leaf anywhere makes two distinct
+    /// traits fold to one name, and impl heads that differ only in their
+    /// bounds then render identically.
+    ///
+    /// Invalid until the name layer stamps it; consumers asking WHICH trait
+    /// a bound names read it through `definition()`.
+    resolved: DefId;
+    /// The name layer reported the spelling as naming no trait, where it is
+    /// written.  Such a bound is satisfied by nothing and held by nothing;
+    /// a check that finds a type failing it would report again an error
+    /// the program already has, so the checks skip it.  False on a bound
+    /// that was not refused, and on one left unstamped without a report,
+    /// which stays a failure to report.
+    refused:  boolean;
     type_args: TypeAnnotation*[];
     span:      SourceSpan;
 
     /// Deep copy into independently-owned arrays (SymbolStr and the
     /// TypeAnnotation* handles are Copy), so a clone can be stored in a
     /// second owner without aliasing this one's buffers.
+    ///
+    /// `resolved` IS copied: specializing an impl rewrites which types a
+    /// bound is applied to, never which trait the bound names, so the
+    /// template's identity is the clone's. Copying it also keeps the answer
+    /// pinned to the module that wrote the bound once the clone is re-visited
+    /// under a different module cursor.
     clone(&this) -> TraitRef {
         mut path_c: SymbolStr[] = [];
         mut args_c: TypeAnnotation*[] = [];
         for (mut i: i64 = 0; i < this.path.length; i++)      { path_c.push(this.path[i]); }
         for (mut i: i64 = 0; i < this.type_args.length; i++) { args_c.push(this.type_args[i]); }
-        return TraitRef { path: path_c, type_args: args_c, span: this.span };
+        return TraitRef { path: path_c, resolved: this.resolved, refused: this.refused,
+                          type_args: args_c, span: this.span };
     }
+
+    /// The trait's identity.  One accessor so a consumer never re-derives it
+    /// from `path`; its path, where text is wanted, is the definition
+    /// table's `path_of`.
+    ///
+    /// A bound the name layer could not place has no identity: the written
+    /// leaf is a search key, not a trait, and a consumer keyed by it would
+    /// reach whichever declaration happens to share the spelling.  The
+    /// unstamped case is recorded as a missing answer and given none, so the
+    /// consumer stops as it would for a bound nothing satisfies; the build is
+    /// refused at its end if nothing else reported it.
+    definition(&this) -> DefId {
+        if (this.resolved.is_valid()) { return this.resolved; }
+        compiler::resolver::res::record_pending_bug("trait bound identity");
+        return DefId::invalid();
+    }
+
 }
 
 /// A trait bound from a where clause (e.g., `where T: Default`,
@@ -608,9 +875,15 @@ type struct TraitBound {
     // and `subject_type` is null. An associated-type PROJECTION subject
     // (`where This::Item: Ord`) leaves this empty and carries the projection
     // annotation in `subject_type` instead - keeping `type_parameter` empty is
-    // what makes every param-name-matching consumer structurally skip a
-    // projection bound (an empty name never equals a real generic param).
+    // what makes a projection bound spell no parameter.  The spelling is for
+    // text; a consumer asking WHICH parameter reads `subject_sym`.
     type_parameter: SymbolStr;
+    // The symbol the bare subject's declaration bound, stamped by the name
+    // layer in the scope the clause is written in; invalid for a projection
+    // subject and for a spelling that names no parameter in that scope.  A
+    // clone keeps it: a `Res` names a definition, and the clone's syntax is
+    // the template's.
+    subject_sym:    SymbolID;
     // Non-null only for a projection subject: the parsed `Base::Member`
     // annotation (a `TypeAnnotation::Projection`). Null for a bare-param bound.
     subject_type:   TypeAnnotation*;
@@ -634,6 +907,7 @@ type struct TraitBound {
         }
         return TraitBound {
             type_parameter: this.type_parameter,
+            subject_sym:    this.subject_sym,
             subject_type:   TypeAnnotation::clone_ptr(this.subject_type),
             trait_refs:     refs_c,
             span:           this.span,
@@ -657,6 +931,21 @@ type enum PatternElement {
 type struct PatternBinding {
     name: SymbolStr;
     span: SourceSpan;
+    /// The binding the name layer declared for this payload, and the payload
+    /// of every `Res::Local` stamped on a use of it.  A pass keeping
+    /// per-binding state keys on this, not on `name`: one function may bind a
+    /// spelling in several arms or nested scopes, and each is its own value.
+    /// A pattern built after name resolution takes one from
+    /// `Resolver::alloc_synthetic_binding`.
+    sym_id: SymbolID;
+    /// The payload's type, as sema bound it against the subject.  Invalid
+    /// until sema's committed walk over this node: a clone starts without it
+    /// and is typed when its own body is checked.
+    resolved_type: TypeRef;
+    /// Whether the source wrote `mut` before the name.  The binding's
+    /// mutability follows the matched value's, so nothing reads this but
+    /// the check that an arm's alternatives (`A(mut v) | B(v)`) agree.
+    written_mut: boolean;
 }
 
 type struct PatternWildcard {
@@ -685,16 +974,10 @@ type struct PatternLiteralString {
 
 /// A nested sub-pattern element (`Some(Some(n))`, `Branch(Leaf(x), _)`).
 /// The pattern is stored opaquely as `void*` (really a
-/// `Compiler::AST::Pattern::PatternNode*`): the AST root module can't import
+/// `compiler::ast::pattern::PatternNode*`): the AST root module can't import
 /// the Pattern module without a cycle, so consumers (parser/sema/codegen)
 /// cast it back. Mirrors `TypeofAnnotation.operand`.
 type struct PatternSub {
     pattern: void*;
     span:    SourceSpan;
-}
-
-/// Base trait info for trait inheritance (e.g., `trait Foo : Bar<T>`).
-type struct BaseTraitInfo {
-    name:            SymbolStr;
-    type_parameters: TypeAnnotation*[];
 }

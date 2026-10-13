@@ -15,29 +15,79 @@
 ///
 /// Leaf component: owns its fields, holds no back-pointers.
 
-namespace Compiler::Sema::State;
+namespace compiler::sema::state;
 
-import Compiler::Types::TypeRef;
-import Compiler::Diag::SourceSpan;
-import Compiler::AST;
-import Compiler::AST::Node;
-import Compiler::AST::Expression;
-import Compiler::AST::Declaration;
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::ast;
+import compiler::ast::{ TypeAnnotation };
+import compiler::ast::node;
+import compiler::ast::expression;
+import compiler::ast::expression::{ CallExprNode, ExpressionNode, LambdaExprNode, ScopeResolutionNode };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::ast::declaration;
+import compiler::ast::declaration::{ FunctionDeclNode, GenericParamNode, ImplBlockNode };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefKey };
+import compiler::decl_index::{ OverloadId };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
+import std::collections::hashset;
+import std::collections::hashset::{ HashSet };
 import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
+
+/// A function's copy specialized for the capturing closures one call
+/// passes: each argument position a closure is passed at, and the closure's
+/// type there.
+type struct ClosureSpec {
+    positions: i64[];
+    types:     TypeRef[];
+    entry:     OverloadId;
+
+    /// Whether this copy is the one for closures of `types` at `positions`,
+    /// compared by identity.
+    binds(&this, positions: &i64[], types: &TypeRef[]) -> boolean {
+        if (this.positions.length != positions.length) { return false; }
+        for (mut i: i64 = 0; i < positions.length; i++) {
+            if (this.positions[i] != positions[i]) { return false; }
+            if (!this.types[i].equals(types[i])) { return false; }
+        }
+        return true;
+    }
+}
+
+/// What sema knows of one local binding (a parameter, a local, a pattern's
+/// binding): its type, whether it is `mut`, and the span of the keyword that
+/// declared it (`const`/`mut`, or a zero-width anchor for a parameter written
+/// without `mut`), which E0218's "replace `const` with `mut`" / "insert `mut`"
+/// quickfix reads; a span with no location means the explanatory note only.
+type struct LocalBinding {
+    sym:     SymbolID;
+    ty:      TypeRef;
+    is_mut:  boolean;
+    kw_span: SourceSpan;
+
+    /// No binding: what a scope's undo log records for a binding that did
+    /// not exist before the scope made it.
+    static none() -> LocalBinding {
+        return LocalBinding { sym: SymbolID::invalid(), ty: TypeRef::invalid(), is_mut: false,
+                              kw_span: SourceSpan::none() };
+    }
+}
 
 type struct SemaState {
-    // -- Per-function locals (reset via ScopeManager.enter_function) --
-    locals:         HashMap<u32, TypeRef>;   // local variable scope (fast path)
-    local_muts:     HashMap<u32, boolean>;   // mutability flag for each local
-    // Span of the declaring `const`/`mut` keyword (top-level locals) or a
-    // zero-width insertion anchor (params declared without `mut`).  E0218
-    // reads this for a precise "replace `const` with `mut`" / "insert `mut`"
-    // quickfix; a missing entry means the explanatory note only.
-    local_kw_spans: HashMap<u32, SourceSpan>;
-    undo_keys:      u32[];                    // scope undo log: keys modified
-    undo_prev:      TypeRef[];                // scope undo log: previous values
-    undo_muts:      boolean[];                // scope undo log: previous mut flags
-    undo_kw_spans:  SourceSpan[];             // scope undo log: previous kw_spans
+    // -- Per-function locals, by the binding the name layer stamped --
+    // A use of a local carries `Res::Local(sym)`, the binding its name was
+    // resolved to where it is written, so a local is asked by that binding
+    // and never again by its spelling.  A scope's undo log records each
+    // binding's previous state, so leaving the scope restores what a
+    // narrowing inside it changed and drops what the scope declared.
+    bindings:        HashMap<SymbolKey, LocalBinding>;
+    binding_undo:    SymbolKey[];
+    binding_prev:    LocalBinding[];
 
     // -- Per-function frame --
     return_type:     TypeRef;                 // current function return type
@@ -63,76 +113,88 @@ type struct SemaState {
     // -- Expected-type hint (set by DeclStmt for initializer resolution) --
     expected_type: TypeRef;
 
-    // -- Match-arm payload binding names (intern ids), per function --
+    // -- The binding an unannotated declaration's initializer flows into --
+    // A value that needs an expected type names this binding in its help
+    // line; `untyped_init` is the initializer itself, so a value nested in
+    // it (an argument) is not mistaken for the whole.
+    untyped_binding: SymbolStr;
+    untyped_init:    ExpressionNode*;
+
+    // -- Match-arm payload bindings, per function --
     // A `match` arm pattern `Variant(p)` binds `p` to a temporary copy of the
     // matched payload; returning a pointer/reference to `p` dangles once the
-    // function returns.  These ids let the return-escape check reject that
+    // function returns.  This set lets the return-escape check reject that
     // (E0455) instead of miscompiling into a use-after-free.
-    payload_binding_ids: u32[];
-    // The subset of the bindings above whose subject is reached through a
-    // by-reference parameter (`match (&this)`, `match (ptr_param)`).  Such a
-    // binding names the CALLER's storage rather than a copy in this frame, so
-    // `&binding` stays valid after the function returns and the escape check
-    // above must not reject it - that is what an in-place accessor
+    payload_bindings: HashSet<SymbolKey>;
+    // The arm bindings whose subject is reached through a by-reference
+    // parameter (`match (&this)`, `match (ptr_param)`).  Such a binding names
+    // the CALLER's storage rather than a copy in this frame, so `&binding`
+    // stays valid after the function returns and the escape check above must
+    // not reject it - that is what an in-place accessor
     // (`payload_ptr(&this) -> T*`) is.  Kept as a separate set rather than by
-    // suppressing the entry above, because the payload-escape check has its own
-    // reason to know a name is a payload binding.
-    alias_binding_ids: u32[];
+    // suppressing the entry above, because the payload-escape check has its
+    // own reason to know a binding is a payload.
+    alias_bindings:   HashSet<SymbolKey>;
+    // The current function's parameters (and its receiver).  Autoref'd /
+    // caller-backed, so `&param` re-borrows caller storage rather than
+    // escaping a stack slot - the return-escape check flags only
+    // `&<body-local>`.
+    param_bindings:   HashSet<SymbolKey>;
     // True while inside a method whose receiver is `&this` / `mut &this`.  A
     // by-value `this` receiver lives in THIS frame, so it is not caller-backed.
     this_is_by_ref: boolean;
-    // The current function's parameter (and `this`) names.  Autoref'd /
-    // caller-backed, so `&param` re-borrows caller storage rather than escaping
-    // a stack slot - the return-escape check flags only `&<body-local>`.
-    param_ids: u32[];
+    // The binding of the method's receiver parameter - what every use of
+    // `this` in the body names.  Invalid outside a method.
+    receiver_sym: SymbolID;
+    // The function whose body is being checked; null outside one.
+    current_func: FunctionDeclNode*;
 
     // -- Closure-capture detection (mutated by LambdaSynth, read by resolve_identifier) --
     // `in_lambda_depth`: 0 outside any lambda, 1 inside the outermost, deeper
     // when nested; gates the capture-fallback path so non-lambda calls never pay.
-    // `lambda_outer_locals`: names visible from outside the lambda currently
-    // being checked (enclosing function locals + outer lambdas' captures); a hit
-    // here on a `locals` miss means "free variable, record a capture".
+    // `outer_bindings`: the bindings visible from outside the lambda currently
+    // being checked (enclosing function locals + outer lambdas' captures); a
+    // use naming one of them rather than a binding of the lambda's own is a
+    // free variable, and records a capture.
     // `current_lambda`: the lambda whose body we're walking - the capture sink.
     in_lambda_depth:     i32;
-    lambda_outer_locals: HashMap<u32, TypeRef>;
+    outer_bindings:      HashMap<SymbolKey, TypeRef>;
     current_lambda:      LambdaExprNode*;
 
     // Per-module monotonic counter for synthesised closure-struct names.
     // Cross-module uniqueness comes from the namespace prefix; never reset.
     closure_counter: u64;
-    // Dedup closure-arg specialisations of free-function calls.  Key is
-    // `<orig_name_id>|<idx>:<closure_ty_id>...`; value is the SymbolStr.id of the
-    // spec's mangled symbol (placed on `call.resolved_callee`).
-    closure_spec_map: HashMap<string, u32>;
+    // A free function's copies specialized for capturing closures, one per
+    // (function, the closures' positions and types), so every call passing
+    // the same closures is pinned to one copy.  Keyed by the function's
+    // definition; a key's copies are told apart by `ClosureSpec::binds`.
+    closure_specs:     ClosureSpec[];
+    closure_spec_keys: HashMap<DefKey, i64[]>;
 
     // Re-entrancy guard for implicit-conversion synthesis: set while re-resolving
     // a synthesized `converter(arg)` call so its own args don't re-trigger a
     // conversion attempt (and converter-aware method selection doesn't recurse).
     in_implicit_conversion: boolean;
 
-    // True when this sema pass runs AFTER monomorphization (authoritative for
-    // codegen): `resolve_expr` re-resolves nodes that already carry a
-    // (possibly-stale, pre-mono) resolved_type so the post-mono pass wins.
-    post_mono_verify: boolean;
 
     // Monotonic counter for the synthetic bindings introduced when lowering `?`
     // to a `match` (build_try_desugar); a unique suffix keeps nested `?` readable.
     try_counter: u32;
 
+    // Variant calls of a generic enum that neither their arguments nor the
+    // expected type instantiated.  An enclosing generic call may still type
+    // one from its own bindings, so each is refused only if the module's
+    // walk ends with it still the template.
+    unbound_variants: ScopeResolutionNode*[];
+
     // -- Symbolic generic-body check --
     // True only while a symbolic generic-body walk is in progress.
     in_symbolic_check: boolean;
-    // Intern ids of the generic-param names in scope for the body under symbolic
-    // check (`T`, `U`); lets body visitors recognize abstract refs and defer.
-    symbolic_generic_param_ids: u32[];
-    // Intern ids of the OWNER type's generic params (the `T` of `Box<T>`); merged
-    // into symbolic_generic_param_ids per body.
-    symbolic_owner_param_ids: u32[];
     // True while symbolically checking a method of a GENERIC owner: owner-rooted
     // field/method accesses (`this.field`) are deferred - concrete monos re-check.
     symbolic_owner_is_generic: boolean;
     // The OWNER type's generic-param AST nodes (`Box<T>`'s `T`), declaration
-    // order = abstract-param index; carries constraints for BoundedParamType.
+    // order = abstract-param index.
     symbolic_owner_param_nodes: GenericParamNode*[];
     // The CURRENT method/free-fn's own generic-param AST nodes; separate 0-based
     // index space from the owner list.
@@ -145,6 +207,16 @@ type struct SemaState {
     // method/free-fn `where T: Display` clause lands in
     // `FunctionDeclNode.trait_bounds`, recovered from here for abstract receivers.
     symbolic_current_func: FunctionDeclNode*;
+    // The trait whose default methods are being walked.  `This` in such a body
+    // is any type implementing that trait, so the trait is `This`'s bound; no
+    // where-clause writes it, and one `This` placeholder serves every trait,
+    // so the placeholder itself cannot say which trait bounds it.
+    symbolic_trait: TypeRef;
+    // The parameters the `static match` arms being walked narrow, innermost
+    // last, each beside the type its arm listed: inside such an arm a type
+    // naming the parameter is that type.
+    symbolic_narrow_syms:  SymbolID[];
+    symbolic_narrow_types: TypeRef[];
     // Telemetry (debug-only): generic bodies walked, and real errors emitted.
     symbolic_bodies_walked:    i64;
     symbolic_total_would_emit: i64;
@@ -160,14 +232,10 @@ type struct SemaState {
 
     static new() -> SemaState {
         return SemaState {
-            locals:         HashMap<u32, TypeRef>::new(),
-            local_muts:     HashMap<u32, boolean>::new(),
-            local_kw_spans: HashMap<u32, SourceSpan>::new(),
-            undo_keys:      [],
-            undo_prev:      [],
-            undo_muts:      [],
-            undo_kw_spans:  [],
-            return_type:       TypeRef::invalid(),
+            bindings:       HashMap::<SymbolKey, LocalBinding>::new(),
+            binding_undo:   [],
+            binding_prev:   [],
+            return_type:      TypeRef::invalid(),
             return_type_ann:   null,
             async_poll_output: TypeRef::invalid(),
             this_type:       TypeRef::invalid(),
@@ -176,29 +244,58 @@ type struct SemaState {
             body_count:      0,
             loop_depth:   0,
             expected_type: TypeRef::invalid(),
-            payload_binding_ids: [],
-            alias_binding_ids: [],
+            untyped_binding: SymbolStr::empty(),
+            untyped_init:    null,
+            payload_bindings: HashSet::<SymbolKey>::new(),
+            alias_bindings:   HashSet::<SymbolKey>::new(),
+            param_bindings:   HashSet::<SymbolKey>::new(),
             this_is_by_ref:  false,
-            param_ids: [],
-            in_lambda_depth:     0,
-            lambda_outer_locals: HashMap<u32, TypeRef>::new(),
+            receiver_sym:    SymbolID::invalid(),
+            current_func: null,
+            in_lambda_depth:    0,
+            outer_bindings:      HashMap::<SymbolKey, TypeRef>::new(),
             current_lambda:      null,
             closure_counter:  0,
-            closure_spec_map: HashMap<string, u32>::new(),
+            closure_specs:     [],
+            closure_spec_keys: HashMap::<DefKey, i64[]>::new(),
             in_implicit_conversion: false,
-            post_mono_verify: false,
             try_counter: 0,
+            unbound_variants: [],
             in_symbolic_check:           false,
-            symbolic_generic_param_ids:  [],
-            symbolic_owner_param_ids:    [],
             symbolic_owner_is_generic:   false,
             symbolic_owner_param_nodes:  [],
             symbolic_method_param_nodes: [],
             symbolic_impl_node:    null,
             symbolic_current_func: null,
+            symbolic_trait:        TypeRef::invalid(),
+            symbolic_narrow_syms:  [],
+            symbolic_narrow_types: [],
             symbolic_bodies_walked:    0,
             symbolic_total_would_emit: 0,
             last_expr_type: TypeRef::invalid(),
         };
+    }
+
+    /// The entry of the copy of the function at `def_slot` specialized for
+    /// closures of `types` at `positions`; invalid when none was made.
+    closure_spec(&this, def_slot: DefKey, positions: &i64[], types: &TypeRef[]) -> OverloadId {
+        match (this.closure_spec_keys.get_ref(&def_slot)) {
+            Option::Some(at) => {
+                for (mut k: i64 = 0; k < (*at).length; k++) {
+                    const spec: ClosureSpec* = &this.closure_specs[(*at)[k]];
+                    if (spec.binds(positions, types)) { return spec.entry; }
+                }
+            }
+            Option::None => { }
+        }
+        return OverloadId::invalid();
+    }
+
+    /// Record `entry` as the copy of the function at `def_slot` specialized
+    /// for closures of `types` at `positions`.
+    add_closure_spec(mut &this, def_slot: DefKey, positions: i64[], types: TypeRef[], entry: OverloadId) -> void {
+        const at: i64[]* = this.closure_spec_keys.get_or_insert(def_slot, []);
+        at.push(this.closure_specs.length);
+        this.closure_specs.push(ClosureSpec { positions: positions, types: types, entry: entry });
     }
 }

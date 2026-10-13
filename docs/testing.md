@@ -238,7 +238,7 @@ format = "pretty"          # plain | pretty | compact
 color  = "auto"            # auto | always | never
 ```
 
-End-user projects with no `[test]` section get the cargo-style `plain`
+End-user projects with no `[test]` section get the one-line-per-test `plain`
 default; override per run with `--format` / `--color` or the `CRYO_TEST_*`
 environment variables.
 

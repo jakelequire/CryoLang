@@ -13,9 +13,16 @@
 ///! Integer arithmetic on every width is silent two's-complement
 ///! **wrapping** on overflow - there is no trap and no diagnostic. This is
 ///! a deliberate, frozen part of the 1.0 surface; Cryo ships no
-///! `checked_*` / `wrapping_*` / `saturating_*` family. Code that must
-///! detect overflow has to range-check its operands first. The wrapping
-///! `abs` methods below are one visible consequence (see each `abs`).
+///! `checked_*` / `wrapping_*` / `saturating_*` arithmetic family. Code
+///! that must detect overflow has to range-check its operands first. The
+///! wrapping `abs` methods below are one visible consequence (see each
+///! `abs`); the signed widths' `checked_abs` answers `None` for the one
+///! value `abs` wraps on, which no range check of the operand can avoid
+///! naming.
+///!
+///! `abs`, `checked_abs` and `clamp` are methods of each numeric type
+///! rather than generic functions: their bodies compare with and negate
+///! from a literal `0`, and no trait says a literal converts to `T`.
 ///!
 ///! ## Buffer-write formatting
 ///!
@@ -29,8 +36,11 @@
 
 namespace std::core::primitives;
 
-import core::intrinsics;
-import alloc::allocator;
+import std::core::intrinsics;
+import std::core::option;
+import std::core::option::{ Option };
+import std::alloc::allocator;
+import std::ffi::libc;
 
 // Digit-count upper bounds: caller picks a buffer at least this big.
 
@@ -139,19 +149,36 @@ implement char {
     }
 }
 
-// Range bounds + abs for the signed integer widths. `abs` wraps at the
-// type's min_value (two's complement has no positive counterpart for
-// the most-negative value): `i8::min_value().abs()` is `-128`, not `128`.
-// This is frozen behavior for 1.0 - there is no `checked_abs`. Narrower
-// widths delegate to `i64`
-// for the decimal-write digit loop so the implementation lives in one
-// place (down in the `implement i64` block).
+// Range bounds, abs, checked_abs and clamp for the signed integer widths.
+// `abs` wraps at the type's min_value (two's complement has no positive
+// counterpart for the most-negative value): `i8::min_value().abs()` is
+// `-128`, not `128`; `checked_abs` answers `None` there instead.  Narrower
+// widths delegate to `i64` for the decimal-write digit loop so the
+// implementation lives in one place (down in the `implement i64` block).
 implement i8 {
     static min_value() -> i8 { return -128 as i8; }
     static max_value() -> i8 { return 127 as i8; }
 
     abs(&this) -> i8 {
         if (this < 0) { return -this as i8; }
+        return this;
+    }
+
+    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// representable: only it negates to a value still negative.
+    checked_abs(&this) -> Option<i8> {
+        if (this < 0) {
+            const neg: i8 = -this as i8;
+            if (neg < 0) { return Option::None; }
+            return Option::Some(neg);
+        }
+        return Option::Some(this);
+    }
+
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: i8, hi: i8) -> i8 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
         return this;
     }
 
@@ -171,6 +198,24 @@ implement i16 {
         return this;
     }
 
+    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// representable: only it negates to a value still negative.
+    checked_abs(&this) -> Option<i16> {
+        if (this < 0) {
+            const neg: i16 = -this as i16;
+            if (neg < 0) { return Option::None; }
+            return Option::Some(neg);
+        }
+        return Option::Some(this);
+    }
+
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: i16, hi: i16) -> i16 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
+        return this;
+    }
+
     /// Buffer must hold at least `I16_MAX_DECIMAL_DIGITS` bytes.
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         const v: i64 = this as i64;
@@ -184,9 +229,27 @@ implement i32 {
 
     /// Wraps at `i32::min_value()`: the most-negative value has no
     /// positive counterpart in two's complement, so `i32::min_value().abs()`
-    /// is itself. Frozen for 1.0 - there is no `checked_abs`.
+    /// is itself; `checked_abs` answers `None` there.
     abs(&this) -> i32 {
         if (this < 0) { return -this; }
+        return this;
+    }
+
+    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// representable: only it negates to a value still negative.
+    checked_abs(&this) -> Option<i32> {
+        if (this < 0) {
+            const neg: i32 = -this;
+            if (neg < 0) { return Option::None; }
+            return Option::Some(neg);
+        }
+        return Option::Some(this);
+    }
+
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: i32, hi: i32) -> i32 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
         return this;
     }
 
@@ -205,6 +268,24 @@ implement i64 {
         if (this < 0) { return -this; }
         return this;
     }
+
+    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// representable: only it negates to a value still negative.
+    checked_abs(&this) -> Option<i64> {
+        if (this < 0) {
+            const neg: i64 = -this;
+            if (neg < 0) { return Option::None; }
+            return Option::Some(neg);
+        }
+        return Option::Some(this);
+    }
+
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: i64, hi: i64) -> i64 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
+        return this;
+    }
 }
 
 // Unsigned range bounds + buffer-write formatting.  Narrower widths
@@ -215,6 +296,13 @@ implement i64 {
 implement u8 {
     static min_value() -> u8 { return 0 as u8; }
     static max_value() -> u8 { return 255 as u8; }
+
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: u8, hi: u8) -> u8 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
+        return this;
+    }
 
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         const v: u64 = this as u64;
@@ -246,6 +334,13 @@ implement u16 {
     static min_value() -> u16 { return 0 as u16; }
     static max_value() -> u16 { return 65535 as u16; }
 
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: u16, hi: u16) -> u16 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
+        return this;
+    }
+
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         const v: u64 = this as u64;
         return v.to_decimal_buf(buffer);
@@ -275,6 +370,13 @@ implement u16 {
 implement u32 {
     static min_value() -> u32 { return 0 as u32; }
     static max_value() -> u32 { return 4294967295; }
+
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: u32, hi: u32) -> u32 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
+        return this;
+    }
 
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         const v: u64 = this as u64;
@@ -306,6 +408,13 @@ implement u64 {
     static min_value() -> u64 { return 0 as u64; }
     static max_value() -> u64 { return 18446744073709551615; }
 
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: u64, hi: u64) -> u64 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
+        return this;
+    }
+
     // Buffer-write formatting. Each writes into a caller-owned `u8*` and
     // returns the number of bytes written. The caller picks the buffer
     // size from the `U64_MAX_*_DIGITS` constants above. This is the
@@ -330,7 +439,7 @@ implement u64 {
             v = v / 10;
         }
         const digits: u64 = 20 - cursor;
-        intrinsics::memcpy(
+        libc::memcpy(
             buffer as void*,
             (&scratch[0] + cursor) as void*,
             digits
@@ -379,7 +488,7 @@ implement u64 {
             v = v >> 4;
         }
         const digits: u64 = 16 - cursor;
-        intrinsics::memcpy(
+        libc::memcpy(
             buffer as void*,
             (&scratch[0] + cursor) as void*,
             digits
@@ -439,7 +548,7 @@ implement u64 {
             v = v >> 3;
         }
         const digits: u64 = 22 - cursor;
-        intrinsics::memcpy(
+        libc::memcpy(
             buffer as void*,
             (&scratch[0] + cursor) as void*,
             digits
@@ -462,7 +571,7 @@ implement u64 {
             v = v >> 1;
         }
         const digits: u64 = 64 - cursor;
-        intrinsics::memcpy(
+        libc::memcpy(
             buffer as void*,
             (&scratch[0] + cursor) as void*,
             digits
@@ -531,6 +640,13 @@ implement u128 {
         return m;
     }
 
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: u128, hi: u128) -> u128 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
+        return this;
+    }
+
     /// Write `this` in base 10 into `buffer`. Returns bytes written.
     /// `buffer` must hold at least `U128_MAX_DECIMAL_DIGITS` bytes.
     to_decimal_buf(&this, buffer: u8*) -> u64 {
@@ -547,7 +663,7 @@ implement u128 {
             v = v / 10;
         }
         const digits: u64 = 39 - cursor;
-        intrinsics::memcpy(
+        libc::memcpy(
             buffer as void*,
             (&scratch[0] + cursor) as void*,
             digits
@@ -591,7 +707,7 @@ implement u128 {
             v = v >> 4;
         }
         const digits: u64 = 32 - cursor;
-        intrinsics::memcpy(
+        libc::memcpy(
             buffer as void*,
             (&scratch[0] + cursor) as void*,
             digits
@@ -614,7 +730,7 @@ implement u128 {
             v = v >> 3;
         }
         const digits: u64 = 43 - cursor;
-        intrinsics::memcpy(
+        libc::memcpy(
             buffer as void*,
             (&scratch[0] + cursor) as void*,
             digits
@@ -637,7 +753,7 @@ implement u128 {
             v = v >> 1;
         }
         const digits: u64 = 128 - cursor;
-        intrinsics::memcpy(
+        libc::memcpy(
             buffer as void*,
             (&scratch[0] + cursor) as void*,
             digits
@@ -660,9 +776,27 @@ implement i128 {
 
     /// Wraps at `i128::min_value()`: the most-negative value has no positive
     /// counterpart in two's complement, so `i128::min_value().abs()` is
-    /// itself. Frozen for 1.0 - there is no `checked_abs`.
+    /// itself; `checked_abs` answers `None` there.
     abs(&this) -> i128 {
         if (this < 0) { return -this; }
+        return this;
+    }
+
+    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// representable: only it negates to a value still negative.
+    checked_abs(&this) -> Option<i128> {
+        if (this < 0) {
+            const neg: i128 = -this;
+            if (neg < 0) { return Option::None; }
+            return Option::Some(neg);
+        }
+        return Option::Some(this);
+    }
+
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: i128, hi: i128) -> i128 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
         return this;
     }
 
@@ -702,6 +836,13 @@ implement usize {
     static min_value() -> usize { return 0 as usize; }
     static max_value() -> usize { return u64::max_value() as usize; }
 
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: usize, hi: usize) -> usize {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
+        return this;
+    }
+
     /// Write `this` in base 10. `buffer` must hold at least
     /// `U64_MAX_DECIMAL_DIGITS` bytes (on a 64-bit target).
     to_decimal_buf(&this, buffer: u8*) -> u64 {
@@ -724,6 +865,24 @@ implement isize {
         return this;
     }
 
+    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// representable: only it negates to a value still negative.
+    checked_abs(&this) -> Option<isize> {
+        if (this < 0) {
+            const neg: isize = -this;
+            if (neg < 0) { return Option::None; }
+            return Option::Some(neg);
+        }
+        return Option::Some(this);
+    }
+
+    /// `this` confined to `[lo, hi]`.
+    clamp(&this, lo: isize, hi: isize) -> isize {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
+        return this;
+    }
+
     /// Write signed `this` in base 10. `buffer` must hold at least
     /// `I64_MAX_DECIMAL_DIGITS` bytes (on a 64-bit target).
     to_decimal_buf(&this, buffer: u8*) -> u64 {
@@ -742,25 +901,53 @@ implement isize {
 // (which itself lives in `fmt::float` for `to_buf` / `to_buf_with`
 // because that needs libm).
 implement f32 {
+    /// Absolute value by clearing the sign bit, so `-0.0` gives `0.0` and a
+    /// NaN keeps its payload with its sign cleared.
     abs(&this) -> f32 {
-        if (this < 0.0 as f32) { return -this; }
+        return intrinsics::fabs32(this);
+    }
+
+    /// `this` confined to `[lo, hi]`, by plain comparisons: a NaN `this`
+    /// compares false against both bounds and is returned unchanged.
+    clamp(&this, lo: f32, hi: f32) -> f32 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
         return this;
     }
 
     is_nan(&this) -> boolean {
         return this != this;
     }
+
+    /// Square root, in single precision: NaN for a negative `this`.
+    sqrt(&this) -> f32 {
+        return intrinsics::sqrt32(this);
+    }
 }
 
 implement f64 {
+    /// Absolute value by clearing the sign bit, so `-0.0` gives `0.0` and a
+    /// NaN keeps its payload with its sign cleared.
     abs(&this) -> f64 {
-        if (this < 0.0) { return -this; }
+        return intrinsics::fabs64(this);
+    }
+
+    /// `this` confined to `[lo, hi]`, by plain comparisons: a NaN `this`
+    /// compares false against both bounds and is returned unchanged.
+    clamp(&this, lo: f64, hi: f64) -> f64 {
+        if (this < lo) { return lo; }
+        if (this > hi) { return hi; }
         return this;
     }
 
     /// `NaN != NaN`, so the cheapest portable check is self-comparison.
     is_nan(&this) -> boolean {
         return this != this;
+    }
+
+    /// Square root: NaN for a negative `this`.
+    sqrt(&this) -> f64 {
+        return intrinsics::sqrt64(this);
     }
 }
 
@@ -774,7 +961,7 @@ implement f64 {
 implement string {
     length(&this) -> u64 {
         if (this == null) { return 0; }
-        return strlen(this);
+        return libc::strlen(this);
     }
 
     is_empty(&this) -> boolean {
@@ -795,7 +982,7 @@ implement string {
     /// accepts the prefixed forms too - a prefix-scan that bailed on the first
     /// digit would misread the `8` in `u8"..."` as a numeric literal.
     is_text_literal(&this) -> boolean {
-        const len: u64 = strlen(this);
+        const len: u64 = libc::strlen(this);
         for (mut i: u64 = 0; i < len; i++) {
             const c: char = this[i];
             if (c == '"' || c == '\'') { return true; }
@@ -813,7 +1000,7 @@ implement string {
     /// Assumes a numeric literal - rule out string/char literals with
     /// `is_text_literal` first.
     is_float_literal(&this) -> boolean {
-        const len: u64 = strlen(this);
+        const len: u64 = libc::strlen(this);
         if (len == 0) { return false; }
         const is_hex: boolean = len >= 2 && this[0] == '0' && (this[1] == 'x' || this[1] == 'X');
         for (mut i: u64 = 0; i < len; i++) {
@@ -833,7 +1020,7 @@ implement string {
     /// over any `l`/`L` length suffix, so `5u`, `0xFFul`, `10LU`, and `7llu` all
     /// report unsigned while `5`, `5l`, and `7ll` do not.
     is_unsigned_literal(&this) -> boolean {
-        mut i: i64 = (strlen(this) as i64) - 1;
+        mut i: i64 = (libc::strlen(this) as i64) - 1;
         while (i >= 0) {
             const c: char = this[i as u64];
             if (c == 'u' || c == 'U') { return true; }
@@ -857,7 +1044,7 @@ implement string {
         if ((buf as void*) == null) {
             core::panic("string::substring: allocation failed", FILE, LINE);
         }
-        memcpy(buf as void*, (this + (start as i64)) as void*, take as u64);
+        libc::memcpy(buf as void*, (this + (start as i64)) as void*, take as u64);
         buf[take] = 0;
         return buf;
     }
@@ -870,7 +1057,7 @@ implement string {
     /// hot loops.
     substr(&this, start: i64, len: i64) -> string {
         if (len <= 0 || start < 0) { return ""; }
-        const total: i64 = strlen(this) as i64;
+        const total: i64 = libc::strlen(this) as i64;
         if (start >= total) { return ""; }
         mut take: i64 = len;
         if (start + take > total) { take = total - start; }
@@ -878,7 +1065,7 @@ implement string {
         if ((buf as void*) == null) {
             core::panic("string::substr: allocation failed", FILE, LINE);
         }
-        memcpy(buf as void*, (this + start) as void*, take as u64);
+        libc::memcpy(buf as void*, (this + start) as void*, take as u64);
         buf[take] = 0;
         return buf;
     }
@@ -886,15 +1073,15 @@ implement string {
     /// Concatenate `other` onto a fresh heap-allocated copy of `this`,
     /// returning the new NUL-terminated string. Caller owns the result.
     append(&this, other: string) -> string {
-        const len1: u64 = strlen(this);
-        const len2: u64 = strlen(other);
+        const len1: u64 = libc::strlen(this);
+        const len2: u64 = libc::strlen(other);
         const total: u64 = len1 + len2 + 1;
         mut buf: string = allocator::alloc(total, 1) as string;
         if ((buf as void*) == null) {
             core::panic("string::append: allocation failed", FILE, LINE);
         }
-        memcpy(buf as void*, this as void*, len1);
-        memcpy((buf + len1) as void*, other as void*, len2);
+        libc::memcpy(buf as void*, this as void*, len1);
+        libc::memcpy((buf + len1) as void*, other as void*, len2);
         buf[len1 + len2] = 0;
         return buf;
     }
@@ -915,10 +1102,10 @@ implement string {
     /// If `this` begins with `prefix`, return the remainder as a fresh
     /// string; otherwise return `this` unchanged (same buffer).
     strip_prefix(&this, prefix: string) -> string {
-        const plen: u64 = strlen(prefix);
-        const slen: u64 = strlen(this);
+        const plen: u64 = libc::strlen(prefix);
+        const slen: u64 = libc::strlen(this);
         if (slen < plen) { return this; }
-        if (strncmp(this, prefix, plen) == 0) {
+        if (libc::strncmp(this, prefix, plen) == 0) {
             return this.substr(plen as i64, (slen - plen) as i64);
         }
         return this;
@@ -927,8 +1114,8 @@ implement string {
     /// True when `this` ends with `suffix` (byte-wise). An empty suffix always
     /// matches; a suffix longer than `this` never does.
     ends_with(&this, suffix: string) -> boolean {
-        const sl: i64 = strlen(this) as i64;
-        const fl: i64 = strlen(suffix) as i64;
+        const sl: i64 = libc::strlen(this) as i64;
+        const fl: i64 = libc::strlen(suffix) as i64;
         if (fl > sl) { return false; }
         mut i: i64 = 0;
         while (i < fl) {
@@ -950,7 +1137,7 @@ implement string {
     /// True when `needle` occurs anywhere in `this` (substring search).
     /// An empty needle always matches, mirroring C `strstr`.
     contains(&this, needle: string) -> boolean {
-        return strstr(this, needle) != null;
+        return libc::strstr(this, needle) != null;
     }
 
     /// Byte index of the first occurrence of `ch`, or -1 if absent.
@@ -1049,41 +1236,41 @@ implement string {
     eq(&this, other: string) -> boolean {
         if (this == null) { return other == null; }
         if (other == null) { return false; }
-        const la: u64 = strlen(this);
-        if (la != strlen(other)) { return false; }
-        return strncmp(this, other, la) == 0;
+        const la: u64 = libc::strlen(this);
+        if (la != libc::strlen(other)) { return false; }
+        return libc::strncmp(this, other, la) == 0;
     }
 
     /// True when `this` begins with `prefix` (byte-wise). An empty prefix
     /// always matches; a prefix longer than `this` never does.
     starts_with(&this, prefix: string) -> boolean {
         if (this == null || prefix == null) { return false; }
-        const plen: u64 = strlen(prefix);
+        const plen: u64 = libc::strlen(prefix);
         if (plen == 0) { return true; }
-        if (strlen(this) < plen) { return false; }
-        return strncmp(this, prefix, plen) == 0;
+        if (libc::strlen(this) < plen) { return false; }
+        return libc::strncmp(this, prefix, plen) == 0;
     }
 
     /// Byte index of the first occurrence of `needle`, or -1 when absent.
     /// An empty needle matches at 0.
     find(&this, needle: string) -> i64 {
         if (this == null || needle == null) { return -1; }
-        const hit: i8* = strstr(this, needle);
+        const hit: i8* = libc::strstr(this, needle) as i8*;
         if (hit == null) { return -1; }
-        return ptr_diff(hit as void*, this as void*);
+        return intrinsics::ptr_diff(hit as void*, this as void*);
     }
 
     /// Byte index of the last occurrence of `needle`, or -1 when absent.
     /// An empty needle matches at the end (the string's length).
     rfind(&this, needle: string) -> i64 {
         if (this == null || needle == null) { return -1; }
-        const nlen: i64 = strlen(needle) as i64;
-        const hlen: i64 = strlen(this) as i64;
+        const nlen: i64 = libc::strlen(needle) as i64;
+        const hlen: i64 = libc::strlen(this) as i64;
         if (nlen == 0) { return hlen; }
         if (nlen > hlen) { return -1; }
         mut i: i64 = hlen - nlen;
         while (i >= 0) {
-            if (strncmp(this + i, needle, nlen as u64) == 0) {
+            if (libc::strncmp(this + i, needle, nlen as u64) == 0) {
                 return i;
             }
             i -= 1;
@@ -1115,12 +1302,12 @@ implement string {
         mut parts: string[] = [];
         if (this == null) { return parts; }
         const total: i64 = this.length() as i64;
-        const slen: i64 = strlen(sep) as i64;
+        const slen: i64 = libc::strlen(sep) as i64;
         if (slen == 0) { parts.push(this.substr(0, total)); return parts; }
         mut i: i64 = 0;
         mut seg_start: i64 = 0;
         while (i <= total - slen) {
-            if (strncmp(this + i, sep, slen as u64) == 0) {
+            if (libc::strncmp(this + i, sep, slen as u64) == 0) {
                 parts.push(this.substr(seg_start, i - seg_start));
                 i += slen;
                 seg_start = i;
@@ -1140,7 +1327,7 @@ implement string {
         mut out: string[] = [];
         if (this == null) { return out; }
         const total: i64 = this.length() as i64;
-        const slen: i64 = strlen(sep) as i64;
+        const slen: i64 = libc::strlen(sep) as i64;
         if (slen == 0) {
             if (total > 0) { out.push(this.substr(0, total)); }
             return out;
@@ -1148,7 +1335,7 @@ implement string {
         mut i: i64 = 0;
         mut start: i64 = 0;
         while (i <= total - slen) {
-            if (strncmp(this + i, sep, slen as u64) == 0) {
+            if (libc::strncmp(this + i, sep, slen as u64) == 0) {
                 if (i > start) { out.push(this.substr(start, i - start)); }
                 i += slen;
                 start = i;
@@ -1164,14 +1351,14 @@ implement string {
     /// a freshly allocated string. An empty `from` returns `this` unchanged.
     replace(&this, from: string, to: string) -> string {
         if (this == null) { return ""; }
-        const flen: i64 = strlen(from) as i64;
+        const flen: i64 = libc::strlen(from) as i64;
         const total: i64 = this.length() as i64;
         if (flen == 0) { return this.substr(0, total); }
         mut result: string = "";
         mut i: i64 = 0;
         mut seg_start: i64 = 0;
         while (i <= total - flen) {
-            if (strncmp(this + i, from, flen as u64) == 0) {
+            if (libc::strncmp(this + i, from, flen as u64) == 0) {
                 result = result.append(this.substr(seg_start, i - seg_start));
                 result = result.append(to);
                 i += flen;

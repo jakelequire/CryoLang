@@ -9,18 +9,28 @@
 ///! no shell).  We rely on the user's git installation for protocol/auth
 ///! handling; nothing here is reimplemented in-process.
 
-namespace Compiler::Deps::Git;
+namespace compiler::deps::git;
 
-import Utils::Logger;
+import utils::logger;
 import std::fs::metadata;
+import std::fs::metadata::{ metadata };
 import std::fs::dir;
 import std::fs::path;
+import std::fs::path::{ Path };
 import std::fmt;
 import std::collections::str;
+import std::collections::str::{ Str };
 import std::collections::string;
+import std::collections::string::{ String };
 import std::core::slice;
+import std::core::slice::{ Slice };
 import std::process::command;
-import Compiler::Deps::Cache;
+import std::process::command::{ Command, Output, Stdio };
+import compiler::deps::cache;
+import compiler::deps::cache::{ Cache };
+import compiler::project_config;
+import compiler::project_config::{ GitRefKind };
+import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
 
 
 
@@ -33,8 +43,9 @@ type struct Git {
 
     /// Ensure the bare clone for `url` exists and (when `refresh` is true)
     /// has the latest remote refs. Idempotent.  Returns true on success.
-    static ensure_bare_clone(url: string, refresh: boolean) -> boolean {
-        const dir: string = Cache::git_dir_for(url);
+    static ensure_bare_clone(url_text: string, refresh: boolean) -> boolean {
+        const url: string = url_text;
+        const dir: string = Cache::git_dir_for(url_text);
 
         if (!metadata::exists(Path::from(dir))) {
             // First-time clone.  `--bare` skips materialising a working
@@ -56,7 +67,7 @@ type struct Git {
         if (refresh) {
             fmt::println(f"[deps] refreshing {url}");
             mut fetch_args: string[] = [
-                format("--git-dir=%s", dir),
+                fmt::format("--git-dir=%s", dir),
                 "fetch", "--quiet", "--tags", "--prune", "--all"];
             const status: i32 = Git::run_git(&fetch_args);
             if (status != 0) {
@@ -79,8 +90,10 @@ type struct Git {
     /// Branch refs have to be qualified; `git fetch` from a bare clone
     /// doesn't track local branches, so we look at the remote-tracking
     /// `refs/heads/<branch>` ref directly.
-    static resolve_ref_to_sha(url: string, ref_kind: GitRefKind, ref_val: string) -> string {
-        const dir: string = Cache::git_dir_for(url);
+    static resolve_ref_to_sha(url_text: string, ref_kind: GitRefKind, ref_val_text: string) -> string {
+        const ref_val: string = ref_val_text;
+        const url: string = url_text;
+        const dir: string = Cache::git_dir_for(url_text);
 
         // Build the candidate refspec list.  We try them in order; the
         // first one that resolves wins.  `git rev-parse` succeeds (exit 0)
@@ -89,11 +102,11 @@ type struct Git {
         mut candidates: string[] = [];
         match (ref_kind) {
             GitRefKind::Tag => {
-                candidates.push(format("refs/tags/%s", ref_val));
+                candidates.push(fmt::format("refs/tags/%s", ref_val));
                 candidates.push(ref_val);  // bare name in case user wrote `tag = "0.1.0"` and the tag is also `0.1.0`
             }
             GitRefKind::Branch => {
-                candidates.push(format("refs/heads/%s", ref_val));
+                candidates.push(fmt::format("refs/heads/%s", ref_val));
                 candidates.push(ref_val);
             }
             GitRefKind::Rev => {
@@ -111,11 +124,11 @@ type struct Git {
             }
         }
 
-        for (mut i: int = 0; i < candidates.length; i++) {
+        for (mut i: i64 = 0; i < candidates.length; i++) {
             mut rp_args: string[] = [
-                format("--git-dir=%s", dir),
+                fmt::format("--git-dir=%s", dir),
                 "rev-parse", "--verify", "--quiet",
-                format("%s^{commit}", candidates[i])];
+                fmt::format("%s^{commit}", candidates[i])];
             const lines: string[] = Git::capture_git(&rp_args);
             if (lines.length > 0 && lines[0].length() > 0) {
                 return lines[0];
@@ -129,9 +142,9 @@ type struct Git {
     /// List every tag in the bare clone for `url`, one per element.
     /// Used for semver-range resolution against `version = "..."`.
     /// Returns an empty list on failure (and prints a diagnostic).
-    static list_tags(url: string) -> string[] {
-        const dir: string = Cache::git_dir_for(url);
-        mut tag_args: string[] = [format("--git-dir=%s", dir), "tag", "--list"];
+    static list_tags(url_text: string) -> string[] {
+        const dir: string = Cache::git_dir_for(url_text);
+        mut tag_args: string[] = [fmt::format("--git-dir=%s", dir), "tag", "--list"];
         return Git::capture_git(&tag_args);
     }
 
@@ -140,28 +153,29 @@ type struct Git {
 
     /// Path to the working tree for (`url`, `sha`).  Does not check
     /// existence; callers use `is_checkout_present` for that.
-    static checkout_path(url: string, sha: string) -> string {
-        return Cache::checkout_dir_for(url, sha);
+    static checkout_path(url_text: string, sha_text: string) -> string {
+        return Cache::checkout_dir_for(url_text, sha_text);
     }
 
     /// True when the working tree at (`url`, `sha`) is fully materialised.
     /// We probe for `.git` rather than the directory itself because an
     /// interrupted clone may leave a half-populated dir behind.
-    static is_checkout_present(url: string, sha: string) -> boolean {
-        const dir: string = Cache::checkout_dir_for(url, sha);
+    static is_checkout_present(url_text: string, sha_text: string) -> boolean {
+        const dir: string = Cache::checkout_dir_for(url_text, sha_text);
         if (!metadata::exists(Path::from(dir))) { return false; }
-        return metadata::exists(Path::from(format("%s/.git", dir)));
+        return metadata::exists(Path::from(fmt::format("%s/.git", dir)));
     }
 
     /// Clone the bare cache into a fresh working tree at `<checkout>/<sha>`,
     /// then `checkout` the requested SHA.  `--local` uses hardlinks where
     /// the filesystem permits, so per-SHA storage cost is dominated by the
     /// working tree itself rather than the .git history.
-    static materialize_checkout(url: string, sha: string) -> boolean {
-        if (Git::is_checkout_present(url, sha)) { return true; }
+    static materialize_checkout(url_text: string, sha_text: string) -> boolean {
+        const sha: string = sha_text;
+        if (Git::is_checkout_present(url_text, sha_text)) { return true; }
 
-        const bare:    string = Cache::git_dir_for(url);
-        const wt:      string = Cache::checkout_dir_for(url, sha);
+        const bare:    string = Cache::git_dir_for(url_text);
+        const wt:      string = Cache::checkout_dir_for(url_text, sha_text);
         const wt_par:  string = wt.parent_dir();
 
         dir::create_dir_all(Path::from(wt_par));

@@ -6,26 +6,37 @@
 ///   3. fill-form    `[value; N]`               -> alloca + fill loop (fixed or dynamic)
 ///
 /// The fill-loop emitters (`emit_fill_loop_indexed` / `emit_fill_loop_raw`)
-/// alloca the loop counter in the *current* block, not via
-/// `IRFlowEmitter::create_entry_alloca`, because at the call-site the entry
-/// block may already have a terminator (a preceding `br cond_bb`) and
-/// inserting another alloca past a terminator breaks the block.
+/// hoist their loop counter to the entry block, so a fill-form literal in a
+/// loop body reuses one counter slot instead of stranding a fresh one per
+/// iteration.  The entry block may already carry a terminator by then;
+/// `create_entry_alloca` inserts before it rather than after.
 ///
 /// Holds `cg`, `state`, and `dispatch` back-pointers; recursion into the
 /// element expressions goes through `dispatch.codegen_rvalue(visitor, ...)`.
 
-namespace Compiler::Codegen::Visit::ArrayLitEmitter;
+namespace compiler::codegen::visit::array_lit_emitter;
 
-import Compiler::Codegen;
-import Compiler::Codegen::{ LLVMTypes, Context, Util };
-import Compiler::Codegen::State::VisitorState;
-import Compiler::Codegen::Visit::ExprDispatch;
-import Compiler::Diag;
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Type, Compound };
-import Compiler::AST;
-import Compiler::AST::{ Node, Visitor, Expression };
+import compiler::codegen;
+import compiler::codegen::{ context, llvm, llvm_types, util };
+import compiler::codegen::state::visitor_state;
+import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::codegen::visit::expr_dispatch;
+import compiler::codegen::visit::expr_dispatch::{ ExprDispatch };
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
+import compiler::types;
+import compiler::types::{ compound, type_base, type_ref, TypeKind };
+import compiler::ast;
+import compiler::ast::{ node, visitor, expression };
 import std::collections::pair;
+import std::ffi::libc;
+import compiler::ast::expression::{ ArrayLiteralNode };
+import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::context::{ CodegenContext };
+import compiler::codegen::llvm_types::{ LBasicBlock, LIntPredicate, LType, LTypeKind, LValue };
+import compiler::types::compound::{ ArrayType };
+import compiler::types::type_base::{ Type };
+import compiler::resolver::res::{ DefId };
 
 
 type struct ArrayLitEmitter {
@@ -86,7 +97,7 @@ type struct ArrayLitEmitter {
             return;
         }
 
-        const arr_t_raw: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+        const arr_t_raw: Type* = this.cg.arena_type(node.resolved_type);
         mut is_dynamic: boolean = false;
         mut arr_type_ptr: ArrayType* = null;
         if (arr_t_raw != null && arr_t_raw.kind == TypeKind::Array) {
@@ -120,13 +131,13 @@ type struct ArrayLitEmitter {
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             const elem: LValue = this.dispatch.codegen_rvalue(visitor, node.elements[i]);
             const idx: LValue = LType::const_int(LType::i64(), i as u64, false);
-            const buf: void* = intrinsics::malloc(16);
+            const buf: void* = libc::malloc(16);
             const buf_arr: void** = buf as void**;
             const zero_idx: LValue = LType::const_int(LType::i64(), 0, false);
             buf_arr[0] = zero_idx.raw;
             buf_arr[1] = idx.raw;
             const gep: LValue = this.cg.builder.build_gep(ty, alloca, buf, 2, "arrelem");
-            intrinsics::free(buf);
+            libc::free(buf);
             this.cg.builder.build_store(elem, gep);
         }
 
@@ -188,7 +199,7 @@ type struct ArrayLitEmitter {
             // `holds(ptr)`), so a literal-seeded, then-grown array would leak
             // with a leaked owner (the LSP per-recompile CompilationContext).
             data_ptr = this.cg.expr_ops.emit_raw_alloc(
-                false, byte_count, 16, "arrdata", node.span, "array literal");
+                LValue::null(), byte_count, 16, "arrdata", node.span, "array literal");
             if (!data_ptr.is_valid()) {
                 this.state.last_value     = LValue::null();
                 this.state.last_is_lvalue = false;
@@ -199,12 +210,12 @@ type struct ArrayLitEmitter {
                 const elem: LValue = this.dispatch.codegen_rvalue(visitor, node.elements[i]);
                 if (!elem.is_valid()) { continue; }
                 const idx: LValue = LType::const_int(LType::i64(), i as u64, false);
-                const buf: void* = intrinsics::malloc(8);
+                const buf: void* = libc::malloc(8);
                 const buf_arr: void** = buf as void**;
                 buf_arr[0] = idx.raw;
                 const slot: LValue = this.cg.builder.build_gep(
                     elem_ty, data_ptr, buf, 1, "arrelem");
-                intrinsics::free(buf);
+                libc::free(buf);
                 this.cg.builder.build_store(elem, slot);
             }
         } else {
@@ -231,7 +242,7 @@ type struct ArrayLitEmitter {
     /// Emit codegen for `[value; N]` (fill form).  N may be a compile-time
     /// constant (fixed array) or a runtime expression (dynamic array).
     emit_fill(mut &this, visitor: ASTVisitor*, node: ArrayLiteralNode*) -> void {
-        const arr_t_raw: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+        const arr_t_raw: Type* = this.cg.arena_type(node.resolved_type);
         if (arr_t_raw == null || arr_t_raw.kind != TypeKind::Array) {
             this.state.last_value     = LValue::null();
             this.state.last_is_lvalue = false;
@@ -325,7 +336,7 @@ type struct ArrayLitEmitter {
             // Shared allocation funnel (see the element-form path above for why
             // a raw `malloc` would leak a literal-seeded, then-grown array).
             const data_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
-                false, byte_count, 16, "filldata", node.span, "array literal");
+                LValue::null(), byte_count, 16, "filldata", node.span, "array literal");
             if (!data_ptr.is_valid()) {
                 this.state.last_value     = LValue::null();
                 this.state.last_is_lvalue = false;
@@ -361,14 +372,12 @@ type struct ArrayLitEmitter {
         const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.body");
         const end_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.end");
 
-        // Alloca the counter in the CURRENT block, not via create_entry_alloca.
-        // The entry block may already hold allocas for preceding locals and
-        // is about to get its `br cond_bb` terminator; inserting another
-        // alloca via `position_at_end(entry)` after we've emitted a
-        // terminator there lands the instruction after the terminator and
-        // breaks the block.  Inline alloca keeps the block well-formed and
-        // LLVM still optimizes it correctly.
-        const i_slot: LValue = this.cg.builder.build_alloca(LType::i64(), "fill.i");
+        // The counter is hoisted to the entry block: a fill-form literal in a
+        // loop body would otherwise leave one counter slot behind per
+        // iteration.  Sharing one slot across iterations is safe because the
+        // store of 0 below re-initializes it before the loop reads it.
+        const i_slot: LValue = this.cg.flow.create_entry_alloca(
+            current_fn, "fill.i", LType::i64());
         this.cg.builder.build_store(
             LType::const_int(LType::i64(), 0, false), i_slot);
         this.cg.builder.build_br(cond_bb);
@@ -379,12 +388,12 @@ type struct ArrayLitEmitter {
         this.cg.builder.build_cond_br(done, end_bb, body_bb);
 
         this.cg.builder.position_at_end(body_bb);
-        const buf: void* = intrinsics::malloc(16);
+        const buf: void* = libc::malloc(16);
         const buf_arr: void** = buf as void**;
         buf_arr[0] = LType::const_int(LType::i64(), 0, false).raw;
         buf_arr[1] = cur.raw;
         const slot: LValue = this.cg.builder.build_gep(arr_ty, base, buf, 2, "fill.slot");
-        intrinsics::free(buf);
+        libc::free(buf);
         if (fill_val.is_valid() && slot.is_valid()) {
             this.cg.builder.build_store(fill_val, slot);
         }
@@ -404,9 +413,10 @@ type struct ArrayLitEmitter {
         const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.body");
         const end_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.end");
 
-        // See `emit_fill_loop_indexed` above for why this alloca goes in
-        // the current block, not via `create_entry_alloca`.
-        const i_slot: LValue = this.cg.builder.build_alloca(LType::i64(), "fill.i");
+        // Hoisted, and safe to share across iterations; see
+        // `emit_fill_loop_indexed` above.
+        const i_slot: LValue = this.cg.flow.create_entry_alloca(
+            current_fn, "fill.i", LType::i64());
         this.cg.builder.build_store(
             LType::const_int(LType::i64(), 0, false), i_slot);
         this.cg.builder.build_br(cond_bb);
@@ -417,11 +427,11 @@ type struct ArrayLitEmitter {
         this.cg.builder.build_cond_br(done, end_bb, body_bb);
 
         this.cg.builder.position_at_end(body_bb);
-        const buf: void* = intrinsics::malloc(8);
+        const buf: void* = libc::malloc(8);
         const buf_arr: void** = buf as void**;
         buf_arr[0] = cur.raw;
         const slot: LValue = this.cg.builder.build_gep(elem_ty, base, buf, 1, "fill.slot");
-        intrinsics::free(buf);
+        libc::free(buf);
         if (fill_val.is_valid() && slot.is_valid()) {
             this.cg.builder.build_store(fill_val, slot);
         }

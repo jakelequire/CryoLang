@@ -26,24 +26,24 @@ Three consequences fall out of that choice, and they are why it was made:
 - **`async` is a compile-time transformation.** The executor is an ordinary library
   (`stdlib/future/`), not part of the language.
 
-## 2. Why there is no `Pin`
+## 2. Why futures are never pinned
 
-Rust needs `Pin` because a future may hold a pointer into its own fields, and moving such a future
-dangles that pointer. Cryo forbids the pattern instead of managing it: **a reference may not be held
-live across a suspension** (`E0455`). No self-references means nothing to pin, which means futures
-are ordinary movable structs and no address-stability contract exists anywhere in the system.
+A future that holds a pointer into its own fields dangles that pointer when it is moved. Cryo forbids
+the pattern instead of managing it: **a reference may not be held live across a suspension**
+(`E0455`). No self-references means nothing to pin in place, which means futures are ordinary
+movable structs and no address-stability contract exists anywhere in the system.
 
-This was not a preference. A `Pin<T>` that actually enforced anything would need lifetimes, a borrow
-checker, and an `unsafe` with teeth - Cryo deliberately has none of the three, so a `Pin` written
-here would enforce nothing. The move checker is the language's one *enforced* ownership mechanism, so
+This was not a preference. A pinning type that actually enforced anything would need lifetimes, a
+borrow checker, and an `unsafe` with teeth - Cryo deliberately has none of the three, so such a type
+written here would enforce nothing. The move checker is the language's one *enforced* ownership mechanism, so
 routing the rule through it is the only soundly-enforced option available.
 
 The cost is real and bounded: an `async function` taking `x: &T` cannot use `x` after an await, and
 no `&mut` into a field may cross one. The owned-value rewrite is always available and is the idiom
 the standard library follows - see §5.
 
-This is a strict subset of Rust's rules. Adding lifetimes and a real `Pin` later would relax it
-without breaking existing code.
+The rule is conservative on purpose. Adding lifetimes and an enforced pinning type later would relax
+it without breaking existing code.
 
 ## 3. What the lowering guarantees
 

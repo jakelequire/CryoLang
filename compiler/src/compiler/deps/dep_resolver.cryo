@@ -21,14 +21,24 @@
 ///! dep it visits.  Cycles are broken by tracking visited project
 ///! roots; a duplicate is a no-op rather than an error.
 
-namespace Compiler::Deps::DepResolver;
+namespace compiler::deps::dep_resolver;
 
-import Utils::Logger;
+import utils::logger;
+import utils::logger::{ cdebug };
 import std::fs::metadata;
+import std::fs::metadata::{ metadata };
 import std::fs::path;
+import std::fs::path::{ Path };
 import std::fmt;
-import Compiler::ProjectConfig;
-import Compiler::Deps::{ Cache, Git, Semver, Lockfile };
+import compiler::project_config;
+import compiler::project_config::{ Dependency, DepKind, GitRefKind, ProjectConfig };
+import compiler::deps::{ cache, git, semver, lockfile };
+import std::collections::str;
+import compiler::deps::cache::{ Cache };
+import compiler::deps::git::{ Git };
+import compiler::deps::lockfile::{ LockedDep, LockedVendor, Lockfile };
+import compiler::deps::semver::{ Constraint };
+import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
 
 
 /// What the resolver is asked to do.
@@ -88,11 +98,13 @@ type struct DepKey {
     /// "path:<abs>" or "git:<sanitized-url>@<sha>".
     val: string;
 
-    static for_path(abs_path: string) -> DepKey {
-        return DepKey { val: format("path:%s", abs_path) };
+    static for_path(abs_path_text: string) -> DepKey {
+        const abs_path: string = abs_path_text;
+        return DepKey { val: fmt::format("path:%s", abs_path) };
     }
-    static for_git(url: string, sha: string) -> DepKey {
-        return DepKey { val: format("git:%s@%s", Cache::sanitize_url(url), sha) };
+    static for_git(url_text: string, sha_text: string) -> DepKey {
+        const sha: string = sha_text;
+        return DepKey { val: fmt::format("git:%s@%s", Cache::sanitize_url(url_text), sha) };
     }
 }
 
@@ -110,7 +122,7 @@ type struct DepResolver {
     /// it.
     static resolve(top_config: ProjectConfig*,
                      mode: ResolveMode,
-                     lock_path: string) -> ResolveOutcome {
+                     lock_path_text: string) -> ResolveOutcome {
         mut outcome: ResolveOutcome = ResolveOutcome::empty();
         mut visited: string[] = [];
 
@@ -119,7 +131,7 @@ type struct DepResolver {
         // ignores it entirely.
         mut existing: Lockfile = match (mode) {
             ResolveMode::Update => { Lockfile::empty() }
-            _ => { Lockfile::read(lock_path) }
+            _ => { Lockfile::read(lock_path_text) }
         };
         mut new_lock: Lockfile = Lockfile::empty();
 
@@ -137,7 +149,7 @@ type struct DepResolver {
             // over verbatim instead of clobbering it with our empty one.  The
             // `string` fields are non-owning pointers into leaked buffers, so a
             // field-wise copy is safe and `disk` drops without a double free.
-            mut disk: Lockfile = Lockfile::read(lock_path);
+            mut disk: Lockfile = Lockfile::read(lock_path_text);
             for (mut vi: i64 = 0; vi < disk.vendor.length; vi++) {
                 new_lock.vendor.push(LockedVendor {
                     name:        disk.vendor[vi].name,
@@ -145,7 +157,7 @@ type struct DepResolver {
                     binding_sha: disk.vendor[vi].binding_sha,
                 });
             }
-            Lockfile::write(lock_path, &new_lock);
+            Lockfile::write(lock_path_text, &new_lock);
         }
 
         // Each arm consumes BOTH lockfiles: one is moved into the outcome,
@@ -181,7 +193,7 @@ type struct DepResolver {
                        new_lock: Lockfile*,
                        visited: string[]*,
                        outcome: ResolveOutcome*) -> void {
-        for (mut i: int = 0; i < cfg.dependencies.length; i++) {
+        for (mut i: i64 = 0; i < cfg.dependencies.length; i++) {
             const dep: Dependency = cfg.dependencies[i];
 
             match (dep.kind) {
@@ -212,7 +224,7 @@ type struct DepResolver {
                               visited: string[]*,
                               outcome: ResolveOutcome*) -> void {
         const dep_root: string = DepResolver::join_path(cfg.project_root, dep.path);
-        if (!metadata::exists(Path::from(format("%s/cryoconfig", dep_root)))) {
+        if (!metadata::exists(Path::from(fmt::format("%s/cryoconfig", dep_root)))) {
             cdebug("[deps] path dep '%s': no cryoconfig at %s\n", dep.name, dep_root);
             return;
         }
@@ -222,7 +234,7 @@ type struct DepResolver {
         visited.push(key.val);
 
         const dep_cfg: ProjectConfig = ProjectConfig::parse(
-            format("%s/cryoconfig", dep_root));
+            fmt::format("%s/cryoconfig", dep_root));
         if (dep_cfg.error_count > 0) {
             fmt::eprintln(f"error: dependency '{dep.name}' has invalid cryoconfig at {dep_root}");
             outcome.failed = true;
@@ -310,12 +322,12 @@ type struct DepResolver {
 
         const co_dir: string = Git::checkout_path(dep.git_url, sha);
         const dep_root: string = if (dep.subdir.length() > 0) {
-            format("%s/%s", co_dir, dep.subdir)
+            fmt::format("%s/%s", co_dir, dep.subdir)
         } else {
             co_dir
         };
 
-        const dep_cryo: string = format("%s/cryoconfig", dep_root);
+        const dep_cryo: string = fmt::format("%s/cryoconfig", dep_root);
         if (!metadata::exists(Path::from(dep_cryo))) {
             fmt::eprintln(f"error: dependency '{dep.name}' has no cryoconfig at {dep_root}");
             outcome.failed = true;
@@ -401,18 +413,19 @@ type struct DepResolver {
     /// loader prefixes consumer_root, absolute for git deps).
     static harvest_roots(dep_cfg: ProjectConfig*,
                            dep_root: string,
-                           path_for_loader: string,
+                           path_for_loader_text: string,
                            dep_name: string,
                            outcome: ResolveOutcome*) -> void {
+        const path_for_loader: string = path_for_loader_text;
         if (dep_cfg.lib.is_present() && dep_cfg.lib.source_dir.length() > 0) {
             outcome.roots.push(DepRoot {
-                path: format("%s/%s", path_for_loader, dep_cfg.lib.source_dir),
+                path: fmt::format("%s/%s", path_for_loader, dep_cfg.lib.source_dir),
                 name: dep_name,
             });
         }
-        for (mut j: int = 0; j < dep_cfg.source_paths.length; j++) {
+        for (mut j: i64 = 0; j < dep_cfg.source_paths.length; j++) {
             outcome.roots.push(DepRoot {
-                path: format("%s/%s", path_for_loader, dep_cfg.source_paths[j]),
+                path: fmt::format("%s/%s", path_for_loader, dep_cfg.source_paths[j]),
                 name: dep_name,
             });
         }
@@ -421,28 +434,31 @@ type struct DepResolver {
     /// Same as `harvest_roots` but always uses absolute paths; git deps
     /// live outside the consumer's project tree.
     static harvest_roots_abs(dep_cfg: ProjectConfig*,
-                               dep_root: string,
+                               dep_root_text: string,
                                dep_name: string,
                                outcome: ResolveOutcome*) -> void {
+        const dep_root: string = dep_root_text;
         if (dep_cfg.lib.is_present() && dep_cfg.lib.source_dir.length() > 0) {
             outcome.roots.push(DepRoot {
-                path: format("%s/%s", dep_root, dep_cfg.lib.source_dir),
+                path: fmt::format("%s/%s", dep_root, dep_cfg.lib.source_dir),
                 name: dep_name,
             });
         }
-        for (mut j: int = 0; j < dep_cfg.source_paths.length; j++) {
+        for (mut j: i64 = 0; j < dep_cfg.source_paths.length; j++) {
             outcome.roots.push(DepRoot {
-                path: format("%s/%s", dep_root, dep_cfg.source_paths[j]),
+                path: fmt::format("%s/%s", dep_root, dep_cfg.source_paths[j]),
                 name: dep_name,
             });
         }
     }
 
     /// `<base>/<rel>` with a defensive shortcut when `base` is "." or empty.
-    static join_path(base: string, rel: string) -> string {
+    static join_path(base_text: string, rel_text: string) -> string {
+        const base: string = base_text;
+        const rel: string = rel_text;
         if (base.length() == 0 || base.eq(".")) {
             return rel;
         }
-        return format("%s/%s", base, rel);
+        return fmt::format("%s/%s", base, rel);
     }
 }

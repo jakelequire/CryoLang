@@ -18,36 +18,48 @@
 /// "no alias" path is just a mapper constructed with an empty alias, in
 /// which records/enums collapse to the opaque `void*` fallback.
 
-namespace Compiler::Bindgen::TypeMap;
+namespace compiler::bindgen::type_map;
 
-import Compiler::Bindgen::Clang;
-import Compiler::Bindgen::Clang::{ CXType, CXCursor, CXString };
-import Compiler::CompilationContext;
-import Compiler::Resolver::{ SymbolStr, InternTable };
-import Compiler::Diag::{ SourceSpan };
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration };
+import compiler::bindgen::clang;
+import compiler::bindgen::clang::{ CXType, CXCursor, CXString };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext, CRecordRef };
+import compiler::module_graph::{ ModulePath };
+import compiler::resolver::{ symbol_str, intern_table };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, Res, ResSlot };
+import compiler::diag::{ source_span };
+import compiler::ast;
+import compiler::ast::{
+    ArrayAnnotation, declaration, FunctionAnnotation, NamedAnnotation, node,
+    PointerAnnotation, PrimitiveAnnotation, TypeAnnotation
+};
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+import std::ffi::libc;
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::symbol_str::{ SymbolStr };
 
 /// CXTypeKind -> Cryo primitive name.  Returns "" for non-scalar kinds.  Pure
 /// (no ctx/alias), so it stays a free helper of the mapper.
 function scalar_name(k: i32) -> string {
-    if (k == Clang::TK_Void)       { return "void"; }
-    if (k == Clang::TK_Bool)       { return "boolean"; }
-    if (k == Clang::TK_Char_U)     { return "u8"; }
-    if (k == Clang::TK_UChar)      { return "u8"; }
-    if (k == Clang::TK_Char_S)     { return "i8"; }
-    if (k == Clang::TK_SChar)      { return "i8"; }
-    if (k == Clang::TK_UShort)     { return "u16"; }
-    if (k == Clang::TK_Short)      { return "i16"; }
-    if (k == Clang::TK_UInt)       { return "u32"; }
-    if (k == Clang::TK_Int)        { return "i32"; }
+    if (k == clang::TK_Void)       { return "void"; }
+    if (k == clang::TK_Bool)       { return "boolean"; }
+    if (k == clang::TK_Char_U)     { return "u8"; }
+    if (k == clang::TK_UChar)      { return "u8"; }
+    if (k == clang::TK_Char_S)     { return "i8"; }
+    if (k == clang::TK_SChar)      { return "i8"; }
+    if (k == clang::TK_UShort)     { return "u16"; }
+    if (k == clang::TK_Short)      { return "i16"; }
+    if (k == clang::TK_UInt)       { return "u32"; }
+    if (k == clang::TK_Int)        { return "i32"; }
     // TK_Long / TK_ULong are handled in `map()` via clang_Type_getSizeOf:
     // their width is target-dependent (LP64 vs LLP64), not a fixed name.
-    if (k == Clang::TK_ULongLong)  { return "u64"; }
-    if (k == Clang::TK_LongLong)   { return "i64"; }
-    if (k == Clang::TK_Float)      { return "f32"; }
-    if (k == Clang::TK_Double)     { return "f64"; }
-    if (k == Clang::TK_LongDouble) { return "f64"; }
+    if (k == clang::TK_ULongLong)  { return "u64"; }
+    if (k == clang::TK_LongLong)   { return "i64"; }
+    if (k == clang::TK_Float)      { return "f32"; }
+    if (k == clang::TK_Double)     { return "f64"; }
+    if (k == clang::TK_LongDouble) { return "f64"; }
     return "";
 }
 
@@ -55,11 +67,11 @@ function scalar_name(k: i32) -> string {
 /// import's alias namespace so neither has to be threaded through the recursion.
 type struct CTypeMapper {
     ctx:   CompilationContext*;
-    /// The import's extern-module alias namespace (empty for the
-    /// functions-only path, in which records collapse to `void*`).
-    alias: SymbolStr;
+    /// The import's extern-module alias's module (`<mod>::alias`; none for
+    /// the functions-only path, in which records collapse to `void*`).
+    alias: ModulePath;
 
-    static new(ctx: CompilationContext*, alias: SymbolStr) -> CTypeMapper {
+    static new(ctx: CompilationContext*, alias: ModulePath) -> CTypeMapper {
         return CTypeMapper { ctx: ctx, alias: alias };
     }
 
@@ -67,7 +79,7 @@ type struct CTypeMapper {
     prim(&this, name: string) -> TypeAnnotation* {
         const sym: SymbolStr = this.ctx.intern_table.intern(name);
         const p: PrimitiveAnnotation* = new PrimitiveAnnotation { name: sym, span: SourceSpan::none() };
-        const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        const ann: TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
         *ann = TypeAnnotation::Primitive(p);
         return ann;
     }
@@ -76,19 +88,29 @@ type struct CTypeMapper {
     /// marks `const T*` (the pointee is const - frontend-only flag).
     ptr(&this, inner: TypeAnnotation*, is_const: boolean) -> TypeAnnotation* {
         const p: PointerAnnotation* = new PointerAnnotation { inner: inner, is_const: is_const, span: SourceSpan::none() };
-        const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        const ann: TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
         *ann = TypeAnnotation::Pointer(p);
         return ann;
     }
 
-    /// Heap-allocate a NamedAnnotation (a reference to an emitted record/enum).
-    /// `qualified` is the alias-qualified name (e.g. `probe::Point`).
-    named(&this, qualified: SymbolStr) -> TypeAnnotation* {
+    /// Heap-allocate a NamedAnnotation naming the record or enum this
+    /// import emits for the C tag `tag`, spelled `<alias>::<tag>` - the name
+    /// every index holds it under, since it is declared in the alias's module.
+    ///
+    /// The reference is built before the name layer has declared anything, so
+    /// it cannot carry the declaration's id yet, and the name layer cannot
+    /// answer it by looking the spelling up (it has no span, so no writing
+    /// module).  It is listed on the context instead: the importer pins it to
+    /// the declaration it emitted for `tag`, and the name layer answers it
+    /// with that declaration's id once it is declared.
+    named(&this, tag: SymbolStr) -> TypeAnnotation* {
         const n: NamedAnnotation* = new NamedAnnotation {
-            name: qualified, span: SourceSpan::none(), pre_resolved: TypeRef::invalid()
+            name: this.qualify_under_alias(tag), span: SourceSpan::none(), pre_resolved: TypeRef::invalid(),
+            res: ResSlot::Pending,
         };
-        const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        const ann: TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
         *ann = TypeAnnotation::Named(n);
+        this.ctx.c_refs.push(CRecordRef { ann: n, alias: this.alias, tag: tag, decl: null });
         return ann;
     }
 
@@ -96,7 +118,7 @@ type struct CTypeMapper {
     array(&this, element: TypeAnnotation*, size: i64) -> TypeAnnotation* {
         const arr: ArrayAnnotation* = new ArrayAnnotation { element: element, size: size,
                                                             size_expr: null, span: SourceSpan::none() };
-        const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        const ann: TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
         *ann = TypeAnnotation::Array(arr);
         return ann;
     }
@@ -107,7 +129,7 @@ type struct CTypeMapper {
         const f: FunctionAnnotation* = new FunctionAnnotation {
             parameters: params, return_type: ret, span: SourceSpan::none()
         };
-        const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        const ann: TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
         *ann = TypeAnnotation::Function(f);
         return ann;
     }
@@ -137,27 +159,25 @@ type struct CTypeMapper {
     /// The bare tag name of a record/enum CXType (e.g. `Point` for
     /// `struct Point`), interned into `ctx`.  Empty SymbolStr for anonymous types.
     tag_name(&this, t: CXType) -> SymbolStr {
-        const decl: CXCursor = Clang::clang_getTypeDeclaration(t);
-        const s: CXString = Clang::clang_getCursorSpelling(decl);
-        const cstr: u8* = Clang::clang_getCString(s);
+        const decl: CXCursor = clang::clang_getTypeDeclaration(t);
+        const s: CXString = clang::clang_getCursorSpelling(decl);
+        const cstr: u8* = clang::clang_getCString(s);
         if (cstr == null || (cstr as string).length() == 0) {
-            Clang::clang_disposeString(s);
+            clang::clang_disposeString(s);
             return SymbolStr::empty();
         }
         const sym: SymbolStr = this.ctx.intern_table.intern(cstr as string);
-        Clang::clang_disposeString(s);
+        clang::clang_disposeString(s);
         return sym;
     }
 
     /// Qualify a record/enum tag name under the import's alias namespace.
     /// Empty alias => no qualification (bare name).
     qualify_under_alias(&this, tag: SymbolStr) -> SymbolStr {
-        if (this.alias.is_empty()) {
+        if (!this.alias.is_valid()) {
             return tag;
         }
-        const ns: string = this.ctx.intern_table.resolve(this.alias);
-        const bare: string = this.ctx.intern_table.resolve(tag);
-        return this.ctx.intern_table.intern(ns + "::" + bare);
+        return this.alias.qualified(tag, this.ctx.intern_table);
     }
 
     /// True when `t` is a C `va_list`.  Checks the declared spelling (the
@@ -166,19 +186,19 @@ type struct CTypeMapper {
     /// catches va_list however a platform's headers spell it.
     static type_is_va_list(t: CXType) -> boolean {
         if (CTypeMapper::type_spelling_contains(t, "va_list")) { return true; }
-        const canon: CXType = Clang::clang_getCanonicalType(t);
+        const canon: CXType = clang::clang_getCanonicalType(t);
         return CTypeMapper::type_spelling_contains(canon, "__va_list_tag");
     }
 
     /// True when the libclang spelling of `t` contains `needle`.
     static type_spelling_contains(t: CXType, needle: string) -> boolean {
-        const s: CXString = Clang::clang_getTypeSpelling(t);
-        const cstr: u8* = Clang::clang_getCString(s);
+        const s: CXString = clang::clang_getTypeSpelling(t);
+        const cstr: u8* = clang::clang_getCString(s);
         mut found: boolean = false;
         if (cstr != null) {
             found = (cstr as string).contains(needle);
         }
-        Clang::clang_disposeString(s);
+        clang::clang_disposeString(s);
         return found;
     }
 
@@ -191,30 +211,30 @@ type struct CTypeMapper {
         if (CTypeMapper::type_is_va_list(t)) {
             return this.prim("va_list");
         }
-        const c: CXType = Clang::clang_getCanonicalType(t);
+        const c: CXType = clang::clang_getCanonicalType(t);
         const k: i32 = c.kind;
 
-        if (k == Clang::TK_Pointer) {
-            const pointee: CXType = Clang::clang_getPointeeType(c);
-            const pc: CXType = Clang::clang_getCanonicalType(pointee);
+        if (k == clang::TK_Pointer) {
+            const pointee: CXType = clang::clang_getPointeeType(c);
+            const pc: CXType = clang::clang_getCanonicalType(pointee);
             // Function-pointer pointee -> a Cryo `(Args) -> Ret` type (already a
             // pointer-shaped value in Cryo, so no extra Pointer wrapper).
-            if (pc.kind == Clang::TK_FunctionProto || pc.kind == Clang::TK_FunctionNoProto) {
+            if (pc.kind == clang::TK_FunctionProto || pc.kind == clang::TK_FunctionNoProto) {
                 mut params: TypeAnnotation*[] = [];
-                const nargs: i32 = Clang::clang_getNumArgTypes(pc);
+                const nargs: i32 = clang::clang_getNumArgTypes(pc);
                 for (mut i: i32 = 0; i < nargs; i++) {
-                    params.push(this.map(Clang::clang_getArgType(pc, i as u32)));
+                    params.push(this.map(clang::clang_getArgType(pc, i as u32)));
                 }
-                const ret: TypeAnnotation* = this.map(Clang::clang_getResultType(pc));
+                const ret: TypeAnnotation* = this.map(clang::clang_getResultType(pc));
                 return this.fnptr(params, ret);
             }
-            const is_const: boolean = Clang::clang_isConstQualifiedType(pointee) != 0;
+            const is_const: boolean = clang::clang_isConstQualifiedType(pointee) != 0;
             // A pointer to a system-header record (e.g. `FILE` == `struct _iobuf`
             // on mingw) -> opaque `void*`.  That record is filtered out of the
             // bindings, so a named `_iobuf*` reference would dangle (E0203);
             // `void*` is also the usable shape for an opaque C handle.
-            if (pc.kind == Clang::TK_Record) {
-                const pdecl: CXCursor = Clang::clang_getTypeDeclaration(pc);
+            if (pc.kind == clang::TK_Record) {
+                const pdecl: CXCursor = clang::clang_getTypeDeclaration(pc);
                 // A pointer to a record that won't be emitted top-level - one in
                 // a system header (`FILE`) or one nested inside another record
                 // (sqlite3's `sqlite3_index_constraint_usage`) - would name a
@@ -231,18 +251,18 @@ type struct CTypeMapper {
         // A C++ reference (`T&` / `T&&`) is a pointer at the ABI level, so it maps
         // to a Cryo pointer to the referent (mirrors the `this`-as-pointer
         // receiver).  `const T&` lowers as `T*` like any const pointer.
-        if (k == Clang::TK_LValueReference || k == Clang::TK_RValueReference) {
-            const referent: CXType = Clang::clang_getPointeeType(c);
-            const is_const_ref: boolean = Clang::clang_isConstQualifiedType(referent) != 0;
+        if (k == clang::TK_LValueReference || k == clang::TK_RValueReference) {
+            const referent: CXType = clang::clang_getPointeeType(c);
+            const is_const_ref: boolean = clang::clang_isConstQualifiedType(referent) != 0;
             return this.ptr(this.map(referent), is_const_ref);
         }
 
-        if (k == Clang::TK_ConstantArray) {
-            const elem: TypeAnnotation* = this.map(Clang::clang_getArrayElementType(c));
-            return this.array(elem, Clang::clang_getArraySize(c));
+        if (k == clang::TK_ConstantArray) {
+            const elem: TypeAnnotation* = this.map(clang::clang_getArrayElementType(c));
+            return this.array(elem, clang::clang_getArraySize(c));
         }
 
-        if (k == Clang::TK_Record) {
+        if (k == clang::TK_Record) {
             // Anonymous record (a nameless `struct {...}` used as a field type):
             // a layout-faithful opaque blob, not `void*`, so the enclosing
             // struct's size/alignment stay correct.  Detected via the type's
@@ -251,8 +271,8 @@ type struct CTypeMapper {
             // an emptiness test would miss it.  An incomplete record (size
             // unknown) keeps the opaque-pointer fallback.
             if (c.is_anonymous_record()) {
-                const sz: i64 = Clang::clang_Type_getSizeOf(c);
-                const al: i64 = Clang::clang_Type_getAlignOf(c);
+                const sz: i64 = clang::clang_Type_getSizeOf(c);
+                const al: i64 = clang::clang_Type_getAlignOf(c);
                 if (sz > 0) { return this.aligned_blob(sz, al); }
                 return this.ptr(this.prim("void"), false);
             }
@@ -261,25 +281,25 @@ type struct CTypeMapper {
             // it as opaque: a layout-faithful blob when sized (keeps an enclosing
             // struct's size right), else an opaque pointer.  (The common
             // pointer-to-system-record case is handled as `void*` above.)
-            const rdecl: CXCursor = Clang::clang_getTypeDeclaration(c);
+            const rdecl: CXCursor = clang::clang_getTypeDeclaration(c);
             if (rdecl.is_in_system_header() || rdecl.is_nested_in_record()) {
-                const sz: i64 = Clang::clang_Type_getSizeOf(c);
-                const al: i64 = Clang::clang_Type_getAlignOf(c);
+                const sz: i64 = clang::clang_Type_getSizeOf(c);
+                const al: i64 = clang::clang_Type_getAlignOf(c);
                 if (sz > 0) { return this.aligned_blob(sz, al); }
                 return this.ptr(this.prim("void"), false);
             }
             // Reference to an emitted record: name it, qualified under the alias.
             const tag: SymbolStr = this.tag_name(c);
-            if (!tag.is_empty() && !this.alias.is_empty()) {
-                return this.named(this.qualify_under_alias(tag));
+            if (!tag.is_empty() && this.alias.is_valid()) {
+                return this.named(tag);
             }
             return this.ptr(this.prim("void"), false);
         }
 
-        if (k == Clang::TK_Enum) {
+        if (k == clang::TK_Enum) {
             const tag: SymbolStr = this.tag_name(c);
-            if (!tag.is_empty() && !this.alias.is_empty()) {
-                return this.named(this.qualify_under_alias(tag));
+            if (!tag.is_empty() && this.alias.is_valid()) {
+                return this.named(tag);
             }
             // Enums with no emittable name still round-trip as their integer width.
             return this.prim("i32");
@@ -290,12 +310,12 @@ type struct CTypeMapper {
         // canonical type's actual size in this TU's target instead of
         // assuming LP64 - a hardcoded i64/u64 gives every bare-`long` C API
         // wrong-width fields and params on Windows.
-        if (k == Clang::TK_Long || k == Clang::TK_ULong) {
-            const long_size: i64 = Clang::clang_Type_getSizeOf(c);
+        if (k == clang::TK_Long || k == clang::TK_ULong) {
+            const long_size: i64 = clang::clang_Type_getSizeOf(c);
             if (long_size == 4) {
-                return this.prim(if (k == Clang::TK_Long) { "i32" } else { "u32" });
+                return this.prim(if (k == clang::TK_Long) { "i32" } else { "u32" });
             }
-            return this.prim(if (k == Clang::TK_Long) { "i64" } else { "u64" });
+            return this.prim(if (k == clang::TK_Long) { "i64" } else { "u64" });
         }
 
         const name: string = scalar_name(k);

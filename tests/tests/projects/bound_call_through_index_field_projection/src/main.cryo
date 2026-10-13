@@ -1,0 +1,82 @@
+namespace BoundCallThroughIndexFieldProjection::Main;
+
+import std::core::cmp::{ Eq, Ord, Ordering };
+import std::core::hash::{ Hash, Hasher };
+import std::core::iter::{ Iterator };
+import std::core::option::{ Option };
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+
+/// `Q` has an inherent `equals` and `compare` that answer wrongly, beside the
+/// `Eq` and `Ord` a generic body's bound names.  Every call below reaches the
+/// standard library's generic code, whose calls are written on a bounded
+/// parameter and so mean the bound's method, however the receiver is
+/// reached: `this.ptr[i]` (`Array::index_of`, `where T: Eq` on the method),
+/// `ptr[j - 1]` (`sort`'s helpers, `where T: Ord`), `node.key`
+/// (`HashMap::get`, `where K: Hash + Eq`), and `value` typed `This::Item`
+/// (`Iterator::min`/`max`, `where This::Item: Ord`).
+type struct Q { v: i32; }
+implement struct Q {
+    equals(&this, o: &Q) -> boolean { return false; }
+    compare(&this, o: &Q) -> Ordering { return Ordering::Equal; }
+}
+implement trait Eq for struct Q {
+    equals(&this, o: &Q) -> boolean { return this.v == o.v; }
+}
+implement trait Ord for struct Q {
+    compare(&this, o: &Q) -> Ordering {
+        if (this.v < o.v) { return Ordering::Less; }
+        if (this.v > o.v) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+}
+implement trait Hash for struct Q {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        hasher.write_u8(this.v as u8);
+    }
+}
+
+type struct Qs { i: i32; }
+implement trait Iterator<Q> for struct Qs {
+    next(mut &this) -> Option<Q> {
+        if (this.i >= 4) { return Option::None; }
+        this.i = this.i + 1;
+        return Option::Some(Q { v: (this.i * 7) % 5 });
+    }
+}
+
+function main() -> i32 {
+    mut a: Array<Q> = Array::<Q>::new();
+    a.push(Q { v: 3 });
+    a.push(Q { v: 1 });
+    a.push(Q { v: 2 });
+    const two: Q = Q { v: 2 };
+    match (a.index_of(&two)) {
+        Option::Some(i) => { if (i != 2) { return 1; } }
+        Option::None => { return 2; }
+    }
+    a.sort();
+    for (mut k: u64 = 0; k < 3; k++) {
+        if (a.get_ref(k).unwrap().v != (k as i32) + 1) { return 3; }
+    }
+
+    mut m: HashMap<Q, i32> = HashMap::<Q, i32>::new();
+    m.insert(Q { v: 5 }, 50);
+    match (m.get(&Q { v: 5 })) {
+        Option::Some(x) => { if (x != 50) { return 4; } }
+        Option::None => { return 5; }
+    }
+
+    // The elements are 2, 4, 1, 3.
+    mut lo: Qs = Qs { i: 0 };
+    match (lo.min()) {
+        Option::Some(q) => { if (q.v != 1) { return 6; } }
+        Option::None => { return 7; }
+    }
+    mut hi: Qs = Qs { i: 0 };
+    match (hi.max()) {
+        Option::Some(q) => { if (q.v != 4) { return 8; } }
+        Option::None => { return 9; }
+    }
+    return 0;
+}

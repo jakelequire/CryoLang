@@ -3,18 +3,30 @@
 ///! Base class providing the token cursor, source span construction, error
 ///! reporting, and recovery infrastructure shared by all parser layers.
 
-namespace Compiler::Parser::ParserBase;
+namespace compiler::parser::parser_base;
 
-import Compiler::Lex;
-import Compiler::Diag;
-import Compiler::Diag::{ SourceSpan, Diagnostic, Suggestion };
-import Compiler::AST::{ Statement, Expression };
-import Compiler::CompilationContext;
-import Compiler::Resolver::SymbolStr;
-import Utils::Logger;
+import compiler::lex;
+import compiler::lex::{ Token, TokenType };
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
+import compiler::ast::{ statement, expression };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::resolver::symbol_str;
+import compiler::resolver::symbol_str::{ SymbolStr };
+import utils::logger;
+import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::collections::string;
+import std::collections::string::{ String };
 import std::collections::str;
+import std::collections::str::{ Str };
 import std::fmt::float;
+import std::fmt;
+import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::statement::{ BlockStmtNode };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::suggestion::{ Suggestion };
 
 
 type class ParserBase {
@@ -36,7 +48,7 @@ public:
     }
 
     tokens:        Token[];
-    pos:           int;
+    pos:           i64;
     source_file:   string;
     ctx:           CompilationContext*;
     panic_mode:    boolean;
@@ -45,31 +57,6 @@ public:
     brace_depth:   int;
     paren_depth:   int;
     bracket_depth: int;
-    // Names bound as parameters or locals in the function being parsed, used
-    // to settle `ident <` in expression position.  `f(a < b, c > (d))` is a
-    // generic call and a pair of comparisons under the same grammar, and the
-    // token scan cannot tell them apart; knowing `a` names a local settles it,
-    // because a local is not a generic function or type.
-    //
-    // Reset per parameter list, so a name is only ever consulted inside the
-    // function that bound it.  Deliberately flat rather than a scope stack: a
-    // name declared in an inner block stays listed for the rest of the
-    // function, which only ever biases toward the comparison reading, and
-    // calling a generic whose name a local in the same function shadows is
-    // pathological either way.
-    local_names:   SymbolStr[];
-    // Module-level names collected up front by `scan_module_names`, which
-    // settles the same `ident <` question for names that are not locals.
-    // Gathered by a token pre-scan rather than as declarations are parsed
-    // because the parse is single-pass: a global or generic declared further
-    // down the file must still be known to a function above it.
-    //
-    // `global_value_names` bind values, so their `<` is a comparison;
-    // `generic_decl_names` are declared with type parameters, so theirs opens
-    // type arguments. A name in neither - anything imported, most obviously -
-    // falls through to the token scan.
-    global_value_names: SymbolStr[];
-    generic_decl_names: SymbolStr[];
     // Paren-less `if`/`while`/`for`/`match` conditions forbid a bare struct
     // literal (`if Foo { .. }` is the loop body, not a struct value).  When a
     // condition is parsed without surrounding `()`, this records the bracketing
@@ -165,9 +152,6 @@ public:
         this.brace_depth  = 0;
         this.paren_depth  = 0;
         this.bracket_depth = 0;
-        this.local_names  = [];
-        this.global_value_names = [];
-        this.generic_decl_names = [];
         this.no_struct_lit_depth = -1;
         this.unary_depth  = 0;
         this.expr_depth   = 0;
@@ -194,8 +178,8 @@ public:
     }
 
     /// Peek at a token at offset from current position.
-    peek_at(offset: int) -> Token {
-        const idx: int = this.pos + offset;
+    peek_at(offset: i64) -> Token {
+        const idx: i64 = this.pos + offset;
         if (idx < 0 || idx >= this.tokens.length) {
             return Token::eof(0, 0);
         }
@@ -259,29 +243,9 @@ public:
             && (this.paren_depth + this.bracket_depth) == this.no_struct_lit_depth;
     }
 
-    /// Check if the current token is any of the given kinds.
-    check_any(kinds: TokenType[]) -> boolean {
-        const cur: TokenType = this.current().kind;
-        for (mut i: int = 0; i < kinds.length; i++) {
-            if (cur == kinds[i]) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     /// Consume and return true if the current token matches the given kind.
     match_tok(kind: TokenType) -> boolean {
         if (this.check(kind)) {
-            this.advance();
-            return true;
-        }
-        return false;
-    }
-
-    /// Consume and return true if the current token matches any of the given kinds.
-    match_any(kinds: TokenType[]) -> boolean {
-        if (this.check_any(kinds)) {
             this.advance();
             return true;
         }
@@ -338,7 +302,7 @@ public:
     /// dominate parser-error UX.
     error_expected_with_insert(kind: TokenType, expected: string) -> void {
         const tok: Token = this.current();
-        const message: string = format("expected %s, found '%s'", expected, tok.lexeme);
+        const message: string = fmt::format("expected %s, found '%s'", expected, tok.lexeme);
         const literal: string = ParserBase::literal_for_token(kind);
         if (literal == "") {
             // No safe auto-insertion; fall back to the plain error.
@@ -354,7 +318,7 @@ public:
         mut anchor_line: u32 = 0;
         mut anchor_col:  u32 = 0;
         mut found_prev:  boolean = false;
-        mut idx: int = this.pos - 1;
+        mut idx: i64 = this.pos - 1;
         while (idx >= 0 && idx < this.tokens.length) {
             const k: TokenType = this.tokens[idx].kind;
             if (k == TokenType::Comment
@@ -385,7 +349,7 @@ public:
             anchor_line, anchor_col);
         diag = diag.suggest(Suggestion::machine_applicable(
             insert_span, literal,
-            format("insert `%s` here", literal)));
+            fmt::format("insert `%s` here", literal)));
         this.ctx.emit_diagnostic(diag);
     }
 
@@ -420,7 +384,7 @@ public:
     /// `namespace X;` followed by `///` doc comments on later lines
     /// gets a span ending at the last doc comment instead of `;`.
     span_from(start: Token) -> SourceSpan {
-        mut idx: int = this.pos - 1;
+        mut idx: i64 = this.pos - 1;
         while (idx >= 0 && idx < this.tokens.length) {
             const k: TokenType = this.tokens[idx].kind;
             if (k == TokenType::Comment
@@ -451,7 +415,8 @@ public:
     /// already rejected those.  Mirrors the codegen-side parse_int_lexeme
     /// so that enum discriminants, pattern integer literals, and codegen
     /// agree on the value of every numeric constant.
-    static parse_numeric_lexeme_i64(s: string) -> i64 {
+    static parse_numeric_lexeme_i64(s_text: string) -> i64 {
+        const s: string = s_text;
         if (s == null) { return 0; }
         const len: i64 = s.length() as i64;
         if (len == 0) { return 0; }
@@ -511,7 +476,8 @@ public:
     /// cares (the fixed-array-size path) report a precise diagnostic instead
     /// of silently using the saturated value. Honours the `0x`/`0o`/`0b`
     /// prefixes, `_` separators, and a leading sign, mirroring the parser.
-    static numeric_lexeme_overflows_u64(s: string) -> boolean {
+    static numeric_lexeme_overflows_u64(s_text: string) -> boolean {
+        const s: string = s_text;
         if (s == null) { return false; }
         const len: i64 = s.length() as i64;
         if (len == 0) { return false; }
@@ -549,7 +515,8 @@ public:
     /// lexeme.  The lexer keeps the quotes in the lexeme (`"foo"`); this
     /// returns just the content (`foo`).  Returns the input unchanged if
     /// it doesn't start and end with `"`.
-    static unquote_string_lexeme(s: string) -> string {
+    static unquote_string_lexeme(s_text: string) -> string {
+        const s: string = s_text;
         if (s == null) { return ""; }
         const len: i64 = s.length() as i64;
         if (len < 2 || s[0] != '"' || s[len - 1] != '"') {
@@ -563,14 +530,16 @@ public:
     /// Parse a numeric-constant token's lexeme as f64.  Defers to
     /// libc `sscanf` for full C99 float syntax (mantissa, exponent, hex
     /// floats not supported here; the lexer doesn't emit them).
-    static parse_numeric_lexeme_f64(s: string) -> f64 {
+    static parse_numeric_lexeme_f64(s_text: string) -> f64 {
+        const s: string = s_text;
         return float::parse_f64(s).unwrap_or(0.0);
     }
 
     /// True if `s` looks like a float literal (contains `.`, `e`, or `E`).
     /// Used by pattern parsing to pick between LiteralInt and LiteralFloat
     /// when the token kind alone (NumericConstant) doesn't distinguish them.
-    static is_float_lexeme(s: string) -> boolean {
+    static is_float_lexeme(s_text: string) -> boolean {
+        const s: string = s_text;
         if (s == null) { return false; }
         const llen: u32 = s.length() as u32;
         for (mut i: u32 = 0; i < llen; i++) {
@@ -611,13 +580,6 @@ public:
         this.ctx.emit_error_at(code, message, this.current_span());
     }
 
-    /// Report an error at a specific span.
-    report_error_at(code: ErrorCode, message: string, span: SourceSpan) -> void {
-        this.panic_mode = true;
-        this.error_count += 1;
-        this.ctx.emit_error_at(code, message, span);
-    }
-
     /// Report a construct that parses cleanly but is not allowed here.
     ///
     /// Unlike `report_error*`, this leaves `panic_mode` clear: the token stream
@@ -631,28 +593,22 @@ public:
     /// Report "expected X, found Y" error.
     error_expected(expected: string) -> void {
         const tok: Token = this.current();
-        const message: string = format("expected %s, found '%s'", expected, tok.lexeme);
+        const message: string = fmt::format("expected %s, found '%s'", expected, tok.lexeme);
         this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, message);
     }
 
     /// Report "unexpected token X" error.
     error_unexpected() -> void {
         const tok: Token = this.current();
-        const message: string = format("unexpected token '%s'", tok.lexeme);
+        const message: string = fmt::format("unexpected token '%s'", tok.lexeme);
         this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN, message);
-    }
-
-    /// Report "unexpected EOF" error.
-    error_eof(context: string) -> void {
-        const message: string = format("unexpected end of file while parsing %s", context);
-        this.report_error(ErrorCode::E0112_UNEXPECTED_EOF, message);
     }
 
 
     /// Consume tokens until we find a synchronization point.
     /// Clears panic_mode when a recovery point is reached.
     synchronize() -> void {
-        LOG_DEBUG(LogComponent::Parser, "[Parser] synchronize() entry at pos %d", this.pos);
+        LOG_DEBUG(LogComponent::Parser, "[Parser] synchronize() entry at pos %lld", this.pos);
         this.panic_mode = false;
 
         while (!this.is_at_end()) {
@@ -683,7 +639,24 @@ public:
 
     /// Check if the current token could start a declaration.
     is_declaration_start() -> boolean {
-        const kind: TokenType = this.current().kind;
+        return ParserBase::opens_declaration(this.current().kind);
+    }
+
+    /// Refuse a binding named by a keyword that opens a declaration
+    /// (`module`, `static`, `struct`, ...).  A block reads a statement that
+    /// begins with such a keyword as a declaration, so `module = q;` is never
+    /// an assignment to the local: it compiled, and the local read whatever
+    /// its slot held.  Keywords are not identifiers there.  A
+    /// keyword that opens nothing (`default`, `string`) stays a legal name.
+    refuse_declaration_keyword_name(tok: Token, what: string) -> void {
+        if (!ParserBase::opens_declaration(tok.kind)) { return; }
+        this.report_invalid_at(ErrorCode::E0100_EXPECTED_TOKEN,
+            fmt::format("expected %s, found `%s`, which is a reserved word", what, tok.lexeme),
+            this.span_from_token(tok));
+    }
+
+    /// Whether a token of `kind` opens a declaration.
+    static opens_declaration(kind: TokenType) -> boolean {
         return match (kind) {
             TokenType::KwFunction  => { true }
             TokenType::KwConst     => { true }
@@ -828,7 +801,7 @@ public:
             return "";
         }
         mut result: string = "";
-        for (mut i: int = 0; i < this.pending_doc_comments.length; i++) {
+        for (mut i: i64 = 0; i < this.pending_doc_comments.length; i++) {
             if (i > 0) {
                 result = result.append("\n");
             }
@@ -847,123 +820,6 @@ public:
     /// Decrement scope depth.
     exit_scope() -> void {
         this.scope_depth -= 1;
-    }
-
-    /// Forget the previous function's bindings. Called when a parameter list
-    /// starts, which is the one point every function and method passes through
-    /// before its body.
-    reset_local_names() -> void {
-        this.local_names = [];
-    }
-
-    /// Record `name` as bound in the function being parsed.
-    note_local_name(name: SymbolStr) -> void {
-        if (!name.is_valid()) { return; }
-        this.local_names.push(name);
-    }
-
-    /// Whether `name` is bound as a parameter or local here. A true answer
-    /// means an `ident <` that follows cannot open type arguments.
-    is_local_name(name: SymbolStr) -> boolean {
-        if (!name.is_valid()) { return false; }
-        for (mut i: int = 0; i < this.local_names.length; i++) {
-            if (this.local_names[i].id == name.id) { return true; }
-        }
-        return false;
-    }
-
-    /// Whether `name` is a module-level `const`/`mut` binding.
-    is_global_value_name(name: SymbolStr) -> boolean {
-        if (!name.is_valid()) { return false; }
-        for (mut i: int = 0; i < this.global_value_names.length; i++) {
-            if (this.global_value_names[i].id == name.id) { return true; }
-        }
-        return false;
-    }
-
-    /// Whether `name` is declared in this module WITH type parameters.
-    is_generic_decl_name(name: SymbolStr) -> boolean {
-        if (!name.is_valid()) { return false; }
-        for (mut i: int = 0; i < this.generic_decl_names.length; i++) {
-            if (this.generic_decl_names[i].id == name.id) { return true; }
-        }
-        return false;
-    }
-
-    /// Whether `name` is known to bind a VALUE rather than a function or type,
-    /// which makes a following `<` a comparison rather than type arguments.
-    binds_a_value(name: SymbolStr) -> boolean {
-        if (this.is_local_name(name)) { return true; }
-        // A local shadows a module-level declaration, so the generic check
-        // only applies to names no local has claimed.
-        if (this.is_generic_decl_name(name)) { return false; }
-        return this.is_global_value_name(name);
-    }
-
-    /// Collect module-level names before parsing, walking the token array
-    /// directly. Only nesting depth zero counts: a `const` inside a function
-    /// body is a local, and a `function` inside a type body is a method whose
-    /// name is reached through a receiver rather than bare.
-    ///
-    /// Both forms are recognised by shape alone, which is unambiguous in
-    /// declaration position - `function NAME <` and `type KIND NAME <` open
-    /// type parameters, with none of the guesswork the expression position
-    /// needs.
-    scan_module_names() -> void {
-        mut depth: int = 0;
-        mut i: int = 0;
-        while (i < this.tokens.length) {
-            const k: TokenType = this.tokens[i].kind;
-
-            if (k == TokenType::LBrace) { depth += 1; i += 1; continue; }
-            if (k == TokenType::RBrace) { depth -= 1; i += 1; continue; }
-
-            if (depth != 0) { i += 1; continue; }
-
-            // `const NAME` / `mut NAME` at depth zero: a module global.
-            if (k == TokenType::KwConst || k == TokenType::KwMut) {
-                if (i + 1 < this.tokens.length &&
-                    this.tokens[i + 1].kind == TokenType::Identifier) {
-                    this.global_value_names.push(
-                        this.ctx.intern(this.tokens[i + 1].lexeme));
-                }
-                i += 1;
-                continue;
-            }
-
-            // `function NAME <` : a generic function.
-            if (k == TokenType::KwFunction) {
-                if (i + 2 < this.tokens.length &&
-                    this.tokens[i + 1].kind == TokenType::Identifier &&
-                    this.tokens[i + 2].kind == TokenType::LAngle) {
-                    this.generic_decl_names.push(
-                        this.ctx.intern(this.tokens[i + 1].lexeme));
-                }
-                i += 1;
-                continue;
-            }
-
-            // `type KIND NAME <` : a generic struct/union/class/enum/trait.
-            // The alias form `type NAME<T> = ...` puts the name one slot
-            // earlier, so both offsets are checked.
-            if (k == TokenType::KwType) {
-                if (i + 3 < this.tokens.length &&
-                    this.tokens[i + 2].kind == TokenType::Identifier &&
-                    this.tokens[i + 3].kind == TokenType::LAngle) {
-                    this.generic_decl_names.push(
-                        this.ctx.intern(this.tokens[i + 2].lexeme));
-                } else if (i + 2 < this.tokens.length &&
-                           this.tokens[i + 1].kind == TokenType::Identifier &&
-                           this.tokens[i + 2].kind == TokenType::LAngle) {
-                    this.generic_decl_names.push(
-                        this.ctx.intern(this.tokens[i + 1].lexeme));
-                }
-                i += 1;
-                continue;
-            }
-
-            i += 1;
-        }
     }
 
     /// Handle `>>` splitting for nested generics.
@@ -992,7 +848,8 @@ public:
     /// end-line of a multi-line block doc comment from its lexeme so
     /// the doc-cluster gap check sees a `/** ... */` spanning multiple
     /// lines correctly.
-    static count_newlines_in_str(s: string) -> int {
+    static count_newlines_in_str(s_text: string) -> int {
+        const s: string = s_text;
         const len: i64 = s.length() as i64;
         mut n: int = 0;
         for (mut i: i64 = 0; i < len; i++) {

@@ -196,7 +196,10 @@ LLVMTypeRef LLVMVectorType(LLVMTypeRef ElementType, unsigned ElementCount);
  * =================================================================== */
 
 LLVMTypeRef    LLVMTypeOf(LLVMValueRef Val);
-const char    *LLVMGetValueName2(LLVMValueRef Val, unsigned long *Length);
+/* `size_t *`, not `unsigned long *`: LLVM writes a size_t through this pointer,
+ * and `unsigned long` is 32-bit on Windows (LLP64), so the binding would claim
+ * a 4-byte slot for an 8-byte store.  The caller already passes a `u64`. */
+const char    *LLVMGetValueName2(LLVMValueRef Val, size_t *Length);
 void           LLVMSetValueName2(LLVMValueRef Val, const char *Name, unsigned long NameLen);
 void           LLVMDumpValue(LLVMValueRef Val);
 char          *LLVMPrintValueToString(LLVMValueRef Val);
@@ -383,6 +386,12 @@ void LLVMSetOrdering(LLVMValueRef MemoryAccessInst, int Ordering);
  * Required for atomic loads and stores. */
 void LLVMSetAlignment(LLVMValueRef V, unsigned Bytes);
 
+/* Read the alignment (in bytes) a load/store/alloca/global carries.  An
+ * alloca is born holding the ABI alignment of its LLVM type, so this reports
+ * what LLVM guarantees unaided - the floor a caller raising alignment for an
+ * `![align(N)]` type must not drop below. */
+unsigned LLVMGetAlignment(LLVMValueRef V);
+
 
 /* ===================================================================
  * Builder - Arithmetic
@@ -554,6 +563,7 @@ void     LLVMInitializeX86AsmPrinter(void);
 void     LLVMInitializeX86AsmParser(void);
 
 char    *LLVMGetDefaultTargetTriple(void);
+void     LLVMGetVersion(unsigned *Major, unsigned *Minor, unsigned *Patch);
 LLVMBool LLVMGetTargetFromTriple(const char *Triple, LLVMTargetRef *T, char **ErrorMessage);
 
 LLVMTargetMachineRef LLVMCreateTargetMachine(LLVMTargetRef T, const char *Triple,
@@ -567,6 +577,8 @@ void                 LLVMDisposeTargetData(LLVMTargetDataRef TD);
 /* Module-owned data layout + type sizing (no dispose: owned by module) */
 LLVMTargetDataRef    LLVMGetModuleDataLayout(LLVMModuleRef M);
 unsigned long long   LLVMABISizeOfType(LLVMTargetDataRef TD, LLVMTypeRef Ty);
+unsigned             LLVMABIAlignmentOfType(LLVMTargetDataRef TD, LLVMTypeRef Ty);
+unsigned long long   LLVMOffsetOfElement(LLVMTargetDataRef TD, LLVMTypeRef StructTy, unsigned Element);
 
 /* Emit object/assembly to file */
 LLVMBool LLVMTargetMachineEmitToFile(LLVMTargetMachineRef T, LLVMModuleRef M,

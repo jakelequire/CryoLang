@@ -9,16 +9,16 @@
 ///!
 ///!   "1.2.3"   exact match against a tag named `1.2.3` or `v1.2.3`
 ///!   "^1.2.3"  highest tag X.Y.Z with X==1 and (Y > 2 or Y==2 and Z>=3)
-///!   "^0.2.3"  highest tag 0.Y.Z with Y==2 and Z>=3   (cargo-style)
-///!   "^0.0.3"  highest tag 0.0.Z with Z==3            (cargo-style)
+///!   "^0.2.3"  highest tag 0.Y.Z with Y==2 and Z>=3   (0.x: minor is major)
+///!   "^0.0.3"  highest tag 0.0.Z with Z==3            (0.0.x: exact)
 ///!
 ///! Tilde, hyphen, and explicit-comparator ranges (`>=`, `<`, `>`, ...)
 ///! are not yet supported; we'd want them eventually but they're not
 ///! load-bearing for the v1 use case.
 
-namespace Compiler::Deps::Semver;
+namespace compiler::deps::semver;
 
-import Utils::Logger;
+import utils::logger;
 import std::collections::str;
 import std::collections::string;
 
@@ -46,7 +46,8 @@ type struct Version {
     /// Parse `vX.Y.Z` or `X.Y.Z`.  Anything trailing the patch (e.g.
     /// `-rc.1` or `+build`) is accepted but discarded.  Returns
     /// `Version::invalid()` on malformed input.
-    static parse(s: string) -> Version {
+    static parse(s_text: string) -> Version {
+        const s: string = s_text;
         const len: i64 = s.length() as i64;
         if (len == 0) { return Version::invalid(); }
 
@@ -57,23 +58,23 @@ type struct Version {
         mut minor: i64 = -1;
         mut patch: i64 = -1;
 
-        const after_major: i64 = Version::read_digits(s, i, len);
+        const after_major: i64 = Version::read_digits(s_text, i, len);
         if (after_major == i) { return Version::invalid(); }
-        major = Version::read_int(s, i, after_major);
+        major = Version::read_int(s_text, i, after_major);
         i = after_major;
         if (i >= len || s[i] != '.') { return Version::invalid(); }
         i += 1;
 
-        const after_minor: i64 = Version::read_digits(s, i, len);
+        const after_minor: i64 = Version::read_digits(s_text, i, len);
         if (after_minor == i) { return Version::invalid(); }
-        minor = Version::read_int(s, i, after_minor);
+        minor = Version::read_int(s_text, i, after_minor);
         i = after_minor;
         if (i >= len || s[i] != '.') { return Version::invalid(); }
         i += 1;
 
-        const after_patch: i64 = Version::read_digits(s, i, len);
+        const after_patch: i64 = Version::read_digits(s_text, i, len);
         if (after_patch == i) { return Version::invalid(); }
-        patch = Version::read_int(s, i, after_patch);
+        patch = Version::read_int(s_text, i, after_patch);
         // Trailing pre-release/build metadata is ignored for ordering.
 
         return Version { major: major, minor: minor, patch: patch, valid: true };
@@ -81,7 +82,8 @@ type struct Version {
 
     /// Walk past the run of ASCII digits in `s` starting at `i`, capped
     /// at `end`.  Returns the index of the first non-digit (or `end`).
-    static read_digits(s: string, i: i64, end: i64) -> i64 {
+    static read_digits(s_text: string, i: i64, end: i64) -> i64 {
+        const s: string = s_text;
         mut p: i64 = i;
         while (p < end && s[p] >= '0' && s[p] <= '9') {
             p += 1;
@@ -91,7 +93,8 @@ type struct Version {
 
     /// Parse `s[start..end)` as a non-negative decimal integer.  Caller
     /// must have established the range is all-digits via `read_digits`.
-    static read_int(s: string, start: i64, end: i64) -> i64 {
+    static read_int(s_text: string, start: i64, end: i64) -> i64 {
+        const s: string = s_text;
         mut acc: i64 = 0;
         for (mut p: i64 = start; p < end; p++) {
             acc = acc * 10 + (s[p] - '0') as i64;
@@ -106,7 +109,7 @@ type struct Version {
 /// Constraint operators we understand.
 type enum ConstraintOp {
     Exact;   // "1.2.3"   - matches only the literal version
-    Caret;   // "^1.2.3"  - cargo-style upper-bound
+    Caret;   // "^1.2.3"  - compatible versions, up to the next major
 }
 
 type struct Constraint {
@@ -125,7 +128,8 @@ type struct Constraint {
     /// Parse a constraint string: the value the user wrote in
     /// `version = "..."`.  The leading `^` selects caret semantics; absent
     /// it, exact match.
-    static parse(s: string) -> Constraint {
+    static parse(s_text: string) -> Constraint {
+        const s: string = s_text;
         if (s.length() == 0) { return Constraint::invalid(); }
 
         mut op:   ConstraintOp = ConstraintOp::Exact;
@@ -150,7 +154,7 @@ type struct Constraint {
         };
     }
 
-    /// Caret-range upper-bound check (cargo / npm convention):
+    /// Caret-range upper-bound check:
     ///   ^1.2.3 => <2.0.0
     ///   ^0.2.3 => <0.3.0
     ///   ^0.0.3 => <0.0.4
@@ -174,7 +178,7 @@ type struct Constraint {
         mut best_tag: string  = "";
         mut best_v:   Version = Version::invalid();
 
-        for (mut i: int = 0; i < tags.length; i++) {
+        for (mut i: i64 = 0; i < tags.length; i++) {
             const tag: string = tags[i];
             const v:   Version = Version::parse(tag);
             if (!v.valid) { continue; }

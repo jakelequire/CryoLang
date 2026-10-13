@@ -12,16 +12,26 @@
 
 namespace std::collections::str;
 
-import core::intrinsics;
-import core::option;
-import core::result;
-import core::slice;
-import core::cmp;
-import core::convert;
-import core::hash;
-import core::iter;
-import collections::string;
-import collections::pair;
+import std::core::intrinsics;
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::slice;
+import std::core::slice::{ Slice };
+import std::core::cmp;
+import std::core::cmp::{ Eq, Ord, Ordering };
+import std::core::convert;
+import std::core::convert::{ ConversionError, TryFrom };
+import std::core::hash;
+import std::core::hash::{ Hash, Hasher };
+import std::core::iter;
+import std::core::iter::{ Iterator };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::pair;
+import std::collections::pair::{ Pair };
+import std::ffi::libc;
 
 type struct Str {
     bytes: u8*;
@@ -32,7 +42,7 @@ type struct Str {
     /// NUL terminator is not included in the view.
     ![implicit]
     static new(text: string) -> Str {
-        return Str { bytes: text as u8*, length: strlen(text) };
+        return Str { bytes: text as u8*, length: libc::strlen(text) };
     }
 
     /// Construct from a raw pointer + length. The caller certifies that
@@ -53,7 +63,7 @@ type struct Str {
     /// `new` remains the implicit `string` -> `Str` conversion.
     static from<T>(src: T) -> Str {
         return static match (T) {
-            string    => { Str { bytes: src as u8*, length: strlen(src) } }
+            string    => { Str { bytes: src as u8*, length: libc::strlen(src) } }
             Slice<u8> => { Str { bytes: src.as_ptr(), length: src.length() } }
         };
     }
@@ -100,22 +110,6 @@ type struct Str {
         };
     }
 
-    /// Byte-wise equality. UTF-8 in canonical form compares as
-    /// expected; non-canonical input compares byte-by-byte.
-    equals(&this, other: &Str) -> boolean {
-        if (this.length != other.length) {
-            return false;
-        }
-        if (this.length == 0) {
-            return true;
-        }
-        return intrinsics::memcmp(
-            this.bytes as void*,
-            other.bytes as void*,
-            this.length
-        ) == 0;
-    }
-
     /// Return a new `String` with every ASCII uppercase byte folded to
     /// lowercase. Non-ASCII bytes are passed through unchanged.
     /// Requires `collections::string`; callers that only need `Str`
@@ -142,7 +136,7 @@ type struct Str {
         const pl: u64 = prefix.length;
         if (pl > this.length) { return false; }
         if (pl == 0) { return true; }
-        return intrinsics::memcmp(
+        return libc::memcmp(
             this.bytes as void*, prefix.bytes as void*, pl) == 0;
     }
 
@@ -151,7 +145,7 @@ type struct Str {
         const sl: u64 = suffix.length;
         if (sl > this.length) { return false; }
         if (sl == 0) { return true; }
-        return intrinsics::memcmp(
+        return libc::memcmp(
             (this.bytes + (this.length - sl)) as void*,
             suffix.bytes as void*, sl) == 0;
     }
@@ -166,7 +160,7 @@ type struct Str {
         mut i: u64 = 0;
         const stop: u64 = this.length - nl;
         while (i <= stop) {
-            if (intrinsics::memcmp(
+            if (libc::memcmp(
                     (this.bytes + i) as void*,
                     needle.bytes as void*, nl) == 0) {
                 return Option::Some(i);
@@ -225,7 +219,7 @@ type struct Str {
 
     /// Iterator over the (non-overlapping) pieces between occurrences of
     /// the byte separator `sep`. A leading/trailing/doubled separator
-    /// yields an empty piece, matching Rust's `str::split`. Each yielded
+    /// yields an empty piece. Each yielded
     /// `Str` borrows from this one. `split` on a one-byte separator is
     /// the common case; multi-byte separators are supported too.
     split(&this, sep: &Str) -> implement Iterator<Str> {
@@ -331,7 +325,7 @@ implement trait Iterator<Str> for struct SplitIter {
             const stop: u64 = this.length - this.sep_length;
             mut i: u64 = this.pos;
             while (i <= stop) {
-                if (intrinsics::memcmp(
+                if (libc::memcmp(
                         (this.bytes + i) as void*,
                         this.sep_bytes as void*, this.sep_length) == 0) {
                     const piece: Str = Str {
@@ -367,7 +361,7 @@ function decode_scalar(bytes: u8*, length: u64, pos: u64) -> Pair<u32, u64> {
 
     // ASCII fast path: one byte, value is the scalar.
     if (lead < 0x80) {
-        return Pair<u32, u64> { first: lead as u32, second: 1 };
+        return Pair::<u32, u64> { first: lead as u32, second: 1 };
     }
 
     // Continuation count and initial scalar bits from the lead byte's
@@ -384,19 +378,19 @@ function decode_scalar(bytes: u8*, length: u64, pos: u64) -> Pair<u32, u64> {
         needed = 3; scalar = (lead & 0x07) as u32; min = 0x10000;
     } else {
         // 10xxxxxx orphan continuation, or 11111xxx out of range.
-        return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+        return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
     }
 
     // The continuation bytes must all be present within the view.
     if (pos + 1 + needed > length) {
-        return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+        return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
     }
 
     mut i: u64 = 1;
     while (i <= needed) {
         const b: u8 = bytes[pos + i];
         if ((b & 0xC0) != 0x80) {
-            return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+            return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
         }
         scalar = (scalar << 6) | ((b & 0x3F) as u32);
         i = i + 1;
@@ -405,16 +399,16 @@ function decode_scalar(bytes: u8*, length: u64, pos: u64) -> Pair<u32, u64> {
     // Reject overlong encodings, surrogate halves, and values above the
     // Unicode range - each is malformed UTF-8.
     if (scalar < min) {
-        return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+        return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
     }
     if (scalar >= 0xD800 && scalar <= 0xDFFF) {
-        return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+        return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
     }
     if (scalar > 0x10FFFF) {
-        return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+        return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
     }
 
-    return Pair<u32, u64> { first: scalar, second: 1 + needed };
+    return Pair::<u32, u64> { first: scalar, second: 1 + needed };
 }
 
 /// Lazy UTF-8 scalar iterator over a `Str`; see `Str::chars`. Borrows
@@ -454,11 +448,13 @@ implement trait Iterator<Pair<u64, u32>> for struct CharIndices {
         const start: u64 = this.pos;
         const step: Pair<u32, u64> = decode_scalar(this.bytes, this.length, this.pos);
         this.pos = this.pos + step.second;
-        return Option::Some(Pair<u64, u32> { first: start, second: step.first });
+        return Option::Some(Pair::<u64, u32> { first: start, second: step.first });
     }
 }
 
 implement trait Eq for struct Str {
+    /// Byte-wise equality. UTF-8 in canonical form compares as
+    /// expected; non-canonical input compares byte-by-byte.
     equals(&this, other: &Str) -> boolean {
         if (this.length != other.length) {
             return false;
@@ -466,7 +462,7 @@ implement trait Eq for struct Str {
         if (this.length == 0) {
             return true;
         }
-        return intrinsics::memcmp(
+        return libc::memcmp(
             this.bytes as void*,
             other.bytes as void*,
             this.length

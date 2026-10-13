@@ -1,0 +1,64 @@
+///! A type's static taken as a VALUE - handed to a callback parameter from
+///! inside the type's own body (the C-callback shape, the libclang
+///! trampolines) and from outside it - beside a module-level function taken
+///! the same way through the module's own leaf.
+///!
+///! The type and the module are named differently: modules and types share
+///! one namespace, so a type spelled like the module that declares it is
+///! refused (E0205, `E0205_type_named_as_its_module`), and a scope segment
+///! names exactly one of them.  A static reaching LLVM as `<null operand!>`
+///! is what a segment resolved to the wrong owner looks like.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::StaticMethodValue;
+
+import std::core::result;
+import std::core::result::{ Result };
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+
+mut g_seen: i64 = 0;
+
+// Its own leaf, not the namespace's.
+type struct Emitter {
+    tag: i64;
+
+    static record(n: i64) -> void { g_seen = g_seen + n; }
+
+    /// Its own static handed to a callback parameter, named through its
+    /// type - the shape of the libclang trampolines.
+    static fire(n: i64) -> void { apply(Emitter::record, n); }
+}
+
+// A module-level free function reached through the module's leaf.
+function tally() -> i64 { return g_seen; }
+
+// Takes the callback by parameter, so the expected type comes from the
+// signature rather than from an annotation on a local.
+function apply(f: (i64) -> void, n: i64) -> void { f(n); }
+
+![test]
+function type_static_as_value_calls_through() -> Result<(), TestError> {
+    g_seen = 0;
+    Emitter::fire(4);
+    Emitter::fire(3);
+    return expect_eq(g_seen, 7);
+}
+
+![test]
+function module_free_function_as_value_calls_through() -> Result<(), TestError> {
+    g_seen = 0;
+    Emitter::record(5);
+    const g: () -> i64 = StaticMethodValue::tally;
+    return expect_eq(g(), 5);
+}
+
+// The same reference from OUTSIDE the type body, still as an argument.
+![test]
+function type_static_as_argument_from_outside() -> Result<(), TestError> {
+    g_seen = 0;
+    apply(Emitter::record, 6);
+    return expect_eq(g_seen, 6);
+}

@@ -3,16 +3,32 @@
 ///! Manages multi-module compilation state: module discovery, topological
 ///! ordering, and cross-module function descriptors.
 
-namespace Compiler::ModuleGraph;
+namespace compiler::module_graph;
 
-import Compiler::Resolver::{ SymbolStr, InternTable };
-import Compiler::Types::{
-    TypeRef, Type, Compound, Arena
+import compiler::resolver::{ symbol_str, intern_table };
+import compiler::types::{
+    type_ref, type_base, compound, arena, TypeKind
 };
-import Compiler::AST::Node;
-import Compiler::DeclIndex;
-import Utils::Logger;
+import compiler::ast::node;
+import compiler::ast::node::{ ProgramNode };
+import compiler::decl_index;
+import utils::logger;
+import utils::logger::{ cdebug };
 import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
+import std::ffi::libc;
+import std::fmt;
+import std::core::hash::{ Hash, Hasher };
+import std::core::cmp::{ Eq };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name::{ DeclName };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, DefTable, DefKind };
+import compiler::resolver::lang_item::{ LangModule };
 
 /// Where a module's source originates, driving which per-package subtree
 /// (`std/`, `local/`, or `<depname>/`) its object/IR output lands in.
@@ -26,13 +42,221 @@ type enum ModuleOrigin {
     Vendor;
 }
 
+/// A module's canonical namespace path - `std::fs`, `compiler::resolver` -
+/// which is the module's identity: a module and a type can never carry the
+/// same name, and the graph registers every module under exactly one path.
+///
+/// It is a type of its own so that a door asking for a MODULE cannot be
+/// handed a spelling that names something else.  It is minted only in this
+/// module, by the graph that registers modules: a registered module's own
+/// path (`ModuleInfo::path`), the module a source file declares
+/// (`ModuleGraph::module_of_file`), and the one door that turns written
+/// text into a module, `ModuleGraph::module_named`, which answers only a
+/// module the graph holds.  Nothing else can build one from a spelling, so
+/// a path always names a module that exists.
+type struct ModulePath {
+private:
+    sym: SymbolStr;
+
+    static of(sym: SymbolStr) -> ModulePath {
+        return ModulePath { sym: sym };
+    }
+
+public:
+    /// No module.
+    static none() -> ModulePath {
+        return ModulePath { sym: SymbolStr::empty() };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.sym.is_valid();
+    }
+
+    equals(&this, other: ModulePath) -> boolean {
+        return this.sym.equals(other.sym);
+    }
+
+    /// Whether this module is `ancestor` or nested anywhere under it.  A
+    /// module's children are the modules whose path continues its own past a
+    /// `::` - `app::net::tcp` is under `app::net` and `app`, while
+    /// `app::network` is not under `app::net`.
+    is_within(&this, ancestor: ModulePath, intern: InternTable*) -> boolean {
+        if (!this.is_valid() || !ancestor.is_valid()) { return false; }
+        if (this.equals(ancestor)) { return true; }
+        return intern.resolve(this.sym).starts_with(intern.resolve(ancestor.sym) + "::");
+    }
+
+    /// The key a table keyed by modules stores this module under.
+    table_key(&this) -> ModuleKey {
+        return ModuleKey { id: this.sym.id as u64 };
+    }
+
+    /// The path as the module's name: text to show in a message or spell a
+    /// symbol or a manifest entry with, never a key a lookup is asked by.
+    decl_name(&this) -> DeclName {
+        return DeclName::of(this.sym);
+    }
+
+    /// The canonical name of the declaration `leaf` in this module,
+    /// `module::leaf`, interned: the name a declaration is registered and
+    /// mangled under.  Composed here and nowhere else, so every registration
+    /// and every reader of one declaration agree on what it is called.
+    qualified(&this, leaf: SymbolStr, intern: InternTable*) -> SymbolStr {
+        return intern.intern(intern.resolve(this.sym) + "::" + intern.resolve(leaf));
+    }
+
+    /// The symbol a specialization of the module-level function `leaf` is
+    /// based on when its leaf alone would collide with another module's:
+    /// the path with each `::` folded to `_`, then the leaf
+    /// (`std_net_ws_frame_read_frame`).  Spelled here, beside `qualified`,
+    /// for the reason that one is.
+    folded(&this, leaf: SymbolStr, intern: InternTable*) -> SymbolStr {
+        const path: string = intern.resolve(this.sym);
+        const n: i64 = path.length() as i64;
+        mut out: string = "";
+        for (mut ci: i64 = 0; ci < n; ci += 1) {
+            if (path[ci] == ':') {
+                const flen: i64 = out.length() as i64;
+                if (flen > 0 && out[flen - 1] != '_') { out += "_"; }
+            } else {
+                out += path.substr(ci, 1);
+            }
+        }
+        return intern.intern(out + "_" + intern.resolve(leaf));
+    }
+}
+
+/// One edge the loader records, by the module it names when the graph
+/// already holds it, or by the namespace written when the target is still
+/// being loaded (an import inside a cycle).  `ModuleGraph::resolve_edges`
+/// turns a written one into its module once discovery has finished.
+type struct RecordedEdge {
+private:
+    target:  ModulePath;
+    written: SymbolStr;
+
+public:
+    /// An edge to a module the graph holds.
+    static to(m: ModulePath) -> RecordedEdge {
+        return RecordedEdge { target: m, written: SymbolStr::empty() };
+    }
+
+    /// An edge to the namespace `ns` as written, for a module the graph may
+    /// not hold yet.
+    static written_as(ns: SymbolStr) -> RecordedEdge {
+        return RecordedEdge { target: ModulePath::none(), written: ns };
+    }
+}
+
+/// What one file can see under a module spelling.
+///
+/// `visible` and `matched` are kept apart because they answer different
+/// questions: nothing carries this spelling at all, versus something does and
+/// the writer cannot reach it.  Collapsing them would report the second as the
+/// first, which is the difference between "no such name" and "add an import".
+type struct ModuleSpellingMatch {
+    /// The single visible module, when `visible == 1`.
+    found:   ModulePath;
+    /// That module as a definition, when `visible == 1`.
+    found_def: DefId;
+    /// A second visible module, for naming the ambiguity.
+    other:   ModulePath;
+    /// Any module carrying the spelling, reachable or not.
+    any:     ModulePath;
+    /// How many carry it AND are reachable from the writing file.
+    visible: i64;
+    /// How many carry it at all.
+    matched: i64;
+}
+
+/// The key of a table keyed by modules.  Made only by
+/// `ModulePath::table_key`, so such a table is handed a module's identity
+/// and never the interned id of some other text.  Hashes as the id's number
+/// does.
+type struct ModuleKey {
+private:
+    id: u64;
+}
+
+implement trait Hash for struct ModuleKey {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.id.hash(hasher);
+    }
+}
+
+implement trait Eq for struct ModuleKey {
+    equals(&this, other: &ModuleKey) -> boolean {
+        return this.id == other.id;
+    }
+}
+
 /// Metadata about a single compilation module (source file).
 type struct ModuleInfo {
+private:
+    /// The module's path, its identity: `path()`.
     name:           SymbolStr;
-    file_path:      string;
+    /// The namespace the file declares, or empty: `declares_namespace()`,
+    /// `namespace_path()`.
     namespace_name: SymbolStr;
-    dependencies:   SymbolStr[];
-    processed:      boolean;
+public:
+    file_path:      string;
+    /// The modules this module imports, which must be compiled first.
+    dependencies:   ModulePath[];
+    /// Modules this module can SEE but does not depend on for build order:
+    /// the expansion of `import A::B::{ X, Y };` into `A::B::X`, `A::B::Y`.
+    ///
+    /// Deliberately NOT dependencies.  `compute_order()` walks `dependencies`,
+    /// and adding an edge per brace item recreates the false cycles the module
+    /// loader avoids for `public module` declarations.  Visibility and build
+    /// order are different relations; only `visible` is built from this, to
+    /// answer "does this module import that namespace?".
+    imported_namespaces: ModulePath[];
+
+    /// Modules this module declares with `public module X;`.
+    ///
+    /// Recorded so a `public module` set can be DERIVED rather than
+    /// transcribed: `instance.cryo` reads `std::prelude`'s set from here and
+    /// hands it to `DeclarationIndex::register_prelude_namespaces`, so
+    /// `stdlib/prelude.cryo` is the single source of truth for what the
+    /// prelude contains.
+    ///
+    /// Deliberately NEITHER a dependency edge NOR a visibility edge, so
+    /// recording it changes no resolution input on its own.  Whether
+    /// `public module` should also grant visibility (i.e. become a real
+    /// re-export) is the `public import` design question, and it should be
+    /// decided and measured on its own terms - not acquired as a side effect
+    /// of removing a hardcoded list.
+    submodules:     ModulePath[];
+
+    /// Modules this module RE-EXPORTS with `export X;`.  An importer of this
+    /// module sees these as if it had imported them itself, transitively.
+    ///
+    /// A VISIBILITY edge and never a build-order one, for the reason
+    /// `imported_namespaces` is: a per-export dependency edge would make
+    /// mutual re-export - which the rule deliberately permits - an
+    /// unsatisfiable cycle across the whole program.  The consequence the
+    /// consumer must respect: the closure over this list can revisit a module,
+    /// so it terminates on a seen-set, not on the graph being acyclic.
+    reexports:      ModulePath[];
+
+    /// The four edge lists above as the loader records them, by the
+    /// namespace each target declares.  An import inside a cycle names a
+    /// module still being loaded, which the graph does not hold yet, so an
+    /// edge cannot be a module when it is recorded.  `ModuleGraph::
+    /// resolve_edges` turns them into the lists above once discovery has
+    /// finished, and empties them.
+    written_dependencies: RecordedEdge[];
+    written_imported:     RecordedEdge[];
+    written_submodules:   RecordedEdge[];
+    written_reexports:    RecordedEdge[];
+    /// Every module this module can see through its imports: its
+    /// dependencies and brace items, closed over re-exports.  Set once
+    /// discovery has finished (`ModuleGraph::set_visible_modules`); the
+    /// relation a written module path is judged reachable by.
+    visible:              ModulePath[];
+    /// Recorded dependencies the graph holds no module for.  A dependency
+    /// closure that met one is incomplete (`compute_import_closure`).
+    unresolved_dependencies: u32;
 
     // Source origin, classified by the orchestrator after discovery from the
     // module's `file_path` (under stdlib_root => Stdlib, under a dependency
@@ -40,43 +264,48 @@ type struct ModuleInfo {
     origin:         ModuleOrigin;
     origin_name:    string;       // dependency name when origin == Dep, else ""
 
-    // Per-module export tracking (populated during Declaration Collection).
-    // Used by codegen to enumerate what a module defines.
-    exports_functions: SymbolStr[];   // qualified names of public functions
-    exports_types:     SymbolStr[];   // qualified names of public types
 
-    // Indices into Monomorphizer.spec_entries for specializations injected
-    // into this module's AST (populated during GenericExpressionResolution).
-    specializations:   i64[];
-
-    static new(name: SymbolStr, path: string) -> ModuleInfo {
-        return ModuleInfo {
-            name:               name,
-            file_path:          path,
-            namespace_name:     SymbolStr::empty(),
-            dependencies:       [],
-            processed:          false,
-            origin:             ModuleOrigin::Local,
-            origin_name:        "",
-            exports_functions:  [],
-            exports_types:      [],
-            specializations:    [],
-        };
-    }
+    /// The module as a definition, registered when the graph adds it
+    /// (`add_module`): the one place a module's `DefId` comes from, so a
+    /// path answered as naming this module reads it here rather than
+    /// recomposing the namespace.  Invalid for a module with no namespace.
+    def:               DefId;
 
     static with_namespace(name: SymbolStr, path: string, ns: SymbolStr) -> ModuleInfo {
         return ModuleInfo {
             name:               name,
             file_path:          path,
             namespace_name:     ns,
-            dependencies:       [],
-            processed:          false,
+            dependencies:        [],
+            imported_namespaces: [],
+            submodules:          [],
+            reexports:           [],
+            written_dependencies: [],
+            written_imported:     [],
+            written_submodules:   [],
+            written_reexports:    [],
+            visible:              [],
+            unresolved_dependencies: 0,
             origin:             ModuleOrigin::Local,
             origin_name:        "",
-            exports_functions:  [],
-            exports_types:      [],
-            specializations:    [],
+            def:                DefId::invalid(),
         };
+    }
+
+    /// This registered module's own path.
+    path(&this) -> ModulePath {
+        return ModulePath::of(this.name);
+    }
+
+    /// Whether the module's file declares a namespace.
+    declares_namespace(&this) -> boolean {
+        return this.namespace_name.is_valid();
+    }
+
+    /// The namespace the module's file declares, as a module identity; none
+    /// when it declares none.
+    namespace_path(&this) -> ModulePath {
+        return ModulePath::of(this.namespace_name);
     }
 
     /// Output subdirectory name for an origin: `"std"`, `"local"`, or the
@@ -93,7 +322,7 @@ type struct ModuleInfo {
             // Each vendored library gets its own subtree beneath `vendor/`
             // (e.g. `vendor/RayLib/deps/*.o`), keyed by the library name in
             // `origin_name`, so multiple vendored libs stay isolated.
-            ModuleOrigin::Vendor => { format("vendor/%s", origin_name) }
+            ModuleOrigin::Vendor => { fmt::format("vendor/%s", origin_name) }
         };
     }
 
@@ -107,67 +336,71 @@ type struct ModuleInfo {
         };
     }
 
-    add_dependency(mut &this, dep: SymbolStr) -> void {
-        this.dependencies.push(dep);
+    /// Record a dependency by the namespace it names.  An edge back to this
+    /// module is dropped when the edges are resolved (`resolve_edges`).
+    add_dependency(mut &this, dep: RecordedEdge) -> void {
+        this.written_dependencies.push(dep);
     }
 
-    add_export_function(mut &this, name: SymbolStr) -> void {
-        this.exports_functions.push(name);
+    /// Record a namespace this module can see without depending on it.
+    /// See `imported_namespaces` for why this is not `add_dependency`.
+    add_imported_namespace(mut &this, ns: RecordedEdge) -> void {
+        this.written_imported.push(ns);
     }
 
-    add_export_type(mut &this, name: SymbolStr) -> void {
-        this.exports_types.push(name);
+    /// Record an `export X;` target by its resolved namespace.
+    /// See `reexports` for why this is not `add_dependency`.
+    add_reexport(mut &this, ns: RecordedEdge) -> void {
+        this.written_reexports.push(ns);
     }
 
-    add_specialization(mut &this, spec_index: i64) -> void {
-        this.specializations.push(spec_index);
+    /// Record a `public module X;` target by its resolved namespace.
+    /// See `submodules` for why this grants nothing on its own.
+    add_submodule(mut &this, ns: RecordedEdge) -> void {
+        this.written_submodules.push(ns);
     }
 
-    mark_processed(mut &this) -> void {
-        this.processed = true;
-    }
+
 }
-
-/// Function descriptor saved between compilation units.
-/// Uses TypeRefs directly from the shared TypeArena; no lossy conversion
-/// to a simplified type representation.  The TypeArena is global and
-/// persists across all modules, so these refs remain valid.
-type struct CrossModuleFnDescriptor {
-    name:        SymbolStr;
-    return_type: TypeRef;
-    param_types: TypeRef[];
-    is_var_arg:  boolean;
-
-    static new(name: SymbolStr, ret: TypeRef) -> CrossModuleFnDescriptor {
-        return CrossModuleFnDescriptor {
-            name:        name,
-            return_type: ret,
-            param_types: [],
-            is_var_arg:  false,
-        };
-    }
-}
-
 
 /// Tracks modules and their dependency relationships for multi-module and
 /// stdlib batch compilation.
 type struct ModuleGraph {
+    /// The compilation's definitions, for a definition's path.  Borrowed;
+    /// set by `CompilationContext`, which owns it.
+    defs: DefTable*;
     modules:          ModuleInfo[];
     topo_order:       u32[];
-    cross_module_fns: CrossModuleFnDescriptor[];
+    /// Modules `compute_order()` could not place, set only when it returns
+    /// false.  Exists so the caller can name the cycle in a USER-FACING
+    /// diagnostic; before this the cycle was reported to the debug channel
+    /// only, so a plain build printed "1 errors" and nothing else.
+    topo_unplaced:    u32[];
 
     // Per-module AST storage: raw pointer array to avoid array[i]=x codegen bug
     module_ast_buf: void*;       // malloc'd buffer of ProgramNode* pointers
     module_ast_cap: u32;         // capacity (== modules.length)
     module_sources: string[];
 
+private:
     // Module name -> index lookup (SymbolStr.id -> module index)
-    name_index: HashMap<u32, u32>;
+    name_index: HashMap<ModuleKey, u32>;
 
+    /// Every module's definition, by the module's path:
+    /// each module of this graph as it is added, and each module a C import
+    /// declares (`extern module cit := "C" { .. }`), which is a module the
+    /// name layer makes and no file holds.  The one table a declaration's
+    /// parent module is asked of.
+    module_defs: HashMap<ModuleKey, DefId>;
+    /// The same entries in the order they were made, for the reverse
+    /// question - which module a definition is (`declaring_module`).  A
+    /// list, because a `DefId` cannot key a map.
+    def_list:  DefId[];
+    def_paths: ModulePath[];
+
+public:
     // Saved resolver scope per module: raw pointer to avoid array[i]=x codegen bug
     // Parallel with modules[]. 0 means "not saved yet".
-    module_scope_buf: void*;    // malloc'd buffer of u64 scope IDs
-    module_scope_cap: u32;
 
     // Set during discovery when any discovered module contains an f-string
     // (`f"..."`).  The orchestrator reads it to force-discover the f-string
@@ -175,27 +408,27 @@ type struct ModuleGraph {
     // transitive deps (ffi::libc etc.) out of programs that don't use one.
     uses_fstring: boolean;
 
-    static new() -> ModuleGraph {
+    static new(defs: DefTable*) -> ModuleGraph {
         // Pre-allocate raw buffers for up to 128 modules to avoid
         // per-module reallocation (which causes heap corruption from
         // repeated malloc/free cycles on raw pointers).
         const initial_cap: u32 = 128;
         const buf_size: u64 = initial_cap as u64 * 8;
-        const ast_buf: void* = malloc(buf_size);
-        memset(ast_buf, 0, buf_size);
-        const scope_buf: void* = malloc(buf_size);
-        memset(scope_buf, 0, buf_size);
+        const ast_buf: void* = libc::malloc(buf_size);
+        libc::memset(ast_buf, 0, buf_size);
 
         return ModuleGraph {
+            defs: defs,
             modules:          [],
             topo_order:       [],
-            cross_module_fns: [],
+            topo_unplaced:    [],
             module_ast_buf:   ast_buf,
             module_ast_cap:   initial_cap,
             module_sources:   [],
-            name_index:       HashMap<u32, u32>::new(),
-            module_scope_buf: scope_buf,
-            module_scope_cap: initial_cap,
+            name_index:       HashMap::<ModuleKey, u32>::new(),
+            module_defs:      HashMap::<ModuleKey, DefId>::new(),
+            def_list:         [],
+            def_paths:        [],
             uses_fstring:     false,
         };
     }
@@ -203,10 +436,21 @@ type struct ModuleGraph {
     /// Register a module for compilation.
     add_module(mut &this, info: ModuleInfo) -> void {
         const idx: u32 = this.modules.length as u32;
-        this.name_index.insert(info.name.id, idx);
+        this.name_index.insert(ModulePath::of(info.name).table_key(), idx);
         // Read the (Copy) file_path before `info` is moved into `this.modules`.
         this.module_sources.push(info.file_path);
         this.modules.push(info);
+        // A module's identity is made here, where the graph first holds it:
+        // a root of the definition tree, named by the path its namespace
+        // declaration writes.
+        const ns: SymbolStr = this.modules[idx as i64].namespace_name;
+        if (ns.is_valid()) {
+            this.modules[idx as i64].def = this.defs.register(
+                DefId::invalid(), ns, DefKind::Module, SourceSpan::none());
+            this.module_defs.insert(ModulePath::of(ns).table_key(), this.modules[idx as i64].def);
+            this.def_list.push(this.modules[idx as i64].def);
+            this.def_paths.push(ModulePath::of(ns));
+        }
 
         // If we exceed pre-allocated capacity, grow the raw buffers.
         // This should be rare (>128 modules).
@@ -214,27 +458,18 @@ type struct ModuleGraph {
             const new_cap: u32 = this.module_ast_cap * 2;
             const new_size: u64 = new_cap as u64 * 8;
 
-            const new_ast_buf: void* = malloc(new_size);
-            memset(new_ast_buf, 0, new_size);
+            const new_ast_buf: void* = libc::malloc(new_size);
+            libc::memset(new_ast_buf, 0, new_size);
             if (this.module_ast_buf != null) {
-                memcpy(new_ast_buf, this.module_ast_buf, this.module_ast_cap as u64 * 8);
+                libc::memcpy(new_ast_buf, this.module_ast_buf, this.module_ast_cap as u64 * 8);
                 // Qualified: bare `free` is resolution-ambiguous with
                 // `std::alloc::heap::free` (same 1-arg shape), since the
                 // resolver's bare-leaf maps don't yet respect imports.
-                intrinsics::free(this.module_ast_buf);
+                libc::free(this.module_ast_buf);
             }
             this.module_ast_buf = new_ast_buf;
 
-            const new_scope_buf: void* = malloc(new_size);
-            memset(new_scope_buf, 0, new_size);
-            if (this.module_scope_buf != null) {
-                memcpy(new_scope_buf, this.module_scope_buf, this.module_scope_cap as u64 * 8);
-                intrinsics::free(this.module_scope_buf);
-            }
-            this.module_scope_buf = new_scope_buf;
-
             this.module_ast_cap   = new_cap;
-            this.module_scope_cap = new_cap;
         }
     }
 
@@ -251,33 +486,405 @@ type struct ModuleGraph {
         return &this.modules[index];
     }
 
-    /// Find a module's index by its name SymbolStr.  Returns -1 if not found.
-    find_module_index(&this, name: SymbolStr) -> i64 {
-        const key: u32 = name.id;
-        return match (this.name_index.get(&key)) {
+private:
+    /// A module is written as a path of text in an
+    /// import, a qualified name or a manifest, and the graph is the only
+    /// thing that knows which modules exist.  Private to the graph: a caller
+    /// elsewhere asks one of the methods below, each named for the one kind
+    /// of text it turns into a module.
+    ///
+    /// The path of the module the namespace `ns` names, when the graph holds
+    /// one under it - discovered, or bound by a C import - and none
+    /// otherwise.  It cannot answer a module that does not exist.
+    module_named(&this, ns: SymbolStr) -> ModulePath {
+        if (!ns.is_valid()) { return ModulePath::none(); }
+        const m: ModulePath = ModulePath::of(ns);
+        if (this.name_index.contains_key(&m.table_key()) || this.module_defs.contains_key(&m.table_key())) {
+            return m;
+        }
+        return ModulePath::none();
+    }
+
+public:
+    /// The module an import or export path names as written in source -
+    /// `import a::b;`, a braced entry's `a::b::c`, `export a::b;` and an
+    /// export's entry - when the graph holds one under that path; none
+    /// otherwise.
+    module_of_written_path(&this, written: SymbolStr) -> ModulePath {
+        return this.module_named(written);
+    }
+
+    /// The module nested in `m` under `leaf` - `<m>::<leaf>` - when the
+    /// graph holds one; none otherwise.  A declaration of `leaf` in `m`
+    /// shares that module's canonical name.
+    module_under(&this, m: ModulePath, leaf: SymbolStr, intern: InternTable*) -> ModulePath {
+        if (!m.is_valid() || intern == null) { return ModulePath::none(); }
+        return this.module_named(m.qualified(leaf, intern));
+    }
+
+    /// The module `<parent>::<leaf>` when a written module path and an item
+    /// name written beside it together also name a module - an imported
+    /// entry that is a sub-module, a type declared beside a module of its
+    /// own path; none otherwise.
+    module_beside_item(&this, parent: string, leaf: string, intern: InternTable*) -> ModulePath {
+        if (intern == null) { return ModulePath::none(); }
+        return this.module_named(intern.intern(parent + "::" + leaf));
+    }
+
+    /// The module the compiler imports on a program's behalf, `m`, when the
+    /// graph holds it; none otherwise (the prelude under `no_std`, the
+    /// formatting runtime before an f-string asks for it).  The path is the
+    /// fixed table's (`LangModule::path`), never one a caller composed.
+    lang_module(&this, m: LangModule, intern: InternTable*) -> ModulePath {
+        if (intern == null) { return ModulePath::none(); }
+        return this.module_named(intern.intern(m.path()));
+    }
+
+    /// The modules reachable without an import: the ones `std::prelude`
+    /// declares with `public module`, as the loader recorded them.  Empty
+    /// when the graph holds no prelude (`no_std`).
+    prelude_set(&this, intern: InternTable*) -> ModulePath[] {
+        mut out: ModulePath[] = [];
+        const idx: i64 = this.find_module_index(this.lang_module(LangModule::Prelude, intern));
+        if (idx < 0) { return out; }
+        for (mut i: i64 = 0; i < this.modules[idx].submodules.length; i++) {
+            out.push(this.modules[idx].submodules[i]);
+        }
+        return out;
+    }
+
+    /// Record what the module at `idx` can see through its imports.
+    set_visible_modules(mut &this, idx: i64, visible: ModulePath[]) -> void {
+        this.modules[idx].visible = visible;
+    }
+
+    /// Whether the module `use_module` can see `target` through its imports.
+    imports(&this, use_module: ModulePath, target: ModulePath) -> boolean {
+        const idx: i64 = this.find_module_index(use_module);
+        if (idx < 0) { return false; }
+        for (mut k: i64 = 0; k < this.modules[idx].visible.length; k++) {
+            if (this.modules[idx].visible[k].equals(target)) { return true; }
+        }
+        return false;
+    }
+
+    /// Which modules a path written in a body names, as the file of
+    /// `use_module` can see them: asked of a whole scope segment, of a
+    /// segment's prefix, and by the type layer to say why a qualified
+    /// annotation named nothing.  With a `root`, the spelling continues a
+    /// path that already named that module (`J::Inner` once `J` named
+    /// `Json`).
+    modules_written_as(&this, spelling: string, use_module: ModulePath, root: ModulePath,
+                       intern: InternTable*) -> ModuleSpellingMatch {
+        return this.modules_in_view(spelling, use_module, root, intern);
+    }
+
+    /// Every module, in the graph's order, whose declared namespace the
+    /// written path `written` abbreviates: for a diagnostic's help naming
+    /// the module an unknown import path was meant to be.
+    modules_abbreviated_by(&this, written: string, intern: InternTable*) -> ModulePath[] {
+        mut out: ModulePath[] = [];
+        if (intern == null) { return out; }
+        for (mut i: i64 = 0; i < this.modules.length; i++) {
+            const ns: SymbolStr = this.modules[i].namespace_name;
+            if (!ns.is_valid()) { continue; }
+            if (ModuleGraph::ns_written_as(intern.resolve(ns), written)) { out.push(ModulePath::of(ns)); }
+        }
+        return out;
+    }
+
+private:
+    /// A path written in a body, matched against
+    /// the namespaces the modules declare, among the modules the writing
+    /// file can see - its own, the ones it imports, the prelude, or a
+    /// package root written whole.  Every candidate is judged here, so
+    /// "nothing carries this spelling" and "something does, out of reach"
+    /// are told apart (`matched` beside `visible`).
+    ///
+    /// A spelling of more than one segment may continue a path from a
+    /// module this file imports: `Toml::Sub` with `import A::Toml;` names
+    /// `A::Toml::Sub`, whose head is the import's binding.  Such a module is
+    /// reachable through the import, as the same path through an alias is.
+    /// The imported modules the head can name are gathered in the same walk,
+    /// and the candidates are judged once it has seen them all.
+    ///
+    /// A path that names a module's whole namespace needs no import: a
+    /// package root is addressable as written.  Only the whole one - an
+    /// abbreviation like `core::option` is a proper suffix whose first
+    /// segment binds nothing, and stays unreachable.
+    modules_in_view(&this, spelling: string, use_module: ModulePath, root: ModulePath,
+                    intern: InternTable*) -> ModuleSpellingMatch {
+        mut r: ModuleSpellingMatch = ModuleSpellingMatch {
+            found:   ModulePath::none(),
+            found_def: DefId::invalid(),
+            other:   ModulePath::none(),
+            any:     ModulePath::none(),
+            visible: 0,
+            matched: 0,
+        };
+        if (intern == null) { return r; }
+        const prelude: ModulePath[] = this.prelude_set(intern);
+        const rooted: boolean = root.is_valid();
+        const rooted_length: u64 =
+            if (rooted) { intern.resolve(root.sym).length() + 2 + spelling.length() } else { 0 };
+        const head: string = QualifiedName::head_of(spelling);
+        const continues: boolean = !rooted && head.length() < spelling.length();
+        const tail_length: u64 = spelling.length() - head.length();
+        mut heads: ModulePath[] = [];
+        mut head_lengths: u64[] = [];
+        mut cands: ModulePath[] = [];
+        mut cand_defs: DefId[] = [];
+        mut cand_lengths: u64[] = [];
+        mut cand_reach: boolean[] = [];
+        for (mut i: i64 = 0; i < this.modules.length; i++) {
+            const cand_ns: SymbolStr = this.modules[i].namespace_name;
+            if (!cand_ns.is_valid()) { continue; }
+            const cand_path: ModulePath = this.modules[i].path();
+            const cand_str: string = intern.resolve(cand_ns);
+            const names_head: boolean = continues && ModuleGraph::ns_written_as(cand_str, head);
+            const names_spelling: boolean = ModuleGraph::ns_written_as(cand_str, spelling)
+                && !(rooted && (cand_str.length() != rooted_length
+                                || !cand_path.is_within(root, intern)));
+            if (!names_head && !names_spelling) { continue; }
+            const imported: boolean = this.imports(use_module, cand_path);
+            if (names_head && imported) {
+                heads.push(cand_path);
+                head_lengths.push(cand_str.length());
+            }
+            if (!names_spelling) { continue; }
+            r.matched = r.matched + 1;
+            if (r.matched == 1) { r.any = cand_path; }
+            mut in_prelude: boolean = false;
+            for (mut p: i64 = 0; p < prelude.length; p++) {
+                if (prelude[p].equals(cand_path)) { in_prelude = true; }
+            }
+            const reachable: boolean = rooted
+                || cand_path.equals(use_module)
+                || cand_str.eq(spelling)
+                || in_prelude
+                || imported;
+            cands.push(cand_path);
+            cand_defs.push(this.modules[i].def);
+            cand_lengths.push(cand_str.length());
+            cand_reach.push(reachable);
+        }
+        for (mut c: i64 = 0; c < cands.length; c++) {
+            mut reachable: boolean = cand_reach[c];
+            for (mut h: i64 = 0; !reachable && h < heads.length; h++) {
+                reachable = head_lengths[h] + tail_length == cand_lengths[c]
+                    && cands[c].is_within(heads[h], intern);
+            }
+            if (!reachable) { continue; }
+            r.visible = r.visible + 1;
+            if (r.visible == 1) { r.found = cands[c]; r.found_def = cand_defs[c]; }
+            if (r.visible == 2) { r.other = cands[c]; }
+        }
+        return r;
+    }
+
+    /// Whether `written` names the namespace `mod_str` as one file may write
+    /// it: the whole namespace, or a suffix of it that starts on a segment
+    /// boundary, so `ture` does not name `std::future`.  Only leading
+    /// segments may be left off: whether `future` names `std::future` from
+    /// here is a scope question, while a path that drops trailing segments
+    /// would name a module that declares nothing it names.
+    static ns_written_as(mod_str: string, written: string) -> boolean {
+        const ml: i64 = mod_str.length() as i64;
+        const pl: i64 = written.length() as i64;
+        if (pl == 0 || pl > ml) { return false; }
+        // Only one alignment can be a suffix, so this is a single check rather
+        // than a scan.
+        const i: i64 = ml - pl;
+        if (!mod_str.substring(i as u32, pl as u32).eq(written)) { return false; }
+        return i == 0 || (i >= 2 && mod_str[i - 1] == ':' && mod_str[i - 2] == ':');
+    }
+
+public:
+    /// Turn every module's recorded edges into the modules they name, once,
+    /// when discovery has finished and the graph holds every module an edge
+    /// can name.  A recorded namespace the graph holds no module for names
+    /// nothing: a dependency's is counted, so a closure over it knows it is
+    /// incomplete; any other edge carries no module to see.
+    resolve_edges(mut &this) -> void {
+        for (mut i: i64 = 0; i < this.modules.length; i++) {
+            // A module is no dependency of its own: `import A::{ X };` records
+            // the parent path `A`, so a file whose own namespace is `A` would
+            // gain an unsatisfiable self-edge and be reported as a cycle
+            // ("blocked by itself").  The edge orders nothing, and the brace
+            // items are recorded separately as visibility edges.  A module
+            // re-exporting itself is dropped for the same reason.
+            mut unresolved: u32 = 0;
+            this.modules[i].dependencies = this.modules_of(&this.modules[i].written_dependencies, i, false, &unresolved);
+            this.modules[i].unresolved_dependencies = unresolved;
+            mut ignored: u32 = 0;
+            this.modules[i].imported_namespaces = this.modules_of(&this.modules[i].written_imported, -1, true, &ignored);
+            this.modules[i].submodules = this.modules_of(&this.modules[i].written_submodules, -1, true, &ignored);
+            this.modules[i].reexports = this.modules_of(&this.modules[i].written_reexports, i, true, &ignored);
+            this.modules[i].written_dependencies = [];
+            this.modules[i].written_imported = [];
+            this.modules[i].written_submodules = [];
+            this.modules[i].written_reexports = [];
+        }
+    }
+
+    /// The modules a recorded list of namespaces names, in order; one the
+    /// graph holds no module for is left out and counted in `*out_unresolved`.
+    /// The module at index `except` (-1 for none) is left out, and with
+    /// `once` a module recorded twice appears once, where it was first
+    /// recorded - both judged by the module, after the namespace is resolved.
+    modules_of(&this, written: &RecordedEdge[], except: i64, once: boolean, out_unresolved: u32*) -> ModulePath[] {
+        mut out: ModulePath[] = [];
+        mut seen: i64[] = [];
+        for (mut i: i64 = 0; i < written.length; i++) {
+            const m: ModulePath =
+                if (written[i].target.is_valid()) { written[i].target } else { this.module_named(written[i].written) };
+            if (!m.is_valid()) {
+                *out_unresolved = *out_unresolved + 1;
+                continue;
+            }
+            const idx: i64 = this.find_module_index(m);
+            if (idx == except) { continue; }
+            if (once) {
+                mut dup: boolean = false;
+                for (mut k: i64 = 0; k < seen.length; k++) {
+                    if (seen[k] == idx) { dup = true; break; }
+                }
+                if (dup) { continue; }
+                seen.push(idx);
+            }
+            out.push(m);
+        }
+        return out;
+    }
+
+    /// The path of the module the source file `file` declares; none for a
+    /// file the graph did not load, or one declaring no namespace.
+    module_of_file(&this, file: string) -> ModulePath {
+        if (file.length() == 0) { return ModulePath::none(); }
+        const idx: i64 = this.find_module_by_path(file);
+        if (idx < 0) { return ModulePath::none(); }
+        return ModulePath::of(this.modules[idx].namespace_name);
+    }
+
+    /// Find a module's index by its path.  Returns -1 if not found.
+    find_module_index(&this, name: ModulePath) -> i64 {
+        return match (this.name_index.get(&name.table_key())) {
             Option::Some(val) => { val as i64 }
             Option::None      => { -1 }
         };
     }
 
-    /// Map an owner key (a namespace name, or a source-file path for modules
-    /// without a namespace) to that module's source-file path, interned.
-    /// Used by spec routing to set a relocated specialization's
-    /// DeclarationIndex module ownership to its template's defining module so it
-    /// agrees with where the spec's AST is placed.  Returns an invalid
-    /// SymbolStr if no module matches.
-    source_file_for_owner_key(&this, key: SymbolStr, intern: InternTable*) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.modules.length; i++) {
-            if (this.modules[i].namespace_name.is_valid()
-                    && this.modules[i].namespace_name.equals(key)) {
-                return intern.intern(this.modules[i].file_path);
+    /// The definition the module at path `m` is, or an invalid id when no
+    /// module has that path.
+    module_def(&this, m: ModulePath) -> DefId {
+        return match (this.module_defs.get(&m.table_key())) {
+            Option::Some(d) => { d }
+            Option::None    => { DefId::invalid() }
+        };
+    }
+
+    /// Register the module a C import declares, under the namespace the
+    /// import composes for its alias (`<mod>::cit`), and answer its path:
+    /// the identity every declaration the import brings in is declared in.
+    /// The importer calls this once per import, before the name layer has
+    /// bound the alias, so the module holds no definition until
+    /// `bind_c_import_module` gives it one.  Registering a namespace again
+    /// keeps the definition already bound to it.
+    register_c_import_module(mut &this, ns: SymbolStr) -> ModulePath {
+        if (!ns.is_valid()) { return ModulePath::none(); }
+        const m: ModulePath = ModulePath::of(ns);
+        if (!this.module_defs.contains_key(&m.table_key())) {
+            this.module_defs.insert(m.table_key(), DefId::invalid());
+        }
+        return m;
+    }
+
+    /// Bind the C import module `m` to `def`, the binding the name layer
+    /// made for the import's alias, as a discovered module is bound in
+    /// `add_module`.
+    bind_c_import_module(mut &this, m: ModulePath, def: DefId) -> void {
+        if (!m.is_valid()) { return; }
+        this.module_defs.insert(m.table_key(), def);
+        this.def_list.push(def);
+        this.def_paths.push(m);
+    }
+
+    /// The module the definition `d` IS: its path when `d` is a module the
+    /// graph holds - discovered, or a C import's - and none for any other
+    /// definition.  Identity to identity: no spelling is read.
+    module_of_def(&this, d: DefId) -> ModulePath {
+        if (!d.is_valid()) { return ModulePath::none(); }
+        for (mut i: i64 = 0; i < this.def_list.length; i++) {
+            if (this.def_list[i].equals(d)) { return this.def_paths[i]; }
+        }
+        return ModulePath::none();
+    }
+
+    /// The module the definition `d` is declared in - the nearest module on
+    /// its parent chain - as the path the graph holds it under: a discovered
+    /// module's, or a C import's.  None when no module encloses `d`, or the
+    /// graph holds none with that definition.  Identity to identity: no
+    /// spelling is read.
+    declaring_module(&this, d: DefId) -> ModulePath {
+        if (this.defs == null) { return ModulePath::none(); }
+        const m: DefId = this.defs.module_of(d);
+        if (!m.is_valid()) { return ModulePath::none(); }
+        for (mut i: i64 = 0; i < this.def_list.length; i++) {
+            if (this.def_list[i].equals(m)) { return this.def_paths[i]; }
+        }
+        return ModulePath::none();
+    }
+
+    /// Every namespace reachable from `ns` by `export` edges, transitively,
+    /// excluding `ns` itself.  Empty when `ns` names no module in the graph.
+    ///
+    /// An `export` grants an importer what the same path would grant if it
+    /// were imported there, and that is not limited to one hop: a facade that
+    /// names a facade must keep granting, or a module's internal layout leaks
+    /// into the spelling every importer has to use.  `reexports` holds one
+    /// hop, so a consumer that reads the field directly sees only the first.
+    ///
+    /// The result is both worklist and visited set - a namespace already
+    /// present is never appended again - which is what terminates the walk.
+    /// It cannot terminate on the graph being acyclic, because mutual
+    /// re-export is legal by design.
+    reexport_closure(&this, ns: ModulePath) -> ModulePath[] {
+        mut out: ModulePath[] = [];
+        const start: i64 = this.find_module_index(ns);
+        if (start < 0) { return out; }
+        const root: ModuleInfo* = this.get_module(start);
+        for (mut i: i64 = 0; i < root.reexports.length; i++) {
+            out.push(root.reexports[i]);
+        }
+        mut wi: i64 = 0;
+        while (wi < out.length) {
+            const via: ModulePath = out[wi];
+            wi = wi + 1;
+            const vidx: i64 = this.find_module_index(via);
+            if (vidx < 0) { continue; }
+            const vinfo: ModuleInfo* = this.get_module(vidx);
+            for (mut ri: i64 = 0; ri < vinfo.reexports.length; ri++) {
+                const nxt: ModulePath = vinfo.reexports[ri];
+                if (nxt.equals(ns)) { continue; }
+                mut seen: boolean = false;
+                for (mut qi: i64 = 0; qi < out.length; qi++) {
+                    if (out[qi].equals(nxt)) { seen = true; }
+                }
+                if (!seen) { out.push(nxt); }
             }
         }
-        // No namespace match: the key may itself be a source-file path
-        // (modules registered without a namespace use the path as their key).
+        return out;
+    }
+
+    /// The source file of the module at path `m`, interned; invalid when the
+    /// graph loaded no file for it (a C import's module, or no module).
+    source_file_of(&this, m: ModulePath, intern: InternTable*) -> SymbolStr {
+        if (!m.is_valid()) { return SymbolStr::empty(); }
         for (mut i: i64 = 0; i < this.modules.length; i++) {
-            const fp: SymbolStr = intern.intern(this.modules[i].file_path);
-            if (fp.equals(key)) { return fp; }
+            if (this.modules[i].namespace_name.is_valid()
+                    && this.modules[i].namespace_name.equals(m.sym)) {
+                return intern.intern(this.modules[i].file_path);
+            }
         }
         return SymbolStr::empty();
     }
@@ -307,19 +914,6 @@ type struct ModuleGraph {
         *slot = ast;
     }
 
-    /// Save the resolver's current scope for a module (called after NameResolution).
-    save_module_scope(mut &this, index: u32, scope_id: u64) -> void {
-        if (index >= this.module_scope_cap || this.module_scope_buf == null) { return; }
-        const slot: u64* = (this.module_scope_buf as u64*) + index;
-        *slot = scope_id;
-    }
-
-    /// Get the saved scope for a module (0 if not saved).
-    get_module_scope(mut &this, index: u32) -> u64 {
-        if (index >= this.module_scope_cap || this.module_scope_buf == null) { return 0; }
-        const slot: u64* = (this.module_scope_buf as u64*) + index;
-        return *slot;
-    }
 
     /// Compute topological order using simple iterative selection.
     /// No raw pointers; uses array scanning for "is placed" checks.
@@ -334,7 +928,7 @@ type struct ModuleGraph {
         mut order: u32[] = [];
         mut max_iters: u32 = n + 1;
 
-        while (order.length < n && max_iters > 0) {
+        while (order.length < (n as i64) && max_iters > 0) {
             max_iters -= 1;
             mut placed_any: boolean = false;
 
@@ -345,7 +939,7 @@ type struct ModuleGraph {
                 // Check if all dependencies are already placed.  Borrow the
                 // deps in place; moving them into a local would alias the
                 // array stored in `this.modules[i]` and double-free.
-                const deps: &SymbolStr[] = &this.modules[i].dependencies;
+                const deps: &ModulePath[] = &this.modules[i].dependencies;
                 mut all_ready: boolean = true;
                 for (mut d: i64 = 0; d < deps.length; d++) {
                     const dep_idx: i64 = this.find_module_index(deps[d]);
@@ -366,20 +960,24 @@ type struct ModuleGraph {
                 cdebug("[TopSort] Cycle detected! %u of %u modules placed.\n",
                     order.length, n);
                 cdebug("[TopSort] Unplaced modules and their unresolved deps:\n");
+                mut unplaced: u32[] = [];
                 for (mut ci: u32 = 0; ci < n; ci++) {
                     if (ModuleGraph::topo_contains(order, ci)) { continue; }
+                    unplaced.push(ci);
                     const cinfo: ModuleInfo* = &this.modules[ci];
                     cdebug("  [%u] %s\n", ci, cinfo.file_path);
                     // Read deps in place - a value copy of `cinfo` would alias
                     // its owning arrays and double-free at scope exit.
                     for (mut cd: i64 = 0; cd < cinfo.dependencies.length; cd++) {
-                        const cdep_idx: i64 = this.find_module_index(cinfo.dependencies[cd]);
+                        const cdep_idx: i64 =
+                            this.find_module_index(cinfo.dependencies[cd]);
                         if (cdep_idx >= 0 && !ModuleGraph::topo_contains(order, cdep_idx as u32)) {
                             cdebug("    -> blocked by [%lld] %s\n",
                                 cdep_idx, this.modules[cdep_idx].file_path);
                         }
                     }
                 }
+                this.topo_unplaced = unplaced;
                 this.topo_order = order;
                 return false;
             }
@@ -388,22 +986,7 @@ type struct ModuleGraph {
         this.topo_order = order;
         // `order` was moved into `this.topo_order`; read its length back
         // through the new owner.
-        return this.topo_order.length == n;
-    }
-
-    /// Register a cross-module function descriptor.
-    register_cross_module_fn(mut &this, desc: CrossModuleFnDescriptor) -> void {
-        this.cross_module_fns.push(desc);
-    }
-
-    /// Look up a cross-module function by name.  Returns null if not found.
-    find_cross_module_fn(&this, name: SymbolStr) -> CrossModuleFnDescriptor* {
-        for (mut i: int = 0; i < this.cross_module_fns.length; i++) {
-            if (this.cross_module_fns[i].name.equals(name)) {
-                return &this.cross_module_fns[i];
-            }
-        }
-        return null;
+        return this.topo_order.length == (n as i64);
     }
 
     /// Transitive import closure of module `root` (including `root` itself),
@@ -435,6 +1018,7 @@ type struct ModuleGraph {
             const cur: u32 = queue[head];
             head = head + 1;
             const info: ModuleInfo* = &this.modules[cur];
+            if (info.unresolved_dependencies > 0 && out_incomplete != null) { *out_incomplete = true; }
             for (mut d: i64 = 0; d < info.dependencies.length; d++) {
                 const didx: i64 = this.find_module_index(info.dependencies[d]);
                 if (didx < 0 || didx >= n as i64) {
@@ -451,12 +1035,11 @@ type struct ModuleGraph {
     }
 
 
-
     // Free helper for topological sort (avoids method-in-complex-function issues)
 
     /// Check if a value is in the order array (linear scan).
     static topo_contains(order: &u32[], val: u32) -> boolean {
-        for (mut i: u32 = 0; i < order.length; i++) {
+        for (mut i: i64 = 0; i < order.length; i++) {
             if (order[i] == val) {
                 return true;
             }
@@ -486,53 +1069,5 @@ type struct ModuleGraph {
         }
         return true;
     }
-
-    /// Build cross-module function descriptors for a specific module.
-    /// Looks up each function's FunctionType in the DeclIndex -> arena to get
-    /// the full signature (return type, param types, variadic flag).
-    static build_cross_module_descriptors(
-        graph: ModuleGraph*, module_sym: SymbolStr,
-        decl_index: DeclarationIndex*, arena: TypeArena*) -> void {
-        if (graph == null || decl_index == null || arena == null) { return; }
-
-        const funcs: SymbolStr[] = decl_index.get_functions_in_module(module_sym);
-        for (mut i: i64 = 0; i < funcs.length; i++) {
-            const fn_name: SymbolStr = funcs[i];
-            const func_type_ref: TypeRef = decl_index.lookup_func_type(fn_name);
-
-            if (func_type_ref.is_invalid()) {
-                // No FunctionType registered; use return-type-only fallback
-                const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
-                if (ret_type.is_valid()) {
-                    graph.register_cross_module_fn(CrossModuleFnDescriptor::new(fn_name, ret_type));
-                }
-                continue;
-            }
-
-            // Look up the FunctionType in the arena to get full signature
-            const ty: Type* = arena.lookup(func_type_ref.id);
-            if (ty == null || ty.kind != TypeKind::Function) {
-                const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
-                if (ret_type.is_valid()) {
-                    graph.register_cross_module_fn(CrossModuleFnDescriptor::new(fn_name, ret_type));
-                }
-                continue;
-            }
-
-            const ft: FunctionType* = ty as FunctionType*;
-            // Independent copy of `param_types` (TypeRef is Copy): the descriptor
-            // owns its array, so aliasing `ft.param_types` here would free the
-            // FunctionType's buffer twice.
-            mut pt_copy: TypeRef[] = [];
-            for (mut i: i64 = 0; i < ft.param_types.length; i++) { pt_copy.push(ft.param_types[i]); }
-            const desc: CrossModuleFnDescriptor = CrossModuleFnDescriptor {
-                name:        fn_name,
-                return_type: ft.return_type,
-                param_types: pt_copy,
-                is_var_arg:  ft.is_variadic,
-            };
-            graph.register_cross_module_fn(desc);
-        }
-    }
-
 }
+

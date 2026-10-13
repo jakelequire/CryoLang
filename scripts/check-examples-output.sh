@@ -35,6 +35,25 @@ export CRYO_STDLIB="${CRYO_STDLIB:-$ROOT/stdlib}"
 EXAMPLES=(02-fizzbuzz 07-shapes 10-expr-interpreter 13-closures)
 
 fail=0
+
+# The list above and the goldens on disk must be the SAME set, in both
+# directions.  A listed example with no golden already failed loudly; a golden
+# with no list entry did not fail at all - the file sits there looking like
+# coverage while nothing ever reads it, and the run still prints "OK (4
+# examples)".  Writing an expected.out is exactly what someone adding an
+# example does, so the silent half is the one that happens.
+for golden in "$ROOT"/examples/*/expected.out; do
+    [ -e "$golden" ] || continue
+    name="$(basename "$(dirname "$golden")")"
+    listed=0
+    for n in "${EXAMPLES[@]}"; do
+        [ "$n" = "$name" ] && listed=1
+    done
+    if [ "$listed" -eq 0 ]; then
+        echo "FAIL $name: has expected.out but is not in EXAMPLES, so nothing runs it"
+        fail=1
+    fi
+done
 for n in "${EXAMPLES[@]}"; do
     dir="$ROOT/examples/$n"
     golden="$dir/expected.out"

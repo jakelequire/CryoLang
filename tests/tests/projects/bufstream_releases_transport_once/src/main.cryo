@@ -1,0 +1,51 @@
+/// A `BufStream` wrapping a transport releases the transport once when the
+/// stream goes out of scope.  The transport is a field: the stream's own
+/// `drop` runs first, then field glue releases every field, the transport
+/// among them.  A `drop` body that also released the transport released it
+/// twice.  The exit code is the release count; 0 means it held.
+namespace BufStreamReleasesTransportOnce::Main;
+
+import std::collections::array::{ Array };
+import std::core::drop::{ Drop };
+import std::core::result::{ Result };
+import std::ffi::libc;
+import std::io::buf::{ BufStream };
+import std::io::traits::{ AsyncTransport, Transfer };
+
+mut g_drops: i32 = 0;
+
+type struct Transport {
+    id: i32;
+}
+
+implement trait AsyncTransport for struct Transport {
+    async read_into(mut &this, buf: Array<u8>) -> Transfer {
+        mut out: Array<u8> = buf;
+        out.truncate(0);
+        return Transfer { buf: out, result: Result::Ok(0) };
+    }
+
+    async write_from(mut &this, buf: Array<u8>) -> Transfer {
+        mut src: Array<u8> = buf;
+        const n: u64 = src.length();
+        return Transfer { buf: src, result: Result::Ok(n) };
+    }
+}
+
+implement trait Drop for struct Transport {
+    drop(mut &this) -> void {
+        g_drops = g_drops + 1;
+    }
+}
+
+function wrap_and_leave() -> i32 {
+    mut s: BufStream<Transport> = BufStream::<Transport>::of(Transport { id: 7 });
+    return s.transport().id;
+}
+
+function main() -> int {
+    if (wrap_and_leave() != 7) { return 10; }
+    if (g_drops != 1) { return g_drops; }
+    libc::printf("bufstream-release ok\n");
+    return 0;
+}

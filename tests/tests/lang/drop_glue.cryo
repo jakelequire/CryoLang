@@ -22,14 +22,23 @@
 namespace CryoTests::Tests::Lang::DropGlue;
 
 import std::core::result;
+import std::core::result::{ Result };
 import std::core::option;
+import std::core::option::{ Option };
 import std::core::drop;
+import std::core::drop::{ Drop };
 import std::core::cmp;
+import std::core::cmp::{ Eq };
 import std::collections::array;
+import std::collections::array::{ Array };
 import std::collections::str;
+import std::collections::str::{ Str };
 import std::collections::string;
+import std::collections::string::{ String };
 import std::test::error;
+import std::test::error::{ TestError };
 import std::test::assert;
+import std::test::assert::{ expect_eq };
 
 mut g_drop_count: i32 = 0;
 function reset() -> void { g_drop_count = 0; }
@@ -181,7 +190,7 @@ function match_mut_binding_realloc_no_double_free() -> Result<(), TestError> {
 function array_of_owned_drops_each() -> Result<(), TestError> {
     reset();
     {
-        mut xs: Array<Probe> = Array<Probe>::new();
+        mut xs: Array<Probe> = Array::<Probe>::new();
         xs.push(Probe { tag: 1 });
         xs.push(Probe { tag: 2 });
     }
@@ -246,4 +255,54 @@ function match_rvalue_subject_consumed_no_double_free() -> Result<(), TestError>
     // Borrow-only arm: subject stays live, hoisted local's glue drops the
     // payload exactly once.
     return expect_eq(count(), 1);
+}
+
+// ---- a user `drop` runs IN ADDITION to field glue ------------------------
+//
+// Writing a destructor used to switch field glue OFF for that type, so the
+// aggregate's fields were released only if the body named them. That made
+// adding a `drop` the one edit that could turn a correct type into a leaking
+// one, and it leaked silently - the same struct without a `drop` had its
+// fields released for it.
+
+// A hand-written `drop` that deliberately releases nothing.
+type struct HandDropped { p: Probe; }
+implement trait Drop for struct HandDropped {
+    drop(mut &this) -> void { }
+}
+
+![test]
+function user_drop_does_not_suppress_field_glue() -> Result<(), TestError> {
+    reset();
+    { mut a: HandDropped = HandDropped { p: Probe { tag: 1 } }; }
+    return expect_eq(count(), 1);
+}
+
+// The transitional case, and the invariant the design now leans on: a body
+// that releases its own field is followed by glue releasing it a second time.
+// That is sound only because a leaf drop nulls what it frees, so the second
+// release is a no-op. Asserted as an EFFECT count rather than a call count, so
+// it stays true once the redundant hand-written releases are stripped.
+mut g_idem_releases: i32 = 0;
+
+type struct IdemProbe { released: boolean; }
+implement trait Drop for struct IdemProbe {
+    drop(mut &this) -> void {
+        if (!this.released) {
+            g_idem_releases = g_idem_releases + 1;
+            this.released = true;
+        }
+    }
+}
+
+type struct ManualOwner { q: IdemProbe; }
+implement trait Drop for struct ManualOwner {
+    drop(mut &this) -> void { this.q.drop(); }
+}
+
+![test]
+function manual_field_release_then_glue_releases_once() -> Result<(), TestError> {
+    g_idem_releases = 0;
+    { mut a: ManualOwner = ManualOwner { q: IdemProbe { released: false } }; }
+    return expect_eq(g_idem_releases, 1);
 }

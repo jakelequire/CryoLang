@@ -43,6 +43,29 @@ CFG
 PANIC_MSG="panicked at verify.cryo:42: boom"
 overall=0
 
+# A skipped arm is a FAILURE unless the caller says otherwise.
+#
+# Both arms used to return 0 when their toolchain was absent, and the script
+# then printed "verify-freestanding: OK" having run half of itself - the same
+# shape as a sweep that covered nothing, and the reason this gate could be run
+# on a host that could not possibly have exercised the Windows tiers and still
+# be quoted as evidence they work.  `--allow-skipped-arm` (the spelling
+# selfhost-check already uses) turns that into a stated decision: the run says
+# out loud which arm it did not run.
+ALLOW_SKIPPED_ARM=0
+for arg in "$@"; do
+    case "$arg" in
+        --allow-skipped-arm) ALLOW_SKIPPED_ARM=1 ;;
+        *) echo "verify-freestanding: unknown argument $arg" >&2; exit 2 ;;
+    esac
+done
+skipped=""
+
+note_skip() {  # <arm> <reason>
+    skipped="$skipped $1"
+    echo "$1: SKIPPED ($2)"
+}
+
 # Build one throwaway user object from a given lib.cryo body. Emits the .o path.
 build_app() {  # <lib.cryo-body-file> <target-flags...>
     local body="$1"; shift
@@ -349,10 +372,10 @@ run_linux() {
 run_windows() {
     local mingw="x86_64-w64-mingw32-gcc"
     if [ "${FREESTANDING_LINUX_ONLY:-0}" != "0" ]; then
-        echo "windows: SKIPPED (FREESTANDING_LINUX_ONLY set)"; return 0
+        note_skip windows "FREESTANDING_LINUX_ONLY set"; return 0
     fi
     if ! command -v "$mingw" >/dev/null || ! command -v wine >/dev/null; then
-        echo "windows: SKIPPED (need $mingw and wine)"; return 0
+        note_skip windows "need $mingw and wine"; return 0
     fi
     local tgt="x86_64-pc-windows-gnu"
     # The `rm -rf .bin` also removes the hosted abort tier, which lives in the
@@ -449,4 +472,23 @@ run_windows() {
 run_linux   || overall=1
 run_windows || overall=1
 
-[ "$overall" -eq 0 ] && echo "verify-freestanding: OK" || { echo "verify-freestanding: FAILED"; exit 1; }
+if [ -n "$skipped" ]; then
+    if [ "$ALLOW_SKIPPED_ARM" -eq 1 ]; then
+        echo "verify-freestanding: arm(s) NOT RUN:$skipped (--allow-skipped-arm)"
+    else
+        echo "verify-freestanding: arm(s) NOT RUN:$skipped"
+        echo "verify-freestanding: this run covered less than the gate claims."
+        echo "  Pass --allow-skipped-arm to accept that deliberately, or supply"
+        echo "  the toolchain the arm needs."
+        overall=1
+    fi
+fi
+
+if [ "$overall" -ne 0 ]; then
+    echo "verify-freestanding: FAILED"; exit 1
+fi
+if [ -n "$skipped" ]; then
+    echo "verify-freestanding: OK for every arm that ran; NOT RUN:$skipped"
+else
+    echo "verify-freestanding: OK (linux + windows)"
+fi

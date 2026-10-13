@@ -8,27 +8,37 @@
 /// global-variable phase - before any basic block exists - just as well as
 /// inside a function body.
 
-namespace Compiler::Codegen::State::StringCache;
+namespace compiler::codegen::state::string_cache;
 
-import Compiler::Codegen::LLVMTypes;
+import compiler::codegen::llvm_types;
+import compiler::codegen::llvm_types::{ LLinkage, LModule, LType, LUnnamedAddr, LValue };
 import std::collections::pair;
+import std::collections::pair::{ Pair };
+import std::fmt;
+import std::ffi::libc;
+import compiler::resolver::mangled_name::{ MangledName };
 
 
 type struct StringCache {
     entries: Pair<string, void*>[];   // (text, LLVMValueRef)
+    /// Each entry's byte count, a NUL among them: two literals that agree up
+    /// to a NUL are two constants.
+    lengths: i64[];
 
     static new() -> StringCache {
-        return StringCache { entries: [] };
+        return StringCache { entries: [], lengths: [] };
     }
 
-    get_or_create(mut &this, text: string, module: LModule*) -> LValue {
+    /// The constant global holding the first `length` bytes of `text`.
+    get_or_create(mut &this, text: string, length: i64, llmodule: LModule*) -> LValue {
         for (mut i: i64 = 0; i < this.entries.length; i++) {
-            if (this.entries[i].first == text) {
+            if (this.lengths[i] == length
+                    && libc::memcmp(this.entries[i].first as u8*, text as u8*, length as u64) == 0) {
                 return LValue { raw: this.entries[i].second };
             }
         }
 
-        const name: string = format(".str.%d", this.entries.length);
+        const name: string = fmt::format(".str.%d", this.entries.length);
 
         // Emit a private, NUL-terminated `[N x i8]` constant global directly
         // at module scope, reproducing what `LLVMBuildGlobalStringPtr` builds
@@ -39,8 +49,8 @@ type struct StringCache {
         // global-variable phase.  Under opaque pointers the global itself is
         // the `i8*`, so it is returned directly (the GEP to element 0 folds
         // away to the global anyway).
-        const arr: LValue = LType::const_string(text);
-        const global: LValue = module.add_global(arr.type_of(), name);
+        const arr: LValue = LType::const_string(text, length);
+        const global: LValue = llmodule.add_global(arr.type_of(), MangledName::new(name));
         global.set_initializer(arr);
         global.set_global_constant(true);
         global.set_linkage(LLinkage::Private);
@@ -48,6 +58,7 @@ type struct StringCache {
         global.set_alignment(1);
 
         this.entries.push(Pair::new(text, global.raw));
+        this.lengths.push(length);
 
         return global;
     }

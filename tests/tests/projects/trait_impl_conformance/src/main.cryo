@@ -1,0 +1,104 @@
+namespace trait_impl_conformance;
+
+import std::core::option::{ Option };
+import std::ffi::libc;
+
+// Implementations whose methods match their traits' declarations in every
+// spelling the check reads through: a default left out, `This` written as
+// the type implemented for, a method's own type parameter renamed, a
+// generic owner written over its own parameters, an associated type bound
+// by position or in the body and spelled bound or as `This::Item`, a
+// projection the supertrait declares, and `Allocate` on a struct.
+
+type trait Shape {
+    area(&this) -> i32;
+    scale(mut &this, k: i32) -> void;
+    static unit() -> This;
+    name(&this) -> i32 { return 7; }
+    pick<U>(&this, u: U) -> U;
+}
+
+type struct Sq { s: i32; }
+
+implement trait Shape for struct Sq {
+    area(&this) -> i32 { return this.s * this.s; }
+    scale(mut &this, k: i32) -> void { this.s = this.s * k; }
+    static unit() -> Sq { return Sq { s: 1 }; }
+    pick<V>(&this, u: V) -> V { return u; }
+}
+
+type trait Dup {
+    dup(&this) -> This;
+    same(&this, o: &This) -> boolean;
+}
+
+type struct Wrap<T> { v: T; }
+
+implement<T> trait Dup for struct Wrap<T> {
+    dup(&this) -> Wrap<T> { return Wrap::<T> { v: this.v }; }
+    same(&this, o: &Wrap<T>) -> boolean { return true; }
+}
+
+type trait Source {
+    type Item;
+    take(mut &this) -> Option<This::Item>;
+}
+
+type trait Back : Source {
+    take_back(mut &this) -> Option<This::Item>;
+}
+
+type struct Count { n: i32; }
+
+implement trait Source for struct Count {
+    type Item = i32;
+    take(mut &this) -> Option<i32> {
+        if (this.n == 0) { return Option::None; }
+        this.n = this.n - 1;
+        return Option::Some(this.n);
+    }
+}
+
+implement trait Back for struct Count {
+    take_back(mut &this) -> Option<This::Item> { return this.take(); }
+}
+
+type struct Down { n: i32; }
+
+implement trait Iterator<i32> for struct Down {
+    next(mut &this) -> Option<i32> {
+        if (this.n == 0) { return Option::None; }
+        this.n = this.n - 1;
+        return Option::Some(this.n);
+    }
+}
+
+mut g_allocs: i32 = 0;
+
+type struct Cell { v: i32; }
+
+implement trait Allocate for struct Cell {
+    static allocate(size: u64, align: u64) -> void* {
+        g_allocs = g_allocs + 1;
+        return libc::malloc(size);
+    }
+}
+
+function main() -> i32 {
+    mut q: Sq = Sq::unit();
+    q.scale(3);
+    if (q.area() != 9) { return 1; }
+    if (q.name() != 7) { return 2; }
+    if (q.pick::<u8>(4) != 4) { return 3; }
+    const w: Wrap<i32> = Wrap::<i32> { v: 5 };
+    if (w.dup().v != 5) { return 4; }
+    if (!w.same(&w)) { return 5; }
+    mut c: Count = Count { n: 3 };
+    if (c.take_back().unwrap() != 2) { return 6; }
+    mut d: Down = Down { n: 2 };
+    if (d.next().unwrap() != 1) { return 7; }
+    const p: Cell* = new Cell { v: 11 };
+    if (p.v != 11) { return 8; }
+    if (g_allocs != 1) { return 9; }
+    return 0;
+}

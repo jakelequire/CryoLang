@@ -1,37 +1,47 @@
 ///! Type Substitution
 ///!
-///! Maps GenericParam/BoundedParam TypeIDs to concrete TypeRefs and
+///! Maps GenericParam TypeIDs to concrete TypeRefs and
 ///! recursively applies substitutions through compound types.
 ///! Used by the monomorphization pipeline to transform generic type
 ///! references into their concrete counterparts.
 
-namespace Compiler::Types::Substitution;
+namespace compiler::types::substitution;
 
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Generic, UserDefined, Compound, Type, Arena };
+import compiler::types;
+import compiler::types::{
+    arena, compound, generic, type_base, type_ref, TypeKind, user_defined
+};
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{ TypeAliasType };
 
 
 // TypeSubstitution: Generic parameter to concrete type mapping
 
-/// Maps generic parameter TypeIDs to concrete TypeRef replacements.
-/// Parallel arrays: param_ids[i] corresponds to replacements[i].
+/// Maps generic parameter types to concrete TypeRef replacements.
+/// Parallel arrays: params[i] corresponds to replacements[i].
 type struct TypeSubstitution {
-    param_ids:    u64[];       // GenericParamType/BoundedParamType TypeIDs
+    params:       TypeRef[];   // GenericParamType handles
     replacements: TypeRef[];   // Parallel: the concrete replacements
 
 
-    /// Create a substitution from parallel arrays of param TypeIDs and concrete types.
-    /// Args are borrowed and copied into independently-owned arrays (u64 and
-    /// TypeRef are Copy), so the caller keeps ownership and the same
-    /// (param_ids, type_args) pair can seed more than one substitution without
+    /// Create a substitution from parallel arrays of param types and concrete types.
+    /// Args are borrowed and copied into independently-owned arrays (TypeRef
+    /// is Copy), so the caller keeps ownership and the same
+    /// (params, type_args) pair can seed more than one substitution without
     /// aliasing a single buffer.
-    static from_params(param_type_ids: &u64[], type_args: &TypeRef[]) -> TypeSubstitution {
-        mut ids_copy:  u64[]     = [];
-        mut args_copy: TypeRef[] = [];
-        for (mut i: i64 = 0; i < param_type_ids.length; i++) { ids_copy.push(param_type_ids[i]); }
-        for (mut i: i64 = 0; i < type_args.length; i++)      { args_copy.push(type_args[i]); }
+    static from_params(param_types: &TypeRef[], type_args: &TypeRef[]) -> TypeSubstitution {
+        mut params_copy: TypeRef[] = [];
+        mut args_copy:   TypeRef[] = [];
+        for (mut i: i64 = 0; i < param_types.length; i++) { params_copy.push(param_types[i]); }
+        for (mut i: i64 = 0; i < type_args.length; i++)   { args_copy.push(type_args[i]); }
         return TypeSubstitution {
-            param_ids:    ids_copy,
+            params:       params_copy,
             replacements: args_copy,
         };
     }
@@ -39,38 +49,38 @@ type struct TypeSubstitution {
     /// Create an empty substitution.
     static empty() -> TypeSubstitution {
         return TypeSubstitution {
-            param_ids:    [],
+            params:       [],
             replacements: [],
         };
     }
 
 
     /// Add a single param -> replacement mapping.
-    add(mut &this, param_id: u64, replacement: TypeRef) -> void {
-        this.param_ids.push(param_id);
+    add(mut &this, param: TypeRef, replacement: TypeRef) -> void {
+        this.params.push(param);
         this.replacements.push(replacement);
     }
 
 
-    /// Look up the replacement for a given param TypeID.
-    /// Returns TypeRef::invalid() if not found.
-    get(&this, param_id: u64) -> TypeRef {
-        for (mut i: i64 = 0; i < this.param_ids.length; i++) {
-            if (this.param_ids[i] == param_id) {
-                return this.replacements[i];
-            }
+    /// Look up the replacement for a given param type.
+    /// Returns TypeRef::invalid() if not found - or if found TWICE with two
+    /// different answers.
+    ///
+    /// The arena hands out one parameter type per DECLARATION, so a
+    /// method's `<J>` and the `implement<.., J, ..>` its body was copied
+    /// under are two types and each has its own answer.  Two different
+    /// answers for one parameter is a substitution built wrong; answering
+    /// with whichever was added first would substitute silently, so the
+    /// answer is invalid and the type it was asked for stays unresolved.  A
+    /// parameter bound twice to the SAME type is one answer and is given.
+    get(&this, param: TypeRef) -> TypeRef {
+        mut found: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i < this.params.length; i++) {
+            if (!this.params[i].equals(param)) { continue; }
+            if (!found.is_valid()) { found = this.replacements[i]; continue; }
+            if (!found.equals(this.replacements[i])) { return TypeRef::invalid(); }
         }
-        return TypeRef::invalid();
-    }
-
-    /// Whether this substitution has any mappings.
-    is_empty(&this) -> boolean {
-        return this.param_ids.length == 0;
-    }
-
-    /// Number of param -> replacement pairs.
-    size(&this) -> i64 {
-        return this.param_ids.length;
+        return found;
     }
 
 
@@ -84,7 +94,7 @@ type struct TypeSubstitution {
             return ty;
         }
 
-        const t: Type* = arena.lookup(ty.id);
+        const t: Type* = arena.lookup(ty);
         if (t == null) {
             return ty;
         }
@@ -92,9 +102,6 @@ type struct TypeSubstitution {
         return match (t.kind) {
             TypeKind::GenericParam => {
                 this.apply_generic_param(ty, t, arena)
-            }
-            TypeKind::BoundedParam => {
-                this.apply_bounded_param(ty, t, arena)
             }
             TypeKind::Pointer => {
                 this.apply_pointer(ty, t, arena)
@@ -137,15 +144,7 @@ type struct TypeSubstitution {
     // Per-kind application helpers
 
     apply_generic_param(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
-        const replacement: TypeRef = this.get(ty.id);
-        if (replacement.is_valid()) {
-            return replacement;
-        }
-        return ty;
-    }
-
-    apply_bounded_param(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
-        const replacement: TypeRef = this.get(ty.id);
+        const replacement: TypeRef = this.get(ty);
         if (replacement.is_valid()) {
             return replacement;
         }
@@ -238,18 +237,23 @@ type struct TypeSubstitution {
 
     /// Substitute the base of an associated-type projection. `I::Item` under
     /// `I -> Range<i32>` becomes `Range<i32>::Item` (still an AssocProjection,
-    /// but now over a concrete base). Reducing that concrete-base projection to
-    /// the actual member type (`i32`) needs the impl registry + resolver and is
-    /// done by the monomorphizer's concrete-projection resolver, not here (this
-    /// type-only substitution has no registry access). A projection whose base
-    /// doesn't change is returned as-is.
+    /// but now over a concrete base), and keeps the trait the projection names.
+    /// Reducing that concrete-base projection to the actual member type (`i32`)
+    /// needs the impl registry and is `TypeResolver::concrete_projection`'s,
+    /// not here (this type-only substitution has no registry access). A
+    /// projection whose base doesn't change is returned as-is.  A caller
+    /// that has that reduction in hand binds the projection itself, and
+    /// its reduced type is used, so nothing enclosing the projection is
+    /// built around one that nothing will resolve.
     apply_assoc_projection(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+        const direct: TypeRef = this.get(ty);
+        if (direct.is_valid()) { return direct; }
         const proj: AssocProjectionType* = t as AssocProjectionType*;
         const new_base: TypeRef = this.apply(proj.base, arena);
         if (new_base.equals(proj.base)) {
             return ty;
         }
-        return arena.create_assoc_projection(new_base, proj.member, proj.owning_trait);
+        return arena.create_assoc_projection(new_base, proj.member, proj.owning_trait, proj.slot);
     }
 
     apply_instantiation(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {

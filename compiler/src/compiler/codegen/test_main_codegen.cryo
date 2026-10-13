@@ -19,24 +19,47 @@
 /// onto `ctx.artifacts.object_files` so the existing linking pass picks it
 /// up automatically.
 ///
-/// All cross-module symbol resolution goes through
-/// `ctx.decl_index.lookup_mangled_name(qualified_sym)`; the synthesizer
-/// does NOT compute mangled names itself.
+/// Every symbol comes from the declaration index: a test function's from
+/// the entry stamped on its declaration, a runtime entry point's from the
+/// one entry under its qualified name.  The synthesizer computes no
+/// mangled name itself.
 
-namespace Compiler::Codegen::TestMainCodegen;
+namespace compiler::codegen::test_main_codegen;
 
-import Compiler::Diag;
-import Compiler::Diag::Diagnostic;
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration, Pattern };
-import Compiler::CompilationContext;
-import Compiler::ProjectConfig;
-import Compiler::DeclIndex;
-import Compiler::Resolver::{ SymbolStr, InternTable };
-import Compiler::Codegen;
-import Compiler::Codegen::LLVMTypes;
-import Compiler::Passes::{ PassID, DirectiveProcessing };
-import Utils::Logger;
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
+import compiler::diag::diagnostic;
+import compiler::ast;
+import compiler::ast::{ declaration, node, NodeKind, pattern };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::project_config;
+import compiler::project_config::{ ProjectConfig };
+import compiler::decl_index;
+import compiler::decl_index::{ DeclarationIndex };
+import compiler::resolver::{ symbol_str, intern_table };
+import compiler::codegen;
+import compiler::codegen::{ llvm };
+import compiler::codegen::llvm_types;
+import compiler::codegen::llvm_types::{
+    LBasicBlock, LBuilder, LFileType, LLinkage, LModule, LTargetMachine, LType, LValue
+};
+import compiler::passes::{ pass_id, directive_processing };
+import utils::logger;
+import utils::logger::{ cdebug };
+import std::ffi::libc;
+import std::fmt;
+import compiler::ast::declaration::{ FunctionDeclNode };
+import compiler::ast::pattern::{ DirectiveNode };
+import compiler::passes::directive_processing::{ DirectiveRecord, DirectiveRegistry };
+import compiler::passes::pass_id::{ PassResult };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::generic_registry;
+import compiler::types::generic_registry::{ GenericRegistry };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::resolver::mangled_name::{ MangledName };
 
 
 // TestEntry: one row collected from the registry
@@ -65,7 +88,7 @@ type struct TestMainCodegen {
     /// resulting `.o` onto `ctx.artifacts.object_files`. No-op if not in
     /// test mode.
     static run_test_main_codegen(ctx: CompilationContext*) -> PassResult {
-        if (!ctx.mode.skip_user_main()) {
+        if (!ctx.options.mode.skip_user_main()) {
             // Not test mode; nothing to synthesize.
             return PassResult::ok();
         }
@@ -85,7 +108,7 @@ type struct TestMainCodegen {
                 "test-main synthesis: could not create LLVM module");
             return PassResult::failure(1);
         }
-        const triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const triple: string = ctx.options.target_triple;
         test_mod.set_target_triple(triple);
         mut tm: LTargetMachine = LTargetMachine::create_target_machine_for_triple(triple);
         if (tm.is_valid()) {
@@ -104,14 +127,14 @@ type struct TestMainCodegen {
         // function's mangled symbol so the linker resolves it later.
         mut entries_buf: void* = null;
         if (test_count > 0) {
-            entries_buf = intrinsics::malloc(test_count * 8);
+            entries_buf = libc::malloc(test_count * 8);
         }
         mut entries: void** = entries_buf as void**;
         mut i: u64 = 0;
         while (i < test_count) {
             const t: TestEntry = tests[i];
             const name_global: LValue = TestMainCodegen::add_private_name_global(test_mod, i, t);
-            const fn_decl:     LValue = TestMainCodegen::add_extern_test_function(test_mod, t.mangled_name);
+            const fn_decl:     LValue = TestMainCodegen::add_extern_test_function(test_mod, MangledName::new(t.mangled_name));
             const entry:       LValue = TestMainCodegen::build_descriptor_const(
                 desc_ty, name_global, t.display_len, fn_decl,
                 t.ignored, t.should_panic);
@@ -130,9 +153,9 @@ type struct TestMainCodegen {
             // a null buffer (the LLVM-C API accepts this for zero-length).
             arr_init = LType::const_array(desc_ty, null, 0);
         }
-        if (entries_buf != null) { intrinsics::free(entries_buf); }
+        if (entries_buf != null) { libc::free(entries_buf); }
 
-        const arr_global: LValue = test_mod.add_global(arr_ty, "__cryo_test_descriptors");
+        const arr_global: LValue = test_mod.add_global(arr_ty, MangledName::new("__cryo_test_descriptors"));
         llvm::LLVMSetInitializer(arr_global.raw, arr_init.raw);
         llvm::LLVMSetGlobalConstant(arr_global.raw, 1);
 
@@ -153,7 +176,7 @@ type struct TestMainCodegen {
             return PassResult::failure(1);
         }
         ctx.artifacts.register_object_file(obj_path);
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug("[TestMainCodegen] emitted %s (%llu tests)\n", obj_path, test_count);
         }
 
@@ -172,7 +195,7 @@ type struct TestMainCodegen {
     static collect_tests(ctx: CompilationContext*) -> TestEntry[] {
         mut out: TestEntry[] = [];
         if (ctx.directive_registry == null) { return out; }
-        const reg: DirectiveRegistry* = ctx.directive_registry as DirectiveRegistry*;
+        const reg: DirectiveRegistry* = ctx.directive_registry;
         const intern: InternTable* = ctx.intern_table;
         const di: DeclarationIndex* = ctx.decl_index;
 
@@ -180,7 +203,7 @@ type struct TestMainCodegen {
         while (i < reg.records.length) {
             const rec: DirectiveRecord = reg.records[i];
             i += 1;
-            if (!rec.kind.eq("test")) { continue; }
+            if (!rec.kind.as_string().eq("test")) { continue; }
             if (rec.decl == null) { continue; }
             if (rec.decl.kind != NodeKind::FunctionDeclaration) { continue; }
             const fn_decl: FunctionDeclNode* = rec.decl as FunctionDeclNode*;
@@ -191,7 +214,7 @@ type struct TestMainCodegen {
             // would not work here because Phase 7b runs after the per-module
             // loop has moved `ctx` into a different module's state.
             const qualified: SymbolStr = rec.qualified_name;
-            const mangled:   SymbolStr = di.lookup_mangled_name(qualified);
+            const mangled:   SymbolStr = di.entry_symbol(fn_decl.overload_entry).spelling();
             if (!mangled.is_valid()) {
                 // Test function never reached codegen; skip silently.  The
                 // user-facing diagnostic for "test function couldn't compile"
@@ -209,8 +232,8 @@ type struct TestMainCodegen {
                 const d: DirectiveNode* = fn_decl.attached_directives[j];
                 j += 1;
                 if (d == null) { continue; }
-                if (d.directive_kind.eq("ignore")) { ignored      = true; }
-                if (d.directive_kind.eq("should_panic")) { should_panic = true; }
+                if (d.directive_kind.as_string().eq("ignore")) { ignored      = true; }
+                if (d.directive_kind.as_string().eq("should_panic")) { should_panic = true; }
             }
 
             const display: string = intern.resolve(qualified);
@@ -234,7 +257,7 @@ type struct TestMainCodegen {
     /// (name.bytes, name.length, func, ignored, should_panic).
     static make_descriptor_struct_type(ptr_ty: LType, i64_ty: LType,
                                           i1_ty: LType) -> LType {
-        const buf: void* = intrinsics::malloc(5 * 8);
+        const buf: void* = libc::malloc(5 * 8);
         const slots: void** = buf as void**;
         slots[0] = ptr_ty.raw;
         slots[1] = i64_ty.raw;
@@ -242,7 +265,7 @@ type struct TestMainCodegen {
         slots[3] = i1_ty.raw;
         slots[4] = i1_ty.raw;
         const ty: LType = LType::literal_struct(buf, 5, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return ty;
     }
 
@@ -255,8 +278,8 @@ type struct TestMainCodegen {
         // [N x i8] type; we deliberately do NOT NUL-terminate; the runner
         // works in length-typed `Str`, not C strings.
         const arr_ty: LType = LType::array_of(LType::i8(), len as u32);
-        const sym: string = format("__cryo_test_name_%llu", idx);
-        const g: LValue = test_mod.add_global(arr_ty, sym);
+        const sym: string = fmt::format("__cryo_test_name_%llu", idx);
+        const g: LValue = test_mod.add_global(arr_ty, MangledName::new(sym));
         const init: LValue = LValue {
             raw: llvm::LLVMConstString(entry.display_name, len as u32, 1),
         };
@@ -273,7 +296,7 @@ type struct TestMainCodegen {
     /// rules, only the call-site type matters, and the runner module emits
     /// the correctly-typed call.  We just need the symbol to participate in
     /// the link.
-    static add_extern_test_function(test_mod: LModule, mangled: string) -> LValue {
+    static add_extern_test_function(test_mod: LModule, mangled: MangledName) -> LValue {
         const fn_ty: LType = LType::function_type(LType::void_type(), null, 0, false);
         return test_mod.add_function(mangled, fn_ty);
     }
@@ -288,7 +311,7 @@ type struct TestMainCodegen {
         // global of array type IS a ptr value at the constant level, so
         // we can use `name_global` directly.  Same for `fn_decl` (function
         // values are pointer-typed).
-        const buf: void* = intrinsics::malloc(5 * 8);
+        const buf: void* = libc::malloc(5 * 8);
         const slots: void** = buf as void**;
         slots[0] = name_global.raw;
         slots[1] = LType::const_int(LType::i64(), name_len, false).raw;
@@ -298,7 +321,7 @@ type struct TestMainCodegen {
         slots[3] = LType::const_int(LType::i1(), ig_v, false).raw;
         slots[4] = LType::const_int(LType::i1(), sp_v, false).raw;
         const v: LValue = LType::const_named_struct(desc_ty, buf, 5);
-        intrinsics::free(buf);
+        libc::free(buf);
         return v;
     }
 
@@ -323,12 +346,9 @@ type struct TestMainCodegen {
         const di:     DeclarationIndex* = ctx.decl_index;
 
         // Look up mangled names of the runtime entry points through the DI.
-        const set_args_qualified: SymbolStr = intern.intern("std::env::set_args");
-        const set_env_qualified:  SymbolStr = intern.intern("std::env::set_env");
-        const run_all_qualified:  SymbolStr = intern.intern("std::test::runner::run_all");
-        const set_args_mangled:   SymbolStr = di.lookup_mangled_name(set_args_qualified);
-        const set_env_mangled:    SymbolStr = di.lookup_mangled_name(set_env_qualified);
-        const run_all_mangled:    SymbolStr = di.lookup_mangled_name(run_all_qualified);
+        const set_args_mangled:   SymbolStr = di.entry_symbol(di.entry_of_def(ctx.generic_registry.wellknown(LangItem::SetArgs))).spelling();
+        const set_env_mangled:    SymbolStr = di.entry_symbol(di.entry_of_def(ctx.generic_registry.wellknown(LangItem::SetEnv))).spelling();
+        const run_all_mangled:    SymbolStr = di.entry_symbol(di.entry_of_def(ctx.generic_registry.wellknown(LangItem::RunAll))).spelling();
         if (!set_args_mangled.is_valid() || !set_env_mangled.is_valid()
                 || !run_all_mangled.is_valid()) {
             // The stdlib's test/env modules weren't compiled into this build
@@ -355,15 +375,15 @@ type struct TestMainCodegen {
         const run_all_ty:  LType = TestMainCodegen::make_function_type_4(i32_ty, i32_ty, ptr_ty, ptr_ty, i64_ty);
 
         // Declare the runner-side externs.
-        const set_args_fn: LValue = test_mod.add_function(set_args_name, set_args_ty);
-        const set_env_fn:  LValue = test_mod.add_function(set_env_name,  set_env_ty);
-        const run_all_fn:  LValue = test_mod.add_function(run_all_name,  run_all_ty);
+        const set_args_fn: LValue = test_mod.add_function(MangledName::new(set_args_name), set_args_ty);
+        const set_env_fn:  LValue = test_mod.add_function(MangledName::new(set_env_name),  set_env_ty);
+        const run_all_fn:  LValue = test_mod.add_function(MangledName::new(run_all_name),  run_all_ty);
 
         // Declare main(i32, ptr, ptr) -> i32.  The third `char** envp`
         // param mirrors the user-program main-widening so `env::vars()`
         // works under `cryo test`; the C runtime always passes it.
         const main_ty: LType = TestMainCodegen::make_function_type_3(i32_ty, i32_ty, ptr_ty, ptr_ty);
-        const main_fn: LValue = test_mod.add_function("main", main_ty);
+        const main_fn: LValue = test_mod.add_function(MangledName::new("main"), main_ty);
         const entry:   LBasicBlock = LBasicBlock::append(main_fn, "entry");
         mut builder: LBuilder = LBuilder::create();
         builder.position_at_end(entry);
@@ -375,39 +395,39 @@ type struct TestMainCodegen {
 
         // call set_args(argc, argv)
         {
-            const args_buf: void* = intrinsics::malloc(2 * 8);
+            const args_buf: void* = libc::malloc(2 * 8);
             const slots: void** = args_buf as void**;
             slots[0] = argc.raw;
             slots[1] = argv.raw;
             builder.build_call(set_args_ty, set_args_fn, args_buf, 2, "");
-            intrinsics::free(args_buf);
+            libc::free(args_buf);
         }
 
         // call set_env(envp)
         {
-            const args_buf: void* = intrinsics::malloc(8);
+            const args_buf: void* = libc::malloc(8);
             const slots: void** = args_buf as void**;
             slots[0] = envp.raw;
             builder.build_call(set_env_ty, set_env_fn, args_buf, 1, "");
-            intrinsics::free(args_buf);
+            libc::free(args_buf);
         }
 
         // ptr_to_first = getelementptr [N x %Desc], @descriptors, i64 0, i64 0
         // -> equivalent to bitcasting the array global to ptr-to-element-0.
         mut first_ptr: LValue = arr_global;
         if (test_count > 0) {
-            const idx_buf: void* = intrinsics::malloc(2 * 8);
+            const idx_buf: void* = libc::malloc(2 * 8);
             const idx_slots: void** = idx_buf as void**;
             const zero_64: LValue = LType::const_int(i64_ty, 0, false);
             idx_slots[0] = zero_64.raw;
             idx_slots[1] = zero_64.raw;
             first_ptr = builder.build_gep(arr_ty, arr_global, idx_buf, 2, "test.first");
-            intrinsics::free(idx_buf);
+            libc::free(idx_buf);
         }
 
         // call run_all(argc, argv, first_ptr, count)
         const count_const: LValue = LType::const_int(i64_ty, test_count, false);
-        const args_buf: void* = intrinsics::malloc(4 * 8);
+        const args_buf: void* = libc::malloc(4 * 8);
         const args_slots: void** = args_buf as void**;
         args_slots[0] = argc.raw;
         args_slots[1] = argv.raw;
@@ -415,7 +435,7 @@ type struct TestMainCodegen {
         args_slots[3] = count_const.raw;
         const rc: LValue = builder.build_call(
             run_all_ty, run_all_fn, args_buf, 4, "test.rc");
-        intrinsics::free(args_buf);
+        libc::free(args_buf);
 
         builder.build_ret(rc);
         builder.dispose();
@@ -424,48 +444,48 @@ type struct TestMainCodegen {
 
     /// Helper: build a `(p1) -> ret` LLVM function type.
     static make_function_type_1(ret: LType, p1: LType) -> LType {
-        const buf: void* = intrinsics::malloc(8);
+        const buf: void* = libc::malloc(8);
         const slots: void** = buf as void**;
         slots[0] = p1.raw;
         const ty: LType = LType::function_type(ret, buf, 1, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return ty;
     }
 
     /// Helper: build a `(p1, p2) -> ret` LLVM function type.
     static make_function_type_2(ret: LType, p1: LType, p2: LType) -> LType {
-        const buf: void* = intrinsics::malloc(2 * 8);
+        const buf: void* = libc::malloc(2 * 8);
         const slots: void** = buf as void**;
         slots[0] = p1.raw;
         slots[1] = p2.raw;
         const ty: LType = LType::function_type(ret, buf, 2, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return ty;
     }
 
     /// Helper: build a `(p1, p2, p3) -> ret` LLVM function type.
     static make_function_type_3(ret: LType, p1: LType, p2: LType, p3: LType) -> LType {
-        const buf: void* = intrinsics::malloc(3 * 8);
+        const buf: void* = libc::malloc(3 * 8);
         const slots: void** = buf as void**;
         slots[0] = p1.raw;
         slots[1] = p2.raw;
         slots[2] = p3.raw;
         const ty: LType = LType::function_type(ret, buf, 3, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return ty;
     }
 
     /// Helper: build a `(p1, p2, p3, p4) -> ret` LLVM function type.
     static make_function_type_4(ret: LType, p1: LType, p2: LType,
                                    p3: LType, p4: LType) -> LType {
-        const buf: void* = intrinsics::malloc(4 * 8);
+        const buf: void* = libc::malloc(4 * 8);
         const slots: void** = buf as void**;
         slots[0] = p1.raw;
         slots[1] = p2.raw;
         slots[2] = p3.raw;
         slots[3] = p4.raw;
         const ty: LType = LType::function_type(ret, buf, 4, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return ty;
     }
 
@@ -489,12 +509,12 @@ type struct TestMainCodegen {
         // objects the linker already collects.
         const obj_dir: string = ctx.project_config.deps_dir_for("local");
         ProjectConfig::mkdir_p(obj_dir);
-        const obj_path: string = format("%s/__cryo_test_main.o", obj_dir);
+        const obj_path: string = fmt::format("%s/__cryo_test_main.o", obj_dir);
 
         const ok: boolean = tm.emit_to_file(test_mod, obj_path, LFileType::Object);
         if (!ok) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("test-main synthesis: failed to emit %s", obj_path));
+                fmt::format("test-main synthesis: failed to emit %s", obj_path));
             return "";
         }
         return obj_path;

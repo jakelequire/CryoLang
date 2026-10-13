@@ -14,13 +14,15 @@
 ///!   - 0  - clean shutdown (`shutdown` then `exit`)
 ///!   - 1  - anything else (mid-frame EOF, fatal protocol error)
 
-namespace Lsp::Server::Server;
+namespace lsp::server::server;
 
 import std::core::option;
 import std::core::result;
 import std::core::intrinsics;
+import std::core::mem;
 import std::collections::str;
 import std::collections::string;
+import std::collections::string::{ String };
 import std::io::stdio;
 import std::io::error;
 import std::io::traits;
@@ -29,50 +31,43 @@ import std::env;
 import std::ffi::libc;
 import std::sys::syscall;
 
-import Lsp::Protocol::Framing;
-import Lsp::Protocol::JsonRpc;
-import Lsp::Server::State;
-import Lsp::Server::Docs;
-import Lsp::Server::Session;
-import Lsp::Server::DiagRenderCache;
-import Lsp::Handlers::Lifecycle;
-import Lsp::Handlers::TextSync;
-import Lsp::Handlers::Hover;
-import Lsp::Handlers::Definition;
-import Lsp::Handlers::Completion;
-import Lsp::Handlers::SemanticTokens;
-import Lsp::Handlers::CodeAction;
-import Lsp::Handlers::CodeLens;
-import Lsp::Handlers::RenderedDiagnostic;
+import lsp::protocol::framing;
+import lsp::protocol::jsonrpc;
+import lsp::server::state;
+import lsp::server::docs;
+import lsp::server::session;
+import lsp::server::diag_render_cache;
+import lsp::handlers::lifecycle;
+import lsp::handlers::text_sync;
+import lsp::handlers::hover;
+import lsp::handlers::definition;
+import lsp::handlers::completion;
+import lsp::handlers::semantic_tokens;
+import lsp::handlers::code_action;
+import lsp::handlers::code_lens;
+import lsp::handlers::rendered_diagnostic;
 
 
 type struct Server {
-    state:      ServerState;
-    docs:       Docs;
-    sessions:   SessionMap;
-    diag_cache: DiagRenderCache;
-    reader:     Stdin;
-    writer:     Stdout;
+    state:      state::ServerState;
+    docs:       docs::Docs;
+    sessions:   session::SessionMap;
+    diag_cache: diag_render_cache::DiagRenderCache;
+    reader:     stdio::Stdin;
+    writer:     stdio::Stdout;
     /// Id allocator for server->client requests (e.g. semanticTokens/refresh).
-    outbound:   OutboundRequests;
+    outbound:   text_sync::OutboundRequests;
 
     static new() -> Server {
         return Server {
-            state:      ServerState::new(),
-            docs:       Docs::new(),
-            sessions:   SessionMap::new(),
-            diag_cache: DiagRenderCache::new(),
-            reader:     stdin(),
-            writer:     stdout(),
-            outbound:   OutboundRequests::new(),
+            state:      state::ServerState::new(),
+            docs:       docs::Docs::new(),
+            sessions:   session::SessionMap::new(),
+            diag_cache: diag_render_cache::DiagRenderCache::new(),
+            reader:     stdio::stdin(),
+            writer:     stdio::stdout(),
+            outbound:   text_sync::OutboundRequests::new(),
         };
-    }
-
-    drop(mut &this) -> void {
-        this.state.drop();
-        this.docs.drop();
-        this.sessions.drop();
-        this.diag_cache.drop();
     }
 
     /// Run until either `exit` or stdin closes.  Returns the process
@@ -93,7 +88,7 @@ type struct Server {
                 if (!Server::poll_stdin_readable(DEBOUNCE_MS)) {
                     // Input went quiet: the edit burst is over.  Compile
                     // and publish the coalesced set, then loop.
-                    TextSync::flush_pending(&this.docs, &this.sessions,
+                    text_sync::flush_pending(&this.docs, &this.sessions,
                                              &this.writer, &this.diag_cache,
                                              &this.outbound);
                     continue;
@@ -102,13 +97,13 @@ type struct Server {
                 // flush so a still-arriving burst keeps coalescing.
             }
 
-            match (FrameCodec::read_message(&this.reader)) {
+            match (framing::FrameCodec::read_message(&this.reader)) {
                 Result::Ok(maybe) => {
                     match (maybe) {
                         Option::Some(body) => {
                             mut owned: String = body;
                             this.handle(owned.as_str());
-                            owned.drop();
+                            mem::drop(owned);
                         }
                         Option::None => {
                             // Clean EOF.  Treat as success only if we
@@ -137,58 +132,58 @@ type struct Server {
     /// (malformed JSON, missing fields) collapse to `Invalid` and
     /// are logged but otherwise ignored - there's no `id` we can
     /// reply against.
-    handle(mut &this, body: Str) -> void {
-        mut msg: IncomingMessage = JsonRpcCodec::parse_incoming(body);
+    handle(mut &this, body: str::Str) -> void {
+        mut msg: jsonrpc::IncomingMessage = jsonrpc::JsonRpcCodec::parse_incoming(body);
         match (msg) {
-            IncomingMessage::Request(_)      => { this.dispatch_request(&msg); }
-            IncomingMessage::Notification(_) => { this.dispatch_notification(&msg); }
-            IncomingMessage::Invalid(_)      => {
+            jsonrpc::IncomingMessage::Request(_)      => { this.dispatch_request(&msg); }
+            jsonrpc::IncomingMessage::Notification(_) => { this.dispatch_notification(&msg); }
+            jsonrpc::IncomingMessage::Invalid(_)      => {
                 // Drop the parse-failure reason on the floor - the
                 // alternative is logging to stderr, which is fine
                 // but adds dependency on `eprintln`.  Add when
                 // surface area justifies it.
             }
         }
-        msg.drop();
+        mem::drop(msg);
     }
 
-    dispatch_request(mut &this, msg: mut &IncomingMessage) -> void {
+    dispatch_request(mut &this, msg: mut &jsonrpc::IncomingMessage) -> void {
         // Extract a borrow of the inner request without moving it
         // out of the enum - match-binding gives us `&` access.
         match (msg) {
-            IncomingMessage::Request(req) => {
-                const method: Str = req.method.as_str();
+            jsonrpc::IncomingMessage::Request(req) => {
+                const method: str::Str = req.method.as_str();
 
                 // `initialize` is the only request that runs while
                 // uninitialized.  Everything else gets the
                 // SERVER_NOT_INITIALIZED rejection.
                 if (!this.state.initialized
-                        && !method.equals(&Str::from("initialize"))) {
+                        && !method.equals(&str::Str::from("initialize"))) {
                     this.reply_error(&req.id,
-                        JsonRpc::SERVER_NOT_INITIALIZED,
-                        Str::from("server not initialized"));
+                        jsonrpc::SERVER_NOT_INITIALIZED,
+                        str::Str::from("server not initialized"));
                     return;
                 }
 
-                if (method.equals(&Str::from("initialize"))) {
-                    const result: JsonValue =
-                        Lifecycle::handle_initialize(&this.state, &req.params);
+                if (method.equals(&str::Str::from("initialize"))) {
+                    const result: value::JsonValue =
+                        lifecycle::handle_initialize(&this.state, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
 
-                if (method.equals(&Str::from("shutdown"))) {
-                    const result: JsonValue =
-                        Lifecycle::handle_shutdown(&this.state);
+                if (method.equals(&str::Str::from("shutdown"))) {
+                    const result: value::JsonValue =
+                        lifecycle::handle_shutdown(&this.state);
                     this.reply_ok(&req.id, result);
                     return;
                 }
 
-                if (method.equals(&Str::from("textDocument/hover"))) {
+                if (method.equals(&str::Str::from("textDocument/hover"))) {
                     // Fully-qualified: bare `Hover::` would resolve to
-                    // the wire-shape `Lsp::Protocol::Lsp::Hover` struct.
-                    const result: JsonValue =
-                        Lsp::Handlers::Hover::handle_hover(
+                    // the wire-shape `lsp::protocol::lsp::Hover` struct.
+                    const result: value::JsonValue =
+                        lsp::handlers::hover::handle_hover(
                             &this.docs, &this.sessions, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
@@ -197,71 +192,71 @@ type struct Server {
                 // provider fires this when the user expands the hover.  Same
                 // params as `textDocument/hover`; a struct/class type-decl
                 // body additionally lists the type's method signatures.
-                if (method.equals(&Str::from("cryo/expandHover"))) {
-                    const result: JsonValue =
-                        Lsp::Handlers::Hover::handle_hover_verbose(
+                if (method.equals(&str::Str::from("cryo/expandHover"))) {
+                    const result: value::JsonValue =
+                        lsp::handlers::hover::handle_hover_verbose(
                             &this.docs, &this.sessions, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
-                if (method.equals(&Str::from("textDocument/definition"))) {
-                    const result: JsonValue =
-                        Lsp::Handlers::Definition::handle_definition(
+                if (method.equals(&str::Str::from("textDocument/definition"))) {
+                    const result: value::JsonValue =
+                        lsp::handlers::definition::handle_definition(
                             &this.docs, &this.sessions, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
-                if (method.equals(&Str::from("textDocument/completion"))) {
-                    const result: JsonValue =
-                        Lsp::Handlers::Completion::handle_completion(
+                if (method.equals(&str::Str::from("textDocument/completion"))) {
+                    const result: value::JsonValue =
+                        lsp::handlers::completion::handle_completion(
                             &this.docs, &this.sessions, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
-                if (method.equals(&Str::from("textDocument/semanticTokens/full"))) {
-                    const result: JsonValue =
-                        Lsp::Handlers::SemanticTokens::handle_semantic_tokens(
+                if (method.equals(&str::Str::from("textDocument/semanticTokens/full"))) {
+                    const result: value::JsonValue =
+                        lsp::handlers::semantic_tokens::handle_semantic_tokens(
                             &this.docs, &this.sessions, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
-                if (method.equals(&Str::from("textDocument/codeAction"))) {
-                    const result: JsonValue = CodeAction::handle(&req.params);
+                if (method.equals(&str::Str::from("textDocument/codeAction"))) {
+                    const result: value::JsonValue = code_action::handle(&req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
-                if (method.equals(&Str::from("textDocument/codeLens"))) {
-                    const result: JsonValue =
-                        CodeLens::handle_code_lens(&this.docs, &this.sessions, &req.params);
+                if (method.equals(&str::Str::from("textDocument/codeLens"))) {
+                    const result: value::JsonValue =
+                        code_lens::handle_code_lens(&this.docs, &this.sessions, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 // Custom request: the editor extension's
                 // TextDocumentContentProvider asks for the rendered
                 // text behind a `cryo-diagnostic:` virtual URI.
-                if (method.equals(&Str::from("cryo/renderedDiagnostic"))) {
-                    const result: JsonValue =
-                        RenderedDiagnostic::handle(&this.diag_cache, &req.params);
+                if (method.equals(&str::Str::from("cryo/renderedDiagnostic"))) {
+                    const result: value::JsonValue =
+                        rendered_diagnostic::handle(&this.diag_cache, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
 
                 this.reply_error(&req.id,
-                    JsonRpc::METHOD_NOT_FOUND,
-                    Str::from("method not found"));
+                    jsonrpc::METHOD_NOT_FOUND,
+                    str::Str::from("method not found"));
             }
             _ => { }
         }
     }
 
-    dispatch_notification(mut &this, msg: mut &IncomingMessage) -> void {
+    dispatch_notification(mut &this, msg: mut &jsonrpc::IncomingMessage) -> void {
         match (msg) {
-            IncomingMessage::Notification(notif) => {
-                const method: Str = notif.method.as_str();
+            jsonrpc::IncomingMessage::Notification(notif) => {
+                const method: str::Str = notif.method.as_str();
 
                 // `exit` is honoured even before initialize - it's
                 // the only way for a stuck handshake to terminate.
-                if (method.equals(&Str::from("exit"))) {
+                if (method.equals(&str::Str::from("exit"))) {
                     const code: i32 = if (this.state.shutdown_requested) {
                         0 as i32
                     } else {
@@ -274,18 +269,18 @@ type struct Server {
                 // except `exit` (handled above).
                 if (!this.state.initialized) { return; }
 
-                if (method.equals(&Str::from("textDocument/didOpen"))) {
-                    TextSync::did_open(&this.docs, &this.sessions,
+                if (method.equals(&str::Str::from("textDocument/didOpen"))) {
+                    text_sync::did_open(&this.docs, &this.sessions,
                                         &notif.params);
                     return;
                 }
-                if (method.equals(&Str::from("textDocument/didChange"))) {
-                    TextSync::did_change(&this.docs, &this.sessions,
+                if (method.equals(&str::Str::from("textDocument/didChange"))) {
+                    text_sync::did_change(&this.docs, &this.sessions,
                                           &notif.params);
                     return;
                 }
-                if (method.equals(&Str::from("textDocument/didClose"))) {
-                    TextSync::did_close(&this.docs, &this.sessions,
+                if (method.equals(&str::Str::from("textDocument/didClose"))) {
+                    text_sync::did_close(&this.docs, &this.sessions,
                                          &this.writer, &notif.params);
                     return;
                 }
@@ -298,7 +293,7 @@ type struct Server {
                 // server that can't cancel simply responds normally, so
                 // this is a deliberate no-op (kept explicit rather than
                 // falling into the catch-all below for documentation).
-                if (method.equals(&Str::from("$/cancelRequest"))) {
+                if (method.equals(&str::Str::from("$/cancelRequest"))) {
                     return;
                 }
 
@@ -311,36 +306,36 @@ type struct Server {
 
     // Replies
 
-    reply_ok(mut &this, id: &JsonValue, result: JsonValue) -> void {
-        const id_clone: JsonValue = JsonRpcCodec::clone_value(id);
-        const resp: ResponseMessage =
-            ResponseMessage::success(id_clone, result);
+    reply_ok(mut &this, id: &value::JsonValue, result: value::JsonValue) -> void {
+        const id_clone: value::JsonValue = jsonrpc::JsonRpcCodec::clone_value(id);
+        const resp: jsonrpc::ResponseMessage =
+            jsonrpc::ResponseMessage::success(id_clone, result);
         this.send_response(&resp);
-        mut owned: ResponseMessage = resp;
-        owned.drop();
+        mut owned: jsonrpc::ResponseMessage = resp;
+        mem::drop(owned);
     }
 
-    reply_error(mut &this, id: &JsonValue, code: i32, message: Str) -> void {
-        const id_clone: JsonValue = JsonRpcCodec::clone_value(id);
-        const err: ErrorObject =
-            ErrorObject::new(code, String::from_str(message));
-        const resp: ResponseMessage =
-            ResponseMessage::failure(id_clone, err);
+    reply_error(mut &this, id: &value::JsonValue, code: i32, message: str::Str) -> void {
+        const id_clone: value::JsonValue = jsonrpc::JsonRpcCodec::clone_value(id);
+        const err: jsonrpc::ErrorObject =
+            jsonrpc::ErrorObject::new(code, String::from_str(message));
+        const resp: jsonrpc::ResponseMessage =
+            jsonrpc::ResponseMessage::failure(id_clone, err);
         this.send_response(&resp);
-        mut owned: ResponseMessage = resp;
-        owned.drop();
+        mut owned: jsonrpc::ResponseMessage = resp;
+        mem::drop(owned);
     }
 
-    send_response(mut &this, resp: &ResponseMessage) -> void {
-        mut body: String = JsonRpcCodec::encode_response(resp);
-        match (FrameCodec::write_message(&this.writer, body.as_str())) {
+    send_response(mut &this, resp: &jsonrpc::ResponseMessage) -> void {
+        mut body: String = jsonrpc::JsonRpcCodec::encode_response(resp);
+        match (framing::FrameCodec::write_message(&this.writer, body.as_str())) {
             Result::Ok(_)  => { }
             Result::Err(_) => {
                 // Write failed - the only reasonable response is to
                 // bail.  We can't even log because stdout is the wire.
             }
         }
-        body.drop();
+        mem::drop(body);
     }
 
 
@@ -388,6 +383,10 @@ type struct Server {
         }
         return false;
     }
+}
+
+implement trait Drop for struct Server {
+    drop(mut &this) -> void { }
 }
 
 

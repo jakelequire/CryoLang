@@ -3,11 +3,13 @@
 /// Defines all token types recognized by the Cryo lexer, along with
 /// the Token struct and helper methods for token classification.
 
-namespace Compiler::Lex;
+namespace compiler::lex;
 
 public module Lexer;
 
-import Utils;
+import utils;
+import std::fmt;
+import utils::keyword::{ Keyword };
 
 /// Represents the type/kind of a lexer token.
 type enum TokenType {
@@ -103,6 +105,7 @@ type enum TokenType {
     KwDouble;
     KwChar;
     KwString;
+    KwNever;
     KwVaList;
     KwTuple;
     KwOptional;
@@ -312,7 +315,7 @@ type enum TokenType {
 /// payload as `lexeme` (14 bytes for `"Hello, World!\n"`) while the
 /// source span needs to cover the original 17-char extent including
 /// quotes and the `\n` digraph.  `lex_string` constructs via
-/// `Token::new_with_extent` to set the right value; `span_from_token`
+/// `Token::new_string` to set the right value; `span_from_token`
 /// in the parser reads it back when computing end-column.
 type struct Token {
     kind:          TokenType;
@@ -330,6 +333,10 @@ type struct Token {
     /// it is already known and carried into `LiteralNode.suffix`.
     numeric_suffix: string;
 
+    /// How many bytes a StringLiteral's decoded lexeme holds, a NUL among
+    /// them (`"a\0b"` is 3); the lexeme's own length for every other token.
+    text_length: i64;
+
     /// Creates a new Token.  `source_length` defaults to the lexeme's
     /// byte length; correct for identifiers, numbers, punctuators,
     /// and any other token where `lexeme` matches the source text.
@@ -341,6 +348,7 @@ type struct Token {
             column:         column,
             source_length:  lexeme.length() as int,
             numeric_suffix: "",
+            text_length:    lexeme.length() as i64,
         };
     }
 
@@ -353,13 +361,30 @@ type struct Token {
             column:         column,
             source_length:  lexeme.length() as int,
             numeric_suffix: suffix,
+            text_length:    lexeme.length() as i64,
+        };
+    }
+
+    /// Creates a StringLiteral from its decoded bytes, `text_length` of
+    /// them, which may hold a NUL before the end; `source_length` is the
+    /// source range it covers, quotes and escape digraphs included.
+    static new_string(lexeme: string, text_length: i64,
+                      line: int, column: int, source_length: int) -> Token {
+        return Token {
+            kind:           TokenType::StringLiteral,
+            lexeme:         lexeme,
+            line:           line,
+            column:         column,
+            source_length:  source_length,
+            numeric_suffix: "",
+            text_length:    text_length,
         };
     }
 
     /// Creates a new Token with an explicit source-text extent.
-    /// Used by `lex_string` (escape-processed lexeme is shorter than
-    /// the source range it covers) and by token-merging passes that
-    /// stitch contiguous tokens into a virtual span.
+    /// Used by `lex_fstring` (the raw template is shorter than the source
+    /// range it covers) and by token-merging passes that stitch contiguous
+    /// tokens into a virtual span.
     static new_with_extent(kind: TokenType, lexeme: string,
                             line: int, column: int, source_length: int) -> Token {
         return Token {
@@ -369,6 +394,7 @@ type struct Token {
             column:         column,
             source_length:  source_length,
             numeric_suffix: "",
+            text_length:    lexeme.length() as i64,
         };
     }
 
@@ -381,35 +407,53 @@ type struct Token {
             column:         column,
             source_length:  0,
             numeric_suffix: "",
+            text_length:    0,
         };
     }
 
-    /// Returns true if this token is a keyword.
-    is_keyword(&this) -> boolean {
-        return this.kind.is_keyword();
-    }
 
-    /// Returns true if this token is a punctuator.
-    is_punctuator(&this) -> boolean {
-        return this.kind.is_punctuator();
-    }
-
-    /// Returns true if this token is a literal.
-    is_literal(&this) -> boolean {
-        return this.kind.is_literal();
-    }
-
-    /// Returns true if this token is EOF.
-    is_eof(&this) -> boolean {
-        return this.kind == TokenType::EOF;
-    }
-
-    to_string(&this) -> string {
-        return this.lexeme;
-    }
 }
 
 implement enum TokenType {
+    /// Returns true if this token spells a primitive type.
+    ///
+    /// The one place that answers "is this name a primitive?".  A second list
+    /// elsewhere drifts: while the type resolver carried its own string table
+    /// and this one did not, `never` was a primitive to the resolver and an
+    /// ordinary identifier to the lexer, so `-> never` parsed to a named
+    /// annotation and only resolved by falling through to a name lookup.
+    ///
+    /// `void` is deliberately absent: it is a return-position-only shape the
+    /// parser handles ahead of the primitive test, not a type a value can have.
+    is_primitive_type(&this) -> boolean {
+        return match (this) {
+            TokenType::KwBoolean => { true }
+            TokenType::KwInt     => { true }
+            TokenType::KwI8      => { true }
+            TokenType::KwI16     => { true }
+            TokenType::KwI32     => { true }
+            TokenType::KwI64     => { true }
+            TokenType::KwI128    => { true }
+            TokenType::KwUint    => { true }
+            TokenType::KwUint8   => { true }
+            TokenType::KwUint16  => { true }
+            TokenType::KwUint32  => { true }
+            TokenType::KwUint64  => { true }
+            TokenType::KwUint128 => { true }
+            TokenType::KwIsize   => { true }
+            TokenType::KwUsize   => { true }
+            TokenType::KwFloat   => { true }
+            TokenType::KwF32     => { true }
+            TokenType::KwF64     => { true }
+            TokenType::KwDouble  => { true }
+            TokenType::KwChar    => { true }
+            TokenType::KwString  => { true }
+            TokenType::KwNever   => { true }
+            TokenType::KwVaList  => { true }
+            _                    => { false }
+        };
+    }
+
     /// Returns true if this token type is a keyword.
     is_keyword(&this) -> boolean {
         return match (this) {
@@ -471,6 +515,7 @@ implement enum TokenType {
             TokenType::KwDouble =>      { true }
             TokenType::KwChar =>        { true }
             TokenType::KwString =>      { true }
+            TokenType::KwNever =>       { true }
             TokenType::KwTuple =>       { true }
             TokenType::KwOptional =>    { true }
             TokenType::KwVaList =>      { true }
@@ -507,95 +552,6 @@ implement enum TokenType {
         }
     }
 
-    /// Returns true if this token type is a punctuator.
-    is_punctuator(&this) -> boolean {
-        return match (this) {
-            // Grouping
-            TokenType::LParen =>                { true }
-            TokenType::RParen =>                { true }
-            TokenType::LBrace =>                { true }
-            TokenType::RBrace =>                { true }
-            TokenType::LSquare =>               { true }
-            TokenType::RSquare =>               { true }
-            TokenType::LAngle =>                { true }
-            TokenType::RAngle =>                { true }
-            // Basic Operations
-            TokenType::Plus =>                  { true }
-            TokenType::Minus =>                 { true }
-            TokenType::Star =>                  { true }
-            TokenType::Slash =>                 { true }
-            TokenType::Percent =>               { true }
-            TokenType::Caret =>                 { true }
-            TokenType::Amp =>                   { true }
-            TokenType::Pipe =>                  { true }
-            TokenType::Tilde =>                 { true }
-            TokenType::Exclaim =>               { true }
-            TokenType::Question =>              { true }
-            TokenType::Colon =>                 { true }
-            TokenType::Semicolon =>             { true }
-            TokenType::Comma =>                 { true }
-            TokenType::Period =>                { true }
-            TokenType::At =>                    { true }
-            TokenType::Hash =>                  { true }
-            TokenType::Dollar =>                { true }
-            TokenType::Backslash =>             { true }
-            // Assignment
-            TokenType::Equal =>                 { true }
-            TokenType::PlusEqual =>             { true }
-            TokenType::MinusEqual =>            { true }
-            TokenType::StarEqual =>             { true }
-            TokenType::SlashEqual =>            { true }
-            TokenType::PercentEqual =>          { true }
-            TokenType::CaretEqual =>            { true }
-            TokenType::AmpEqual =>              { true }
-            TokenType::PipeEqual =>             { true }
-            // Comparison
-            TokenType::EqualEqual =>            { true }
-            TokenType::ExclaimEqual =>          { true }
-            TokenType::LessEqual =>             { true }
-            TokenType::GreaterEqual =>          { true }
-            TokenType::Spaceship =>             { true }
-            // Logical
-            TokenType::AmpAmp =>                { true }
-            TokenType::PipePipe =>              { true }
-            TokenType::QuestionQuestion =>      { true }
-            // Bitwise & Shift
-            TokenType::LessLess =>              { true }
-            TokenType::GreaterGreater =>        { true }
-            TokenType::LessLessEqual =>         { true }
-            TokenType::GreaterGreaterEqual =>   { true }
-            // Increment/Decrement
-            TokenType::PlusPlus =>              { true }
-            TokenType::MinusMinus =>            { true }
-            // Arrow & Access
-            TokenType::Arrow =>                 { true }
-            TokenType::ColonColon =>            { true }
-            TokenType::DotDot =>                { true }
-            TokenType::DotDotEq =>              { true }
-            TokenType::Ellipsis =>              { true }
-            TokenType::FatArrow =>              { true }
-            // Special
-            TokenType::QuestionDot =>           { true }
-            TokenType::PipeGreater =>           { true }
-            TokenType::LessPipe =>              { true }
-            TokenType::HashHash =>              { true }
-            TokenType::BangBracket =>           { true }
-            _ =>                                { false }
-        };
-    }
-
-    /// Returns true if this token type is a literal or identifier.
-    is_literal(&this) -> boolean {
-        return match (this) {
-            TokenType::Identifier =>        { true }
-            TokenType::NumericConstant =>   { true }
-            TokenType::CharConstant =>      { true }
-            TokenType::StringLiteral =>     { true }
-            TokenType::FStringLiteral =>    { true }
-            _ =>                            { false }
-        };
-    }
-
     /// Returns true if this token type is an assignment operator.
     is_assignment_op(&this) -> boolean {
         return match (this) {
@@ -614,25 +570,42 @@ implement enum TokenType {
         };
     }
 
-    /// For a compound-assignment token (`+=`, `-=`, ...) return the lexeme
-    /// of the underlying binary operator it desugars to (`+`, `-`, ...).
-    /// Returns "" for `=` and any non-compound token.  Used by sema to
-    /// type-check the arithmetic half of a compound assignment via
-    /// `check_binary_op`; without it, nonsense compounds like `s *= 3`
-    /// (string) passed sema unchecked and emitted null IR in codegen.
-    compound_base_lexeme(&this) -> string {
+    /// True for a binary operator whose value is a `boolean` whatever its
+    /// operands are: a comparison or `&&` / `||`.
+    yields_boolean(&this) -> boolean {
         return match (this) {
-            TokenType::PlusEqual           => { "+" }
-            TokenType::MinusEqual          => { "-" }
-            TokenType::StarEqual           => { "*" }
-            TokenType::SlashEqual          => { "/" }
-            TokenType::PercentEqual        => { "%" }
-            TokenType::AmpEqual            => { "&" }
-            TokenType::PipeEqual           => { "|" }
-            TokenType::CaretEqual          => { "^" }
-            TokenType::LessLessEqual       => { "<<" }
-            TokenType::GreaterGreaterEqual => { ">>" }
-            _                              => { "" }
+            TokenType::EqualEqual   => { true }
+            TokenType::ExclaimEqual => { true }
+            TokenType::LAngle       => { true }
+            TokenType::RAngle       => { true }
+            TokenType::LessEqual    => { true }
+            TokenType::GreaterEqual => { true }
+            TokenType::AmpAmp       => { true }
+            TokenType::PipePipe     => { true }
+            _                       => { false }
+        };
+    }
+
+    /// For a compound-assignment token (`+=`, `-=`, ...) return the binary
+    /// operator it desugars to (`+`, `-`, ...); `Unknown` for `=` and any
+    /// non-compound token.  Sema type-checks the arithmetic half of a
+    /// compound assignment with it and codegen emits that half with it, so
+    /// the two cannot disagree about what `a op= b` computes; without the
+    /// check, nonsense compounds like `s *= 3` (string) passed sema and
+    /// emitted null IR in codegen.
+    compound_base(&this) -> TokenType {
+        return match (this) {
+            TokenType::PlusEqual           => { TokenType::Plus }
+            TokenType::MinusEqual          => { TokenType::Minus }
+            TokenType::StarEqual           => { TokenType::Star }
+            TokenType::SlashEqual          => { TokenType::Slash }
+            TokenType::PercentEqual        => { TokenType::Percent }
+            TokenType::AmpEqual            => { TokenType::Amp }
+            TokenType::PipeEqual           => { TokenType::Pipe }
+            TokenType::CaretEqual          => { TokenType::Caret }
+            TokenType::LessLessEqual       => { TokenType::LessLess }
+            TokenType::GreaterGreaterEqual => { TokenType::GreaterGreater }
+            _                              => { TokenType::Unknown }
         };
     }
 
@@ -722,6 +695,7 @@ implement enum TokenType {
             TokenType::KwDouble =>              { "double" }
             TokenType::KwChar =>                { "char" }
             TokenType::KwString =>              { "string" }
+            TokenType::KwNever =>               { "never" }
             TokenType::KwVaList =>              { "va_list" }
             TokenType::KwTuple =>               { "tuple" }
             TokenType::KwOptional =>            { "optional" }
@@ -829,7 +803,8 @@ implement enum TokenType {
 
     /// Looks up a keyword TokenType from its source string.
     /// Returns TokenType::Unknown if the string is not a keyword.
-    static from_keyword(s: string) -> TokenType {
+    static from_keyword(s_text: Keyword) -> TokenType {
+        const s: string = s_text.as_string();
         return match (s) {
             // Control Flow
             "if"          => { TokenType::KwIf }
@@ -889,6 +864,7 @@ implement enum TokenType {
             "double"      => { TokenType::KwDouble }
             "char"        => { TokenType::KwChar }
             "string"      => { TokenType::KwString }
+            "never"       => { TokenType::KwNever }
             "va_list"     => { TokenType::KwVaList }
             "tuple"       => { TokenType::KwTuple }
             "optional"    => { TokenType::KwOptional }
@@ -1045,16 +1021,13 @@ public:
     line:   int;
     column: int;
 
-    static new(path: string, line: int, column: int) -> SourceLocation {
+    static new(path_text: string, line: int, column: int) -> SourceLocation {
+        const path: string = path_text;
         return SourceLocation {
             path:   path,
             line:   line,
             column: column,
         };
-    }
-
-    to_string(&this) -> string {
-        return format("%s:%d:%d", this.path, this.line, this.column);
     }
 
     newline(mut &this) {
@@ -1081,6 +1054,5 @@ public:
         }
     }
 }
-
 
 

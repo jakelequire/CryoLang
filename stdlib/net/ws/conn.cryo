@@ -22,21 +22,33 @@
 
 namespace std::net::ws::conn;
 
-import core::option;
-import core::result;
-import core::slice;
-import io::error;
-import io::traits;
-import io::buf;
-import collections::array;
-import collections::string;
-import collections::str;
-import net::socket::tcp;
-import net::ws::frame;
-import net::ws::handshake;
-import future::poll;
-import future::waker;
-import future::traits;
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::slice;
+import std::core::slice::{ Slice };
+import std::io::error;
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::traits;
+import std::io::traits::{ AsyncTransport };
+import std::io::buf;
+import std::io::buf::{ BufStream };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::net::socket::tcp;
+import std::net::socket::tcp::{ TcpStream };
+import std::net::ws::frame;
+import std::net::ws::frame::{ Frame, OpCode };
+import std::net::ws::handshake;
+import std::future::poll;
+import std::future::waker;
+import std::future::traits;
+import std::core::mem;
 
 /// Cap on one line of the opening handshake's head, and on how many such
 /// lines are read. A peer that never sends the terminating blank line cannot
@@ -70,7 +82,7 @@ type struct WebSocket<S> {
     /// masked (client) vs unmasked (server) framing per RFC 6455. Use
     /// `client_handshake` / `server_handshake` to run the upgrade first.
     static of(conn: BufStream<S>, is_client: boolean) -> WebSocket<S> {
-        return WebSocket<S> { conn: conn, is_client: is_client, closed: false };
+        return WebSocket::<S> { conn: conn, is_client: is_client, closed: false };
     }
 
     /// The buffered connection, for callers that need the transport itself
@@ -193,13 +205,13 @@ type struct WebSocket<S> {
     /// is closed when the `WebSocket` is dropped.
     async close(mut &this, code: u16, reason: Str) -> Result<(), IoError>
     where S: AsyncTransport {
-        mut payload: Array<u8> = Array<u8>::with_capacity(2 + reason.length());
+        mut payload: Array<u8> = Array::<u8>::with_capacity(2 + reason.length());
         payload.push((code >> 8) as u8);
         payload.push((code)      as u8);
         payload.append(reason.as_bytes());
         const queued: Result<(), IoError> = this.conn.queue_frame(
             true, OpCode::Close, payload.as_slice(), this.is_client);
-        payload.drop();
+        mem::drop(payload);
         this.closed = true;
         queued?;
         return await this.conn.flush();
@@ -210,7 +222,7 @@ type struct WebSocket<S> {
     /// frame surfaces as `Message::Close`.
     async recv(mut &this) -> Result<Message, IoError>
     where S: AsyncTransport {
-        mut acc: Array<u8> = Array<u8>::new();
+        mut acc: Array<u8> = Array::<u8>::new();
         mut binary: boolean = false;
         mut control_count: u64 = 0;
         loop {
@@ -262,7 +274,7 @@ type struct WebSocket<S> {
             // Nothing suspends between the frame's arrival and here, so the
             // frame never crosses a suspension point and is released as soon
             // as its bytes have been copied out.
-            fr.drop();
+            mem::drop(fr);
 
             if (bad) {
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
@@ -287,10 +299,8 @@ type struct WebSocket<S> {
     }
 }
 
-implement trait Drop for struct WebSocket<S> {
-    drop(mut &this) -> void {
-        this.conn.drop();
-    }
+implement<S> trait Drop for struct WebSocket<S> {
+    drop(mut &this) -> void { }
 }
 
 /// Connect a WebSocket over an already-connected TCP socket: wrap it, run the
@@ -299,7 +309,7 @@ implement trait Drop for struct WebSocket<S> {
 async function connect(sock: TcpStream, host: Str, path: Str)
         -> Result<WebSocket<TcpStream>, IoError> {
     mut ws: WebSocket<TcpStream> =
-        WebSocket<TcpStream>::of(BufStream<TcpStream>::of(sock), true);
+        WebSocket::<TcpStream>::of(BufStream::<TcpStream>::of(sock), true);
     (await ws.client_handshake(host, path))?;
     return Result::Ok(ws);
 }
@@ -308,7 +318,7 @@ async function connect(sock: TcpStream, host: Str, path: Str)
 /// handshake, and hand back the upgraded connection.
 async function accept(sock: TcpStream) -> Result<WebSocket<TcpStream>, IoError> {
     mut ws: WebSocket<TcpStream> =
-        WebSocket<TcpStream>::of(BufStream<TcpStream>::of(sock), false);
+        WebSocket::<TcpStream>::of(BufStream::<TcpStream>::of(sock), false);
     (await ws.server_handshake())?;
     return Result::Ok(ws);
 }
@@ -320,7 +330,7 @@ function build_message(data: Array<u8>, binary: boolean) -> Message {
         return Message::Binary(bytes);
     }
     const text: String = String::from_str(Str::from_raw(bytes.as_ptr(), bytes.length()));
-    bytes.drop();
+    mem::drop(bytes);
     return Message::Text(text);
 }
 

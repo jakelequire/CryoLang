@@ -3,15 +3,23 @@
 ///! Parses `cryoconfig` INI-like project files to configure multi-module
 ///! compilation.  Provides target type policies and project root discovery.
 
-namespace Compiler::ProjectConfig;
+namespace compiler::project_config;
 
-import Utils::Logger;
+import utils::logger;
+import utils::logger::{ cdebug };
 import std::fmt;
 import std::fs::file;
 import std::fs::metadata;
+import std::fs::metadata::{ metadata };
 import std::fs::path;
+import std::fs::path::{ Path };
 import std::collections::str;
 import std::collections::string;
+import std::collections::string::{ String };
+import std::ffi::libc;
+import std::core::mem;
+import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
+import utils::keyword::{ Keyword };
 
 
 // Native-build cache bucket, stamped at compile time per the OS this compiler
@@ -47,7 +55,8 @@ implement enum TargetType {
 
     /// Parse a target type from a string.  Unrecognized values default to
     /// `Executable`.
-    static from_string(s: string) -> TargetType {
+    static from_string(s_text: Keyword) -> TargetType {
+        const s: string = s_text.as_string();
         if (s.eq("library")) { return TargetType::Library; }
         if (s.eq("stdlib"))  { return TargetType::Stdlib; }
         return TargetType::Executable;
@@ -67,18 +76,12 @@ type enum PanicStrategy {
 }
 
 implement enum PanicStrategy {
-    label(&this) -> string {
-        return match (this) {
-            PanicStrategy::Unspecified => { "unspecified" }
-            PanicStrategy::Abort       => { "abort"       }
-            PanicStrategy::Unwind      => { "unwind"      }
-        };
-    }
 
     /// Parse a `[compiler] panic` / `--panic=` value.  Anything unrecognized is
     /// `Abort`, the conservative reading: a typo must not silently hand a build
     /// an unwinder it never asked for.
-    static from_string(s: string) -> PanicStrategy {
+    static from_string(s_text: Keyword) -> PanicStrategy {
+        const s: string = s_text.as_string();
         if (s.eq("unwind")) { return PanicStrategy::Unwind; }
         return PanicStrategy::Abort;
     }
@@ -205,12 +208,6 @@ type struct Dependency {
         };
     }
 
-    /// True for git deps that name a fixed commit (`rev = "<sha>"`),
-    /// where no remote lookup is needed beyond the initial clone.
-    is_pinned_rev(&this) -> boolean {
-        return this.kind == DepKind::Git
-            && this.ref_kind == GitRefKind::Rev;
-    }
 }
 
 /// One `[vendor.<Name>]` project pin.  Locks `import vendor::<Name>` for this
@@ -290,6 +287,11 @@ type struct ProjectConfig {
     /// codegen.  The CLI `--codegen-threads=N` overrides this.  Never affects
     /// emitted bytes (each object is compiled independently), only build speed.
     codegen_threads: i64;
+    /// `[compiler] test_plant_unanswered_name = true` - for the compiler's
+    /// own test of the name layer's exit check only: the first written
+    /// identifier the check walks is reset to unanswered, so the check's
+    /// refusal can be exercised over a correct program.
+    test_plant_unanswered_name: boolean;
     /// Compile-once, link-twice.  Set (to the `[lib]` name, e.g. "compiler")
     /// on a `[[bin]]` view when the project also declares a `[lib]` whose
     /// closure the bin's compile covers: after the bin links, the driver
@@ -418,6 +420,7 @@ type struct ProjectConfig {
             native_alloc: false,
             emit_llvm:    false,
             codegen_threads: -1,
+            test_plant_unanswered_name: false,
             bundle_lib_from_bin: "",
             cxx_ffi:      false,
             project_root: ".",
@@ -495,6 +498,7 @@ type struct ProjectConfig {
             native_alloc:  this.native_alloc,
             emit_llvm:     this.emit_llvm,
             codegen_threads: this.codegen_threads,
+            test_plant_unanswered_name: this.test_plant_unanswered_name,
             bundle_lib_from_bin: this.bundle_lib_from_bin,
             cxx_ffi:       this.cxx_ffi,
             project_root:  this.project_root,
@@ -547,13 +551,6 @@ type struct ProjectConfig {
             || this.libs.length > 0;
     }
 
-    /// True when the cryoconfig declares one or more `[[lib]]` array members -
-    /// the workspace form, where the project builds several independent
-    /// library archives (each from its own `source_dir`) rather than a single
-    /// output.  Drives the per-member build loop in the driver.
-    is_workspace(&this) -> boolean {
-        return this.libs.length > 0;
-    }
 
     /// Whether this project requires an entry point (main function).
     requires_entry_point(&this) -> boolean {
@@ -576,17 +573,18 @@ type struct ProjectConfig {
                                  || this.project_root.eq(".")) {
             this.source_dir
         } else {
-            format("%s/%s", this.project_root, this.source_dir)
+            fmt::format("%s/%s", this.project_root, this.source_dir)
         };
-        const lib_path: string = format("%s/lib.cryo", base);
+        const lib_path: string = fmt::format("%s/lib.cryo", base);
         if (metadata::exists(Path::from(lib_path))) {
             return lib_path;
         }
-        return format("%s/_module.cryo", base);
+        return fmt::format("%s/_module.cryo", base);
     }
 
     /// Parse a cryoconfig file at the given path.
-    static parse(path: string) -> ProjectConfig {
+    static parse(path_text: string) -> ProjectConfig {
+        const path: string = path_text;
         if (!metadata::exists(Path::from(path))) {
             cdebug("[ProjectConfig] Warning: cryoconfig not found at '%s', using defaults\n", path);
             return ProjectConfig::default();
@@ -712,7 +710,7 @@ type struct ProjectConfig {
                     match (key) {
                         "project_name"  => { config.project_name = val; }
                         "output_dir"    => { config.output_dir = val; }
-                        "target_type"   => { config.target_type = TargetType::from_string(val); }
+                        "target_type"   => { config.target_type = TargetType::from_string(Keyword::new(val)); }
                         "entry_point"   => { config.entry_point = val; }
                         "source_dir"    => { config.source_dir = val; }
                         "target_triple" => { config.target_triple = val; }
@@ -741,10 +739,13 @@ type struct ProjectConfig {
                         }
                         "no_std"    => { config.no_std    = ProjectConfig::parse_bool(val); }
                         "no_runtime" => { config.no_runtime = ProjectConfig::parse_bool(val); }
-                        "panic"     => { config.panic = PanicStrategy::from_string(val); }
+                        "panic"     => { config.panic = PanicStrategy::from_string(Keyword::new(val)); }
                         "emit_llvm" => { config.emit_llvm = ProjectConfig::parse_bool(val); }
                         "codegen_threads" => {
                             config.codegen_threads = ProjectConfig::parse_codegen_threads(val);
+                        }
+                        "test_plant_unanswered_name" => {
+                            config.test_plant_unanswered_name = ProjectConfig::parse_bool(val);
                         }
                         // Removed in the v1.0 schema:
                         "args" => {
@@ -869,7 +870,7 @@ type struct ProjectConfig {
         if (this.project_root == "" || this.project_root.eq(".")) {
             return this.entry_point;
         }
-        return format("%s/%s", this.project_root, this.entry_point);
+        return fmt::format("%s/%s", this.project_root, this.entry_point);
     }
 
     // Build-directory layout
@@ -908,7 +909,7 @@ type struct ProjectConfig {
     /// distinguishes them for Windows targets, and ordinary users only
     /// build one target at a time.
     profile_dir(&this) -> string {
-        return format("%s/target/%s/%s",
+        return fmt::format("%s/target/%s/%s",
             this.output_dir, this.profile, this.target_subdir());
     }
 
@@ -934,13 +935,15 @@ type struct ProjectConfig {
 
     /// Per-origin object output dir: `<profile_dir>/<origin_subdir>/deps`.
     /// `origin_subdir` is `"std"`, `"local"`, or a dependency name.
-    deps_dir_for(&this, origin_subdir: string) -> string {
-        return format("%s/%s/deps", this.profile_dir(), origin_subdir);
+    deps_dir_for(&this, origin_subdir_text: string) -> string {
+        const origin_subdir: string = origin_subdir_text;
+        return fmt::format("%s/%s/deps", this.profile_dir(), origin_subdir);
     }
 
     /// Per-origin LLVM IR (`.ll`) output dir: `<profile_dir>/<origin_subdir>/ir`.
-    ir_dir_for(&this, origin_subdir: string) -> string {
-        return format("%s/%s/ir", this.profile_dir(), origin_subdir);
+    ir_dir_for(&this, origin_subdir_text: string) -> string {
+        const origin_subdir: string = origin_subdir_text;
+        return fmt::format("%s/%s/ir", this.profile_dir(), origin_subdir);
     }
 
     /// Umbrella directory for vendored-library build artifacts:
@@ -952,55 +955,51 @@ type struct ProjectConfig {
     /// folder holds the resolved copy actually compiled into this build, so
     /// what's visible here is exactly what was built.
     vendor_dir(&this) -> string {
-        return format("%s/vendor", this.profile_dir());
+        return fmt::format("%s/vendor", this.profile_dir());
     }
 
     /// Incremental-build state dir (whole-build, owned by the local project):
     /// `<profile_dir>/local/incremental`.
     incremental_dir(&this) -> string {
-        return format("%s/local/incremental", this.profile_dir());
+        return fmt::format("%s/local/incremental", this.profile_dir());
     }
 
     /// Per-profile executable, the link target BEFORE hoisting:
     /// `<profile_dir>/<name>[-test]`.
     profile_bin_path(&this, test_suffix: boolean) -> string {
         if (test_suffix) {
-            return format("%s/%s-test", this.profile_dir(), this.project_name);
+            return fmt::format("%s/%s-test", this.profile_dir(), this.project_name);
         }
-        return format("%s/%s", this.profile_dir(), this.project_name);
+        return fmt::format("%s/%s", this.profile_dir(), this.project_name);
     }
 
-    /// Per-profile library archive, the bundle target BEFORE hoisting:
-    /// `<profile_dir>/lib<name>.a`.
-    profile_lib_path(&this, archive_name: string) -> string {
-        return format("%s/%s", this.profile_dir(), archive_name);
-    }
 
     /// Hoisted final executable at the build root.  `test_suffix` appends
     /// `-test` so a `cryo test` binary coexists with a `cryo run` build.
     /// This is the stable, profile-agnostic path `cryo run` execs.
     bin_artifact_path(&this, test_suffix: boolean) -> string {
         if (test_suffix) {
-            return format("%s/%s-test", this.output_dir, this.project_name);
+            return fmt::format("%s/%s-test", this.output_dir, this.project_name);
         }
-        return format("%s/%s", this.output_dir, this.project_name);
+        return fmt::format("%s/%s", this.output_dir, this.project_name);
     }
 
     /// Hoisted final library-archive at the build root: `<output_dir>/lib<name>.a`.
-    lib_archive_path(&this, archive_name: string) -> string {
-        return format("%s/%s", this.output_dir, archive_name);
+    lib_archive_path(&this, archive_name_text: string) -> string {
+        const archive_name: string = archive_name_text;
+        return fmt::format("%s/%s", this.output_dir, archive_name);
     }
 
     /// JSON build manifest path (per-profile): `<profile_dir>/build-manifest.json`.
     manifest_path(&this) -> string {
-        return format("%s/build-manifest.json", this.profile_dir());
+        return fmt::format("%s/build-manifest.json", this.profile_dir());
     }
 
     /// Incremental fingerprint sidecar, keyed by target name so a
     /// multi-target project's `[lib]` and each `[[bin]]` track their inputs
     /// independently: `<profile_dir>/local/incremental/<project_name>.fp`.
     fingerprint_path(&this) -> string {
-        return format("%s/%s.fp", this.incremental_dir(), this.project_name);
+        return fmt::format("%s/%s.fp", this.incremental_dir(), this.project_name);
     }
 
     /// Per-module cache-key sidecar (one `namespace<TAB>keyhex` line per
@@ -1008,7 +1007,7 @@ type struct ProjectConfig {
     /// `<profile_dir>/local/incremental/<project_name>.modkeys`. Read by the
     /// next build to decide which modules' objects can be reused.
     module_keys_path(&this) -> string {
-        return format("%s/%s.modkeys", this.incremental_dir(), this.project_name);
+        return fmt::format("%s/%s.modkeys", this.incremental_dir(), this.project_name);
     }
 
     /// Recursively create `path` and any missing parent directories, like
@@ -1018,7 +1017,8 @@ type struct ProjectConfig {
     /// EEXIST for an existing prefix is harmless and ignored.  Static so the
     /// codegen / manifest passes can reach it without a free-function symbol
     /// that could collide with another module's leaf-name.
-    static mkdir_p(path: string) -> void {
+    static mkdir_p(path_text: string) -> void {
+        const path: string = path_text;
         const len: u64 = path.length();
         if (len == 0) { return; }
         const src: i8* = path as i8*;
@@ -1027,12 +1027,12 @@ type struct ProjectConfig {
             // At each interior '/', the prefix built so far (src[0..i]) is the
             // parent directory to create before descending into it.
             if (i > 0 && src[i] == '/') {
-                mkdir(s.as_cstr() as string, 493);  // 0755
+                libc::mkdir(s.as_cstr() as string, 493);  // 0755
             }
             s.push_byte(src[i] as u8);
         }
-        mkdir(s.as_cstr() as string, 493);  // 0755
-        s.drop();
+        libc::mkdir(s.as_cstr() as string, 493);  // 0755
+        mem::drop(s);
     }
 
     /// Built-in optimization level for a profile name. `debug` => O0 (keeps
@@ -1052,9 +1052,10 @@ type struct ProjectConfig {
 
     /// Search for a cryoconfig file starting from `start_dir` and walking upward.
     /// Returns the path to the cryoconfig file, or "" if not found.
-    static find_cryoconfig(start_dir: string) -> string {
+    static find_cryoconfig(start_dir_text: string) -> string {
+        const start_dir: string = start_dir_text;
         // Try start_dir itself
-        const candidate: string = format("%s/cryoconfig", start_dir);
+        const candidate: string = fmt::format("%s/cryoconfig", start_dir);
         if (metadata::exists(Path::from(candidate))) {
             return candidate;
         }
@@ -1068,7 +1069,8 @@ type struct ProjectConfig {
     }
 
     /// Parse a boolean value from a string.
-    static parse_bool(s: string) -> boolean {
+    static parse_bool(s_text: string) -> boolean {
+        const s: string = s_text;
         return match (s) {
             "false" | "no"  | "0" => { false }
             "true"  | "yes" | "1" => { true  }
@@ -1083,7 +1085,8 @@ type struct ProjectConfig {
     /// 0..3. Accepts C-style `O0`/`O1`/`O2`/`O3` (case-insensitive), a bare
     /// `0`..`3`, and the legacy booleans (`true`/`yes` => O2, `false`/`no` =>
     /// O0). Anything unrecognized falls back to O2 (the default level).
-    static parse_opt_level(s: string) -> u32 {
+    static parse_opt_level(s_text: string) -> u32 {
+        const s: string = s_text;
         return match (s) {
             "true"  | "yes"   => { 2 }
             "false" | "no"    => { 0 }
@@ -1099,7 +1102,8 @@ type struct ProjectConfig {
     /// `"auto"` / empty => `-1` (use the online CPU count); `"off"` / `"serial"`
     /// / `"false"` / `"no"` / `0` / `1` => `1` (serial codegen); a bare positive
     /// integer => that many workers.  Unrecognized text => `-1` (auto).
-    static parse_codegen_threads(s: string) -> i64 {
+    static parse_codegen_threads(s_text: string) -> i64 {
+        const s: string = s_text;
         if (s.length() == 0 || s == "auto") { return -1; }
         if (s == "off" || s == "serial" || s == "false" || s == "no") { return 1; }
         const len: i64 = s.length() as i64;
@@ -1118,7 +1122,8 @@ type struct ProjectConfig {
     /// Parse a TOML-like string array value: `["a", "b", "c"]` -> ["a","b","c"].
     /// Lenient: ignores whitespace and missing brackets, handles single- and
     /// double-quoted entries, returns an empty array when nothing parses.
-    static parse_string_array(raw: string) -> string[] {
+    static parse_string_array(raw_text: string) -> string[] {
+        const raw: string = raw_text;
         mut result: string[] = [];
         const len: i64 = raw.length() as i64;
         mut i: i64 = 0;
@@ -1189,7 +1194,8 @@ type struct ProjectConfig {
     /// ref selector for a git dep.  All diagnostics go to `g_stderr`.
     ///
     /// Whitespace and missing `{}` braces are tolerated.
-    static parse_inline_table_into_dep(raw: string, dep: Dependency*) -> i64 {
+    static parse_inline_table_into_dep(raw_text: string, dep: Dependency*) -> i64 {
+        const raw: string = raw_text;
         mut errors: i64 = 0;
 
         // Track which keys were supplied so we can validate combinations
@@ -1345,7 +1351,8 @@ type struct ProjectConfig {
     /// Heuristic: does this look like a URL the user accidentally put in
     /// `path`?  Catches `https://`, `http://`, `git://`, `ssh://`, the
     /// `git@host:path` SCP-ish form, and bare `*.git` paths.
-    static looks_like_url(s: string) -> boolean {
+    static looks_like_url(s_text: string) -> boolean {
+        const s: string = s_text;
         if (s.starts_with("http://"))  { return true; }
         if (s.starts_with("https://")) { return true; }
         if (s.starts_with("git://"))   { return true; }

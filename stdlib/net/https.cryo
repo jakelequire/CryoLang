@@ -11,27 +11,42 @@
 
 namespace std::net::https;
 
-import core::option;
-import core::result;
-import collections::array;
-import collections::str;
-import io::error;
-import io::traits;
-import io::buf;
-import net::addr::ip;
-import net::addr::socket_addr;
-import net::socket::tcp;
-import net::dns;
-import net::tls::context;
-import net::tls::stream;
-import net::tls::future;
-import net::http::method;
-import net::http::request;
-import net::http::response;
-import net::http::conn;
-import future::poll;
-import future::waker;
-import future::traits;
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::result;
+import std::core::result::{ Result };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::io::error;
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::traits;
+import std::io::buf;
+import std::io::buf::{ BufStream };
+import std::net::addr::ip;
+import std::net::addr::socket_addr;
+import std::net::addr::socket_addr::{ SocketAddr };
+import std::net::socket::tcp;
+import std::net::socket::tcp::{ TcpConnect, TcpStream };
+import std::net::dns;
+import std::net::dns::{ Resolve, ResolvedAddrs };
+import std::net::tls::context;
+import std::net::tls::context::{ TlsConnector };
+import std::net::tls::stream;
+import std::net::tls::stream::{ TlsStream };
+import std::net::tls::future;
+import std::net::http::method;
+import std::net::http::method::{ Method };
+import std::net::http::request;
+import std::net::http::request::{ Request };
+import std::net::http::response;
+import std::net::http::response::{ Response };
+import std::net::http::conn;
+import std::future::poll;
+import std::future::waker;
+import std::future::traits;
+import std::core::mem;
 
 type struct HttpsClient {
     connector: TlsConnector;
@@ -95,7 +110,7 @@ type struct HttpsClient {
         // slowest step of the request.
         const addr: SocketAddr = match (await first_ipv4(host, port)) {
             Result::Ok(a)  => { a }
-            Result::Err(e) => { request_local.drop(); return Result::Err(e); }
+            Result::Err(e) => { mem::drop(request_local); return Result::Err(e); }
         };
         request_local.headers.insert(
             Str::new("Connection"),
@@ -104,23 +119,23 @@ type struct HttpsClient {
 
         mut tcp: TcpStream = match (await TcpConnect::start(addr)) {
             Result::Ok(s)  => { s }
-            Result::Err(e) => { request_local.drop(); return Result::Err(e); }
+            Result::Err(e) => { mem::drop(request_local); return Result::Err(e); }
         };
         mut tls: TlsStream = match (await this.connector.connect(tcp, host)) {
             Result::Ok(t)  => { t }   // consumed `tcp`
-            Result::Err(e) => { request_local.drop(); return Result::Err(e); }
+            Result::Err(e) => { mem::drop(request_local); return Result::Err(e); }
         };
-        mut c: BufStream<TlsStream> = BufStream<TlsStream>::of(tls);
+        mut c: BufStream<TlsStream> = BufStream::<TlsStream>::of(tls);
 
         request_local.encode_into(c.pending())?;
         (await c.flush())?;
         return await c.read_response();
     }
+}
 
-    /// Release the underlying TLS context.
-    drop(mut &this) -> void {
-        this.connector.drop();
-    }
+implement trait Drop for struct HttpsClient {
+    /// The underlying TLS context is released by its field.
+    drop(mut &this) -> void { }
 }
 
 /// Resolve `host` off the executor and return the first IPv4 address paired
@@ -129,7 +144,7 @@ type struct HttpsClient {
 async function first_ipv4(host: Str, port: u16) -> Result<SocketAddr, IoError> {
     mut resolved: ResolvedAddrs = (await Resolve::start(host))?;
     const chosen: Option<SocketAddr> = resolved.first_ipv4(port);
-    resolved.drop();
+    mem::drop(resolved);
     match (chosen) {
         Option::Some(addr) => { return Result::Ok(addr); }
         Option::None       => { return Result::Err(IoError::new(IoErrorKind::Unsupported, 0)); }

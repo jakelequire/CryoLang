@@ -10,20 +10,38 @@
 /// (`sema_int_unsigned_bound` / `sema_default_int_type`) so there is one source
 /// of truth.
 
-namespace Compiler::Sema::LiteralResolver;
+namespace compiler::sema::literal_resolver;
 
-import Compiler::Types::TypeRef;
-import Compiler::Types::Type;
-import Compiler::Types::Arena;
-import Compiler::Types::Compound;
-import Compiler::Lex;
-import Compiler::AST;
-import Compiler::AST::Expression;
-import Compiler::Diag;
-import Compiler::CompilationContext;
-import Compiler::Sema::State;
-import Compiler::Sema::Helpers;
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::type_base;
+import compiler::types::type_base::{ IntType, Type };
+import compiler::types::arena;
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound;
+import compiler::lex;
+import compiler::ast;
+import compiler::ast::{ LiteralKind, NodeKind };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::expression;
+import compiler::ast::expression::{ BinaryExprNode, ExpressionNode, LiteralNode, UnaryExprNode };
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::sema::state;
+import compiler::sema::state::{ SemaState };
+import compiler::sema::helpers;
+import compiler::sema::helpers::{
+    int_literal_exceeds, is_constant_numeric_expr, is_numeric_literal_expr, sema_default_int_type,
+    sema_int_unsigned_bound, sema_numeric_suffix_type, try_fold_const_i64
+};
 import std::fmt;
+import compiler::diag::diagnostic;
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::types;
+import compiler::types::{ TypeKind };
+import utils::keyword::{ Keyword };
 
 type struct LiteralResolver {
     arena: TypeArena*;
@@ -48,15 +66,43 @@ type struct LiteralResolver {
             LiteralKind::String  => { this.arena.get_string() }
             LiteralKind::Char    => { this.arena.get_char() }
             LiteralKind::Boolean => { this.arena.get_bool() }
-            LiteralKind::Null    => {
-                // Type `null` as `void*` (Pointer to Void) rather than bare Void:
-                // the `void* <-> T*` rule in TypeChecker handles assignment to any
-                // concrete pointer type without a dedicated `void -> Pointer`
-                // widening, preserving null semantics without letting arbitrary
-                // void-typed expressions widen.
-                this.arena.get_pointer_to(this.arena.get_void())
-            }
+            LiteralKind::Null    => { this.resolve_null_literal() }
         };
+    }
+
+    /// Type the `null` literal.
+    ///
+    /// The default is `void*` (Pointer to Void) rather than bare Void: the
+    /// `void* <-> T*` rule in TypeChecker then admits it in any concrete
+    /// pointer position without a dedicated `void -> Pointer` widening, so an
+    /// arbitrary void-typed expression still cannot widen.
+    ///
+    /// A function type is the one pointer-shaped type that rule does not
+    /// reach, and it must not be added to it: `void*` and `(A) -> R` are the
+    /// same `i8*` after `map_type`, but the conversion between them is
+    /// explicit in BOTH directions, and relaxing that would let any `void*`
+    /// become a callable.  So `null` adopts the expected function type
+    /// instead - it is the literal that is polymorphic, exactly as an integer
+    /// literal adopts an expected width, not the conversion that is widened.
+    /// Without this, a null function pointer needs a cast in precisely the
+    /// positions that check assignability (annotated binding, `return`,
+    /// struct-literal field) while a data pointer beside it in the same
+    /// literal needs none.
+    resolve_null_literal(&this) -> TypeRef {
+        return this.null_literal_type(this.state.expected_type);
+    }
+
+    /// The type of a `null` or unit literal written where `expected` is
+    /// expected (invalid for no expectation).  Code built after the type
+    /// check - the async lowering's literals - is typed by this same rule.
+    null_literal_type(&this, expected: TypeRef) -> TypeRef {
+        if (expected.is_valid()) {
+            const exp: Type* = this.arena.lookup(expected);
+            if (exp != null && exp.kind == TypeKind::Function) {
+                return expected;
+            }
+        }
+        return this.arena.get_pointer_to(this.arena.get_void());
     }
 
     /// Type an integer literal.  Adopts an integer `expected_type` (bounds-checked
@@ -71,16 +117,16 @@ type struct LiteralResolver {
         // own type and ordinary assignment checking reports the mismatch -
         // previously the suffix was validated by the lexer and then discarded,
         // so a contradiction was silently resolved in the context's favour.
-        const suffixed: TypeRef = sema_numeric_suffix_type(this.arena, lit.suffix);
+        const suffixed: TypeRef = sema_numeric_suffix_type(this.arena, Keyword::new(lit.suffix));
         if (suffixed.is_valid()) {
-            const st: Type* = this.arena.lookup(suffixed.id);
+            const st: Type* = this.arena.lookup(suffixed);
             if (st != null && st.kind == TypeKind::Int) {
                 const sit: IntType* = st as IntType*;
                 const smax: u64 = sema_int_unsigned_bound(sit.int_kind.bit_width());
                 if (smax != 0 && int_literal_exceeds(lit.value, smax)) {
                     this.ctx.emit_error_at(
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
-                        format("integer literal `%s` is out of range for type `%s`",
+                        fmt::format("integer literal `%s` is out of range for type `%s`",
                             lit.value, sit.int_kind.to_string()),
                         lit.span);
                 }
@@ -89,7 +135,7 @@ type struct LiteralResolver {
             return suffixed;
         }
         if (this.state.expected_type.is_valid()) {
-            const exp: Type* = this.arena.lookup(this.state.expected_type.id);
+            const exp: Type* = this.arena.lookup(this.state.expected_type);
             if (exp != null && exp.kind == TypeKind::Int) {
                 const it: IntType* = exp as IntType*;
                 // Bound the literal by what fits in the target's bit width (its
@@ -101,7 +147,7 @@ type struct LiteralResolver {
                 if (max_mag != 0 && int_literal_exceeds(lit.value, max_mag)) {
                     this.ctx.emit_error_at(
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
-                        format("integer literal `%s` is out of range for type `%s`",
+                        fmt::format("integer literal `%s` is out of range for type `%s`",
                             lit.value, it.int_kind.to_string()),
                         lit.span);
                 } else if (max_mag != 0 && it.int_kind.is_signed()) {
@@ -119,7 +165,7 @@ type struct LiteralResolver {
                     if (int_literal_exceeds(lit.value, signed_min_mag)) {
                         mut diag: Diagnostic = Diagnostic::warning(
                             ErrorCode::W0012_SIGNED_LITERAL_OUT_OF_RANGE,
-                            format("integer literal `%s` is outside the range of signed type `%s`; it is stored as its two's-complement bit pattern (wraps to a negative value)",
+                            fmt::format("integer literal `%s` is outside the range of signed type `%s`; it is stored as its two's-complement bit pattern (wraps to a negative value)",
                                 lit.value, it.int_kind.to_string()));
                         diag = diag.at(lit.span);
                         this.ctx.emit_diagnostic(diag);
@@ -140,7 +186,7 @@ type struct LiteralResolver {
                 if (char_max != 0 && int_literal_exceeds(lit.value, char_max)) {
                     this.ctx.emit_error_at(
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
-                        format("integer literal `%s` is out of range for type `char`",
+                        fmt::format("integer literal `%s` is out of range for type `char`",
                             lit.value),
                         lit.span);
                 }
@@ -155,13 +201,13 @@ type struct LiteralResolver {
     /// Type a float literal: a type suffix settles it, else adopt a float
     /// `expected_type`, else default to f64.
     resolve_float_literal(&this, lit: LiteralNode*) -> TypeRef {
-        const suffixed: TypeRef = sema_numeric_suffix_type(this.arena, lit.suffix);
+        const suffixed: TypeRef = sema_numeric_suffix_type(this.arena, Keyword::new(lit.suffix));
         if (suffixed.is_valid()) {
             this.warn_if_suffix_redundant(lit, suffixed);
             return suffixed;
         }
         if (this.state.expected_type.is_valid()) {
-            const exp: Type* = this.arena.lookup(this.state.expected_type.id);
+            const exp: Type* = this.arena.lookup(this.state.expected_type);
             if (exp != null && exp.kind == TypeKind::Float) {
                 return this.state.expected_type;
             }
@@ -189,10 +235,10 @@ type struct LiteralResolver {
         if (lit.has_resolved_type()) { return; }
         const contextual: TypeRef = this.type_without_suffix(lit);
         if (!contextual.is_valid()) { return; }
-        if (contextual.id != suffixed.id) { return; }
+        if (!contextual.equals(suffixed)) { return; }
         mut diag: Diagnostic = Diagnostic::warning(
             ErrorCode::W0014_REDUNDANT_NUMERIC_SUFFIX,
-            format("redundant type suffix `%s` on numeric literal `%s`; the surrounding context already types it",
+            fmt::format("redundant type suffix `%s` on numeric literal `%s`; the surrounding context already types it",
                 lit.suffix, lit.value));
         diag = diag.at(lit.span);
         this.ctx.emit_diagnostic(diag);
@@ -202,7 +248,7 @@ type struct LiteralResolver {
     type_without_suffix(&this, lit: LiteralNode*) -> TypeRef {
         if (lit.literal_kind == LiteralKind::Float) {
             if (this.state.expected_type.is_valid()) {
-                const fexp: Type* = this.arena.lookup(this.state.expected_type.id);
+                const fexp: Type* = this.arena.lookup(this.state.expected_type);
                 if (fexp != null && fexp.kind == TypeKind::Float) {
                     return this.state.expected_type;
                 }
@@ -210,7 +256,7 @@ type struct LiteralResolver {
             return this.arena.get_f64();
         }
         if (this.state.expected_type.is_valid()) {
-            const exp: Type* = this.arena.lookup(this.state.expected_type.id);
+            const exp: Type* = this.arena.lookup(this.state.expected_type);
             if (exp != null && (exp.kind == TypeKind::Int || exp.kind == TypeKind::Char)) {
                 return this.state.expected_type;
             }
@@ -222,7 +268,7 @@ type struct LiteralResolver {
     /// literal/constant being resolved would already adopt it).
     expected_type_is_int_type(&this) -> boolean {
         if (!this.state.expected_type.is_valid()) { return false; }
-        const e: Type* = this.arena.lookup(this.state.expected_type.id);
+        const e: Type* = this.arena.lookup(this.state.expected_type);
         return e != null && e.kind == TypeKind::Int;
     }
 
@@ -231,7 +277,7 @@ type struct LiteralResolver {
         if (!is_numeric_literal_expr(arg)) { return false; }
         const lit: LiteralNode* = arg as LiteralNode*;
         if (lit.literal_kind != LiteralKind::Integer) { return false; }
-        const t: Type* = this.arena.lookup(target.id);
+        const t: Type* = this.arena.lookup(target);
         if (t == null || t.kind != TypeKind::Int) { return false; }
         const it: IntType* = t as IntType*;
         const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
@@ -239,11 +285,80 @@ type struct LiteralResolver {
         return !int_literal_exceeds(lit.value, max_mag);
     }
 
+    /// Whether a constant integer expression (`8 * 10000 + 64 * 100`) keeps
+    /// its value at `target`'s width: every sub-expression folds to a value
+    /// `target` holds, so computing it at that width gives what computing it
+    /// at the default width would.  Such an expression adopts the parameter's
+    /// type as a single literal that fits does; one that does not stays at
+    /// its default width and meets the parameter's narrowing check.
+    const_expr_fits_target(&this, expr: ExpressionNode*, target: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(target);
+        if (t == null || t.kind != TypeKind::Int) { return false; }
+        return LiteralResolver::const_expr_fits_int(expr, t as IntType*);
+    }
+
+    /// Refuse an expression made only of literals (`200 + 100`, `-200`)
+    /// stored where an integer of type `target` is - a declaration's
+    /// initializer, an assignment's value - when `target` does not hold its
+    /// value: computed at `target`'s width it would silently become another
+    /// number.  A value is held as a single literal is: up to the width's
+    /// unsigned maximum (a bit pattern), or down to a signed type's minimum.
+    /// A single literal is bounded where it is typed; true when refused.
+    refuse_narrowing_constant(&this, expr: ExpressionNode*, target: TypeRef) -> boolean {
+        if (expr == null || !target.is_valid()) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind != NodeKind::BinaryExpression && node.kind != NodeKind::UnaryExpression) { return false; }
+        if (!is_constant_numeric_expr(expr)) { return false; }
+        const t: Type* = this.arena.lookup(target);
+        if (t == null || t.kind != TypeKind::Int) { return false; }
+        const it: IntType* = t as IntType*;
+        const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
+        if (max_mag == 0) { return false; }
+        mut v: i64 = 0;
+        if (!try_fold_const_i64(expr, &v)) { return false; }
+        const held: boolean = if (v >= 0) {
+            (v as u64) <= max_mag
+        } else {
+            it.int_kind.is_signed() && v >= -((max_mag / 2) as i64) - 1
+        };
+        if (held) { return false; }
+        this.ctx.emit_error_at(
+            ErrorCode::E0010_NUMBER_TOO_LARGE,
+            fmt::format("this value is %lld, which `%s` does not hold: it narrows the value and would silently truncate; add an explicit `as` cast",
+                v, it.int_kind.to_string()),
+            expr.span);
+        return true;
+    }
+
+    static const_expr_fits_int(expr: ExpressionNode*, it: IntType*) -> boolean {
+        if (expr == null) { return false; }
+        mut v: i64 = 0;
+        if (!try_fold_const_i64(expr, &v)) { return false; }
+        const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
+        if (max_mag == 0) { return false; }
+        if (it.int_kind.is_signed()) {
+            const hi: i64 = (max_mag / 2) as i64;
+            if (v > hi || v < -hi - 1) { return false; }
+        } else {
+            if (v < 0 || (v as u64) > max_mag) { return false; }
+        }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::UnaryExpression) {
+            return LiteralResolver::const_expr_fits_int((expr as UnaryExprNode*).operand, it);
+        }
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            return LiteralResolver::const_expr_fits_int(b.left, it)
+                && LiteralResolver::const_expr_fits_int(b.right, it);
+        }
+        return true;
+    }
+
     /// True when `ty` resolves to a signed integer type.  Decides whether a
     /// negative numeric-literal argument may adopt a parameter's type: a SIGNED
     /// slot is the i64::MIN-width fix; an UNSIGNED slot would turn `-1` huge.
     is_signed_int_type(&this, ty: TypeRef) -> boolean {
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null || t.kind != TypeKind::Int) { return false; }
         return (t as IntType*).int_kind.is_signed();
     }

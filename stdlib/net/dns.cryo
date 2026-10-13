@@ -29,25 +29,41 @@
 
 namespace std::net::dns;
 
-import core::option;
-import core::result;
-import core::mem;
-import core::ptr;
-import core::drop;
-import alloc::layout;
-import alloc::allocator;
-import collections::str;
-import collections::string;
-import collections::array;
-import io::error;
-import ffi::libc;
-import net::addr::ip;
-import net::addr::socket_addr;
-import net::sys;
-import future::poll;
-import future::waker;
-import future::traits;
-import future::blocking;
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::mem;
+import std::core::ptr;
+import std::core::ptr::{ NonNull };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::alloc::layout;
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator;
+import std::alloc::allocator::{ GlobalAlloc };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::io::error;
+import std::io::error::{ IoError, IoErrorKind };
+import std::ffi::libc;
+import std::net::addr::ip;
+import std::net::addr::ip::{ IpAddr, IpV4Addr, IpV6Addr };
+import std::net::addr::socket_addr;
+import std::net::addr::socket_addr::{ SocketAddr };
+import std::net::sys;
+import std::future::poll;
+import std::future::poll::{ Poll };
+import std::future::waker;
+import std::future::waker::{ Context };
+import std::future::traits;
+import std::future::traits::{ Future };
+import std::future::blocking;
+import std::future::blocking::{ BlockingJob, BlockingPool, JOB_PENDING };
 
 // AF_INET is 2 on every platform; AF_INET6 differs (Linux/BSD = 10,
 // Windows = 23). `getaddrinfo` reports the OS family value in `ai_family`,
@@ -90,10 +106,10 @@ type struct ResolvedAddrs {
         }
         return Option::None;
     }
+}
 
-    drop(mut &this) -> void {
-        this.addrs.drop();
-    }
+implement trait Drop for struct ResolvedAddrs {
+    drop(mut &this) -> void { }
 }
 
 /// Resolve `host` to every A / AAAA record the resolver returns, in
@@ -118,11 +134,11 @@ function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
     const rc: i32 = sys::os_getaddrinfo(host_c.as_ptr(), null, &hints[0], &res);
     if (rc != 0) {
         const err: IoError = eai_to_io(rc);
-        host_c.drop();
+        mem::drop(host_c);
         return Result::Err(err);
     }
 
-    mut addrs: Array<IpAddr> = Array<IpAddr>::new();
+    mut addrs: Array<IpAddr> = Array::<IpAddr>::new();
     mut cur: u8* = res;
     while (cur != null) {
         const family: u32 = read_u32(cur, 4);
@@ -144,10 +160,10 @@ function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
     }
 
     sys::os_freeaddrinfo(res);
-    host_c.drop();
+    mem::drop(host_c);
 
     if (addrs.is_empty()) {
-        addrs.drop();
+        mem::drop(addrs);
         return Result::Err(IoError::new(IoErrorKind::NotFound, 0));
     }
     return Result::Ok(ResolvedAddrs { addrs: addrs });
@@ -158,7 +174,7 @@ function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
 /// must be dropped by the caller.
 function lookup(host: Str, port: u16) -> Result<Array<SocketAddr>, IoError> {
     mut resolved: ResolvedAddrs = resolve(host)?;
-    mut out: Array<SocketAddr> = Array<SocketAddr>::new();
+    mut out: Array<SocketAddr> = Array::<SocketAddr>::new();
     mut i: u64 = 0;
     while (i < resolved.length()) {
         match (resolved.get(i)) {
@@ -167,7 +183,7 @@ function lookup(host: Str, port: u16) -> Result<Array<SocketAddr>, IoError> {
         }
         i++;
     }
-    resolved.drop();
+    mem::drop(resolved);
     return Result::Ok(out);
 }
 
@@ -176,7 +192,7 @@ function lookup(host: Str, port: u16) -> Result<Array<SocketAddr>, IoError> {
 function resolve_one(host: Str) -> Result<IpAddr, IoError> {
     mut resolved: ResolvedAddrs = resolve(host)?;
     const first: Option<IpAddr> = resolved.get(0);
-    resolved.drop();
+    mem::drop(resolved);
     match (first) {
         Option::Some(ip) => { return Result::Ok(ip); }
         Option::None     => { return Result::Err(IoError::new(IoErrorKind::NotFound, 0)); }
@@ -227,12 +243,12 @@ function resolve_job_run(raw: u8*) -> void {
 /// stays correct whether or not anyone was still waiting.
 function resolve_job_free(raw: u8*) -> void {
     mut j: ResolveJob* = raw as ResolveJob*;
-    j.host.drop();
+    ptr::drop_in_place::<String>(&j.host);
     if (j.produced && j.ok) {
-        j.addrs.drop();
+        ptr::drop_in_place::<ResolvedAddrs>(&j.addrs);
     }
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(raw), Layout::of<ResolveJob>());
+    alloc.deallocate(NonNull::new(raw), Layout::of::<ResolveJob>());
 }
 
 /// Resolve `host` without stalling the executor: the lookup runs on the
@@ -286,8 +302,8 @@ implement trait Future for struct Resolve {
             }
             mut alloc: GlobalAlloc = GlobalAlloc::new();
             mut j: ResolveJob* = null;
-            match (alloc.allocate(Layout::of<ResolveJob>())) {
-                Result::Ok(raw) => { j = raw.cast<ResolveJob>().as_ptr(); }
+            match (alloc.allocate(Layout::of::<ResolveJob>())) {
+                Result::Ok(raw) => { j = raw.cast::<ResolveJob>().as_ptr(); }
                 Result::Err(_)  => {
                     return Poll::Ready(Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)));
                 }
@@ -324,8 +340,8 @@ implement trait Future for struct Resolve {
                 // pool thread could still be releasing it), and leaving an empty
                 // `ResolvedAddrs` behind is what stops its teardown from
                 // freeing the array twice.
-                mut taken: ResolvedAddrs = ResolvedAddrs { addrs: Array<IpAddr>::new() };
-                mem::swap<ResolvedAddrs>(&taken, &j.addrs);
+                mut taken: ResolvedAddrs = ResolvedAddrs { addrs: Array::<IpAddr>::new() };
+                mem::swap::<ResolvedAddrs>(&taken, &j.addrs);
                 out = Result::Ok(taken);
             } else {
                 out = Result::Err(j.err);

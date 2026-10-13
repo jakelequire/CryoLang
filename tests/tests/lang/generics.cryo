@@ -6,9 +6,15 @@
 namespace CryoTests::Tests::Lang::Generics;
 
 import std::core::result;
+import std::core::result::{ Result };
 import std::core::cmp;
+import std::core::cmp::{ Ordering };
 import std::test::error;
+import std::test::error::{ TestError };
 import std::test::assert;
+import std::test::assert::{ expect, expect_eq };
+import std::collections::str;
+import std::collections::str::{ Str };
 
 // ============================================================================
 // Single + multi-param generic structs
@@ -19,7 +25,7 @@ type struct TestPair<A, B> {
     second: B;
 
     static of(first: A, second: B) -> TestPair<A, B> {
-        return TestPair<A, B> { first: first, second: second };
+        return TestPair::<A, B> { first: first, second: second };
     }
 }
 
@@ -29,7 +35,7 @@ type struct Triple<A, B, C> {
     c: C;
 
     static of(a: A, b: B, c: C) -> Triple<A, B, C> {
-        return Triple<A, B, C> { a: a, b: b, c: c };
+        return Triple::<A, B, C> { a: a, b: b, c: c };
     }
 }
 
@@ -37,7 +43,7 @@ type struct Holder<T> {
     value: T;
 
     static wrap(value: T) -> Holder<T> {
-        return Holder<T> { value: value };
+        return Holder::<T> { value: value };
     }
 
     get(&this) -> T {
@@ -48,7 +54,7 @@ type struct Holder<T> {
     /// supplied projection.  Note: callback-style helpers are flaky in
     /// the bootstrap (cf. memory) but a method-level <U> binding works.
     static rebox<U>(other: U) -> Holder<U> {
-        return Holder<U>::wrap(other);
+        return Holder::<U>::wrap(other);
     }
 }
 
@@ -277,7 +283,7 @@ type struct Counter<T> {
     count: i32;
 
     static start(value: T) -> Counter<T> {
-        return Counter<T> { value: value, count: 0 };
+        return Counter::<T> { value: value, count: 0 };
     }
 
     bump(mut &this) -> void {
@@ -315,4 +321,78 @@ function generic_literal_arg_adapts_to_sibling_width() -> Result<(), TestError> 
         Result::Err(e) => { return Result::Err(e); }
     }
     return Result::Ok(());
+}
+
+// ============================================================================
+// Answers a generic body decides, carried into each copy
+// ============================================================================
+
+// `sizeof`/`alignof` of a parameter: each copy's operand is its own type.
+function size_in_copy<T>() -> u64 { return sizeof(T) + alignof(T); }
+
+![test]
+function sizeof_in_a_copy_is_the_copys_type() -> Result<(), TestError> {
+    match (expect_eq(size_in_copy::<u8>(), 2)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(size_in_copy::<i64>(), 16);
+}
+
+// A local declared with a parameter's type, assigned through a pointer.
+function swap_in_copy<T>(a: T*, b: T*) -> void {
+    const temp: T = *a;
+    *a = *b;
+    *b = temp;
+}
+
+![test]
+function local_of_parameter_type_in_a_copy() -> Result<(), TestError> {
+    mut x: i64 = 3;
+    mut y: i64 = 40000000000;
+    swap_in_copy::<i64>(&x, &y);
+    match (expect_eq(x, 40000000000)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(y, 3);
+}
+
+type struct CarriedPair<T> { left: T; right: T; }
+
+// A destructure whose type names the body's parameter.
+function spread_in_copy<T>(p: CarriedPair<T>, take_right: boolean) -> T {
+    const { left, right }: CarriedPair<T> = p;
+    if (take_right) { return right; }
+    return left;
+}
+
+![test]
+function destructure_of_parameter_type_in_a_copy() -> Result<(), TestError> {
+    match (expect_eq(spread_in_copy::<i64>(CarriedPair::<i64> { left: 1, right: 50000000000 }, true), 50000000000)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(spread_in_copy::<i64>(CarriedPair::<i64> { left: 1, right: 50000000000 }, false), 1);
+}
+
+type enum CarriedChoice<T> { Neither; One(T); }
+
+// A match on an enum of the parameter: each arm's variant in every copy.
+function choose_in_copy<T>(c: CarriedChoice<T>, fallback: T) -> T {
+    match (c) {
+        CarriedChoice::One(v)  => { return v; }
+        CarriedChoice::Neither => { return fallback; }
+    }
+}
+
+![test]
+function enum_pattern_of_parameter_type_in_a_copy() -> Result<(), TestError> {
+    const one: CarriedChoice<i64> = CarriedChoice::One(7);
+    const neither: CarriedChoice<i64> = CarriedChoice::Neither;
+    match (expect_eq(choose_in_copy::<i64>(one, 9), 7)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(choose_in_copy::<i64>(neither, 9), 9);
 }

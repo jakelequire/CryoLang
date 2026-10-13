@@ -33,30 +33,47 @@
 
 namespace std::net::http2::connection;
 
-import core::option;
-import core::result;
-import core::slice;
-import core::primitives;
-import core::convert;
-import core::mem;
-import io::error;
-import io::traits;
-import io::buf;
-import collections::array;
-import collections::string;
-import collections::str;
-import collections::hashmap;
-import net::http::method;
-import net::http::status;
-import net::http::headers;
-import net::http::request;
-import net::http::response;
-import net::http2::frame;
-import net::http2::hpack;
-import net::http2::settings;
-import future::poll;
-import future::waker;
-import future::traits;
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::slice;
+import std::core::slice::{ Slice };
+import std::core::primitives;
+import std::core::convert;
+import std::core::mem;
+import std::io::error;
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::traits;
+import std::io::traits::{ AsyncTransport };
+import std::io::buf;
+import std::io::buf::{ BufStream };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::collections::hashmap;
+import std::net::http::method;
+import std::net::http::method::{ Method };
+import std::net::http::status;
+import std::net::http::status::{ StatusCode };
+import std::net::http::headers;
+import std::net::http::headers::{ Headers };
+import std::net::http::request;
+import std::net::http::request::{ Request };
+import std::net::http::response;
+import std::net::http::response::{ Response };
+import std::net::http2::frame;
+import std::net::http2::frame::{ Frame };
+import std::net::http2::hpack;
+import std::net::http2::hpack::{ HeaderField, HpackDecoder, HpackEncoder };
+import std::net::http2::settings;
+import std::net::http2::settings::{ Settings };
+import std::future::poll;
+import std::future::waker;
+import std::future::traits;
 
 /// The 24-octet client connection preface (RFC 7540 section 3.5).
 const PREFACE_LEN: u64 = 24;
@@ -108,18 +125,10 @@ type struct Http2Connection<S> {
     conn_send_window:      i64;
     stream_send_window:    i64;
 
-    /// Release the HPACK encoder/decoder tables and the transport. The
-    /// connection owns the transport, so dropping this closes the socket.
-    drop(mut &this) -> void {
-        this.conn.drop();
-        this.encoder.drop();
-        this.decoder.drop();
-    }
-
     /// New client-side connection taking ownership of `conn`. Call
     /// `handshake_client` before issuing requests.
     static new_client(conn: BufStream<S>) -> Http2Connection<S> {
-        return Http2Connection<S> {
+        return Http2Connection::<S> {
             conn:                  conn,
             encoder:               HpackEncoder::new(LOCAL_HEADER_TABLE_SIZE as u64),
             decoder:               HpackDecoder::new(LOCAL_HEADER_TABLE_SIZE as u64),
@@ -135,7 +144,7 @@ type struct Http2Connection<S> {
 
     /// New server-side connection over an accepted, already-buffered transport.
     static new_server(conn: BufStream<S>) -> Http2Connection<S> {
-        return Http2Connection<S> {
+        return Http2Connection::<S> {
             conn:                  conn,
             encoder:               HpackEncoder::new(LOCAL_HEADER_TABLE_SIZE as u64),
             decoder:               HpackDecoder::new(LOCAL_HEADER_TABLE_SIZE as u64),
@@ -205,7 +214,7 @@ type struct Http2Connection<S> {
             // `process_control` only queues, so the frame is released before
             // the flush below rather than being carried across it.
             const outcome: Result<boolean, IoError> = this.process_control(&fr);
-            fr.drop();
+            mem::drop(fr);
             match (outcome) {
                 Result::Ok(_)  => { }
                 Result::Err(e) => { return Result::Err(e); }
@@ -217,7 +226,7 @@ type struct Http2Connection<S> {
 
     /// Queue our advertised SETTINGS frame. Synchronous; the caller flushes.
     queue_settings(mut &this) -> Result<(), IoError> {
-        mut payload: Array<u8> = Array<u8>::new();
+        mut payload: Array<u8> = Array::<u8>::new();
         settings::push_entry(&payload, settings::SETTINGS_HEADER_TABLE_SIZE, LOCAL_HEADER_TABLE_SIZE);
         settings::push_entry(&payload, settings::SETTINGS_ENABLE_PUSH, LOCAL_ENABLE_PUSH);
         settings::push_entry(&payload, settings::SETTINGS_INITIAL_WINDOW_SIZE, LOCAL_INITIAL_WINDOW_SIZE);
@@ -225,7 +234,7 @@ type struct Http2Connection<S> {
         settings::push_entry(&payload, settings::SETTINGS_MAX_HEADER_LIST_SIZE, LOCAL_MAX_HEADER_LIST_SIZE);
         const r: Result<(), IoError> =
             this.conn.queue_h2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice());
-        payload.drop();
+        mem::drop(payload);
         return r;
     }
 
@@ -390,7 +399,7 @@ type struct Http2Connection<S> {
         while (this.stream_send_window <= 0 || this.conn_send_window <= 0) {
             mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as u64))?;
             const outcome: Result<boolean, IoError> = this.process_control(&fr);
-            fr.drop();
+            mem::drop(fr);
             match (outcome) {
                 Result::Ok(_)  => { }
                 Result::Err(e) => { return Result::Err(e); }
@@ -426,20 +435,20 @@ type struct Http2Connection<S> {
         this.next_stream_id = this.next_stream_id + 2;
         this.stream_send_window = this.remote_initial_window;
 
-        mut block: Array<u8> = Array<u8>::new();
+        mut block: Array<u8> = Array::<u8>::new();
         this.encode_request_headers(&block, &request_local, scheme, authority);
         const has_body: boolean = !request_local.body.is_empty();
 
         // Take the body out and release the request before anything suspends:
         // only the bytes have to survive into `send_body`, and a request left
         // live across the flush would be carried for nothing.
-        mut body_bytes: Array<u8> = Array<u8>::new();
-        mem::swap<Array<u8>>(&body_bytes, &request_local.body);
-        request_local.drop();
+        mut body_bytes: Array<u8> = Array::<u8>::new();
+        mem::swap::<Array<u8>>(&body_bytes, &request_local.body);
+        mem::drop(request_local);
 
         const queued: Result<(), IoError> =
             this.queue_header_block(sid, block.as_slice(), !has_body);
-        block.drop();
+        mem::drop(block);
         queued?;
 
         // `send_body` flushes whether or not there are DATA frames, so the
@@ -453,8 +462,8 @@ type struct Http2Connection<S> {
     /// block and body.
     async read_response(mut &this, sid: u32) -> Result<Response, IoError>
     where S: AsyncTransport {
-        mut block: Array<u8> = Array<u8>::new();
-        mut body: Array<u8> = Array<u8>::new();
+        mut block: Array<u8> = Array::<u8>::new();
+        mut body: Array<u8> = Array::<u8>::new();
         mut headers_done: boolean = false;
         mut stream_done: boolean = false;
 
@@ -471,41 +480,41 @@ type struct Http2Connection<S> {
             mut handled: boolean = false;
             match (control) {
                 Result::Ok(h)  => { handled = h; }
-                Result::Err(e) => { fr.drop(); return Result::Err(e); }
+                Result::Err(e) => { mem::drop(fr); return Result::Err(e); }
             }
             if (handled) {
-                fr.drop();
+                mem::drop(fr);
                 (await this.conn.flush())?;
                 continue;
             }
 
             if (fr.ftype == frame::FRAME_RST_STREAM && fr.stream_id == sid) {
-                fr.drop();
+                mem::drop(fr);
                 return Result::Err(IoError::new(IoErrorKind::ConnectionReset, 0));
             } else if (fr.ftype == frame::FRAME_HEADERS && fr.stream_id == sid) {
                 block.append(header_fragment(&fr));
                 if (fr.has_flag(frame::FLAG_END_HEADERS)) { headers_done = true; }
                 if (fr.has_flag(frame::FLAG_END_STREAM))  { stream_done = true; }
-                fr.drop();
+                mem::drop(fr);
             } else if (fr.ftype == frame::FRAME_CONTINUATION && fr.stream_id == sid) {
                 block.append(fr.payload.as_slice());
                 if (fr.has_flag(frame::FLAG_END_HEADERS)) { headers_done = true; }
-                fr.drop();
+                mem::drop(fr);
             } else if (fr.ftype == frame::FRAME_DATA && fr.stream_id == sid) {
                 body.append(data_fragment(&fr));
                 const consumed: u64 = fr.payload.length();
                 const end: boolean = fr.has_flag(frame::FLAG_END_STREAM);
-                fr.drop();
+                mem::drop(fr);
                 this.queue_ack_data(sid, consumed)?;
                 (await this.conn.flush())?;
                 if (end) { stream_done = true; }
             } else {
-                fr.drop();
+                mem::drop(fr);
             }
         }
 
         const built: Option<Response> = build_response(&this.decoder, block.as_slice(), body);
-        block.drop();
+        mem::drop(block);
         match (built) {
             Option::Some(resp) => { return Result::Ok(resp); }
             Option::None       => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
@@ -530,7 +539,7 @@ type struct Http2Connection<S> {
                     // throwaway in its place for the struct's
                     // implicit destructor to reclaim.
                     mut req: Request = Request::new(Method::Get, Str::new("/"));
-                    mem::swap<Request>(&req, &on_stream.req);
+                    mem::swap::<Request>(&req, &on_stream.req);
                     const resp: Response = (handler)(req);
                     (await this.send_response(sid, resp))?;
                 }
@@ -543,8 +552,8 @@ type struct Http2Connection<S> {
     /// assembled request. `None` means the connection closed cleanly.
     async read_request(mut &this) -> Result<Option<RequestOnStream>, IoError>
     where S: AsyncTransport {
-        mut block: Array<u8> = Array<u8>::new();
-        mut body: Array<u8> = Array<u8>::new();
+        mut block: Array<u8> = Array::<u8>::new();
+        mut body: Array<u8> = Array::<u8>::new();
         mut sid: u32 = 0;
         mut have_stream: boolean = false;
         mut headers_done: boolean = false;
@@ -573,11 +582,11 @@ type struct Http2Connection<S> {
             mut handled: boolean = false;
             match (control) {
                 Result::Ok(h)  => { handled = h; }
-                Result::Err(e) => { fr.drop(); return Result::Err(e); }
+                Result::Err(e) => { mem::drop(fr); return Result::Err(e); }
             }
             if (handled) {
                 const closing: boolean = this.goaway_received && !have_stream;
-                fr.drop();
+                mem::drop(fr);
                 if (closing) { return Result::Ok(Option::None); }
                 (await this.conn.flush())?;
                 continue;
@@ -590,26 +599,26 @@ type struct Http2Connection<S> {
                     if (fr.has_flag(frame::FLAG_END_HEADERS)) { headers_done = true; }
                     if (fr.has_flag(frame::FLAG_END_STREAM))  { stream_done = true; }
                 }
-                fr.drop();
+                mem::drop(fr);
             } else if (fr.ftype == frame::FRAME_CONTINUATION && have_stream && fr.stream_id == sid) {
                 block.append(fr.payload.as_slice());
                 if (fr.has_flag(frame::FLAG_END_HEADERS)) { headers_done = true; }
-                fr.drop();
+                mem::drop(fr);
             } else if (fr.ftype == frame::FRAME_DATA && have_stream && fr.stream_id == sid) {
                 body.append(data_fragment(&fr));
                 const consumed: u64 = fr.payload.length();
                 const end: boolean = fr.has_flag(frame::FLAG_END_STREAM);
-                fr.drop();
+                mem::drop(fr);
                 this.queue_ack_data(sid, consumed)?;
                 (await this.conn.flush())?;
                 if (end) { stream_done = true; }
             } else {
-                fr.drop();
+                mem::drop(fr);
             }
         }
 
         const built: Option<Request> = build_request(&this.decoder, block.as_slice(), body);
-        block.drop();
+        mem::drop(block);
         match (built) {
             Option::Some(req) => {
                 return Result::Ok(Option::Some(RequestOnStream { stream_id: sid, req: req }));
@@ -624,19 +633,19 @@ type struct Http2Connection<S> {
         mut response: Response = resp;
         this.stream_send_window = this.remote_initial_window;
 
-        mut block: Array<u8> = Array<u8>::new();
+        mut block: Array<u8> = Array::<u8>::new();
         this.encode_response_headers(&block, &response);
         const has_body: boolean = !response.body.is_empty();
 
         // As in `request`: take the bytes, release the message, and only then
         // suspend.
-        mut body_bytes: Array<u8> = Array<u8>::new();
-        mem::swap<Array<u8>>(&body_bytes, &response.body);
-        response.drop();
+        mut body_bytes: Array<u8> = Array::<u8>::new();
+        mem::swap::<Array<u8>>(&body_bytes, &response.body);
+        mem::drop(response);
 
         const queued: Result<(), IoError> =
             this.queue_header_block(sid, block.as_slice(), !has_body);
-        block.drop();
+        mem::drop(block);
         queued?;
 
         return await this.send_body(sid, body_bytes, has_body);
@@ -696,6 +705,13 @@ type struct Http2Connection<S> {
     }
 }
 
+implement<S> trait Drop for struct Http2Connection<S> {
+    /// The HPACK encoder/decoder tables and the transport are released by
+    /// their fields. The connection owns the transport, so dropping this
+    /// closes the socket.
+    drop(mut &this) -> void { }
+}
+
 // ---- free helpers ---------------------------------------------------------
 
 /// Append every byte or report `OutOfMemory`; the outgoing buffer is the one
@@ -720,7 +736,7 @@ function build_response(decoder: mut &HpackDecoder, block: Slice<u8>, body: Arra
     mut body_local: Array<u8> = body;
     mut fields: Array<HeaderField> = match (decoder.decode(block)) {
         Option::Some(f) => { f }
-        Option::None    => { body_local.drop(); return Option::None; }
+        Option::None    => { mem::drop(body_local); return Option::None; }
     };
 
     mut code: u16 = 0;
@@ -740,7 +756,7 @@ function build_response(decoder: mut &HpackDecoder, block: Slice<u8>, body: Arra
         }
         i++;
     }
-    if (!have_status) { fields.drop(); body_local.drop(); return Option::None; }
+    if (!have_status) { mem::drop(fields); mem::drop(body_local); return Option::None; }
 
     mut resp: Response = Response::new(StatusCode::from_u16(code));
     mut j: u64 = 0;
@@ -756,7 +772,7 @@ function build_response(decoder: mut &HpackDecoder, block: Slice<u8>, body: Arra
         }
         j++;
     }
-    fields.drop();
+    mem::drop(fields);
 
     resp.set_body(body_local);
     return Option::Some(resp);
@@ -768,7 +784,7 @@ function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array
     mut body_local: Array<u8> = body;
     mut fields: Array<HeaderField> = match (decoder.decode(block)) {
         Option::Some(f) => { f }
-        Option::None    => { body_local.drop(); return Option::None; }
+        Option::None    => { mem::drop(body_local); return Option::None; }
     };
 
     mut method: Option<Method> = Option::None;
@@ -787,10 +803,10 @@ function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array
                         Result::Err(_) => { }
                     }
                 } else if (name.equals(&Str::new(":path"))) {
-                    match (path) { Option::Some(mut p) => { p.drop(); } Option::None => { } }
+                    match (path) { Option::Some(mut p) => { mem::drop(p); } Option::None => { } }
                     path = Option::Some(String::from_str(value));
                 } else if (name.equals(&Str::new(":authority"))) {
-                    match (authority) { Option::Some(mut a) => { a.drop(); } Option::None => { } }
+                    match (authority) { Option::Some(mut a) => { mem::drop(a); } Option::None => { } }
                     authority = Option::Some(String::from_str(value));
                 }
             }
@@ -803,27 +819,27 @@ function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array
     match (method) {
         Option::Some(m) => { chosen_method = m; }
         Option::None    => {
-            cleanup_opt_string(path);
-            cleanup_opt_string(authority);
-            fields.drop(); body_local.drop();
+            mem::drop(path);
+            mem::drop(authority);
+            mem::drop(fields); mem::drop(body_local);
             return Option::None;
         }
     }
     mut path_str: String = match (path) {
         Option::Some(p) => { p }
         Option::None    => {
-            cleanup_opt_string(authority);
-            fields.drop(); body_local.drop();
+            mem::drop(authority);
+            mem::drop(fields); mem::drop(body_local);
             return Option::None;
         }
     };
 
     mut req: Request = Request::new(chosen_method, path_str.as_str());
-    path_str.drop();
+    mem::drop(path_str);
     match (authority) {
         Option::Some(mut a) => {
             req.headers.insert(Str::new("host"), a.as_str());
-            a.drop();
+            mem::drop(a);
         }
         Option::None => { }
     }
@@ -841,17 +857,10 @@ function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array
         }
         j++;
     }
-    fields.drop();
+    mem::drop(fields);
 
     req.set_body(body_local);
     return Option::Some(req);
-}
-
-function cleanup_opt_string(opt: Option<String>) -> void {
-    match (opt) {
-        Option::Some(mut s) => { s.drop(); }
-        Option::None        => { }
-    }
 }
 
 /// Extract the header-block fragment from a HEADERS frame, stripping any

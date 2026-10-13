@@ -2,8 +2,8 @@
 ///
 /// Lambda typing + closure lowering: resolving a lambda's param/return types and
 /// walking its body in a fresh per-function frame, recording captured names off
-/// the enclosing scope, synthesising a closure struct (+ `__call__`, + `drop` for
-/// non-Copy captures) for a capturing lambda, rewriting `f(args)` to
+/// the enclosing scope, synthesising a closure struct (+ `__call__`, + a `Drop`
+/// implementation for non-Copy captures) for a capturing lambda, rewriting `f(args)` to
 /// `f.__call__(args)` when `f` is a closure local, and the free-call
 /// closure-arg specialisation.
 ///
@@ -15,19 +15,68 @@
 /// Env (arena/intern/ctx) + peers: state, symbolic (param binding), scopes (local
 /// registration), dispatch (body walk).
 
-namespace Compiler::Sema::LambdaSynth;
+namespace compiler::sema::lambda_synth;
 
-import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Ownership, Resolver, GenericRegistry };
-import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName };
-import Compiler::AST;
-import Compiler::AST::{ Node, Visitor, Expression, Statement, Declaration, Cloner };
-import Compiler::Diag;
-import Compiler::Diag::{ Diagnostic, SourceSpan };
-import Compiler::CompilationContext;
-import Compiler::Sema::{ State, SymbolicChecker, ScopeManager, Dispatch };
+import compiler::types::{
+    type_ref, type_base, arena, compound, user_defined, ownership, resolver, generic_registry, TypeKind
+};
+import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
+import compiler::ast;
+import compiler::ast::{
+    cloner, declaration, expression, MemberPin, NamedAnnotation, node, NodeKind, statement,
+    TypeAnnotation, Visibility, visitor
+};
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, source_span };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::sema::{ state, symbolic_checker, scope_manager, dispatch };
 import std::core::{ option, mem };
 import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap, HashMapIter };
 import std::fmt;
+import compiler::ast::cloner::{ ASTCloner };
+import compiler::ast::declaration::{
+    DeclarationNode, FieldDeclNode, FunctionDeclNode, ImplBlockNode, MethodNode, ReceiverForm,
+    StructDeclNode, VarDeclNode
+};
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::ast::expression::{
+    CalleePin,
+    CallExprNode, ExpressionNode, IdentifierNode, LambdaExprNode, MemberAccessNode
+};
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::statement::{ BlockStmtNode, DeclStmtNode, StatementNode };
+import compiler::ast::visitor::{ ASTVisitor };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res;
+import compiler::resolver::res::{ Res, ResSlot, DefId, DefKey, DefKind, FamilyOwner };
+import compiler::decl_index::{ OverloadId };
+import compiler::module_graph::{ ModulePath };
+import compiler::resolver::resolver::{ Resolver };
+import compiler::sema::dispatch::{ SemaDispatch };
+import compiler::sema::scope_manager::{ ScopeManager };
+import compiler::sema::state::{ LocalBinding, SemaState };
+import compiler::resolver::symbol_id::{ SymbolKey };
+import std::collections::hashset;
+import std::collections::hashset::{ HashSet };
+import compiler::sema::symbolic_checker::{ SymbolicChecker };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{ FunctionType };
+import compiler::types::generic_registry::{ GenericRegistry };
+import compiler::types::ownership::{ OwnershipQuery };
+import compiler::types::resolver::{ ResolutionContext };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{ FieldInfo, MethodInfo, StructType };
+import std::core::mem::{ swap };
+import std::core::option::{ Option };
 
 type struct LambdaSynth {
     arena:    TypeArena*;
@@ -37,11 +86,15 @@ type struct LambdaSynth {
     symbolic: SymbolicChecker*;
     scopes:   ScopeManager*;
     dispatch: SemaDispatch*;
+    /// The allocator a synthesized binding's identity comes from.  The shadow
+    /// locals this synthesis writes into a closure body are declared after
+    /// name resolution ran, so nothing else can say which binding each is.
+    resolver: Resolver*;
 
     static null() -> LambdaSynth {
         return LambdaSynth {
             arena: null, intern: null, ctx: null, state: null,
-            symbolic: null, scopes: null, dispatch: null,
+            symbolic: null, scopes: null, dispatch: null, resolver: null,
         };
     }
 
@@ -51,6 +104,7 @@ type struct LambdaSynth {
         this.arena    = arena;
         this.intern   = intern;
         this.ctx      = ctx;
+        this.resolver = ctx.get_resolver();
         this.state    = state;
         this.symbolic = symbolic;
         this.scopes   = scopes;
@@ -62,14 +116,16 @@ type struct LambdaSynth {
     /// per-function frame (capturing free variables), and return either the
     /// synthesised closure-struct type (capturing) or a function type (non-capturing).
     resolve_lambda(mut &this, visitor: ASTVisitor*, node: LambdaExprNode*) -> TypeRef {
-        // One-shot guard: a capturing lambda already lowered (post_mono re-walk)
+        // One-shot guard: a capturing lambda an earlier walk already lowered
         // carries its closure-struct type - return it, don't re-lower.
         if (node.is_capturing() && node.has_resolved_type()
                 && this.is_closure_struct_type(node.resolved_type)) {
             return node.resolved_type;
         }
 
-        mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        mut res_ctx: ResolutionContext = ResolutionContext::new("");
+        // A lambda's parameter and return annotations are written where the
+        // lambda is, inside a body, and resolve there.
         this.symbolic.symbolic_bind_params(&res_ctx);
 
         mut param_types: TypeRef[] = [];
@@ -77,7 +133,7 @@ type struct LambdaSynth {
             const p: VarDeclNode* = node.parameters[i];
             if (p == null) { continue; }
             mut pty: TypeRef = p.resolved_type;
-            if (!pty.is_valid() && p.type_annotation != null && this.ctx.type_resolver != null) {
+            if (!pty.is_valid() && p.type_annotation != null) {
                 pty = this.ctx.type_resolver.resolve(p.type_annotation, &res_ctx);
                 if (pty.is_valid()) { p.resolved_type = pty; }
             }
@@ -87,61 +143,55 @@ type struct LambdaSynth {
 
         mut ret_ty: TypeRef = node.return_type;
         if (!ret_ty.is_valid()) {
-            if (node.return_type_ann != null && this.ctx.type_resolver != null) {
+            if (node.return_type_ann != null) {
                 ret_ty = this.ctx.type_resolver.resolve(node.return_type_ann, &res_ctx);
             }
             if (!ret_ty.is_valid()) { ret_ty = this.arena.get_void(); }
             node.set_return_type(ret_ty);
         }
 
-        // Save the enclosing frame, install a fresh one for the lambda body.
-        // HashMaps alias-and-restore (no drop on reassign);
-        // owning undo/payload arrays start empty and are exchanged via `swap`.
-        const saved_locals:    HashMap<u32, TypeRef>    = this.state.locals;
-        const saved_muts:      HashMap<u32, boolean>    = this.state.local_muts;
-        const saved_kw:        HashMap<u32, SourceSpan> = this.state.local_kw_spans;
-        mut saved_undo_keys: u32[]        = [];
-        mut saved_undo_prev: TypeRef[]    = [];
-        mut saved_undo_muts: boolean[]    = [];
-        mut saved_undo_kw:   SourceSpan[] = [];
+        // Save the enclosing frame, install a fresh one for the lambda body:
+        // the owning tables start empty and are exchanged via `swap`.
         const saved_ret:       TypeRef         = this.state.return_type;
         const saved_ret_ann:   TypeAnnotation* = this.state.return_type_ann;
         const saved_this:      TypeRef         = this.state.this_type;
         const saved_this_mut:  boolean         = this.state.this_is_mut;
         const saved_this_byref: boolean        = this.state.this_is_by_ref;
-        mut saved_payload:   u32[]             = [];
-        mut saved_alias:     u32[]             = [];
         const saved_expected:  TypeRef         = this.state.expected_type;
         const saved_loop:      i32             = this.state.loop_depth;
-        const saved_outer_locals: HashMap<u32, TypeRef> = this.state.lambda_outer_locals;
         const saved_lambda_depth: i32                   = this.state.in_lambda_depth;
         const saved_current_lam:  LambdaExprNode*       = this.state.current_lambda;
+        mut saved_bindings: HashMap<SymbolKey, LocalBinding> = HashMap::<SymbolKey, LocalBinding>::new();
+        mut saved_binding_undo: SymbolKey[] = [];
+        mut saved_binding_prev: LocalBinding[] = [];
+        mut saved_payload: HashSet<SymbolKey> = HashSet::<SymbolKey>::new();
+        mut saved_alias:   HashSet<SymbolKey> = HashSet::<SymbolKey>::new();
+        mut saved_outer:   HashMap<SymbolKey, TypeRef> = HashMap::<SymbolKey, TypeRef>::new();
+        mut saved_params:  HashSet<SymbolKey> = HashSet::<SymbolKey>::new();
+        swap(&this.state.bindings, &saved_bindings);
+        swap(&this.state.binding_undo, &saved_binding_undo);
+        swap(&this.state.binding_prev, &saved_binding_prev);
+        swap(&this.state.payload_bindings, &saved_payload);
+        swap(&this.state.alias_bindings, &saved_alias);
+        swap(&this.state.outer_bindings, &saved_outer);
 
-        // Compose the body's view of out-of-scope bindings: further-out captures
-        // plus immediate enclosing locals (the latter shadows the former).
-        mut new_outer_locals: HashMap<u32, TypeRef> = HashMap<u32, TypeRef>::new();
-        mut outer_it: HashMapIter<u32, TypeRef> = saved_outer_locals.iter();
+        // Compose the body's view of out-of-scope bindings: further-out
+        // captures plus the enclosing frame's bindings.
+        mut outer_it: HashMapIter<SymbolKey, TypeRef> = saved_outer.iter();
         loop {
             match (outer_it.next()) {
-                Option::Some(pair) => { new_outer_locals.insert(pair.first, pair.second); }
+                Option::Some(pair) => { this.state.outer_bindings.insert(pair.first, pair.second); }
                 Option::None => { break; }
             }
         }
-        mut local_it: HashMapIter<u32, TypeRef> = saved_locals.iter();
+        mut local_it: HashMapIter<SymbolKey, LocalBinding> = saved_bindings.iter();
         loop {
             match (local_it.next()) {
-                Option::Some(pair) => { new_outer_locals.insert(pair.first, pair.second); }
+                Option::Some(pair) => { this.state.outer_bindings.insert(pair.first, pair.second.ty); }
                 Option::None => { break; }
             }
         }
 
-        this.state.locals         = HashMap<u32, TypeRef>::new();
-        this.state.local_muts     = HashMap<u32, boolean>::new();
-        this.state.local_kw_spans = HashMap<u32, SourceSpan>::new();
-        swap(&this.state.undo_keys,     &saved_undo_keys);
-        swap(&this.state.undo_prev,     &saved_undo_prev);
-        swap(&this.state.undo_muts,     &saved_undo_muts);
-        swap(&this.state.undo_kw_spans, &saved_undo_kw);
         this.state.return_type     = ret_ty;
         this.state.return_type_ann = node.return_type_ann;
         // A lambda returns for itself, not for an enclosing `poll`: a `?` in its
@@ -152,19 +202,18 @@ type struct LambdaSynth {
         this.state.this_type       = TypeRef::invalid();
         this.state.this_is_mut     = false;
         this.state.this_is_by_ref  = false;
-        swap(&this.state.payload_binding_ids, &saved_payload);
-        swap(&this.state.alias_binding_ids, &saved_alias);
-        this.state.param_ids = [];
+        // The lambda's body has no caller-backed parameters of the enclosing
+        // function; those come back when it is done.
+        swap(&this.state.param_bindings, &saved_params);
         this.state.expected_type   = TypeRef::invalid();
         this.state.loop_depth      = 0;
-        this.state.lambda_outer_locals = new_outer_locals;
         this.state.in_lambda_depth     = saved_lambda_depth + 1;
         this.state.current_lambda      = node;
 
         for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
             const p: VarDeclNode* = node.parameters[pi];
             if (p == null) { continue; }
-            this.scopes.register_local_with_mut(p.name, p.resolved_type, p.is_mutable);
+            this.scopes.declare(p.sym_id, p.resolved_type, p.is_mutable);
         }
 
         if (node.body != null) {
@@ -172,24 +221,21 @@ type struct LambdaSynth {
         }
 
         // Restore the enclosing frame.
-        this.state.locals         = saved_locals;
-        this.state.local_muts     = saved_muts;
-        this.state.local_kw_spans = saved_kw;
-        swap(&this.state.undo_keys,     &saved_undo_keys);
-        swap(&this.state.undo_prev,     &saved_undo_prev);
-        swap(&this.state.undo_muts,     &saved_undo_muts);
-        swap(&this.state.undo_kw_spans, &saved_undo_kw);
+        swap(&this.state.bindings, &saved_bindings);
+        swap(&this.state.binding_undo, &saved_binding_undo);
+        swap(&this.state.binding_prev, &saved_binding_prev);
+        swap(&this.state.payload_bindings, &saved_payload);
+        swap(&this.state.alias_bindings, &saved_alias);
+        swap(&this.state.outer_bindings, &saved_outer);
+        swap(&this.state.param_bindings, &saved_params);
         this.state.return_type     = saved_ret;
         this.state.return_type_ann = saved_ret_ann;
         this.state.async_poll_output = saved_poll_out;
         this.state.this_type       = saved_this;
         this.state.this_is_mut     = saved_this_mut;
         this.state.this_is_by_ref  = saved_this_byref;
-        swap(&this.state.payload_binding_ids, &saved_payload);
-        swap(&this.state.alias_binding_ids, &saved_alias);
         this.state.expected_type   = saved_expected;
         this.state.loop_depth      = saved_loop;
-        this.state.lambda_outer_locals = saved_outer_locals;
         this.state.in_lambda_depth     = saved_lambda_depth;
         this.state.current_lambda      = saved_current_lam;
 
@@ -199,9 +245,10 @@ type struct LambdaSynth {
             const prop_registry: GenericRegistry* = this.ctx.get_generic_registry();
             for (mut ci: i64 = 0; ci < node.captured_names.length; ci++) {
                 const cap_name: SymbolStr = node.captured_names[ci];
-                if (!this.scopes.lookup_local(cap_name).is_valid()) {
+                if (!this.scopes.type_of(node.captured_syms[ci]).is_valid()) {
                     const cap_ty: TypeRef = node.captured_types[ci];
-                    saved_current_lam.add_capture(cap_name, cap_ty, node.captured_spans[ci]);
+                    saved_current_lam.add_capture(cap_name, node.captured_syms[ci],
+                                                  cap_ty, node.captured_spans[ci]);
                     if (!OwnershipQuery::is_copy(this.arena, prop_registry, this.intern, cap_ty)) {
                         saved_current_lam.is_move = true;
                     }
@@ -224,35 +271,50 @@ type struct LambdaSynth {
         if (!is_copy && this.state.current_lambda != null) {
             this.state.current_lambda.is_move = true;
         }
-        this.scopes.register_local(ident.name, outer_ty);
+        this.scopes.declare(ident.res.local_sym(), outer_ty, false);
         if (this.state.current_lambda != null) {
-            this.state.current_lambda.add_capture(ident.name, outer_ty, ident.span);
+            this.state.current_lambda.add_capture(ident.name, ident.res.local_sym(),
+                                                  outer_ty, ident.span);
         }
         return outer_ty;
     }
 
-    /// Mint a unique closure type name `<ns>::__Closure_<N>`.
-    mint_closure_name(mut &this) -> SymbolStr {
+    /// Register the definition of a new closure struct, `<ns>::__Closure_<N>`,
+    /// in the module being lowered.  The synthesizer creates the declaration,
+    /// so this is its one registration; its name is the definition's path.
+    mint_closure_def(mut &this, span: SourceSpan) -> DefId {
         const idx: u64 = this.state.closure_counter;
         this.state.closure_counter += 1;
-        const ns_str: string = if (this.ctx.has_namespace()) {
-            this.ctx.namespace_display()
-        } else {
-            this.ctx.source_file
-        };
-        return this.intern.intern(format("%s::__Closure_%lld", ns_str, idx as i64));
+        if (this.ctx.has_namespace()) {
+            return this.ctx.register_in_module(this.ctx.unit_module,
+                this.intern.intern(fmt::format("__Closure_%lld", idx as i64)), DefKind::Type, span);
+        }
+        return this.ctx.register_in_module(ModulePath::none(),
+            this.intern.intern(fmt::format("%s::__Closure_%lld", this.ctx.source_file, idx as i64)),
+            DefKind::Type, span);
     }
 
-    /// Synthesise the closure-struct + `__call__` (+ `drop` for non-Copy captures)
+    /// The receiver of a method synthesized on a closure struct: the struct by
+    /// reference, with a binding of its own, as every method's receiver is.
+    closure_receiver(mut &this, struct_ref: TypeRef, span: SourceSpan) -> VarDeclNode* {
+        mut recv: VarDeclNode* = new VarDeclNode(this.intern.intern("&this"), span);
+        recv.set_receiver(ReceiverForm::ByReference);
+        recv.set_sym_id(this.resolver.alloc_synthetic_binding());
+        recv.set_mutable(false);
+        recv.set_resolved_type(this.arena.get_pointer_to(struct_ref));
+        return recv;
+    }
+
+    /// Synthesise the closure-struct + `__call__` (+ `Drop` for non-Copy captures)
     /// for a capturing lambda; returns the closure struct's TypeRef.
     synthesize_closure_struct(mut &this, lambda: LambdaExprNode*) -> TypeRef {
         const ctx_ptr: CompilationContext* = this.ctx;
         const intern_ptr: InternTable* = this.intern;
         const arena_ptr: TypeArena* = this.arena;
 
-        const qual_name: SymbolStr = this.mint_closure_name();
-        const module_sym: SymbolStr = intern_ptr.intern(ctx_ptr.source_file);
         const span: SourceSpan = lambda.span;
+        const closure_def: DefId = this.mint_closure_def(span);
+        const qual_name: SymbolStr = ctx_ptr.defs.path_of(closure_def).spelling();
 
         // 1. StructDeclNode + FieldDeclNodes.
         mut struct_decl: StructDeclNode* = new StructDeclNode(qual_name, span);
@@ -269,8 +331,9 @@ type struct LambdaSynth {
         }
 
         // 2. Arena StructType + fields.
-        const struct_ref: TypeRef = arena_ptr.create_struct(qual_name, module_sym);
-        const struct_t: Type* = arena_ptr.lookup(struct_ref.id);
+        const struct_ref: TypeRef = arena_ptr.create_struct(
+            qual_name, ctx_ptr.declaring_module(closure_def));
+        const struct_t: Type* = arena_ptr.lookup(struct_ref);
         if (struct_t != null && struct_t.kind == TypeKind::Struct) {
             const st: StructType* = struct_t as StructType*;
             mut infos: FieldInfo[] = [];
@@ -281,10 +344,13 @@ type struct LambdaSynth {
             st.set_fields(infos);
         }
 
-        // 3. `__call__` FunctionDeclNode (implicit receiver).
+        // 3. `__call__` FunctionDeclNode: the closure struct by reference, then
+        // the lambda's own parameters.
         const call_name: SymbolStr = intern_ptr.intern("__call__");
         mut call_fn: FunctionDeclNode* = new FunctionDeclNode(call_name, span);
         call_fn.set_resolved_return_type(lambda.return_type);
+        const call_recv: VarDeclNode* = this.closure_receiver(struct_ref, span);
+        call_fn.add_parameter(call_recv);
         for (mut i: i64 = 0; i < lambda.parameters.length; i++) {
             call_fn.add_parameter(lambda.parameters[i]);
         }
@@ -299,10 +365,25 @@ type struct LambdaSynth {
 
             mut this_ident: IdentifierNode* = new IdentifierNode(this_ident_sym, span);
             this_ident.set_resolved_type(struct_ref);
+            this_ident.set_res(Res::Local(call_recv.sym_id));
             mut access: MemberAccessNode* = new MemberAccessNode(
                 this_ident as ExpressionNode*, cap_name, span, span);
             access.set_resolved_type(cap_ty);
+            // Capture `i` is field `i` of the struct laid out above; nothing
+            // after this walks a node that already carries its type, so the
+            // position is recorded here, where it is known.
+            access.set_resolved_member(MemberPin::Field(0, i));
+            // The shadow is the captured binding inside `__call__`: the body
+            // moved in below still names that binding in every use it holds, so
+            // the shadow takes its identity.  With a fresh one, a move of the
+            // capture inside the body names no declaration of `__call__`, and
+            // the checks keyed by binding never see it.
             mut shadow: VarDeclNode* = new VarDeclNode(cap_name, span);
+            shadow.set_sym_id(if (lambda.captured_syms[i].is_valid()) {
+                lambda.captured_syms[i]
+            } else {
+                this.resolver.alloc_synthetic_binding()
+            });
             shadow.set_mutable(false);
             shadow.set_resolved_type(cap_ty);
             shadow.set_initializer(access as ExpressionNode*);
@@ -327,58 +408,21 @@ type struct LambdaSynth {
 
         // 5. MethodNode + attach.
         mut method: MethodNode* = new MethodNode(call_fn, span);
+        call_fn.def = ctx_ptr.define_method(closure_def, call_fn.name, span,
+            method as ASTNode*);
         method.set_visibility(Visibility::Public);
         method.set_static(false);
         method.set_sink(false);
         struct_decl.add_method(method);
 
-        // 5b. Synthesize `drop` if any capture is non-Copy.
-        mut drop_method: MethodNode* = null;
-        const registry_ptr: GenericRegistry* = this.ctx.get_generic_registry();
-        mut has_noncopy_capture: boolean = false;
-        for (mut di: i64 = 0; di < lambda.captured_names.length; di++) {
-            if (!OwnershipQuery::is_copy(arena_ptr, registry_ptr, intern_ptr, lambda.captured_types[di])) {
-                has_noncopy_capture = true;
-                break;
-            }
-        }
-        if (has_noncopy_capture) {
-            const drop_name: SymbolStr = intern_ptr.intern("drop");
-            mut drop_fn: FunctionDeclNode* = new FunctionDeclNode(drop_name, span);
-            drop_fn.set_resolved_return_type(arena_ptr.get_void());
-
-            mut drop_body: BlockStmtNode* = new BlockStmtNode(span);
-            for (mut di: i64 = 0; di < lambda.captured_names.length; di++) {
-                const cap_name: SymbolStr = lambda.captured_names[di];
-                const cap_ty:   TypeRef   = lambda.captured_types[di];
-                if (OwnershipQuery::is_copy(arena_ptr, registry_ptr, intern_ptr, cap_ty)) { continue; }
-
-                mut this_id: IdentifierNode* = new IdentifierNode(this_ident_sym, span);
-                this_id.set_resolved_type(struct_ref);
-                mut field_acc: MemberAccessNode* = new MemberAccessNode(
-                    this_id as ExpressionNode*, cap_name, span, span);
-                field_acc.set_resolved_type(cap_ty);
-                mut drop_acc: MemberAccessNode* = new MemberAccessNode(
-                    field_acc as ExpressionNode*, drop_name, span, span);
-                mut drop_call: CallExprNode* = new CallExprNode(drop_acc as ExpressionNode*, span);
-                const drop_stmt: ExprStmtNode* = new ExprStmtNode(drop_call as ExpressionNode*, span);
-                drop_body.add_statement(drop_stmt as StatementNode*);
-            }
-            drop_fn.set_body(drop_body);
-            drop_method = new MethodNode(drop_fn, span);
-            drop_method.set_visibility(Visibility::Public);
-            drop_method.set_static(false);
-            drop_method.set_sink(false);
-            struct_decl.add_method(drop_method);
-        }
-
-        // 6. Populate StructType.methods so overload resolution finds `__call__`/`drop`.
+        // 6. Populate StructType.methods so overload resolution finds `__call__`.
         if (struct_t != null && struct_t.kind == TypeKind::Struct) {
             const st: StructType* = struct_t as StructType*;
             mut method_param_types: TypeRef[] = [];
             for (mut pi: i64 = 0; pi < call_fn.parameters.length; pi++) {
                 const pp: VarDeclNode* = call_fn.parameters[pi];
-                if (pp != null && pp.resolved_type.is_valid()) {
+                // A method's entry lists what a call passes: not the receiver.
+                if (pp != null && !pp.is_receiver() && pp.resolved_type.is_valid()) {
                     method_param_types.push(pp.resolved_type);
                 }
             }
@@ -396,48 +440,97 @@ type struct LambdaSynth {
                 ast_node:      method as void*,
             };
             st.add_method(minfo);
-
-            if (drop_method != null) {
-                mut drop_param_types: TypeRef[] = [];
-                const drop_fn_ty: TypeRef = arena_ptr.get_function(
-                    arena_ptr.get_void(), drop_param_types, false);
-                const drop_minfo: MethodInfo = MethodInfo {
-                    name:          intern_ptr.intern("drop"),
-                    function_type: drop_fn_ty,
-                    is_public:     true,
-                    is_protected:  false,
-                    is_static:     false,
-                    is_virtual:    false,
-                    is_override:   false,
-                    param_types:   drop_param_types,
-                    ast_node:      drop_method as void*,
-                };
-                st.add_method(drop_minfo);
-            }
         }
 
         // 7. DeclarationIndex registration.
-        ctx_ptr.decl_index.register_type_with_module(qual_name, struct_ref, module_sym);
+        struct_decl.def = closure_def;
+        ctx_ptr.decl_index.register_type(closure_def, struct_ref, true);
         mut method_arr: MethodNode*[] = [method];
-        if (drop_method != null) { method_arr.push(drop_method); }
-        ctx_ptr.decl_index.register_methods_with_module(
-            qual_name, method_arr, module_sym, intern_ptr, arena_ptr);
+        ctx_ptr.decl_index.register_methods(
+            struct_ref, method_arr, intern_ptr, arena_ptr, "closure/struct methods");
+        const drop_impl: ImplBlockNode* = this.closure_drop_impl(lambda, struct_decl, struct_ref, span);
 
         // 8. Inject into ProgramNode so subsequent passes walk it.
         if (ctx_ptr.artifacts.ast.root != null) {
             ctx_ptr.artifacts.ast.root.add_statement(struct_decl as ASTNode*);
+            if (drop_impl != null) {
+                ctx_ptr.artifacts.ast.root.add_statement(drop_impl as ASTNode*);
+            }
         }
 
         return struct_ref;
     }
 
+    /// `implement trait Drop for struct <closure>`, for a closure that
+    /// captures a value that is not `Copy`; null when every capture is
+    /// `Copy`, so the closure is `Copy` too.  The destructor's body is
+    /// empty: the captures are the struct's fields, and they are released
+    /// after its `drop` runs, as any aggregate's are.  Being the closure's
+    /// destructor, it is what a written `f.drop()` and the scope-exit
+    /// release both reach.
+    closure_drop_impl(mut &this, lambda: LambdaExprNode*, struct_decl: StructDeclNode*,
+                      struct_ref: TypeRef, span: SourceSpan) -> ImplBlockNode* {
+        const registry_ptr: GenericRegistry* = this.ctx.get_generic_registry();
+        mut has_noncopy_capture: boolean = false;
+        for (mut di: i64 = 0; di < lambda.captured_names.length; di++) {
+            if (!OwnershipQuery::is_copy(this.arena, registry_ptr, this.intern, lambda.captured_types[di])) {
+                has_noncopy_capture = true;
+                break;
+            }
+        }
+        if (!has_noncopy_capture) { return null; }
+        const drop_id: DefId = registry_ptr.wellknown(LangItem::Drop);
+        if (!drop_id.is_valid()) { return null; }
+
+        const drop_name: SymbolStr = this.intern.intern("drop");
+        mut drop_fn: FunctionDeclNode* = new FunctionDeclNode(drop_name, span);
+        drop_fn.set_resolved_return_type(this.arena.get_void());
+        drop_fn.set_origin_trait(drop_id);
+        drop_fn.add_parameter(this.closure_receiver(struct_ref, span));
+        drop_fn.set_body(new BlockStmtNode(span));
+        mut drop_method: MethodNode* = new MethodNode(drop_fn, span);
+        drop_fn.def = this.ctx.define_method(struct_decl.def, drop_name, span,
+            drop_method as ASTNode*);
+        drop_method.set_visibility(Visibility::Public);
+        drop_method.set_static(false);
+        drop_method.set_sink(false);
+
+        mut impl_node: ImplBlockNode* = new ImplBlockNode(struct_decl.name, span);
+        // A synthesized head is walked by no resolver, so the synthesizer,
+        // which holds both definitions, records what it names.
+        impl_node.res.answer(Res::Def(struct_decl.def));
+        mut trait_ann: NamedAnnotation* = new NamedAnnotation {
+            name: this.intern.intern("Drop"), span: span, pre_resolved: TypeRef::invalid(),
+            res: ResSlot::Pending,
+        };
+        trait_ann.res.answer(Res::Def(drop_id));
+        impl_node.set_trait_annotation(new TypeAnnotation::Named(trait_ann));
+        impl_node.trait_def = drop_id;
+        impl_node.add_method(drop_method);
+
+        mut impl_methods: MethodNode*[] = [drop_method];
+        this.ctx.decl_index.register_methods(
+            struct_ref, impl_methods, this.intern, this.arena, "closure/drop impl");
+        registry_ptr.register_trait_impl(drop_id, struct_ref, impl_node);
+        return impl_node;
+    }
+
     /// True when `ty` is a struct carrying a `__call__` method (a closure type).
     is_closure_struct_type(mut &this, ty: TypeRef) -> boolean {
-        if (!ty.is_valid()) { return false; }
-        const t: Type* = this.arena.lookup(ty.id);
-        if (t == null || t.kind != TypeKind::Struct) { return false; }
-        const st: StructType* = t as StructType*;
-        return st.get_method(this.intern.intern("__call__")) != null;
+        return this.closure_call_type(ty).is_valid();
+    }
+
+    /// The function type the closure type `ty` is called as - its
+    /// `__call__`'s parameters after the receiver, and its return - which is
+    /// what a function-typed parameter it is passed to must be; invalid when
+    /// `ty` is no closure type.
+    closure_call_type(mut &this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return TypeRef::invalid(); }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || t.kind != TypeKind::Struct) { return TypeRef::invalid(); }
+        const call_m: MethodInfo* = this.ctx.decl_index.type_method(ty, this.intern.intern("__call__"), this.arena);
+        if (call_m == null) { return TypeRef::invalid(); }
+        return call_m.function_type;
     }
 
     /// True if any of `call`'s arguments is a capturing closure (an anonymous
@@ -460,7 +553,7 @@ type struct LambdaSynth {
         const cn: ASTNode* = call.callee as ASTNode*;
         if (cn.kind != NodeKind::Identifier) { return; }
         const ident: IdentifierNode* = call.callee as IdentifierNode*;
-        const local_ty: TypeRef = this.scopes.lookup_local(ident.name);
+        const local_ty: TypeRef = this.scopes.type_of(ident.res.local_sym());
         if (!this.is_closure_struct_type(local_ty)) { return; }
         ident.set_resolved_type(local_ty);
         const call_sym: SymbolStr = this.intern.intern("__call__");
@@ -472,8 +565,47 @@ type struct LambdaSynth {
     /// When a call passes capturing closures to fn-typed params of a
     /// non-generic free function, synthesise a spec'd clone whose params are typed
     /// as the concrete closure-struct, inject it, and pin `call.resolved_callee`.
-    try_specialize_for_closure_args(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> void {
+    ///
+    /// The callee is `selected`, the entry of the stamped declaration's
+    /// family the call's arguments select (`CallResolver::closure_call_entry`):
+    /// the signature is that entry's own, and the clone is of the declaration
+    /// it was registered for.  The stamp names the family, not one of its
+    /// overloads, so neither the stamp's definition nor its path says which
+    /// signature a call means.  A local (a fn-pointer parameter or binding)
+    /// names no declaration and is not specialized - asking the bare index
+    /// for the leaf instead handed back whichever global shared the local's
+    /// spelling, and a capturing closure passed to a parameter `f` was then
+    /// bound to global `f`'s clone, exit 0.
+    ///
+    /// A callee declared in another module has no AST in this root and is
+    /// not specialized here; that is the reach of the pass, not a lookup
+    /// that failed.
+    try_specialize_for_closure_args(mut &this, call: CallExprNode*, ident: IdentifierNode*,
+                                    selected: OverloadId) -> void {
         if (call == null || ident == null) { return; }
+
+        mut callee_res: Res = Res::Err;
+        match (ident.res) {
+            ResSlot::Answered(r) => { callee_res = r; }
+            _ => {}
+        }
+        const callee_def: DefId = callee_res.def_id();
+        if (!callee_def.is_valid()) {
+            // A local fn-pointer cannot receive a closure struct: there is no
+            // declaration to specialize, and the indirect call would treat
+            // the struct as a function pointer.  Refused, as a generic or
+            // method callee is below.
+            match (callee_res) {
+                Res::Local(_) => {
+                    if (this.call_has_closure_struct_arg(call)) {
+                        this.reject_closure_struct_args_in_non_free_call(
+                            call, "passing a capturing closure to a fn-pointer local's parameter");
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
 
         // Guard: a capturing closure (closure-struct value) passed to a
         // *generic* free function's fn-typed parameter is not yet supported.
@@ -484,32 +616,29 @@ type struct LambdaSynth {
         // which segfaults at the indirect call.  Reject cleanly here, BEFORE
         // the `generic_args`/`resolved_callee` early returns below, so an
         // explicit `f<T>(closure)` call is caught as well as an inferred one.
+        const stamped_fn: FunctionDeclNode* = this.top_level_function_of(callee_def);
         if (this.call_has_closure_struct_arg(call)) {
-            mut gen_fn: FunctionDeclNode* = this.find_top_level_function(ident.name);
-            if (gen_fn == null) {
-                const q: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
-                if (!q.equals(ident.name)) { gen_fn = this.find_top_level_function(q); }
-            }
-            if (gen_fn != null && gen_fn.is_generic()) {
+            if (stamped_fn != null && stamped_fn.is_generic()) {
                 this.reject_closure_struct_args_in_non_free_call(
                     call, "passing a capturing closure to a generic free function's parameter");
                 return;
             }
         }
 
-        if (call.resolved_callee.is_valid()) { return; }
+        if (call.resolved_callee.is_some()) { return; }
         if (call.generic_args.length > 0) { return; }
 
-        mut callee_fn_ref: TypeRef = this.ctx.decl_index.lookup_func_type(ident.name);
-        if (!callee_fn_ref.is_valid()) {
-            const qual: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
-            if (!qual.equals(ident.name)) {
-                callee_fn_ref = this.ctx.decl_index.lookup_func_type(qual);
-            }
-        }
+        // The signature is the selected entry's own, and the declaration
+        // cloned is the one that entry was registered for.
+        if (!selected.is_valid()) { return; }
+        const callee_fn_ref: TypeRef = this.ctx.decl_index.entry_signature(selected);
         if (!callee_fn_ref.is_valid()) { return; }
+        const selected_decl: ASTNode* = this.ctx.decl_index.entry_decl(selected);
+        const orig_func: FunctionDeclNode* =
+            if (selected_decl == null || selected_decl.kind != NodeKind::FunctionDeclaration) { null } else {
+                this.top_level_function_of((selected_decl as FunctionDeclNode*).def) };
 
-        const ft_raw: Type* = this.arena.lookup(callee_fn_ref.id);
+        const ft_raw: Type* = this.arena.lookup(callee_fn_ref);
         if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return; }
         const ft: FunctionType* = ft_raw as FunctionType*;
         if (ft.is_variadic) { return; }
@@ -518,7 +647,7 @@ type struct LambdaSynth {
         mut sub_indices: i64[] = [];
         mut sub_types:   TypeRef[] = [];
         for (mut i: i64 = 0; i < ft.param_types.length; i++) {
-            const p_t: Type* = this.arena.lookup(ft.param_types[i].id);
+            const p_t: Type* = this.arena.lookup(ft.param_types[i]);
             if (p_t == null || p_t.kind != TypeKind::Function) { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null) { continue; }
@@ -528,26 +657,22 @@ type struct LambdaSynth {
         }
         if (sub_indices.length == 0) { return; }
 
-        mut key: string = format("%u", ident.name.id);
-        for (mut ki: i64 = 0; ki < sub_indices.length; ki++) {
-            key = format("%s|%lld:%llu", key, sub_indices[ki], sub_types[ki].id);
+        if (orig_func == null) { return; }
+        // Keyed by the selected DEFINITION: two callees sharing a leaf, or
+        // overloads sharing a path, must not share a specialization.
+        const def_slot: DefKey = this.ctx.defs.table_key(orig_func.def);
+        mut rec_pos: i64[] = [];
+        mut rec_types: TypeRef[] = [];
+        for (mut qi: i64 = 0; qi < sub_types.length; qi++) {
+            rec_pos.push(sub_indices[qi]);
+            rec_types.push(sub_types[qi]);
         }
-        match (this.state.closure_spec_map.get(&key)) {
-            Option::Some(prior) => {
-                call.set_resolved_callee(SymbolStr::from_id(prior));
-                return;
-            }
-            Option::None => { /* fall through */ }
+        const prior: OverloadId = this.state.closure_spec(def_slot, &rec_pos, &rec_types);
+        if (prior.is_valid()) {
+            call.set_resolved_callee(CalleePin::Decl(prior));
+            return;
         }
 
-        mut orig_func: FunctionDeclNode* = this.find_top_level_function(ident.name);
-        if (orig_func == null) {
-            const qual: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
-            if (!qual.equals(ident.name)) {
-                orig_func = this.find_top_level_function(qual);
-            }
-        }
-        if (orig_func == null) { return; }
         // Generic receivers are handled by the capturing-closure guard at the
         // top of this function (they are rejected before reaching here).
         if (orig_func.is_generic()) { return; }
@@ -583,21 +708,28 @@ type struct LambdaSynth {
             this.ctx.artifacts.ast.root.add_statement(spec_func as ASTNode*);
         }
 
-        const qualified_spec: SymbolStr = this.ctx.qualify_symbol_sym(spec_name);
+        // The specialization is a copy of `orig_func`: registered in no
+        // family, its symbol mangled under the module `orig_func` is
+        // declared in; the definition, this pin and the closure-spec cache
+        // read the one entry.
         mut spec_param_types: TypeRef[] = [];
         for (mut i: i64 = 0; i < spec_func.parameters.length; i++) {
             spec_param_types.push(spec_func.parameters[i].resolved_type);
         }
-        const mangled: MangledName = MangledName::for_free_function(
-            this.intern, this.arena,
-            QualifiedName::from_symbol(qualified_spec),
-            spec_param_types, spec_func.resolved_return_type, false);
-        call.set_resolved_callee(mangled.value);
-        this.state.closure_spec_map.insert(key, mangled.value.id);
+        const spec_ft: TypeRef = this.arena.get_function(
+            spec_func.resolved_return_type, spec_param_types, false);
+        const entry: OverloadId = this.ctx.decl_index.register_copy_signature(
+            this.ctx.copy_module_family(orig_func.def), spec_name, spec_func.resolved_return_type, spec_ft,
+            this.intern, this.arena, spec_func.span, spec_func as ASTNode*);
+        spec_func.set_overload_entry(entry);
+        call.set_resolved_callee(CalleePin::Decl(entry));
+        this.state.add_closure_spec(def_slot, rec_pos, rec_types, entry);
     }
 
-    /// Linear scan for a top-level FunctionDeclNode named `name`.
-    find_top_level_function(&this, name: SymbolStr) -> FunctionDeclNode* {
+    /// The top-level function of this root that declares the definition `d`,
+    /// or null - a function declared in another module, or a definition no
+    /// function declares.
+    top_level_function_of(&this, d: DefId) -> FunctionDeclNode* {
         if (this.ctx.artifacts.ast.root == null) { return null; }
         const stmts: &ASTNode*[] = &this.ctx.artifacts.ast.root.statements;
         for (mut i: i64 = 0; i < stmts.length; i++) {
@@ -605,19 +737,45 @@ type struct LambdaSynth {
             if (s == null) { continue; }
             if (s.kind != NodeKind::FunctionDeclaration) { continue; }
             const fn: FunctionDeclNode* = s as FunctionDeclNode*;
-            if (fn.name.id == name.id) { return fn; }
+            if (fn.def.equals(d)) { return fn; }
         }
         return null;
     }
 
-    /// Mint a stable spec name `<orig>__cl_<ty1>_<ty2>_...` for a closure-arg spec.
+    /// The identifier of a closure-arg specialization of `orig`: the
+    /// specialization encoding over the closure types, through the one
+    /// mangler every specialization goes through.  A closure type's name is
+    /// its module and a per-build counter (`mint_closure_def`), so the
+    /// identifier is a function of the source; an arena id is not, and a
+    /// symbol spelling one moves whenever an unrelated type is created
+    /// earlier.
     mint_closure_spec_name(mut &this, orig: SymbolStr, closure_tys: TypeRef[]) -> SymbolStr {
-        mut s: string = this.intern.resolve(orig);
-        s = format("%s__cl", s);
-        for (mut i: i64 = 0; i < closure_tys.length; i++) {
-            s = format("%s_%llu", s, closure_tys[i].id);
-        }
-        return this.intern.intern(s);
+        return MangledName::specialized_identifier(
+            this.intern, this.arena, QualifiedName::from_symbol(orig), &closure_tys);
+    }
+
+    /// E0458 when a capturing closure of type `value_ty` is held by a slot
+    /// of function type `slot_ty` - `what`, a variable, a field, an array
+    /// element, an assigned place or a returned value.  A variant's payload
+    /// is a scope-resolution call's argument, refused as such.  A function-typed
+    /// slot holds a function pointer, which has no room for the closure's
+    /// captures: only a non-generic free function's parameter is
+    /// specialised to the closure's own type.
+    refuse_stored_closure(mut &this, value_ty: TypeRef, slot_ty: TypeRef, span: SourceSpan,
+                          what: string) -> void {
+        if (!this.is_closure_struct_type(value_ty)) { return; }
+        const st: Type* = this.arena.lookup(slot_ty);
+        if (st == null || st.kind != TypeKind::Function) { return; }
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0458_CLOSURE_ARG_NON_FREE,
+            fmt::format("a capturing closure cannot be held by %s of function type `%s`", what,
+                this.arena.format_display(st)));
+        diag = diag.at_with_label(span, "this closure captures from its environment");
+        diag = diag.with_note(
+            "a function-typed value is a function pointer, with no room for a closure's captures; a capturing closure is passed only to a non-generic free function's `(Args) -> Ret` parameter");
+        diag = diag.help(
+            "pass the closure straight to such a function, or leave the variable's type to inference: `const f = (...) -> T { ... };`");
+        this.ctx.emit_diagnostic(diag);
     }
 
     /// Emit E0458 for each closure-struct argument to a method / scope call (v1.0
@@ -631,7 +789,7 @@ type struct LambdaSynth {
             if (!this.is_closure_struct_type(arg.resolved_type)) { continue; }
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0458_CLOSURE_ARG_NON_FREE,
-                format("%s is not yet supported", context_msg));
+                fmt::format("%s is not yet supported", context_msg));
             diag = diag.at_with_label(arg.span, "this is a capturing closure (anonymous struct value)");
             diag = diag.with_note(
                 "v1.0 routes capturing closures through NON-GENERIC free-function `(Args) -> Ret` parameters only; generic free-function, method-call, and scope-resolution-call closure parameters are deferred");

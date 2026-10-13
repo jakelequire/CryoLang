@@ -11,13 +11,23 @@
 ///
 /// Holds only `cg: CodegenContext*`; does not touch the visitor's state.
 
-namespace Compiler::Codegen::Visit::EnumVariantEmitter;
+namespace compiler::codegen::visit::enum_variant_emitter;
 
-import Compiler::Codegen;
-import Compiler::Codegen::{ LLVMTypes, Context };
-import Compiler::Diag;
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Type, UserDefined, Generic, Arena };
+import compiler::codegen;
+import compiler::codegen::{ context, llvm, llvm_types };
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
+import compiler::types;
+import compiler::types::{ arena, generic, type_base, type_ref, TypeKind, user_defined };
+import std::ffi::libc;
+import std::fmt;
+import compiler::codegen::context::{ CodegenContext };
+import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{ EnumType, EnumVariantInfo };
 
 
 type struct EnumVariantEmitter {
@@ -38,9 +48,9 @@ type struct EnumVariantEmitter {
     /// this is a hard error, not a skip.
     report_unresolved_payload(&this, et: EnumType*, variant: EnumVariantInfo*) -> void {
         this.cg.ctx.emit_error(ErrorCode::E0600_CODEGEN_FAILED,
-            format("codegen: payload type of enum variant `%s::%s` is unresolved (generic parameter not instantiated); the constructed value would lose its payload",
-                   this.cg.resolve(et.qualified_name),
-                   this.cg.resolve(variant.name)));
+            fmt::format("codegen: payload type of enum variant `%s::%s` is unresolved (generic parameter not instantiated); the constructed value would lose its payload",
+                   this.cg.ctx.intern_table.shown(et.qualified_name),
+                   variant.display_name(this.cg.ctx.intern_table)));
     }
 
     /// Current LLVM function for entry-block alloca placement.
@@ -133,12 +143,12 @@ type struct EnumVariantEmitter {
                     return LValue::null();
                 }
                 const byte_offset: LValue = LType::const_int(LType::i64(), offsets[i], false);
-                const obuf: void* = intrinsics::malloc(8);
+                const obuf: void* = libc::malloc(8);
                 const obuf_arr: void** = obuf as void**;
                 obuf_arr[0] = byte_offset.raw;
                 const field_ptr_raw: LValue = this.cg.builder.build_gep(
                     LType::i8(), payload_ptr, obuf, 1, "enum.field.ptr");
-                intrinsics::free(obuf);
+                libc::free(obuf);
                 const field_ptr: LValue = this.cg.builder.build_bitcast(
                     field_ptr_raw, LType::pointer_to(field_ty), "enum.field.cast");
                 const stored_field: LValue = this.coerce_int_payload(
@@ -200,11 +210,11 @@ type struct EnumVariantEmitter {
     /// would collapse onto its predecessor. Mirrors the same dereference in
     /// compute_enum_layout (type_map) so the store offsets match the alloc.
     resolve_payload_type(&this, ty: TypeRef) -> Type* {
-        mut t: Type* = this.cg.lookup_type_by_id(ty.id);
+        mut t: Type* = this.cg.arena_type(ty);
         if (t != null && t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t as InstantiatedType*;
             if (inst.has_resolved_type()) {
-                const resolved: Type* = this.cg.lookup_type_by_id(inst.resolved_type.id);
+                const resolved: Type* = this.cg.arena_type(inst.resolved_type);
                 if (resolved != null) { t = resolved; }
             }
         }

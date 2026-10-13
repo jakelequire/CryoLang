@@ -4,20 +4,45 @@
 /// compilation module.  Holds the LLVM module, builder, type mapper, and
 /// value/scope maps that codegen needs to produce IR.
 
-namespace Compiler::Codegen::Context;
+namespace compiler::codegen::context;
 
-import Compiler::Codegen;
-import Compiler::Codegen::{ LLVMTypes, TypeMap, Abi };
-import Compiler::Codegen::State::{ LoopStack, ValueTable, FunctionRegistry, GlobalRegistry, StringCache, DiagSink };
-import Compiler::Codegen::Ops::{ IRFlowEmitter, SymbolResolver, IntrinsicEmitter, ExprOps, DeclarationEmitter };
-import Compiler::CompilationContext;
-import Compiler::DeclIndex;
-import Compiler::Diag;
-import Compiler::Diag::{ Diagnostic, SourceSpan, Sink };
-import Compiler::Types;
-import Compiler::Types::{ TypeRef, Type, Arena, Compound, Generic };
-import Compiler::Resolver::{ SymbolStr, InternTable, MangledName, QualifiedName };
+import compiler::codegen;
+import compiler::codegen::{ llvm_types, type_map, abi };
+import compiler::codegen::state::{ loop_stack, value_table, function_registry, global_registry, string_cache, diag_sink };
+import compiler::codegen::ops::{ ir_flow_emitter, symbol_resolver, intrinsic_emitter, expr_ops, declaration_emitter };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::decl_index;
+import compiler::decl_index::{ DeclarationIndex };
+import compiler::diag;
+import compiler::diag::{ diagnostic, source_span, sink };
+import compiler::types;
+import compiler::types::{ arena, compound, generic, type_base, type_ref, TypeKind };
+import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import std::collections::pair;
+import compiler::codegen::abi::{ AbiClassifier };
+import compiler::codegen::llvm_types::{ LBuilder, LModule, LTargetMachine, LType, LValue };
+import compiler::codegen::ops::declaration_emitter::{ DebugInfoState, DeclarationEmitter };
+import compiler::codegen::ops::expr_ops::{ ExprOps };
+import compiler::codegen::ops::intrinsic_emitter::{ IntrinsicEmitter };
+import compiler::codegen::ops::ir_flow_emitter::{ IRFlowEmitter };
+import compiler::codegen::ops::symbol_resolver::{ SymbolResolver };
+import compiler::codegen::state::diag_sink::{ DiagSink };
+import compiler::codegen::state::function_registry::{ FunctionRegistry };
+import compiler::codegen::state::global_registry::{ GlobalRegistry };
+import compiler::codegen::state::loop_stack::{ LoopStack };
+import compiler::codegen::state::string_cache::{ StringCache };
+import compiler::codegen::state::value_table::{ ValueTable };
+import compiler::codegen::type_map::{ TypeMapper };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::ast::expression;
+import compiler::ast::expression::{ CallExprNode };
+import compiler::sema::sema;
+import compiler::sema::sema::{ SemaVisitor };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_ref::{ TypeRef };
 
 
 type struct CodegenContext {
@@ -72,11 +97,19 @@ type struct CodegenContext {
     //    plus function/method prologue/epilogue lowering. --
     decl: DeclarationEmitter;
 
+    debug_info: DebugInfoState;
+
     // -- Shared references --
     ctx: CompilationContext*;
 
     // -- Diagnostic routing + stripped-functions set --
     diag: DiagSink;
+
+    /// Sema's overload selection, for the calls drop glue builds: a
+    /// `.field.drop()` codegen synthesizes is resolved by the same walk as a
+    /// written call, so the emitter reads its pin and never derives a callee
+    /// from the receiver type.  Built on first use.
+    synth_binder: SemaVisitor*;
 
     /// Create a new codegen context for a module.
     static new(ctx: CompilationContext*, module_name: string) -> CodegenContext {
@@ -89,7 +122,7 @@ type struct CodegenContext {
         // per-target branches (va_list shape today; aggregate
         // classification later) dispatch without consulting the
         // triple again on every call.
-        const abi_triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const abi_triple: string = ctx.options.target_triple;
 
         return CodegenContext {
             llvm_module: mod,
@@ -108,10 +141,30 @@ type struct CodegenContext {
             intrinsics: IntrinsicEmitter::null(),
             expr_ops:   ExprOps::null(),
             decl:       DeclarationEmitter::null(),
+            debug_info: DebugInfoState::off(),
 
             ctx:  ctx,
             diag: DiagSink::new(ctx),
+            synth_binder: null,
         };
+    }
+
+    /// Bind a destructor call this module's codegen synthesized (see
+    /// `synth_binder`) to the receiver type's destructor, by identity.
+    bind_destructor_call(mut &this, call: CallExprNode*) -> void {
+        if (this.synth_binder == null) {
+            this.synth_binder = SemaVisitor::synthesized_binder(this.ctx);
+        }
+        this.synth_binder.bind_destructor_call(call);
+    }
+
+    /// Bind `delete p`'s synthesized `p.drop()` to the destructor of the
+    /// type `p` points at, by identity.
+    bind_pointee_destructor_call(mut &this, call: CallExprNode*, pointee: TypeRef) -> void {
+        if (this.synth_binder == null) {
+            this.synth_binder = SemaVisitor::synthesized_binder(this.ctx);
+        }
+        this.synth_binder.bind_pointee_destructor_call(call, pointee);
     }
 
     /// Two-phase init step 2: wire up back-pointers on sub-components.
@@ -122,14 +175,16 @@ type struct CodegenContext {
     wire(mut &this) -> void {
         this.flow.wire(&this.builder, &this.loops);
 
+        this.type_mapper.wire(&this.llvm_module);
+
         this.abi.wire(&this.type_mapper);
 
         this.resolver.wire(&this.llvm_module, &this.type_mapper, &this.abi,
                            &this.functions, &this.globals, this.ctx);
 
         this.intrinsics.wire(&this.llvm_module, &this.builder, &this.abi,
-                             this.ctx.project_no_runtime,
-                             this.ctx.project_panic_unwind);
+                             this.ctx.options.freestanding(),
+                             this.ctx.options.unwinds());
 
         this.expr_ops.wire(&this.llvm_module, &this.builder, &this.type_mapper,
                            &this.abi,
@@ -140,9 +195,24 @@ type struct CodegenContext {
                        &this.abi,
                        &this.values, &this.functions, &this.globals,
                        &this.str_cache, &this.flow, &this.resolver,
-                       &this.expr_ops, &this.intrinsics, &this.diag, this.ctx);
+                       &this.expr_ops, &this.intrinsics, &this.diag,
+                       &this.debug_info, this.ctx);
     }
 
+
+    /// GEP to a user type's field.  `layout` is the type whose FIELD list the
+    /// index belongs to and `mapped` its emitted body; the element index comes
+    /// from `TypeMapper::field_element_index`, never from the field index
+    /// directly, because a body carries a vtable slot and alignment padding
+    /// the field list does not.  Use `build_struct_gep` only for an aggregate
+    /// whose element positions ARE its definition - a fat pointer, an enum's
+    /// tag and payload, the vtable slot - never for a declared field.
+    field_gep(mut &this, layout: Type*, mapped: LType, base: LValue,
+              field_idx: i64, name: string) -> LValue {
+        const elem: i64 = this.type_mapper.field_element_index(layout, field_idx);
+        if (elem < 0) { return LValue::null(); }
+        return this.builder.build_struct_gep(mapped, base, elem as u32, name);
+    }
 
     // Convenience accessors that route through CompilationContext.  Kept
     // because the post-decomposition struct is slim and the accessors
@@ -167,12 +237,6 @@ type struct CodegenContext {
         return c.decl_index;
     }
 
-    /// Qualify a symbol name with the current module namespace.
-    qualify(&this, sym: SymbolStr) -> SymbolStr {
-        const c: CompilationContext* = this.ctx;
-        return c.qualify_symbol_sym(sym);
-    }
-
     /// Resolve an interned SymbolStr to its string.
     resolve(&this, sym: SymbolStr) -> string {
         const c: CompilationContext* = this.ctx;
@@ -180,21 +244,14 @@ type struct CodegenContext {
         return it.resolve(sym);
     }
 
-    /// Intern a string into the shared InternTable.
-    intern_str(&this, text: string) -> SymbolStr {
-        const c: CompilationContext* = this.ctx;
-        const it: InternTable* = c.intern_table;
-        return it.intern(text);
-    }
-
-    /// Look up a type in the arena by ID.
-    /// Splits the chained `cg.get_arena().lookup(id)` pattern into two
+    /// Look up a type in the arena.
+    /// Splits the chained `cg.get_arena().lookup(ty)` pattern into two
     /// local-typed deref steps; chained method-call resolution across
     /// pointer hops has historically been brittle here.
-    lookup_type_by_id(&this, id: u64) -> Type* {
+    arena_type(&this, ty: TypeRef) -> Type* {
         const c: CompilationContext* = this.ctx;
         const a: TypeArena* = c.type_arena;
-        return a.lookup(id);
+        return a.lookup(ty);
     }
 
     /// Whether a Cryo type is a *signed* integer.  Used by the integer
@@ -204,7 +261,7 @@ type struct CodegenContext {
     /// Returns `false` for non-integer / unresolvable types, which keeps
     /// the historical `zext` behaviour for those cases (no regression).
     int_type_is_signed(&this, ty: TypeRef) -> boolean {
-        const t: Type* = this.lookup_type_by_id(ty.id);
+        const t: Type* = this.arena_type(ty);
         if (t != null && t.kind == TypeKind::Int) {
             const it: IntType* = t as IntType*;
             return it.int_kind.is_signed();

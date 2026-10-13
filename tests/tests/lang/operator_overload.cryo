@@ -15,9 +15,15 @@
 namespace CryoTests::Tests::Lang::OperatorOverload;
 
 import std::core::result;
+import std::core::result::{ Result };
 import std::core::ops;
+import std::core::ops::{
+    Add, BitAnd, BitNot, BitOr, BitXor, Deref, Index, Mul, Neg, Not, Shl, Shr
+};
 import std::test::error;
+import std::test::error::{ TestError };
 import std::test::assert;
+import std::test::assert::{ expect_eq };
 
 // A minimal smart-pointer-like wrapper implementing Deref.
 type struct Boxed { value: i32; }
@@ -92,16 +98,17 @@ function index_pointer_aliases_in_place() -> Result<(), TestError> {
     return expect_eq(t.b, 99);
 }
 
-// A container whose `index` bumps a counter, so a compound assignment that
-// evaluated the LHS place twice would show `calls == 2`.
+// A container whose `index` bumps a counter it points at, so a compound
+// assignment that evaluated the LHS place twice would show `calls == 2`.
+// `index` takes `&this`, as `Index` declares it, so the count lives outside.
 type struct Counted {
     slot:  i32;
-    calls: i32;
+    calls: i32*;
 }
 
 implement trait Index<i64, i32> for Counted {
-    index(mut &this, idx: i64) -> i32* {
-        this.calls = this.calls + 1;
+    index(&this, idx: i64) -> i32* {
+        *this.calls = *this.calls + 1;
         return &this.slot;
     }
 }
@@ -152,20 +159,21 @@ function index_sugar_writes() -> Result<(), TestError> {
 // Compound assignment through `[]` calls `index` exactly once.
 ![test]
 function index_sugar_compound_once() -> Result<(), TestError> {
-    mut c: Counted = Counted { slot: 5, calls: 0 };
+    mut calls: i32 = 0;
+    mut c: Counted = Counted { slot: 5, calls: &calls };
     c[0] += 7;
     match (expect_eq(c.slot, 12)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
     }
-    return expect_eq(c.calls, 1);
+    return expect_eq(calls, 1);
 }
 
 // Generic container: `[]` sugar reads and writes through a specialized
 // `Wrap<i32>::index`.
 ![test]
 function index_sugar_generic() -> Result<(), TestError> {
-    mut w: Wrap<i32> = Wrap<i32> { x: 100, y: 200 };
+    mut w: Wrap<i32> = Wrap::<i32> { x: 100, y: 200 };
     match (expect_eq(w[0], 100)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -197,6 +205,18 @@ implement trait Neg<V2> for V2 {
 // Both operands references: exercises the `&&Rhs` guard in build_operator_call.
 function add_via_refs(a: &V2, b: &V2) -> V2 { return a + b; }
 function neg_via_ref(a: &V2) -> V2 { return -a; }
+// `-x` on a parameter a `Neg` bound licenses: each copy calls its type's `neg`.
+function neg_bounded<T>(a: T) -> T where T: Neg<T> { return -a; }
+
+![test]
+function negation_through_a_bound() -> Result<(), TestError> {
+    const n: V2 = neg_bounded::<V2>(V2 { x: 3, y: 4 });
+    match (expect_eq(n.x, -3)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(n.y, -4);
+}
 
 ![test]
 function index_through_reference() -> Result<(), TestError> {
@@ -362,7 +382,7 @@ function deref_sugar_compound() -> Result<(), TestError> {
 // `SmartBox<i32>::deref`.
 ![test]
 function deref_sugar_generic() -> Result<(), TestError> {
-    mut g: SmartBox<i32> = SmartBox<i32> { slot: 200 };
+    mut g: SmartBox<i32> = SmartBox::<i32> { slot: 200 };
     match (expect_eq(*g, 200)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -375,7 +395,21 @@ function deref_sugar_generic() -> Result<(), TestError> {
 ![test]
 function deref_sugar_bounded_param() -> Result<(), TestError> {
     const b: Boxed = Boxed { value: 77 };
-    return expect_eq(read_deref<Boxed, i32>(b), 77);
+    return expect_eq(read_deref::<Boxed, i32>(b), 77);
+}
+
+// A Deref target that is not the value's first field: reading the value
+// itself instead of calling `deref` gives `tag`, not `slot`.
+type struct Tagged { tag: i32; slot: i32; }
+implement trait Deref<i32> for Tagged {
+    deref(&this) -> i32* { return &this.slot; }
+}
+
+// `*b` in a copy of a generic body calls the copy's `deref`.
+![test]
+function deref_sugar_bounded_param_calls_deref() -> Result<(), TestError> {
+    const b: Tagged = Tagged { tag: 5, slot: 66 };
+    return expect_eq(read_deref::<Tagged, i32>(b), 66);
 }
 
 // -- Deref coercion on member access: `b.field` / `b.method()` auto-deref. --
@@ -450,7 +484,7 @@ function deref_coercion_multi_hop() -> Result<(), TestError> {
 // Coercion through a generic smart pointer, field + method + write.
 ![test]
 function deref_coercion_generic() -> Result<(), TestError> {
-    mut g: GBox<Coord> = GBox<Coord> { held: Coord { px: 11, py: 22 } };
+    mut g: GBox<Coord> = GBox::<Coord> { held: Coord { px: 11, py: 22 } };
     match (expect_eq(g.px, 11)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }

@@ -1,14 +1,24 @@
-namespace Compiler::Lex::Lexer;
+namespace compiler::lex::lexer;
 
-import Compiler::Lex;
-import Compiler::Diag;
-import Compiler::Diag::SourceSpan;
-import Compiler::Diag::Diagnostic;
-import Compiler::Diag::Suggestion;
-import Compiler::Diag::Sink;
-import Utils::Logger;
+import compiler::lex;
+import compiler::lex::{ SourceLocation, Token, TokenType };
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::diagnostic;
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::suggestion;
+import compiler::diag::suggestion::{ Suggestion };
+import compiler::diag::sink;
+import compiler::diag::sink::{ DiagnosticSink };
+import utils::logger;
+import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::collections::string;
+import std::collections::string::{ String };
 import std::collections::str;
+import std::fmt;
+import utils::keyword::{ Keyword };
 
 type struct Lexer {
 private:
@@ -18,11 +28,8 @@ private:
     current:          string;
     buffer_start:     string;
     buffer_end:       string;
-    spot_content:     string;
     current_location: SourceLocation;
-    current_token:    Token;
     previous_token:   Token;
-    token_count:      u64;
     sink:             DiagnosticSink*;
 
 public:
@@ -30,7 +37,9 @@ public:
     /// caller owns the read: on-disk files come from
     /// `fs::file::read_to_string(...).into_raw()`, in-memory buffers
     /// (LSP overrides, f-string sub-lexing) are passed through verbatim.
-    static new(path: string, source: string, sink: DiagnosticSink*) -> Lexer {
+    static new(path_text: string, source_text: string, sink: DiagnosticSink*) -> Lexer {
+        const path: string = path_text;
+        const source: string = source_text;
         return Lexer {
             path:             path,
             source:           source,
@@ -38,11 +47,8 @@ public:
             current:          "",
             buffer_start:     "",
             buffer_end:       "",
-            spot_content:     "",
-            current_location: SourceLocation::new(path, 1, 1),
-            current_token:    Token::new(TokenType::Unknown, "", 1, 1),
+            current_location: SourceLocation::new(path_text, 1, 1),
             previous_token:   Token::new(TokenType::Unknown, "", 1, 1),
-            token_count:      0,
             sink:             sink,
         };
     }
@@ -158,7 +164,7 @@ private:
         const punct_kind: TokenType = this.lex_punctuator(c);
         if (punct_kind != TokenType::Unknown) {
             const punct_len: u64 = (this.current as i64 - token_start as i64) as u64;
-            const punct_lexeme: string = token_start.substr(0, punct_len);
+            const punct_lexeme: string = token_start.substr(0, punct_len as i64);
             return Token::new(punct_kind, punct_lexeme, start_line, start_col);
         }
 
@@ -179,8 +185,8 @@ private:
         }
 
         const len: u64 = (this.current as i64 - start as i64) as u64;
-        const text: string = start.substr(0, len);
-        const kw_kind: TokenType = TokenType::from_keyword(text);
+        const text: string = start.substr(0, len as i64);
+        const kw_kind: TokenType = TokenType::from_keyword(Keyword::new(text));
         const kind: TokenType = if (kw_kind == TokenType::Unknown) { TokenType::Identifier } else { kw_kind };
 
         return Token::new(kind, text, start_line, start_col);
@@ -311,9 +317,9 @@ private:
             }
 
             const suffix_len: u64 = (this.current as i64 - suffix_start as i64) as u64;
-            const suffix: string = suffix_start.substr(0, suffix_len);
+            const suffix: string = suffix_start.substr(0, suffix_len as i64);
 
-            if (!Lexer::is_valid_numeric_suffix(suffix)) {
+            if (!Lexer::is_valid_numeric_suffix(Keyword::new(suffix))) {
                 // Not a valid suffix, backtrack
                 this.current = suffix_start;
             } else if (is_float && !Lexer::is_float_suffix(suffix)) {
@@ -329,7 +335,7 @@ private:
         }
 
         const len: u64 = (this.current as i64 - start as i64) as u64;
-        const lexeme: string = start.substr(0, len);
+        const lexeme: string = start.substr(0, len as i64);
 
         return Token::new_number(lexeme, start_line, start_col, accepted_suffix);
     }
@@ -346,6 +352,7 @@ private:
 
         while (!this.at_end() && this.peek() != quote) {
             if (this.peek() == '\\' && !this.at_end()) {
+                this.refuse_bad_octal_escape();
                 this.advance(); // consume backslash
                 if (!this.at_end()) {
                     this.advance(); // consume escaped character
@@ -369,7 +376,8 @@ private:
             return this.emit_error_close_literal(
                 ErrorCode::E0002_UNTERMINATED_STRING,
                 "Unterminated string literal",
-                "\"");
+                "\"",
+                this.current_location.line, this.current_location.column);
         }
 
         this.advance(); // consume closing quote
@@ -378,9 +386,10 @@ private:
         // `start` already points past the opening quote, so offset=0.
         // Subtract 1 for the closing quote that was just consumed.
         const raw_len: u64 = (this.current as i64 - start as i64 - 1) as u64;
-        const raw_text: string = start.substr(0, raw_len);
+        const raw_text: string = start.substr(0, raw_len as i64);
 
-        const processed: string = Lexer::process_escape_sequences(raw_text);
+        const processed: String = Lexer::process_escape_sequences(raw_text);
+        const byte_length: i64 = processed.length() as i64;
 
         // Source extent covers both quotes plus every byte between
         // them (including escape digraphs, which the processed lexeme
@@ -388,9 +397,8 @@ private:
         // the math self-evident.
         const source_length: int = (raw_len + 2 as u64) as int;
 
-        return Token::new_with_extent(
-            TokenType::StringLiteral, processed,
-            start_line, start_col, source_length);
+        return Token::new_string(processed.into_raw(), byte_length,
+                                 start_line, start_col, source_length);
     }
 
     /// Lex an f-string `f"..."`.  The dispatcher consumed both the `f`
@@ -402,6 +410,14 @@ private:
     /// `{`/`}`, sub-parses each hole as an expression, and processes the
     /// per-chunk escapes there.  We still skip `\X` digraphs while scanning
     /// so an escaped quote `\"` doesn't terminate the literal early.
+    ///
+    /// The scan tracks brace depth because a hole's body is Cryo source, not
+    /// literal text: inside `{...}` a `"` opens a nested string literal that
+    /// belongs to the expression, so only a quote at depth 0 closes the
+    /// f-string.  Without that, `f"{if (b) { "y" } else { "n" }}"` would end
+    /// at the quote before `y`.  `{{`/`}}` are literal braces and so change
+    /// no depth, but only at depth 0 - inside a hole they are two nested
+    /// blocks.
     lex_fstring(&this) -> Token {
         const start_line: int = this.current_location.line;
         // The `f` and the `"` were both consumed by the dispatcher, so the
@@ -410,23 +426,48 @@ private:
 
         const start: string = this.current;
 
-        while (!this.at_end() && this.peek() != '"') {
-            if (this.peek() == '\\' && !this.at_end()) {
+        mut depth: i64 = 0;
+        while (!this.at_end()) {
+            const c: char = this.peek();
+
+            if (c == '\\') {
+                // A hole's own literals are lexed again with the hole and
+                // checked there.
+                if (depth == 0) { this.refuse_bad_octal_escape(); }
                 this.advance(); // consume backslash
                 if (!this.at_end()) {
                     this.advance(); // consume escaped character
                 }
-            } else {
-                if (this.peek() == '\n') {
-                    // Consume without advance(): advance() would call
-                    // increment_char() after newline() already reset the
-                    // column, leaving column 2 for the first byte of the
-                    // next line. Mirrors skip_whitespace().
-                    this.current++;
-                    this.current_location.newline();
-                } else {
+                continue;
+            }
+
+            if (depth == 0) {
+                if (c == '"') { break; } // closes the f-string
+                if ((c == '{' || c == '}') && this.peek_ahead(1) == c) {
+                    // `{{` / `}}`: a literal brace, not a hole boundary.
                     this.advance();
+                    this.advance();
+                    continue;
                 }
+                if (c == '{') { depth = 1; }
+            } else {
+                if (c == '"' || c == '\'') {
+                    this.skip_fstring_nested_literal(c);
+                    continue;
+                }
+                if (c == '{') { depth += 1; }
+                else if (c == '}') { depth -= 1; }
+            }
+
+            if (c == '\n') {
+                // Consume without advance(): advance() would call
+                // increment_char() after newline() already reset the
+                // column, leaving column 2 for the first byte of the
+                // next line. Mirrors skip_whitespace().
+                this.current++;
+                this.current_location.newline();
+            } else {
+                this.advance();
             }
         }
 
@@ -435,7 +476,8 @@ private:
             return this.emit_error_close_literal(
                 ErrorCode::E0002_UNTERMINATED_STRING,
                 "Unterminated f-string literal",
-                "\"");
+                "\"",
+                start_line, start_col);
         }
 
         this.advance(); // consume closing quote
@@ -443,7 +485,7 @@ private:
         // Raw template without the surrounding quotes: `start` points past
         // the opening quote, subtract 1 for the closing quote consumed above.
         const raw_len: u64 = (this.current as i64 - start as i64 - 1) as u64;
-        const raw_text: string = start.substr(0, raw_len);
+        const raw_text: string = start.substr(0, raw_len as i64);
 
         // Source extent covers `f`, both quotes, and every body byte.
         const source_length: int = (raw_len + 3 as u64) as int;
@@ -451,6 +493,32 @@ private:
         return Token::new_with_extent(
             TokenType::FStringLiteral, raw_text,
             start_line, start_col, source_length);
+    }
+
+    /// Advance past a string or char literal nested in an f-string hole,
+    /// leaving `current` just past its closing `q`.  The bytes stay in the
+    /// raw template verbatim - the parser re-scans them the same way when it
+    /// looks for the hole's `}` - so this only has to keep the outer scan
+    /// from reading the literal's own quotes and braces as f-string syntax.
+    /// Runs to end-of-buffer if unterminated, leaving the caller to report
+    /// the unterminated f-string.
+    skip_fstring_nested_literal(&this, q: char) {
+        this.advance(); // opening quote
+        while (!this.at_end()) {
+            const c: char = this.peek();
+            if (c == '\\') {
+                this.advance();
+                if (!this.at_end()) { this.advance(); }
+                continue;
+            }
+            if (c == '\n') {
+                this.current++;
+                this.current_location.newline();
+                continue;
+            }
+            this.advance();
+            if (c == q) { return; }
+        }
     }
 
     lex_character(&this) -> Token {
@@ -465,6 +533,14 @@ private:
 
         // Escape sequence
         if (this.peek() == '\\') {
+            if (this.refuse_bad_octal_escape()) {
+                // Already reported: consume through the closing quote on this
+                // line so the rest is not also refused as a second
+                // character.
+                while (!this.at_end() && this.peek() != '\n' && this.peek() != '\'') { this.advance(); }
+                if (!this.at_end() && this.peek() == '\'') { this.advance(); }
+                return Token::new(TokenType::Unknown, "", start_line, start_col);
+            }
             this.advance(); // consume backslash
             if (!this.at_end()) {
                 const escape_char: char = this.peek();
@@ -474,6 +550,13 @@ private:
                 if (escape_char == 'x') {
                     mut i: int = 0;
                     while (i < 2 && !this.at_end() && Lexer::is_hex_digit(this.peek())) {
+                        this.advance();
+                        i++;
+                    }
+                } else if (escape_char >= '0' && escape_char <= '7') {
+                    // Octal escape: up to two more octal digits.
+                    mut i: int = 0;
+                    while (i < 2 && !this.at_end() && this.peek() >= '0' && this.peek() <= '7') {
                         this.advance();
                         i++;
                     }
@@ -554,13 +637,14 @@ private:
             return this.emit_error_close_literal(
                 ErrorCode::E0003_UNTERMINATED_CHAR,
                 "Unterminated character literal",
-                "'");
+                "'",
+                this.current_location.line, this.current_location.column);
         }
         this.advance(); // consume closing '\''
 
         // `start` points past the opening quote; subtract 1 for closing quote.
         const len: u64 = (this.current as i64 - start as i64 - 1) as u64;
-        const lexeme: string = start.substr(0, len);
+        const lexeme: string = start.substr(0, len as i64);
 
         return Token::new(TokenType::CharConstant, lexeme, start_line, start_col);
     }
@@ -613,7 +697,7 @@ private:
         }
 
         const len: u64 = (this.current as i64 - start as i64) as u64;
-        const lexeme: string = start.substr(0, len);
+        const lexeme: string = start.substr(0, len as i64);
 
         return Token::new(TokenType::Comment, lexeme, start_line, start_col);
     }
@@ -680,7 +764,7 @@ private:
         }
 
         const len: u64 = (this.current as i64 - start as i64) as u64;
-        const lexeme: string = start.substr(0, len);
+        const lexeme: string = start.substr(0, len as i64);
 
         return Token::new(doc_kind, lexeme, start_line, start_col);
     }
@@ -891,21 +975,26 @@ private:
     /// Like `emit_error`, but attaches a machine-applicable suggestion
     /// that inserts `insertion` at the literal's start-of-body position.
     /// Used by the unterminated-string / unterminated-char paths so the
-    /// user's editor can close the literal in one click.  `body_line` /
-    /// `body_col` point at the byte AFTER the opening quote (where the
-    /// missing closer logically belongs); the suggestion uses a
-    /// zero-width span at the current end-of-stream position so the
+    /// user's editor can close the literal in one click.  The suggestion
+    /// uses a zero-width span at the current end-of-stream position so the
     /// insertion lands at the cursor, exactly where the user dropped
     /// the closing quote.
+    ///
+    /// `at_line` / `at_col` carry the primary span.  A caller whose scan can
+    /// run far past the mistake - an f-string, whose holes swallow the rest
+    /// of the file when one is left open - passes the literal's own opening
+    /// position, so the caret stays on the literal instead of landing on
+    /// end-of-file.
     emit_error_close_literal(&this, code: ErrorCode, message: string,
-                              insertion: string) -> Token {
+                              insertion: string,
+                              at_line: int, at_col: int) -> Token {
         if (this.sink != null) {
             const span: SourceSpan = SourceSpan::new(
                 this.path,
-                this.current_location.line as u32,
-                this.current_location.column as u32,
-                this.current_location.line as u32,
-                this.current_location.column as u32 + 1
+                at_line as u32,
+                at_col as u32,
+                at_line as u32,
+                at_col as u32 + 1
             );
             mut diag: Diagnostic = Diagnostic::error(code, message);
             diag = diag.at(span);
@@ -918,7 +1007,7 @@ private:
             );
             diag = diag.suggest(Suggestion::machine_applicable(
                 ins_span, insertion,
-                format("close the literal with `%s`", insertion)));
+                fmt::format("close the literal with `%s`", insertion)));
             this.sink.emit(diag);
         }
         return Token::new(
@@ -957,6 +1046,45 @@ private:
         );
     }
 
+    /// With `current` on a literal's backslash, refuse a malformed octal
+    /// escape and return true; return false for anything else.  An octal
+    /// escape is one to three digits `0`-`7` spelling one byte, so `\8` and
+    /// `\9` name no escape, and a value past `\377` names no byte.  Either
+    /// would otherwise reach the escape pass, which keeps an unknown escape's
+    /// two characters and keeps only the low byte of a large value.
+    refuse_bad_octal_escape(&this) -> boolean {
+        const first: char = this.peek_ahead(1);
+        mut ndig: i64 = 1;
+        mut message: string = "";
+        mut help: string = "";
+        if (first == '8' || first == '9') {
+            message = "is not an escape: an octal escape's digits are `0` to `7`";
+            help = "write the digit itself without a backslash, or a byte by its octal or hex value (`\\033` and `\\x1b` are both ESC)";
+        } else {
+            if (first < '0' || first > '7') { return false; }
+            const val: i64 = Lexer::octal_escape(this.current, 1, 4, &ndig);
+            if (val <= 255) { return false; }
+            message = "is out of range: an octal escape is one byte, `\\0` to `\\377`";
+            help = "write fewer digits; an escape ends after three, so `\\0123` is `\\012` and then `3`";
+        }
+        if (this.sink == null) { return true; }
+        const written: string = this.current.substr(0, 1 + ndig);
+        const span: SourceSpan = SourceSpan::new(
+            this.path,
+            this.current_location.line as u32,
+            this.current_location.column as u32,
+            this.current_location.line as u32,
+            (this.current_location.column + 1 + ndig as int) as u32
+        );
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0013_BAD_OCTAL_ESCAPE,
+            fmt::format("`%s` %s", written, message));
+        diag = diag.at(span);
+        diag = diag.help(help);
+        this.sink.emit(diag);
+        return true;
+    }
+
 private:
     static is_alpha(c: char) -> boolean {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
@@ -981,7 +1109,8 @@ private:
     /// True if `s` is one of the accepted numeric-literal type suffixes
     /// (e.g. `42u32`, `1.5f64`, `0xffi8`). Kept as a single source of truth
     /// so adding a new primitive width touches one list instead of several.
-    static is_valid_numeric_suffix(s: string) -> boolean {
+    static is_valid_numeric_suffix(s_text: Keyword) -> boolean {
+        const s: string = s_text.as_string();
         const table: string[] = [
             "i8", "i16", "i32", "i64", "i128",
             "u8", "u16", "u32", "u64", "u128",
@@ -1001,15 +1130,20 @@ private:
     }
 
     /// Processes escape sequences in a string literal, converting backslash
-    /// sequences (e.g. \n, \t, \\) into their actual character values.
-    static process_escape_sequences(raw: string) -> string {
+    /// sequences (e.g. \n, \t, \\) into the bytes they spell.  Every byte is
+    /// kept, a NUL among them, so the answer's length - not the text's first
+    /// NUL - is where the literal ends.
+    ///
+    /// `public` overrides the `private:` run above it: the parser decodes
+    /// f-string segments with this, and the C importer decodes `#define`
+    /// string bodies, so this is the single decoder three modules share
+    /// rather than a lexer internal.
+    public static process_escape_sequences(raw_text: string) -> String {
+        const raw: string = raw_text;
         const len: i64 = raw.length() as i64;
-        if (len == 0) {
-            return raw;
-        }
 
-        // Build into an owned String; escapes only shrink, so with_capacity
-        // reserves enough that no reallocation occurs.
+        // Escapes only shrink, so with_capacity reserves enough that no
+        // reallocation occurs.
         mut buf: String = String::with_capacity((len + 1) as u64);
         mut ri: i64 = 0;  // read index
 
@@ -1022,89 +1156,141 @@ private:
                 continue;
             }
 
-            // We have a backslash; look at the next character
             const esc: char = *(raw + ri + 1) as char;
-            ri += 2; // consume both backslash and escape char
-
-            match (esc) {
-                'n'  => { buf.push_byte('\n' as u8); }
-                't'  => { buf.push_byte('\t' as u8); }
-                'r'  => { buf.push_byte('\r' as u8); }
-                '\\' => { buf.push_byte('\\' as u8); }
-                '\'' => { buf.push_byte('\'' as u8); }
-                '"'  => { buf.push_byte('"' as u8); }
-                '0'  => { buf.push_byte('\0' as u8); }
-                'x'  => {
-                    // Hex escape: \xHH (exactly up to 2 hex digits).  A
-                    // `\x` with no following hex digit is malformed; emit
-                    // it literally rather than silently materialising a NUL
-                    // byte (writing `val == 0` would truncate the bogus
-                    // escape to `\0` and corrupt the string).
-                    mut val: i64 = 0;
-                    mut digits: int = 0;
-                    while (digits < 2 && ri < len && Lexer::is_hex_digit(*(raw + ri))) {
-                        const d: char = *(raw + ri) as char;
-                        mut dv: i64 = 0;
-                        if (d >= '0' && d <= '9')      { dv = d as i64 - '0' as i64; }
-                        else if (d >= 'a' && d <= 'f') { dv = d as i64 - 'a' as i64 + 10; }
-                        else if (d >= 'A' && d <= 'F') { dv = d as i64 - 'A' as i64 + 10; }
-                        val = val * 16 + dv;
-                        ri += 1;
-                        digits += 1;
-                    }
-                    if (digits == 0) {
-                        buf.push_byte('\\' as u8);
-                        buf.push_byte('x' as u8);
-                    } else {
-                        buf.push_byte(val as u8);
-                    }
-                }
-                'u'  => {
-                    // Unicode escape: \u{HEX} - parse the brace-delimited
-                    // codepoint and emit its UTF-8 encoding.  Malformed
-                    // forms (missing `{`, no digits, codepoint out of the
-                    // Unicode range) are preserved literally so a downstream
-                    // pass reports them rather than this silently dropping
-                    // bytes.
-                    if (ri < len && *(raw + ri) as char == '{') {
-                        ri += 1; // consume '{'
-                        mut cp: i64 = 0;
-                        mut ndig: int = 0;
-                        while (ri < len && Lexer::is_hex_digit(*(raw + ri))) {
-                            const d: char = *(raw + ri) as char;
-                            mut dv: i64 = 0;
-                            if (d >= '0' && d <= '9')      { dv = d as i64 - '0' as i64; }
-                            else if (d >= 'a' && d <= 'f') { dv = d as i64 - 'a' as i64 + 10; }
-                            else if (d >= 'A' && d <= 'F') { dv = d as i64 - 'A' as i64 + 10; }
-                            cp = cp * 16 + dv;
-                            ri += 1;
-                            ndig += 1;
-                        }
-                        const closed: boolean = ri < len && *(raw + ri) as char == '}';
-                        if (closed) { ri += 1; } // consume '}'
-                        if (ndig > 0 && closed && cp <= 0x10FFFF) {
-                            Lexer::encode_utf8(&buf, cp);
-                        } else {
-                            // Malformed: preserve the `\u` we consumed; the
-                            // brace/digit bytes were already copied past or
-                            // will be re-scanned as ordinary characters.
-                            buf.push_byte('\\' as u8);
-                            buf.push_byte('u' as u8);
-                        }
-                    } else {
-                        buf.push_byte('\\' as u8);
-                        buf.push_byte('u' as u8);
-                    }
-                }
-                _ => {
-                    // Unknown escape; preserve both characters
-                    buf.push_byte('\\' as u8);
-                    buf.push_byte(esc as u8);
-                }
+            mut spanned: i64 = 0;
+            const value: i64 = Lexer::escape_value(raw, ri, len, &spanned);
+            ri += spanned;
+            if (value < 0) {
+                // Malformed or unknown: kept as written, so a later pass
+                // reports it rather than this dropping bytes.
+                buf.push_byte('\\' as u8);
+                buf.push_byte(esc as u8);
+            } else if (esc == 'u') {
+                Lexer::encode_utf8(&buf, value);
+            } else {
+                buf.push_byte(value as u8);
             }
         }
 
-        return buf.into_raw();
+        return buf;
+    }
+
+    /// The value of the escape whose backslash is at `at` in `text` (below
+    /// `len`): the byte a named, hex or octal escape spells, or the code
+    /// point of a `\u{...}`.  -1 for an escape no rule names (`\q`), a `\x`
+    /// with no hex digit, or a malformed `\u`.  Writes through `spanned`
+    /// how many characters the escape takes, backslash included.  The one
+    /// escape decoder, for strings and characters alike.
+    public static escape_value(text: string, at: i64, len: i64, spanned: i64*) -> i64 {
+        *spanned = 2;
+        if (at + 1 >= len) { *spanned = 1; return -1; }
+        const esc: char = *(text + at + 1) as char;
+        // `\` and one to three octal digits is the byte they spell: `\0` is
+        // NUL, `\033` is ESC.  A value past `\377` was refused where it was
+        // lexed.
+        if (esc >= '0' && esc <= '7') {
+            mut nd: i64 = 0;
+            const ov: i64 = Lexer::octal_escape(text, at + 1, len, &nd);
+            *spanned = 1 + nd;
+            return ov;
+        }
+        match (esc) {
+            'n'  => { return 10; }
+            't'  => { return 9; }
+            'r'  => { return 13; }
+            'a'  => { return 7; }
+            'b'  => { return 8; }
+            'f'  => { return 12; }
+            'v'  => { return 11; }
+            '\\' => { return 92; }
+            '\'' => { return 39; }
+            '"'  => { return 34; }
+            'x'  => {
+                // One or two hex digits.  None is malformed, not a NUL.
+                mut val: i64 = 0;
+                mut digits: i64 = 0;
+                while (digits < 2 && at + 2 + digits < len && Lexer::is_hex_digit(*(text + at + 2 + digits))) {
+                    val = val * 16 + Lexer::hex_value(*(text + at + 2 + digits) as char);
+                    digits += 1;
+                }
+                *spanned = 2 + digits;
+                if (digits == 0) { return -1; }
+                return val;
+            }
+            'u'  => {
+                mut body: i64 = 0;
+                const cp: i64 = Lexer::unicode_escape(text, at + 2, len, &body);
+                *spanned = 2 + body;
+                return cp;
+            }
+            _ => { return -1; }
+        }
+    }
+
+    /// The value of an octal escape's digits: up to three octal digits of
+    /// `text` from position `at` (below `len`), stopping at the first that
+    /// is not one, as C reads them.  Writes how many were read through
+    /// `digits` - 0 when `text[at]` is no octal digit.  The value can pass a
+    /// byte (`\777`); the lexer refuses that where it is written.
+    public static octal_escape(text: string, at: i64, len: i64, digits: i64*) -> i64 {
+        mut val: i64 = 0;
+        mut n: i64 = 0;
+        while (n < 3 && at + n < len) {
+            const d: char = *(text + at + n) as char;
+            if (d < '0' || d > '7') { break; }
+            val = val * 8 + (d as i64 - '0' as i64);
+            n += 1;
+        }
+        *digits = n;
+        return val;
+    }
+
+    /// The codepoint of a `\u{HEX}` escape whose `{` would be at `at` in
+    /// `text` (below `len`), or -1 when it is malformed: no `{`, no hex
+    /// digit, no closing `}`, or past U+10FFFF.  Writes through `spanned`
+    /// how many characters from `at` the escape's body takes - the `{`, the
+    /// digits and the `}` that are there, malformed or not.
+    public static unicode_escape(text: string, at: i64, len: i64, spanned: i64*) -> i64 {
+        *spanned = 0;
+        if (at >= len || *(text + at) as char != '{') { return -1; }
+        mut i: i64 = at + 1;
+        mut cp: i64 = 0;
+        mut ndig: i64 = 0;
+        while (i < len && Lexer::is_hex_digit(*(text + i))) {
+            cp = cp * 16 + Lexer::hex_value(*(text + i) as char);
+            i += 1;
+            ndig += 1;
+        }
+        const closed: boolean = i < len && *(text + i) as char == '}';
+        if (closed) { i += 1; }
+        *spanned = i - at;
+        if (ndig > 0 && closed && cp <= 0x10FFFF) { return cp; }
+        return -1;
+    }
+
+    /// The value of a character literal from its text between the quotes,
+    /// as the lexer hands it over (`'\n'` arrives as backslash and `n`): its
+    /// one character, or the codepoint or byte its escape spells, read by
+    /// the decoder strings use.  An escape that decoder does not name is the
+    /// character after the backslash.  The one decoder of a character
+    /// literal, for its value and for a pattern's bound alike.
+    public static char_literal_value(text: string) -> i64 {
+        if (text == null) { return 0; }
+        const len: i64 = text.length() as i64;
+        if (len == 0) { return 0; }
+        if (len < 2 || text[0] != '\\') { return text[0] as i64; }
+        mut spanned: i64 = 0;
+        const value: i64 = Lexer::escape_value(text, 0, len, &spanned);
+        if (value >= 0) { return value; }
+        return text[1] as i64;
+    }
+
+    /// A hex digit's value, 0 for any other character.
+    static hex_value(d: char) -> i64 {
+        if (d >= '0' && d <= '9') { return d as i64 - '0' as i64; }
+        if (d >= 'a' && d <= 'f') { return d as i64 - 'a' as i64 + 10; }
+        if (d >= 'A' && d <= 'F') { return d as i64 - 'A' as i64 + 10; }
+        return 0;
     }
 
     /// Encode Unicode codepoint `cp` (assumed <= 0x10FFFF) as UTF-8, appending

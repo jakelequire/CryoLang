@@ -15,15 +15,42 @@
 /// identifier resolution) drives them directly; they have not been unified into
 /// a single keyed resolver.
 
-namespace Compiler::Sema::TypeUtils;
+namespace compiler::sema::type_utils;
 
-import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Generic, Checker };
-import Compiler::Resolver::{ SymbolStr, InternTable, Resolver };
-import Compiler::CompilationContext;
-import Compiler::DeclIndex;
-import Compiler::AST;
-import Compiler::AST::Node;
+import std::fmt;
+import compiler::types::{
+    type_ref, type_base, arena, compound, user_defined, generic, checker, TypeKind
+};
+import compiler::resolver::{ symbol_str, intern_table, resolver };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResBase, ResSlot };
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::decl_index;
+import compiler::decl_index::{ GlobalEntry };
+import compiler::ast;
+import compiler::ast::{ MemberPin };
+import compiler::ast::node;
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::expression;
+import compiler::ast::expression::{ ScopeResolutionNode };
 import std::core::slice;
+import std::core::slice::{ Slice };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::resolver::{ Resolver };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::checker::{ TypeChecker, TypeCompatibility };
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
 
 type struct TypeUtils {
     arena:   TypeArena*;
@@ -46,39 +73,112 @@ type struct TypeUtils {
 
     // -- DeclarationIndex lookup delegates --
 
-    lookup_func_return(&this, name: SymbolStr) -> TypeRef {
-        return this.ctx.decl_index.lookup_func_return(name);
+    /// The global a WRITTEN name refers to, or invalid when it refers to
+    /// something else or to nothing.
+    ///
+    /// Absence and "answered, but not a definition" are deliberately one
+    /// outcome: a bare name may be a local, a builtin or a function, so
+    /// neither is a failure and neither licenses a second lookup under
+    /// another key.  The stamp is the writer's own answer, and it is a
+    /// canonical name, which the spelling - a leaf - can never be.
+    spelling_global(&this, slot: ResSlot) -> TypeRef {
+        return match (slot) {
+            ResSlot::Answered(r) => { this.def_global(r.def_id()) }
+            _                    => { TypeRef::invalid() }
+        };
     }
 
-    lookup_global_var(&this, name: SymbolStr) -> TypeRef {
-        // Prefer the current module's qualified global so a same-bare-name
-        // global in another module can't shadow it: the decl-index global map
-        // is keyed by bare name and is last-write-wins, so two modules each
-        // declaring e.g. a private `const FILETIME_TO_UNIX_TICKS` would
-        // otherwise collide (codegen already mangles globals per-namespace,
-        // so the type side must qualify to match). Falls back to the bare
-        // name for globals referenced from outside their declaring module.
-        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(name);
-        if (!qualified.equals(name)) {
-            const q: TypeRef = this.ctx.decl_index.lookup_global(qualified);
-            if (q.is_valid()) { return q; }
+    /// The global the definition `q` is, from its registration slot.
+    def_global(&this, q: DefId) -> TypeRef {
+        return this.ctx.global_entry_of_def(q).type_ref;
+    }
+
+    /// The type a WRITTEN name refers to, or invalid when it refers to
+    /// something else or to nothing.
+    ///
+    /// The bare-identifier counterpart of `spelling_global`, and absent for the
+    /// same reasons: a name that answers `Local`, `PrimTy` or `GenericParam`
+    /// names no declaration to look up, and that is an answer rather than a
+    /// failure, so it licenses no second lookup under another key.
+    spelling_type(&this, slot: ResSlot) -> TypeRef {
+        return match (slot) {
+            ResSlot::Answered(r) => { this.spelling_type_answered(r) }
+            _                    => { TypeRef::invalid() }
+        };
+    }
+
+    /// The answered half of `spelling_type`.
+    ///
+    /// An answer that declines to name a type is complete and licenses no
+    /// second lookup; an answer naming a definition the index does not hold
+    /// is a registration defect, which `def_type` records rather than papers
+    /// over with a spelling lookup.
+    spelling_type_answered(&this, r: Res) -> TypeRef {
+        // A written primitive names no declaration; the primitive table's
+        // answer is its identity, read the way an impl head's `PrimTy` is.
+        match (r) {
+            Res::PrimTy(n) => { return this.ctx.decl_index.type_of_def(this.ctx.defs.primitive(n)); }
+            _              => { }
         }
-        return this.ctx.decl_index.lookup_global(name);
+        const q: DefId = r.def_id();
+        if (!q.is_valid()) { return TypeRef::invalid(); }
+        return this.def_type(q, "sema/spelling_type_answered");
     }
 
-    /// The global `name` as declared by the module named by `scope_leaf`, for a
-    /// qualified `scope_leaf::name` reference. Invalid when no single module
-    /// matches, leaving the caller its existing fallback.
-    lookup_global_in_scope(&this, name: SymbolStr, scope_leaf: SymbolStr,
-                           out_ns: SymbolStr*) -> TypeRef {
-        mut module: SymbolStr = SymbolStr::empty();
-        return this.ctx.decl_index.find_global_in_scope(name, scope_leaf, this.intern,
-                                                        out_ns, &module);
+    /// The type the definition `q` is, recording an unregistered definition
+    /// against `site`.
+    ///
+    /// A `Res::Def` is the name layer's own answer, so the index either
+    /// holds it or the declaration never registered.  There is no second key
+    /// worth trying: the only other key available is the spelling, which is
+    /// a leaf, and a leaf answers from whichever module happens to own it -
+    /// so a retry would turn a registration defect into a silently wrong
+    /// type instead of reporting it.
+    def_type(&this, q: DefId, site: string) -> TypeRef {
+        const found: TypeRef = this.ctx.decl_index.type_of_def(q);
+        if (found.is_valid()) {
+            return found;
+        }
+        compiler::resolver::res::record_unregistered_def(site);
+        return TypeRef::invalid();
     }
 
-    lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
-        return this.canonicalize_method_return(
-            this.lookup_method_return_raw(type_sym, method_sym));
+    /// The global the qualified path `scope` names, per the qualifier's stamp.
+    ///
+    /// The stamp is the name layer's answer for the qualifier segment - the
+    /// module that declares the global, handed over as it is - beside the
+    /// written member leaf.  A qualifier that resolved to something other
+    /// than a definition names no module, and that is an answer rather than
+    /// a miss: nothing declares a Cryo global under such a path.
+    scope_global_type(&this, scope: ScopeResolutionNode*) -> TypeRef {
+        const seen: Res = scope.require_scope_res("sema: scope-resolution global");
+        const entry: GlobalEntry =
+            this.ctx.decl_index.global_in_module(
+                scope.member_name, this.ctx.module_of_def(seen.def_id()));
+        // The slot is the answer codegen loads the global by.
+        if (entry.valid) { scope.set_resolved_member(MemberPin::Global(entry.slot)); }
+        return entry.type_ref;
+    }
+
+    /// The registered type `ty` reads its methods off, or invalid: `ty`
+    /// itself when the index registered it; an instantiation's resolved
+    /// type once it has one, else its template; a dynamic array's
+    /// registration, keyed by its element.  The ref-keyed twin of
+    /// `lookup_type_sym`, which answers the same owner's NAME for display
+    /// and for the composed keys.
+    method_owner_ref(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return TypeRef::invalid(); }
+        if (this.ctx.decl_index.lookup_type_name(ty).is_valid()) { return ty; }
+        const t: Type* = this.arena.lookup(ty);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) { return inst.resolved_type; }
+            if (this.ctx.decl_index.lookup_type_name(inst.generic_base).is_valid()) { return inst.generic_base; }
+        }
+        if (t != null && t.kind == TypeKind::Array && (t as ArrayType*).is_dynamic()) {
+            return this.ctx.decl_index.lookup_array_type((t as ArrayType*).element);
+        }
+        return TypeRef::invalid();
     }
 
     /// Fold a method's stored return annotation to its canonical instantiation
@@ -86,60 +186,63 @@ type struct TypeUtils {
     /// matches every other path; otherwise an inline `Box::new(String::from_str)`
     /// mints a bogus bare-`String` clone whose method is never emitted.
     canonicalize_method_return(&this, ty: TypeRef) -> TypeRef {
-        if (this.ctx.type_resolver == null) { return ty; }
         return this.ctx.type_resolver.canonicalize_default_generic_type(ty);
     }
 
-    // widen: bare -> qualified -> cross-module cascade.
-    lookup_method_return_raw(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
-        // As-is (already-qualified names from monomorphized types).
-        const bare_ret: TypeRef = this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
-        if (bare_ret.is_valid()) { return bare_ret; }
-        // Module-qualified (local/same-module types registered under qualified names).
-        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(type_sym);
-        if (!qualified.equals(type_sym)) {
-            const q_ret: TypeRef = this.ctx.decl_index.lookup_method_return(qualified, method_sym);
-            if (q_ret.is_valid()) { return q_ret; }
-        }
-        // Cross-module: resolve the type's original module via the scope chain.
-        const cross_sym: SymbolStr = this.resolve_cross_module_name(type_sym);
-        if (cross_sym.is_valid()) {
-            return this.ctx.decl_index.lookup_method_return(cross_sym, method_sym);
-        }
-        return TypeRef::invalid();
+    /// The function TYPE registered in the family `(owner, leaf)`, with no
+    /// widening: the index either holds the family or it does not.
+    lookup_func_type_exact(&this, owner: FamilyOwner, leaf: SymbolStr) -> TypeRef {
+        return this.ctx.decl_index.lookup_func_type(owner, leaf);
     }
 
-    // widen: qualified -> direct -> cross-module -> arena-leaf cascade.
-    lookup_type_by_sym(&this, name: SymbolStr) -> TypeRef {
-        // Current module's qualified name FIRST so module-local types are
-        // preferred over bare-name aliases from other modules.
-        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(name);
-        if (!qualified.equals(name)) {
-            const q_ty: TypeRef = this.ctx.decl_index.lookup_type(qualified);
-            if (q_ty.is_valid()) { return q_ty; }
+    /// The type this path's QUALIFIER names, read off the answer the name layer
+    /// wrote on the node rather than re-derived from the spelling.
+    ///
+    /// `TypeRelative` is a positive claim that the qualifier names a type, and
+    /// it carries WHICH: a canonical name that already accounts for the imports
+    /// of the module that WROTE the path.  Matching the written spelling
+    /// against the index answers the same question from strictly less
+    /// information - the tier that ends that cascade is keyed by bare leaf and
+    /// so answers from any module in the program, with no import in hand.  That
+    /// is how a reference synthesized into a module which never imported the
+    /// type still resolved, and it would answer just as readily with a
+    /// same-leaf type from a module the writer cannot see.
+    ///
+    /// A written primitive (`u8::MAX`) is answered as `PrimTy`: it names no
+    /// declaration, because a primitive owns members without being declared
+    /// anywhere, and the primitive table's answer is its identity - so the
+    /// answer is read the way an impl head's is.
+    ///
+    /// Invalid for every other answer.  A qualifier naming a MODULE is not a
+    /// type claim, and a type parameter names no declaration to look up;
+    /// manufacturing a type for either here would assert an ownership the
+    /// stamp does not make.
+    scope_qualifier_type(&this, scope: ScopeResolutionNode*) -> TypeRef {
+        mut base: ResBase = ResBase::PrimTy(scope.scope_name);
+        const seen: Res = scope.require_scope_res("sema: scope-resolution qualifier");
+        match (seen) {
+            Res::TypeRelative(b, _) => { base = b; }
+            _                       => { return TypeRef::invalid(); }
         }
-        // Already-qualified names (specialized impl target_type) + cross-module aliases.
-        const direct: TypeRef = this.ctx.decl_index.lookup_type(name);
-        if (direct.is_valid()) { return direct; }
-        // Cross-module via scope chain.
-        const cross_sym: SymbolStr = this.resolve_cross_module_name(name);
-        if (cross_sym.is_valid()) {
-            const cross_ty: TypeRef = this.ctx.decl_index.lookup_type(cross_sym);
-            if (cross_ty.is_valid()) { return cross_ty; }
-        }
-        // Arena leaf-index: types visible via the TypeResolver fallback chain but
-        // not in the Resolver's scope chain (indirectly-imported submodule types).
-        const leaf_ref: TypeRef = this.arena.lookup_by_leaf(name);
-        if (leaf_ref.is_valid()) { return leaf_ref; }
-        return TypeRef::invalid();
-    }
-
-    /// Resolve a bare name to its original module-qualified form via the
-    /// Resolver's scope chain, or empty if not found.
-    resolve_cross_module_name(&this, name: SymbolStr) -> SymbolStr {
-        const resolver: Resolver* = this.ctx.get_resolver();
-        if (resolver == null) { return SymbolStr::empty(); }
-        return resolver.resolve_type_qualified_name(name);
+        return match (base) {
+            // By the id, through the recording door: a type-relative stamp
+            // names a declaration, and one the index does not hold is a
+            // registration defect (an `extern module` alias qualifier is
+            // `Def`, the module lane's, and never arrives here).
+            ResBase::Def(d)    => { this.def_type(d, "sema: scope-resolution qualifier") }
+            ResBase::PrimTy(n) => { this.ctx.decl_index.type_of_def(this.ctx.defs.primitive(n)) }
+            // A clone's segment: the substituter rewrote `T::default()` to
+            // `i32::default()` and recorded the type it rewrote it to, while
+            // the stamp still describes the template.  Read through the
+            // definition that type was registered as, so the answer is the
+            // type the index holds for it.  A template body walked before any
+            // substitution carries no id, and a parameter names no
+            // declaration to look up.
+            ResBase::GenericParam(_) => {
+                this.ctx.decl_index.type_of_def(this.ctx.decl_index.registered_def(scope.spec_owner))
+            }
+            _                  => { TypeRef::invalid() }
+        };
     }
 
     /// The registry name for a type: direct, else (for an InstantiatedType) its
@@ -148,7 +251,7 @@ type struct TypeUtils {
     lookup_type_sym(&this, ty: TypeRef) -> SymbolStr {
         const direct: SymbolStr = this.ctx.decl_index.lookup_type_name(ty);
         if (direct.is_valid()) { return direct; }
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t != null && t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t as InstantiatedType*;
             if (inst.has_resolved_type()) {
@@ -171,36 +274,40 @@ type struct TypeUtils {
         return SymbolStr::empty();
     }
 
-    /// Non-receiver parameter count of a qualified free function, or -1.
-    scope_fn_arity(&this, q_sym: SymbolStr) -> i64 {
-        if (this.ctx.decl_index == null) { return -1; }
-        const ft_ref: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
-        if (!ft_ref.is_valid()) { return -1; }
-        const t: Type* = this.arena.lookup(ft_ref.id);
-        if (t == null || t.kind != TypeKind::Function) { return -1; }
-        return (t as FunctionType*).param_types.length;
-    }
-
     /// The template module recorded for an injected specialization (side table
     /// populated during GenericExpressionResolution injection).
-    find_template_module(&this, node: ASTNode*) -> SymbolStr {
-        if (node == null) { return SymbolStr::empty(); }
-        return this.ctx.lookup_injected_origin(node as u64);
+    find_template_module(&this, node: ASTNode*) -> ModulePath {
+        if (node == null) { return ModulePath::none(); }
+        return this.ctx.lookup_injected_origin(node);
     }
 
 
     // -- Structural type probes --
 
-    /// Any unsubstituted generic parameter (GenericParam / BoundedParam) anywhere
-    /// in the type's structure.  Gates type-mismatch diagnostics that would fire
-    /// spuriously on a leftover template-form signature type inside a
-    /// monomorphized caller.
+    /// Any unsubstituted generic parameter (GenericParam) anywhere
+    /// in the type's structure, including a function type's parameters and
+    /// return and a projection's base (`(&I::Item) -> boolean` mentions `I`).
+    /// A substitution gated on this answer leaves a type it misses holding
+    /// a parameter nothing will replace.  An unresolved projection on a
+    /// concrete base mentions no parameter; `contains_unresolved_projection`
+    /// asks about that.
     contains_generic_param(&this, tref: TypeRef) -> boolean {
         if (!tref.is_valid()) { return false; }
-        const t: Type* = this.arena.lookup(tref.id);
+        const t: Type* = this.arena.lookup(tref);
         if (t == null) { return false; }
-        if (t.kind == TypeKind::GenericParam || t.kind == TypeKind::BoundedParam) {
+        if (t.kind == TypeKind::GenericParam) {
             return true;
+        }
+        if (t.kind == TypeKind::AssocProjection) {
+            return this.contains_generic_param((t as AssocProjectionType*).base);
+        }
+        if (t.kind == TypeKind::Function) {
+            const func: FunctionType* = t as FunctionType*;
+            if (this.contains_generic_param(func.return_type)) { return true; }
+            for (mut i: i64 = 0; i < func.param_types.length; i++) {
+                if (this.contains_generic_param(func.param_types[i])) { return true; }
+            }
+            return false;
         }
         if (t.kind == TypeKind::Pointer) {
             return this.contains_generic_param((t as PointerType*).pointee);
@@ -236,7 +343,7 @@ type struct TypeUtils {
     /// concrete (`Range<i32>::Item`) yet the type stays abstract until reduced.
     contains_unresolved_projection(&this, tref: TypeRef) -> boolean {
         if (!tref.is_valid()) { return false; }
-        const t: Type* = this.arena.lookup(tref.id);
+        const t: Type* = this.arena.lookup(tref);
         if (t == null) { return false; }
         if (t.kind == TypeKind::AssocProjection) {
             return !(t as AssocProjectionType*).resolved_type.is_valid();
@@ -260,6 +367,14 @@ type struct TypeUtils {
             }
             return false;
         }
+        if (t.kind == TypeKind::Function) {
+            const func: FunctionType* = t as FunctionType*;
+            if (this.contains_unresolved_projection(func.return_type)) { return true; }
+            for (mut i: i64 = 0; i < func.param_types.length; i++) {
+                if (this.contains_unresolved_projection(func.param_types[i])) { return true; }
+            }
+            return false;
+        }
         if (t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t as InstantiatedType*;
             for (mut i: i64 = 0; i < inst.type_args.length; i++) {
@@ -274,7 +389,7 @@ type struct TypeUtils {
     /// underlying concrete type (caller checks for the kind it wants, e.g. Enum).
     unwrap_to_enum(&this, ty: TypeRef) -> Type* {
         if (!ty.is_valid()) { return null; }
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null) { return null; }
         if (t.kind == TypeKind::Reference) {
             return this.unwrap_to_enum((t as ReferenceType*).referent);
@@ -294,7 +409,7 @@ type struct TypeUtils {
     /// when its `resolved_type` is still invalid), or null.
     peel_to_instantiation(&this, ty: TypeRef) -> InstantiatedType* {
         if (!ty.is_valid()) { return null; }
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null) { return null; }
         if (t.kind == TypeKind::Reference) {
             return this.peel_to_instantiation((t as ReferenceType*).referent);
@@ -306,6 +421,40 @@ type struct TypeUtils {
             return t as InstantiatedType*;
         }
         return null;
+    }
+
+    /// Substitute a receiver instantiation's arguments for its owner's
+    /// parameters in a type declared on the owner - a method's return or a
+    /// field's type: `Slice<u8>::get -> Option<u8>`.  In a generic body the
+    /// receiver's arguments may themselves be parameters - `Holder<X>`
+    /// inside `run<X>`, or `Conn<U>` as `this` in `implement struct
+    /// Conn<U>` over `Conn<S>` - and those are the ones in scope, so they are
+    /// substituted like any other: leaving the owner's `S` in the answer
+    /// hands the body a parameter it does not have.  Returns `ty` unchanged
+    /// when it is already concrete, the receiver is no instantiation, or the
+    /// arity disagrees; for a concrete receiver, also when the answer stays
+    /// abstract (a parameter no receiver argument binds, such as a method's
+    /// own).
+    subst_owner_params_from_receiver(&this, recv_type: TypeRef, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return ty; }
+        if (!this.contains_generic_param(ty)) { return ty; }
+        const inst: InstantiatedType* = this.peel_to_instantiation(recv_type);
+        if (inst == null) { return ty; }
+        const gr: GenericRegistry* = this.ctx.get_generic_registry();
+        if (gr == null) { return ty; }
+        const tmpl: TemplateEntry* = gr.template_of_type(inst.generic_base);
+        if (tmpl == null) { return ty; }
+        if (tmpl.param_types.length != inst.type_args.length) { return ty; }
+        mut abstract_recv: boolean = false;
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (this.contains_generic_param(inst.type_args[i])) { abstract_recv = true; }
+        }
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(
+            tmpl.param_types, inst.type_args);
+        const out: TypeRef = subst.apply(ty, this.arena);
+        if (!out.is_valid()) { return ty; }
+        if (!abstract_recv && this.contains_generic_param(out)) { return ty; }
+        return out;
     }
 
     // -- Generic-identity views (carrier-free) ---------------------------------
@@ -322,7 +471,7 @@ type struct TypeUtils {
     /// The template `ty` is an instantiation of, or invalid.
     view_generic_base(&this, ty: TypeRef) -> TypeRef {
         if (!ty.is_valid()) { return TypeRef::invalid(); }
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null) { return TypeRef::invalid(); }
         if (t.kind == TypeKind::Reference) {
             return this.view_generic_base((t as ReferenceType*).referent);
@@ -336,7 +485,7 @@ type struct TypeUtils {
     /// Number of type arguments `ty` carries as an instantiation (0 if none).
     view_type_arg_count(&this, ty: TypeRef) -> i64 {
         if (!ty.is_valid()) { return 0; }
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null) { return 0; }
         if (t.kind == TypeKind::Reference) {
             return this.view_type_arg_count((t as ReferenceType*).referent);
@@ -350,7 +499,7 @@ type struct TypeUtils {
     /// The `i`-th type argument of `ty` as an instantiation, or invalid.
     view_type_arg_at(&this, ty: TypeRef, i: i64) -> TypeRef {
         if (!ty.is_valid() || i < 0) { return TypeRef::invalid(); }
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null) { return TypeRef::invalid(); }
         if (t.kind == TypeKind::Reference) {
             return this.view_type_arg_at((t as ReferenceType*).referent, i);
@@ -367,7 +516,7 @@ type struct TypeUtils {
     /// been monomorphized yet.
     view_concrete_of(&this, ty: TypeRef) -> TypeRef {
         if (!ty.is_valid()) { return TypeRef::invalid(); }
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null) { return TypeRef::invalid(); }
         if (t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t as InstantiatedType*;
@@ -389,29 +538,37 @@ type struct TypeUtils {
     }
 
     /// Peel Pointer / Reference / resolved-InstantiatedType wrappers (bounded
-    /// depth) to the underlying base `Type*`, or null if an instantiation is
-    /// still unresolved.
-    unwrap_to_base_type(&this, ty: TypeRef) -> Type* {
-        mut t: Type* = this.arena.lookup(ty.id);
+    /// depth) to the underlying base type's handle, or invalid if an
+    /// instantiation is still unresolved.
+    unwrap_to_base_ref(&this, ty: TypeRef) -> TypeRef {
+        mut cur: TypeRef = ty;
+        mut t: Type* = this.arena.lookup(cur);
         mut depth: i32 = 0;
         while (t != null && depth < 5) {
             match (t.kind) {
                 TypeKind::Pointer => {
-                    t = this.arena.lookup((t as PointerType*).pointee.id);
+                    cur = (t as PointerType*).pointee;
                 }
                 TypeKind::Reference => {
-                    t = this.arena.lookup((t as ReferenceType*).referent.id);
+                    cur = (t as ReferenceType*).referent;
                 }
                 TypeKind::InstantiatedType => {
                     const it: InstantiatedType* = t as InstantiatedType*;
-                    if (!it.has_resolved_type()) { return null; }
-                    t = this.arena.lookup(it.resolved_type.id);
+                    if (!it.has_resolved_type()) { return TypeRef::invalid(); }
+                    cur = it.resolved_type;
                 }
-                _ => { return t; }
+                _ => { return cur; }
             }
+            t = this.arena.lookup(cur);
             depth += 1;
         }
-        return t;
+        if (t == null) { return TypeRef::invalid(); }
+        return cur;
+    }
+
+    /// The base `Type*` `unwrap_to_base_ref` peels to, or null.
+    unwrap_to_base_type(&this, ty: TypeRef) -> Type* {
+        return this.arena.lookup(this.unwrap_to_base_ref(ty));
     }
 
     /// The generic base of an instantiation, or invalid.
@@ -426,7 +583,7 @@ type struct TypeUtils {
 
     /// Pointee of a concrete pointer TypeRef, or invalid if not a pointer.
     proj_pointer_pointee(&this, t: TypeRef) -> TypeRef {
-        const ty: Type* = this.arena.lookup(t.id);
+        const ty: Type* = this.arena.lookup(t);
         if (ty != null && ty.kind == TypeKind::Pointer) {
             return (ty as PointerType*).pointee;
         }
@@ -435,7 +592,7 @@ type struct TypeUtils {
 
     /// Referent of a concrete reference TypeRef, or invalid if not a ref.
     proj_reference_referent(&this, t: TypeRef) -> TypeRef {
-        const ty: Type* = this.arena.lookup(t.id);
+        const ty: Type* = this.arena.lookup(t);
         if (ty != null && ty.kind == TypeKind::Reference) {
             return (ty as ReferenceType*).referent;
         }
@@ -447,34 +604,25 @@ type struct TypeUtils {
 
     /// True when one side is an Enum and the other an Int (enum<->discriminant).
     enum_int_compatible(&this, a: TypeRef, b: TypeRef) -> boolean {
-        const at: Type* = this.arena.lookup(a.id);
-        const bt: Type* = this.arena.lookup(b.id);
+        const at: Type* = this.arena.lookup(a);
+        const bt: Type* = this.arena.lookup(b);
         if (at == null || bt == null) { return false; }
         if (at.kind == TypeKind::Enum && bt.kind == TypeKind::Int) { return true; }
         if (at.kind == TypeKind::Int && bt.kind == TypeKind::Enum) { return true; }
         return false;
     }
 
-    /// True when `t` resolves to a reference (`&T`) type.
-    is_reference_type(&this, t: TypeRef) -> boolean {
+    /// True when `t` resolves to a function type (`(A) -> R`) - a callable slot.
+    is_function_type(&this, t: TypeRef) -> boolean {
         if (!t.is_valid()) { return false; }
-        const ty: Type* = this.arena.lookup(t.id);
-        return ty != null && ty.kind == TypeKind::Reference;
-    }
-
-    /// True when `t` resolves to a reference OR pointer - the value is already an
-    /// address and must not be auto-ref'd again.
-    is_ref_or_ptr_type(&this, t: TypeRef) -> boolean {
-        if (!t.is_valid()) { return false; }
-        const ty: Type* = this.arena.lookup(t.id);
-        if (ty == null) { return false; }
-        return ty.kind == TypeKind::Reference || ty.kind == TypeKind::Pointer;
+        const ty: Type* = this.arena.lookup(t);
+        return ty != null && ty.kind == TypeKind::Function;
     }
 
     /// One level of pointer/reference indirection peeled off `t`, or invalid when
     /// `t` is neither a pointer nor a reference.
     peel_indirection(&this, t: TypeRef) -> TypeRef {
-        const ty: Type* = this.arena.lookup(t.id);
+        const ty: Type* = this.arena.lookup(t);
         if (ty == null) { return TypeRef::invalid(); }
         if (ty.kind == TypeKind::Pointer)   { return (ty as PointerType*).pointee; }
         if (ty.kind == TypeKind::Reference) { return (ty as ReferenceType*).referent; }
@@ -484,7 +632,19 @@ type struct TypeUtils {
     /// True when `arg` and `param` describe the same underlying type up to one
     /// level of pointer/reference spelling - `&T`<->`&mut T`, `&T`<->`T*`, and
     /// value<->`&T`/`T*` (call-site auto-ref).  At least one side must be an
-    /// indirection; the underlying types must be non-`Incompatible`.
+    /// indirection, and the underlying types must be ASSIGNABLE to each other.
+    ///
+    /// Assignable, not merely "not Incompatible": this predicate is the second
+    /// opinion asked after `can_assign` has already said no, so accepting a pair
+    /// that needs an explicit cast means one peel plus any castable relation is
+    /// enough to waive the diagnosis - `i64` against `i32*` peels to `i64` vs
+    /// `i32`, which are cast-compatible.
+    ///
+    /// The auto-ref clause below is why a value whose type ALREADY equals the
+    /// pointee still binds a pointer parameter: `f(42)` against `i32*` matches
+    /// on `equals` and the call site materializes a temporary.  That is this
+    /// predicate's purpose at a CALL; a plain `=` must not ask it, and asks
+    /// `indirection_spelling_compatible` instead.
     indirection_compatible(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
         const a_peeled: TypeRef = this.peel_indirection(arg_ty);
         const p_peeled: TypeRef = this.peel_indirection(param_ty);
@@ -497,45 +657,115 @@ type struct TypeUtils {
         // only models for `Derived*`->`Base*`.
         if (this.checker.is_subclass_of(a_in, p_in)) { return true; }
         const c: TypeCompatibility = this.checker.check_compatibility(a_in, p_in);
-        return c != TypeCompatibility::Incompatible;
+        return c.is_assignable();
     }
 
-    /// Whether `t` is concrete enough for argument type-checking to judge.  False
-    /// for generic/bounded params, function (template) types, and unresolved
-    /// instantiations; recurses through pointer/reference/array/optional/tuple.
-    /// `()` and `void` are treated as never-a-mismatch (skip).
+    /// True when two types differ only in how the SAME indirection is spelled -
+    /// `&T` vs `&mut T` vs `T*`.  BOTH sides must be indirections.
+    ///
+    /// This is `indirection_compatible` minus its call-site auto-ref clause, and
+    /// it is what a plain `=` must ask.  Auto-ref is something a CALL does: the
+    /// callee gets the address of a temporary the call site materializes.  An
+    /// assignment materializes nothing, so admitting the value<->pointer half
+    /// there waived the diagnosis for `p = 42` on a `i32*` - and since the
+    /// literal defaults to `i32`, it matched the pointee exactly and never even
+    /// reached a compatibility question.  What codegen then emitted was a 32-bit
+    /// store into the 64-bit pointer slot, leaving the high half of the previous
+    /// pointer in place.
+    indirection_spelling_compatible(&this, from_ty: TypeRef, to_ty: TypeRef) -> boolean {
+        const f_peeled: TypeRef = this.peel_indirection(from_ty);
+        const t_peeled: TypeRef = this.peel_indirection(to_ty);
+        if (!f_peeled.is_valid() || !t_peeled.is_valid()) { return false; }
+        if (f_peeled.equals(t_peeled)) { return true; }
+        if (this.checker.is_subclass_of(f_peeled, t_peeled)) { return true; }
+        return this.checker.check_compatibility(f_peeled, t_peeled).is_assignable();
+    }
+
+    /// Whether `t` is concrete enough for argument / assignment type-checking to
+    /// judge.  A `()` or `void` VALUE is never a mismatch, so it is skipped here;
+    /// everything else defers to `arg_type_part_is_concrete`.
+    ///
+    /// The void skip belongs at the TOP LEVEL only.  Applied to a component it
+    /// says `void*` cannot be judged, which silently disabled the check for every
+    /// `void*` argument and assignment in the tree - and `void*` is the type the
+    /// FFI and type-erasure seams are made of, so that is the last place the
+    /// check should be absent.
     arg_type_is_concrete(&this, t: TypeRef) -> boolean {
         if (!t.is_valid()) { return false; }
-        const ty: Type* = this.arena.lookup(t.id);
+        const ty: Type* = this.arena.lookup(t);
+        if (ty == null) { return false; }
+        if (ty.kind == TypeKind::Unit) { return false; }
+        if (ty.kind == TypeKind::Void) { return false; }
+        return this.arg_type_part_is_concrete(t);
+    }
+
+    /// Whether every part of `t` names a settled type - one a mismatch can be
+    /// judged against.  False for generic/bounded params, function TEMPLATES,
+    /// unreduced projections (`I::Item` is whatever the impl that binds `I`
+    /// says, which no type here is yet) and unresolved instantiations; recurses through
+    /// pointer/reference/array/optional/tuple and through a function signature.
+    ///
+    /// A `Function` is settled once its parameters and return type are: it is an
+    /// address with a known signature, structurally interned, so two spellings of
+    /// one signature share an id and a mismatch is real.  Treating the whole kind
+    /// as unjudgeable - which this inherited from the generic-INFERENCE predicate,
+    /// where the question is instead "can this pin a type variable?" - left a
+    /// callback field or parameter accepting any value at all, and the failure is
+    /// a call through the slot into whatever was stored there.
+    arg_type_part_is_concrete(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t);
         if (ty == null) { return false; }
         if (ty.kind == TypeKind::GenericParam)     { return false; }
-        if (ty.kind == TypeKind::BoundedParam)     { return false; }
         if (ty.kind == TypeKind::FunctionTemplate) { return false; }
-        if (ty.kind == TypeKind::Function)         { return false; }
-        if (ty.kind == TypeKind::Unit)             { return false; }
-        if (ty.kind == TypeKind::Void)             { return false; }
+        if (ty.kind == TypeKind::AssocProjection)  { return false; }
         if (ty.kind == TypeKind::Pointer) {
-            return this.arg_type_is_concrete((ty as PointerType*).pointee);
+            return this.arg_type_part_is_concrete((ty as PointerType*).pointee);
         }
         if (ty.kind == TypeKind::Reference) {
-            return this.arg_type_is_concrete((ty as ReferenceType*).referent);
+            return this.arg_type_part_is_concrete((ty as ReferenceType*).referent);
         }
         if (ty.kind == TypeKind::Array) {
-            return this.arg_type_is_concrete((ty as ArrayType*).element);
+            return this.arg_type_part_is_concrete((ty as ArrayType*).element);
         }
         if (ty.kind == TypeKind::Optional) {
-            return this.arg_type_is_concrete((ty as OptionalType*).wrapped);
+            return this.arg_type_part_is_concrete((ty as OptionalType*).wrapped);
         }
         if (ty.kind == TypeKind::Tuple) {
             const tt: TupleType* = ty as TupleType*;
             for (mut i: i64 = 0; i < tt.elements.length; i++) {
-                if (!this.arg_type_is_concrete(tt.elements[i])) { return false; }
+                if (!this.arg_type_part_is_concrete(tt.elements[i])) { return false; }
             }
             return true;
+        }
+        if (ty.kind == TypeKind::Function) {
+            const ft: FunctionType* = ty as FunctionType*;
+            for (mut i: i64 = 0; i < ft.param_types.length; i++) {
+                if (!this.arg_type_part_is_concrete(ft.param_types[i])) { return false; }
+            }
+            return this.arg_type_part_is_concrete(ft.return_type);
         }
         if (ty.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = ty as InstantiatedType*;
             if (!inst.has_resolved_type()) { return false; }
+        }
+        return true;
+    }
+
+    /// Whether `t` names one type a generic enum constructor's instantiation
+    /// can be inferred from: a settled type, or an instantiation not yet
+    /// minted whose arguments each name one type.  Before monomorphization
+    /// `String<GlobalAlloc>` is such an instantiation, and it names one type
+    /// as surely as its specialization does; an argument that is a parameter,
+    /// or holds one, names none.
+    arg_type_names_one_type(&this, t: TypeRef) -> boolean {
+        if (this.arg_type_is_concrete(t)) { return true; }
+        const ty: Type* = this.arena.lookup(t);
+        if (ty == null || ty.kind != TypeKind::InstantiatedType) { return false; }
+        const inst: InstantiatedType* = ty as InstantiatedType*;
+        if (inst.has_resolved_type() || inst.type_args.length == 0) { return false; }
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (!this.arg_type_names_one_type(inst.type_args[i])) { return false; }
         }
         return true;
     }
@@ -545,7 +775,7 @@ type struct TypeUtils {
     same_param_sig(&this, a: Slice<TypeRef>, b: Slice<TypeRef>) -> boolean {
         if (a.length != b.length) { return false; }
         for (mut i: i64 = 0; i < a.length as i64; i++) {
-            if (a.get(i as u64).unwrap().id != b.get(i as u64).unwrap().id) { return false; }
+            if (!a.get(i as u64).unwrap().equals(b.get(i as u64).unwrap())) { return false; }
         }
         return true;
     }
@@ -556,12 +786,12 @@ type struct TypeUtils {
     /// nominals are keyed by qualified name in the arena and compound types are
     /// interned structurally, so one semantic type has exactly one id.
     types_equivalent(&this, a: TypeRef, b: TypeRef) -> boolean {
-        return a.id == b.id;
+        return a.equals(b);
     }
 
     /// True when `t` is a pointer/reference whose pointee is the same type as `v`.
     is_ptr_or_ref_to(&this, t: TypeRef, v: TypeRef) -> boolean {
-        const ty: Type* = this.arena.lookup(t.id);
+        const ty: Type* = this.arena.lookup(t);
         if (ty == null) { return false; }
         if (ty.kind == TypeKind::Pointer) {
             return this.types_equivalent((ty as PointerType*).pointee, v);
@@ -572,13 +802,12 @@ type struct TypeUtils {
         return false;
     }
 
-    /// Display name for a TypeRef (re-interned so it doesn't outlive the
-    /// formatter's static buffer).  Returns "?" for invalid refs.
+    /// Display name for a TypeRef, for a message.  Returns "?" for invalid
+    /// refs.
     type_display_name(&this, ty: TypeRef) -> string {
         if (!ty.is_valid()) { return "?"; }
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null) { return "?"; }
-        const sym: SymbolStr = this.intern.intern(this.arena.format_display(t));
-        return this.intern.resolve(sym);
+        return this.arena.format_display(t);
     }
 }

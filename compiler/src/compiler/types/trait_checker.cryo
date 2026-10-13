@@ -13,17 +13,40 @@
 ///! composes a TraitChecker and forwards to it; sema constructs one directly
 ///! from the CompilationContext's shared components.
 
-namespace Compiler::Types::TraitChecker;
+namespace compiler::types::trait_checker;
 
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration, Statement, Expression, Pattern };
-import Compiler::Types::{
-    Generic, UserDefined, Compound, Type, Arena, TypeRef,
-    Substitution, Inference, GenericRegistry, Ownership
+import compiler::ast;
+import compiler::ast::{
+    declaration, expression, node, pattern, statement, TraitBound, TraitRef,
+    TypeAnnotation
 };
-import Compiler::Diag;
-import Compiler::Diag::{ Sink, Diagnostic, SourceSpan };
-import Compiler::Resolver::{ InternTable, SymbolStr };
+import compiler::types::{
+    generic, user_defined, compound, type_base, arena, type_ref,
+    substitution, inference, generic_registry, ownership, TypeKind
+};
+import compiler::diag;
+import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
+import compiler::resolver::{ intern_table, symbol_str };
+import std::fmt;
+import compiler::ast::declaration::{ FunctionDeclNode, ImplBlockNode, MethodNode, VarDeclNode };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::sink::{ DiagnosticSink };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name::{ DeclName };
+import compiler::resolver::res::{ DefId };
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{ PointerType, ReferenceType };
+import compiler::types::user_defined::{ TypeAliasType };
+import compiler::types::generic::{ GenericParamType };
+import compiler::types::generic_registry::{ GenericRegistry };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::types::ownership::{ OwnershipQuery };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
 
 
 /// Read-only trait-satisfaction query engine. See file header.
@@ -54,7 +77,14 @@ type struct TraitChecker {
     /// past a handful of levels) and a depleted depth conservatively
     /// returns false so an unsatisfiable bound never accidentally enables
     /// body specialization.
-    type_implements_trait(&this, ty: TypeRef, trait_name: SymbolStr, depth: i32) -> boolean {
+    /// `trait_name` is the trait's IDENTITY (`TraitRef::identity()`, a
+    /// stamped annotation, or `GenericRegistry::wellknown`), never a written
+    /// leaf: the marker comparisons below are identity comparisons, and a leaf
+    /// would match a user trait that merely shares the spelling.
+    ///
+    /// The trait-impl registry is keyed by that identity too, so one name
+    /// asks both questions.
+    type_implements_trait(&this, ty: TypeRef, trait_name: DefId, depth: i32) -> boolean {
         if (depth >= 16) {
             // Depth budget exhausted on a deep or cyclic impl/where-clause
             // chain. Return false (unchanged) so an unsatisfiable bound never
@@ -67,10 +97,10 @@ type struct TraitChecker {
             // untouched because this receiver is `&this`; emit() records the
             // error in the sink (the same `&this` diagnostics.emit pattern used
             // elsewhere - e.g. resolver.cryo's resolve()).
-            const tn: string = this.intern_table.resolve(trait_name);
+            const tn: string = this.intern_table.shown(this.arena.defs.path_of(trait_name));
             this.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("trait-bound resolution exceeded the recursion limit (16) while checking `%s`; the impl or where-clause chain may be cyclic", tn)));
+                fmt::format("trait-bound resolution exceeded the recursion limit (16) while checking `%s`; the impl or where-clause chain may be cyclic", tn)));
             return false;
         }
 
@@ -79,7 +109,7 @@ type struct TraitChecker {
         // registry. The marker trait declared in core/marker.cryo
         // intentionally has no impl blocks; the compiler is the single
         // source of truth for "is this type bitwise-duplicable".
-        const copy_name: SymbolStr = this.intern_table.intern("Copy");
+        const copy_name: DefId = this.generic_registry.wellknown(LangItem::Copy);
         if (copy_name.is_valid() && trait_name.equals(copy_name)) {
             return OwnershipQuery::is_copy(this.arena, this.generic_registry,
                                             this.intern_table, ty);
@@ -89,12 +119,12 @@ type struct TraitChecker {
         // as `Copy`: the compiler decides via a type walk, not via
         // `implement trait Send for T { ... }` lookups.  See
         // OwnershipQuery::is_send / is_sync for the rules.
-        const send_name: SymbolStr = this.intern_table.intern("Send");
+        const send_name: DefId = this.generic_registry.wellknown(LangItem::Send);
         if (send_name.is_valid() && trait_name.equals(send_name)) {
             return OwnershipQuery::is_send(this.arena, this.generic_registry,
                                             this.intern_table, ty);
         }
-        const sync_name: SymbolStr = this.intern_table.intern("Sync");
+        const sync_name: DefId = this.generic_registry.wellknown(LangItem::Sync);
         if (sync_name.is_valid() && trait_name.equals(sync_name)) {
             return OwnershipQuery::is_sync(this.arena, this.generic_registry,
                                             this.intern_table, ty);
@@ -106,18 +136,14 @@ type struct TraitChecker {
         // stdlib/core/drop.cryo, while pointers to user types still require
         // the pointee to `implement trait Drop`. Avoids needing a parser
         // extension to support pointer impl targets like `for u8*`.
-        const drop_name: SymbolStr = this.intern_table.intern("Drop");
+        const drop_name: DefId = this.generic_registry.wellknown(LangItem::Drop);
         if (drop_name.is_valid() && trait_name.equals(drop_name)) {
             // Pointers/references are non-owning aliases.  Delegate
             // `T*: Drop` to `T: Drop` so primitive pointers auto-pass while
             // pointers to user types require the pointee to impl `Drop`.  This
-            // is checked BEFORE the `Copy` rule below: a pointer is itself
-            // `Copy`, but a `where T: Drop` container of `T*` must still drop
-            // its elements through the pointee's real `Drop` - answering
-            // "satisfied" off the pointer's own Copy-ness would wrongly
-            // instantiate a container drop whose body derefs to a non-Copy
-            // pointee that has no `drop` method.
-            const t_ptr: Type* = this.arena.lookup(ty.id);
+            // is checked BEFORE the `Copy` rule below, which a pointer would
+            // otherwise always satisfy.
+            const t_ptr: Type* = this.arena.lookup(ty);
             if (t_ptr != null && t_ptr.kind == TypeKind::Pointer) {
                 const pt: PointerType* = t_ptr as PointerType*;
                 return this.type_implements_trait(pt.pointee, trait_name, depth + 1);
@@ -137,44 +163,64 @@ type struct TraitChecker {
         }
 
         // The subject is used directly, whether it is a pre-mono InstantiatedType
-        // wrapper or a post-mono concrete spec: both `bare_name_of` and the
+        // wrapper or a post-mono concrete spec: both `carries_impl_key` and the
         // type-arg substitution below read the instantiation identity through the
         // `inst_*` views, and a concrete carries that identity itself.
-        //
-        // (This used to swap in the origin carrier first, because a concrete spec
-        // struct's bare name is its MANGLED spec name (`5Range$Li$G`) and the
-        // trait-impl registry is keyed on the template's bare name (`Range`), so
-        // the impl was wrongly dropped.  `bare_name_of` now resolves a concrete to
-        // its template, so the swap is unnecessary.)
         const subject: TypeRef = ty;
-        const target_name: SymbolStr = this.bare_name_of(subject);
-        if (!target_name.is_valid()) { return false; }
-        // Collision-proof: resolve the impl by the subject's canonical
-        // qualified-name identity so a same-leaf type in another module doesn't
-        // inherit this trait's impl (falls back to the bare lookup when the
-        // subject isn't a precisely-registered named aggregate).
-        const impl_block: ImplBlockNode* =
-            OwnershipQuery::resolve_trait_impl_for_type(this.arena,
-                this.generic_registry, this.intern_table, trait_name, subject);
-        if (impl_block == null) {
-            // No `implement trait Drop` for this type - but a non-Copy
-            // type whose destructor is written as an inherent `drop`
-            // method still satisfies Drop: drop-insertion and codegen
-            // both resolve `.drop()` to the inherent method (mirroring
-            // `is_copy`, which already treats an inherent `drop` as
-            // non-Copy).  Without this, a `where T: Drop` container
-            // (`Box<T>`, `Rc<T>`, `Array<T>`, ...) rejects any T whose
-            // destructor is inline rather than a trait impl, and
-            // `Box<T>::drop` is never instantiated -> E0636 at codegen.
-            // Container types always carry a trait Drop impl, so they
-            // never reach this branch and keep the `where T: Drop` check
-            // below.
-            if (drop_name.is_valid() && trait_name.equals(drop_name)) {
-                return OwnershipQuery::has_inherent_drop(this.arena,
-                    this.generic_registry, this.intern_table, ty);
-            }
-            return false;
+        if (!this.arena.carries_impl_key(subject, this.intern_table)) { return false; }
+        // The candidates by identity, the first whose bounds hold.
+        const impl_block: ImplBlockNode* = this.select_impl(trait_name, subject, depth);
+        // A method merely named `drop` does not satisfy `Drop`: a type
+        // implements it with `implement trait Drop`, as any other trait.
+        return impl_block != null;
+    }
+
+    /// The impl of `trait_id` for `subject` that APPLIES: the first
+    /// candidate the registry assembles by unification
+    /// (`GenericRegistry::heads_for`) whose where-clause holds for the
+    /// subject's arguments.  Null when no head unifies or every one that
+    /// does is refused by its bounds - selection, candidate assembly then
+    /// confirmation, in one place.
+    select_impl(&this, trait_id: DefId, subject: TypeRef, depth: i32) -> ImplBlockNode* {
+        if (this.generic_registry == null) { return null; }
+        const heads: ImplBlockNode*[] = this.generic_registry.heads_for(trait_id, subject, this.intern_table);
+        for (mut i: i64 = 0; i < heads.length; i++) {
+            if (this.impl_applies(heads[i], subject, depth)) { return heads[i]; }
         }
+        return null;
+    }
+
+    /// Every impl that applies to `subject`, of every trait: the registry's
+    /// candidates (`trait_impls_of`) with each one's where-clause confirmed.
+    /// The set a method call on a concrete receiver binds against.
+    impls_of(&this, subject: TypeRef) -> ImplBlockNode*[] {
+        mut out: ImplBlockNode*[] = [];
+        if (this.generic_registry == null) { return out; }
+        const heads: ImplBlockNode*[] = this.generic_registry.trait_impls_of(subject, this.intern_table);
+        for (mut i: i64 = 0; i < heads.length; i++) {
+            if (this.impl_applies(heads[i], subject, 0)) { out.push(heads[i]); }
+        }
+        return out;
+    }
+
+    /// Whether a candidate head applies to `subject`: a clone the
+    /// monomorphizer placed under a specialization was confirmed when it was
+    /// placed (its bounds held for those arguments, and are substituted away
+    /// on the clone), so it applies outright; a written head applies when
+    /// its where-clause holds for the subject.
+    impl_applies(&this, head: ImplBlockNode*, subject: TypeRef, depth: i32) -> boolean {
+        if (head == null) { return false; }
+        if (head.spec_owner.is_valid()) { return true; }
+        return this.impl_bounds_hold(head, subject, depth);
+    }
+
+    /// Whether `impl_block`'s where-clause holds for `subject`: the head's
+    /// written target parameters bound to the subject's arguments, each bound
+    /// checked recursively.  A head with no where-clause holds outright.  A
+    /// subject that carries no arguments cannot bind the head's parameters,
+    /// so a bounded head is refused for it rather than assumed.
+    impl_bounds_hold(&this, impl_block: ImplBlockNode*, subject: TypeRef, depth: i32) -> boolean {
+        if (impl_block == null) { return false; }
         if (impl_block.where_bounds.length == 0) { return true; }
         // Build a fresh substitution from the impl's generic params to
         // the concrete type's args. For `implement<T> trait Eq for Option<T>`
@@ -201,95 +247,92 @@ type struct TraitChecker {
         if (impl_block.target_args.length != subj_nargs) {
             return false;
         }
-        mut nested: TypeSubstitution = TypeSubstitution::empty();
-        for (mut gi: i64 = 0; gi < impl_block.target_args.length; gi++) {
-            const ta: TypeAnnotation* = impl_block.target_args[gi];
-            if (ta == null) { continue; }
-            match (*ta) {
-                TypeAnnotation::Named(n) => {
-                    // `lookup_subst_for_param` keys by the GenericParam's
-                    // name, so the index here only has to make a GenericParam
-                    // TypeRef; the name is what matters.
-                    const gp_ref: TypeRef = this.arena.create_generic_param(n.name, gi as u64);
-                    nested.add(gp_ref.id, this.arena.inst_type_arg_at(subject, gi));
-                }
-                _ => {}
-            }
+        mut args: TypeRef[] = [];
+        for (mut gi: i64 = 0; gi < subj_nargs; gi++) {
+            args.push(this.arena.inst_type_arg_at(subject, gi));
         }
+        mut nested: TypeSubstitution = TypeSubstitution::empty();
+        this.add_head_param_bindings(impl_block, &args, &nested);
         return this.bounds_satisfied_at_depth(impl_block.where_bounds, &nested, depth + 1);
+    }
+
+    /// Bind the parameters an implement block's head writes to an
+    /// instantiation's arguments: `U` in `implement<U> .. for Wrap<U>`, for
+    /// `Wrap<Plain>`, to `Plain`.  An impl's parameters are its own; they
+    /// relate to the type's only through the head, so a bound the impl
+    /// writes (`where U: Show`) is checked against these bindings and never
+    /// against the type's parameters, which may be spelled differently.  A
+    /// head whose argument count differs from `args` binds nothing.
+    add_head_param_bindings(&this, impl_block: ImplBlockNode*, args: &TypeRef[],
+                            subst: TypeSubstitution*) -> void {
+        if (impl_block == null || subst == null) { return; }
+        if (impl_block.target_args.length != args.length) { return; }
+        for (mut gi: i64 = 0; gi < impl_block.target_args.length; gi++) {
+            const gp_ref: TypeRef = this.head_param_type(impl_block, gi);
+            if (gp_ref.is_valid()) { subst.add(gp_ref, args[gi]); }
+        }
+    }
+
+    /// The type of the parameter an implement block's head writes at
+    /// position `index` (`U` in `.. for Wrap<U>`, at 0), or invalid where
+    /// the head writes a type there.
+    head_param_type(&this, impl_block: ImplBlockNode*, index: i64) -> TypeRef {
+        if (impl_block == null || index < 0 || index >= impl_block.target_args.length) {
+            return TypeRef::invalid();
+        }
+        const ta: TypeAnnotation* = impl_block.target_args[index];
+        if (ta == null) { return TypeRef::invalid(); }
+        match (*ta) {
+            TypeAnnotation::Named(n) => {
+                if (n.param_sym().is_valid()) {
+                    return this.arena.create_generic_param(n.param_sym(), n.name, index as u64);
+                }
+            }
+            _ => {}
+        }
+        return TypeRef::invalid();
     }
 
     /// Lenient "does `ty` implement `trait_name`" check for verifying an
     /// `implement Trait` binding annotation against its initializer.
     ///
-    /// `type_implements_trait` fully verifies an impl's where-bounds, but it
-    /// can't bind where-clause-ONLY generics - e.g. the `T` in
-    /// `implement<I, T> Iterator<T> for CopiedIter<I> where I: Iterator<T*>`
-    /// is recovered by pointer-peeling at instantiation, which the bound
-    /// checker doesn't replay - so it wrongly reports `CopiedIter`/`TakeIter`/
-    /// `MapIter`/`FilterIter` as non-implementers. For an opaque-binding
-    /// sanity check the precise where-bounds don't matter: it's enough that
-    /// the trait is implemented for this type at all (a genuinely unrelated
-    /// type has no such impl). Any truly-unsatisfied where-bound still
-    /// surfaces precisely at the first trait-method call on the concrete type.
-    type_satisfies_opaque_bound(&this, ty: TypeRef, trait_name: SymbolStr) -> boolean {
+    /// `type_implements_trait` confirms a head's where-bounds, and cannot
+    /// bind a where-clause-ONLY generic - the `T` in `implement<I, T>
+    /// Iterator<T> for CopiedIter<I> where I: Iterator<T*>` is recovered by
+    /// pointer-peeling at instantiation, which the bound checker does not
+    /// replay - so a written head with such a bound reads as unsatisfied
+    /// until its clone is placed.  For an opaque-binding sanity check the
+    /// bounds do not matter: it is enough that a head of the trait unifies
+    /// with the type at all (a genuinely unrelated type has none).  A truly
+    /// unsatisfied bound still surfaces at the first trait-method call on
+    /// the concrete type.
+    type_satisfies_opaque_bound(&this, ty: TypeRef, trait_name: DefId) -> boolean {
         if (this.type_implements_trait(ty, trait_name, 0)) { return true; }
         if (this.generic_registry == null) { return false; }
-        // No carrier swap needed: `bare_name_of` resolves a post-mono concrete to
-        // its template, and `resolve_trait_impl_for_type` keys off the same.
-        const subject: TypeRef = ty;
-        const target_name: SymbolStr = this.bare_name_of(subject);
-        if (!target_name.is_valid()) { return false; }
-        return OwnershipQuery::resolve_trait_impl_for_type(this.arena,
-            this.generic_registry, this.intern_table, trait_name, subject) != null;
+        return this.generic_registry.heads_for(trait_name, ty, this.intern_table).length > 0;
     }
 
     /// When sema's call-site method lookup misses on a spec'd type, we want
     /// to distinguish "this method genuinely doesn't exist" from "the trait
     /// providing this method has a where-clause that isn't satisfied for this
-    /// specialization".  Walks the trait impls registered against `receiver`'s
-    /// base type and returns the bare name of the first trait whose impl
-    /// provides `method_name` but whose `where_bounds` aren't satisfied for the
-    /// receiver's type args.  Returns `SymbolStr::empty()` when no such
-    /// trait exists.
+    /// specialization".  Walks the heads that unify with `receiver` and
+    /// returns the IDENTITY of the first trait whose head provides
+    /// `method_name` (by the trait-method door) but whose `where_bounds` do
+    /// not hold for the receiver's type args.  Returns `DeclName::empty()`
+    /// when no such trait exists.
     diagnose_method_bounds_failure(&this, receiver: TypeRef,
-                                    method_name: SymbolStr) -> SymbolStr {
-        if (this.generic_registry == null) { return SymbolStr::empty(); }
-
-        // Sema typically passes the spec'd concrete type (e.g. the Enum for
-        // `Result_int_OpaqueErr`) rather than an InstantiatedType wrapper.  Trait
-        // impls are registered against the TEMPLATE's bare name (`Result`), and
-        // `bare_name_of` resolves a concrete to its template through its intrinsic
-        // generic identity - so the receiver is probed directly.  (This used to
-        // swap in the origin carrier first; without that, the registry lookup
-        // missed every template impl and fell through to the generic
-        // "method not found" diagnostic.)
-        const probe_ref: TypeRef = receiver;
-        const base_name: SymbolStr = this.bare_name_of(probe_ref);
-        if (!base_name.is_valid()) { return SymbolStr::empty(); }
-        const traits: SymbolStr[] = this.generic_registry.traits_implemented_by(base_name);
-        for (mut i: i64 = 0; i < traits.length; i++) {
-            const trait_name: SymbolStr = traits[i];
-            const impl_block: ImplBlockNode* =
-                OwnershipQuery::resolve_trait_impl_for_type(this.arena,
-                    this.generic_registry, this.intern_table, trait_name, probe_ref);
-            if (impl_block == null) { continue; }
-            // Does this impl provide the method we're looking for?
-            mut has_method: boolean = false;
-            for (mut mi: i64 = 0; mi < impl_block.methods.length; mi++) {
-                const m: MethodNode* = impl_block.methods[mi];
-                if (m != null && m.func != null && m.func.name.equals(method_name)) {
-                    has_method = true;
-                    break;
-                }
-            }
-            if (!has_method) { continue; }
-            // Method exists; check whether bounds hold for this receiver.
-            if (!this.type_implements_trait(probe_ref, trait_name, 0)) {
-                return trait_name;
+                                    method_name: SymbolStr) -> DeclName {
+        if (this.generic_registry == null) { return DeclName::empty(); }
+        const blocks: ImplBlockNode*[] = this.generic_registry.trait_impls_of(receiver, this.intern_table);
+        for (mut i: i64 = 0; i < blocks.length; i++) {
+            const impl_block: ImplBlockNode* = blocks[i];
+            const m: MethodNode* = this.generic_registry.impl_method_by_leaf(impl_block, method_name);
+            if (m == null || m.func == null) { continue; }
+            if (!this.type_implements_trait(receiver, impl_block.trait_def, 0)) {
+                return this.arena.defs.path_of(impl_block.trait_def);
             }
         }
-        return SymbolStr::empty();
+        return DeclName::empty();
     }
 
     /// Check whether every trait bound in `bounds` holds under `subst`.
@@ -306,7 +349,7 @@ type struct TraitChecker {
             // the whole spec. (Crisp projection-level filtering is a future
             // refinement - see plan risk #1.)
             if (bound.has_projection_subject()) { continue; }
-            const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
+            const concrete: TypeRef = this.lookup_subst_for_param(bound.subject_sym, subst);
             if (!concrete.is_valid()) {
                 // No substitution for this param; the bound names a
                 // generic the caller didn't supply.  This is normal for
@@ -322,13 +365,39 @@ type struct TraitChecker {
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef* = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
-                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
-                if (!this.type_implements_trait(concrete, trait_name, 0)) {
+                if (!this.type_implements_trait(concrete, tref.definition(), 0)) {
                     return false;
                 }
             }
         }
         return true;
+    }
+
+    /// The first trait reference in `bounds` that `subst` does not satisfy,
+    /// or null when every one holds: `bounds_satisfied` with the failing
+    /// bound named, for a diagnostic that points at it.  A bound whose
+    /// argument is missing from the substitution or still abstract is
+    /// deferred, as `bounds_satisfied` defers it; `*out_concrete` is the
+    /// argument the failing bound was checked against.
+    unsatisfied_trait_ref(&this, bounds: &TraitBound[], subst: TypeSubstitution*,
+                          out_concrete: TypeRef*) -> TraitRef* {
+        if (bounds.length == 0 || subst == null) { return null; }
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const bound: TraitBound* = &bounds[bi];
+            if (bound.has_projection_subject()) { continue; }
+            const concrete: TypeRef = this.lookup_subst_for_param(bound.subject_sym, subst);
+            if (!concrete.is_valid()) { continue; }
+            if (this.arena.contains_generic_param(concrete)) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: TraitRef* = &bound.trait_refs[ri];
+                // A bound refused where it is written is reported there.
+                if (tref.path.length == 0 || tref.refused) { continue; }
+                if (this.type_implements_trait(concrete, tref.definition(), 0)) { continue; }
+                *out_concrete = concrete;
+                return tref;
+            }
+        }
+        return null;
     }
 
     /// `bounds_satisfied` with explicit recursion depth, used by
@@ -344,13 +413,12 @@ type struct TraitChecker {
             // method body, not filterable by param substitution here. Treat as
             // satisfied rather than failing the spec (matching `bounds_satisfied`).
             if (bound.has_projection_subject()) { continue; }
-            const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
+            const concrete: TypeRef = this.lookup_subst_for_param(bound.subject_sym, subst);
             if (!concrete.is_valid()) { return false; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef* = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
-                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
-                if (!this.type_implements_trait(concrete, trait_name, depth)) {
+                if (!this.type_implements_trait(concrete, tref.definition(), depth)) {
                     return false;
                 }
             }
@@ -369,77 +437,58 @@ type struct TraitChecker {
         return this.bounds_satisfied(func.trait_bounds, subst);
     }
 
-    /// Find the substituted concrete TypeRef for a generic param by name.
-    lookup_subst_for_param(&this, name: SymbolStr, subst: TypeSubstitution*) -> TypeRef {
-        if (subst == null) { return TypeRef::invalid(); }
-        for (mut i: i64 = 0; i < subst.param_ids.length; i++) {
-            const pt: Type* = this.arena.lookup(subst.param_ids[i]);
-            if (pt == null) { continue; }
-            if (pt.kind == TypeKind::GenericParam) {
-                const gp: GenericParamType* = pt as GenericParamType*;
-                if (gp.param_name.equals(name)) { return subst.replacements[i]; }
-            } else if (pt.kind == TypeKind::BoundedParam) {
-                const bp: BoundedParamType* = pt as BoundedParamType*;
-                if (bp.param_name.equals(name)) { return subst.replacements[i]; }
+    /// Whether `func`'s receiver is written as the template `base`
+    /// instantiated with arguments other than `args`, read under `subst`
+    /// (the template's parameters bound to `args`): on `implement
+    /// Result<T, E>` as `Result<i32, string>`, `this: Result<T*, E>` denotes
+    /// `Result<i32*, string>` and is not a method of it; `this: Result<T, E>`
+    /// is.  A receiver written as the bare owner names every instantiation.
+    method_receiver_excludes(&this, func: FunctionDeclNode*, subst: TypeSubstitution*,
+                             base: TypeRef, args: &TypeRef[]) -> boolean {
+        if (func == null) { return false; }
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null || !param.is_receiver()) { continue; }
+            mut ty: TypeRef = param.resolved_type;
+            if (subst != null) { ty = subst.apply(ty, this.arena); }
+            ty = this.receiver_core(ty);
+            if (!this.arena.inst_generic_base(ty).equals(base)) { return false; }
+            if (this.arena.inst_type_arg_count(ty) != args.length) { return false; }
+            for (mut ai: i64 = 0; ai < args.length; ai++) {
+                if (!this.arena.inst_type_arg_at(ty, ai).equals(args[ai])) { return true; }
             }
+            return false;
+        }
+        return false;
+    }
+
+    /// The type a receiver is a reference or pointer to, through aliases.
+    receiver_core(&this, ty: TypeRef) -> TypeRef {
+        mut cur: TypeRef = ty;
+        for (mut depth: i32 = 0; depth < 8; depth++) {
+            const t: Type* = this.arena.lookup(cur);
+            if (t == null) { return cur; }
+            if (t.kind == TypeKind::Reference) { cur = (t as ReferenceType*).referent; continue; }
+            if (t.kind == TypeKind::Pointer) { cur = (t as PointerType*).pointee; continue; }
+            if (t.kind == TypeKind::TypeAlias && (t as TypeAliasType*).has_target()) {
+                cur = (t as TypeAliasType*).target;
+                continue;
+            }
+            return cur;
+        }
+        return cur;
+    }
+
+    /// The replacement `subst` holds for the generic parameter whose
+    /// declaration bound `sym`.
+    lookup_subst_for_param(&this, sym: SymbolID, subst: TypeSubstitution*) -> TypeRef {
+        if (subst == null) { return TypeRef::invalid(); }
+        for (mut i: i64 = 0; i < subst.params.length; i++) {
+            const pt: Type* = this.arena.lookup(subst.params[i]);
+            if (pt == null || pt.kind != TypeKind::GenericParam) { continue; }
+            if ((pt as GenericParamType*).declared_by(sym)) { return subst.replacements[i]; }
         }
         return TypeRef::invalid();
     }
 
-    /// Return the bare (unqualified) leaf name of a TypeRef, suitable for
-    /// keying into the trait-impl registry. For primitives, returns the
-    /// display name. For user-defined types, returns the last `::` segment
-    /// of the qualified name. Returns empty when no name is available.
-    bare_name_of(&this, ty: TypeRef) -> SymbolStr {
-        const t: Type* = this.arena.lookup(ty.id);
-        if (t == null) { return SymbolStr::empty(); }
-        // Primitives carry their name as display_name (e.g. "i32").  Unit
-        // hashes under "()" so `implement trait Drop for ()` (and any
-        // future trait impls on the unit type) round-trip through the
-        // registry.  Void has no value-level uses outside return types,
-        // so it stays empty.
-        const k: TypeKind = t.kind;
-        if (k == TypeKind::Int || k == TypeKind::Float || k == TypeKind::Bool ||
-            k == TypeKind::Char || k == TypeKind::String) {
-            return this.intern_table.intern(t.display_name());
-        }
-        if (k == TypeKind::Unit) {
-            return this.intern_table.intern("()");
-        }
-        if (k == TypeKind::Void) {
-            return SymbolStr::empty();
-        }
-        // Generic instantiations: trait impls are registered against the
-        // TEMPLATE's bare name (e.g. `implement trait Hash for String`
-        // registers `(Hash, String)` regardless of which `String<A>` spec
-        // the bound is being checked for). Recurse on `generic_base`
-        // instead of unwrapping through `resolved_type`, so a spec like
-        // `String<GlobalAlloc>` keys against `String`.
-        //
-        // `inst_generic_base` covers a pre-mono wrapper AND a post-mono concrete
-        // (which carries its own base).  Handling the concrete HERE is what lets
-        // callers pass a receiver directly: they used to have to swap in the
-        // origin carrier first, because a concrete fell through to the branch
-        // below and keyed against its SPEC name (`String_GlobalAlloc`), which no
-        // registry holds.
-        const inst_base: TypeRef = this.arena.inst_generic_base(ty);
-        if (inst_base.is_valid()) {
-            return this.bare_name_of(inst_base);
-        }
-        const qname: SymbolStr = this.arena.get_qualified_name(ty);
-        if (!qname.is_valid()) { return SymbolStr::empty(); }
-        const qstr: string = this.intern_table.resolve(qname);
-        const qlen: i64 = qstr.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < qlen; i++) {
-            if (qstr[i] == ':' && qstr[i + 1] == ':') { last_sep = i + 2; }
-        }
-        if (last_sep < 0) { return qname; }
-        // The tail is the NUL-terminated suffix of `qstr` from `last_sep`;
-        // point straight at it and intern once.  (Was an O(n^2) char-by-char
-        // `format("%s%c", ...)` rebuild - a top heap consumer in a self-host
-        // build; same fix as `OwnershipQuery::leaf_segment`.)
-        const tail: string = qstr + last_sep;
-        return this.intern_table.intern(tail);
-    }
 }

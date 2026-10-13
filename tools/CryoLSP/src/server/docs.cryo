@@ -11,24 +11,27 @@
 ///! `insert` for a different URI does not invalidate prior borrows
 ///! (HashMap entries are individually heap-allocated).
 
-namespace Lsp::Server::Docs;
+namespace lsp::server::docs;
 
 import std::core::option;
 import std::core::drop;
+import std::core::mem;
 import std::collections::str;
 import std::collections::string;
+import std::collections::string::{ String };
 import std::collections::hashmap;
-import Lsp::Server::LineIndex;
+import std::collections::hashmap::{ HashMap };
+import lsp::server::line_index;
 
 
 type struct Document {
     uri:        String;
     version:    i32;
     text:       String;
-    line_index: LineIndex;
+    line_index: line_index::LineIndex;
 
     static new(uri: String, text: String, version: i32) -> Document {
-        const idx: LineIndex = LineIndex::build(text.as_str());
+        const idx: line_index::LineIndex = line_index::LineIndex::build(text.as_str());
         return Document {
             uri:        uri,
             version:    version,
@@ -37,14 +40,16 @@ type struct Document {
         };
     }
 
-    /// Replace the buffer (full sync) - drops the previous text and
-    /// LineIndex, then rebuilds the index from the new contents.
+    /// Replace the buffer (full sync) - drops the previous text, then
+    /// rebuilds the index from the new contents and drops the previous one.
     replace_text(mut &this, new_text: String, new_version: i32) -> void {
-        this.text.drop();
-        this.line_index.drop();
-        this.text       = new_text;
-        this.version    = new_version;
-        this.line_index = LineIndex::build(this.text.as_str());
+        mut old_text: String = new_text;
+        mem::swap(&old_text, &this.text);
+        mem::drop(old_text);
+        this.version = new_version;
+        mut old_index: line_index::LineIndex = line_index::LineIndex::build(this.text.as_str());
+        mem::swap(&old_index, &this.line_index);
+        mem::drop(old_index);
     }
 }
 
@@ -52,7 +57,7 @@ type struct Docs {
     by_uri: HashMap<String, Document>;
 
     static new() -> Docs {
-        return Docs { by_uri: HashMap<String, Document>::new() };
+        return Docs { by_uri: HashMap::<String, Document>::new() };
     }
 
     /// Insert a freshly-built document.  If a document already exists
@@ -61,37 +66,37 @@ type struct Docs {
     insert(mut &this, doc: Document) -> void {
         const key: String = String::from_str(doc.uri.as_str());
         match (this.by_uri.insert(key, doc)) {
-            Option::Some(prev) => { mut p: Document = prev; p.drop(); }
+            Option::Some(prev) => { mem::drop(prev); }
             Option::None       => { }
         }
     }
 
     /// Borrow the document at `uri`, or `None` if no such document is
     /// open.  The pointer remains valid until `remove(uri)`.
-    get(&this, uri: Str) -> Option<Document*> {
+    get(&this, uri: str::Str) -> Option<Document*> {
         const key: String = String::from_str(uri);
         const result: Option<Document*> = this.by_uri.get_ref(&key);
         mut owned: String = key;
-        owned.drop();
+        mem::drop(owned);
         return result;
     }
 
     /// Remove and drop the document at `uri`.  Returns whether one
     /// was actually removed (mostly for diagnostic logging - handlers
     /// don't generally care about the answer).
-    remove(mut &this, uri: Str) -> boolean {
+    remove(mut &this, uri: str::Str) -> boolean {
         const key: String = String::from_str(uri);
         match (this.by_uri.remove(&key)) {
             Option::Some(doc) => {
                 mut d: Document = doc;
-                d.drop();
+                mem::drop(d);
                 mut k: String = key;
-                k.drop();
+                mem::drop(k);
                 return true;
             }
             Option::None => {
                 mut k: String = key;
-                k.drop();
+                mem::drop(k);
                 return false;
             }
         }
@@ -109,15 +114,9 @@ type struct Docs {
 // can't store `Document` or `CompilerSession` in a HashMap.
 
 implement trait Drop for Document {
-    drop(mut &this) -> void {
-        this.uri.drop();
-        this.text.drop();
-        this.line_index.drop();
-    }
+    drop(mut &this) -> void { }
 }
 
 implement trait Drop for Docs {
-    drop(mut &this) -> void {
-        this.by_uri.drop();
-    }
+    drop(mut &this) -> void { }
 }

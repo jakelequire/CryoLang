@@ -1,60 +1,61 @@
 ///! Compiler intrinsics.
 ///!
 ///! Operations the compiler lowers directly to LLVM IR rather than through a
-///! normal call. Everything else that lives in libc (`printf`, `strlen`,
-///! `fopen`) belongs in the `ffi` module as explicit C externs.
+///! normal call: `IntrinsicKind::from_name` maps the leaf to a kind and
+///! `intrinsic_emitter` switches on it, so a rename here breaks lowering.
+///!
+///! A C function belongs in `ffi::libc` as an explicit extern, not here. The
+///! declarations that remain are ones the emitter recognises, plus the three
+///! allocation entries codegen names when it synthesizes an allocation and
+///! the stdlib allocator is not in the program (`new` under `no_std`).
+///!
+///! An intrinsic is reached as `intrinsics::name`, like any declaration; a
+///! bare `free` in a module that declares no `free` is an error, whatever
+///! this file declares.
 
 namespace std::core::intrinsics;
 
-// Windows-only msvcrt aliases for the few CRT functions POSIX names
-// differently.  Declared inline (rather than via `import ffi::libc`)
-// because intrinsics is a leaf module - libc and syscall already
-// import the prelude (which itself re-exports intrinsics), so a
-// cross-import here would back-edge the module graph.  Multiple
-// extern declarations of the same C symbol are equivalent at link
-// time, so the duplication with `ffi::libc` is harmless.
-![target(windows)]
-extern "C" {
-    function _popen(command: string, mode: string) -> void*;
-    function _pclose(stream: void*) -> i32;
-    // msvcrt's realpath equivalent: `_fullpath(absPath, relPath, maxLen)`.
-    // Note the argument order is the reverse of POSIX `realpath(path,
-    // resolved)`; the Windows `realpath` shim below swaps them.  Returns
-    // `absPath` on success, null on failure (same contract as realpath).
-    function _fullpath(absPath: i8*, relPath: string, maxLength: u64) -> i8*;
-}
-
-// Allocation.  These remain intrinsics because the self-hosted compiler
-// (compiler/src) still calls `intrinsics::malloc` / `intrinsics::free`
-// directly; new stdlib code calls the `ffi::libc` wrappers instead.
-// Over-aligned allocation (`aligned_alloc` / `aligned_free`, with the
-// Windows `_aligned_malloc` dispatch) now lives in `ffi::libc`.
+// Allocation: libc's `malloc`, `realloc` and `free`, under the names
+// codegen's synthesized allocation names (`std::core::intrinsics::malloc`)
+// where `std::alloc::allocator` is not linked, and the names a `no_std`
+// program writes them by.
 intrinsic function malloc(size: u64) -> void*;
-intrinsic function calloc(count: u64, size: u64) -> void*;
 intrinsic function realloc(ptr: void*, new_size: u64) -> void*;
 intrinsic function free(ptr: void*) -> void;
-
-// Bulk memory.
-intrinsic function memcpy(dest: void*, src: void*, count: u64) -> void*;
-intrinsic function memmove(dest: void*, src: void*, count: u64) -> void*;
-intrinsic function memset(dest: void*, value: i32, count: u64) -> void*;
-intrinsic function memcmp(a: void*, b: void*, count: u64) -> i32;
-intrinsic function memchr(ptr: void*, value: i32, count: u64) -> void*;
 
 // Pointer distance in bytes. Pointer stepping is done with the `+`/`-`
 // operators (element-scaled) or `mem::offset`; there is no `ptr_add`/`ptr_sub`.
 intrinsic function ptr_diff(a: void*, b: void*) -> i64;
+
+// Bit operations, each one LLVM instruction.
+//   bswapN(v)       v with its bytes in reverse order (`llvm.bswap`).
+//   popcountN(v)    the number of set bits (`llvm.ctpop`).
+//   clzN(v)/ctzN(v) the number of leading / trailing zero bits
+//                   (`llvm.ctlz` / `llvm.cttz`); a zero input answers the
+//                   width, 32 or 64, never undefined.
+//   rotlN(v, n)     v rotated left / right by n bits (`llvm.fshl` /
+//   rotrN(v, n)     `llvm.fshr`); n is taken modulo the width.
+// A count is a `u32` whatever the operand's width - the emitter narrows the
+// 64-bit counts - since no count exceeds 64.
+intrinsic function bswap16(value: u16) -> u16;
+intrinsic function bswap32(value: u32) -> u32;
+intrinsic function bswap64(value: u64) -> u64;
+intrinsic function popcount32(value: u32) -> u32;
+intrinsic function popcount64(value: u64) -> u32;
+intrinsic function clz32(value: u32) -> u32;
+intrinsic function clz64(value: u64) -> u32;
+intrinsic function ctz32(value: u32) -> u32;
+intrinsic function ctz64(value: u64) -> u32;
+intrinsic function rotl32(value: u32, n: u32) -> u32;
+intrinsic function rotl64(value: u64, n: u32) -> u64;
+intrinsic function rotr32(value: u32, n: u32) -> u32;
+intrinsic function rotr64(value: u64, n: u32) -> u64;
 
 // Aborts the process after printing the message and source location.
 // Typed `never` (the divergent/bottom type): callers structurally treat
 // the call as non-returning, so no post-call `unreachable` special-casing
 // on the panic symbol name is needed.
 intrinsic function panic(message: string, file: string, line: u32) -> never;
-
-// printf-style heap-allocated string formatter. Cryoc emits the body
-// (`linkonce_odr ptr @format(ptr, ...)`) into every module via
-// `emit_format_runtime`; this declaration is what sema/decl_index see.
-intrinsic function format(fmt: string, args...) -> string;
 
 // The catch_unwind primitive (see `core::panic_unwind`). Runs the opaque
 // void-returning trampoline `body(data)` inside a catch-all landing pad and
@@ -183,154 +184,11 @@ intrinsic function sqrt64(value: f64) -> f64;
 intrinsic function sqrt32(value: f32) -> f32;
 intrinsic function fma64(x: f64, y: f64, z: f64) -> f64;
 
-// Bridge intrinsics: libc declarations exposed bare to satisfy the
-// legacy-shaped self-hosted compiler.
-//
-// These mirror the legacy stdlib's intrinsic surface so compiler/src/ keeps
-// building without a sweep to `libc::printf` / `libc::fopen` / etc.  Each
-// declaration emits an LLVM extern that the linker resolves through libc.
-// New stdlib code should call the typed wrappers in `ffi::libc` instead.
-
-// stdio: strings & streams
-intrinsic function strlen(str: string) -> u64;
-intrinsic function strcmp(s1: string, s2: string) -> i32;
-intrinsic function strncmp(s1: string, s2: string, count: u64) -> i32;
-intrinsic function strcpy(dest: i8*, src: string) -> i8*;
-intrinsic function strncpy(dest: i8*, src: string, count: u64) -> i8*;
-intrinsic function strcat(dest: i8*, src: string) -> i8*;
-intrinsic function strchr(str: string, c: i32) -> i8*;
-intrinsic function strrchr(str: string, c: i32) -> i8*;
-intrinsic function strstr(haystack: string, needle: string) -> i8*;
-intrinsic function strdup(str: string) -> i8*;
-intrinsic function atoi(str: string) -> i32;
-
-intrinsic function printf(format: string, args...) -> i32;
-intrinsic function sprintf(buffer: i8*, format: string, args...) -> i32;
-intrinsic function snprintf(buffer: i8*, size: u64, format: string, args...) -> i32;
-intrinsic function fprintf(file: void*, format: string, args...) -> i32;
-// va_list-taking variant of fprintf; `va` must be the `args` identifier of
-// an enclosing variadic function (which Cryo lowers to a `va_list*` pointer).
-// Used to write a printf-style debug wrapper on top of variadic forwarding.
-intrinsic function vfprintf(file: void*, format: string, va: void*) -> i32;
-// va_list-taking variant of printf (writes to stdout); `va` must be the
-// `args` identifier of an enclosing variadic function.  Powers the
-// printf-style `print` / `println` in `std::fmt`.
-intrinsic function vprintf(format: string, va: void*) -> i32;
-intrinsic function sscanf(str: string, format: string, args...) -> i32;
-intrinsic function getchar() -> i32;
-intrinsic function putchar(c: i32) -> i32;
-intrinsic function puts(str: string) -> i32;
-
-// FILE* I/O
-intrinsic function fopen(path: string, mode: string) -> void*;
-intrinsic function fdopen(fd: i32, mode: string) -> void*;
-intrinsic function fclose(file: void*) -> i32;
-intrinsic function fread(buffer: void*, size: u64, count: u64, file: void*) -> u64;
-intrinsic function fwrite(buffer: void*, size: u64, count: u64, file: void*) -> u64;
-intrinsic function fseek(file: void*, offset: i64, whence: i32) -> i32;
-intrinsic function ftell(file: void*) -> i64;
-intrinsic function fflush(file: void*) -> i32;
-intrinsic function fgets(buffer: i8*, size: i32, file: void*) -> i8*;
-intrinsic function fputs(str: string, file: void*) -> i32;
-intrinsic function fgetc(file: void*) -> i32;
-intrinsic function fputc(c: i32, file: void*) -> i32;
-intrinsic function feof(file: void*) -> i32;
-intrinsic function ferror(file: void*) -> i32;
-intrinsic function fileno(file: void*) -> i32;
-// Tempfile-backed FILE*: auto-deleted on `fclose`.  Available on both
-// glibc and msvcrt, so no per-target gating needed.  Used by
-// `render_to_string`'s Windows path as the buffer-the-output substitute
-// for POSIX `open_memstream`.
-intrinsic function tmpfile() -> void*;
-// Pipe-backed subprocess.  POSIX `popen`/`pclose` are spelled
-// `_popen`/`_pclose` on msvcrt.  The Windows shims forward through the
-// gated extern decls in `ffi::libc`; the public surface
-// (`intrinsics::popen`/`pclose`) stays the same.
-![target(unix)]
-intrinsic function popen(command: string, mode: string) -> void*;
-
-![target(unix)]
-intrinsic function pclose(pipe: void*) -> i32;
-
-![target(windows)]
-function popen(command: string, mode: string) -> void* {
-    return _popen(command, mode);
-}
-
-![target(windows)]
-function pclose(pipe: void*) -> i32 {
-    return _pclose(pipe);
-}
-
-// In-memory output stream: open_memstream(char **bufp, size_t *sizep).
-// fprintf into the returned FILE*, then fflush/fclose; *bufp then holds
-// the accumulated bytes as a NUL-terminated buffer the caller must free.
-// Backs the diagnostic renderer's "render to a string" path so the
-// language server can ship a fully rendered report to the editor.
-//
-// POSIX-only.  Windows has no msvcrt equivalent; callers that need
-// "render to a string" on Windows should branch via `![target(...)]`
-// to a tmpfile-based path (see `compiler/src/compiler/diag/renderer.cryo
-// ::render_to_string`).
-![target(unix)]
-intrinsic function open_memstream(bufp: i8**, sizep: u64*) -> void*;
-
-// fd-level I/O
-intrinsic function read(fd: i32, buffer: void*, count: u64) -> i64;
-intrinsic function write(fd: i32, buffer: void*, count: u64) -> i64;
-intrinsic function open(path: string, flags: i32, mode: i32) -> i32;
-intrinsic function close(fd: i32) -> i32;
-intrinsic function lseek(fd: i32, offset: i64, whence: i32) -> i64;
-intrinsic function dup(fd: i32) -> i32;
-intrinsic function dup2(oldfd: i32, newfd: i32) -> i32;
-intrinsic function pipe(pipefd: i32*) -> i32;
-intrinsic function fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
-
-// Filesystem
-intrinsic function stat(path: string, buf: void*) -> i32;
-intrinsic function fstat(fd: i32, buf: void*) -> i32;
-intrinsic function lstat(path: string, buf: void*) -> i32;
-intrinsic function access(path: string, mode: i32) -> i32;
-intrinsic function mkdir(path: string, mode: i32) -> i32;
-intrinsic function rmdir(path: string) -> i32;
-intrinsic function unlink(path: string) -> i32;
-intrinsic function rename(oldpath: string, newpath: string) -> i32;
-intrinsic function symlink(target: string, linkpath: string) -> i32;
-intrinsic function link(oldpath: string, newpath: string) -> i32;
-// readlink / isatty moved to `ffi::libc` (OS-dispatched there).
-// realpath: POSIX absolute-path canonicalizer.  msvcrt has no `realpath`,
-// but `_fullpath` fills the same role (it lexically resolves to an absolute
-// path; unlike POSIX realpath it does not resolve symlinks, which Windows
-// largely doesn't use for the paths Cryo canonicalizes - stdlib roots and
-// the compiler's own location).  Argument order is swapped vs `_fullpath`.
-![target(unix)]
-intrinsic function realpath(path: string, resolved: i8*) -> i8*;
-
-![target(windows)]
-function realpath(path: string, resolved: i8*) -> i8* {
-    return _fullpath(resolved, path, 4096);
-}
-intrinsic function chmod(path: string, mode: i32) -> i32;
-intrinsic function getcwd(buf: i8*, size: u64) -> i8*;
-intrinsic function chdir(path: string) -> i32;
-intrinsic function opendir(path: string) -> void*;
-intrinsic function readdir(dirp: void*) -> void*;
-intrinsic function closedir(dirp: void*) -> i32;
+// `struct dirent` field accessors.  Genuine intrinsics: codegen lowers each
+// to a load at the platform's own field offset, so the stdlib never has to
+// model a layout that differs between the C libraries.
 intrinsic function dirent_name(entry: void*) -> string;
 intrinsic function dirent_type(entry: void*) -> i32;
-
-// Process & environment
-intrinsic function exit(status: i32) -> void;
-intrinsic function abort() -> void;
-intrinsic function fork() -> i32;
-intrinsic function execvp(file: string, argv: void*) -> i32;
-intrinsic function system(command: string) -> i32;
-intrinsic function wait(status: i32*) -> i32;
-intrinsic function waitpid(pid: i32, status: i32*, options: i32) -> i32;
-intrinsic function getpid() -> i32;
-intrinsic function kill(pid: i32, sig: i32) -> i32;
-intrinsic function getenv(name: string) -> i8*;
-intrinsic function setenv(name: string, value: string, overwrite: i32) -> i32;
 
 // va_arg pluck helpers used by codegen for variadic dispatch.
 intrinsic function va_arg_i32(args: void*) -> i32;

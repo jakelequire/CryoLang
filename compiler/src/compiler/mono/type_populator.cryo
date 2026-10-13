@@ -1,4 +1,4 @@
-/// Mono Type Populator  (Compiler::Mono::TypePopulator)
+/// Mono Type Populator  (compiler::mono::type_populator)
 ///
 /// Reads a freshly specialized + re-resolved AST and fills the concrete arena
 /// type's fields / methods / variants (struct, class, enum), and builds a
@@ -11,12 +11,30 @@
 /// + DeclarationIndex registration live in `MonoCallSpecializer`, which consumes
 /// sema's stash; this collaborator is purely "spec'd AST -> arena type".
 
-namespace Compiler::Mono::TypePopulator;
+namespace compiler::mono::type_populator;
 
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration, Statement };
-import Compiler::Types::{ Type, Arena, TypeRef, UserDefined, Compound, Generic, Substitution };
-import Compiler::Resolver::{ InternTable, SymbolStr };
+import compiler::ast;
+import compiler::ast::{ declaration, node, NodeKind, statement, Visibility };
+import compiler::types::{
+    type_base, arena, type_ref, user_defined, compound, generic, substitution, TypeKind
+};
+import compiler::resolver::{ intern_table, symbol_str };
+import compiler::types::generic_registry;
+import compiler::types::generic_registry::{ TemplateEntry };
+import compiler::ast::declaration::{
+    ClassDeclNode, EnumDeclNode, FieldDeclNode, FunctionDeclNode, ImplBlockNode, MethodNode,
+    StructDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::node::{ ASTNode };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{
+    ClassType, EnumType, EnumVariantInfo, FieldInfo, MethodInfo, StructType
+};
 
 
 type struct MonoTypePopulator {
@@ -38,8 +56,8 @@ type struct MonoTypePopulator {
 
     populate_concrete_type(mut &this, concrete_type: TypeRef, specialized_ast: ASTNode*,
                            node_kind: NodeKind, subst: TypeSubstitution*,
-                           entry: TemplateEntry*) -> void {
-        const concrete_t: Type* = this.arena.lookup(concrete_type.id);
+                           entry: TemplateEntry*, impl_nodes: &ASTNode*[]) -> void {
+        const concrete_t: Type* = this.arena.lookup(concrete_type);
         if (concrete_t == null || specialized_ast == null) { return; }
 
         match (node_kind) {
@@ -61,6 +79,57 @@ type struct MonoTypePopulator {
             }
             _ => {}
         }
+        this.populate_impl_block_methods(concrete_t, impl_nodes);
+    }
+
+    /// Mirror the specialization's `implement` blocks onto its arena type,
+    /// as the type-resolution pass does for a written declaration.  An
+    /// enum's inherent methods live ONLY in such blocks, so without this a
+    /// specialized enum has an empty method set and no call on it can be
+    /// bound by identity.
+    populate_impl_block_methods(mut &this, t: Type*, impl_nodes: &ASTNode*[]) -> void {
+        if (t == null) { return; }
+        for (mut i: i64 = 0; i < impl_nodes.length; i++) {
+            const n: ASTNode* = impl_nodes[i];
+            if (n == null || n.kind != NodeKind::ImplementationBlock) { continue; }
+            const block: ImplBlockNode* = n as ImplBlockNode*;
+            for (mut mi: i64 = 0; mi < block.methods.length; mi++) {
+                const m: MethodNode* = block.methods[mi];
+                if (m == null || m.func == null) { continue; }
+                if (t.kind == TypeKind::Struct) {
+                    (t as StructType*).add_method(this.method_info_of(m));
+                } else if (t.kind == TypeKind::Class) {
+                    (t as ClassType*).add_method(this.method_info_of(m));
+                } else if (t.kind == TypeKind::Enum) {
+                    (t as EnumType*).add_method(this.method_info_of(m));
+                }
+            }
+        }
+    }
+
+    /// The arena's view of one method node: its non-receiver parameter
+    /// types and the function type they form.
+    method_info_of(mut &this, m: MethodNode*) -> MethodInfo {
+        mut ptypes: TypeRef[] = [];
+        for (mut pi: i64 = 0; pi < m.func.parameters.length; pi++) {
+            const pp: VarDeclNode* = m.func.parameters[pi];
+            if (pp == null) { continue; }
+            if (pp.is_receiver()) { continue; }
+            ptypes.push(pp.resolved_type);
+        }
+        const fn_ty: TypeRef = this.arena.get_function(
+            m.func.resolved_return_type, ptypes, m.func.is_variadic);
+        return MethodInfo {
+            name:          m.func.name,
+            function_type: fn_ty,
+            is_public:     m.visibility == Visibility::Public,
+            is_protected:  m.visibility == Visibility::Protected,
+            is_static:     m.is_static,
+            is_virtual:    m.is_virtual,
+            is_override:   m.is_override,
+            param_types:   ptypes,
+            ast_node:      m as void*,
+        };
     }
 
     /// Populate a specialized StructType's fields from the specialized AST.
@@ -86,6 +155,7 @@ type struct MonoTypePopulator {
         // on a generic struct would be silently dropped for every instantiation.
         st.set_repr(decl.repr_c, decl.repr_packed, decl.repr_transparent);
         st.set_min_alignment(decl.min_alignment);
+        st.set_async_recv_slot(decl.async_recv_slot);
 
         this.populate_struct_methods(st, decl);
     }
@@ -119,33 +189,10 @@ type struct MonoTypePopulator {
     /// Union counterpart to populate_struct_methods.
     populate_union_methods(mut &this, st: StructType*, decl: UnionDeclNode*) -> void {
         if (st == null || decl == null) { return; }
-        const this_amp: SymbolStr = this.intern_table.intern("&this");
-        const this_val: SymbolStr = this.intern_table.intern("this");
         for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
             const m: MethodNode* = decl.methods[mi];
             if (m == null || m.func == null) { continue; }
-            mut ptypes: TypeRef[] = [];
-            for (mut pi: i64 = 0; pi < m.func.parameters.length; pi++) {
-                const pp: VarDeclNode* = m.func.parameters[pi];
-                if (pp == null) { continue; }
-                if (pp.name.equals(this_amp)) { continue; }
-                if (pp.name.equals(this_val)) { continue; }
-                ptypes.push(pp.resolved_type);
-            }
-            const fn_ty: TypeRef = this.arena.get_function(
-                m.func.resolved_return_type, ptypes, m.func.is_variadic);
-            const minfo: MethodInfo = MethodInfo {
-                name:          m.func.name,
-                function_type: fn_ty,
-                is_public:     m.visibility == Visibility::Public,
-                is_protected:  m.visibility == Visibility::Protected,
-                is_static:     m.is_static,
-                is_virtual:    m.is_virtual,
-                is_override:   m.is_override,
-                param_types:   ptypes,
-                ast_node:      m as void*,
-            };
-            st.add_method(minfo);
+            st.add_method(this.method_info_of(m));
         }
     }
 
@@ -176,66 +223,20 @@ type struct MonoTypePopulator {
     /// etc.; that breaks consume detection for by-value receivers.
     populate_struct_methods(mut &this, st: StructType*, decl: StructDeclNode*) -> void {
         if (st == null || decl == null) { return; }
-        const this_amp: SymbolStr = this.intern_table.intern("&this");
-        const this_val: SymbolStr = this.intern_table.intern("this");
         for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
             const m: MethodNode* = decl.methods[mi];
             if (m == null || m.func == null) { continue; }
-            mut ptypes: TypeRef[] = [];
-            for (mut pi: i64 = 0; pi < m.func.parameters.length; pi++) {
-                const pp: VarDeclNode* = m.func.parameters[pi];
-                if (pp == null) { continue; }
-                if (pp.name.equals(this_amp)) { continue; }
-                if (pp.name.equals(this_val)) { continue; }
-                ptypes.push(pp.resolved_type);
-            }
-            const fn_ty: TypeRef = this.arena.get_function(
-                m.func.resolved_return_type, ptypes, m.func.is_variadic);
-            const minfo: MethodInfo = MethodInfo {
-                name:          m.func.name,
-                function_type: fn_ty,
-                is_public:     m.visibility == Visibility::Public,
-                is_protected:  m.visibility == Visibility::Protected,
-                is_static:     m.is_static,
-                is_virtual:    m.is_virtual,
-                is_override:   m.is_override,
-                param_types:   ptypes,
-                ast_node:      m as void*,
-            };
-            st.add_method(minfo);
+            st.add_method(this.method_info_of(m));
         }
     }
 
     /// Class counterpart to populate_struct_methods.
     populate_class_methods(mut &this, ct: ClassType*, decl: ClassDeclNode*) -> void {
         if (ct == null || decl == null) { return; }
-        const this_amp: SymbolStr = this.intern_table.intern("&this");
-        const this_val: SymbolStr = this.intern_table.intern("this");
         for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
             const m: MethodNode* = decl.methods[mi];
             if (m == null || m.func == null) { continue; }
-            mut ptypes: TypeRef[] = [];
-            for (mut pi: i64 = 0; pi < m.func.parameters.length; pi++) {
-                const pp: VarDeclNode* = m.func.parameters[pi];
-                if (pp == null) { continue; }
-                if (pp.name.equals(this_amp)) { continue; }
-                if (pp.name.equals(this_val)) { continue; }
-                ptypes.push(pp.resolved_type);
-            }
-            const fn_ty: TypeRef = this.arena.get_function(
-                m.func.resolved_return_type, ptypes, m.func.is_variadic);
-            const minfo: MethodInfo = MethodInfo {
-                name:          m.func.name,
-                function_type: fn_ty,
-                is_public:     m.visibility == Visibility::Public,
-                is_protected:  m.visibility == Visibility::Protected,
-                is_static:     m.is_static,
-                is_virtual:    m.is_virtual,
-                is_override:   m.is_override,
-                param_types:   ptypes,
-                ast_node:      m as void*,
-            };
-            ct.add_method(minfo);
+            ct.add_method(this.method_info_of(m));
         }
     }
 
@@ -260,7 +261,7 @@ type struct MonoTypePopulator {
 
         // Look up the base generic enum.  Its variants were populated by type
         // resolution with GenericParam payloads (`Some(T)` -> [GenericParam_T]).
-        const base_t: Type* = this.arena.lookup(entry.base_type.id);
+        const base_t: Type* = this.arena.lookup(entry.base_type);
         if (base_t == null || base_t.kind != TypeKind::Enum) { return; }
         const base_et: EnumType* = base_t as EnumType*;
 
@@ -278,8 +279,7 @@ type struct MonoTypePopulator {
                 const substituted: TypeRef = subst.apply(base_variant.payload_types[j], this.arena);
                 payload_types.push(substituted);
             }
-            et.add_variant(EnumVariantInfo::new(
-                base_variant.name, payload_types, base_variant.tag_value));
+            et.add_variant(base_variant.with_payloads(payload_types));
         }
     }
 

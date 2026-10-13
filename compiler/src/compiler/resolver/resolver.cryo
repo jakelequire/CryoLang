@@ -5,23 +5,344 @@
 /// pass to declare symbols and resolve names, then queried by downstream
 /// passes via SymbolID lookups.
 
-namespace Compiler::Resolver::Resolver;
+namespace compiler::resolver::resolver;
 
-import Compiler::Resolver;
-import Compiler::Resolver::{ SymbolID, SymbolStr, InternTable, Symbol, Scope, ResolutionMap };
-import Compiler::Diag;
-import Compiler::Diag::SourceSpan;
+import std::fmt;
+import compiler::module_graph;
+import compiler::module_graph::{ ModuleGraph };
+import compiler::resolver;
+import compiler::resolver::{ symbol_id, symbol_str, intern_table, symbol, scope, resolution_map };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, Res, ResBase, DefTable, DefKind };
+import compiler::resolver::namespace_kind;
+import compiler::resolver::namespace_kind::{ Namespace };
+import compiler::diag;
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
 import std::collections::{ pair, hashmap };
 import std::core::option;
-import Utils::Logger;
+import std::core::option::{ Option };
+import utils::logger;
+import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::resolution_map::{ ResolutionMap };
+import compiler::resolver::scope::{ ScopeID, ScopeKind };
+import compiler::resolver::symbol::{ Symbol, SymbolKind };
+import compiler::resolver::symbol_id::{ SymbolID, SymbolIds, SymbolKey };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::module_graph::{ ModuleKey, ModulePath };
+import std::collections::hashmap::{ HashMap };
+import std::collections::pair::{ Pair };
+
+/// One name bound directly in a scope, with the TIER it occupies.  A scope's
+/// bindings are ordered:
+///
+///     locals / generic params
+///       -> current-module items          (public AND private)
+///       -> imported modules' export sets
+///       -> prelude
+///
+/// and an inner tier shadows an outer one silently.  A flat
+/// `name -> SymbolID` map cannot express it -- a declaration and an import
+/// compete for one slot and the first writer wins -- so the tier travels
+/// WITH the entry.
+///
+/// It is a field rather than a parallel `boolean[]` deliberately: a parallel
+/// array holds its invariant only as long as every push site remembers to
+/// update both, and an insert path that forgets desyncs it silently, every
+/// index-based read after it returning a NEIGHBOUR's tier.
+///
+/// `Scope` holds SymbolIDs, not Symbols, and has no route back to the symbol
+/// arena, so it cannot recover `SymbolKind::Import` on its own; the tier is
+/// stated at insert time by which entry point was used.
+///
+/// The PRELUDE tier is not modelled here: it lives in the DeclarationIndex
+/// (`prelude_ns`, `is_prelude_ns`), so `is_import == false` means "not an
+/// import into this scope", not "tier 2 exclusively".
+type struct ScopeEntry {
+    name:      SymbolStr;
+    sym:       SymbolID;
+    /// false = declared by this scope's own module (tier 2, or a local/param
+    ///         in a Function/Block scope); true = brought in by an `import`
+    ///         (tier 3).
+    is_import: boolean;
+    /// Whether the binding is in the type namespace.
+    in_type_ns: boolean;
+
+    static new(name: SymbolStr, sym: SymbolID, is_import: boolean, in_type_ns: boolean) -> ScopeEntry {
+        return ScopeEntry { name: name, sym: sym, is_import: is_import, in_type_ns: in_type_ns };
+    }
+}
+
+/// A scope of the tree the resolver walks: a rib, holding the bindings
+/// written directly in it by the name each was written under.
+///
+/// Its names are private to this module.  The scope doors and the
+/// resolver's own walks are the only readers of a rib by name; any other
+/// module reaches a scope's bindings by identity (`binding_count`,
+/// `binding_at`) or asks the resolver, so a lookup of a rib by name written
+/// anywhere else is refused as a private access.
+type struct Scope {
+public:
+    id:              ScopeID;
+    kind:            ScopeKind;
+    parent_id:       ScopeID;
+    owner_name:      string;
+    span:            SourceSpan;
+    child_scope_ids: ScopeID[];
+
+    static new(id: ScopeID, kind: ScopeKind, parent: ScopeID,
+               owner: string, span: SourceSpan) -> Scope {
+        return Scope {
+            id:                 id,
+            kind:               kind,
+            parent_id:          parent,
+            owner_name:         owner,
+            span:               span,
+            child_scope_ids:    [],
+            symbols:            [],
+            symbol_index:       HashMap::<u32, i64>::new(),
+            overloads:          [],
+            overload_in_type_ns: [],
+            meetings:           [],
+            ambig_name_ids:     [],
+            ambig_module_a:     [],
+            ambig_module_b:     [],
+            ambig_ns:           [],
+        };
+    }
+
+    /// How many names the scope binds directly.
+    binding_count(&this) -> i64 {
+        return this.symbols.length;
+    }
+
+    /// The binding the scope's `i`th name holds, in insertion order.
+    binding_at(&this, i: i64) -> SymbolID {
+        return this.symbols[i].sym;
+    }
+
+    /// Register a child scope.
+    add_child(mut &this, child: ScopeID) -> void {
+        this.child_scope_ids.push(child);
+    }
+
+private:
+    // One entry per name bound directly in this scope, in insertion order.
+    symbols:         ScopeEntry[];
+
+    // Fast lookup index: SymbolStr.id -> index in symbols[]
+    symbol_index:    HashMap<u32, i64>;
+
+    // Overloaded names: flat array of (name_key, SymbolID) pairs, and
+    // beside each whether that binding is in the type namespace.
+    overloads:       Pair<u32, SymbolID>[];
+    overload_in_type_ns: boolean[];
+
+    // Every binding added under a name the scope already bound: `.first`
+    // the binding the name held, `.second` the one added.  The scope keeps
+    // one of the two (or both, as overloads); the name layer reads these to
+    // refuse a declaration beside an import of its name.
+    meetings:        Pair<SymbolID, SymbolID>[];
+
+    // Ambiguous imports: the names imported from two different modules,
+    // which a bare use must refuse.  A tie is within one namespace: a type
+    // and a function of one leaf never tie.
+    ambig_name_ids:   u32[];      // SymbolStr.id of ambiguous names
+    ambig_module_a:   ModulePath[];   // the first import's module
+    ambig_module_b:   ModulePath[];   // the conflicting import's module
+    ambig_ns:         Namespace[];
+
+    /// The binding this scope alone holds under `name`, or invalid.
+    find(&this, name: SymbolStr) -> SymbolID {
+        return match (this.symbol_index.get(&name.id)) {
+            Option::Some(idx) => { this.symbols[idx].sym }
+            Option::None      => { SymbolID::invalid() }
+        };
+    }
+
+    /// Insert a DECLARATION into this scope (tier 2, or a local/param).
+    ///
+    /// If the name already exists and allows_overload is true, adds to the
+    /// overload set instead.  A type and a function of one name are bound in
+    /// two namespaces, so neither displaces the other: the one declared
+    /// second joins the overload set too, whichever came first, and a
+    /// lookup chooses between them by namespace.  Returns false if the name
+    /// is a duplicate declaration in its namespace and overloading is not
+    /// allowed.
+    ///
+    /// A declaration arriving over an IMPORT takes the slot: the inner tier
+    /// shadows the outer one, whichever line of the file came first.
+    insert(mut &this, name: SymbolStr, sym_id: SymbolID, allows_overload: boolean,
+           in_type_ns: boolean) -> boolean {
+        const existing: Option<i64> = this.symbol_index.get(&name.id);
+        if (existing.is_some()) {
+            const idx: i64 = existing.unwrap();
+            this.meetings.push(Pair::<SymbolID, SymbolID>::new(this.symbols[idx].sym, sym_id));
+            if (this.symbols[idx].is_import) {
+                // Tier 2 over tier 3.  The displaced import is dropped rather
+                // than demoted into the overload set: the inner tier SHADOWS
+                // the outer one, so the import is reachable only by a
+                // qualified path from here on.  Dropping it is also what
+                // makes the two source orders agree -- declaration-first
+                // already produced exactly this set, because `insert_import`
+                // never added itself as an overload.
+                this.symbols[idx].sym = sym_id;
+                this.symbols[idx].is_import = false;
+                this.symbols[idx].in_type_ns = in_type_ns;
+                // Any ambiguity recorded for this name was import-vs-import.
+                // A declaration shadows every import of the name, so the
+                // ambiguity is no longer reachable and must not be reported:
+                // ambiguity is confined to WITHIN a tier.
+                this.clear_ambiguity(name);
+                return true;
+            }
+            if (allows_overload || !this.binds_in(name, in_type_ns)) {
+                this.add_overload(name, sym_id, in_type_ns);
+                return true;
+            }
+            return false;
+        }
+
+        this.push_entry(name, sym_id, false, in_type_ns);
+        return true;
+    }
+
+    /// Whether a binding this scope holds under `name` is in the type
+    /// namespace (`in_type_ns`) or in the value namespace (not).
+    binds_in(&this, name: SymbolStr, in_type_ns: boolean) -> boolean {
+        match (this.symbol_index.get(&name.id)) {
+            Option::Some(idx) => {
+                if (this.symbols[idx].in_type_ns == in_type_ns) { return true; }
+            }
+            Option::None => { }
+        }
+        for (mut i: i64 = 0; i < this.overloads.length; i++) {
+            if (this.overloads[i].first == name.id && this.overload_in_type_ns[i] == in_type_ns) { return true; }
+        }
+        return false;
+    }
+
+    /// Insert an IMPORT symbol (tier 3).
+    ///
+    /// If this scope's own module already DECLARES the name, the import is
+    /// shadowed and skipped silently -- explicitly not a diagnostic.  If the
+    /// name already exists as an import from a DIFFERENT module, mark it
+    /// ambiguous (the user must qualify); from the SAME module (re-import),
+    /// skip silently.  `ns` is the namespace the two imports tie in.
+    insert_import(mut &this, name: SymbolStr, sym_id: SymbolID,
+                  new_module: ModulePath, existing_module: ModulePath, ns: Namespace) -> boolean {
+        const existing: Option<i64> = this.symbol_index.get(&name.id);
+        if (existing.is_some()) {
+            const idx: i64 = existing.unwrap();
+            this.meetings.push(Pair::<SymbolID, SymbolID>::new(this.symbols[idx].sym, sym_id));
+            // A declaration owns the slot; the import is shadowed.  The two
+            // are in different tiers, so they never compete as ambiguous.
+            if (!this.symbols[idx].is_import) {
+                return true;
+            }
+            if (new_module.equals(existing_module)) {
+                return true;
+            }
+            // Different module: mark as ambiguous, keep the first import so
+            // lookups still find SOMETHING, but the ambiguity tells the
+            // resolver to emit an error.
+            this.ambig_name_ids.push(name.id);
+            this.ambig_module_a.push(existing_module);
+            this.ambig_module_b.push(new_module);
+            this.ambig_ns.push(ns);
+            return true;
+        }
+        this.push_entry(name, sym_id, true, ns == Namespace::Type);
+        return true;
+    }
+
+    /// Append a fresh binding and index it.  The ONLY place a `ScopeEntry` is
+    /// created, so the tier and the index can never disagree with the array.
+    push_entry(mut &this, name: SymbolStr, sym_id: SymbolID,
+               is_import: boolean, in_type_ns: boolean) -> void {
+        const idx: i64 = this.symbols.length;
+        this.symbols.push(ScopeEntry::new(name, sym_id, is_import, in_type_ns));
+        this.symbol_index.insert(name.id, idx);
+    }
+
+    /// Drop every ambiguity record for `name`: a declaration took the
+    /// name's slot, and both imports the record was between are shadowed.
+    clear_ambiguity(mut &this, name: SymbolStr) -> void {
+        mut keep_names: u32[] = [];
+        mut keep_a:     ModulePath[] = [];
+        mut keep_b:     ModulePath[] = [];
+        mut keep_ns:    Namespace[] = [];
+        for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
+            if (this.ambig_name_ids[i] == name.id) { continue; }
+            keep_names.push(this.ambig_name_ids[i]);
+            keep_a.push(this.ambig_module_a[i]);
+            keep_b.push(this.ambig_module_b[i]);
+            keep_ns.push(this.ambig_ns[i]);
+        }
+        this.ambig_name_ids = keep_names;
+        this.ambig_module_a = keep_a;
+        this.ambig_module_b = keep_b;
+        this.ambig_ns = keep_ns;
+    }
+
+    /// Whether `name` is ambiguous in `ns` (imported from two modules).
+    is_ambiguous(&this, name: SymbolStr, ns: Namespace) -> boolean {
+        for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
+            if (this.ambig_name_ids[i] == name.id && this.ambig_ns[i] == ns) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The two conflicting modules for an ambiguous name, or none when it is
+    /// not ambiguous.
+    get_ambiguous_modules(&this, name: SymbolStr, ns: Namespace) -> ModulePath[] {
+        for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
+            if (this.ambig_name_ids[i] == name.id && this.ambig_ns[i] == ns) {
+                return [this.ambig_module_a[i], this.ambig_module_b[i]];
+            }
+        }
+        return [];
+    }
+
+    /// Add a symbol to the overload set for the given name.
+    add_overload(mut &this, name: SymbolStr, sym_id: SymbolID, in_type_ns: boolean) -> void {
+        this.overloads.push(Pair::<u32, SymbolID>::new(name.id, sym_id));
+        this.overload_in_type_ns.push(in_type_ns);
+    }
+
+    /// Every binding the scope holds under `name`: the primary one, then
+    /// the overloads.
+    get_overloads(&this, name: SymbolStr) -> SymbolID[] {
+        mut result: SymbolID[] = [];
+        const opt: Option<i64> = this.symbol_index.get(&name.id);
+        if (opt.is_some()) {
+            result.push(this.symbols[opt.unwrap()].sym);
+        }
+        for (mut i: i64 = 0; i < this.overloads.length; i++) {
+            if (this.overloads[i].first == name.id) {
+                result.push(this.overloads[i].second);
+            }
+        }
+        return result;
+    }
+}
 
 type struct Resolver {
+    /// The compilation's definitions, for a definition's path.  Borrowed;
+    /// set by `CompilationContext`, which owns it.
+    defs: DefTable*;
+    /// The module graph, for the definition a declaring symbol's module is:
+    /// a declaration's id is registered under its module's.
+    graph: ModuleGraph*;
     // Intern table: borrowed pointer, owned by CompilationContext
     intern_table:       InternTable*;
 
     // Symbol arena
     symbols:            Symbol[];
-    next_symbol_id:     u64;
+    symbol_ids:         SymbolIds;
 
     // Scope tree
     scopes:             Scope[];
@@ -32,70 +353,126 @@ type struct Resolver {
     // Resolution map
     resolution_map:     ResolutionMap;
 
-    // Cross-module exports: Pair<SymbolID, u64>[] avoids T[][] codegen
+    // Cross-module exports: Pair<SymbolID, ModulePath>[] avoids T[][] codegen
     // paths.  SymbolID[][] and HashMap<K, SymbolID[]>
     // mishandle T[] as a generic type argument (inner array descriptor
     // corrupted on store/load).  Pair<A,B>[] sidesteps generic-over-array
     // codegen entirely.
-    exports:              Pair<SymbolID, u64>[];  // .first = exported symbol, .second = module key (SymbolStr.id)
+    exports:              Pair<SymbolID, ModulePath>[];  // .first = exported symbol, .second = the module exporting it
 
-    import_aliases:       Pair<SymbolStr, SymbolID>[];  // .first = alias name, .second = sym_id
 
     // Current context
-    current_module:     SymbolStr;
+    current_module:     ModulePath;
 
-    // Index: interned owner_name id -> ids of Module-kind scopes with that
-    // name.  find_module_scope would otherwise linear-scan every scope with a
-    // per-scope strcmp (~3% frontend self-time combined).  The resolver may
-    // create several same-named Module scopes across pipeline stages, so this
-    // is a multimap; find_module_scope iterates only the candidates and still
-    // picks the most-populated live scope (symbol counts read live).
-    module_scope_index: HashMap<u32, u64[]>;
+    /// The namespaces a file can name WITHOUT importing them.
+    ///
+    /// The tier chain a bare name is looked up through ends at the prelude;
+    /// without this the scope walk would know only a module's own
+    /// declarations and its imports, and nothing at all about the names that
+    /// are reachable by default.  A file writing `Option::Some` while importing
+    /// no option module would bind nothing, and an answer from anywhere else
+    /// - a leaf-index search, say - would not be scoped to the writer at all.
+    ///
+    ///
+    /// Held as namespaces rather than as copied symbols so the tier stays one
+    /// list instead of a per-module duplication of every prelude export, and so
+    /// it shadows correctly: it is consulted only after every real scope has
+    /// been asked, which is what makes an inner declaration win.
+    prelude_modules:    ModulePath[];
+
+    // Index: interned module name id -> the id of that module's scope.  A
+    // lookup would otherwise linear-scan every scope with a per-scope strcmp
+    // (~3% frontend self-time combined).  One entry per module, never several:
+    // the scope is built on first ask and reused, so there is no candidate set
+    // to choose between.
+    /// The one scope a module owns, by the module's identity.
+    ///
+    /// A module scope is not a rib.  A rib - a function body, a block, a
+    /// generic parameter list - is pushed on entry and popped on exit, and a
+    /// stack is right for it.  A module is a persistent node: it is built once
+    /// and looked up forever after, and entering one sets a pointer to
+    /// something that already exists.  Treating the two alike is what made
+    /// entering a module fourteen times produce fourteen scopes, only the
+    /// third of them populated, and a save/restore mechanism necessary to
+    /// paper over it.
+    module_scopes: HashMap<ModuleKey, u64>;
+    /// The traits a `where` clause bounds each type parameter by: `.first`
+    /// the parameter's symbol, `.second` the trait's definition.  `S::Item`
+    /// is `Item` of whichever of these traits declares it; a trait the
+    /// parameter is not bounded by does not answer it, however it is spelled.
+    param_bounds:  Pair<SymbolID, DefId>[];
+
+    /// The declaration each import binding names, by the binding's key.  An
+    /// import of a leaf binds every declaration the module offers under it,
+    /// one binding each, so a type and a same-leaf function arrive as two
+    /// bindings and each one's target is what a namespace chooses between.
+    import_targets: HashMap<SymbolKey, SymbolID>;
+
+    /// The import bindings an explicit entry - `import M::{ name }` - made,
+    /// by binding.  A glob's bindings are not among them: a second explicit
+    /// import of a name is refused against an explicit one only.
+    explicit_imports: HashMap<SymbolKey, boolean>;
 
     /// Create a new Resolver with a global scope.
-    /// The InternTable pointer must outlive the Resolver (owned by CompilationContext).
-    static new(table: InternTable*) -> Resolver {
+    /// Every pointer must outlive the Resolver (owned by CompilationContext).
+    static new(table: InternTable*, defs: DefTable*, graph: ModuleGraph*) -> Resolver {
         const global_id: ScopeID = ScopeID::new(1);
         const global: Scope = Scope::new(
             global_id, ScopeKind::Global, ScopeID::invalid(),
-            "", "<global>", SourceSpan::none()
+            "<global>", SourceSpan::none()
         );
 
         return Resolver {
+            defs: defs,
+            graph: graph,
             intern_table:         table,
             symbols:              [],
-            next_symbol_id:       1,
+            symbol_ids:           SymbolIds::new(),
             scopes:               [global],
             next_scope_id:        2,
             global_scope:         global_id,
             current_scope:        global_id,
             resolution_map:       ResolutionMap::new(),
             exports:              [],
-            import_aliases:       [],
-            current_module:       SymbolStr::empty(),
-            module_scope_index:   HashMap<u32, u64[]>::new(),
+            current_module:       ModulePath::none(),
+            prelude_modules:      [],
+            module_scopes:        HashMap::<ModuleKey, u64>::new(),            param_bounds:         [],
+            import_targets:       HashMap::<SymbolKey, SymbolID>::new(),
+            explicit_imports:     HashMap::<SymbolKey, boolean>::new(),
         };
+    }
+
+    /// Record that the type parameter `param` is bounded by the trait `bound`.
+    record_param_bound(mut &this, param: SymbolID, bound: DefId) -> void {
+        if (!param.is_valid() || !bound.is_valid()) { return; }
+        for (mut i: i64 = 0; i < this.param_bounds.length; i++) {
+            if (this.param_bounds[i].first.equals(param) && this.param_bounds[i].second.equals(bound)) { return; }
+        }
+        this.param_bounds.push(Pair::<SymbolID, DefId>::new(param, bound));
+    }
+
+    /// The traits the type parameter `param` is bounded by, in the order its
+    /// `where` clauses name them.
+    bounds_of_param(&this, param: SymbolID) -> DefId[] {
+        mut out: DefId[] = [];
+        if (!param.is_valid()) { return out; }
+        for (mut i: i64 = 0; i < this.param_bounds.length; i++) {
+            if (this.param_bounds[i].first.equals(param)) { out.push(this.param_bounds[i].second); }
+        }
+        return out;
     }
 
 
     // Scope management
 
     /// Allocate and register a new scope as a child of the given parent.
-    create_scope(mut &this, kind: ScopeKind, parent: ScopeID, module: string,
+    create_scope(mut &this, kind: ScopeKind, parent: ScopeID,
                  owner: string, span: SourceSpan) -> ScopeID {
         const id: ScopeID = ScopeID::new(this.next_scope_id);
         this.next_scope_id += 1;
 
-        const scope: Scope = Scope::new(id, kind, parent, module, owner, span);
+        const scope: Scope = Scope::new(id, kind, parent, owner, span);
         this.scopes.push(scope);
-
-        // Index Module-kind scopes by their interned owner name so
-        // find_module_scope skips the full scope scan.
-        if (kind == ScopeKind::Module) {
-            const oid: u32 = this.intern_table.intern(owner).id;
-            const bucket: u64[]* = this.module_scope_index.get_or_insert(oid, []);
-            (*bucket).push(id.id);
-        }
 
         // Register as child of parent (O(1) direct index)
         if (parent.is_valid()) {
@@ -105,12 +482,13 @@ type struct Resolver {
         return id;
     }
 
+    /// The module the ambient scope cursor is currently standing in.
+    current_module_path(&this) -> ModulePath { return this.current_module; }
+
     /// Create a child scope of the current scope and move the cursor into it.
     enter_scope(mut &this, kind: ScopeKind, owner: string, span: SourceSpan) -> ScopeID {
         LOG_DEBUG(LogComponent::General, "[Resolver] enter_scope() kind=%s owner='%s'", kind.to_string(), owner);
-        const mod_str: string = this.intern_table.resolve(this.current_module);
-        const id: ScopeID = this.create_scope(kind, this.current_scope,
-                                               mod_str, owner, span);
+        const id: ScopeID = this.create_scope(kind, this.current_scope, owner, span);
         this.current_scope = id;
         return id;
     }
@@ -128,9 +506,89 @@ type struct Resolver {
 
     /// Allocate the next monotonic SymbolID.
     alloc_symbol_id(mut &this) -> SymbolID {
-        const id: SymbolID = SymbolID::new(this.next_symbol_id);
-        this.next_symbol_id += 1;
-        return id;
+        return this.symbol_ids.next();
+    }
+
+    /// The identity of a binding a pass SYNTHESIZED after name resolution ran.
+    ///
+    /// Such a binding is never looked up by name - the pass that made it holds
+    /// the declaration and every use it wrote - so it gets no scope entry and
+    /// no `Symbol`.  What it does need is to be DISTINCT: a later pass keeping
+    /// per-binding state has to tell it from an unrelated binding that happens
+    /// to share its spelling, and the spelling cannot do that (a synthesized
+    /// state-machine local and a user local can spell the same thing, and two
+    /// synthesized ones in one body routinely do).
+    ///
+    /// Not a way to introduce a name.  A binding that a later reader must find
+    /// BY NAME is declared, in a scope, through `declare_variable`.
+    alloc_synthetic_binding(mut &this) -> SymbolID {
+        return this.alloc_symbol_id();
+    }
+
+    /// Put a declaring symbol in the arena, stamped with the definition it is.
+    ///
+    /// The one place the name layer registers a definition: every
+    /// declaration enters the arena through it, and an import enters carrying
+    /// the id of the declaration it binds (`declare_import`), so an answer the
+    /// name layer gives for any binding reads a stamp, and two answers for one
+    /// binding cannot name two definitions.
+    ///
+    /// A binding a body introduces - a local, a parameter, a generic
+    /// parameter - is not a definition and keeps `DefId::invalid()`: it is
+    /// named by its `SymbolID`, and an answer for one is `Res::Local` or
+    /// `Res::GenericParam`, never `Res::Def`.
+    admit(mut &this, sym: Symbol) -> void {
+        const at: i64 = this.symbol_ids.slot_of(sym.id);
+        if (at != this.symbols.length) {
+            panic(fmt::format(
+                "internal compiler error: symbol admitted at arena slot %lld, its id names slot %lld",
+                this.symbols.length, at), FILE, LINE);
+        }
+        this.symbols.push(sym);
+        if (!this.is_definition(&this.symbols[at])) { return; }
+        this.symbols[at].def = this.defs.register(
+            this.declaring_module_def(&this.symbols[at]), this.symbols[at].name,
+            this.def_kind_of(&this.symbols[at]), this.symbols[at].declaring_span);
+    }
+
+    /// The definition of the module `sym` is declared in; invalid for a
+    /// symbol declared in no module.
+    ///
+    /// The symbol holds its module as the graph's identity, so this is the
+    /// graph's definition for that module and nothing is looked up by text.
+    declaring_module_def(&this, sym: &Symbol) -> DefId {
+        if (!sym.source_module.is_valid()) { return DefId::invalid(); }
+        return this.graph.module_def(sym.source_module);
+    }
+
+    /// Whether a declaring symbol is a definition this arena registers: an
+    /// item a path can name from outside the body that declares it.  A
+    /// variable is one only at module scope, where it is a global.  A method
+    /// is a definition too, but its parent is its owner, which the symbol
+    /// does not hold: the name layer registers it and the symbol arrives
+    /// carrying the id (`declare_method`).
+    is_definition(&this, sym: &Symbol) -> boolean {
+        if (sym.kind == SymbolKind::Variable) {
+            return this.scopes[(sym.scope_id.id - 1) as i64].kind == ScopeKind::Module;
+        }
+        return sym.kind == SymbolKind::Namespace
+            || sym.kind == SymbolKind::Function
+            || sym.kind == SymbolKind::Intrinsic
+            || sym.kind == SymbolKind::Type
+            || sym.kind == SymbolKind::TypeAlias
+            || sym.kind == SymbolKind::Constant;
+    }
+
+    /// What kind of definition a declaring symbol is; `is_definition` holds.
+    def_kind_of(&this, sym: &Symbol) -> DefKind {
+        return match (sym.kind) {
+            SymbolKind::Namespace => { DefKind::Module }
+            SymbolKind::Type      => { DefKind::Type }
+            SymbolKind::TypeAlias => { DefKind::Type }
+            SymbolKind::Variable  => { DefKind::Value }
+            SymbolKind::Constant  => { DefKind::Value }
+            _                     => { DefKind::Function }
+        };
     }
 
     /// Insert a symbol into the arena and current scope.
@@ -139,14 +597,14 @@ type struct Resolver {
     /// the arena but NOT indexed in the scope; a debug log is emitted so
     /// the duplicate can be diagnosed without flooding the user.
     declare(mut &this, sym: Symbol) -> SymbolID {
-        LOG_DEBUG(LogComponent::Resolver, "declare() symbol id=%lu", sym.id.id);
+        LOG_DEBUG(LogComponent::Resolver, "declare() symbol id=%lu", sym.id.key());
         const id: SymbolID = sym.id;
-        this.symbols.push(sym);
+        this.admit(sym);
 
         // Insert into current scope (O(1) direct index)
         const allows_overload: boolean = sym.kind.allows_overload();
         const inserted: boolean = this.scopes[this.current_scope.id - 1]
-            .insert(sym.name, id, allows_overload);
+            .insert(sym.name, id, allows_overload, Namespace::Type.accepts(sym.kind));
 
         if (!inserted) {
             LOG_DEBUG(LogComponent::Resolver,
@@ -158,31 +616,159 @@ type struct Resolver {
         return id;
     }
 
+    /// Every time the scope `scope` bound an import (or a module alias) and
+    /// a declaration under one name, in either order: `.first` the import,
+    /// `.second` the declaration.  Read off the scope's own record of a name
+    /// bound twice (`Scope::meetings`); the name layer refuses a pair in one
+    /// namespace (E0205).
+    import_meetings_in(&this, scope: u64) -> Pair<SymbolID, SymbolID>[] {
+        mut out: Pair<SymbolID, SymbolID>[] = [];
+        if (scope == 0) { return out; }
+        const s: Scope* = this.get_scope(ScopeID { id: scope });
+        for (mut i: i64 = 0; i < s.meetings.length; i++) {
+            const a: SymbolID = s.meetings[i].first;
+            const b: SymbolID = s.meetings[i].second;
+            const a_import: boolean = this.symbols[this.symbol_ids.slot_of(a)].kind == SymbolKind::Import;
+            const b_import: boolean = this.symbols[this.symbol_ids.slot_of(b)].kind == SymbolKind::Import;
+            if (a_import && !b_import) { out.push(Pair::<SymbolID, SymbolID>::new(a, b)); }
+            if (b_import && !a_import) { out.push(Pair::<SymbolID, SymbolID>::new(b, a)); }
+        }
+        return out;
+    }
+
+    /// Whether the import binding `id` is one an explicit entry
+    /// (`import M::{ name }`, `import M::name`) made, not a glob's.
+    is_explicit_import(&this, id: SymbolID) -> boolean {
+        return this.explicit_imports.get(&id.table_key()).is_some();
+    }
+
     /// Declare an import symbol with ambiguity detection.
-    /// If the name already exists from a DIFFERENT module, the name is
-    /// marked ambiguous and the resolver will emit an error when it's used
-    /// without qualification (e.g. "use Pair" when both BattleTest::Pair
-    /// and Collections::Pair::Pair are imported).
-    declare_import(mut &this, sym: Symbol) -> SymbolID {
+    /// If the name already exists from a DIFFERENT module in the same
+    /// namespace, the name is marked ambiguous in that namespace and the
+    /// resolver will emit an error when it's used there without
+    /// qualification (e.g. "use Pair" when both BattleTest::Pair and
+    /// Collections::Pair::Pair are imported).
+    ///
+    /// The symbol carries the id of the declaration it binds, copied by the
+    /// import that found it: an import is not a definition, so it is not
+    /// admitted as one.  `target` is that declaration: one binding names one
+    /// declaration, and a second declaration the same module offers under
+    /// the leaf - a type beside a function - is a second binding of the
+    /// name, held in the scope's overload set as the declaring module's own
+    /// scope holds it.  The same declaration imported again binds nothing new.
+    ///
+    /// `explicit` is an entry of `import M::{ name }`, as opposed to a glob.
+    /// An explicit entry whose name an earlier explicit entry already brought
+    /// into this scope, in the namespace `target` is in, binds nothing, and
+    /// the earlier binding is answered for the caller to refuse the import
+    /// (E0243); a type and a function of one leaf are two namespaces and do
+    /// not collide.  Otherwise the answer is invalid.  `check_repeat` is
+    /// false for the entry's second and later declarations in a namespace -
+    /// a function's overloads - which join the entry's own first binding.
+    declare_import(mut &this, sym: Symbol, target: SymbolID, explicit: boolean,
+                   check_repeat: boolean) -> SymbolID {
         const id: SymbolID = sym.id;
-        // Intern the module path to get a heap-safe SymbolStr ID
-        const new_module_sym: SymbolStr = this.intern_table.intern(sym.source_module);
-        const new_module_id: u32 = new_module_sym.id;
+        const name: SymbolStr = sym.name;
+        const new_module: ModulePath = sym.source_module;
         this.symbols.push(sym);
+        this.import_targets.insert(id.table_key(), target);
 
         // Get the existing symbol's module ID (if any) so the scope
         // can detect cross-module name conflicts.
-        mut existing_module_id: u32 = 0;
-        const existing_id: SymbolID = this.scopes[this.current_scope.id - 1].find(sym.name);
+        mut existing_module: ModulePath = ModulePath::none();
+        const existing_id: SymbolID = this.scopes[this.current_scope.id - 1].find(name);
         if (existing_id.is_valid()) {
-            const ex_mod: string = this.symbols[existing_id.id - 1].source_module;
-            const ex_mod_sym: SymbolStr = this.intern_table.intern(ex_mod);
-            existing_module_id = ex_mod_sym.id;
+            // Every binding the scope holds under the name answers both
+            // questions: whether an explicit entry already brought it in,
+            // and whether one of them already names `target`.
+            const all: SymbolID[] = this.scopes[this.current_scope.id - 1].get_overloads(name);
+            if (explicit && check_repeat) {
+                const first: SymbolID = this.binding_beside(&all, target, true);
+                if (first.is_valid()) { return first; }
+            }
+            // The import this one competes with is the one in its namespace;
+            // with none there, the name's first binding.
+            const ex: Symbol = this.symbols[this.symbol_ids.slot_of(existing_id)];
+            const rival: SymbolID = this.binding_beside(&all, target, false);
+            const peer: Symbol = if (rival.is_valid()) { this.symbols[this.symbol_ids.slot_of(rival)] } else { ex };
+            existing_module = peer.source_module;
+            if (ex.kind == SymbolKind::Import && existing_module.equals(new_module)) {
+                const bound: SymbolID = this.binding_to(&all, target);
+                if (!bound.is_valid()) {
+                    this.scopes[this.current_scope.id - 1].add_overload(name, id, this.namespace_of(target) == Namespace::Type);
+                }
+                if (explicit) {
+                    this.explicit_imports.insert(if (bound.is_valid()) { bound.table_key() } else { id.table_key() }, true);
+                }
+                return SymbolID::invalid();
+            }
+            // Another module's item of the leaf in the OTHER namespace - a
+            // function beside an imported type - is a second binding of the
+            // name, not a rival for it: a lookup chooses between them by
+            // namespace, as it does for one module's type and function.
+            if (ex.kind == SymbolKind::Import && !rival.is_valid()) {
+                this.scopes[this.current_scope.id - 1].add_overload(name, id, this.namespace_of(target) == Namespace::Type);
+                if (explicit) { this.explicit_imports.insert(id.table_key(), true); }
+                return SymbolID::invalid();
+            }
         }
 
         this.scopes[this.current_scope.id - 1]
-            .insert_import(sym.name, id, new_module_id, existing_module_id);
-        return id;
+            .insert_import(name, id, new_module, existing_module, this.namespace_of(target));
+        if (explicit) { this.explicit_imports.insert(id.table_key(), true); }
+        return SymbolID::invalid();
+    }
+
+    /// Among one name's `bindings`, the import binding whose target is
+    /// `target`, or an invalid id.
+    binding_to(&this, bindings: &SymbolID[], target: SymbolID) -> SymbolID {
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            const t: Option<SymbolID> = this.import_targets.get(&bindings[i].table_key());
+            if (t.is_some() && t.unwrap().equals(target)) { return bindings[i]; }
+        }
+        return SymbolID::invalid();
+    }
+
+    /// The namespace the declaration `target` is bound in.
+    namespace_of(&this, target: SymbolID) -> Namespace {
+        return if (Namespace::Type.accepts(this.symbols[this.symbol_ids.slot_of(target)].kind)) {
+            Namespace::Type
+        } else {
+            Namespace::Value
+        };
+    }
+
+    /// Among one name's `bindings`, an import binding whose target is in the
+    /// namespace `target` is in - one an explicit entry made, when
+    /// `explicit_only` - or an invalid id.
+    binding_beside(&this, bindings: &SymbolID[], target: SymbolID, explicit_only: boolean) -> SymbolID {
+        const ns: Namespace = this.namespace_of(target);
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (explicit_only && !this.explicit_imports.get(&bindings[i].table_key()).is_some()) { continue; }
+            const t: Option<SymbolID> = this.import_targets.get(&bindings[i].table_key());
+            if (t.is_some() && ns.accepts(this.symbols[this.symbol_ids.slot_of(t.unwrap())].kind)) {
+                return bindings[i];
+            }
+        }
+        return SymbolID::invalid();
+    }
+
+    /// The declaration an import binding names in the namespace `ns`: among
+    /// the bindings its scope holds under its name, the target whose kind
+    /// `ns` accepts, or an invalid id when the module offered nothing under
+    /// the leaf in `ns`.  The binding a lookup returned is one of them, so
+    /// the answer is chosen by namespace, never by which declaration the
+    /// module happened to list first.
+    import_target(&this, s: &Symbol, ns: Namespace) -> SymbolID {
+        if (s.kind != SymbolKind::Import || !s.scope_id.is_valid()) { return SymbolID::invalid(); }
+        const all: SymbolID[] = this.scopes[s.scope_id.id - 1].get_overloads(s.name);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            const t: Option<SymbolID> = this.import_targets.get(&all[i].table_key());
+            if (!t.is_some()) { continue; }
+            const target: SymbolID = t.unwrap();
+            if (ns.accepts(this.symbols[this.symbol_ids.slot_of(target)].kind)) { return target; }
+        }
+        return SymbolID::invalid();
     }
 
     /// True when `name` is already bound in the CURRENT scope (parents are
@@ -193,11 +779,11 @@ type struct Resolver {
         return this.scopes[this.current_scope.id - 1].find(name).is_valid();
     }
 
-    declare_variable(mut &this, name: SymbolStr, span: SourceSpan, is_mutable: boolean) -> SymbolID {
+    declare_variable(mut &this, name: SymbolStr, span: SourceSpan,
+                     is_mutable: boolean, is_public: boolean) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::variable(id, name, this.current_scope, span,
-                                              mod_str, is_mutable);
+                                              this.current_module, is_mutable, is_public);
         return this.declare(sym);
     }
 
@@ -207,73 +793,81 @@ type struct Resolver {
     /// arm is a value pattern, not a fresh binding.
     declare_constant(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::constant(id, name, this.current_scope, span,
-                                             mod_str);
+                                             this.current_module);
         return this.declare(sym);
     }
 
     declare_function(mut &this, name: SymbolStr, span: SourceSpan, is_public: boolean) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::function(id, name, this.current_scope, span,
-                                              mod_str, is_public);
+                                              this.current_module, is_public);
         return this.declare(sym);
     }
 
     declare_type(mut &this, name: SymbolStr, span: SourceSpan, is_public: boolean) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::type_sym(id, name, this.current_scope, span,
-                                              mod_str, is_public);
+                                              this.current_module, is_public);
         return this.declare(sym);
+    }
+
+    /// Declare the constructor of the class `class_sym` just declared: a
+    /// value binding under the class's name, in the same scope, carrying the
+    /// class's definition and visibility.
+    declare_constructor(mut &this, class_sym: SymbolID) -> SymbolID {
+        const cls: Symbol = this.get_symbol(class_sym);
+        const id: SymbolID = this.alloc_symbol_id();
+        return this.declare(Symbol::constructor(id, cls.name, this.current_scope, cls.declaring_span,
+                                                this.current_module, cls.visibility.is_public(), cls.def));
     }
 
     declare_parameter(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::parameter(id, name, this.current_scope, span,
-                                               mod_str);
+                                               this.current_module);
         return this.declare(sym);
+    }
+
+    /// Bind `name` in the current scope as a refused import, so a use of it
+    /// resolves to `Res::Err` instead of to nothing.
+    declare_refused(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
+        const id: SymbolID = this.alloc_symbol_id();
+        return this.declare(Symbol::refused(id, name, this.current_scope, span));
     }
 
     declare_field(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::field(id, name, this.current_scope, span,
-                                           mod_str);
+                                           this.current_module);
         return this.declare(sym);
     }
 
     declare_enum_variant(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::enum_variant(id, name, this.current_scope, span,
-                                                  mod_str);
+                                                  this.current_module);
         return this.declare(sym);
     }
 
-    declare_method(mut &this, name: SymbolStr, span: SourceSpan, is_public: boolean) -> SymbolID {
+    declare_method(mut &this, name: SymbolStr, span: SourceSpan, is_public: boolean,
+                   def: DefId) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
-        const sym: Symbol = Symbol::method(id, name, this.current_scope, span,
-                                            mod_str, is_public);
+        mut sym: Symbol = Symbol::method(id, name, this.current_scope, span,
+                                          this.current_module, is_public);
+        sym.def = def;
         return this.declare(sym);
     }
 
-    /// Declare a set of generic parameters as symbols in the current scope.
-    /// This is the single source of truth for introducing generic param names
-    /// into the scope tree; used by NameResolution for function, struct,
-    /// class, enum, and trait declarations.
-    declare_generic_params(mut &this, names: SymbolStr[], spans: SourceSpan[]) -> void {
-        const mod_str: string = this.intern_table.resolve(this.current_module);
-        for (mut i: int = 0; i < names.length; i++) {
-            const id: SymbolID = this.alloc_symbol_id();
-            const sym: Symbol = Symbol::generic_param(id, names[i],
-                this.current_scope, spans[i],
-                mod_str);
-            this.declare(sym);
-        }
+    /// Declare one generic parameter as a symbol in the current scope and
+    /// answer its id, which is what every reference to the parameter is
+    /// stamped with.  The one door for introducing a generic parameter into
+    /// the scope tree; `NameResolution::declare_generics` is its caller.
+    declare_generic_param(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
+        const id: SymbolID = this.alloc_symbol_id();
+        const sym: Symbol = Symbol::generic_param(id, name, this.current_scope, span,
+            this.current_module);
+        return this.declare(sym);
     }
 
 
@@ -283,10 +877,10 @@ type struct Resolver {
     /// Returns true if the name was imported from multiple modules.
     /// NOTE: Accesses scopes via array index directly (not by-value copy)
     /// to ensure the ambiguity arrays added during import processing are visible.
-    is_ambiguous(&this, name: SymbolStr) -> boolean {
+    is_ambiguous(&this, name: SymbolStr, ns: Namespace) -> boolean {
         mut scope_id: ScopeID = this.current_scope;
         while (scope_id.is_valid()) {
-            if (this.scopes[scope_id.id - 1].is_ambiguous(name)) {
+            if (this.scopes[scope_id.id - 1].is_ambiguous(name, ns)) {
                 return true;
             }
             scope_id = this.scopes[scope_id.id - 1].parent_id;
@@ -294,14 +888,22 @@ type struct Resolver {
         return false;
     }
 
-    /// Get the conflicting module paths for an ambiguous name.
-    /// Returns two interned SymbolStr values: [module_a, module_b].
-    get_ambiguous_modules(&this, name: SymbolStr) -> SymbolStr[] {
-        mut scope_id: ScopeID = this.current_scope;
+    /// The two modules whose imports tie for an ambiguous name:
+    /// [module_a, module_b].
+    get_ambiguous_modules(&this, name: SymbolStr, ns: Namespace) -> ModulePath[] {
+        return this.ambiguous_modules_from(this.current_scope, name, ns);
+    }
+
+    /// The two modules whose imports tie for `name`, walking outward from an
+    /// EXPLICIT scope - the one a name was written in - rather than from the
+    /// cursor, which a pass called from elsewhere may have left standing in
+    /// another module.  Empty when no rib on the chain records a tie.
+    ambiguous_modules_from(&this, start: ScopeID, name: SymbolStr, ns: Namespace) -> ModulePath[] {
+        mut scope_id: ScopeID = start;
         while (scope_id.is_valid()) {
-            const ids: u32[] = this.scopes[scope_id.id - 1].get_ambiguous_module_ids(name);
-            if (ids.length >= 2) {
-                return [SymbolStr::from_id(ids[0]), SymbolStr::from_id(ids[1])];
+            const mods: ModulePath[] = this.scopes[scope_id.id - 1].get_ambiguous_modules(name, ns);
+            if (mods.length >= 2) {
+                return mods;
             }
             scope_id = this.scopes[scope_id.id - 1].parent_id;
         }
@@ -323,30 +925,140 @@ type struct Resolver {
             }
             scope_id = scope.parent_id;
         }
-        return SymbolID::invalid();
+        const any_ns: Option<Namespace> = Option::None;
+        return this.lookup_prelude(name, any_ns);
     }
 
-    /// Look up a name in the current scope only.
-    lookup_local(&this, name: SymbolStr) -> SymbolID {
-        const scope: Scope* = this.get_scope(this.current_scope);
-        return scope.find(name);
-    }
-
-    /// Collect all overloads for a name across the scope chain.
-    lookup_overloads(&this, name: SymbolStr, start: ScopeID) -> SymbolID[] {
-        mut result: SymbolID[] = [];
+    /// A written type name, or the first segment of a
+    /// written type path, is text until the writer's ribs bind it, and this
+    /// is where that text becomes a binding for the name layer's type
+    /// question: the first binding a rib holds under `name`, walking outward
+    /// from `start` - a type, a generic parameter, an import, a module
+    /// alias - then the prelude's one answer.  What the binding is decides
+    /// what the path means, so the caller reads its kind.
+    type_binding(&this, name: SymbolStr, start: ScopeID) -> SymbolID {
         mut scope_id: ScopeID = start;
         while (scope_id.is_valid()) {
             const scope: Scope* = this.get_scope(scope_id);
-            const overloads: SymbolID[] = scope.get_overloads(name);
-            for (mut i: i64 = 0; i < overloads.length; i++) {
-                result.push(overloads[i]);
+            const found: SymbolID = this.rib_binding(scope, name, Namespace::Type);
+            if (found.is_valid()) {
+                return found;
             }
             scope_id = scope.parent_id;
         }
-        return result;
+        const any_ns: Option<Namespace> = Option::None;
+        return this.lookup_prelude(name, any_ns);
     }
 
+    /// The binding the rib `scope` holds under `name` for a question asked
+    /// in `ns`: its first binding, unless that one is a declaration of the
+    /// other namespace and a second binding of the name is in `ns` - a type
+    /// declared after a function of its leaf, or a function after a type.
+    /// Invalid when the rib binds nothing under `name`.  Only the scope
+    /// doors ask it.
+    rib_binding(&this, scope: Scope*, name: SymbolStr, ns: Namespace) -> SymbolID {
+        const found: SymbolID = scope.find(name);
+        if (!found.is_valid()) { return found; }
+        const first: Symbol = this.get_symbol(found);
+        if (first.kind == SymbolKind::Import || ns.accepts(first.kind)) { return found; }
+        const all: SymbolID[] = scope.get_overloads(name);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            const s: Symbol = this.get_symbol(all[i]);
+            if (s.kind != SymbolKind::Import && ns.accepts(s.kind)) { return all[i]; }
+        }
+        return found;
+    }
+
+    /// A bare identifier in value position is written
+    /// as text and nothing but the ribs of its writer can say what it binds,
+    /// so this is where that text becomes a binding - once, for the node
+    /// that carries it; every later reader asks the stamp.
+    ///
+    /// The binding `name` has in the VALUE namespace, walking the rib chain
+    /// outward from `start`, or an invalid id.
+    ///
+    /// Each rib is asked for every binding it holds under the name - a type
+    /// and a function may share one - and answers with the first a value can
+    /// be: a declaration the value namespace accepts, a refused import (which
+    /// binds the name to nothing and stops the walk), or an import that binds
+    /// a value.  A binding that is only a type neither answers nor shadows:
+    /// the two namespaces are separate, so an inner type spelled like an
+    /// outer function leaves the function reachable.  The prelude is asked
+    /// last, in the value namespace.  The binding is returned as the rib
+    /// holds it - an import, not its target - because an import's own
+    /// record is what says whether it was ambiguous.
+    lookup_value(&this, name: SymbolStr, start: ScopeID) -> SymbolID {
+        mut scope_id: ScopeID = start;
+        while (scope_id.is_valid()) {
+            const scope: Scope* = this.get_scope(scope_id);
+            const all: SymbolID[] = scope.get_overloads(name);
+            for (mut i: i64 = 0; i < all.length; i++) {
+                const sym: Symbol = this.get_symbol(all[i]);
+                if (sym.kind == SymbolKind::Import) {
+                    if (this.import_target(&sym, Namespace::Value).is_valid()) { return all[i]; }
+                    continue;
+                }
+                if (Namespace::Value.accepts(sym.kind)) { return all[i]; }
+            }
+            scope_id = scope.parent_id;
+        }
+        return this.lookup_prelude(name, Option::Some(Namespace::Value));
+    }
+
+    /// The declaration a value binding names: an import's target in the
+    /// value namespace, any other binding itself.
+    value_target(&this, id: SymbolID) -> SymbolID {
+        if (!id.is_valid()) { return id; }
+        const sym: Symbol = this.get_symbol(id);
+        if (sym.kind != SymbolKind::Import) { return id; }
+        const target: SymbolID = this.import_target(&sym, Namespace::Value);
+        if (target.is_valid()) { return target; }
+        return id;
+    }
+
+    /// The outermost tier of the rib chain: names reachable without an import.
+    ///
+    /// Consulted only after every enclosing scope has been asked, which is what
+    /// makes it a TIER and not a second strategy - an inner declaration or an
+    /// explicit import shadows it, exactly as a nearer rib shadows a farther
+    /// one.  It answers the same question the walk above does and returns the
+    /// same kind of answer, so no caller acquires a branch on which tier
+    /// replied.
+    ///
+    /// A name two prelude modules both export is left UNANSWERED rather than
+    /// taken from whichever module the graph happens to list first: picking
+    /// would make the meaning of a program depend on module order, which is the
+    /// property this subsystem exists to remove.
+    ///
+    /// Asked in a namespace, a module answers with its declaration in that
+    /// namespace.  Asked in none, a module offering several declarations
+    /// under the leaf - a type and a function - is left unanswered for the
+    /// same reason: which of them it lists first is declaration order.
+    lookup_prelude(&this, name: SymbolStr, ns: Option<Namespace>) -> SymbolID {
+        mut found: SymbolID = SymbolID::invalid();
+        for (mut i: i64 = 0; i < this.prelude_modules.length; i++) {
+            const all: SymbolID[] = this.exports_named(this.prelude_modules[i], name);
+            if (all.length == 0) { continue; }
+            mut hit: SymbolID = SymbolID::invalid();
+            if (ns.is_some()) {
+                hit = this.export_in(this.prelude_modules[i], name, ns.unwrap());
+                if (!hit.is_valid()) { continue; }
+            } else {
+                if (all.length > 1) { return SymbolID::invalid(); }
+                hit = all[0];
+            }
+            if (found.is_valid()) { return SymbolID::invalid(); }
+            found = hit;
+        }
+        return found;
+    }
+
+    /// Record the namespaces reachable without an import.  Derived from the
+    /// prelude module's own `public module` list, so it is empty when no
+    /// prelude was loaded rather than defaulting to a transcribed set.
+    set_prelude_modules(mut &this, mods: ModulePath[]) -> void {
+        this.prelude_modules = mods;
+    }
 
     // Resolution map access
 
@@ -360,68 +1072,103 @@ type struct Resolver {
         return this.resolution_map.resolve(span);
     }
 
-    /// Record an overload set for a span.
-    record_overloads(mut &this, span: SourceSpan, sym_ids: SymbolID[]) -> void {
-        this.resolution_map.record_overloads(span, sym_ids);
-    }
-
-    /// Get overload candidates for a span.
-    get_overload_candidates(&this, span: SourceSpan) -> SymbolID[] {
-        return this.resolution_map.resolve_overloads(span);
-    }
-
 
     // Cross-module
 
     /// Register a symbol as exported from the current module.
     export_symbol(mut &this, sym_id: SymbolID) -> void {
-        this.exports.push(Pair<SymbolID, u64>::new(sym_id, this.current_module.id as u64));
+        this.exports.push(Pair::<SymbolID, ModulePath>::new(sym_id, this.current_module));
     }
 
     /// Get all exported symbols from a module.
-    get_exports(&this, module: SymbolStr) -> SymbolID[] {
-        const mod_key: u64 = module.id as u64;
+    get_exports(&this, m: ModulePath) -> SymbolID[] {
         mut result: SymbolID[] = [];
         for (mut i: i64 = 0; i < this.exports.length; i++) {
-            if (this.exports[i].second == mod_key) {
+            if (this.exports[i].second.equals(m)) {
                 result.push(this.exports[i].first);
             }
         }
         return result;
     }
 
-    /// Look up a specific name in a module's exports.
-    lookup_in_module(&this, module: SymbolStr, name: SymbolStr) -> SymbolID {
-        const mod_key: u64 = module.id as u64;
+    /// The declaration `id` stands for: the one an import binding names, or
+    /// `id` itself for a declaration.  An `export` entry with `as` offers
+    /// its binding under the alias, and a reader of a module's export list is
+    /// handed what the binding names, never the binding.
+    declaration_of(&this, id: SymbolID) -> SymbolID {
+        const t: Option<SymbolID> = this.import_targets.get(&id.table_key());
+        return if (t.is_some()) { t.unwrap() } else { id };
+    }
+
+    /// The public declaration module `m` exports under `name` in the
+    /// namespace `ns`, or an invalid id: `M::f` in an expression names the
+    /// function `f`, never a type `M` also declares as `f`.
+    export_in(&this, m: ModulePath, name: SymbolStr, ns: Namespace) -> SymbolID {
+        const all: SymbolID[] = this.exports_named(m, name);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            if (ns.accepts(this.get_symbol(all[i]).kind)) { return all[i]; }
+        }
+        return SymbolID::invalid();
+    }
+
+    /// A path's segment after a module, or a leaf
+    /// asked of the prelude's modules, is written as text, and the module's
+    /// export list - not its scope, which keeps one of a type and a function
+    /// sharing a leaf - is what says which declarations it offers under it.
+    ///
+    /// Every public declaration module `m` exports under `name`, in
+    /// declaration order: a type and a function may share a leaf, and a
+    /// reader that wants one of them chooses by kind.
+    exports_named(&this, m: ModulePath, name: SymbolStr) -> SymbolID[] {
+        mut out: SymbolID[] = [];
         for (mut i: i64 = 0; i < this.exports.length; i++) {
-            if (this.exports[i].second == mod_key) {
+            if (this.exports[i].second.equals(m)) {
                 const sym: Symbol = this.get_symbol(this.exports[i].first);
                 if (sym.name.equals(name) && sym.visibility.is_public()) {
-                    return this.exports[i].first;
+                    out.push(this.declaration_of(this.exports[i].first));
                 }
             }
         }
-        return SymbolID::invalid();
+        return out;
     }
 
-    /// Register an import alias (e.g., `import Foo as Bar` maps "Bar" -> sym_id).
-    register_import_alias(mut &this, alias: SymbolStr, sym_id: SymbolID) -> void {
-        this.import_aliases.push(Pair<SymbolStr, SymbolID>::new(alias, sym_id));
-    }
-
-    /// Look up an import alias.
-    lookup_import_alias(&this, alias: SymbolStr) -> SymbolID {
-        for (mut i: i64 = 0; i < this.import_aliases.length; i++) {
-            if (this.import_aliases[i].first.equals(alias)) {
-                return this.import_aliases[i].second;
-            }
+    /// The top-level declarations `module` holds under `name` and marks
+    /// `private` - the one case a path or an import can name a declaration
+    /// and still be handed nothing, which the writer must be told about
+    /// rather than left to read as "no such name".  Every one, in
+    /// declaration order: a type and a function may share a leaf (the second
+    /// sits in the scope's overload set), and a reader that wants one of
+    /// them chooses by kind.
+    ///
+    /// Read off the module's own scope: the export list holds only what is
+    /// public, so a private declaration is exactly what it does not carry.
+    private_declarations(&this, m: ModulePath, name: SymbolStr) -> SymbolID[] {
+        mut out: SymbolID[] = [];
+        const sid: u64 = this.find_module_scope(m);
+        if (sid == 0) { return out; }
+        const scope: Scope* = this.get_scope(ScopeID { id: sid });
+        const all: SymbolID[] = scope.get_overloads(name);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            const sym: Symbol = this.get_symbol(all[i]);
+            if (sym.kind == SymbolKind::Import) { continue; }
+            if (sym.visibility.is_public()) { continue; }
+            out.push(all[i]);
         }
-        return SymbolID::invalid();
+        return out;
     }
 
-    /// Get a symbol by its SymbolID.  Indexes by id-1 (IDs start at 1).
+    /// The binding module `m`'s own scope holds under `name` - declared or
+    /// imported, public or private - or invalid.  Neither the rib chain nor
+    /// the module's exports are consulted.
+    module_binding(&this, m: ModulePath, name: SymbolStr) -> SymbolID {
+        const sid: u64 = this.find_module_scope(m);
+        if (sid == 0) { return SymbolID::invalid(); }
+        return this.get_scope(ScopeID { id: sid }).find(name);
+    }
+
+    /// Get a symbol by its SymbolID, one this resolver's allocator made.
     get_symbol(&this, id: SymbolID) -> Symbol {
-        return this.symbols[id.id - 1];
+        return this.symbols[this.symbol_ids.slot_of(id)];
     }
 
     /// Borrow a scope by its ScopeID.  Indexes by id-1 (IDs start at 1).
@@ -445,257 +1192,108 @@ type struct Resolver {
 
     // Type name resolution (used by TypeResolver)
 
-    /// Resolve a type name to its module-qualified form by walking the scope
-    /// chain from global and checking cross-module imports.
+    /// The canonical qualified name of a symbol.
     ///
-    /// Returns the qualified name string (e.g., "MyModule::MyStruct") that
-    /// can be used for TypeArena/DeclarationIndex lookup, or empty if not found.
+    /// A symbol stores its leaf and its declaring module separately, so the
+    /// canonical form is built rather than read off.  Every answer that names a
+    /// definition is built here, because a second construction site is how two
+    /// lanes come to disagree about what the same declaration is called - and
+    /// the qualified name is the key `DeclarationIndex`, the type arena and the
+    /// mangler all use, so disagreeing about it is not a cosmetic difference.
     ///
-    /// Handles both bare names ("Vec2") and already-qualified names
-    /// ("Math::Vec2::Vec2").  For qualified input, extracts the leaf segment and
-    /// resolves that, then validates the written prefix against the module the
-    /// symbol was declared in — two modules may export the same leaf name, and
-    /// the leaf-keyed scope chain cannot tell them apart on its own.
-    resolve_type_qualified_name(&this, name: SymbolStr) -> SymbolStr {
-        return this.resolve_type_qualified_name_from(this.current_scope, name);
+    /// A re-exported symbol keeps the module that DECLARED it, which is what
+    /// makes the name canonical rather than a statement about the route taken
+    /// to reach it.
+    qualified_name_of(&this, sym: &Symbol) -> SymbolStr {
+        if (!sym.source_module.is_valid()) { return sym.name; }
+        return sym.source_module.qualified(sym.name, this.intern_table);
     }
 
-    /// `resolve_type_qualified_name`, but resolving the leaf from an EXPLICIT
-    /// scope rather than the ambient cursor.  See
-    /// `resolve_type_qualified_name_bare_from` for why the scope is a parameter.
-    resolve_type_qualified_name_from(&this, start: ScopeID,
-                                     name: SymbolStr) -> SymbolStr {
-        const name_str: string = this.intern_table.resolve(name);
-        LOG_DEBUG(LogComponent::Resolver,
-            "[resolve_type_qn] looking for '%s' starting at scope %llu",
-            name_str, start.id);
-
-        // If the name is already qualified (contains "::"), try it as-is first
-        // (it may already be the canonical form), then fall back to extracting
-        // the leaf and resolving that.
-        if (this.contains_separator(name_str)) {
-            // Try the full qualified name directly; caller may already have
-            // the canonical form (e.g., from a previous resolution).
-            // No scope walk needed for this; just return it for DeclarationIndex
-            // or arena lookup by the caller.
-            // If the caller's lookup fails, it will try bare-name fallback.
-
-            // Extract the leaf (last segment) and resolve it. The scope chain is
-            // keyed by leaf alone, so this can land on a same-named type from an
-            // entirely different module — `executor::JoinHandle` reaching
-            // `thread::JoinHandle` in a program that imports both. Accept the
-            // result only when its declaring module agrees with the qualifier
-            // that was actually written; otherwise fall through to the export
-            // scan below, which searches BY prefix. Without that check the winner
-            // is whichever module registered the leaf last, which is not a
-            // property the source mentions.
-            const leaf_sym: SymbolStr = this.extract_leaf(name_str);
-            if (leaf_sym.is_valid()) {
-                const resolved: SymbolStr =
-                    this.resolve_type_qualified_name_bare_from(start, leaf_sym);
-                if (resolved.is_valid() && this.qualifier_agrees(resolved, name_str)) {
-                    return resolved;
-                }
-            }
-            // A module-qualified type whose leaf isn't reachable through the
-            // current scope chain - e.g. `future::Ready` when only the parent
-            // `std::future` was imported, so `Ready` entered as a re-export of
-            // the `future::ready` submodule (`public module future::ready;`).
-            // The bare `Ready` already resolves elsewhere; make the qualified
-            // form consistent by resolving it against the cross-module export
-            // table: a public type whose leaf is `Ready` and whose declaring
-            // module matches the `future` prefix.
-            const via_exports: SymbolStr = this.resolve_qualified_type_via_exports(name_str);
-            if (via_exports.is_valid()) {
-                return via_exports;
-            }
-            // Return the input as-is; it may be the canonical form already
-            return name;
-        }
-
-        return this.resolve_type_qualified_name_bare_from(start, name);
-    }
-
-    /// Resolve a module-qualified type name (`Module::Leaf`) to its canonical
-    /// `<declaring-module>::Leaf` by scanning the cross-module export table for a
-    /// public type whose leaf name is `Leaf` and whose declaring module is
-    /// consistent with the `Module` prefix. Used only as a fallback in
-    /// `resolve_type_qualified_name` when the leaf isn't reachable through the
-    /// current scope chain (the qualified analogue of an already-working bare
-    /// name that entered as a submodule re-export). Empty when none matches.
-    resolve_qualified_type_via_exports(&this, name_str: string) -> SymbolStr {
-        const nlen: i64 = name_str.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < nlen; i++) {
-            if (name_str[i] == ':' && name_str[i + 1] == ':') { last_sep = i; }
-        }
-        if (last_sep <= 0 || last_sep + 2 >= nlen) { return SymbolStr::empty(); }
-        const prefix_str: string = name_str.substring(0, last_sep);
-        const leaf_str: string = name_str.substring(last_sep + 2, nlen - last_sep - 2);
-        const leaf_sym: SymbolStr = this.intern_table.intern(leaf_str);
-
-        for (mut i: i64 = 0; i < this.exports.length; i++) {
-            const sym: Symbol = this.get_symbol(this.exports[i].first);
-            if (sym.kind != SymbolKind::Type && sym.kind != SymbolKind::TypeAlias) { continue; }
-            if (!sym.visibility.is_public()) { continue; }
-            if (!sym.name.equals(leaf_sym)) { continue; }
-            const mod_sym: SymbolStr = SymbolStr::from_id(this.exports[i].second as u32);
-            const mod_str: string = this.intern_table.resolve(mod_sym);
-            if (this.module_ns_matches_prefix(mod_str, prefix_str)) {
-                return this.intern_table.intern(mod_str + "::" + leaf_str);
-            }
-        }
-        return SymbolStr::empty();
-    }
-
-    /// True when the module `resolved` was declared in is consistent with the
-    /// qualifier written in `written_str`. `resolved` is a canonical
-    /// `Module::Leaf`; `written_str` is the `Prefix::Leaf` the source spelled.
+    /// A written type name's leaf, in the type
+    /// namespace, walking outward from `scope` - a module's own scope, or
+    /// the scope enclosing a class whose base it names - then the prelude.
+    /// The answer for a name written there once nothing nearer binds it.
     ///
-    /// An unqualified `written_str` agrees with anything — there is no qualifier
-    /// to contradict. A `resolved` with no module of its own agrees with nothing
-    /// qualified, since a written prefix cannot name the global namespace.
-    qualifier_agrees(&this, resolved: SymbolStr, written_str: string) -> boolean {
-        const written_prefix: string = this.prefix_of(written_str);
-        if ((written_prefix.length() as i64) == 0) { return true; }
-        const resolved_mod: string = this.prefix_of(this.intern_table.resolve(resolved));
-        if ((resolved_mod.length() as i64) == 0) { return false; }
-        return this.module_ns_matches_prefix(resolved_mod, written_prefix);
-    }
+    /// `scope` is explicit, with no ambient-cursor default: given the
+    /// writer's scope there is no cursor pointing at the wrong module to
+    /// correct.
+    type_res_in_scope(&this, name: SymbolStr, scope: ScopeID) -> Res {
+        const ns: Namespace = Namespace::Type;
 
-    /// Everything before the final "::" in `s`, or empty when there is none.
-    /// E.g. "std::future::executor::JoinHandle" -> "std::future::executor".
-    prefix_of(&this, s: string) -> string {
-        const len: i64 = s.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < len; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') {
-                last_sep = i;
-            }
-        }
-        if (last_sep <= 0) { return ""; }
-        return s.substring(0, last_sep);
-    }
-
-    /// True when `prefix` occurs in the module namespace `mod_str` as a run of
-    /// whole `::`-delimited segments. This honors the qualifier (`future` matches
-    /// `std::future::ready` but `other` does not) while tolerating the root
-    /// segments a written prefix omits (`future` == `std::future` minus `std`).
-    module_ns_matches_prefix(&this, mod_str: string, prefix_str: string) -> boolean {
-        const ml: i64 = mod_str.length() as i64;
-        const pl: i64 = prefix_str.length() as i64;
-        if (pl == 0 || pl > ml) { return false; }
-        mut i: i64 = 0;
-        while (i + pl <= ml) {
-            if (mod_str.substring(i, pl).eq(prefix_str)) {
-                const boundary_before: boolean =
-                    i == 0 || (i >= 2 && mod_str[i - 1] == ':' && mod_str[i - 2] == ':');
-                const boundary_after: boolean =
-                    i + pl == ml || (i + pl + 1 < ml && mod_str[i + pl] == ':' && mod_str[i + pl + 1] == ':');
-                if (boundary_before && boundary_after) { return true; }
-            }
-            i += 1;
-        }
-        return false;
-    }
-
-    /// The defining module of the function a bare name resolves to here, or an
-    /// empty SymbolStr when the name isn't a function visible from this scope.
-    ///
-    /// This is the import-aware half of picking between same-named functions in
-    /// different modules: the scope chain already models what the current
-    /// module can see, so a candidate whose defining module this returns is the
-    /// one the source actually names. Without it, selection can only compare
-    /// candidate counts, and two same-named generics anywhere in the program
-    /// leave every caller of either one unresolvable.
-    resolve_function_source_module(&this, name: SymbolStr) -> SymbolStr {
-        mut scope_id: ScopeID = this.current_scope;
+        // Walking outward is the rib chain: an inner tier shadows the outer
+        // one, and the first acceptable binding wins.
+        mut scope_id: ScopeID = scope;
         while (scope_id.is_valid()) {
-            const scope: Scope* = this.get_scope(scope_id);
-            const found: SymbolID = scope.find(name);
+            const sc: Scope* = this.get_scope(scope_id);
+            const found: SymbolID = this.rib_binding(sc, name, ns);
             if (found.is_valid()) {
                 const sym: Symbol = this.get_symbol(found);
-                // `Import` is the kind a name brought in by `import` carries -
-                // an imported function is not re-declared as `Function` in the
-                // importer's scope. `resolve_type_qualified_name_bare` accepts
-                // it for the same reason.
-                if (sym.kind == SymbolKind::Function || sym.kind == SymbolKind::Import) {
-                    if (sym.source_module == "") { return SymbolStr::empty(); }
-                    return this.intern_table.intern(sym.source_module);
-                }
-            }
-            scope_id = scope.parent_id;
-        }
-        return SymbolStr::empty();
-    }
-
-    /// Core qualified-name resolution for a bare (unqualified) type name.
-    /// Walks scope chain and import aliases to find the symbol, then constructs
-    /// the canonical qualified form: "module::name".
-    resolve_type_qualified_name_bare(&this, name: SymbolStr) -> SymbolStr {
-        return this.resolve_type_qualified_name_bare_from(this.current_scope, name);
-    }
-
-    /// `resolve_type_qualified_name_bare`, but walking from an EXPLICIT scope
-    /// instead of the resolver's ambient cursor.
-    ///
-    /// A bare leaf in a type annotation means what the annotation's OWN module
-    /// says: that module's declarations, then its imports, then the prelude. The
-    /// ambient cursor answers for whatever module a pass happens to be walking,
-    /// which is the caller's at any re-resolution site - so two modules exporting
-    /// the same leaf silently bind to the wrong one.
-    ///
-    /// Taking the start scope as a PARAMETER is what makes this safe where a
-    /// cursor swap is not: resolution recurses (a type's arguments, a function
-    /// annotation's parameters), and each nested resolution carries its own
-    /// start scope. Repointing the shared cursor instead leaks the switch into
-    /// every nested resolution underneath it.
-    resolve_type_qualified_name_bare_from(&this, start: ScopeID,
-                                          name: SymbolStr) -> SymbolStr {
-        // 1. Walk scope chain from `start` for Type/TypeAlias/Import symbols.
-        mut scope_id: ScopeID = start;
-        while (scope_id.is_valid()) {
-            const scope: Scope* = this.get_scope(scope_id);
-            const found: SymbolID = scope.find(name);
-            if (found.is_valid()) {
-                const sym: Symbol = this.get_symbol(found);
-                if (sym.kind == SymbolKind::Type ||
-                    sym.kind == SymbolKind::TypeAlias ||
-                    sym.kind == SymbolKind::Import) {
-                    // Construct qualified name from symbol's module
-                    const resolved: string = this.intern_table.resolve(sym.name);
-                    if (sym.source_module != "") {
-                        return this.intern_table.intern(sym.source_module + "::" + resolved);
+                if (ns.accepts(sym.kind)) {
+                    // Two imports of one leaf from different modules bind
+                    // the name to neither (two candidates within one tier
+                    // are ambiguous).  The rib keeps the first so a lookup lands
+                    // somewhere; the record of the second is what says the
+                    // first was never the answer.  The rib DID bind the
+                    // name - to nothing - so the walk stops here rather than
+                    // letting an outer tier answer a name this one holds.
+                    if (sym.kind == SymbolKind::Import && sc.is_ambiguous(name, ns)) {
+                        return Res::Err;
                     }
-                    return sym.name;
+                    // An import names the declaration it binds in `ns`.  One
+                    // that binds none there keeps its own answer, and the
+                    // stage that needs the kind reports the mismatch.
+                    const target: SymbolID = this.import_target(&sym, ns);
+                    if (target.is_valid()) {
+                        const tsym: Symbol = this.get_symbol(target);
+                        return this.res_for_binding(&tsym);
+                    }
+                    return this.res_for_binding(&sym);
                 }
             }
-            scope_id = scope.parent_id;
+            scope_id = sc.parent_id;
         }
 
-        // 2. Check import aliases.
-        //    `import_aliases` is resolver-global and reset per module, so it holds
-        //    the aliases of the module the cursor is on - not of `start`. Consult
-        //    it only when those are the same module; for a foreign start scope an
-        //    alias hit would be the CALLER's `import X as Y`, which is exactly the
-        //    kind of cross-module leak this overload exists to prevent. (Aliases
-        //    are not yet stored per-scope, so a foreign module's own aliases are
-        //    simply not visible here; the caller falls through to its next
-        //    lookup rather than binding something wrong.)
-        if (start.id == this.current_scope.id) {
-            const alias_id: SymbolID = this.lookup_import_alias(name);
-            if (alias_id.is_valid()) {
-                const alias_sym: Symbol = this.get_symbol(alias_id);
-                const resolved: string = this.intern_table.resolve(alias_sym.name);
-                if (alias_sym.source_module != "") {
-                    return this.intern_table.intern(alias_sym.source_module + "::" + resolved);
-                }
-                return alias_sym.name;
+        // The outermost rib: names reachable without an import.  Reached here,
+        // after every enclosing scope has been asked, because that is what
+        // makes the prelude a TIER - an inner declaration or an explicit import
+        // shadows it - and because a caller that consults the prelude for
+        // itself when this returns `Err` would be a second way to answer one
+        // question, free to disagree with this one about what a bare name
+        // means.  `lookup` reaches the same tier at the same point in its walk.
+        //
+        // Filtered by `ns` like every other rib.  Without the filter a question
+        // asked in one namespace is answerable by whatever kind a prelude
+        // module happens to export under the name.
+        const asked: Option<Namespace> = Option::Some(ns);
+        const pre: SymbolID = this.lookup_prelude(name, asked);
+        if (pre.is_valid()) {
+            const psym: Symbol = this.get_symbol(pre);
+            if (ns.accepts(psym.kind)) {
+                return this.res_for_binding(&psym);
             }
         }
 
-        // 3. Not found
-        return SymbolStr::empty();
+        // No rib bound the name, the prelude included.  Reported as `Err`
+        // WITHOUT a diagnostic only because every caller today projects this
+        // back into its own not-found path and diagnoses there; the moment a
+        // caller reads the `Res` directly, the diagnostic belongs here, since
+        // this is the only place that knows which namespace was asked and from
+        // where.
+        return Res::Err;
+    }
+
+    /// The answer a binding `type_res_in_scope` found produces.  Every tier
+    /// of its walk builds its result here, so no tier can disagree with
+    /// another about what a generic parameter means.
+    res_for_binding(&this, sym: &Symbol) -> Res {
+        // A refused import bound the name to nothing, and the import's own
+        // diagnostic is the report; nothing rooted in it is answered.
+        if (sym.kind == SymbolKind::Refused) { return Res::Err; }
+        // A parameter names ITSELF.  Substitution happens strictly below this,
+        // in the type layer, which is what lets a `Res` be copied verbatim by
+        // `ASTCloner`.
+        if (sym.kind == SymbolKind::GenericParam) { return Res::GenericParam(sym.id); }
+        return Res::Def(sym.def);
     }
 
 
@@ -712,61 +1310,94 @@ type struct Resolver {
         return false;
     }
 
-    /// Extract the last segment after the final "::" in a string.
-    /// E.g., "Math::Vec2::Vec2" -> intern("Vec2")
-    extract_leaf(&this, s: string) -> SymbolStr {
-        const len: i64 = s.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < len; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') {
-                last_sep = i;
-            }
-        }
-        if (last_sep < 0) {
-            return this.intern_table.intern(s);
-        }
-        const start: i64 = last_sep + 2;
-        if (start >= len) {
-            return SymbolStr::empty();
-        }
-        return this.intern_table.intern(s.substring(start, len - start));
-    }
 
-
-    // Module-level reset (batch mode)
-
-    /// Reset per-module state for the next module.  Preserves accumulated
-    /// symbols/scopes/exports but resets the scope cursor to global.
-    reset_for_next_module(mut &this) -> void {
-        this.current_scope = this.global_scope;
-        this.current_module = SymbolStr::empty();
-        this.import_aliases = [];
-    }
-
-    /// Switch to a specific module.  Creates a fresh Module scope
-    /// parented to global so that each module's declarations live in
-    /// their own scope and bare names cannot collide across modules.
-    /// Used by NameResolution (Phase 3).  Later phases restore the
-    /// saved scope via set_module_with_scope().
-    set_module(mut &this, name: SymbolStr) -> void {
+    /// Enter a module: its scope becomes the current one.
+    ///
+    /// A LOOKUP, not a construction.  The module owns exactly one scope for
+    /// the life of the compilation, built on the first ask and returned
+    /// unchanged after, so entering a module twice lands in the same scope
+    /// and there is nothing to save or restore across the gap.
+    ///
+    /// Use this whenever the destination is a MODULE.  `restore_scope` is for
+    /// the other half of the model - resuming a scope captured earlier, which
+    /// may be a rib inside a module rather than the module itself.
+    ///
+    /// Answers the module the cursor stood in before, for a caller that
+    /// switches in and must hand it back (`restore_scope`).
+    set_module(mut &this, name: ModulePath) -> ModulePath {
+        const previous: ModulePath = this.current_module;
         this.current_module = name;
-        const mod_str: string = this.intern_table.resolve(name);
-        this.current_scope = this.create_scope(
-            ScopeKind::Module, this.global_scope,
-            mod_str, mod_str, SourceSpan::none());
-        this.import_aliases = [];
+        this.current_scope = ScopeID { id: this.module_scope_of(name) };
+        return previous;
     }
 
-    /// Switch to a module and restore a previously saved scope.
-    /// Used by the multi-module orchestrator for passes after NameResolution.
-    set_module_with_scope(mut &this, name: SymbolStr, saved_scope: u64) -> void {
+    /// The scope a module owns, built on first ask and returned unchanged
+    /// after.
+    ///
+    /// Every entry into a module goes through here, so there is exactly one
+    /// scope per module for the life of the compilation and nothing to save or
+    /// restore: the scope a pass left behind is the scope the next pass finds.
+    /// The module's `Symbol` is declared with it, so the identity and the
+    /// bindings it owns are created together.
+    module_scope_of(mut &this, name: ModulePath) -> u64 {
+        const oid: ModuleKey = name.table_key();
+        match (this.module_scopes.get(&oid)) {
+            Option::Some(sid) => { return sid; }
+            Option::None      => { }
+        }
+        const fresh: ScopeID = this.create_scope(
+            ScopeKind::Module, this.global_scope,
+            this.intern_table.shown(name.decl_name()), SourceSpan::none());
+        this.module_scopes.insert(oid, fresh.id);
+        this.declare_module_symbol(name);
+        return fresh.id;
+    }
+
+    /// Give a module an IDENTITY.
+    ///
+    /// A module scope is keyed by the module's interned name, and a consumer
+    /// that wants to say WHICH module a path names holds that same handle -
+    /// so no layer has to rebuild a bare leaf's module by concatenation.  The
+    /// symbol is what a `Res` can eventually name.
+    ///
+    /// Declared in the global scope under the module's FULL name, because
+    /// module scopes are flat there rather than nested: there is no parent
+    /// module scope to declare it in.  A full name is never asked for as a
+    /// bare leaf, so nothing resolves differently for having it; binding a
+    /// module under its LEAF is what an import does, and that is separate.
+    ///
+    /// Called once per module, by `module_scope_of` when it makes the
+    /// module's scope: every later entry into the module finds that scope
+    /// and declares nothing.
+    declare_module_symbol(mut &this, m: ModulePath) -> void {
+        const g: i64 = (this.global_scope.id - 1) as i64;
+        const name: SymbolStr = m.decl_name().spelling();
+        const id: SymbolID = this.alloc_symbol_id();
+        const sym: Symbol = Symbol::namespace_sym(
+            id, name, this.global_scope, SourceSpan::none(), m);
+        this.admit(sym);
+        this.scopes[g].insert(name, id, false, true);
+    }
+
+    /// Resume a scope captured earlier, under `name` as the current module.
+    ///
+    /// The transient half of the model, and the reason this is not just
+    /// `set_module`: `saved_scope` comes from `get_current_scope_id()` at the
+    /// top of a scope-switched region and may be a RIB - a function body a
+    /// pass was standing in - rather than a module scope.  Jumping to the
+    /// module's own scope instead would lose that nesting.
+    ///
+    /// A module destination wants `set_module`.  Reaching for this one with a
+    /// scope that was just looked up for the same module says "restore" while
+    /// meaning "enter", which is how two readings of these call sites were
+    /// wrong about what they do.
+    restore_scope(mut &this, name: ModulePath, saved_scope: u64) -> void {
         this.current_module = name;
         if (saved_scope > 0) {
             this.current_scope = ScopeID { id: saved_scope };
         } else {
             this.current_scope = this.global_scope;
         }
-        this.import_aliases = [];
     }
 
     /// Get the current scope ID as a raw u64 (for saving/restoring).
@@ -774,54 +1405,19 @@ type struct Resolver {
         return this.current_scope.id;
     }
 
-    /// Find the scope ID for a module by its namespace name.
-    /// Searches all Module-kind scopes for one whose owner_name matches
-    /// the given module name string.  Returns the most populated scope
-    /// (highest symbol count) since the Resolver may create multiple
-    /// scopes with the same module name at different pipeline stages.
-    find_module_scope(&this, module_name: string) -> u64 {
-        mut best_id: u64 = 0;
-        mut best_count: i64 = -1;
-        const oid: u32 = this.intern_table.lookup(module_name).id;
-        match (this.module_scope_index.get_ref(&oid)) {
-            Option::Some(plist) => {
-                for (mut k: i64 = 0; k < (*plist).length; k++) {
-                    const sid: u64 = (*plist)[k];
-                    const idx: i64 = (sid - 1) as i64;
-                    const count: i64 = this.scopes[idx].symbols.length;
-                    if (count > best_count) {
-                        best_count = count;
-                        best_id = sid;
-                    }
-                }
-            }
-            Option::None => { }
-        }
-        return best_id;
+    /// The scope a module owns, or 0 when no module of that name was entered.
+    ///
+    /// This used to search every scope recorded under the name and return the
+    /// most populated one, because entering a module built a new scope each
+    /// time and all but one of them were empty.  There is one scope now, so
+    /// there is nothing to choose between.
+    find_module_scope(&this, module_name: ModulePath) -> u64 {
+        if (!module_name.is_valid()) { return 0; }
+        const oid: ModuleKey = module_name.table_key();
+        return match (this.module_scopes.get(&oid)) {
+            Option::Some(sid) => { sid }
+            Option::None      => { 0 }
+        };
     }
 
-    /// Dump the current scope tree and symbol table for debugging.
-    debug_dump(&this) -> void {
-        cdebug("=== Resolver Dump ===\n");
-        cdebug("Symbols:\n");
-        for (mut i: i64 = 0; i < this.symbols.length; i++) {
-            const sym: Symbol = this.symbols[i];
-            const name: string = this.intern_table.resolve(sym.name);
-            cdebug("  [%lu] %s (scope %u) module='%s'\n",
-                sym.id.id, name, sym.scope_id.id, sym.source_module);
-        }
-
-        cdebug("Exports: %lld symbols\n", this.exports.length);
-
-        cdebug("Import Aliases:\n");
-        for (mut i: i64 = 0; i < this.import_aliases.length; i++) {
-            const alias: string = this.intern_table.resolve(this.import_aliases[i].first);
-            const sym: Symbol = this.get_symbol(this.import_aliases[i].second);
-            const name: string = this.intern_table.resolve(sym.name);
-            cdebug("  %s -> [%lu] %s (scope %u)\n",
-                alias, sym.id.id, name, sym.scope_id.id);
-        }
-
-        cdebug("=== End Resolver Dump ===\n");
-    }
 }

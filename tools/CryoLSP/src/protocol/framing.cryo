@@ -24,13 +24,15 @@
 ///! safely means teaching the poll path about the codec's buffer, which
 ///! is a separate change.)
 
-namespace Lsp::Protocol::Framing;
+namespace lsp::protocol::framing;
 
 import std::core::option;
 import std::core::result;
 import std::core::slice;
+import std::core::mem;
 import std::collections::str;
 import std::collections::string;
+import std::collections::string::{ String };
 import std::io::stdio;
 import std::io::error;
 import std::io::traits;
@@ -39,7 +41,7 @@ import std::io::traits;
 // Errors
 
 type enum FrameError {
-    Io(IoError);
+    Io(error::IoError);
     MissingContentLength;
     InvalidContentLength;
     UnexpectedEof;
@@ -95,7 +97,7 @@ type struct FrameCodec {
     /// parser.  `Ok(None)` means a clean EOF before any byte arrived (the
     /// client closed stdin between frames) - the server treats that as a
     /// normal exit if shutdown was requested.
-    static read_message(reader: mut &Stdin) -> Result<Option<String>, FrameError> {
+    static read_message(reader: mut &stdio::Stdin) -> Result<Option<String>, FrameError> {
         mut content_length: u64    = 0;
         mut got_length:    boolean = false;
         mut saw_any_byte:  boolean = false;
@@ -107,7 +109,7 @@ type struct FrameCodec {
                 Result::Ok(line_status) => {
                     match (line_status) {
                         LineStatus::Eof => {
-                            line_buf.drop();
+                            mem::drop(line_buf);
                             if (saw_any_byte) {
                                 return Result::Err(FrameError::UnexpectedEof);
                             }
@@ -126,7 +128,7 @@ type struct FrameCodec {
                                         got_length     = true;
                                     }
                                     Option::None => {
-                                        line_buf.drop();
+                                        mem::drop(line_buf);
                                         return Result::Err(FrameError::InvalidContentLength);
                                     }
                                 }
@@ -136,12 +138,12 @@ type struct FrameCodec {
                     }
                 }
                 Result::Err(e) => {
-                    line_buf.drop();
+                    mem::drop(line_buf);
                     return Result::Err(e);
                 }
             }
         }
-        line_buf.drop();
+        mem::drop(line_buf);
 
         if (!got_length) {
             return Result::Err(FrameError::MissingContentLength);
@@ -176,16 +178,16 @@ type struct FrameCodec {
             match (reader.read(&chunk[0], want)) {
                 Result::Ok(n) => {
                     if (n == 0) {
-                        body.drop();
+                        mem::drop(body);
                         return Result::Err(FrameError::UnexpectedEof);
                     }
                     // One memcpy per chunk (the `Str` view over `chunk`),
                     // versus a push per byte before.
-                    body.push(Str::from_raw(&chunk[0], n));
+                    body.push(str::Str::from_raw(&chunk[0], n));
                     read_so_far = read_so_far + n;
                 }
                 Result::Err(e) => {
-                    body.drop();
+                    mem::drop(body);
                     return Result::Err(FrameError::Io(e));
                 }
             }
@@ -197,7 +199,7 @@ type struct FrameCodec {
     /// the header block is closing; returns `Blank`.  `Eof` only when no
     /// byte arrived at all - once any byte is buffered, EOF means the
     /// peer hung up mid-header and we surface that as an error.
-    static read_header_line(reader: mut &Stdin, out: mut &String) -> Result<LineStatus, FrameError> {
+    static read_header_line(reader: mut &stdio::Stdin, out: mut &String) -> Result<LineStatus, FrameError> {
         mut prev_cr: boolean = false;
         mut got_any: boolean = false;
         mut byte:    u8      = 0;
@@ -241,20 +243,20 @@ type struct FrameCodec {
     }
 
     /// Case-sensitive prefix check (LSP fixes the casing).
-    static header_is_content_length(line: Str) -> boolean {
+    static header_is_content_length(line: str::Str) -> boolean {
         if (line.length() < HEADER_CONTENT_LENGTH_LEN) { return false; }
-        const head: Str = line.sub_bytes(0, HEADER_CONTENT_LENGTH_LEN);
-        return head.equals(&Str::from(HEADER_CONTENT_LENGTH));
+        const head: str::Str = line.sub_bytes(0, HEADER_CONTENT_LENGTH_LEN);
+        return head.equals(&str::Str::from(HEADER_CONTENT_LENGTH));
     }
 
-    static parse_content_length(line: Str) -> Option<u64> {
+    static parse_content_length(line: str::Str) -> Option<u64> {
         return FrameCodec::parse_u64_skip_ws(line.sub_bytes(
             HEADER_CONTENT_LENGTH_LEN, line.length()));
     }
 
     /// Skip leading SP / HTAB then parse decimal digits.  `None` on any
     /// non-digit (including a trailing comment, which LSP doesn't permit).
-    static parse_u64_skip_ws(s: Str) -> Option<u64> {
+    static parse_u64_skip_ws(s: str::Str) -> Option<u64> {
         const len: u64 = s.length();
         const ptr: u8* = s.as_ptr();
         mut i: u64 = 0;
@@ -283,16 +285,16 @@ type struct FrameCodec {
     /// Caller is responsible for flushing if their writer is buffered;
     /// `Stdout::write` is unbuffered so a one-frame-per-turn server
     /// doesn't need to.
-    static write_message(writer: mut &Stdout, body: Str) -> Result<(), IoError> {
+    static write_message(writer: mut &stdio::Stdout, body: str::Str) -> Result<(), error::IoError> {
         mut header: String = String::with_capacity(64);
         header.push("Content-Length: ");
         mut len_buf: u8[20];
         const len_digits: u64 = body.length().to_decimal_buf(&len_buf[0]);
-        header.push(Str::from_raw(&len_buf[0], len_digits));
+        header.push(str::Str::from_raw(&len_buf[0], len_digits));
         header.push("\r\n\r\n");
 
-        const w_header: Result<(), IoError> = writer.write(header.as_bytes());
-        header.drop();
+        const w_header: Result<(), error::IoError> = writer.write(header.as_bytes());
+        mem::drop(header);
         match (w_header) {
             Result::Ok(_)  => { }
             Result::Err(e) => { return Result::Err(e); }

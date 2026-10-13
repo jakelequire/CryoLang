@@ -4,18 +4,64 @@
 ///! Pratt-style precedence-climbing for binary operators, prefix/postfix
 ///! unary handling, and recursive type annotation parsing.
 
-namespace Compiler::Parser::ExprParser;
+namespace compiler::parser::expr_parser;
 
-import Compiler::Lex;
-import Compiler::Lex::Lexer;
-import Compiler::Diag;
-import Compiler::Diag::SourceSpan;
-import Compiler::AST;
-import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern };
-import Compiler::CompilationContext;
-import Compiler::Resolver::{ SymbolStr, QualifiedName };
-import Compiler::Parser::ParserBase;
-import Utils::Logger;
+import compiler::lex;
+import compiler::lex::{ Token, TokenType };
+import compiler::lex::lexer;
+import compiler::lex::lexer::{ Lexer };
+import std::collections::string;
+import std::collections::string::{ String };
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::ast;
+import compiler::ast::{
+    ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
+    ImplTraitAnnotation, LiteralKind, MemberPin, NamedAnnotation, node, NodeKind, pattern,
+    PatternBinding, PatternElement, PatternKind, PatternLiteralFloat, PatternLiteralInt,
+    PatternSub, PatternWildcard, PointerAnnotation, PrimitiveAnnotation,
+    ProjectionAnnotation, ReferenceAnnotation, statement, ThisTypeAnnotation,
+    TupleAnnotation, TypeAnnotation, TypeofAnnotation
+};
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::resolver::{ symbol_str, qualified_name };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, Res, ResSlot };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::parser::parser_base;
+import compiler::parser::parser_base::{ ParserBase };
+import utils::logger;
+import utils::logger::{ LOG_DEBUG, LogComponent };
+import compiler::diag::diagnostic;
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::suggestion;
+import compiler::diag::suggestion::{ Suggestion };
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::generic_registry;
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
+import std::fmt;
+import compiler::ast::declaration::{ VarDeclNode };
+import compiler::ast::expression::{
+    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
+    IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
+    ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode, StructLiteralNode,
+    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
+    YieldExprNode
+};
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::pattern::{
+    EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode
+};
+import compiler::ast::statement::{ BlockStmtNode, ExprStmtNode, MatchStmtNode, StatementNode };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_str::{ SymbolStr };
 
 
 // Monotonic counter for synthetic `??`-desugar binding names.  Match-arm
@@ -107,7 +153,7 @@ public:
             const right: ExpressionNode* = this.parse_conditional();
             if (right == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
-                    format("expected expression after '%s'", op.lexeme));
+                    fmt::format("expected expression after '%s'", op.lexeme));
                 return left;
             }
             const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
@@ -131,7 +177,7 @@ public:
                     "expression nesting too deep (null-coalesce recursion limit exceeded)");
                 return left;
             }
-            this.advance();
+            const op_tok: Token = this.advance();
             this.expr_depth += 1;
             const right: ExpressionNode* = this.parse_pipe();
             this.expr_depth -= 1;
@@ -141,7 +187,8 @@ public:
                 return left;
             }
             const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
-            left = this.desugar_null_coalesce(left, right, span);
+            left = this.desugar_null_coalesce(left, right, span,
+                                              this.span_from_token(op_tok));
         }
         return left;
     }
@@ -181,34 +228,44 @@ public:
     /// `a ?? b` => `match (a) { Option::Some(v) => { v } Option::None => { b } }`.
     /// `a` becomes the match scrutinee so it is evaluated exactly once, and
     /// `b` lands in the `None` arm so it is only evaluated when `a` is `None`.
+    ///
+    /// Every node synthesized here carries `op_span` (the `??` token) rather
+    /// than the expression's own extent.  The resolution map keys a reference
+    /// by its span's START position alone, so a synthesized name stamped with
+    /// `span` - which begins where `left` begins - collides with `left`'s own
+    /// key and overwrites it: a bare identifier operand then resolves to the
+    /// arm binding instead of itself, which reads as never-referenced (a W0001
+    /// false positive, and the wrong target for LSP hover and go-to-definition).
+    /// No user expression can begin at the operator's column, so stamping the
+    /// synthesized nodes there cannot collide with one.  `match_expr` keeps the
+    /// full extent because it is not a name and nothing records against it.
     desugar_null_coalesce(left: ExpressionNode*, right: ExpressionNode*,
-                          span: SourceSpan) -> ExpressionNode* {
+                          span: SourceSpan, op_span: SourceSpan) -> ExpressionNode* {
         g_coalesce_counter += 1;
-        const bind_str:  string    = format("__cryo_coalesce_%u", g_coalesce_counter);
+        const bind_str:  string    = fmt::format("__cryo_coalesce_%u", g_coalesce_counter);
         const bind_name: SymbolStr = this.ctx.intern(bind_str);
 
         mut match_expr: MatchExprNode* = new MatchExprNode(left, span);
 
         // Some(v) => { v }
-        mut some_pat: EnumPatternNode* = new EnumPatternNode(span);
-        some_pat.set_enum_name(this.ctx.intern("Option"));
-        some_pat.set_variant_name(this.ctx.intern("Some"));
-        const pb: PatternBinding* = new PatternBinding { name: bind_name, span: span };
+        mut some_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "Some", op_span);
+        const pb: PatternBinding* = new PatternBinding {
+            name: bind_name, span: op_span, sym_id: SymbolID::invalid(),
+            resolved_type: TypeRef::invalid(), written_mut: false
+        };
         some_pat.add_element(PatternElement::Binding(pb));
-        mut some_arm: MatchArmNode* = new MatchArmNode(span);
+        mut some_arm: MatchArmNode* = new MatchArmNode(op_span);
         some_arm.add_pattern(some_pat as PatternNode*);
-        const some_ident: IdentifierNode* = new IdentifierNode(bind_name, span);
-        const some_stmt:  ExprStmtNode*   = new ExprStmtNode(some_ident as ExpressionNode*, span);
-        mut some_block: BlockStmtNode* = new BlockStmtNode(span);
+        const some_ident: IdentifierNode* = new IdentifierNode(bind_name, op_span);
+        const some_stmt:  ExprStmtNode*   = new ExprStmtNode(some_ident as ExpressionNode*, op_span);
+        mut some_block: BlockStmtNode* = new BlockStmtNode(op_span);
         some_block.add_statement(some_stmt as StatementNode*);
         some_arm.set_body(some_block as StatementNode*);
         match_expr.add_arm(some_arm);
 
         // None => { b }
-        mut none_pat: EnumPatternNode* = new EnumPatternNode(span);
-        none_pat.set_enum_name(this.ctx.intern("Option"));
-        none_pat.set_variant_name(this.ctx.intern("None"));
-        mut none_arm: MatchArmNode* = new MatchArmNode(span);
+        const none_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "None", op_span);
+        mut none_arm: MatchArmNode* = new MatchArmNode(op_span);
         none_arm.add_pattern(none_pat as PatternNode*);
         const none_stmt: ExprStmtNode* = new ExprStmtNode(right, right.span);
         mut none_block: BlockStmtNode* = new BlockStmtNode(right.span);
@@ -217,6 +274,25 @@ public:
         match_expr.add_arm(none_arm);
 
         return match_expr as ExpressionNode*;
+    }
+
+    /// `Item::variant` as a pattern, where `item` is an enum the language
+    /// itself desugars through.  The pattern means the language's enum -
+    /// `x ?? d` and `for` are defined over `std::core::option::Option` -
+    /// whatever the writing module's scope holds under that leaf, and the
+    /// desugaring built the node, so it names the language item rather than
+    /// leaving a spelling for the name layer to look up in the user's scope
+    /// (`ResSlot::Lang`, answered once the item is claimed):
+    /// a module declaring its own `Option` would otherwise have its enum
+    /// matched against the language's value and refused.  The leaf stays on
+    /// the node for a diagnostic to print.
+    lang_variant_pattern(item: LangItem, variant: string, span: SourceSpan) -> EnumPatternNode* {
+        mut pat: EnumPatternNode* = new EnumPatternNode(span);
+        pat.set_enum_name(this.ctx.intern(item.leaf()));
+        pat.set_variant_name(this.ctx.intern(variant));
+        pat.res = ResSlot::Lang(item);
+        this.ctx.note_lang_ref(pat as ASTNode*, item);
+        return pat;
     }
 
     /// Parse ternary conditional (right-associative).
@@ -291,8 +367,26 @@ public:
             const op: Token = this.advance();
             const right: ExpressionNode* = this.parse_binary_expression(prec + 1);
             if (right == null) {
+                // `a < b >` with nothing an expression can start with after
+                // it is the shape a generic-argument list spelled without its
+                // `::` leaves behind - `Name<T>::m`, `Name<T> { .. }`,
+                // `f<T>` as a value - since `<` after a name is a comparison.
+                // Name the spelling; the reader is otherwise sent to fix a
+                // comparison they never wrote.
+                if (op.kind == TokenType::RAngle && left.kind == NodeKind::BinaryExpression
+                        && (left as BinaryExprNode*).op.kind == TokenType::LAngle) {
+                    this.panic_mode = true;
+                    this.error_count += 1;
+                    mut diag: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0102_EXPECTED_EXPRESSION,
+                        fmt::format("expected expression after '%s'", op.lexeme));
+                    diag = diag.at(this.current_span());
+                    diag = diag.with_note("`<` after a name is a comparison; generic arguments in expression position follow `::` - `Name::<T>::member`, `f::<T>(x)`, `Name::<T> { .. }`");
+                    this.ctx.emit_diagnostic(diag);
+                    return left;
+                }
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
-                    format("expected expression after '%s'", op.lexeme));
+                    fmt::format("expected expression after '%s'", op.lexeme));
                 return left;
             }
             const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
@@ -324,15 +418,16 @@ public:
                 // `a..=b` => `RangeInclusive::new(a, b)`.  The range types
                 // are stdlib (`std::core::ops`); sema/codegen never see a
                 // dedicated range operator, just a static constructor call.
-                const ctor_scope: SymbolStr = this.ctx.intern(
-                    if (op.kind == TokenType::DotDotEq) {
-                        "RangeInclusive"
-                    } else {
-                        "Range"
-                    });
+                // The scope names the language's type by its definition, so a
+                // module declaring its own `Range` keeps its range literals.
+                const range_item: LangItem =
+                    if (op.kind == TokenType::DotDotEq) { LangItem::RangeInclusive } else { LangItem::Range };
+                const ctor_scope: SymbolStr = this.ctx.intern(range_item.leaf());
                 const new_name: SymbolStr = this.ctx.intern("new");
-                const sr: ScopeResolutionNode* = new ScopeResolutionNode(
+                mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
                     ctor_scope, new_name, span);
+                sr.scope_res = ResSlot::Lang(range_item);
+                this.ctx.note_lang_ref(sr as ASTNode*, range_item);
                 mut call: CallExprNode* =
                     new CallExprNode(sr as ExpressionNode*, span);
                 call.add_argument(left);
@@ -354,52 +449,37 @@ public:
         while (this.check(TokenType::KwAs)) {
             this.advance();
             mut target: TypeAnnotation* = null;
-            // A parenthesized cast target - function `(T) -> R`, tuple
-            // `(T, U)`, unit `()`, or grouping `(T)` - cannot be reached
-            // through parse_base_type, which has no LParen branch.  The
-            // narrow entry below is deliberate for bare base types (it keeps
-            // `x as u64 * 8` parsing as `(x as u64) * 8`), but that ambiguity
-            // needs a base type sitting to the left of the `*`; a leading `(`
-            // can never be a binary operator, so delegate to the same paren
-            // parser the annotation grammar uses.  It consumes its own
-            // suffixes, so the `*` disambiguation must not run over it again.
+            // `as const T*` casts to a pointer-to-const; the const binds
+            // to the first pointer suffix (threaded via
+            // parse_type_suffixes_q).
+            mut pending_const: boolean = false;
+            if (this.check(TokenType::KwConst)) {
+                this.advance();
+                pending_const = true;
+            }
+            // The target's base first, then its suffixes selectively: `x as
+            // u64 * 8` is (x as u64) * 8, not x as (u64*) followed by an
+            // orphaned 8.  A parenthesized base - function `(T) -> R`, tuple
+            // `(T, U)`, unit `()`, grouping `(T)` - is read by the paren
+            // parser the annotation grammar uses; parse_base_type has no
+            // `(` branch.
             if (this.check(TokenType::LParen)) {
                 target = this.parse_paren_type();
-                if (target == null) {
-                    this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                        "expected type after 'as'");
-                    return expr;
-                }
             } else {
-                // `as const T*` casts to a pointer-to-const; the const binds
-                // to the first pointer suffix (threaded via
-                // parse_type_suffixes_q).
-                mut pending_const: boolean = false;
-                if (this.check(TokenType::KwConst)) {
-                    this.advance();
-                    pending_const = true;
-                }
-                // Parse base type first, then selectively apply suffixes.
-                // This resolves the ambiguity: `x as u64 * 8` should be
-                // (x as u64) * 8, not x as (u64*) followed by orphaned 8.
-                // We consume * as pointer suffix only if it's NOT followed
-                // by a token that could start an expression (number, ident, etc.).
                 target = this.parse_base_type();
-                if (target == null) {
-                    this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                        "expected type after 'as'");
-                    return expr;
-                }
-                // Apply pointer/array suffixes only when * is not an operator.
-                // Disambiguate: `x as u64 * 8` -> (x as u64) * 8, not x as (u64*)
-                // Heuristic: * is a pointer suffix if followed by a non-expression
-                // token (;  )  }  ]  ,  as  EOF).  Otherwise it's multiplication.
-                if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
-                    target = this.parse_type_suffixes_q(target, pending_const);
-                } else if (!this.check(TokenType::Star)) {
-                    // Non-star suffixes ([], ?) are unambiguous
-                    target = this.parse_type_suffixes_q(target, pending_const);
-                }
+            }
+            if (target == null) {
+                this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                    "expected type after 'as'");
+                return expr;
+            }
+            // `*` is a pointer suffix when followed by a token that cannot
+            // start an expression (;  )  }  ]  ,  as  EOF); otherwise it is
+            // multiplication.  Other suffixes ([], ?) are unambiguous.
+            if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
+                target = this.parse_type_suffixes_q(target, pending_const);
+            } else if (!this.check(TokenType::Star)) {
+                target = this.parse_type_suffixes_q(target, pending_const);
             }
             const span: SourceSpan = ParserBase::merge_spans(expr.span, this.current_span());
             expr = new CastExprNode(expr, target, span);
@@ -430,7 +510,7 @@ public:
             this.unary_depth -= 1;
             if (operand == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
-                    format("expected expression after unary '%s'", op.lexeme));
+                    fmt::format("expected expression after unary '%s'", op.lexeme));
                 return null;
             }
             const span: SourceSpan = ParserBase::merge_spans(
@@ -508,11 +588,19 @@ public:
                 mut carried_gen_args: TypeAnnotation*[] = [];
                 if (expr.kind == NodeKind::ScopeResolution) {
                     const psr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+                    // An impl-qualified path names one member of one
+                    // implementation; folding it into a longer scope would
+                    // drop the trait that qualifies it.
+                    if (psr.impl_trait != null) {
+                        this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN,
+                            "`(Trait for Type)::member` names one member; it cannot be extended with `::`");
+                        break;
+                    }
                     const scope_part: string  = this.ctx.intern_table.resolve(psr.scope_name);
                     const member_part: string = this.ctx.intern_table.resolve(psr.member_name);
                     if (scope_part.length() > 0) {
                         scope_name = this.ctx.intern_table.intern(
-                            format("%s::%s", scope_part, member_part));
+                            fmt::format("%s::%s", scope_part, member_part));
                     } else {
                         scope_name = psr.member_name;
                     }
@@ -530,7 +618,11 @@ public:
                 } else {
                     scope_name = this.get_expr_name(expr);
                 }
-                expr = this.parse_scope_member(scope_name, carried_gen_args, expr.span);
+                const this_type_head: boolean = expr.kind == NodeKind::Identifier
+                    && (expr as IdentifierNode*).is_this_type_keyword;
+                mut sr: ScopeResolutionNode* = this.parse_scope_member(scope_name, carried_gen_args, expr.span);
+                sr.scope_is_this_type = this_type_head;
+                expr = sr as ExpressionNode*;
             } else if (this.check(TokenType::LBrace)
                        && expr.kind == NodeKind::ScopeResolution
                        && !this.struct_lit_suppressed()
@@ -549,7 +641,7 @@ public:
                 const scope_s: string  = this.ctx.intern_table.resolve(sr.scope_name);
                 const member_s: string = this.ctx.intern_table.resolve(sr.member_name);
                 const qname: SymbolStr = this.ctx.intern_table.intern(
-                    format("%s::%s", scope_s, member_s));
+                    fmt::format("%s::%s", scope_s, member_s));
                 // Deep-clone the member generic args; `sr` owns its pointees.
                 mut sl_gen: TypeAnnotation*[] = [];
                 for (mut gi: i64 = 0; gi < sr.generic_args.length; gi++) {
@@ -628,7 +720,9 @@ public:
         if (tok.kind == TokenType::KwThis) {
             const ttok: Token = this.advance();
             const name: SymbolStr = this.intern_lexeme(ttok);
-            return new IdentifierNode(name, this.span_from_token(ttok));
+            mut id: IdentifierNode* = new IdentifierNode(name, this.span_from_token(ttok));
+            id.is_this_keyword = true;
+            return id;
         }
 
         if (tok.kind == TokenType::KwIf) {
@@ -729,11 +823,13 @@ public:
         if (tok.kind.is_keyword()) {
             const ktok: Token = this.advance();
             const name: SymbolStr = this.intern_lexeme(ktok);
-            return new IdentifierNode(name, this.span_from_token(ktok));
+            mut id: IdentifierNode* = new IdentifierNode(name, this.span_from_token(ktok));
+            id.is_this_type_keyword = ktok.kind == TokenType::KwThisType;
+            return id;
         }
 
         this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
-            format("expected expression, found '%s'", tok.lexeme));
+            fmt::format("expected expression, found '%s'", tok.lexeme));
         return null;
     }
 
@@ -756,7 +852,7 @@ public:
             }
         }
         if (!is_special_base) {
-            for (mut i: int = 0; i < tok.lexeme.length(); i++) {
+            for (mut i: u64 = 0; i < tok.lexeme.length(); i++) {
                 const c: char = tok.lexeme[i];
                 if (c == '.' || c == 'e' || c == 'E') {
                     kind = LiteralKind::Float;
@@ -772,7 +868,9 @@ public:
     /// Parse a string literal.
     parse_string_literal() -> ExpressionNode* {
         const tok: Token = this.advance();
-        return new LiteralNode(tok.lexeme, LiteralKind::String, this.span_from_token(tok));
+        mut lit: LiteralNode* = new LiteralNode(tok.lexeme, LiteralKind::String, this.span_from_token(tok));
+        lit.byte_length = tok.text_length;
+        return lit;
     }
 
     /// Parse a character literal.
@@ -954,12 +1052,15 @@ public:
     /// Flush the literal run `raw[start, end)` into `acc` as a
     /// `fmt_append_lit(acc, "<escape-processed>")` call.  No-op when empty.
     /// Uses `this.fstr_span` for synthesized node spans.
-    fstr_flush_range(acc: ExpressionNode*, raw: string,
+    fstr_flush_range(acc: ExpressionNode*, raw_text: string,
                      start: i64, end: i64) -> ExpressionNode* {
+        const raw: string = raw_text;
         if (end <= start) { return acc; }
         const text_raw: string = raw.substr(start, end - start);
-        const text: string = Lexer::process_escape_sequences(text_raw);
-        const lit: LiteralNode* = new LiteralNode(text, LiteralKind::String, this.fstr_span);
+        const text: String = Lexer::process_escape_sequences(text_raw);
+        const byte_length: i64 = text.length() as i64;
+        mut lit: LiteralNode* = new LiteralNode(text.into_raw(), LiteralKind::String, this.fstr_span);
+        lit.byte_length = byte_length;
         return this.fstr_call2("fmt_append_lit", acc, lit as ExpressionNode*);
     }
 
@@ -991,15 +1092,16 @@ public:
     /// would sit at 1:1 and collide in the resolution map, so a local used only
     /// inside an f-string looks unreferenced (W0001 false positive) and LSP
     /// hover/def point nowhere.
-    fstr_parse_hole(src: string, base_line: int, base_col: int) -> ExpressionNode* {
-        mut lx: Lexer = Lexer::new("<fstring>", src, this.ctx.diagnostics);
+    fstr_parse_hole(src_text: string, base_line: int, base_col: int) -> ExpressionNode* {
+        mut lx: Lexer = Lexer::new("<fstring>", src_text, this.ctx.diagnostics);
         lx.seed_location(base_line, base_col);
         const hole_toks: Token[] = lx.lex();
         return this.parse_expr_from_tokens(hole_toks);
     }
 
     /// Length of `s` with trailing ASCII whitespace trimmed.
-    fstr_rstrip_len(s: string) -> i64 {
+    fstr_rstrip_len(s_text: string) -> i64 {
+        const s: string = s_text;
         mut n: i64 = s.length() as i64;
         while (n > 0) {
             const ch: char = *(s + n - 1) as char;
@@ -1035,13 +1137,14 @@ public:
     /// mixing a bare ternary with a spec must parenthesise the ternary; an
     /// idiomatic `a ? b : c` (spaces around `:`) is caught by the caller's
     /// grammar check failing on the leading space, leaving the hole intact.
-    fstr_find_spec_colon(s: string, tl: i64) -> i64 {
+    fstr_find_spec_colon(s_text: string, tl: i64) -> i64 {
+        const s: string = s_text;
         mut depth: i64 = 0;
         mut i: i64 = 0;
         while (i < tl) {
             const c: char = *(s + i) as char;
             if (c == '"' || c == '\'') {
-                i = this.fstr_skip_quoted(s, tl, i, c);
+                i = this.fstr_skip_quoted(s_text, tl, i, c);
                 continue;
             }
             if (c == '(' || c == '[' || c == '{') {
@@ -1065,7 +1168,8 @@ public:
     /// `< > ^` and `type` is `x X o b`.  Rejecting an ill-formed suffix is
     /// what lets a ternary's ` : b` fall back to being part of the
     /// expression rather than a (broken) spec.
-    fstr_spec_is_valid(s: string) -> boolean {
+    fstr_spec_is_valid(s_text: string) -> boolean {
+        const s: string = s_text;
         const n: i64 = s.length() as i64;
         if (n == 0) { return false; }
         mut i: i64 = 0;
@@ -1110,7 +1214,8 @@ public:
     /// Advance past a string/char literal in a hole scan.  `j` indexes the
     /// opening quote `q`; returns the index just past the closing quote (or
     /// end-of-template if unterminated, leaving the outer scan to fail).
-    fstr_skip_quoted(src: string, len: i64, j: i64, q: char) -> i64 {
+    fstr_skip_quoted(src_text: string, len: i64, j: i64, q: char) -> i64 {
+        const src: string = src_text;
         mut k: i64 = j + 1;
         while (k < len) {
             const ck: char = *(src + k) as char;
@@ -1121,75 +1226,75 @@ public:
         return k;
     }
 
+    /// True at `::<`: the turbofish, the one place `<` opens generic
+    /// arguments in expression position.  `<` anywhere else is a comparison,
+    /// so `g(LIMIT < x, MAXV > (y))` is two comparisons whatever `LIMIT` and
+    /// `MAXV` name, and `Vec::<i32>::new()` is a path whose every `::` after
+    /// the arguments is an ordinary step.
+    at_turbofish() -> boolean {
+        return this.check(TokenType::ColonColon) && this.peek_at(1).kind == TokenType::LAngle;
+    }
+
     /// Parse an identifier, handling scope resolution, generic calls, and struct literals.
     parse_identifier_or_call() -> ExpressionNode* {
         const tok: Token = this.advance();
         const name: SymbolStr = this.intern_lexeme(tok);
         mut expr: ExpressionNode* = new IdentifierNode(name, this.span_from_token(tok));
 
-        // Check for generic args: Name<T, U>.
-        //
-        // A name bound to a value - a parameter, a local, or a module-level
-        // global - is not a generic function or type, so its `<` is a
-        // comparison however much the following tokens resemble type
-        // arguments. This is what settles `f(a < b, c > (d))`, which the token
-        // scan alone reads as the generic call `a<b, c>(d)`. Names that bind
-        // no known value - including everything imported - still go to the
-        // scan.
-        if (this.check(TokenType::LAngle) && !this.binds_a_value(name) &&
-            this.is_generic_call_ahead()) {
-            // Record whether this was knowledge or a guess. Knowing the name is
-            // declared generic in this module settles it; otherwise only the
-            // token scan spoke, and the same text may have been comparisons.
-            if (!this.is_generic_decl_name(name)) {
-                (expr as IdentifierNode*).set_generic_angle_guessed(true);
-            }
-            const gen_args: TypeAnnotation*[] = this.parse_generic_args();
+        // Generic arguments on the name: `Name::<T, U>`.  A bare `<` after a
+        // name is a comparison, whatever the name binds.
+        if (this.at_turbofish()) {
+            this.advance(); // consume '::'
+            return this.parse_generic_head(expr, name, tok);
+        }
+        return this.parse_identifier_tail(expr, name, tok);
+    }
 
-            // After generic args, check what follows
-            if (this.check(TokenType::LParen)) {
-                // Generic function call: func<T>(args)
-                // Check if uppercase first char -> struct constructor
-                if (tok.lexeme.length() > 0 && tok.lexeme[0] >= 'A' && tok.lexeme[0] <= 'Z') {
-                    // Could be struct constructor or function call; check for '{'
-                    // For now treat all Name<T>(...) as call
-                }
-                mut call: CallExprNode* = new CallExprNode(expr, expr.span);
-                call.set_generic_args(gen_args);
-                this.advance(); // consume '('
-                if (!this.check(TokenType::RParen)) {
-                    while (true) {
-                        const arg: ExpressionNode* = this.parse_expression();
-                        if (arg != null) {
-                            call.add_argument(arg);
-                        }
-                        if (!this.match_tok(TokenType::Comma)) {
-                            break;
-                        }
+    /// The generic-argument list on a name and what follows it: a call
+    /// `f::<T>(..)`, a struct literal `Name::<T> { .. }`, a scope step
+    /// `Name::<T>::member`, or the generic function itself as a value
+    /// (`tramp::<i32>` passed, cast or assigned).  The cursor is on the `<`.
+    parse_generic_head(expr: ExpressionNode*, name: SymbolStr, tok: Token) -> ExpressionNode* {
+        mut head: ExpressionNode* = expr;
+        const gen_args: TypeAnnotation*[] = this.parse_generic_args();
+
+        if (this.check(TokenType::LParen)) {
+            mut call: CallExprNode* = new CallExprNode(head, head.span);
+            call.set_generic_args(gen_args);
+            this.advance(); // consume '('
+            if (!this.check(TokenType::RParen)) {
+                while (true) {
+                    const arg: ExpressionNode* = this.parse_expression();
+                    if (arg != null) {
+                        call.add_argument(arg);
+                    }
+                    if (!this.match_tok(TokenType::Comma)) {
+                        break;
                     }
                 }
-                this.consume(TokenType::RParen, "')'");
-                call.span = this.span_from(tok);
-                return call;
-            } else if (this.check(TokenType::LBrace) && !this.struct_lit_suppressed()) {
-                // Generic struct literal: Name<T> { field: value }
-                return this.parse_struct_literal_body(name, gen_args, tok);
-            } else if (this.check(TokenType::ColonColon)) {
-                // Generic scope resolution: Name<T>::member
-                this.advance(); // consume '::'
-                expr = this.parse_scope_member(name, gen_args, this.span_from_token(tok));
-            } else {
-                // Generic args parsed but no `(`, `{`, or `::` follows: this is
-                // a generic function-reference VALUE, e.g. `tramp<i32>` used as
-                // a value (passed/cast/assigned, not called). Attach the args to
-                // the identifier so the monomorphizer can instantiate the named
-                // template for them and codegen can reference the specialized
-                // symbol. `expr` is the IdentifierNode built at the top of this
-                // routine; nothing else has consumed it yet.
-                (expr as IdentifierNode*).set_generic_args(gen_args);
             }
-            // Generic args parsed but nothing useful follows; just continue with postfix
+            this.consume(TokenType::RParen, "')'");
+            call.span = this.span_from(tok);
+            return call;
+        } else if (this.check(TokenType::LBrace) && !this.struct_lit_suppressed()) {
+            return this.parse_struct_literal_body(name, gen_args, tok);
+        } else if (this.check(TokenType::ColonColon)) {
+            this.advance(); // consume '::'
+            head = this.parse_scope_member(name, gen_args, this.span_from_token(tok));
+        } else {
+            // The args are attached to the identifier so the monomorphizer can
+            // instantiate the named template for them and codegen can
+            // reference the specialized symbol.  `head` is the IdentifierNode
+            // built by the caller; nothing else has consumed it yet.
+            (head as IdentifierNode*).set_generic_args(gen_args);
         }
+        return this.parse_identifier_tail(head, name, tok);
+    }
+
+    /// What may follow a name, with or without generic arguments: a scope
+    /// step `Name::member` and a struct literal `Name { field: value }`.
+    parse_identifier_tail(expr_in: ExpressionNode*, name: SymbolStr, tok: Token) -> ExpressionNode* {
+        mut expr: ExpressionNode* = expr_in;
 
         // Check for scope resolution without generic args: Name::member
         if (this.check(TokenType::ColonColon)) {
@@ -1218,7 +1323,7 @@ public:
                 const scope_s: string  = this.ctx.intern_table.resolve(sr.scope_name);
                 const member_s: string = this.ctx.intern_table.resolve(sr.member_name);
                 lit_name = this.ctx.intern_table.intern(
-                    format("%s::%s", scope_s, member_s));
+                    fmt::format("%s::%s", scope_s, member_s));
                 // Deep-clone: `sr` owns its `generic_args` pointees; a shallow
                 // alias would let both `sr` and the struct literal free the
                 // same nodes. Mirrors the `new Type {}` clone at the heap path.
@@ -1239,6 +1344,13 @@ public:
         const tok1: Token = this.peek_at(1);
         const tok2: Token = this.peek_at(2);
         if (tok1.kind == TokenType::Identifier && tok2.kind == TokenType::Colon) {
+            return true;
+        }
+        // A keyword can name a field (`type: 1`), so it opens a literal too.
+        // Only the `keyword :` form: a keyword binds no local, so the
+        // shorthand below could never refer to one, and leaving it out keeps
+        // a block whose first statement begins with a keyword unambiguous.
+        if (tok1.kind.is_keyword() && tok2.kind == TokenType::Colon) {
             return true;
         }
         // Shorthand field init: { ident , ... } or { ident }
@@ -1263,7 +1375,17 @@ public:
         this.consume(TokenType::LBrace, "'{'");
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            const field_tok: Token = this.consume(TokenType::Identifier, "field name");
+            // A field may be named by a keyword (`type: 1`), because a bound C
+            // struct's member names are not the language's to choose.  Inside
+            // a literal body the token is unambiguously a field name, which is
+            // the same reason `.` and `::` already accept one.
+            mut field_tok: Token = this.current();
+            if (field_tok.kind == TokenType::Identifier
+                    || field_tok.kind.is_keyword()) {
+                this.advance();
+            } else {
+                field_tok = this.consume(TokenType::Identifier, "field name");
+            }
             const field_name: SymbolStr = this.intern_lexeme(field_tok);
 
             // Shorthand field init: { field } is sugar for { field: field }
@@ -1280,7 +1402,9 @@ public:
             const init: FieldInit = FieldInit {
                 field_name: field_name,
                 value:      value,
-                span:       field_span,
+                span:        field_span,
+                pin:         MemberPin::None,
+                pin_carried: false,
             };
             lit.add_field_init(init);
 
@@ -1317,6 +1441,13 @@ public:
             }
             // Void literal / unit value: create null literal
             return new LiteralNode("void", LiteralKind::Null, this.span_from(start));
+        }
+
+        // Impl-qualified path: `(Trait for Type)::member`.  A `for` at the
+        // group's own depth is never an expression, so the shape is decided
+        // before the lambda and tuple readings are tried.
+        if (this.looks_like_impl_head()) {
+            return this.parse_impl_qualified_path(start);
         }
 
         // Check for lambda: (name: Type, ...) -> body
@@ -1391,6 +1522,105 @@ public:
         return false;
     }
 
+    /// Lookahead: does the paren group just opened (the `(` consumed, `pos`
+    /// at its first token) hold a `for` at its own depth?  Nothing an
+    /// expression can be has `for` inside its parentheses - a lambda body's
+    /// `for` sits behind its `->` and braces - so the shape is an
+    /// impl-qualified head, `(Trait for Type)`.  Bracketed groups the head's
+    /// type arguments may carry (a tuple type) nest; a `for` inside one is
+    /// no expression either, and is left to the type parser to refuse.
+    looks_like_impl_head(&this) -> boolean {
+        mut depth: int = 1;
+        mut off:   int = 0;
+        while (off < 4096) {
+            const k: TokenType = this.peek_at(off).kind;
+            if (k == TokenType::EOF) { return false; }
+            if (k == TokenType::LParen || k == TokenType::LSquare || k == TokenType::LBrace) {
+                depth += 1;
+            } else if (k == TokenType::RParen || k == TokenType::RSquare || k == TokenType::RBrace) {
+                depth -= 1;
+                if (depth == 0) { return false; }
+            } else if (k == TokenType::KwFor && depth == 1) {
+                return true;
+            }
+            off += 1;
+        }
+        return false;
+    }
+
+    /// `(Trait for Type)::member`, the `(` consumed: the member THAT trait's
+    /// implementation for the type delivers, where the bare `Type::member`
+    /// would tie between two traits providing it.  The head reuses `for`
+    /// exactly as `implement trait Trait for Type` writes it.
+    ///
+    /// The path is a `Type::member` path whose scope segment is the target -
+    /// its name and generic arguments, as `Type<Args>::member` carries them -
+    /// with the trait beside it; so the target is what a scope segment can
+    /// name, a type by name with arguments or a primitive, as an impl head's
+    /// target is, and the trait is a name with arguments as an impl head's
+    /// trait is.
+    parse_impl_qualified_path(start: Token) -> ExpressionNode* {
+        const trait_ann: TypeAnnotation* = this.parse_type_annotation();
+        this.consume(TokenType::KwFor, "'for'");
+        const target_ann: TypeAnnotation* = this.parse_type_annotation();
+        this.consume(TokenType::RParen, "')'");
+        if (this.panic_mode || trait_ann == null || target_ann == null) { return null; }
+        const head_span: SourceSpan = this.span_from(start);
+
+        mut trait_ok: boolean = false;
+        match (*trait_ann) {
+            TypeAnnotation::Named(_)   => { trait_ok = true; }
+            TypeAnnotation::Generic(g) => {
+                match (*g.base) {
+                    TypeAnnotation::Named(_) => { trait_ok = true; }
+                    _                        => { }
+                }
+            }
+            _ => { }
+        }
+        if (!trait_ok) {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "expected a trait name before `for` in `(Trait for Type)::member`");
+            return null;
+        }
+
+        mut scope_name: SymbolStr = SymbolStr::empty();
+        mut scope_args: TypeAnnotation*[] = [];
+        match (*target_ann) {
+            TypeAnnotation::Named(n)     => { scope_name = n.name; }
+            TypeAnnotation::Primitive(p) => { scope_name = p.name; }
+            TypeAnnotation::Generic(g)   => {
+                match (*g.base) {
+                    TypeAnnotation::Named(n) => {
+                        scope_name = n.name;
+                        // Deep-clone: `g` owns its pointees.
+                        for (mut gi: i64 = 0; gi < g.args.length; gi++) {
+                            scope_args.push(TypeAnnotation::clone_ptr(g.args[gi]));
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        if (!scope_name.is_valid()) {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "expected a type name after `for` in `(Trait for Type)::member`, as an impl head's target is written");
+            return null;
+        }
+
+        if (!this.check(TokenType::ColonColon)) {
+            this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN,
+                fmt::format("expected `::` and a member after `(Trait for Type)`, found '%s'",
+                    this.current().lexeme));
+            return null;
+        }
+        this.advance(); // consume '::'
+        mut sr: ScopeResolutionNode* = this.parse_scope_member(scope_name, scope_args, head_span);
+        sr.set_impl_trait(trait_ann);
+        return sr;
+    }
+
     /// Parse a lambda starting from the parameter list (after '(' was consumed).
     /// Lambdas accept a stripped-down parameter form: `name` or `name: Type`,
     /// without `mut`, default values, or variadics. Kept inline (rather than
@@ -1445,7 +1675,7 @@ public:
         this.consume(TokenType::Arrow, "'->'");
 
         mut lambda: LambdaExprNode* = new LambdaExprNode(this.span_from_token(start));
-        for (mut i: int = 0; i < params.length; i++) {
+        for (mut i: i64 = 0; i < params.length; i++) {
             lambda.add_parameter(params[i]);
         }
 
@@ -1541,6 +1771,22 @@ public:
     }
 
     /// Parse a new expression: new Type(args) or new Type[size]
+    /// Consume `::segment` pairs and append them to `path`.
+    ///
+    /// A keyword is accepted as a segment because `new Enum::new` is legal -
+    /// a variant may be spelled with one.
+    append_path_segments(&this, path: string) -> string {
+        mut out: string = path;
+        while (this.check(TokenType::ColonColon)
+               && (this.peek_at(1).kind == TokenType::Identifier
+                   || this.peek_at(1).kind.is_keyword())) {
+            this.advance();
+            const seg_tok: Token = this.advance();
+            out = fmt::format("%s::%s", out, seg_tok.lexeme);
+        }
+        return out;
+    }
+
     parse_new_expression() -> ExpressionNode* {
         const start: Token = this.advance(); // consume 'new'
         // The target type is usually a user-defined name (Identifier), but
@@ -1555,52 +1801,34 @@ public:
         } else {
             type_tok = this.consume(TokenType::Identifier, "type name");
         }
-        const type_name: SymbolStr = this.intern_lexeme(type_tok);
+        // The WHOLE path is recorded and nothing is decided here.  `new A::B`
+        // can name a type `B` in module `A` or variant `B` of enum `A`, and
+        // the two are told apart by what the path resolves to, not by how it
+        // is spelled - the same rule every other path in the language follows.
+        // Deciding at the parser is what made `new Lib::Widget` take `Lib` as
+        // the type and fail in codegen.
+        mut path: string = type_tok.lexeme;
+        path = this.append_path_segments(path);
+        mut type_name: SymbolStr = this.ctx.intern(path);
         mut node: NewExprNode* = new NewExprNode(type_name, this.span_from_token(start));
 
-        // Optional generic args on the type: new Type<T>(...)
+        // Optional generic args on the type: `new Type<T>(...)`.  The operand
+        // of `new` is a type, so a `<` here is never a comparison.
         // Scope `scope_gen_args` to this branch: it is moved into the node
         // unconditionally here and never read afterwards, so a branch-local
         // binding leaves nothing conditionally moved past the if.
-        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+        if (this.check(TokenType::LAngle)) {
             const scope_gen_args: TypeAnnotation*[] = this.parse_generic_args();
             node.set_generic_args(scope_gen_args);
         }
 
-        // Enum variant construction: new EnumType::Variant(args)
-        // The '::' means this is a heap-allocated enum variant, not a struct.
-        // Consume the ::Variant(args) and store the variant name + arguments
-        // on the NewExprNode.  Codegen reads variant_name to dispatch to
-        // build_enum_variant; without it, the class-`new` path would just
-        // malloc and return uninitialized memory, leaving every callsite
-        // with a TypeAnnotation pointer whose tag/payload bytes look like
-        // glibc bin-head pointers.
-        if (this.check(TokenType::ColonColon)) {
-            this.advance(); // consume '::'
-            // Consume the variant name (identifier or keyword like 'new')
-            if (this.check(TokenType::Identifier) || this.current().kind.is_keyword()) {
-                const variant_tok: Token = this.advance();
-                node.set_variant_name(this.intern_lexeme(variant_tok));
-            }
-            // Parse call arguments: new Enum::Variant(payload)
-            if (this.check(TokenType::LParen)) {
-                this.advance();
-                if (!this.check(TokenType::RParen)) {
-                    while (true) {
-                        const arg: ExpressionNode* = this.parse_expression();
-                        if (arg != null) {
-                            node.add_argument(arg);
-                        }
-                        if (!this.match_tok(TokenType::Comma)) {
-                            break;
-                        }
-                    }
-                }
-                this.consume(TokenType::RParen, "')'");
-            }
-            node.span = this.span_from(start);
-            return node;
-        }
+        // Generic arguments bind to the TYPE, so a variant segment can follow
+        // them: `new Option<i64>::Some(41)`.  The path is continued here for
+        // the same reason it is not decided at all - the segments are recorded
+        // and the split is resolution's.
+        path = this.append_path_segments(path);
+        type_name = this.ctx.intern(path);
+        node.type_name = type_name;
 
         if (this.check(TokenType::LParen)) {
             // Constructor call: new Type(args)
@@ -1650,39 +1878,18 @@ public:
     parse_sizeof_expression() -> ExpressionNode* {
         const start: Token = this.advance(); // consume 'sizeof'
         this.consume(TokenType::LParen, "'('");
-        const type_tok: Token = this.current();
-        const type_name: SymbolStr = this.intern_lexeme(type_tok);
-        const type_span: SourceSpan = this.span_from_token(type_tok);
-
-        // Parse the full type expression (with generics, references, etc.)
-        // and stash it on the node so that monomorphization can substitute
-        // generic params and type_resolution can produce a concrete
-        // resolved_type for codegen.  Without this, `sizeof(HashMapEntry<K, V>)`
-        // collapses to bare `HashMapEntry` at codegen and the spec lookup fails.
         const ann: TypeAnnotation* = this.parse_type_annotation();
-
         this.consume(TokenType::RParen, "')'");
-        const node: SizeofExprNode* = new SizeofExprNode(type_name, type_span, this.span_from(start));
-        if (ann != null) { node.set_type_ann(ann); }
-        return node;
+        return new SizeofExprNode(ann, this.span_from(start));
     }
 
     /// Parse alignof(Type): supports qualified names and generic args.
     parse_alignof_expression() -> ExpressionNode* {
         const start: Token = this.advance(); // consume 'alignof'
         this.consume(TokenType::LParen, "'('");
-        const type_tok: Token = this.current();
-        const type_name: SymbolStr = this.intern_lexeme(type_tok);
-        const type_span: SourceSpan = this.span_from_token(type_tok);
-
-        // Parse the full type expression; see parse_sizeof_expression for
-        // why we don't just consume and discard the generic args.
         const ann: TypeAnnotation* = this.parse_type_annotation();
-
         this.consume(TokenType::RParen, "')'");
-        const node: AlignofExprNode* = new AlignofExprNode(type_name, type_span, this.span_from(start));
-        if (ann != null) { node.set_type_ann(ann); }
-        return node;
+        return new AlignofExprNode(ann, this.span_from(start));
     }
 
     /// Parse typeof(expr)
@@ -1778,7 +1985,7 @@ public:
         mut match_expr: MatchExprNode* = new MatchExprNode(subject, this.span_from_token(start));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            const before_pos: int = this.pos;
+            const before_pos: i64 = this.pos;
             const arm: MatchArmNode* = this.parse_expr_match_arm();
             if (arm != null) {
                 match_expr.add_arm(arm);
@@ -1815,7 +2022,7 @@ public:
             scrutinee, this.span_from_token(start));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            const before_pos: int = this.pos;
+            const before_pos: i64 = this.pos;
             const arm: StaticMatchArmNode* = this.parse_static_match_arm();
             if (arm != null) {
                 sm.add_arm(arm);
@@ -2036,7 +2243,7 @@ public:
         }
 
         this.report_error(ErrorCode::E0113_INVALID_PATTERN,
-            format("expected pattern, found '%s'", this.current().lexeme));
+            fmt::format("expected pattern, found '%s'", this.current().lexeme));
         return null;
     }
 
@@ -2082,7 +2289,7 @@ public:
             hi_kind = LiteralKind::Char;
         } else {
             this.report_error(ErrorCode::E0113_INVALID_PATTERN,
-                format("expected a literal high bound after '..', found '%s'",
+                fmt::format("expected a literal high bound after '..', found '%s'",
                        hi_tok.lexeme));
             return pat;
         }
@@ -2129,7 +2336,7 @@ public:
         mut enum_path: string = first_tok.lexeme;
         mut path_end_tok: Token = first_tok;
         while (this.check(TokenType::ColonColon)) {
-            enum_path = format("%s::%s", enum_path, variant_tok.lexeme);
+            enum_path = fmt::format("%s::%s", enum_path, variant_tok.lexeme);
             path_end_tok = variant_tok;
             this.advance(); // consume '::'
             variant_tok = this.consume(TokenType::Identifier, "variant name");
@@ -2147,10 +2354,12 @@ public:
         if (this.check(TokenType::LParen)) {
             this.advance();
             while (!this.check(TokenType::RParen) && !this.is_at_end()) {
-                // Optional `mut` modifier on a binding: purely syntactic
-                // here; the binding itself is mutable when the matched arm
-                // value is mutable (no separate AST flag needed).
-                if (this.check(TokenType::KwMut)) {
+                // Optional `mut` modifier on a binding: the binding itself
+                // is mutable when the matched arm value is mutable; the
+                // marker is kept only so an arm's alternatives can be held
+                // to writing it alike.
+                const bind_mut: boolean = this.check(TokenType::KwMut);
+                if (bind_mut) {
                     this.advance();
                 }
                 if (this.current().lexeme == "_") {
@@ -2171,10 +2380,14 @@ public:
                     };
                     pat.add_element(PatternElement::Sub(ps));
                 } else if (this.check(TokenType::Identifier) || this.current().kind.is_keyword()) {
+                    this.refuse_declaration_keyword_name(this.current(), "a binding name");
                     const bind_tok: Token = this.advance();
                     const bs: SourceSpan = this.span_from_token(bind_tok);
                     const bn: SymbolStr = this.intern_lexeme(bind_tok);
-                    const pb: PatternBinding* = new PatternBinding { name: bn, span: bs };
+                    const pb: PatternBinding* = new PatternBinding {
+                        name: bn, span: bs, sym_id: SymbolID::invalid(),
+                        resolved_type: TypeRef::invalid(), written_mut: bind_mut
+                    };
                     pat.add_element(PatternElement::Binding(pb));
                 } else if (this.check(TokenType::NumericConstant)
                         || (this.check(TokenType::Minus)
@@ -2321,8 +2534,8 @@ public:
             const dot_pos: i64 = ExprParser::lexeme_first_dot(member_tok.lexeme);
             if (dot_pos >= 0) {
                 const lex_len: i64 = member_tok.lexeme.length() as i64;
-                const first_str: string = member_tok.lexeme.substr(0, dot_pos as u64);
-                const rest_str: string = member_tok.lexeme.substr((dot_pos + 1) as u64, (lex_len - dot_pos - 1) as u64);
+                const first_str: string = member_tok.lexeme.substr(0, dot_pos as i64);
+                const rest_str: string = member_tok.lexeme.substr((dot_pos + 1) as i64, (lex_len - dot_pos - 1) as i64);
                 const first_sym: SymbolStr = this.ctx.intern(first_str);
                 const rest_sym: SymbolStr = this.ctx.intern(rest_str);
                 const tok_span: SourceSpan = this.span_from_token(member_tok);
@@ -2340,12 +2553,9 @@ public:
         const span: SourceSpan = ParserBase::merge_spans(object.span, member_span);
         mut node: MemberAccessNode* = new MemberAccessNode(object, member, member_span, span);
 
-        // Pick up explicit type arguments on the member: `obj.method<T, U>(...)`.
-        // Mirrors the same lookahead that scope-resolution and primary
-        // identifiers already do; without it `obj.cast<T>()` parses as
-        // `(obj.cast) < T > ()` (comparison + shift) and the call
-        // disappears.
-        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+        // Explicit type arguments on the member: `obj.method::<T, U>(...)`.
+        if (this.at_turbofish()) {
+            this.advance(); // consume '::'
             const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
             node.set_generic_args(member_gen_args);
         }
@@ -2384,8 +2594,9 @@ public:
             sr.set_scope_generic_args(scope_gen_args);
         }
 
-        // Check for generic args on the member itself: Foo::bar<U>
-        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+        // Generic args on the member itself: `Foo::bar::<U>`.
+        if (this.at_turbofish()) {
+            this.advance(); // consume '::'
             const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
             sr.set_generic_args(member_gen_args);
         }
@@ -2395,106 +2606,6 @@ public:
 
 
     // Generic Disambiguation
-
-    /// Scan forward to determine if `<` begins generic type arguments.
-    /// Returns true if we find a matching `>` followed by `(`, `{`, or `::`.
-    ///
-    /// The scan stays inside the grouping the `<` appeared in. A type argument
-    /// list is balanced with respect to `()` and `[]` - a tuple type `(i32,
-    /// i64)` or an array suffix `[]` nests, but nothing may close a group the
-    /// list did not open. So a closer arriving at depth zero means the `<` was
-    /// a comparison, and any `>` found beyond it belongs to something else
-    /// entirely. Without this the scan runs out of the enclosing argument list
-    /// and pairs the `<` with a `>` from a LATER argument: in
-    /// `f((a < b), (c > (d)))` it spans `a < b), (c >`, then generic-argument
-    /// parsing fails on the `)` it never expected to see.
-    is_generic_call_ahead() -> boolean {
-        mut angle_depth: int = 1;
-        mut group_depth: int = 0;
-        mut offset: int = 1;
-        const max_lookahead: int = 200;
-
-        while (offset < max_lookahead) {
-            const tok: Token = this.peek_at(offset);
-
-            // EOF: not a generic
-            if (tok.kind == TokenType::EOF) { return false; }
-
-            if (tok.kind == TokenType::LParen || tok.kind == TokenType::LSquare) {
-                group_depth += 1;
-            } else if (tok.kind == TokenType::RParen ||
-                       tok.kind == TokenType::RSquare) {
-                if (group_depth == 0) { return false; }
-                group_depth -= 1;
-            }
-
-            if (tok.kind == TokenType::LAngle) {
-                angle_depth += 1;
-            } else if (tok.kind == TokenType::RAngle) {
-                angle_depth -= 1;
-                if (angle_depth == 0) {
-                    // Check what follows the closing >
-                    const next: Token = this.peek_at(offset + 1);
-                    if (next.kind == TokenType::LParen ||
-                        next.kind == TokenType::LBrace ||
-                        next.kind == TokenType::ColonColon) {
-                        return true;
-                    }
-                    // Also allow > followed by > (nested generic closing)
-                    if (next.kind == TokenType::RAngle) {
-                        return true;
-                    }
-                    // Also allow > at end of type annotation context (e.g., in parameter lists)
-                    // or before type suffixes (*, [], ?)
-                    if (next.kind == TokenType::Comma)     { return true; }
-                    if (next.kind == TokenType::RParen)    { return true; }
-                    if (next.kind == TokenType::Semicolon) { return true; }
-                    if (next.kind == TokenType::Equal)     { return true; }
-                    if (next.kind == TokenType::Star)      { return true; }
-                    if (next.kind == TokenType::LSquare)   { return true; }
-                    if (next.kind == TokenType::Question)  { return true; }
-                    if (next.kind == TokenType::Arrow)     { return true; }
-                    // `Type<Args> =>` heads a `static match` arm whose scrutinee
-                    // type is itself generic (`Slice<u8> => { ... }`).  Without
-                    // this the `<Args>` is left unconsumed and the arm fails to
-                    // parse.  A bare `a < b => c` has no balanced `>`, so it
-                    // never reaches this follower check and stays a comparison.
-                    if (next.kind == TokenType::FatArrow)  { return true; }
-                    // Generic function-reference value cast: `tramp<i32> as void*`.
-                    // Without this, `<` is mis-parsed as less-than and the cast
-                    // fails to parse. (GAP 1a)
-                    if (next.kind == TokenType::KwAs)      { return true; }
-                    // Trait-impl follower: `Foo<T> for Bar`. Only meaningful
-                    // when parsing a trait annotation inside parse_impl block.
-                    if (next.kind == TokenType::KwFor)     { return true; }
-                    // `Bar<T> where ...` in impl blocks.
-                    if (next.kind == TokenType::KwWhere)   { return true; }
-                    return false;
-                }
-            } else if (tok.kind == TokenType::GreaterGreater) {
-                // >> could be two > tokens for nested generics
-                angle_depth -= 2;
-                if (angle_depth <= 0) {
-                    return true;
-                }
-            }
-
-            // Tokens that cannot appear in type arguments -> not generic
-            if (tok.kind == TokenType::Semicolon ||
-                tok.kind == TokenType::LBrace ||
-                tok.kind == TokenType::RBrace ||
-                tok.kind == TokenType::KwIf ||
-                tok.kind == TokenType::KwWhile ||
-                tok.kind == TokenType::KwFor ||
-                tok.kind == TokenType::KwReturn) {
-                return false;
-            }
-
-            offset += 1;
-        }
-
-        return false;
-    }
 
     /// Error recovery for a `<...>` that turned out not to hold type
     /// arguments: advance past its closing `>` so the enclosing expression can
@@ -2540,12 +2651,10 @@ public:
         while (!this.check(TokenType::RAngle) &&
                !this.check(TokenType::GreaterGreater) &&
                !this.is_at_end()) {
-            // A literal can never begin a type, so the `<` was a comparison
-            // that the lookahead misread - `f(x < 2, 3 > (4))` being the usual
-            // shape. Diagnosed here rather than in `parse_type_annotation`,
-            // which would first report a bare "expected type" from a position
-            // where the reader has no reason to expect one, leaving two errors
-            // for one mistake.
+            // A literal can never begin a type.  Diagnosed here rather than in
+            // `parse_type_annotation`, which would first report a bare
+            // "expected type" from a position where the reader has no reason
+            // to expect one, leaving two errors for one mistake.
             const lead: TokenType = this.current().kind;
             if (lead == TokenType::NumericConstant ||
                 lead == TokenType::StringLiteral ||
@@ -2554,7 +2663,7 @@ public:
                 lead == TokenType::KwTrue ||
                 lead == TokenType::KwFalse) {
                 this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                    format("expected a type in generic arguments, found the value `%s`; if `<` was meant as a comparison, parenthesise the operands - `(x < y)`",
+                    fmt::format("expected a type in generic arguments, found the value `%s`",
                            this.current().lexeme));
                 // Resync past the matching `>` and return rather than break.
                 // Leaving the cursor on the offending token makes the enclosing
@@ -2575,7 +2684,7 @@ public:
                 // (4))` - so lead with that rather than with a bare "expected
                 // type", which reads as though a type belonged here.
                 this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                    format("expected type in generic arguments, found '%s'; if `<` was meant as a comparison, parenthesise the operands - `(x < y)`",
+                    fmt::format("expected type in generic arguments, found '%s'; if `<` was meant as a comparison, parenthesise the operands - `(x < y)`",
                            this.current().lexeme));
                 break;
             }
@@ -2635,8 +2744,12 @@ public:
         // Parenthesized types: tuple `(T, U)`, 1-tuple `(T,)`, grouping `(T)`,
         // unit `()`, or function `(T, U) -> R`. Disambiguated by the trailing
         // comma (grouping vs 1-tuple) and a following `->` (function type).
+        // The suffixes after the `)` apply to the whole group:
+        // `(i32, i32)[]`, and `((i32) -> i32)[]` for an array of functions.
         if (this.check(TokenType::LParen)) {
-            return this.parse_paren_type();
+            const group: TypeAnnotation* = this.parse_paren_type();
+            if (group == null) { return null; }
+            return this.parse_type_suffixes(group);
         }
 
         // Bracket tuple types `[T, U]` are not supported; tuples use the
@@ -2721,6 +2834,7 @@ public:
                 name:         this.intern_lexeme(head_tok),
                 span:         this.span_from_token(head_tok),
                 pre_resolved: TypeRef::invalid(),
+                res: ResSlot::Pending,
             }
         );
         while (this.check(TokenType::ColonColon)) {
@@ -2730,9 +2844,11 @@ public:
             const pj: ProjectionAnnotation* = new ProjectionAnnotation {
                 base:         base_ann,
                 member:       this.intern_lexeme(mem_tok),
-                owning_trait: SymbolStr::empty(),
+                rooted_at:    SymbolID::invalid(),
+                owner_trait:  DefId::invalid(),
                 resolved:     TypeRef::invalid(),
                 span:         this.span_from(head_tok),
+                refused:      false,
             };
             base_ann = new TypeAnnotation::Projection(pj);
         }
@@ -2771,9 +2887,11 @@ public:
                 const pj: ProjectionAnnotation* = new ProjectionAnnotation {
                     base:         base_ann,
                     member:       this.ctx.intern(mem_tok.lexeme),
-                    owning_trait: SymbolStr::empty(),
+                    rooted_at:    SymbolID::invalid(),
+                    owner_trait:  DefId::invalid(),
                     resolved:     TypeRef::invalid(),
                     span:         this.span_from(tok),
+                    refused:      false,
                 };
                 base_ann = new TypeAnnotation::Projection(pj);
             }
@@ -2826,7 +2944,7 @@ public:
                 // offending token.
                 if (next.kind != TokenType::Identifier) {
                     this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                        format("expected an identifier after `::`, found '%s'",
+                        fmt::format("expected an identifier after `::`, found '%s'",
                             next.lexeme));
                     break;
                 }
@@ -2836,13 +2954,15 @@ public:
 
             const name: SymbolStr = this.ctx.intern(qn.display(this.ctx.get_intern_table()));
 
-            // Check for generic parameters: Type<A, B>
-            if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+            // Generic arguments: `Type<A, B>`.  Type position - a `<` after a
+            // type name is never a comparison.
+            if (this.check(TokenType::LAngle)) {
                 const base_ann: TypeAnnotation* = new TypeAnnotation::Named(
                     new NamedAnnotation {
                         name: name,
                         span: this.span_from_token(tok),
                         pre_resolved: TypeRef::invalid(),
+                        res: ResSlot::Pending,
                     }
                 );
 
@@ -2860,12 +2980,13 @@ public:
                 name: name,
                 span: this.span_from_token(tok),
                 pre_resolved: TypeRef::invalid(),
+                res: ResSlot::Pending,
             };
             return new TypeAnnotation::Named(named_ann);
         }
 
         this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-            format("expected type, found '%s'", tok.lexeme));
+            fmt::format("expected type, found '%s'", tok.lexeme));
         return null;
     }
 
@@ -2959,7 +3080,7 @@ public:
                         // build a garbage array type.
                         if (ParserBase::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
                             this.report_error(ErrorCode::E0010_NUMBER_TOO_LARGE,
-                                format("array size `%s` does not fit in 64 bits",
+                                fmt::format("array size `%s` does not fit in 64 bits",
                                     size_tok.lexeme));
                         }
                         size = ParserBase::parse_numeric_lexeme_i64(size_tok.lexeme);
@@ -2996,6 +3117,7 @@ public:
                         name:         this.ctx.intern("Option"),
                         span:         this.current_span(),
                         pre_resolved: TypeRef::invalid(),
+                        res: ResSlot::Pending,
                     }
                 );
                 mut opt_args: TypeAnnotation*[] = [];
@@ -3056,7 +3178,9 @@ public:
     ///   `(T, U, ...)` -> tuple type.
     ///   `(T, U) -> R` -> function type (also `() -> R`).
     /// The trailing comma (grouping vs 1-tuple) and a following `->` (function
-    /// type) are the two disambiguators.
+    /// type) are the two disambiguators.  Suffixes after the `)` are the
+    /// caller's: a cast target reads a `*` there as multiplication when an
+    /// operand follows it.
     parse_paren_type() -> TypeAnnotation* {
         const start: Token = this.advance(); // consume '('
 
@@ -3102,19 +3226,17 @@ public:
             return new TypeAnnotation::Tuple(unit_ann);
         }
 
-        // `(T)` with no trailing comma -> grouping; the inner type is complete
-        // (it already ran through parse_type_annotation, suffixes included).
+        // `(T)` with no trailing comma -> grouping: the inner type.
         if (params.length == 1 && !trailing_comma) {
             return params[0];
         }
 
-        // `(T,)` 1-tuple or `(T, U, ...)` tuple. Allow type suffixes so
-        // `(i32, i32)*`, `(i32, i32)?`, `(i32, i32)[]` all work.
+        // `(T,)` 1-tuple or `(T, U, ...)` tuple.
         const tup_ann: TupleAnnotation* = new TupleAnnotation {
             elements: params,
             span:     this.span_from(start),
         };
-        return this.parse_type_suffixes(new TypeAnnotation::Tuple(tup_ann));
+        return new TypeAnnotation::Tuple(tup_ann);
     }
 
     /// Parse the DEPRECATED bracket tuple type `[T, U, V]`. Retained only for
@@ -3125,45 +3247,9 @@ public:
     /// TupleAnnotation as `(...)`.
     // Type Helper Predicates
 
-    /// Check if the current token starts a type annotation.
-    is_type_start() -> boolean {
-        if (this.is_primitive_type_token()) { return true; }
-        return match (&this.current().kind) {
-            TokenType::Identifier => { true }
-            TokenType::KwVoid     => { true }
-            TokenType::Amp        => { true }
-            TokenType::LParen     => { true }
-            _                     => { false }
-        };
-    }
-
     /// Check if the current token is a primitive type keyword.
     is_primitive_type_token() -> boolean {
-        return match (&this.current().kind) {
-            TokenType::KwBoolean => { true }
-            TokenType::KwInt     => { true }
-            TokenType::KwI8      => { true }
-            TokenType::KwI16     => { true }
-            TokenType::KwI32     => { true }
-            TokenType::KwI64     => { true }
-            TokenType::KwI128    => { true }
-            TokenType::KwUint    => { true }
-            TokenType::KwUint8   => { true }
-            TokenType::KwUint16  => { true }
-            TokenType::KwUint32  => { true }
-            TokenType::KwUint64  => { true }
-            TokenType::KwUint128 => { true }
-            TokenType::KwIsize   => { true }
-            TokenType::KwUsize   => { true }
-            TokenType::KwFloat   => { true }
-            TokenType::KwF32     => { true }
-            TokenType::KwF64     => { true }
-            TokenType::KwDouble  => { true }
-            TokenType::KwChar    => { true }
-            TokenType::KwString  => { true }
-            TokenType::KwVaList  => { true }
-            _                    => { false }
-        };
+        return this.current().kind.is_primitive_type();
     }
 
 
@@ -3189,7 +3275,8 @@ public:
     // index, or -1 if none. Used by `parse_member_access_expr` to split a
     // float-shaped token back into a chain of tuple indices when the lexer
     // has eaten the dot.
-    static lexeme_first_dot(s: string) -> i64 {
+    static lexeme_first_dot(s_text: string) -> i64 {
+        const s: string = s_text;
         if (s == null) { return -1; }
         const len: i64 = s.length() as i64;
         for (mut i: i64 = 0; i < len; i++) {

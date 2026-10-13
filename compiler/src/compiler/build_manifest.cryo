@@ -23,7 +23,7 @@
 ///! 6a), a module's `.o` is not a pure function of its own source - so the
 ///! per-module key is computed two ways (see `module_source_hash` /
 ///! `toolchain_fingerprint` here and the key derivation in
-///! `instance.cryo::compile_project_with_ctx`):
+///! `instance.cryo::run_project`):
 ///!   - a module that OWNS specializations (its `.o` embeds monomorphized
 ///!     instances whose type-args can come from any consumer) folds a GLOBAL
 ///!     digest of every module's source hash - it rebuilds whenever any
@@ -41,19 +41,31 @@
 ///! through every call. The pure FNV/hex folding helpers stay free because
 ///! the per-module-key loop in `instance.cryo` folds them directly.
 
-namespace Compiler::BuildManifest;
+namespace compiler::build_manifest;
 
-import Compiler::ProjectConfig;
-import Utils::Logger;
+import compiler::project_config;
+import compiler::project_config::{ ProjectConfig };
+import utils::logger;
+import utils::build_stamp::{ StampSlot };
 import std::fs::file;
 import std::fs::metadata;
+import std::fs::metadata::{ metadata };
 import std::fs::path;
+import std::fs::path::{ Path };
 import std::fmt;
 import std::env;
 import std::core::{ hash, primitives };
 import std::collections::string;
+import std::collections::string::{ String };
 import std::collections::array;
+import std::collections::array::{ Array };
 import std::json::{ value, serializer };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::core::hash::{ Fnv128Hasher };
+import std::core::mem;
+import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
+import std::json::value::{ JsonObject, JsonValue };
 
 /// A source module feeding the build, as the fingerprint + manifest see it.
 type struct ModuleEntry {
@@ -99,7 +111,8 @@ type struct ModuleKeyTable {
     /// with the same-arity `read`/`write` intrinsics and a reference-array static
     /// fails codegen resolution outright (E0636). The distinctly-named free
     /// function sidesteps both.
-    static read_module_keys(path: string) -> ModuleKeyTable {
+    static read_module_keys(path_text: string) -> ModuleKeyTable {
+        const path: string = path_text;
         mut t: ModuleKeyTable = ModuleKeyTable::empty();
         if (!metadata::exists(Path::from(path))) { return t; }
         mut content: string = "";
@@ -152,7 +165,7 @@ type struct ModuleKeyTable {
                 fmt::eprintln(f"warning: cannot write per-module cache keys to {path}");
             }
         }
-        text.drop();
+        mem::drop(text);
     }
 }
 
@@ -173,7 +186,8 @@ type struct Manifest {
     stdlib_archive: string;
 
     static new(cfg: ProjectConfig*, opt_level: u32, debug_info: boolean,
-               stdlib_archive: string) -> Manifest {
+               stdlib_archive_text: string) -> Manifest {
+        const stdlib_archive: string = stdlib_archive_text;
         return Manifest {
             cfg:            cfg,
             opt_level:      opt_level,
@@ -221,7 +235,8 @@ type struct Manifest {
     /// True when the saved fingerprint matches `fp_hex` AND every artifact
     /// still exists on disk. A missing sidecar or any missing artifact forces
     /// a build.
-    is_up_to_date(&this, fp_hex: string, artifacts: &string[]) -> boolean {
+    is_up_to_date(&this, fp_hex_text: string, artifacts: &string[]) -> boolean {
+        const fp_hex: string = fp_hex_text;
         const saved: string = Manifest::read_file_trimmed(this.cfg.fingerprint_path());
         if (saved.length() == 0) { return false; }
         if (!saved.eq(fp_hex)) { return false; }
@@ -233,7 +248,8 @@ type struct Manifest {
 
     /// Write the fingerprint sidecar (`incremental/inputs.fp`), creating the
     /// incremental dir first.
-    write_fingerprint(&this, fp_hex: string) -> void {
+    write_fingerprint(&this, fp_hex_text: string) -> void {
+        const fp_hex: string = fp_hex_text;
         ProjectConfig::mkdir_p(this.cfg.incremental_dir());
         const path: string = this.cfg.fingerprint_path();
         mut text: String = String::new();
@@ -245,13 +261,14 @@ type struct Manifest {
                 fmt::eprintln(f"warning: cannot write build fingerprint to {path}");
             }
         }
-        text.drop();
+        mem::drop(text);
     }
 
     /// Write the human/tooling-facing per-profile `build-manifest.json` at
     /// `<output_dir>/target/<profile>/build-manifest.json`.
-    write_manifest(&this, modules: &ModuleEntry[], fp_hex: string,
+    write_manifest(&this, modules: &ModuleEntry[], fp_hex_text: string,
                    artifacts: &string[]) -> void {
+        const fp_hex: string = fp_hex_text;
         ProjectConfig::mkdir_p(this.cfg.profile_dir());
         const path: string = this.cfg.manifest_path();
 
@@ -285,9 +302,9 @@ type struct Manifest {
         root.put("link", JsonValue::Object(link));
 
         // modules: namespace + source + origin + object path + size.
-        mut mods: Array<JsonValue> = Array<JsonValue>::new();
+        mut mods: Array<JsonValue> = Array::<JsonValue>::new();
         for (mut i: i64 = 0; i < modules.length; i++) {
-            const obj: string = format("%s/%s.o",
+            const obj: string = fmt::format("%s/%s.o",
                 this.cfg.deps_dir_for(modules[i].origin_subdir),
                 Manifest::path_module(modules[i].namespace_name));
             const obj_size: i64 = Manifest::file_size_bytes(obj);
@@ -306,7 +323,7 @@ type struct Manifest {
 
         mut doc: JsonValue = JsonValue::Object(root);
         mut text: String = serializer::stringify_pretty(&doc);
-        doc.drop();
+        mem::drop(doc);
 
         text.push_byte(10 as u8);        // trailing newline (matches prior fputs)
         match (file::write(Path::from(path), text.as_bytes())) {
@@ -315,7 +332,7 @@ type struct Manifest {
                 fmt::eprintln(f"warning: cannot write build manifest to {path}");
             }
         }
-        text.drop();
+        mem::drop(text);
     }
 
     /// A 128-bit digest as 32 lowercase hex characters, high half first.
@@ -333,7 +350,14 @@ type struct Manifest {
     /// perturbs the fingerprint. The byte count is mixed in last as a length
     /// guard. File reading is compiler-specific, so this lives here and drives
     /// the canonical `Hasher::fold` for the actual byte mixing.
-    static fold_file(h: Fnv128Hasher*, path: string) -> void {
+    static fold_file(h: Fnv128Hasher*, path_text: string) -> void {
+        Manifest::fold_file_contents(h, path_text, false);
+    }
+
+    /// `fold_file`, reading a binary's build stamp as zeros when
+    /// `clear_stamp` is set.
+    static fold_file_contents(h: Fnv128Hasher*, path_text: string, clear_stamp: boolean) -> void {
+        const path: string = path_text;
         if (!metadata::exists(Path::from(path))) {
             h.fold("<missing>");
             return;
@@ -343,10 +367,13 @@ type struct Manifest {
                 mut bytes: Array<u8> = data;
                 const n: u64 = bytes.length();
                 const d: u8* = bytes.as_ptr();
+                if (clear_stamp) {
+                    StampSlot::clear_text(d, n);
+                }
                 for (mut i: u64 = 0; i < n; i++) {
                     h.fold(d[i]);
                 }
-                bytes.drop();
+                mem::drop(bytes);
                 h.fold(n);
             }
             Result::Err(_) => {
@@ -366,7 +393,10 @@ type struct Manifest {
     }
 
     /// FNV-1a digest of the running compiler's own bytes. Changes whenever the
-    /// compiler changes, invalidating every cached build it produced.
+    /// compiler changes, invalidating every cached build it produced.  The
+    /// build stamp reads as zeros: `cryo stamp` rewrites it in place and it
+    /// changes nothing the compiler emits, so a new stamp is not a new
+    /// compiler.
     static compiler_fingerprint() -> u128 {
         const exe: string = Manifest::self_exe_path();
         mut h: Fnv128Hasher = Fnv128Hasher::new();
@@ -374,7 +404,7 @@ type struct Manifest {
             h.fold("<unknown-compiler>");
             return h.finish128();
         }
-        Manifest::fold_file(&h, exe);
+        Manifest::fold_file_contents(&h, exe, true);
         return h.finish128();
     }
 
@@ -419,7 +449,8 @@ type struct Manifest {
 
     /// Read a file's content with trailing whitespace/newlines stripped, or ""
     /// when the file is absent or unreadable.
-    static read_file_trimmed(path: string) -> string {
+    static read_file_trimmed(path_text: string) -> string {
+        const path: string = path_text;
         mut raw: string = "";
         match (file::read_to_string(Path::from(path))) {
             Result::Ok(s)  => { raw = s.into_raw(); }
@@ -435,18 +466,6 @@ type struct Manifest {
         return s.into_raw();
     }
 
-    /// Mangle a namespace to its object-file stem (`::` -> `_`), matching
-    /// `CodegenPasses::legacy_obj_path`.
-    static mangle_module(ns: string) -> string {
-        const len: u64 = ns.length();
-        const src: i8* = ns as i8*;
-        mut s: String = String::with_capacity(len + 1);
-        for (mut i: u64 = 0; i < len; i++) {
-            if (src[i] == ':') { s.push_byte('_' as u8); }
-            else { s.push_byte(src[i] as u8); }
-        }
-        return s.into_raw();
-    }
 
     /// Map a namespace to its object-file RELATIVE PATH: each `::` becomes a
     /// directory separator (`std::core::intrinsics` -> `std/core/intrinsics`),
@@ -477,7 +496,8 @@ type struct Manifest {
 
     /// File size in bytes via `fs::metadata`, without reading the contents.
     /// Returns -1 when the file can't be stat'd.
-    static file_size_bytes(path: string) -> i64 {
+    static file_size_bytes(path_text: string) -> i64 {
+        const path: string = path_text;
         match (metadata::metadata(Path::from(path))) {
             Result::Ok(m)  => { return m.len() as i64; }
             Result::Err(_) => { return -1 as i64; }

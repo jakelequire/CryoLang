@@ -11,19 +11,33 @@
 /// through `sema_int_unsigned_bound` / `sema_default_int_type` so the
 /// width->magnitude mapping lives in exactly one place.
 
-namespace Compiler::Sema::Helpers;
+namespace compiler::sema::helpers;
 
-import Compiler::AST;
-import Compiler::ConstTable;
-import Compiler::Resolver::SymbolStr;
-import Compiler::AST::Node;
-import Compiler::AST::Expression;
-import Compiler::Lex;
-import Compiler::Types;
-import Compiler::Types::TypeRef;
-import Compiler::Types::Type;
-import Compiler::Types::Arena;
-import Compiler::Types::Compound;
+import compiler::ast;
+import compiler::ast::{ LiteralKind, NodeKind };
+import compiler::const_table;
+import compiler::const_table::{ ConstEval };
+import compiler::resolver::symbol_str;
+import compiler::ast::node;
+import compiler::ast::node::{ ASTNode };
+import compiler::lex::{ TokenType };
+import compiler::ast::expression;
+import compiler::ast::expression::{
+    BinaryExprNode, ExpressionNode, LiteralNode, UnaryExprNode
+};
+import compiler::lex;
+import compiler::lex::lexer;
+import compiler::lex::lexer::{ Lexer };
+import compiler::types;
+import compiler::types::{ TypeKind };
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::type_base;
+import compiler::types::type_base::{ FloatType, IntType, Type };
+import compiler::types::arena;
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound;
+import utils::keyword::{ Keyword };
 
 
 // -- Numeric maxima (private; reached via the accessors below) --
@@ -67,7 +81,8 @@ public function sema_default_int_type(arena: TypeArena*, value: string) -> TypeR
 /// so it settles the literal outright: neither the expected-type adoption above
 /// nor the magnitude default applies.  The suffix set is the lexer's
 /// (`Lexer::is_valid_numeric_suffix`); anything outside it never reaches here.
-public function sema_numeric_suffix_type(arena: TypeArena*, suffix: string) -> TypeRef {
+public function sema_numeric_suffix_type(arena: TypeArena*, suffix_text: Keyword) -> TypeRef {
+    const suffix: string = suffix_text.as_string();
     if (suffix == "")     { return TypeRef::invalid(); }
     if (suffix == "i8")   { return arena.get_i8();   }
     if (suffix == "i16")  { return arena.get_i16();  }
@@ -97,7 +112,7 @@ public function sema_expr_has_numeric_suffix(expr: ExpressionNode*) -> boolean {
     }
     if (node.kind == NodeKind::UnaryExpression) {
         const u: UnaryExprNode* = expr as UnaryExprNode*;
-        if (u.op.lexeme == "-" || u.op.lexeme == "+" || u.op.lexeme == "~") {
+        if (u.op.kind == TokenType::Minus || u.op.kind == TokenType::Plus || u.op.kind == TokenType::Tilde) {
             return sema_expr_has_numeric_suffix(u.operand);
         }
         return false;
@@ -156,17 +171,17 @@ public function is_constant_numeric_expr(expr: ExpressionNode*) -> boolean {
     }
     if (node.kind == NodeKind::UnaryExpression) {
         const u: UnaryExprNode* = expr as UnaryExprNode*;
-        if (u.op.lexeme == "-" || u.op.lexeme == "+" || u.op.lexeme == "~") {
+        if (u.op.kind == TokenType::Minus || u.op.kind == TokenType::Plus || u.op.kind == TokenType::Tilde) {
             return is_constant_numeric_expr(u.operand);
         }
         return false;
     }
     if (node.kind == NodeKind::BinaryExpression) {
         const b: BinaryExprNode* = expr as BinaryExprNode*;
-        const op: string = b.op.lexeme;
+        const op: TokenType = b.op.kind;
         const is_arith: boolean =
-            op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
-            || op == "<<" || op == ">>" || op == "&" || op == "|" || op == "^";
+            op == TokenType::Plus || op == TokenType::Minus || op == TokenType::Star || op == TokenType::Slash || op == TokenType::Percent
+            || op == TokenType::LessLess || op == TokenType::GreaterGreater || op == TokenType::Amp || op == TokenType::Pipe || op == TokenType::Caret;
         if (!is_arith) { return false; }
         return is_constant_numeric_expr(b.left)
             && is_constant_numeric_expr(b.right);
@@ -180,7 +195,7 @@ public function is_constant_numeric_expr(expr: ExpressionNode*) -> boolean {
 /// keep defaulting to i32 so a genuine narrowing is still flagged.
 public function is_wide_int_type(arena: TypeArena*, ty: TypeRef) -> boolean {
     if (!ty.is_valid()) { return false; }
-    const t: Type* = arena.lookup(ty.id);
+    const t: Type* = arena.lookup(ty);
     if (t == null || t.kind != TypeKind::Int) { return false; }
     const it: IntType* = t as IntType*;
     return it.int_kind.bit_width() >= 64;
@@ -193,7 +208,7 @@ public function is_wide_int_type(arena: TypeArena*, ty: TypeRef) -> boolean {
 /// a `double` against a `float` signature.
 public function is_narrow_float_type(arena: TypeArena*, ty: TypeRef) -> boolean {
     if (!ty.is_valid()) { return false; }
-    const t: Type* = arena.lookup(ty.id);
+    const t: Type* = arena.lookup(ty);
     if (t == null || t.kind != TypeKind::Float) { return false; }
     const ft: FloatType* = t as FloatType*;
     return ft.bit_width() < 64;
@@ -207,7 +222,7 @@ public function is_narrow_float_type(arena: TypeArena*, ty: TypeRef) -> boolean 
 /// argument's own type keeps selecting the specialization.
 public function is_adoptable_numeric_type(arena: TypeArena*, ty: TypeRef) -> boolean {
     if (!ty.is_valid()) { return false; }
-    const t: Type* = arena.lookup(ty.id);
+    const t: Type* = arena.lookup(ty);
     if (t == null) { return false; }
     return t.kind == TypeKind::Int || t.kind == TypeKind::Float
         || t.kind == TypeKind::Char;
@@ -223,7 +238,7 @@ public function is_negative_numeric_literal_expr(expr: ExpressionNode*) -> boole
     const node: ASTNode* = expr as ASTNode*;
     if (node.kind != NodeKind::UnaryExpression) { return false; }
     const u: UnaryExprNode* = expr as UnaryExprNode*;
-    if (u.op.lexeme != "-") { return false; }
+    if (u.op.kind != TokenType::Minus) { return false; }
     return is_numeric_literal_expr(u.operand);
 }
 
@@ -241,7 +256,8 @@ public function is_zero_int_literal(expr: ExpressionNode*) -> boolean {
 
 // -- Literal-text parsing / folding --
 
-public function int_literal_text_is_zero(s: string) -> boolean {
+public function int_literal_text_is_zero(s_text: string) -> boolean {
+    const s: string = s_text;
     if (s == null) { return false; }
     const len: i64 = s.length() as i64;
     mut i: i64 = 0;
@@ -267,49 +283,12 @@ public function int_literal_text_is_zero(s: string) -> boolean {
     return saw_digit;
 }
 
-/// Parse an integer-literal lexeme (decimal or `0x`/`0o`/`0b`, `_` allowed) into
-/// a u64.  Returns false on a non-integer char or overflow past u64.  Sibling of
-/// `int_literal_exceeds`, but yields the value.
-public function parse_int_literal_u64(s: string, out: u64*) -> boolean {
-    if (s == null) { return false; }
-    const len: i64 = s.length() as i64;
-    if (len == 0) { return false; }
-    mut i: i64 = 0;
-    mut radix: u64 = 10;
-    if (len >= 2 && s[0] == '0') {
-        const c1: char = s[1];
-        if (c1 == 'x' || c1 == 'X') { radix = 16; i = 2; }
-        else if (c1 == 'b' || c1 == 'B') { radix = 2; i = 2; }
-        else if (c1 == 'o' || c1 == 'O') { radix = 8; i = 2; }
-    }
-    mut acc: u64 = 0;
-    mut saw: boolean = false;
-    while (i < len) {
-        const c: char = s[i];
-        if (c == '_') { i = i + 1; continue; }
-        mut d: u64 = 0;
-        if (c >= '0' && c <= '9') { d = (c - '0') as u64; }
-        else if (c >= 'a' && c <= 'f') { d = (c - 'a' + 10) as u64; }
-        else if (c >= 'A' && c <= 'F') { d = (c - 'A' + 10) as u64; }
-        // Stop at the type suffix (`i64`/`u64`/...) and fold the magnitude parsed
-        // so far, rather than failing the fold on a perfectly valid suffixed
-        // literal (`100i64`). Same suffix-stop as `int_literal_exceeds`.
-        else { break; }
-        if (d >= radix) { return false; }
-        saw = true;
-        if (acc > (SEMA_U64_MAX - d) / radix) { return false; }
-        acc = acc * radix + d;
-        i = i + 1;
-    }
-    if (!saw) { return false; }
-    *out = acc;
-    return true;
-}
 
 /// True when the integer-literal text `s` denotes a magnitude strictly greater
 /// than `max_mag` (or overflows u64).  Honors `0x`/`0b`/`0o` prefixes and `_`
 /// separators.  Returns false on malformed text so other passes own that error.
-public function int_literal_exceeds(s: string, max_mag: u64) -> boolean {
+public function int_literal_exceeds(s_text: string, max_mag: u64) -> boolean {
+    const s: string = s_text;
     if (s == null) { return false; }
     const len: i64 = s.length() as i64;
     if (len == 0) { return false; }
@@ -359,13 +338,15 @@ public function int_literal_exceeds(s: string, max_mag: u64) -> boolean {
 /// and has no constant table to resolve a named constant against, so an
 /// identifier reads as non-constant here.
 public function try_fold_const_i64(expr: ExpressionNode*, out: i64*) -> boolean {
-    return ConstantTable::fold_i64(expr, null, SymbolStr::empty(), null, out);
+    const ev: ConstEval = ConstEval::literals_only();
+    return ev.fold(expr, out);
 }
 
 /// Parse a member-name as a non-negative tuple index.  Returns -1 for any
 /// non-digit character or empty input (callers distinguish "not a tuple index"
 /// from "out of bounds").  Plain decimal only.
-public function parse_tuple_index(s: string) -> i64 {
+public function parse_tuple_index(s_text: string) -> i64 {
+    const s: string = s_text;
     if (s == null) { return -1; }
     const len: i64 = s.length() as i64;
     if (len == 0) { return -1; }
@@ -379,36 +360,17 @@ public function parse_tuple_index(s: string) -> i64 {
 }
 
 /// Decode a range-pattern bound's interned text into a signed value for the
-/// `lo <= hi` ordering check.  Kept here (not in codegen) so sema doesn't reach
-/// across layers.  Best-effort: a malformed lexeme decodes to 0 rather than
-/// raising a second error.
-public function sema_decode_range_bound(s: string, kind: LiteralKind) -> i64 {
+/// `lo <= hi` ordering check.  A character bound is decoded as every
+/// character literal is (`Lexer::char_literal_value`).  Best-effort: a
+/// malformed integer lexeme decodes to 0 rather than raising a second error.
+public function sema_decode_range_bound(s_text: string, kind: LiteralKind) -> i64 {
+    const s: string = s_text;
     if (s == null) { return 0; }
     const len: i64 = s.length() as i64;
     if (len == 0) { return 0; }
 
     if (kind == LiteralKind::Char) {
-        // The lexer hands over the text *between* the quotes, so `'\n'` arrives
-        // as the two chars `\` `n`.  Resolve the C-style escapes.
-        if (len >= 2 && s[0] == '\\') {
-            const esc: char = s[1];
-            if (esc == 'n')  { return 10; }
-            if (esc == 't')  { return 9; }
-            if (esc == 'r')  { return 13; }
-            if (esc == '0')  { return 0; }
-            if (esc == '\\') { return 92; }
-            if (esc == '\'') { return 39; }
-            if (esc == '"')  { return 34; }
-            if (esc == 'a')  { return 7; }
-            if (esc == 'b')  { return 8; }
-            if (esc == 'f')  { return 12; }
-            if (esc == 'v')  { return 11; }
-            if (esc == 'x' && len >= 4) {
-                return sema_hex_digit(s[2]) * 16 + sema_hex_digit(s[3]);
-            }
-            return esc as i64;
-        }
-        return s[0] as i64;
+        return Lexer::char_literal_value(s);
     }
 
     // Integer bound: optional sign, then 0x/0o/0b/decimal, '_' separators.
@@ -446,23 +408,11 @@ public function sema_hex_digit(c: char) -> i64 {
 
 // -- Name / lexeme predicates (pure) --
 
-/// True when `name` is the spelling of a built-in numeric type.
-public function is_numeric_type_name(name: string) -> boolean {
-    return name.eq("i8") || name.eq("i16")
-        || name.eq("i32") || name.eq("i64")
-        || name.eq("i128")
-        || name.eq("u8") || name.eq("u16")
-        || name.eq("u32") || name.eq("u64")
-        || name.eq("u128")
-        || name.eq("isize") || name.eq("usize")
-        || name.eq("f32") || name.eq("f64")
-        || name.eq("int");
-}
-
 /// True when `s` is the body of a numeric literal: an optional sign followed by
 /// decimal digits with at most one `.` (hex/octal/binary carry a `0x`/`0o`/`0b`
 /// prefix and won't appear inside a number-meant string literal).
-public function lexeme_looks_like_number(s: string) -> boolean {
+public function lexeme_looks_like_number(s_text: string) -> boolean {
+    const s: string = s_text;
     if (s == null) { return false; }
     const n: i64 = s.length() as i64;
     if (n == 0) { return false; }
@@ -477,16 +427,6 @@ public function lexeme_looks_like_number(s: string) -> boolean {
         return false;
     }
     return true;
-}
-
-/// Length of the common leading-character prefix of two namespace strings.  A
-/// longer shared prefix means the candidate module lives in the same subsystem
-/// as the caller (used to break module-proximity ties in call resolution).
-public function ns_shared_prefix_len(a: string, b: string) -> i64 {
-    if (a == null || b == null) { return 0; }
-    mut i: i64 = 0;
-    while (a[i] != 0 && b[i] != 0 && a[i] == b[i]) { i = i + 1; }
-    return i;
 }
 
 /// Shallow copy of a TypeRef slice into a fresh owned array (TypeRef is Copy).
