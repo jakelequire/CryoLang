@@ -252,15 +252,25 @@ endif
 # a no-change build) even though the rebuilt bytes are identical.  The file
 # rule below rebuilds it, through `make stdlib`, whenever it is missing or
 # older than any stdlib source or the pin that compiles it.
+#
+# The linked compiler is then stamped (`cryo stamp`) with the checkout it was
+# built from, which is what `cryo version` reports.  The stamp is a region of
+# the binary rewritten in place, so no object changes.  The pin outputs are
+# excluded from the dirty check, as cryo-pin.py excludes them from its own:
+# a pin refresh rewrites bin/ between stamping its two halves.
+CRYO_PROFILE  := release
+STAMP_EXCLUDE := bin/cryo,bin/cryo.pin.txt,bin/cryo.exe,bin/cryo.exe.pin.txt
 ifeq ($(HOST_OS),windows)
 cryo: $(LIBCRYO_A) runtime-tiers
 	@echo "==> Building self-hosted cryo via bin/cryo.exe"
-	@cd compiler && "$(subst /,\,$(PIN_EXE))" build
+	@cd compiler && "$(subst /,\,$(PIN_EXE))" build --profile=$(CRYO_PROFILE)
+	@"$(subst /,\,$(PIN_EXE))" stamp "$(STAGE2_EXE)" --profile=$(CRYO_PROFILE) --exclude=$(STAMP_EXCLUDE)
 	@echo "==> Self-hosted cryo built: $(STAGE2_EXE)"
 else
 cryo: $(LIBCRYO_A) runtime-tiers
 	@echo "==> Building self-hosted cryo via bin/cryo"
-	@cd compiler && "$(PIN)" build
+	@cd compiler && "$(PIN)" build --profile=$(CRYO_PROFILE)
+	@"$(PIN)" stamp "$(STAGE2)" --profile=$(CRYO_PROFILE) --exclude=$(STAMP_EXCLUDE)
 	@echo "==> Self-hosted cryo built: $(STAGE2)"
 endif
 
@@ -322,7 +332,8 @@ cryo-exe: cryo runtime-tiers-win
 	@test -f "$(WIN_LLVM_LIB)" || { echo "ERROR: windows libLLVM-C import lib missing at"; echo "       $(WIN_LLVM_LIB)"; echo "       Run: scripts/fetch-windows-llvm.sh"; exit 1; }
 	@test -f "$(WIN_CLANG_LIB)" || { echo "ERROR: windows libclang import lib missing at"; echo "       $(WIN_CLANG_LIB)"; echo "       Run: scripts/fetch-windows-llvm.sh"; exit 1; }
 	@echo "==> Cross-building cryo.exe ($(WIN_TRIPLE)) via the self-hosted compiler"
-	@cd compiler && "$(STAGE2)" build --target=$(WIN_TRIPLE) --no-incremental
+	@cd compiler && "$(STAGE2)" build --target=$(WIN_TRIPLE) --no-incremental --profile=$(CRYO_PROFILE)
+	@"$(PIN)" stamp "$(STAGE2_EXE)" --profile=$(CRYO_PROFILE) --exclude=$(STAMP_EXCLUDE)
 	@echo "==> cryo.exe: $(STAGE2_EXE)"
 
 ifeq ($(HOST_OS),windows)
