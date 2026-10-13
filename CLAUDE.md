@@ -402,6 +402,46 @@ honest zeros here were measured over the wrong population entirely.
 
 ---
 
+## Retention: nothing temporary outlives its work
+
+Scratch once reached 150 GB inside and beside this repo, most of it nobody
+could name. These rules keep that from coming back.
+
+- **Everything temporary has a deletion point, stated when it is made.**
+  Debug scripts, probes, scratch builds, logs, instrumented compilers and
+  codemods all count. Write the deletion point down with the thing ("delete
+  when unit 2 lands"), not afterwards.
+- **Scratch lives outside the repo, or in `.scratch/`** - the one ignored
+  in-tree scratch location. Never anywhere else in the tree: not beside a
+  test project, not in `examples/`, not in `stdlib/`.
+- **Scratch is deleted when the work ends.** At the end of a session, delete
+  your scratch. Copy anything worth keeping (a repro, a measurement) into a
+  bug file, a test, or a commit message first.
+- **A one-off codemod is deleted in the very next commit.** The commit that
+  ran it carries it (see "Commit a generator with what it generated").
+- **No dead code or dead scripts.** A function, target, script or file
+  nothing calls is deleted in the change that orphans it, not left for
+  later.
+- **Build outputs are regenerable or they are removed.** Every directory a
+  target writes is gitignored and removed by `make clean`. A target that
+  writes somewhere new adds that path to both, in the same commit.
+
+### The bug log: `.bug-report/`
+
+Known open bugs live in `.bug-report/` at the repo root - gitignored, local
+to the checkout, one markdown file per bug, named `NNNN-short-name.md`
+(`0001-generic-class-allocate-link-error.md`) and numbered in order. Each
+file has a title, a plain description, a minimal repro where one exists, what
+is known about the cause, a severity (silent miscompile / crash / wrong
+error / missing check / cosmetic / infrastructure) and where it came from.
+
+- A bug found and not fixed gets a file, with its repro in the file - not
+  only in a scratch directory that is about to be deleted.
+- **A bug's file is deleted when its fix lands.**
+- Features and plans go in `docs/roadmap.md`, not here.
+
+---
+
 ## Conventions
 
 - Bare integer literals: `1`, not `1u32` — including in synthesized code.

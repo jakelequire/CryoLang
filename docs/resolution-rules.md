@@ -194,6 +194,33 @@ yet is recorded with the change that builds it, not here.
      out of `this`,** leaving `None` behind, and are fixed together with 309.
      (Jake)
 
+313. **No more fixes before the merge.**  Known bugs are logged in
+     `.bug-report/` and fixed on later branches.  (Jake)
+
+314. **`.bug-report/` at the repo root is gitignored.**  Each bug gets its
+     own markdown file named `NNNN-short-name.md`
+     (`0001-generic-class-allocate-link-error.md`), numbered in order.  A
+     file is deleted when its bug is resolved.  (Jake)
+
+315. **Retention, written into `CLAUDE.md` as rules for agents:** anything
+     temporary (debug scripts, probes, scratch builds, logs, codemods) has
+     a stated deletion point and does not litter the repo; scratch lives
+     outside the repo or in an ignored scratch location and is deleted when
+     the work ends; a one-off codemod is deleted in the very next commit
+     (ruling 268); a bug file is deleted when its bug is fixed; no dead code
+     or dead scripts are left behind.  (Jake)
+
+316. **The first project after the merge is the editor's rewrite,** on a
+     new branch `lsp-rewrite`, before the type-syntax update and the class
+     removal.  (Jake)
+
+317. **The last fix session's five open questions are logged, not acted on
+     now:** assignment through a reference releasing nothing, adding
+     `mem::replace` / `Option::take`, making W0015 an error, a bare call
+     only the generic overload accepts being refused, and static-method
+     ties ignoring `where` clauses - as bugs in `.bug-report/` or items in
+     `docs/roadmap.md`.  (Dispatch, delegated, per ruling 313)
+
 ### 2026-10-12
 
 247. **The compiler's `![allow]`s that named the deleted lint, and the

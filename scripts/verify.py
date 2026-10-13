@@ -676,8 +676,7 @@ def main():
     logdir = os.path.join(runs, stamp)
     os.makedirs(logdir)
     # Keep the newest runs only: each holds a census log and two hash lists,
-    # and an ignored scratch directory that only grows is how `.objcmp/`
-    # reached 15 GB.
+    # and an ignored directory that only grows fills the disk unnoticed.
     for old in sorted(os.listdir(runs))[:-KEEP_RUNS]:
         shutil.rmtree(os.path.join(runs, old), ignore_errors=True)
     t0 = time.monotonic()

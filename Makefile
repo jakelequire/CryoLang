@@ -238,8 +238,10 @@ Pins and release
   make release-windows   dist/ zip (POSIX host, cross-built).
   make install           Symlink bin/cryo and the stdlib into a prefix (POSIX).
   make uninstall         Remove those symlinks.
-  make clean             Remove the compiler, stdlib, runtime tier, LSP and
-                         test-helper build outputs.
+  make clean             Remove every build output in the tree: compiler,
+                         stdlib, runtime tiers, LSP, test helpers, test and
+                         example builds, .verify/, .cross-check/,
+                         build-logs/ and dist/.
 
 Internal, called by pin: pin-linux-impl, pin-windows-impl, _pin-windows-do.
 
@@ -253,7 +255,8 @@ Side effects beyond the named output
                   it first when any .cryo under compiler/src or stdlib is
                   newer than it.
   verify          runs `make check-fast` from inside itself, and keeps a
-                  clone and baseline compilers under .verify/.
+                  clone and baseline compilers under .verify/ until
+                  `make clean`.
   install         writes symlinks outside the repository (may need sudo).
 endef
 
@@ -909,16 +912,19 @@ uninstall:
 	@./install.sh --dev --uninstall
 
 # ---- clean ------------------------------------------------------------
-# Every build output the targets above write inside the tree, for every
-# triple: the compiler, the stdlib and runtime tier archives, the LSP build and
-# its installed copy, and the test helper archives.  The committed pins and
-# the caches outside these directories (.verify/, .toolchains/) stay.
+# Every output the targets above write inside the tree, for every triple:
+# the compiler, the stdlib and runtime tier archives, the LSP build and its
+# installed copy, the test helper archives, the test suite's and the
+# examples' build directories, the gates' state (.verify/ with its cached
+# baseline compilers, .cross-check/, build-logs/) and the release staging
+# (dist/).  Each is rebuilt by the target that wrote it.  The committed pins
+# and the fetched .toolchains/ stay.
 # Windows cannot delete a file a running process holds (an editor's
 # cryolsp.exe), and `rmdir` does not report it, so the Windows recipe checks
 # what is left afterwards and fails naming it.
 ifeq ($(HOST_OS),windows)
 clean:
-	@echo ==^> Cleaning compiler, stdlib, runtime tier, LSP and test-helper build outputs
+	@echo ==^> Cleaning build outputs, test and example builds, and gate state
 	@if exist compiler\build rmdir /s /q compiler\build
 	@if exist stdlib\.bin rmdir /s /q stdlib\.bin
 	@if exist runtime\.bin rmdir /s /q runtime\.bin
@@ -926,12 +932,16 @@ clean:
 	@if exist bin\cryolsp.exe del /q bin\cryolsp.exe
 	@if exist bin\cryolsp del /q bin\cryolsp
 	@del /q tests\helpers\*.o tests\helpers\*.a 2>NUL || rem
+	@for %%d in (tests\build .verify .cross-check build-logs dist) do @if exist %%d rmdir /s /q %%d
+	@for /d %%p in (examples\* tests\tests\projects\*) do @if exist %%p\build rmdir /s /q %%p\build
 	@for %%d in (compiler\build stdlib\.bin runtime\.bin tools\CryoLSP\build bin\cryolsp.exe) do @if exist %%d (echo clean: %%d is still there; a running process holds a file in it & exit /b 1)
 else
 clean:
-	@echo "==> Cleaning compiler, stdlib, runtime tier, LSP and test-helper build outputs"
+	@echo "==> Cleaning build outputs, test and example builds, and gate state"
 	@rm -rf compiler/build stdlib/.bin runtime/.bin
 	@rm -rf tools/CryoLSP/build
 	@rm -f bin/cryolsp bin/cryolsp.exe
 	@rm -f $(TEST_HELPERS_DIR)/*.o $(TEST_HELPERS_DIR)/*.a
+	@rm -rf tests/build .verify .cross-check build-logs dist
+	@rm -rf examples/*/build tests/tests/projects/*/build
 endif

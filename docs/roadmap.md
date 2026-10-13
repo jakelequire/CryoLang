@@ -4,7 +4,16 @@ What comes after `naming-impl` is merged into `main`.  Each item says what
 it is and what is still open about it.  Nothing here is built yet; the
 rulings that constrain an item are in the appendix of
 `docs/resolution-rules.md`, and the language as it stands is
-`docs/cryo.md`.
+`docs/cryo.md`.  Known bugs are not here: they are in the local bug log,
+`.bug-report/` (see `CLAUDE.md`).
+
+**Order.**  CI is aligned with `make verify`'s gate list first, as
+housekeeping (ruling 266: CI matches verify's gate list first thing after
+the merge).  The first project is the editor's rewrite, on a branch named
+`lsp-rewrite` (ruling 316: the editor's rewrite comes first, before the
+type-syntax update and the class removal).  Then the type-syntax update
+(the array syntax below), then the class removal, then trait objects; the
+other items are not ordered yet.
 
 ## Merge notes
 
@@ -44,7 +53,20 @@ manual dispatch, so its first run is the merge itself.  As it stands:
 
 So the first CI run on `main` exercises six gates the branch's sessions
 did not run as routine; a red one there is not evidence that the merge broke
-it, and is worth checking against the branch tip first.
+it, and is worth checking against the branch tip first.  Aligning the two
+lists is the first housekeeping after the merge.
+
+**Warnings.**  A clean build of the compiler, the standard library's own
+build and the editor's build each report 0 warnings.  Compare warnings only
+from a clean build: an incremental build does not replay a cached module's
+warnings.
+
+**`--baseline` cannot reach `main`.**  `make verify ARGS="--baseline REV"`
+fails for any revision before the version stamp, `main` included (ruling
+298: fixed after the merge), because the baseline is stamped by the working
+tree's Makefile and an older compiler has no stamp slot.  So the merge
+itself cannot be checked object-for-object against `main`; compare against
+`naming-impl`'s tip instead.
 
 **Known red or unexercised.**
 - `scripts/release-smoke.sh` fails for the Windows archive today, which
@@ -61,17 +83,20 @@ it, and is worth checking against the branch tip first.
 - `ProcessAsync::two_children_join_concurrently` flakes under load on
   Windows: it compares two wall-clock measurements, and process start-up
   under the suite's load can stretch one past the other.  `CRYO_TEST_JOBS=4`
-  steadies it.
+  steadies it.  It is the only test known to flake.
 
-**Tree state.**  Session scratch under `.objcmp/` is untracked (ruling 267:
-session scratch is never tracked), the one-off codemods are deleted (ruling
-268: a codemod goes in the commit after the one that ran it), and
-`scripts/README.md` names every remaining script and its caller.  The
-untracked plans in `docs/` and `.todo/` are not part of the branch.
+**Tree state.**  The session scratch directories are deleted (ruling 299:
+the scratch directories are deleted after an inventory), the one-off
+codemods are deleted (ruling 268: a codemod goes in the commit after the
+one that ran it), and `scripts/README.md` names every remaining script and
+its caller.  `make clean` removes every build output and gate state the
+targets write.  The untracked plans in `docs/` and `.todo/` are not part of
+the branch.
 
-## The editor's symbol layer, rebuilt on compiler identities
+## First: the editor's rewrite (`lsp-rewrite`)
 
-The language server answers from the compiler's own identities - the
+The first project after the merge, on its own branch (ruling 316).  The
+language server answers from the compiler's own identities - the
 definitions, types and module identities the name layer stamps - instead
 of finding declarations by their spelling.
 
@@ -336,6 +361,31 @@ the idiom, are the first sites it reaches.
 
 Open: whether a raw-pointer root is in scope (the compiler's own AST cloner
 moves array fields through node pointers), and the spelling of a take.
+
+## `mem::replace` and `Option::take`
+
+The take that full move checking needs, as one call instead of a
+`mem::swap` into a temporary followed by `mem::drop`:
+`mem::replace(&place, value)` returns what the place held and leaves
+`value` behind, and `Option::take(mut &this)` returns the option's value
+and leaves `None`.  The standard library's `Child::close_stdin`, its
+request/response `set_body` and the editor's `take_pending` are the first
+callers.
+
+Open: whether `Option::take` is enough on its own, or every owning type
+needs a take with a default left behind.
+
+## W0015 becomes an error
+
+An explicit destructor call, `x.drop()`, is a warning today, and the
+compiler, the standard library and the editor have none left.  The
+warning's own text says it will become an error; then `mem::drop(x)` is
+the only way to release a value early.  An ordinary method that happens to
+be named `drop` on a type with no `Drop` is not a destructor call, and is
+told apart before the warning becomes an error.
+
+Open: whether `ptr::drop_in_place` stays the spelling for releasing a
+value through a raw pointer.
 
 ## Open questions
 
