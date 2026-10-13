@@ -24,7 +24,7 @@ api-index-check` fails if it is stale.
 make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS asserted
-make verify              # build once; census, examples, lsp, cross, check-fast CONCURRENTLY,
+make verify              # build once; census, examples, lsp, cross, incr, check-fast CONCURRENTLY,
                          # objects hashed; ARGS="--baseline HEAD --require-identical" proves
                          # a change moved no compiled output (baseline built in .verify/, cached);
                          # a change that makes a refused program compile DECLARES its project in
@@ -32,12 +32,14 @@ make verify              # build once; census, examples, lsp, cross, check-fast 
                          # a program the baseline built, in tests/started-passing
 make roster-check        # every unit test, project and negative file against the roster
                          # golden (tests/test-roster.txt); its OK line prints the current counts
-make check-fast          # verify's self-test + pin integrity, builds nothing. Run before committing.
+make check-fast          # verify's and verify-pin's self-tests + pin integrity, builds nothing.
+                         # Run before committing.
 make lsp-check           # compile tools/CryoLSP with the compiler under test
 make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s
 make vendor-check        # every constant shape survives `cryo vendor`
 make api-index-check     # docs/stdlib-api.txt is not stale
-make verify-pin          # both pins match their sidecars AND each other
+make verify-pin          # both pins match their sidecars (sha256 and stamped commit) AND
+                         # each other
 make verify-freestanding # runtime/ tiers built by the compiler under test
 make examples            # smoke-build every examples/ project (refuses a sweep below
                          # scripts/examples-gate.py's --min)
@@ -46,7 +48,15 @@ make incremental-check   # incremental build == clean build, per module
 make incremental-instance-check  # an edit asking a cached module for a new generic
                          # instance still links (a verify gate: `incr`)
 make selfhost-check      # byte-identity fixed point, BOTH OS, ~17 min
+make help                # every target, and every side effect beyond its named output
 ```
+
+Every target that runs the compiler under test (`test`, `test-census`,
+`examples`, `lsp-check`, `verify`, ...) rebuilds `compiler/build/cryo` first
+when any `.cryo` under `compiler/src` or `stdlib` is newer than it, so a manual
+`make cryo` before them is not needed. That is a timestamp check: after a
+branch switch, see the landmine below. `scripts/README.md` says what each
+script does and who calls it.
 
 ### CI fires on `main` only, so on a branch the enforcement is LOCAL
 
@@ -57,9 +67,9 @@ only things that run are what a person or an agent runs.
 
 So:
 
-- **`make check-fast`** before committing: verify's self-test and pin
-  integrity. It builds nothing and takes seconds, so it is no evidence about
-  the compiler; `make verify` is.
+- **`make check-fast`** before committing: verify's and verify-pin's
+  self-tests and pin integrity. It builds nothing and takes seconds, so it is
+  no evidence about the compiler; `make verify` is.
 - **No commit hook runs.** Nothing refuses a commit; the gates above are
   what a person or an agent runs.
 

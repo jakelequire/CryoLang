@@ -201,7 +201,8 @@ Tests and gates
                          concurrently and their objects are hashed
                          (ARGS="--baseline HEAD --require-identical").
   make check-fast        verify's self-test and verify-pin; builds nothing.
-  make verify-selftest   verify's judges, driven through their cases.
+  make verify-selftest   verify's judges and verify-pin's checks, driven
+                         through fixtures they must accept and refuse.
   make lsp-check         tools/CryoLSP builds with the compiler under test
                          (into its own directory; installs nothing).
   make cross-check       runtime, stdlib, compiler and CryoLSP for the other
@@ -228,8 +229,9 @@ Tests and gates
 Pins and release
   make pin               Refresh bin/cryo and bin/cryo.exe and their sidecars
                          (Windows host: through WSL).
-  make verify-pin        Each pin matches its sidecar's sha256, and both name
-                         the same commit.
+  make verify-pin        Each pin matches its sidecar's sha256 and is stamped
+                         with the commit the sidecar names, and both name the
+                         same commit.
   make verify-pin-clean  The same, and the pins were built from a clean tree.
   make release           Alias of release-linux.
   make release-linux     dist/ tarball with a static, stamped cryo (POSIX).
@@ -522,8 +524,10 @@ endif
 # ---- pin self-verification --------------------------------------------
 # Assert each committed pin's bytes match its .pin.txt sidecar sha256
 # (catches a binary committed without regenerating its sidecar, corruption,
-# or a hand-edited sidecar).  Pure-python, no build, runs on any host.
-#   verify-pin        integrity only (sha256 == sidecar)
+# or a hand-edited sidecar), and that the commit `cryo stamp` wrote into each
+# pin is the one its sidecar names.  Pure-python, no build, runs on any host;
+# it reads the stamp from the bytes, so both pins are checked on either host.
+#   verify-pin        integrity (sha256 and stamped commit == sidecar)
 #   verify-pin-clean  ALSO require a clean-worktree pin - the release gate
 #                     (a pin built from a dirty tree isn't reproducible).
 verify-pin:
@@ -651,10 +655,12 @@ incremental-instance-check: cryo
 	@$(PYTHON) scripts/incremental-instance-check.py --cryo "$(STAGE2)"
 endif
 
-# The judges behind verify's tests/started-compiling declarations, driven
-# through every case they must refuse and every case they must allow.
+# The judges behind verify's tests/started-compiling declarations, and
+# verify-pin's checks, driven through every case they must refuse and every
+# case they must allow.
 verify-selftest:
 	@$(PYTHON) scripts/verify.py --selftest
+	@$(PYTHON) scripts/verify-pin.py --selftest
 
 # ---- the pre-commit sweep ----------------------------------------------
 # Every gate here is source-derived, so this target builds nothing.  A short

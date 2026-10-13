@@ -452,10 +452,11 @@ make selfhost-check    # 3-round / 6-stage byte-identity gate
 make test              # run the repo-level test suite
 make lsp               # build the Cryo-language LSP (bin/cryolsp)
 make pin               # refresh bin/cryo and bin/cryo.exe (host-aware)
-make clean             # remove compiler + stdlib build outputs
+make clean             # remove compiler, stdlib, runtime tier and LSP build outputs
+make help              # every target, and what each one changes besides its output
 ```
 
-Day-to-day flow: `make cryo`. Pre-tag / pre-merge gate: `make selfhost-check`.
+Day-to-day flow: `make cryo`. Before a commit: `make check-fast`; the evidence that a change is safe: `make verify`. Pre-tag / pre-merge gate: `make selfhost-check`.
 
 The pinned binary at `bin/cryo` is required - every build target drives off it. If the pin is missing, check out a revision that has it committed.
 
@@ -518,7 +519,7 @@ CryoLang/
 |   +-- 11-http-server    net::http server
 |   +-- ...
 +-- tests/                Repo-level test suite (uses ![test])
-+-- scripts/              Build helpers (selfhost-check, cryo-pin)
++-- scripts/              Gates, pinning, release and toolchain scripts (scripts/README.md)
 +-- assets/
 +-- Makefile              Top-level build orchestration
 +-- install.sh            Symlink installer

@@ -6,6 +6,69 @@ rulings that constrain an item are in the appendix of
 `docs/resolution-rules.md`, and the language as it stands is
 `docs/cryo.md`.
 
+## Merge notes
+
+For the person merging `naming-impl` into `main`.  It has served its purpose
+once CI runs verify's gate list.
+
+**What the local gates mean.**  `make check-fast` runs verify's self-test,
+verify-pin's self-test and `make verify-pin` (each pin's sha256 and stamped
+commit match its sidecar, and both pins name one commit).  It builds
+nothing, so it says nothing about the compiler.  `make verify` is the
+evidence: it builds the compiler once, then runs the census (every suite,
+counts against `tests/test-roster.txt`), every example's build, the LSP
+build with the compiler under test, the other OS's half (objects only), the
+incremental new-instance fixture and check-fast, all concurrently; with
+`ARGS="--baseline HEAD --require-identical"` it also proves no compiled
+object moved.
+
+**CI does not run the same list** (ruling 266: CI is aligned with verify's
+gate list first thing after the merge).  CI fires only on `main` and on a
+manual dispatch, so its first run is the merge itself.  As it stands:
+
+| gate | `make verify` | CI |
+|---|---|---|
+| census (`test-census`) | yes | yes |
+| examples build | yes | yes |
+| `lsp-check` | yes | yes |
+| `cross-check` | yes | no |
+| `incremental-instance-check` | yes | no |
+| `check-fast` (the two self-tests) | yes | no; CI runs `verify-pin` alone |
+| object comparison against a baseline | yes | no |
+| `roster-check` | no (the census reads the same golden) | yes |
+| `examples-golden`, `valgrind-check`, `verify-freestanding` | no (POSIX only) | yes |
+| `incremental-check` | no | yes |
+| `vendor-check` | no | yes |
+| `api-index-check` | no | yes |
+| `selfhost-check` | no | yes, Linux arm, `--allow-skipped-arm` |
+
+So the first CI run on `main` exercises six gates the branch's sessions
+did not run as routine; a red one there is not evidence that the merge broke
+it, and is worth checking against the branch tip first.
+
+**Known red or unexercised.**
+- `scripts/release-smoke.sh` fails for the Windows archive today, which
+  ships no `stdlib/.bin/libcryo.a` while the compiler puts one on the link
+  line.  The first release tag off `main` meets it.
+- Nothing runs the release archive itself; the verify job exercises a
+  different binary, linked differently.
+- `selfhost-check`'s wine path has never run under WSL and is skipped on CI
+  (ruling 270: it is measured on the CI runner before it is kept or
+  deleted).
+- `make release`, `install` and `uninstall` are POSIX recipes with no
+  Windows branch; on a Windows host they fail with a cmd parse error rather
+  than a refusal.
+- Two unit tests flake under load on Windows:
+  `ProcessAsync::two_children_join_concurrently` and
+  `FutureBlocking::blocking_pool_a_configured_ceiling_is_enforced`.
+  `CRYO_TEST_JOBS=4` steadies both.
+
+**Tree state.**  Session scratch under `.objcmp/` is untracked (ruling 267:
+session scratch is never tracked), the one-off codemods are deleted (ruling
+268: a codemod goes in the commit after the one that ran it), and
+`scripts/README.md` names every remaining script and its caller.  The
+untracked plans in `docs/` and `.todo/` are not part of the branch.
+
 ## The editor's symbol layer, rebuilt on compiler identities
 
 The language server answers from the compiler's own identities - the
