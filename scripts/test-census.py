@@ -18,14 +18,18 @@ This does.  It runs the suite, streams the output through unchanged so the CI
 log reads the same, and then asserts that the three suites accounted for every
 entry the roster golden pins:
 
-    unit          passed + failed + ignored + filtered == pinned unit entries
+    unit          passed + failed + ignored + filtered == pinned unit entries,
+                                                        less those gated to
+                                                        another OS
     compile-fail  passed + failed                      == pinned negative files
     projects      passed + failed + skipped + ignored  == pinned projects
     projects      every pinned project was REACHED, by name
 
-Each is an identity, not a floor, and each is HOST-INDEPENDENT even though the
-outcomes are not: a project gated to another OS is skipped rather than absent,
-and skipped is one of the terms.  A suite whose summary block never printed is
+Each is an identity, not a floor, and each holds on every host even though the
+outcomes do not: a project gated to another OS is skipped rather than absent,
+and skipped is one of the terms; a unit test gated to another OS is never
+compiled here, so it is excused by the `![target]` reading roster-check
+waives it by.  A suite whose summary block never printed is
 a refusal - that is the zero this exists to see, and it cannot be told from
 success any other way.
 
@@ -40,6 +44,7 @@ Usage:
 Exit codes: the suite's own, unless the census itself fails (then 1).
 """
 import argparse
+import importlib.util
 import os
 import re
 import subprocess
@@ -65,10 +70,30 @@ PROJ_SKIP = re.compile(r"skipped \(requires (.+?)\)\s*$")
 PROJ_IGNORE = re.compile(r"(?:^|\.\.\. )ignored\s*$")
 
 
+def roster_check():
+    """scripts/roster-check.py as a module: its reading of the `![target]`
+    gates is the one both gates use."""
+    spec = importlib.util.spec_from_file_location(
+        "roster_check", os.path.join(ROOT, "scripts", "roster-check.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def pinned():
-    """(unit count, negative count, project NAMES) from the roster golden."""
+    """(unit count, negative count, project NAMES, unit entries gated to
+    another OS) from the roster golden.
+
+    The golden is a union across hosts, so a unit test gated to another OS is
+    pinned here and never compiled: it is excused from the unit count, by the
+    same reading of the source roster-check waives it by.  A test gated to
+    this host, or to none, is still owed.
+    """
+    rc = roster_check()
+    gated = rc.gated_tests()
     unit = neg = 0
     projects = set()
+    elsewhere = []
     with open(GOLDEN, "r", encoding="utf-8") as fh:
         for raw in fh:
             line = raw.strip()
@@ -79,8 +104,11 @@ def pinned():
             elif line.startswith("project "):
                 projects.add(line.split(None, 1)[1].split(":", 1)[0])
             elif ": test" in line:
-                unit += 1
-    return unit, neg, projects
+                if rc.gated_elsewhere(line, gated):
+                    elsewhere.append(line)
+                else:
+                    unit += 1
+    return unit, neg, projects, elsewhere
 
 
 def parse(lines):
@@ -161,7 +189,7 @@ def main():
     sys.stdout.flush()
     code = proc.wait()
 
-    want_unit, want_neg, want_projects = pinned()
+    want_unit, want_neg, want_projects, unit_elsewhere = pinned()
     blocks, reached, skipped, ignored = parse(captured)
 
     problems = []
@@ -220,6 +248,8 @@ def main():
     print()
     print("test-census: roster pins %d unit, %d compile-fail, %d project(s)"
           % (want_unit, want_neg, len(want_projects)))
+    for ln in unit_elsewhere:
+        print("  gated    %s (not built on this host)" % ln.rsplit(": test", 1)[0])
     for name, reason in skipped:
         print("  skipped  %-40s requires %s" % (name, reason))
     if ignored:

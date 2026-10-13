@@ -190,6 +190,26 @@ def leaf_name(entry):
     return entry.rsplit(": test", 1)[0].rsplit("::", 1)[-1].strip()
 
 
+def gated_elsewhere(entry, gated):
+    """Whether a golden entry is a unit test this host does not build.
+
+    Unit entries only.  The project and negative sections are read off the
+    filesystem, so every host enumerates the same population and an absence
+    there is a deletion, never a gate.  `unix` names both POSIX hosts, so a
+    test gated to it is built here on either of them.
+
+    `test-census` asks this too, so the two gates cannot disagree on which
+    pinned entries a host is excused from.
+    """
+    if not is_unit(entry):
+        return False
+    g = gated.get(leaf_name(entry))
+    if g is None:
+        return False
+    here = (HOST_TARGET, "unix") if HOST_TARGET in ("linux", "macos") else (HOST_TARGET,)
+    return g not in here
+
+
 def golden_entries():
     """Every committed golden entry, whitespace-normalized."""
     if not os.path.exists(GOLDEN):
@@ -379,9 +399,7 @@ def main(argv):
         # only a test that still exists and cannot run here.
         gated = gated_tests()
         keep = [ln for ln in golden_entries()
-                if is_unit(ln)
-                and gated.get(leaf_name(ln)) not in (None, HOST_TARGET)
-                and ln not in set(entries)]
+                if gated_elsewhere(ln, gated) and ln not in set(entries)]
         merged = sorted(set(entries) | set(keep))
         with open(GOLDEN, "w", newline="\n") as f:
             f.write("\n".join(merged) + "\n")
@@ -405,18 +423,8 @@ def main(argv):
     # deleted.  A test gated to THIS host that went missing is still a failure,
     # and so is one with no gate at all -- only the other platform's are waived.
     gated = gated_tests()
-
-    def other_platform(ln):
-        # Unit entries only.  The project and negative sections are read off
-        # the filesystem, so every host enumerates the same population and an
-        # absence there is a deletion, never a gate.
-        if not is_unit(ln):
-            return False
-        g = gated.get(leaf_name(ln))
-        return g is not None and g != HOST_TARGET
-
-    waived = [ln for ln in missing if other_platform(ln)]
-    missing = [ln for ln in missing if not other_platform(ln)]
+    waived = [ln for ln in missing if gated_elsewhere(ln, gated)]
+    missing = [ln for ln in missing if not gated_elsewhere(ln, gated)]
     for ln in waived:
         print("roster-check: gated   %s (not built on %s)" % (ln, HOST_TARGET))
 

@@ -12,7 +12,7 @@ one; the history keeps it.
 | script | what it does | called by |
 |---|---|---|
 | `verify.py` | Builds once, runs census, examples, lsp-check, cross-check, incremental-instance-check and check-fast concurrently, hashes every object, and with `--baseline REV` compares them against a compiler built from REV; `--selftest` drives its judges | `make verify`, `make verify-selftest` |
-| `test-census.py` | Runs `cryo test` and asserts each suite's count against `tests/test-roster.txt` | `make test-census`, `verify.py` (census), CI |
+| `test-census.py` | Runs `cryo test` and asserts each suite's count against `tests/test-roster.txt`; a unit test gated to another OS is excused by `roster-check.py`'s own reading of the `![target]` gates | `make test-census`, `verify.py` (census), CI |
 | `roster-check.py` | Checks the discovered unit tests, projects and negative files against `tests/test-roster.txt`; `--merge` / `--update` re-pin it | `make roster-check`, CI |
 | `examples-gate.py` | Builds every `examples/` project; refuses a sweep that found none, or fewer than `--min` | `make examples`, `verify.py` (examples), CI |
 | `check-examples-output.sh` | Builds and runs four examples and diffs their stdout against `examples/<name>/expected.out` (bash, POSIX only) | `make examples-golden`, CI |
