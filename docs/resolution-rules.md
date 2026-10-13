@@ -220,6 +220,53 @@ yet is recorded with the change that builds it, not here.
      Stack::<i32>::new()`) is refused with a clear error for now;** full
      support is on the roadmap.  (Jake)
 
+266. **CI is aligned with `make verify`'s gate list first thing after the
+     merge.**  Until then the difference is written down in the merge notes
+     (`docs/roadmap.md`).  (Jake)
+
+267. **Session scratch under `.objcmp/` is never tracked.**  The files that
+     were committed there are untracked and stay on disk.  (Jake)
+
+268. **A one-off codemod is deleted in the commit right after the one that
+     ran it.**  The commit that ran it carries the generator; the history
+     keeps it from then on.  (Jake)
+
+269. **`tools/CryoLSP/tests/smoke.py` stays, and is wired into the LSP
+     check after the merge.**  (Jake)
+
+270. **selfhost-check's wine path is measured on the CI runner after the
+     merge, before its fate is decided.**  (Jake)
+
+271. **A project test may compare a program's output against a file,**
+     through a `test.json` field named `stdout_file`.  After the merge.
+     (Jake)
+
+272. **Right after the merge, `cryo test` prints each suite's count and
+     lists every suite,** so the census and roster scripts can retire.
+     (Jake)
+
+273. **`scripts/` is restructured into `gates/`, `pin/`, `release/`,
+     `toolchain/` and `dev/` after the merge,** not before.  (Jake)
+
+274. **`make install-lsp` stays in the Makefile,** and its help line says
+     that it replaces the installed VS Code extension.  (Jake)
+
+275. **Primitives keep `max_value()` and `min_value()` for now;**
+     associated constants such as `i32::MAX` are roadmap work for after the
+     merge.  (Jake)
+
+276. **The wordings of the class-value cast error and the generic-alias
+     path error stay as they are.**  (Jake)
+
+277. **A plain import reaches a submodule its target re-exports whole:**
+     after `import std::future;`, `waker::Waker` names the re-exported
+     module's type, as `docs/cryo.md` states.  (Jake)
+
+278. **The release build stamps the static Linux binary it ships.**  (Jake)
+
+279. **`make verify-pin` also checks that each pin's stamped commit is the
+     commit its sidecar names.**  (Jake)
+
 ### 2026-10-11
 
 227. **The cleanup that removes the Python gates also removes

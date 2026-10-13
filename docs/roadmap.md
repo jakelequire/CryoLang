@@ -35,8 +35,58 @@ of scope until after the merge into `main`).  Today it fires only on
 `main` and on a manual dispatch, so on a branch the gates are what a
 person or an agent runs.
 
+The first change after the merge makes CI run the gate list `make verify`
+runs (ruling 266: CI is aligned with verify's gate list first thing after
+the merge), so green on `main` means what green meant on the branch.  Until
+then the difference is recorded in the merge notes.
+
 Open: which gates run on every push and which only before a release; and
 whether branch pushes trigger anything at all.
+
+## The test runner reports what it ran
+
+Right after the merge, `cryo test` always prints a count for each of its
+three suites - zero included - and `--list` lists all three, not the unit
+suite alone (ruling 272: the runner prints each suite's count and lists
+every suite, retiring the census and roster scripts).  `test-census.py`
+then reduces to nothing, and `roster-check.py` to a diff of `--list`
+against the golden.
+
+A project's `test.json` gains `stdout_file`, which compares the program's
+whole output against a file (ruling 271: a `stdout_file` field compares a
+program's output against a file).  The examples' `expected.out` goldens move
+onto it, which retires `scripts/check-examples-output.sh` and makes the
+check run on Windows as well.
+
+Open: the summary line's exact format, and whether line endings are
+normalised before the comparison.
+
+## Gate and script follow-ups
+
+- **`scripts/` is restructured** into `gates/`, `pin/`, `release/`,
+  `toolchain/` and `dev/` (ruling 273: the restructure happens after the
+  merge).  Renames only, with every caller updated in the same commit.
+- **The language server's smoke test runs in the LSP check.**
+  `tools/CryoLSP/tests/smoke.py` starts the server and asks it questions;
+  nothing calls it today (ruling 269: it stays and is wired into the LSP
+  check after the merge).
+- **selfhost-check's wine path is measured on the CI runner** before it is
+  kept or deleted (ruling 270: measure first, then decide).  It cannot run
+  under WSL, and CI passes `--allow-skipped-arm` to tolerate its absence.
+- **The language server reports the stamped version** (`serverInfo`) that
+  `cryo version` prints.
+- **`cryo version --verbose` shows the binary's sha256,** once the standard
+  library has a sha256; it has sha1 only today.
+
+## Associated constants
+
+A type declares named constants reached by a path, so `i32::MAX` is a
+value.  Until then a primitive's bounds are `min_value()` and `max_value()`,
+and `i32::MAX` is refused (ruling 275: primitives keep `max_value()` and
+`min_value()` for now).
+
+Open: whether a trait may declare a constant its implementations supply,
+and whether a constant may be used where a type argument is expected.
 
 ## Array syntax
 

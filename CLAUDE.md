@@ -377,6 +377,9 @@ reasoning that makes deleting it feel safe. A 6,587-edit migration once had its
 generator and its whole input population living in a session temp dir while the
 edits lived on one branch; the branch diff was the only copy of either. If a
 change was produced by a script, the script lands in the same commit.
+A one-off codemod is then deleted in the very next commit: the commit that
+ran it holds it, and that is where anyone reproducing the change looks. Only a
+generator that is re-run (an index, a golden) stays in the tree.
 
 **Measure before you conclude.** `nm`/`strace`/a counter beats an
 intent-audit. Assumptions in this project have an unusually high rate of
