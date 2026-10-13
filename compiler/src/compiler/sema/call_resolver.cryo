@@ -2264,29 +2264,37 @@ type struct CallResolver {
                                          scope: ScopeResolutionNode*) -> void {
         if (call == null || scope == null) { return; }
         if (call.resolved_type_args.length > 0) { return; }
-        const entry: TemplateEntry* = this.find_static_method_template(scope);
+        const entry: TemplateEntry* = this.find_static_method_template(scope, call);
         if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) { return; }
         if (entry.param_types.length == 0) { return; }
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
         if (tmpl == null) { return; }
+        const binds: TypeRef[] = this.static_template_bindings(call, scope, entry, tmpl);
+        if (binds.length == 0) { return; }
+        call.set_resolved_type_args(binds);
+    }
 
+    /// The type arguments the static call `call` through `scope` binds the
+    /// generic static method `tmpl` (its template `entry`) with: the
+    /// turbofish written on the member or the scope, else the arguments'
+    /// inference.  Empty when the turbofish's count differs from the
+    /// method's, a type argument does not resolve, or inference leaves a
+    /// parameter unbound.
+    static_template_bindings(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
+                             entry: TemplateEntry*, tmpl: FunctionDeclNode*) -> TypeRef[] {
         mut targs: &TypeAnnotation*[] = &call.generic_args;
         if (targs.length == 0 && scope.generic_args.length > 0) { targs = &scope.generic_args; }
+        if (targs.length == 0) { return this.infer_free_call_bindings(call, entry, tmpl); }
         mut binds: TypeRef[] = [];
-        if (targs.length > 0) {
-            if (targs.length != entry.param_types.length) { return; }
-            mut rc: ResolutionContext = ResolutionContext::new("");
-            this.symbolic.symbolic_bind_params(&rc);
-            for (mut i: i64 = 0; i < targs.length; i++) {
-                const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
-                if (!tr.is_valid()) { return; }
-                binds.push(tr);
-            }
-        } else {
-            binds = this.infer_free_call_bindings(call, entry, tmpl);
-            if (binds.length == 0) { return; }
+        if (targs.length != entry.param_types.length) { return binds; }
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        this.symbolic.symbolic_bind_params(&rc);
+        for (mut i: i64 = 0; i < targs.length; i++) {
+            const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
+            if (!tr.is_valid()) { return []; }
+            binds.push(tr);
         }
-        call.set_resolved_type_args(binds);
+        return binds;
     }
 
     emit_free_call_bound_failure(mut &this, at: SourceSpan, tmpl: FunctionDeclNode*,
@@ -3185,7 +3193,8 @@ type struct CallResolver {
         }
         const oi: i64 = this.select_family_overload(&overloads, &arg_types);
         if (oi < 0) {
-            this.refuse_unmatched_family_call(call, callee, &overloads, &arg_types);
+            this.refuse_unmatched_family_call(call, this.intern.shown(this.ctx.defs.leaf_of(callee)),
+                &overloads, &arg_types);
             return TypeRef::invalid();
         }
         // The pin is the selected entry: the declaration and the one of its
@@ -3207,10 +3216,10 @@ type struct CallResolver {
     /// that arity is the arity check's to report.  An integer literal is
     /// `i32` wherever the signatures differ in its type, so a literal only
     /// another width accepts is refused here, with the help to write it.
-    refuse_unmatched_family_call(mut &this, call: CallExprNode*, callee: DefId,
+    /// `leaf` is the family's name as the candidates are shown.
+    refuse_unmatched_family_call(mut &this, call: CallExprNode*, leaf: string,
                                  overloads: &TypeRef[], arg_types: &TypeRef[]) -> void {
         if (this.state.in_symbolic_check || overloads.length < 2) { return; }
-        const leaf: string = this.intern.shown(this.ctx.defs.leaf_of(callee));
         const argc: i64 = arg_types.length;
         mut literal: boolean = false;
         for (mut i: i64 = 0; i < argc; i++) {
@@ -3227,7 +3236,12 @@ type struct CallResolver {
             if (t == null || t.kind != TypeKind::Function) { continue; }
             const ft: FunctionType* = t as FunctionType*;
             if (ft.param_types.length != argc) { continue; }
-            for (mut p: i64 = 0; p < argc; p++) { cand_params.push(ft.param_types[p]); }
+            for (mut p: i64 = 0; p < argc; p++) {
+                cand_params.push(ft.param_types[p]);
+                // A generic parameter takes a literal's type; it does not
+                // fix one.
+                if (this.types.contains_generic_param(ft.param_types[p])) { literal = false; }
+            }
             count = count + 1;
         }
         if (count == 0) { return; }
@@ -5483,15 +5497,15 @@ type struct CallResolver {
     }
 
     /// True when `owner` - the type that won resolution, or a written
-    /// specialization's instantiation - is a generic template, owns the
-    /// static-method template `Owner::method`, or is an instantiation not yet
-    /// built.  Sema then leaves the callee unpinned for mono.
-    scope_is_generic_template(&this, owner: TypeRef, member_sym: SymbolStr) -> boolean {
+    /// specialization's instantiation - is a generic template, the static
+    /// method the call `call` through `scope` selects of it is a template of
+    /// its own (`static_call_template`), or the owner is an instantiation
+    /// not yet built.  Sema then leaves the callee unpinned for mono.
+    scope_is_generic_template(mut &this, owner: TypeRef, scope: ScopeResolutionNode*, call: CallExprNode*) -> boolean {
         if (!owner.is_valid()) { return false; }
         if (this.ctx.generic_registry.template_of_type(owner) != null) { return true; }
         const owner_def: DefId = this.ctx.decl_index.def_of(owner, this.ctx.type_arena);
-        if (owner_def.is_valid() && member_sym.is_valid()
-                && this.ctx.member_template(ResBase::Def(owner_def), member_sym) != null) {
+        if (owner_def.is_valid() && this.static_call_template(owner_def, scope, call) != null) {
             return true;
         }
         const t: Type* = this.arena.lookup(owner);
@@ -5527,7 +5541,7 @@ type struct CallResolver {
         }
         if (call.resolved_callee.is_some()) { return; }
         if (!scope_sym.is_valid() || !member_sym.is_valid()) { return; }
-        if (this.scope_is_generic_template(owner, member_sym)) {
+        if (this.scope_is_generic_template(owner, scope, call)) {
             this.record_template_static(call, scope, owner);
             return;
         }
@@ -6784,39 +6798,53 @@ type struct CallResolver {
         return OverloadId::invalid();
     }
 
-    /// Several inherent entries of `fits` accept the arguments, a
-    /// non-generic method and a generic one among them: neither outranks
-    /// the other for being non-generic, so the `Type::method` call is
-    /// ambiguous (E0154).  The non-generic entry is answered so the tie is
-    /// the one error the call reports; invalid when the entries are not
-    /// such a pair.
+    /// Several inherent entries of `fits` accept the arguments, so the
+    /// `Type::method` call is ambiguous (E0154): a non-generic method does
+    /// not outrank a generic one for being non-generic, and no generic
+    /// method outranks another.  The non-generic entry, when there is one,
+    /// is answered so the tie is the one error the call reports; invalid
+    /// otherwise.
     report_static_generic_tie(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*,
                               call: CallExprNode*, owner: FamilyOwner) -> OverloadId {
         mut plain: OverloadId = OverloadId::invalid();
-        mut generic: OverloadId = OverloadId::invalid();
+        mut generics: OverloadId[] = [];
         for (mut i: i64 = 0; i < fits.length; i++) {
             if (this.ctx.decl_index.entry_trait(fits[i]).is_valid()) { continue; }
             const m: MethodNode* = this.ctx.decl_index.entry_method(fits[i]);
             if (m == null || m.func == null) { continue; }
-            if (m.func.generic_params.length > 0) { generic = fits[i]; } else { plain = fits[i]; }
+            if (m.func.generic_params.length > 0) { generics.push(fits[i]); } else { plain = fits[i]; }
         }
-        if (!plain.is_valid() || !generic.is_valid()) { return OverloadId::invalid(); }
+        if (generics.length == 0 || (!plain.is_valid() && generics.length < 2)) { return OverloadId::invalid(); }
         const leaf: string = if (path != null) { this.intern.resolve(path.member_name) } else { "" };
         const owner_t: TypeRef = match (owner) {
             FamilyOwner::Type(t) => { t }
             FamilyOwner::Def(d)  => { this.ctx.decl_index.type_of_def(d) }
             FamilyOwner::Template(_) => { TypeRef::invalid() }
         };
+        const owner_str: string = this.arena.resolve_display_name_short(owner_t);
         const at: SourceSpan = if (path != null) { path.span } else { call.span };
-        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0154_AMBIGUOUS_CALL,
+        const primary: string = if (plain.is_valid()) {
             fmt::format("`%s` is ambiguous: a non-generic and a generic method of `%s` both accept these arguments",
-                leaf, this.arena.resolve_display_name_short(owner_t)));
-        d = d.at_with_label(at, "both methods apply here");
-        d = d.with_note_at(fmt::format("candidate #1: `%s`, not generic", leaf),
-            this.ctx.decl_index.entry_span(plain));
-        d = d.with_note_at(fmt::format("candidate #2: `%s`, generic", leaf),
-            this.ctx.decl_index.entry_span(generic));
-        d = d.help("a method is not preferred for being non-generic; rename one of them");
+                leaf, owner_str)
+        } else {
+            fmt::format("`%s` is ambiguous: more than one generic method of `%s` accepts these arguments",
+                leaf, owner_str)
+        };
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0154_AMBIGUOUS_CALL, primary);
+        d = d.at_with_label(at, if (plain.is_valid()) { "both methods apply here" } else { "these methods all apply here" });
+        mut n: i32 = 1;
+        if (plain.is_valid()) {
+            d = d.with_note_at(fmt::format("candidate #1: `%s`, not generic", leaf),
+                this.ctx.decl_index.entry_span(plain));
+            n = 2;
+        }
+        for (mut i: i64 = 0; i < generics.length; i++) {
+            d = d.with_note_at(fmt::format("candidate #%d: `%s`, generic", n, leaf),
+                this.ctx.decl_index.entry_span(generics[i]));
+            n = n + 1;
+        }
+        d = d.help(if (plain.is_valid()) { "a method is not preferred for being non-generic; rename one of them" }
+                   else { "rename one of them, or write the type arguments that leave one applying" });
         this.ctx.emit_diagnostic(d);
         return plain;
     }
@@ -6954,20 +6982,55 @@ type struct CallResolver {
         }
         mut fits: OverloadId[] = this.select_static_overload(&entries, &arg_types, false, call, scope);
         if (fits.length == 0) { fits = this.select_static_overload(&entries, &arg_types, true, call, scope); }
+        if (fits.length == 0) {
+            this.refuse_unmatched_static_call(call, &entries, &arg_types, leaf);
+            return false;
+        }
         const chosen: OverloadId = this.choose_entry(&fits, scope, call, owner);
         if (!chosen.is_valid()) { return false; }
         this.pin_static_entry(call, scope, chosen);
         return true;
     }
 
+    /// E0214 for a static call no entry of the family `entries` accepts
+    /// (`refuse_unmatched_family_call`).  A family with one entry of the
+    /// call's arity that is not generic is left to the argument check, which
+    /// compares the arguments with that one signature; a generic one's
+    /// parameters are its own type parameters there, which that check
+    /// cannot judge.
+    refuse_unmatched_static_call(mut &this, call: CallExprNode*, entries: &OverloadId[],
+                                 arg_types: &TypeRef[], leaf: SymbolStr) -> void {
+        mut overloads: TypeRef[] = [];
+        mut same_arity: i64 = 0;
+        mut generic: boolean = false;
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const sig: TypeRef = this.ctx.decl_index.entry_signature(entries[i]);
+            overloads.push(sig);
+            const ft: Type* = this.arena.lookup(sig);
+            if (ft == null || ft.kind != TypeKind::Function) { continue; }
+            if ((ft as FunctionType*).param_types.length != arg_types.length) { continue; }
+            same_arity = same_arity + 1;
+            if (this.static_entry_template(entries[i]) != null) { generic = true; }
+        }
+        if (same_arity == 1 && !generic) { return; }
+        this.refuse_unmatched_family_call(call, this.intern.resolve(leaf), &overloads, arg_types);
+    }
+
     /// Every entry of `entries` whose parameters (`static_entry_params`)
-    /// every argument fits.  `autoref` admits a value argument for a
-    /// reference parameter to its type.
+    /// every argument fits, a generic static method among them when its own
+    /// type parameters bind to the arguments (`static_template_fits`).
+    /// `autoref` admits a value argument for a reference parameter to its
+    /// type.
     select_static_overload(mut &this, entries: &OverloadId[], arg_types: &TypeRef[],
                            autoref: boolean, call: CallExprNode*,
                            scope: ScopeResolutionNode*) -> OverloadId[] {
         mut fits: OverloadId[] = [];
         for (mut oi: i64 = 0; oi < entries.length; oi++) {
+            const tmpl: TemplateEntry* = this.static_entry_template(entries[oi]);
+            if (tmpl != null) {
+                if (this.static_template_fits(tmpl, call, scope, arg_types)) { fits.push(entries[oi]); }
+                continue;
+            }
             const params: TypeRef[] = this.static_entry_params(entries[oi], call, scope);
             if (params.length == 0 && arg_types.length > 0) { continue; }
             if (params.length != arg_types.length) { continue; }
@@ -6986,6 +7049,30 @@ type struct CallResolver {
         return fits;
     }
 
+    /// Whether the generic static method `t` accepts the path call `call`'s
+    /// arguments: its own type parameters bind from the call
+    /// (`static_template_bindings`), and every argument fits the parameter
+    /// they make - an untyped numeric literal any numeric parameter, which
+    /// it adopts as it does in a call to the method alone.
+    static_template_fits(mut &this, t: TemplateEntry*, call: CallExprNode*,
+                         scope: ScopeResolutionNode*, arg_types: &TypeRef[]) -> boolean {
+        if (call == null) { return false; }
+        const f: FunctionDeclNode* = t.ast_node as FunctionDeclNode*;
+        if (f == null || f.parameters.length != arg_types.length) { return false; }
+        const binds: TypeRef[] = this.static_template_bindings(call, scope, t, f);
+        if (binds.length != t.param_types.length) { return false; }
+        for (mut i: i64 = 0; i < f.parameters.length; i++) {
+            const p: VarDeclNode* = f.parameters[i];
+            if (p == null || !p.resolved_type.is_valid()) { return false; }
+            const param: TypeRef = this.subst_params(&t.param_types, &binds, p.resolved_type);
+            if (!param.is_valid()) { return false; }
+            if (this.overload_param_matches_arg(param, arg_types[i])) { continue; }
+            if (this.sema_arg_is_polymorphic_literal(call.arguments[i]) && this.literal_adopts_binding(param)) { continue; }
+            return false;
+        }
+        return true;
+    }
+
     /// The parameters a path call `Owner::m(args)` passes to entry `e`: its
     /// signature's.  A generic method's template takes its signature with
     /// the method's own type parameters bound for this call
@@ -6993,7 +7080,7 @@ type struct CallResolver {
     /// written - and none when they do not bind.  A method-level
     /// specialization takes none: it is an instance minted from a template,
     /// not a declaration a path names.  A generic static method is its own
-    /// function template and is not selected here.
+    /// function template, which `static_template_fits` judges.
     static_entry_params(mut &this, e: OverloadId, call: CallExprNode*,
                         scope: ScopeResolutionNode*) -> TypeRef[] {
         mut params: TypeRef[] = [];
@@ -7192,20 +7279,50 @@ type struct CallResolver {
     /// for a GENERIC static method on a NON-generic owner (registered by
     /// `register_static_method_templates`, keyed `Owner::method` under the
     /// owner's registered name).  The owner is the one the scope segment
-    /// names; null when no such template is registered.
-    find_static_method_template(&this, scope: ScopeResolutionNode*) -> TemplateEntry* {
+    /// names; null when the method the call selects is no such template.
+    find_static_method_template(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TemplateEntry* {
         // A specialization owns no template of its own: its static methods
         // are specialized with it, so a segment spelled as one names none.
-        mut entry: TemplateEntry* = null;
-        if (!scope.spec_owner.is_valid()) {
-            match (scope.require_scope_res("static-method template owner")) {
-                Res::TypeRelative(b, _) => {
-                    entry = this.ctx.member_template(b, scope.member_name);
-                }
-                _ => { }
-            }
+        if (scope.spec_owner.is_valid()) { return null; }
+        return match (scope.require_scope_res("static-method template owner")) {
+            Res::TypeRelative(ResBase::Def(d), _) => { this.static_call_template(d, scope, call) }
+            _                                     => { null }
+        };
+    }
+
+    /// The generic static method of the non-generic owner `owner` that the
+    /// call `call` through `scope` names, as its own function template: the
+    /// owner's only method of the leaf when it is one, else the one entry of
+    /// the family the arguments select (`select_static_overload`) when that
+    /// entry is a template.  Null when the selection is a plain method, or
+    /// none or several entries - the static overload pin reports a call the
+    /// arguments select no single entry of.
+    static_call_template(mut &this, owner: DefId, scope: ScopeResolutionNode*, call: CallExprNode*) -> TemplateEntry* {
+        const leaf: SymbolStr = scope.member_name;
+        if (!owner.is_valid() || !leaf.is_valid()) { return null; }
+        const entries: OverloadId[] = this.ctx.decl_index.lookup_family_entries(FamilyOwner::Def(owner), leaf);
+        if (entries.length < 2) { return this.ctx.member_template(ResBase::Def(owner), leaf); }
+        if (call == null) { return null; }
+        mut arg_types: TypeRef[] = [];
+        for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+            const arg: ExpressionNode* = call.arguments[ai];
+            if (arg == null || !arg.resolved_type.is_valid()) { return null; }
+            arg_types.push(arg.resolved_type);
         }
-        return entry;
+        mut fits: OverloadId[] = this.select_static_overload(&entries, &arg_types, false, call, scope);
+        if (fits.length == 0) { fits = this.select_static_overload(&entries, &arg_types, true, call, scope); }
+        if (fits.length != 1) { return null; }
+        return this.static_entry_template(fits[0]);
+    }
+
+    /// The function template entry `e` is when it is a generic static
+    /// method; null for any other entry.
+    static_entry_template(&this, e: OverloadId) -> TemplateEntry* {
+        const m: MethodNode* = this.ctx.decl_index.entry_method(e);
+        if (m == null || m.func == null || !m.is_static || m.func.generic_params.length == 0) { return null; }
+        const t: TemplateEntry* = this.ctx.generic_registry.template_of(m.func.def);
+        if (t == null || t.node_kind != NodeKind::FunctionDeclaration) { return null; }
+        return t;
     }
 
     /// Resolve a call to a GENERIC static method on a NON-generic owner
@@ -7230,7 +7347,7 @@ type struct CallResolver {
         // here would bypass that disambiguation and mis-resolve an overloaded
         // module function.  The owner of a static method is always a nominal type.
         if (!this.scope_names_a_type(scope)) { return TypeRef::invalid(); }
-        const entry: TemplateEntry* = this.find_static_method_template(scope);
+        const entry: TemplateEntry* = this.find_static_method_template(scope, call);
         if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) {
             return TypeRef::invalid();
         }
@@ -7238,25 +7355,11 @@ type struct CallResolver {
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
         if (tmpl == null || !tmpl.resolved_return_type.is_valid()) { return TypeRef::invalid(); }
 
-        // Infer the method's own type args: explicit turbofish (on the member or,
+        // The method's own type args: explicit turbofish (on the member or,
         // as a fallback, the scope), else argument inference + where-bound
         // projection (the free-function inference, which runs PASS D).
-        mut binds: TypeRef[] = [];
-        mut targs: &TypeAnnotation*[] = &call.generic_args;
-        if (targs.length == 0 && scope.generic_args.length > 0) { targs = &scope.generic_args; }
-        if (targs.length > 0) {
-            if (targs.length != entry.param_types.length) { return TypeRef::invalid(); }
-            mut rc: ResolutionContext = ResolutionContext::new("");
-            this.symbolic.symbolic_bind_params(&rc);
-            for (mut i: i64 = 0; i < targs.length; i++) {
-                const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
-                if (!tr.is_valid()) { return TypeRef::invalid(); }
-                binds.push(tr);
-            }
-        } else {
-            binds = this.infer_free_call_bindings(call, entry, tmpl);
-            if (binds.length != entry.param_types.length) { return TypeRef::invalid(); }
-        }
+        const binds: TypeRef[] = this.static_template_bindings(call, scope, entry, tmpl);
+        if (binds.length != entry.param_types.length) { return TypeRef::invalid(); }
         // Every arg must BIND; it need not yet be CONCRETE.  Called from inside a
         // generic body the args carry the enclosing template's parameters
         // (`Futures::timeout(d, this.read())` in `implement struct BufStream<S>`
@@ -8578,7 +8681,7 @@ type struct CallResolver {
             }
         } else {
             const owner_ty: TypeRef = this.scope_owner_type(scope);
-            if (this.scope_is_generic_template(owner_ty, scope.member_name)) {
+            if (this.scope_is_generic_template(owner_ty, scope, call)) {
                 this.check_template_static_args(visitor, scope, call);
                 return;
             }

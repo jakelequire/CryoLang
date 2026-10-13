@@ -160,6 +160,22 @@ yet is recorded with the change that builds it, not here.
 305. **E0458's wording stays:** "a capturing closure cannot be held by a
      variable of function type ...".  (Dispatch, delegated)
 
+306. **The standard library's explicit destructor calls that release a
+     field or a match binding inside a destructor are removed;** each field
+     is then released when the destructor finishes.  Every site is checked on
+     its own, and a site whose release order is observable is kept and
+     reported instead.  (Dispatch, delegated)
+
+307. **The explicit-destructor-call warning and the language document say
+     what the compiler does for a local:** `x.drop()` on a local stops its
+     release at scope exit and stops later use of it.  (Dispatch, delegated)
+
+308. **The editor's purely mechanical warnings are fixed when there is
+     room** - an explicit drop of a local becomes `mem::drop(x)`, and a
+     literal suffix the declared type already gives is removed - proved as
+     the standard library's were.  This is not the editor's rebuild.
+     (Dispatch, delegated)
+
 ### 2026-10-12
 
 247. **The compiler's `![allow]`s that named the deleted lint, and the
