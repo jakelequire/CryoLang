@@ -214,7 +214,7 @@ type struct Http2Connection<S> {
             // `process_control` only queues, so the frame is released before
             // the flush below rather than being carried across it.
             const outcome: Result<boolean, IoError> = this.process_control(&fr);
-            fr.drop();
+            mem::drop(fr);
             match (outcome) {
                 Result::Ok(_)  => { }
                 Result::Err(e) => { return Result::Err(e); }
@@ -234,7 +234,7 @@ type struct Http2Connection<S> {
         settings::push_entry(&payload, settings::SETTINGS_MAX_HEADER_LIST_SIZE, LOCAL_MAX_HEADER_LIST_SIZE);
         const r: Result<(), IoError> =
             this.conn.queue_h2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice());
-        payload.drop();
+        mem::drop(payload);
         return r;
     }
 
@@ -399,7 +399,7 @@ type struct Http2Connection<S> {
         while (this.stream_send_window <= 0 || this.conn_send_window <= 0) {
             mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as u64))?;
             const outcome: Result<boolean, IoError> = this.process_control(&fr);
-            fr.drop();
+            mem::drop(fr);
             match (outcome) {
                 Result::Ok(_)  => { }
                 Result::Err(e) => { return Result::Err(e); }
@@ -444,11 +444,11 @@ type struct Http2Connection<S> {
         // live across the flush would be carried for nothing.
         mut body_bytes: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&body_bytes, &request_local.body);
-        request_local.drop();
+        mem::drop(request_local);
 
         const queued: Result<(), IoError> =
             this.queue_header_block(sid, block.as_slice(), !has_body);
-        block.drop();
+        mem::drop(block);
         queued?;
 
         // `send_body` flushes whether or not there are DATA frames, so the
@@ -480,41 +480,41 @@ type struct Http2Connection<S> {
             mut handled: boolean = false;
             match (control) {
                 Result::Ok(h)  => { handled = h; }
-                Result::Err(e) => { fr.drop(); return Result::Err(e); }
+                Result::Err(e) => { mem::drop(fr); return Result::Err(e); }
             }
             if (handled) {
-                fr.drop();
+                mem::drop(fr);
                 (await this.conn.flush())?;
                 continue;
             }
 
             if (fr.ftype == frame::FRAME_RST_STREAM && fr.stream_id == sid) {
-                fr.drop();
+                mem::drop(fr);
                 return Result::Err(IoError::new(IoErrorKind::ConnectionReset, 0));
             } else if (fr.ftype == frame::FRAME_HEADERS && fr.stream_id == sid) {
                 block.append(header_fragment(&fr));
                 if (fr.has_flag(frame::FLAG_END_HEADERS)) { headers_done = true; }
                 if (fr.has_flag(frame::FLAG_END_STREAM))  { stream_done = true; }
-                fr.drop();
+                mem::drop(fr);
             } else if (fr.ftype == frame::FRAME_CONTINUATION && fr.stream_id == sid) {
                 block.append(fr.payload.as_slice());
                 if (fr.has_flag(frame::FLAG_END_HEADERS)) { headers_done = true; }
-                fr.drop();
+                mem::drop(fr);
             } else if (fr.ftype == frame::FRAME_DATA && fr.stream_id == sid) {
                 body.append(data_fragment(&fr));
                 const consumed: u64 = fr.payload.length();
                 const end: boolean = fr.has_flag(frame::FLAG_END_STREAM);
-                fr.drop();
+                mem::drop(fr);
                 this.queue_ack_data(sid, consumed)?;
                 (await this.conn.flush())?;
                 if (end) { stream_done = true; }
             } else {
-                fr.drop();
+                mem::drop(fr);
             }
         }
 
         const built: Option<Response> = build_response(&this.decoder, block.as_slice(), body);
-        block.drop();
+        mem::drop(block);
         match (built) {
             Option::Some(resp) => { return Result::Ok(resp); }
             Option::None       => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
@@ -582,11 +582,11 @@ type struct Http2Connection<S> {
             mut handled: boolean = false;
             match (control) {
                 Result::Ok(h)  => { handled = h; }
-                Result::Err(e) => { fr.drop(); return Result::Err(e); }
+                Result::Err(e) => { mem::drop(fr); return Result::Err(e); }
             }
             if (handled) {
                 const closing: boolean = this.goaway_received && !have_stream;
-                fr.drop();
+                mem::drop(fr);
                 if (closing) { return Result::Ok(Option::None); }
                 (await this.conn.flush())?;
                 continue;
@@ -599,26 +599,26 @@ type struct Http2Connection<S> {
                     if (fr.has_flag(frame::FLAG_END_HEADERS)) { headers_done = true; }
                     if (fr.has_flag(frame::FLAG_END_STREAM))  { stream_done = true; }
                 }
-                fr.drop();
+                mem::drop(fr);
             } else if (fr.ftype == frame::FRAME_CONTINUATION && have_stream && fr.stream_id == sid) {
                 block.append(fr.payload.as_slice());
                 if (fr.has_flag(frame::FLAG_END_HEADERS)) { headers_done = true; }
-                fr.drop();
+                mem::drop(fr);
             } else if (fr.ftype == frame::FRAME_DATA && have_stream && fr.stream_id == sid) {
                 body.append(data_fragment(&fr));
                 const consumed: u64 = fr.payload.length();
                 const end: boolean = fr.has_flag(frame::FLAG_END_STREAM);
-                fr.drop();
+                mem::drop(fr);
                 this.queue_ack_data(sid, consumed)?;
                 (await this.conn.flush())?;
                 if (end) { stream_done = true; }
             } else {
-                fr.drop();
+                mem::drop(fr);
             }
         }
 
         const built: Option<Request> = build_request(&this.decoder, block.as_slice(), body);
-        block.drop();
+        mem::drop(block);
         match (built) {
             Option::Some(req) => {
                 return Result::Ok(Option::Some(RequestOnStream { stream_id: sid, req: req }));
@@ -641,11 +641,11 @@ type struct Http2Connection<S> {
         // suspend.
         mut body_bytes: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&body_bytes, &response.body);
-        response.drop();
+        mem::drop(response);
 
         const queued: Result<(), IoError> =
             this.queue_header_block(sid, block.as_slice(), !has_body);
-        block.drop();
+        mem::drop(block);
         queued?;
 
         return await this.send_body(sid, body_bytes, has_body);
@@ -739,7 +739,7 @@ function build_response(decoder: mut &HpackDecoder, block: Slice<u8>, body: Arra
     mut body_local: Array<u8> = body;
     mut fields: Array<HeaderField> = match (decoder.decode(block)) {
         Option::Some(f) => { f }
-        Option::None    => { body_local.drop(); return Option::None; }
+        Option::None    => { mem::drop(body_local); return Option::None; }
     };
 
     mut code: u16 = 0;
@@ -759,7 +759,7 @@ function build_response(decoder: mut &HpackDecoder, block: Slice<u8>, body: Arra
         }
         i++;
     }
-    if (!have_status) { fields.drop(); body_local.drop(); return Option::None; }
+    if (!have_status) { mem::drop(fields); mem::drop(body_local); return Option::None; }
 
     mut resp: Response = Response::new(StatusCode::from_u16(code));
     mut j: u64 = 0;
@@ -775,7 +775,7 @@ function build_response(decoder: mut &HpackDecoder, block: Slice<u8>, body: Arra
         }
         j++;
     }
-    fields.drop();
+    mem::drop(fields);
 
     resp.set_body(body_local);
     return Option::Some(resp);
@@ -787,7 +787,7 @@ function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array
     mut body_local: Array<u8> = body;
     mut fields: Array<HeaderField> = match (decoder.decode(block)) {
         Option::Some(f) => { f }
-        Option::None    => { body_local.drop(); return Option::None; }
+        Option::None    => { mem::drop(body_local); return Option::None; }
     };
 
     mut method: Option<Method> = Option::None;
@@ -824,7 +824,7 @@ function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array
         Option::None    => {
             cleanup_opt_string(path);
             cleanup_opt_string(authority);
-            fields.drop(); body_local.drop();
+            mem::drop(fields); mem::drop(body_local);
             return Option::None;
         }
     }
@@ -832,13 +832,13 @@ function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array
         Option::Some(p) => { p }
         Option::None    => {
             cleanup_opt_string(authority);
-            fields.drop(); body_local.drop();
+            mem::drop(fields); mem::drop(body_local);
             return Option::None;
         }
     };
 
     mut req: Request = Request::new(chosen_method, path_str.as_str());
-    path_str.drop();
+    mem::drop(path_str);
     match (authority) {
         Option::Some(mut a) => {
             req.headers.insert(Str::new("host"), a.as_str());
@@ -860,7 +860,7 @@ function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array
         }
         j++;
     }
-    fields.drop();
+    mem::drop(fields);
 
     req.set_body(body_local);
     return Option::Some(req);
