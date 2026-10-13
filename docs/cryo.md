@@ -3105,10 +3105,13 @@ implement trait Drop for Owner {
 > partially-consumed aggregate depend on the no-op behaviour.
 
 **Do not call `drop` by hand.** An explicit `x.drop()` warns (`W0015`) and will
-become an error: the value is released at scope exit anyway, so the call is at
-best redundant and at worst a second release. To release **early**, use
-`mem::drop(x)`, which takes the value - so the move checker rejects any later
-use and the scope-exit drop is suppressed. A bare `x.drop()` does neither.
+become an error. To release **early**, use `mem::drop(x)`, which takes the
+value - so the move checker rejects any later use and the scope-exit drop is
+suppressed. On a local, `x.drop()` does the same: it is read as a move, so the
+local is released once, there, and a later use is refused (`E0452`). On a
+field, `h.a.drop()` releases the field and the owner releases it again when it
+is released itself - a second release, harmless only while every destructor
+leaves what it freed empty.
 
 **Only `implement trait Drop` defines a destructor.** A method merely named `drop` - declared in a struct body or an inherent `implement` block - is an ordinary method: it is not run at scope exit, it does not make the type satisfy `where T: Drop`, and calling it releases nothing else.
 
