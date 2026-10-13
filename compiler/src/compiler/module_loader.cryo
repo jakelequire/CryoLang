@@ -90,6 +90,12 @@ private:
     // Value: file path (e.g., "src/compiler/AST/node.cryo")
     ns_map: HashMap<string, string>;
 
+    // Normalized file path -> `vendor::<Name>`, for each binding a
+    // `vendor::<Name>` import resolved to.  The generated file declares
+    // `namespace <Name>;`, but the module is registered under the path the
+    // import writes, because an import names a module whole.
+    vendor_modules: HashMap<string, string>;
+
 public:
     /// LSP-mode editor-buffer override.  When `lsp_override_path` is
     /// non-empty and matches the file the loader is about to read, the
@@ -139,6 +145,7 @@ public:
             loaded_paths:  [],
             scanned_ns:    HashMap::<string, string>::new(),
             ns_map:        HashMap::<string, string>::new(),
+            vendor_modules: HashMap::<string, string>::new(),
             lsp_override_path:    "",
             lsp_override_content: "",
             vendor_registry:  VendorRegistry::empty(),
@@ -484,15 +491,19 @@ public:
             && import_path.starts_with("vendor::");
     }
 
-    /// Record that an import-walk resolved a `vendor::Name` import, so the
-    /// library's native link metadata is merged later (`merge_vendor_links`).
-    /// Dedups by registry key.  No-op for non-vendor paths or unregistered
-    /// libraries.  Called from the discovery loop (which holds `mut &this`).
-    note_vendor_import(mut &this, import_path: string) -> void {
+    /// Record that an import-walk resolved a `vendor::Name` import to the
+    /// binding file `resolved`: the module discovered from that file is
+    /// named `vendor::<Name>`, and the library's native link metadata is
+    /// merged later (`merge_vendor_links`, deduped by registry key).  No-op
+    /// for non-vendor paths or unregistered libraries.  Called from the
+    /// discovery loop (which holds `mut &this`).
+    note_vendor_import(mut &this, import_path: string, resolved: string) -> void {
         if (!ModuleLoader::is_vendor_path(import_path)) { return; }
         const lib: string = import_path + 8;
         const idx: i64 = this.vendor_registry.find_index(lib);
         if (idx < 0) { return; }
+        this.vendor_modules.insert(resolved.to_ascii_lower(),
+            "vendor::" + this.vendor_registry.entries[idx].name);
         const key: string = this.vendor_registry.entries[idx].key;
         for (mut i: i64 = 0; i < this.used_vendor_keys.length; i++) {
             if (this.used_vendor_keys[i] == key) { return; }
@@ -648,10 +659,15 @@ public:
         }
 
         // Create ModuleInfo (store original path so the lexer can open the file)
-        const mod_name: SymbolStr = if (scan.namespace_name.is_valid()) {
-            scan.namespace_name
+        const vendor_name: Option<string> = this.vendor_modules.get(&norm_path);
+        const mod_name: SymbolStr = if (vendor_name.is_some()) {
+            intern.intern(vendor_name.unwrap())
         } else {
-            intern.intern(ModuleLoader::extract_module_name(file_path))
+            if (scan.namespace_name.is_valid()) {
+                scan.namespace_name
+            } else {
+                intern.intern(ModuleLoader::extract_module_name(file_path))
+            }
         };
         const mod_name_str: string = intern.resolve(mod_name);
         mut info: ModuleInfo = ModuleInfo::with_namespace(
@@ -723,9 +739,10 @@ public:
 
             import_files[i] = resolved;
 
-            // Vendor import: record the library so its native link metadata
-            // is merged into the link command after discovery.
-            this.note_vendor_import(import_path);
+            // Vendor import: name the binding's module and record the library
+            // so its native link metadata is merged into the link command
+            // after discovery.
+            this.note_vendor_import(import_path, resolved);
 
             // Recursively discover the dependency (must happen before
             // add_dependency so the target module's namespace is known)

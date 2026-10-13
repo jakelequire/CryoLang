@@ -221,6 +221,15 @@ yet is recorded with the change that builds it, not here.
      ties ignoring `where` clauses - as bugs in `.bug-report/` or items in
      `docs/roadmap.md`.  (Dispatch, delegated, per ruling 313)
 
+318. **A vendored library's module is named `vendor::<Name>`,** the path
+     its import writes, whatever namespace the generated binding declares.
+     `import vendor::RayLib;` names it whole and `RayLib::InitWindow`
+     reaches its items, as with any import.  The binding generator and the
+     written import are unchanged; the loader names the module it reached
+     through a `vendor::` import.  (Jake, choosing this over making the
+     generator declare `namespace vendor::<Name>` or changing how a vendor
+     import is written)
+
 ### 2026-10-12
 
 247. **The compiler's `![allow]`s that named the deleted lint, and the

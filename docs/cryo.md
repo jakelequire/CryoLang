@@ -2746,6 +2746,8 @@ import Json as Loc;
 type struct Loc { n: i32; }        // error[E0205]
 ```
 
+A library registered with `cryo vendor` is imported as `vendor::<Name>`, and that is its module's name: `import vendor::RayLib;` binds the module, and `RayLib::InitWindow(..)` reaches its items. The generated binding declares `namespace RayLib;`, but a module reached through a `vendor::` import is named by the path the import writes.
+
 Each `import` declaration imports from a single path. To bring two items from the same module into scope, use the selective brace form (`import M::{A, B};`) or write two separate `import` statements.
 
 Wildcard imports are convenient but can cause name collisions; prefer the brace form or using the module name directly.
