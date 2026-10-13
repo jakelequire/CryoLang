@@ -86,11 +86,17 @@ def target_triple(exe, runner=None, env=None) -> str:
     overwrite each other's archives.
     """
     cmd = (list(runner) if runner else []) + [str(exe), "version", "--triple"]
-    out = subprocess.run(cmd, capture_output=True, text=True,
-                         env=env).stdout.strip()
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    out = r.stdout.strip()
     if not out:
-        sys.exit("selfhost-check: `version --triple` returned nothing from "
-                 f"{exe}; the pinned compiler predates it.")
+        # Empty is two different failures: a compiler that predates the
+        # subcommand answers and exits non-zero with its usage, while one that
+        # never started (a missing DLL, a runner that cannot launch it) says
+        # nothing of its own.  The exit code and stderr tell them apart.
+        sys.exit("selfhost-check: `%s` printed no triple (exit %d).\n"
+                 "  stderr: %s"
+                 % (" ".join(cmd), r.returncode,
+                    r.stderr.strip()[-2000:] or "<empty>"))
     return out
 def stage_answers(exe, runner=None, env=None):
     """What a stage compiler says when RUN, or None if it cannot be.
