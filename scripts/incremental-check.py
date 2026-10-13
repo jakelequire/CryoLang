@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-module incremental-build soundness harness.
 
-The contract for per-module incremental compilation (see HANDOFF.md §5 and
+The contract for per-module incremental compilation (see
 build_manifest.cryo) is BYTE-IDENTITY: for ANY edit, an incremental build must
 produce a final binary byte-for-byte identical to a clean `--no-incremental`
 build of the same source. A false cache hit is a silent miscompile, so this

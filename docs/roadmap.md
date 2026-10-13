@@ -58,10 +58,10 @@ it, and is worth checking against the branch tip first.
 - `make release`, `install` and `uninstall` are POSIX recipes with no
   Windows branch; on a Windows host they fail with a cmd parse error rather
   than a refusal.
-- Two unit tests flake under load on Windows:
-  `ProcessAsync::two_children_join_concurrently` and
-  `FutureBlocking::blocking_pool_a_configured_ceiling_is_enforced`.
-  `CRYO_TEST_JOBS=4` steadies both.
+- `ProcessAsync::two_children_join_concurrently` flakes under load on
+  Windows: it compares two wall-clock measurements, and process start-up
+  under the suite's load can stretch one past the other.  `CRYO_TEST_JOBS=4`
+  steadies it.
 
 **Tree state.**  Session scratch under `.objcmp/` is untracked (ruling 267:
 session scratch is never tracked), the one-off codemods are deleted (ruling
@@ -140,6 +140,12 @@ normalised before the comparison.
   `cryo version` prints.
 - **`cryo version --verbose` shows the binary's sha256,** once the standard
   library has a sha256; it has sha1 only today.
+- **`make verify ARGS="--baseline REV"` works for a revision from before
+  the version stamp,** `main` included (ruling 298: fixed after the merge).
+  verify builds every baseline with the working tree's Makefile, which runs
+  `cryo stamp` on it, and a compiler from before the stamp has no slot to
+  stamp: "it holds 0 stamp regions; expected exactly one".  A baseline
+  build needs to skip the stamp step.
 
 ## Associated constants
 

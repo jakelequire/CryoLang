@@ -763,9 +763,10 @@ endif
 # Build AND run the deterministic, input-free examples and diff their stdout
 # against committed goldens (examples/<name>/expected.out).  Catches runtime
 # regressions that the build-only `examples` target misses.  POSIX-only: the
-# script is bash, so a Windows host refuses rather than reporting success.
+# script is bash, so a Windows host refuses rather than reporting success,
+# and builds nothing first.
 ifeq ($(HOST_OS),windows)
-examples-golden: $(STAGE2_EXE) $(LIBCRYO_A)
+examples-golden:
 	$(error examples-golden: UNAVAILABLE on this host -- it builds AND RUNS the examples and diffs stdout with bash; run it from WSL)
 else
 examples-golden: $(STAGE2) $(LIBCRYO_A)
@@ -777,9 +778,10 @@ endif
 # invalid free/read/write or definite leak.  The static move-checker rejects
 # use-after-move at compile time; this exercises the generated drop/free paths
 # at runtime, so a miscompile that double-freed or leaked an owned value is
-# caught here.  POSIX/Linux-only and requires valgrind on PATH.
+# caught here.  POSIX/Linux-only and requires valgrind on PATH; a Windows host
+# refuses and builds nothing first.
 ifeq ($(HOST_OS),windows)
-valgrind-check: $(STAGE2_EXE) $(LIBCRYO_A)
+valgrind-check:
 	$(error valgrind-check: UNAVAILABLE on this host -- valgrind is POSIX/Linux only; run it from WSL)
 else
 valgrind-check: $(STAGE2) $(LIBCRYO_A)

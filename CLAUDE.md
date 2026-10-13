@@ -451,6 +451,11 @@ with no diff to check it against.
   A flat `stdlib/.bin/libcryo.a` is the pre-split layout and is removed by the
   `stdlib` target; the flat path stays meaningful for an INSTALLED tree, which
   holds one target by construction, and a release stages it there.
+- **`make selfhost-check` on Windows deletes `compiler/build/cryo.exe`** and
+  empties `stdlib/.bin/x86_64-pc-windows-gnu/` while it runs.  It rebuilds
+  the archive from the pin, but not `compiler/build/cryo.exe`: run `make
+  cryo` after it.  Start no other build during it - one that links while the
+  archive is gone fails, naming the flat `stdlib/.bin/libcryo.a`.
 - A scratch project outside the repo cannot find the stdlib — set
   `CRYO_STDLIB`. `compiler/build/cryo` cannot find it from another directory;
   `bin/cryo` can.

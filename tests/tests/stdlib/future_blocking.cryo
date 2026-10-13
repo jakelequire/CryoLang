@@ -73,8 +73,9 @@ const FLAG_SET_DELAY_MS: u64 = 50;
 /// `barrier`/`need` are the second condition, used only by the concurrency test:
 /// every job bumps `barrier` as it starts and will not finish until the count
 /// reaches `need`, so a group of them can require each other to be RUNNING at the
-/// same time rather than merely to have run. `barrier` is null when a job has no
-/// such requirement.
+/// same time rather than merely to have run. A job that gives up takes its count
+/// back as it leaves, so a job starting after it cannot count it as running
+/// still. `barrier` is null when a job has no such requirement.
 type struct FlagJob {
     job:     BlockingJob;
     flag:    Atomic<u32>;    // 1 once the sibling task has run
@@ -108,6 +109,7 @@ function flag_job_run(raw: u8*) -> void {
         }
         clock::sleep(Duration::from_millis(5));
     }
+    if (j.barrier != null) { j.barrier.fetch_sub(1, MemoryOrder::AcqRel); }
     j.saw = 0;
 }
 
@@ -411,13 +413,14 @@ function blocking_pool_a_configured_ceiling_is_enforced() -> Result<(), TestErro
     // readings below would then describe cancelled jobs rather than the ceiling.
     if (!all_ran) { ok = false; }
     BlockingPool::stop(pool);
-    // `a` and `b` ran together and timed out at a barrier the third job could
-    // not reach; `c` then ran alone and found all three arrivals counted, so it
-    // saw its condition met. `c` is asserted too: it is what distinguishes "the
-    // ceiling held `c` back" from "`c` never ran at all".
+    // No two-thread pool runs three jobs at once, so none of them can see the
+    // barrier reach three: `a` and `b` time out at it, and `c`, starting on a
+    // thread one of them gave up, counts at most itself and the other.  A pool
+    // that ignored its ceiling would run all three together, and every one
+    // would see three.  That `c` ran at all is `all_ran`, above.
     if (a.saw != 0) { ok = false; }
     if (b.saw != 0) { ok = false; }
-    if (c.saw != 1) { ok = false; }
+    if (c.saw != 0) { ok = false; }
     a.job.release();
     b.job.release();
     c.job.release();
@@ -427,16 +430,16 @@ function blocking_pool_a_configured_ceiling_is_enforced() -> Result<(), TestErro
 }
 
 /// Three jobs that each demand all three be running, on an executor whose
-/// blocking ceiling is two. The first two get threads and time out at a barrier
-/// the third cannot reach; the third runs once they release their threads and
-/// finds every arrival counted.
+/// blocking ceiling is two. None can see all three running: the first two get
+/// threads and time out at the barrier, and the third, run once one of them
+/// releases its thread, times out too.
 async function three_flags(x: FlagJob*, y: FlagJob*, z: FlagJob*) -> i64 {
     const p: ((i64, i64), i64) =
         await Futures::join(Futures::join(FlagFuture::start(x), FlagFuture::start(y)),
                             FlagFuture::start(z));
     if (p.0.0 != 0) { return -30; }
     if (p.0.1 != 0) { return -31; }
-    if (p.1 != 1)   { return -32; }
+    if (p.1 != 0)   { return -32; }
     return 0;
 }
 
