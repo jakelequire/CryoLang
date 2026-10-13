@@ -41,8 +41,10 @@ jobs:
       - name: Install the LLVM toolchain (apt.llvm.org on cache miss)
         run: ./scripts/ci/install-llvm.sh
 
-      - name: Verify the committed pins match their sidecars (sha256)
-        run: make verify-pin
+      # check-fast is verify-pin plus the self-tests of verify's and
+      # verify-pin's judges, the same target `make verify` runs as `fast`.
+      - name: Verify the pins match their sidecars, and self-test the gates' judges
+        run: make check-fast
 
       - name: Build cryo (stdlib + self-hosted compiler via pinned bin/cryo)
         run: make cryo
@@ -51,6 +53,18 @@ jobs:
         run: |
           ./compiler/build/cryo --version
           ./compiler/build/cryo --help
+
+      # `make verify`'s `incr` gate: an edit that asks a cached module for a
+      # new generic instance still links.  incremental-check (its own job)
+      # compares binaries over an edit matrix and does not make that edit.
+      #
+      # verify's `cross` gate is not here.  On a Linux host the compiler LINKS
+      # a windows-gnu build rather than stopping at objects, so `make
+      # cross-check` needs mingw and the LLVM-C import lib, which this job has
+      # not got; the windows native job runs it in the direction a Windows
+      # host does, where the Linux triple stops at objects.
+      - name: An edit asking a cached module for a new generic instance still links
+        run: make incremental-instance-check
 
       # Moved ahead of the test suite deliberately.  The LSP links the compiler
       # as a library and nothing else here compiles it, so it is the only step
@@ -176,6 +190,58 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: selfhost-check-logs
+          path: build-logs/
+          if-no-files-found: ignore
+
+  # selfhost-check's Windows arm under wine, provisioned the way windows-smoke
+  # provisions its cross build.  It has never been seen to run - not under
+  # WSL, not here - so it runs on a manual dispatch only, as a measurement:
+  # what it does on this runner decides whether the arm is kept as a gate or
+  # deleted.  Until then it gates nothing on a push.
+  selfhost-wine-arm:
+    name: selfhost-check windows arm under wine (dispatch only, measurement)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Restore the LLVM toolchain cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cryo-ci
+          key: llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/llvm-version.env', 'scripts/ci/install-llvm.sh') }}
+
+      - name: Install the LLVM toolchain (apt.llvm.org on cache miss)
+        run: ./scripts/ci/install-llvm.sh
+
+      - name: Install wine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 wine
+
+      - name: Restore the windows LLVM bits cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .toolchains/llvm-win
+          key: llvm-win-${{ hashFiles('scripts/llvm-version.env') }}
+
+      - name: Fetch the windows LLVM bits and llvm-mingw
+        run: ./scripts/fetch-windows-llvm.sh
+
+      # Both arms, no --allow-skipped-arm: a skipped Windows arm fails, so
+      # the result says whether the arm ran, not only whether it passed.
+      - name: Run selfhost-check, both arms
+        env:
+          WINEDEBUG: "-all"
+          WINEDLLOVERRIDES: "mscoree,mshtml="
+        run: make selfhost-check
+
+      - name: Upload stage logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: selfhost-wine-arm-logs
           path: build-logs/
           if-no-files-found: ignore
 
@@ -310,11 +376,14 @@ jobs:
     #   verify-freestanding          a bash script, and this job drives make
     #                                through cmd. Its Windows arm runs from a
     #                                developer's WSL, not from here.
-    #   lsp-check, examples          real Windows coverage, but both are a full
-    #                                build for a surface the Linux job already
-    #                                covers at source level. Add them when this
-    #                                job is trusted enough to be required.
     #   vendor-check                 needs libclang on the runner; not staged.
+    #
+    # It does run every gate `make verify` runs on a Windows host - census,
+    # examples, lsp-check, cross-check, incremental-instance-check and
+    # check-fast - so green here means what verify's green means on the
+    # machine the compiler is developed on.  cross-check runs here and not on
+    # Linux: from Windows the Linux triple stops at objects, while a Linux host
+    # links a windows-gnu build and needs a cross toolchain.
     timeout-minutes: 60
     defaults:
       run:
@@ -412,8 +481,8 @@ jobs:
         run: |
           "$(Resolve-Path .toolchains/llvm-win/bin)" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Verify the committed pins match their sidecars (sha256)
-        run: make verify-pin
+      - name: Verify the pins match their sidecars, and self-test the gates' judges
+        run: make check-fast
 
       - name: Build cryo (stdlib + self-hosted compiler via pinned bin/cryo.exe)
         env:
@@ -424,6 +493,28 @@ jobs:
         run: |
           ./compiler/build/cryo.exe --version
           ./compiler/build/cryo.exe --help
+
+      # Ahead of the suite, as on Linux: each covers a surface the suite does
+      # not build, and a gate behind a long step that fails never runs.
+      - name: Compile the language server against the compiler under test
+        env:
+          CRYO_CC: gcc
+        run: make lsp-check
+
+      - name: Compile runtime, stdlib, compiler and LSP for the Linux triple (objects only)
+        env:
+          CRYO_CC: gcc
+        run: make cross-check
+
+      - name: An edit asking a cached module for a new generic instance still links
+        env:
+          CRYO_CC: gcc
+        run: make incremental-instance-check
+
+      - name: Build the example projects (examples/*/ smoke gate)
+        env:
+          CRYO_CC: gcc
+        run: make examples
 
       - name: Run the test suite, with the suite counts asserted
         env:

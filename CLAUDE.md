@@ -35,7 +35,9 @@ make roster-check        # every unit test, project and negative file against th
 make check-fast          # verify's and verify-pin's self-tests + pin integrity, builds nothing.
                          # Run before committing.
 make lsp-check           # compile tools/CryoLSP with the compiler under test
-make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s
+make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s;
+                         # from WINDOWS only - a Linux host links the windows-gnu
+                         # build and fails without mingw + the LLVM-C import lib
 make vendor-check        # every constant shape survives `cryo vendor`
 make api-index-check     # docs/stdlib-api.txt is not stale
 make verify-pin          # both pins match their sidecars (sha256 and stamped commit) AND

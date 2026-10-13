@@ -31,19 +31,19 @@ incremental new-instance fixture and check-fast, all concurrently; with
 `ARGS="--baseline HEAD --require-identical"` it also proves no compiled
 object moved.
 
-**CI does not run the same list** (ruling 266: CI is aligned with verify's
-gate list first thing after the merge).  CI fires only on `main` and on a
-manual dispatch, so its first run is the merge itself.  As it stands:
+**CI runs verify's gate list** (ruling 266: CI is aligned with verify's
+gate list first thing after the merge), but for the object comparison.  CI
+fires only on `main` and on a manual dispatch.  As it stands:
 
 | gate | `make verify` | CI |
 |---|---|---|
-| census (`test-census`) | yes | yes |
-| examples build | yes | yes |
-| `lsp-check` | yes | yes |
-| `cross-check` | yes | no |
-| `incremental-instance-check` | yes | no |
-| `check-fast` (the two self-tests) | yes | no; CI runs `verify-pin` alone |
-| object comparison against a baseline | yes | no |
+| census (`test-census`) | yes | yes, both hosts |
+| examples build | yes | yes, both hosts |
+| `lsp-check` | yes | yes, both hosts |
+| `cross-check` | yes | windows native only: a Linux host links the windows-gnu build and needs mingw and the LLVM-C import lib |
+| `incremental-instance-check` | yes | yes, both hosts |
+| `check-fast` (the two self-tests) | yes | yes, both hosts |
+| object comparison against a baseline | yes | no: which revision CI compares against, and whether a moved object fails, is not decided |
 | `roster-check` | no (the census reads the same golden) | yes |
 | `examples-golden`, `valgrind-check`, `verify-freestanding` | no (POSIX only) | yes |
 | `incremental-check` | no | yes |

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile runtime/, stdlib/, compiler/ and tools/CryoLSP for the OTHER
-operating system's triple - objects only, no link - and fail if any of it
-does not compile.
+operating system's triple - objects only, from a Windows host - and fail if
+any of it does not compile.
 
 What the host cannot see
 ------------------------
@@ -14,9 +14,15 @@ nothing on a Windows host reports it; the runtime's backtrace tier went red
 that way and stayed red until someone ran the freestanding script from WSL.
 
 `cryo build --target=<triple>` selects the other OS's gates and compiles
-every module through name resolution, sema and codegen to object files; the
-link is skipped, so no cross toolchain is needed.  That is the whole gate:
-four projects, one foreign triple, exit codes read.
+every module through name resolution, sema and codegen to object files.
+That is the whole gate: four projects, one foreign triple, exit codes read.
+
+On a Windows host the Linux triple has no link configuration, so the build
+stops at objects and no cross toolchain is needed.  On a Linux host it does
+not: the compiler links a windows-gnu executable with
+`x86_64-w64-mingw32-gcc` and the LLVM-C import library, so `compiler` and
+`tools/CryoLSP` fail here unless both are installed.  The gate is run from
+Windows - by `make verify` there and by CI's windows native job.
 
 What it does not cover
 ----------------------
