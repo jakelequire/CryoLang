@@ -283,23 +283,26 @@ type struct CallResolver {
     select_family_overload(&this, overloads: &TypeRef[], arg_types: &TypeRef[]) -> i64 {
         if (overloads.length == 1) { return 0; }
         for (mut oi: i64 = 0; oi < overloads.length; oi++) {
-            const ot: Type* = this.arena.lookup(overloads[oi]);
-            if (ot == null || ot.kind != TypeKind::Function) { continue; }
-            const fn_ty: FunctionType* = ot as FunctionType*;
-            if (fn_ty.is_variadic) {
-                if (arg_types.length < fn_ty.param_types.length) { continue; }
-            } else if (fn_ty.param_types.length != arg_types.length) {
-                continue;
-            }
-            mut all_match: boolean = true;
-            for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) {
-                if (!this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi])) {
-                    all_match = false; break;
-                }
-            }
-            if (all_match) { return oi; }
+            if (this.signature_accepts(overloads[oi], arg_types)) { return oi; }
         }
         return -1;
+    }
+
+    /// Whether the signature `sig` takes `arg_types` exactly (variadic: on
+    /// its fixed prefix).
+    signature_accepts(&this, sig: TypeRef, arg_types: &TypeRef[]) -> boolean {
+        const ot: Type* = this.arena.lookup(sig);
+        if (ot == null || ot.kind != TypeKind::Function) { return false; }
+        const fn_ty: FunctionType* = ot as FunctionType*;
+        if (fn_ty.is_variadic) {
+            if (arg_types.length < fn_ty.param_types.length) { return false; }
+        } else if (fn_ty.param_types.length != arg_types.length) {
+            return false;
+        }
+        for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) {
+            if (!this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi])) { return false; }
+        }
+        return true;
     }
 
 
@@ -2267,21 +2270,21 @@ type struct CallResolver {
         if (entry.param_types.length == 0) { return; }
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
         if (tmpl == null) { return; }
-        const binds: TypeRef[] = this.static_template_bindings(call, scope, entry, tmpl);
+        const binds: TypeRef[] = this.template_call_bindings(call, scope, entry, tmpl);
         if (binds.length == 0) { return; }
         call.set_resolved_type_args(binds);
     }
 
-    /// The type arguments the static call `call` through `scope` binds the
-    /// generic static method `tmpl` (its template `entry`) with: the
-    /// turbofish written on the member or the scope, else the arguments'
-    /// inference.  Empty when the turbofish's count differs from the
-    /// method's, a type argument does not resolve, or inference leaves a
-    /// parameter unbound.
-    static_template_bindings(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
-                             entry: TemplateEntry*, tmpl: FunctionDeclNode*) -> TypeRef[] {
+    /// The type arguments `call` binds the generic function `tmpl` (its
+    /// template `entry`) with - a generic static method called through
+    /// `scope`, or a free function, whose `scope` is null: the turbofish
+    /// written on the member or the scope, else the arguments' inference.
+    /// Empty when the turbofish's count differs from the function's, a type
+    /// argument does not resolve, or inference leaves a parameter unbound.
+    template_call_bindings(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
+                           entry: TemplateEntry*, tmpl: FunctionDeclNode*) -> TypeRef[] {
         mut targs: &TypeAnnotation*[] = &call.generic_args;
-        if (targs.length == 0 && scope.generic_args.length > 0) { targs = &scope.generic_args; }
+        if (targs.length == 0 && scope != null && scope.generic_args.length > 0) { targs = &scope.generic_args; }
         if (targs.length == 0) { return this.infer_free_call_bindings(call, entry, tmpl); }
         mut binds: TypeRef[] = [];
         if (targs.length != entry.param_types.length) { return binds; }
@@ -3165,7 +3168,7 @@ type struct CallResolver {
         // unpinned so mono specializes.
         const gen_tmpl: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
         if (gen_tmpl != null && gen_tmpl.param_types.length > 0) { return TypeRef::invalid(); }
-        return this.pin_family_signature(call, this.callee_def(ident));
+        return this.pin_family_signature(call, this.callee_def(ident), null);
     }
 
     /// Pin `call` to the signature of `callee`'s family its arguments select,
@@ -3173,9 +3176,11 @@ type struct CallResolver {
     /// the member-function door, by the declaration's owner and leaf; which
     /// entry is the selection (`select_family_overload`).  Invalid, pinning
     /// nothing, when an argument is untyped or no signature accepts them.
-    /// Shared by a bare call and a module-qualified one: both name a
-    /// declaration, and which of its signatures a call means is one question.
-    pin_family_signature(mut &this, call: CallExprNode*, callee: DefId) -> TypeRef {
+    /// Shared by a bare call and a module-qualified one, whose path is
+    /// `scope` (null for a bare call): both name a declaration, and which of
+    /// its signatures a call means is one question.
+    pin_family_signature(mut &this, call: CallExprNode*, callee: DefId,
+                         scope: ScopeResolutionNode*) -> TypeRef {
         if (call == null || call.resolved_callee.is_some()) { return TypeRef::invalid(); }
         mut arg_types: TypeRef[] = [];
         for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
@@ -3195,6 +3200,7 @@ type struct CallResolver {
                 &overloads, &arg_types);
             return TypeRef::invalid();
         }
+        this.report_free_generic_tie(call, callee, scope, &arg_types);
         // The pin is the selected entry: the declaration and the one of its
         // signatures the arguments chose, carrying its own symbol.
         call.set_resolved_callee(CalleePin::Decl(entries[oi]));
@@ -3207,6 +3213,61 @@ type struct CallResolver {
             }
         }
         return this.overload_return_type(overloads[oi]);
+    }
+
+    /// E0154 when a non-generic signature of `callee`'s family and one of its
+    /// generic functions both accept the arguments of `call`, and true then.
+    /// A function is not preferred for being non-generic, as a method is
+    /// not, so the call is ambiguous.  Asked by a bare call and a
+    /// module-qualified one alike, whichever declaration the name layer
+    /// stamped; the caller keeps whatever it pinned, so the tie is the one
+    /// error the call reports.  A type argument, on the call or on the path
+    /// `scope` (null for a bare call), names the generic function, so no tie.
+    report_free_generic_tie(mut &this, call: CallExprNode*, callee: DefId,
+                            scope: ScopeResolutionNode*, arg_types: &TypeRef[]) -> boolean {
+        if (call.generic_args.length > 0) { return false; }
+        if (scope != null && scope.generic_args.length > 0) { return false; }
+        const entries: OverloadId[] = this.family_entries(callee);
+        if (entries.length < 2) { return false; }
+        mut plain: OverloadId = OverloadId::invalid();
+        mut generics: OverloadId[] = [];
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const d: ASTNode* = this.ctx.decl_index.entry_decl(entries[i]);
+            if (d == null || d.kind != NodeKind::FunctionDeclaration) { continue; }
+            const f: FunctionDeclNode* = d as FunctionDeclNode*;
+            if (f.generic_params.length == 0) {
+                if (!plain.is_valid()
+                        && this.signature_accepts(this.ctx.decl_index.entry_signature(entries[i]), arg_types)) {
+                    plain = entries[i];
+                }
+                continue;
+            }
+            const t: TemplateEntry* = this.ctx.generic_registry.template_of(f.def);
+            if (t == null || t.node_kind != NodeKind::FunctionDeclaration) { continue; }
+            if (!this.template_fits(t, call, null, arg_types)) { continue; }
+            // A generic whose where-clause the arguments fail does not
+            // accept them.
+            const binds: TypeRef[] = this.template_call_bindings(call, null, t, f);
+            mut unmet_arg: TypeRef = TypeRef::invalid();
+            if (this.unmet_call_bound(f, &t.param_syms, &binds, &unmet_arg) != null) { continue; }
+            generics.push(entries[i]);
+        }
+        if (!plain.is_valid() || generics.length == 0) { return false; }
+        const leaf: string = this.intern.shown(this.ctx.defs.leaf_of(callee));
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0154_AMBIGUOUS_CALL,
+            fmt::format("`%s` is ambiguous: a non-generic and a generic function both accept these arguments", leaf));
+        d = d.at_with_label(call.span, "both functions apply here");
+        d = d.with_note_at(fmt::format("candidate #1: `%s`, not generic", leaf),
+            this.ctx.decl_index.entry_span(plain));
+        for (mut i: i64 = 0; i < generics.length; i++) {
+            d = d.with_note_at(fmt::format("candidate #%d: `%s`, generic", (i + 2) as i32, leaf),
+                this.ctx.decl_index.entry_span(generics[i]));
+        }
+        d = d.help(fmt::format(
+            "a function is not preferred for being non-generic; rename one of them, or call the generic one with its type arguments (`%s::<T>(...)`)",
+            leaf));
+        this.ctx.emit_diagnostic(d);
+        return true;
     }
 
     /// E0214 for a call to an overloaded family that no signature of the
@@ -7016,7 +7077,7 @@ type struct CallResolver {
 
     /// Every entry of `entries` whose parameters (`static_entry_params`)
     /// every argument fits, a generic static method among them when its own
-    /// type parameters bind to the arguments (`static_template_fits`).
+    /// type parameters bind to the arguments (`template_fits`).
     /// `autoref` admits a value argument for a reference parameter to its
     /// type.
     select_static_overload(mut &this, entries: &OverloadId[], arg_types: &TypeRef[],
@@ -7026,7 +7087,7 @@ type struct CallResolver {
         for (mut oi: i64 = 0; oi < entries.length; oi++) {
             const tmpl: TemplateEntry* = this.static_entry_template(entries[oi]);
             if (tmpl != null) {
-                if (this.static_template_fits(tmpl, call, scope, arg_types)) { fits.push(entries[oi]); }
+                if (this.template_fits(tmpl, call, scope, arg_types)) { fits.push(entries[oi]); }
                 continue;
             }
             const params: TypeRef[] = this.static_entry_params(entries[oi], call, scope);
@@ -7047,17 +7108,18 @@ type struct CallResolver {
         return fits;
     }
 
-    /// Whether the generic static method `t` accepts the path call `call`'s
+    /// Whether the generic function `t` - a static method called through
+    /// `scope`, or a free function, whose `scope` is null - accepts `call`'s
     /// arguments: its own type parameters bind from the call
-    /// (`static_template_bindings`), and every argument fits the parameter
+    /// (`template_call_bindings`), and every argument fits the parameter
     /// they make - an untyped numeric literal any numeric parameter, which
-    /// it adopts as it does in a call to the method alone.
-    static_template_fits(mut &this, t: TemplateEntry*, call: CallExprNode*,
-                         scope: ScopeResolutionNode*, arg_types: &TypeRef[]) -> boolean {
+    /// it adopts as it does in a call to the function alone.
+    template_fits(mut &this, t: TemplateEntry*, call: CallExprNode*,
+                  scope: ScopeResolutionNode*, arg_types: &TypeRef[]) -> boolean {
         if (call == null) { return false; }
         const f: FunctionDeclNode* = t.ast_node as FunctionDeclNode*;
         if (f == null || f.parameters.length != arg_types.length) { return false; }
-        const binds: TypeRef[] = this.static_template_bindings(call, scope, t, f);
+        const binds: TypeRef[] = this.template_call_bindings(call, scope, t, f);
         if (binds.length != t.param_types.length) { return false; }
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
             const p: VarDeclNode* = f.parameters[i];
@@ -7078,7 +7140,7 @@ type struct CallResolver {
     /// written - and none when they do not bind.  A method-level
     /// specialization takes none: it is an instance minted from a template,
     /// not a declaration a path names.  A generic static method is its own
-    /// function template, which `static_template_fits` judges.
+    /// function template, which `template_fits` judges.
     static_entry_params(mut &this, e: OverloadId, call: CallExprNode*,
                         scope: ScopeResolutionNode*) -> TypeRef[] {
         mut params: TypeRef[] = [];
@@ -7356,7 +7418,7 @@ type struct CallResolver {
         // The method's own type args: explicit turbofish (on the member or,
         // as a fallback, the scope), else argument inference + where-bound
         // projection (the free-function inference, which runs PASS D).
-        const binds: TypeRef[] = this.static_template_bindings(call, scope, entry, tmpl);
+        const binds: TypeRef[] = this.template_call_bindings(call, scope, entry, tmpl);
         if (binds.length != entry.param_types.length) { return TypeRef::invalid(); }
         // Every arg must BIND; it need not yet be CONCRETE.  Called from inside a
         // generic body the args carry the enclosing template's parameters
@@ -7403,6 +7465,19 @@ type struct CallResolver {
     /// a generic function or method taken as a value; `at` is the use's span.
     check_call_where_bounds(mut &this, at: SourceSpan, tmpl: FunctionDeclNode*,
                             param_syms: &SymbolID[], bindings: &TypeRef[]) -> boolean {
+        mut concrete: TypeRef = TypeRef::invalid();
+        const tref: TraitRef* = this.unmet_call_bound(tmpl, param_syms, bindings, &concrete);
+        if (tref == null) { return true; }
+        this.emit_free_call_bound_failure(at, tmpl, tref, concrete, tref.path[tref.path.length - 1]);
+        return false;
+    }
+
+    /// The first where-clause bound of `tmpl` that the bound args in
+    /// `bindings` do not satisfy, with the arg it fails written to
+    /// `out_concrete`; null when every bound holds (or the arg is still
+    /// abstract/skippable).  Reports nothing.
+    unmet_call_bound(mut &this, tmpl: FunctionDeclNode*, param_syms: &SymbolID[],
+                     bindings: &TypeRef[], out_concrete: TypeRef*) -> TraitRef* {
         for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
             const bound: TraitBound* = &tmpl.trait_bounds[bi];
             mut idx: i64 = -1;
@@ -7417,14 +7492,13 @@ type struct CallResolver {
                 const tref: TraitRef* = &bound.trait_refs[ri];
                 // A bound refused where it is written is reported there.
                 if (tref.path.length == 0 || tref.refused) { continue; }
-                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
                 if (!this.trait_checker().type_implements_trait(concrete, tref.definition(), 0)) {
-                    this.emit_free_call_bound_failure(at, tmpl, tref, concrete, trait_name);
-                    return false;
+                    *out_concrete = concrete;
+                    return tref;
                 }
             }
         }
-        return true;
+        return null;
     }
 
     /// Resolve a call through a path to a GENERIC method of a GENERIC-owner
@@ -8364,6 +8438,17 @@ type struct CallResolver {
             const no_turbofish: boolean =
                 (scope == null || scope.generic_args.length == 0) && call.generic_args.length == 0;
             if (no_turbofish) {
+                // The stamp names the family's generic function; a
+                // non-generic signature of it may accept the arguments too.
+                mut arg_types: TypeRef[] = [];
+                for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+                    const arg: ExpressionNode* = call.arguments[ai];
+                    if (arg == null || !arg.resolved_type.is_valid()) { break; }
+                    arg_types.push(arg.resolved_type);
+                }
+                if (arg_types.length == call.arguments.length) {
+                    this.report_free_generic_tie(call, callee, scope, &arg_types);
+                }
                 const tfn: FunctionDeclNode* = tmpl.ast_node as FunctionDeclNode*;
                 if (tfn != null) {
                     mut binds: TypeRef[] = this.infer_free_call_bindings(call, tmpl, tfn);
@@ -8400,7 +8485,7 @@ type struct CallResolver {
             // Which of the member's signatures the arguments select, as for
             // a bare call; the first declaration the path names is not the
             // answer when the member is overloaded.
-            const selected_ret: TypeRef = this.pin_family_signature(call, callee);
+            const selected_ret: TypeRef = this.pin_family_signature(call, callee, scope);
             if (selected_ret.is_valid()) { return selected_ret; }
             this.pin_scope_callee_def(call, callee);
         }
