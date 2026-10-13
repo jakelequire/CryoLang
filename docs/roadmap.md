@@ -165,6 +165,57 @@ at once; how a fixed-size array's length is written when it is a constant
 expression; and what the conversion does with arrays of function types,
 which today need parentheses (`((i32) -> i32)[]`).
 
+## The class removal
+
+Classes are removed as a language feature before the v1.0 freeze: after
+the array syntax and the type-system update, and well before the pipeline
+work, compile-time execution and what follows them.  What remains is
+structs, enums and traits.  The compiler's AST goes straight to enums and
+`match` (ruling 290: no intermediate struct-node stage).
+
+It starts with a read-only scoping audit.  What is known now:
+
+- 109 classes, all in the compiler; the standard library, the language
+  server and the examples declare none.
+- The AST is 69 of them, at most 3 deep.
+- 6 visitors walk it (cloner, dumper, substituter, IR generator, name
+  resolver, sema).
+- Dispatch is already by tag: about 1,300 `kind` checks and 2,400 casts,
+  against 188 `accept()` calls.
+- Every hierarchy is a closed set, so each becomes an enum with no need for
+  dynamic dispatch.
+
+The class defects known today stay unfixed, since classes are going
+(ruling 291: an unchecked `override`, a silently missing vtable slot, and
+slots matched by name).  Trait objects must not repeat them.
+
+Open: how the six visitors' `visit` overloads become `match` arms without
+a flag day across the whole compiler, and what replaces `ASTNode`'s
+`Allocate` arena when the nodes are enum values.
+
+## Trait objects
+
+A pointer or reference to a trait, dispatched through a table of the
+implementation's methods.  Built after the class removal, possibly after
+v1.0 (ruling 286).
+
+- **Spelling:** `virtual &Shape` and `virtual Shape*`, a prefix as in
+  `mut &this`; there is no `dyn` (ruling 285).  Until then `&Shape` and
+  `Shape*` are refused where they are written (`E0313`; ruling 287).
+- **Object safety is per method** (ruling 288): a method that cannot go in
+  the table - one with type parameters of its own, for instance - is unavailable on
+  the object, and the rest of the trait still works.
+- **Borrowed pointers first** (ruling 289); an owning box, which must take
+  its drop, size and alignment from the table, comes later.
+- The table's slots come from the trait's method numbering, the same one
+  the trait-implementation check (E0312) relies on, never from method
+  names.
+
+Open: whether a supertrait's methods are reachable from a subtrait object
+directly or through an upcast; and how a generic implementation coerced to
+an object becomes a monomorphization root, including in the incremental
+cache.
+
 ## The compiler pipeline: AST, HIR, MIR, LLVM
 
 The front end lowers the syntax tree to a high-level representation, then

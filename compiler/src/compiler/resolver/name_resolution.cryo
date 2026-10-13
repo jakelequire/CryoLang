@@ -2485,8 +2485,14 @@ public:
         if (ann == null) { return; }
         match (*ann) {
             TypeAnnotation::Named(n)       => { this.stamp_named_annotation(n); }
-            TypeAnnotation::Pointer(p)     => { this.stamp_annotation(p.inner); }
-            TypeAnnotation::Reference(r)   => { this.stamp_annotation(r.inner); }
+            TypeAnnotation::Pointer(p)     => {
+                this.stamp_annotation(p.inner);
+                this.refuse_trait_pointee(p.inner, p.span, false);
+            }
+            TypeAnnotation::Reference(r)   => {
+                this.stamp_annotation(r.inner);
+                this.refuse_trait_pointee(r.inner, r.span, true);
+            }
             TypeAnnotation::Array(a)       => {
                 this.stamp_annotation(a.element);
                 // `T[N]`'s size is the one EXPRESSION hanging off an
@@ -2782,6 +2788,52 @@ public:
     /// a generic struct literal's `struct_type` is the other, and both are
     /// answered by `type_spelling_res` so the two cannot come to disagree
     /// about what a spelling names.
+    /// E0313 at a pointer or reference whose pointee, `inner`, names a
+    /// trait: `&Shape`, `Shape*` or `&Conv<i64>`.  A trait is no type, so
+    /// the pointer would point at nothing a value has; a trait object is not
+    /// supported yet.  The trait's name is answered `Err` in this position,
+    /// so the annotation reads as refused where it is written and nothing
+    /// after reports it again.  `&This` names the implementing type.
+    refuse_trait_pointee(&this, inner: TypeAnnotation*, span: SourceSpan, is_ref: boolean) -> void {
+        if (inner == null) { return; }
+        mut named: NamedAnnotation* = null;
+        mut generic: boolean = false;
+        match (*inner) {
+            TypeAnnotation::Named(n)   => { named = n; }
+            TypeAnnotation::Generic(g) => {
+                match (*g.base) {
+                    TypeAnnotation::Named(bn) => { named = bn; generic = true; }
+                    _                         => { }
+                }
+            }
+            _ => { }
+        }
+        if (named == null) { return; }
+        mut trait_def: DefId = DefId::invalid();
+        match (named.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(d) => { trait_def = d; }
+                    _           => { }
+                }
+            }
+            _ => { }
+        }
+        if (!trait_def.is_valid() || this.ctx.generic_registry.get_trait_decl(trait_def) == null) { return; }
+        named.res = ResSlot::Answered(Res::Err);
+        const name: string = this.resolver.intern_table.resolve(named.name);
+        const shown: string = if (generic) { fmt::format("%s<...>", name) } else { name };
+        const written: string = if (is_ref) { fmt::format("&%s", shown) } else { fmt::format("%s*", shown) };
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0313_TRAIT_AS_POINTEE,
+            fmt::format("`%s` is a trait, so `%s` is not a type", name, written));
+        d = d.at_with_label(span, if (is_ref) { "a reference to a trait" } else { "a pointer to a trait" });
+        d = d.with_note(fmt::format("a trait object is not supported yet; it will be written `virtual &%s` or `virtual %s*`",
+            shown, shown));
+        d = d.help(fmt::format("to accept any type that implements `%s`, use a bounded type parameter: `function f<T>(p: &T) where T: %s`",
+            name, shown));
+        this.ctx.emit_diagnostic(d);
+    }
+
     stamp_named_annotation(&this, n: NamedAnnotation*) -> void {
         // A synthesizer that knows its referent answers the slot at birth
         // (bindgen's C-import types), and its answer stands: the walk is not
