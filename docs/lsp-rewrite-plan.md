@@ -496,12 +496,99 @@ steps.
 - C13 is not done: the qualified-name suggestion needs new diagnostic text,
   which waits for a decision on its wording.
 
-### Step 10. Module caching: the design
+### Step 10. Module caching: the design (written; nothing built)
 
-- Measure per-stage time and the standard library's share in Lsp mode;
-  answer how a snapshot is invalidated when an imported module changes, and
-  whether the cache is per module or per file. Written here; built after the
-  first release.
+**Measured** (Windows host, one run each, `cryo check` with a probe that
+charged the time between two module entries to the first module's origin;
+the probe was reverted). The compiler project, 166 local and 81 standard
+library modules, 26.4 s:
+
+| stage | standard library | the project's own |
+|---|---|---|
+| discovery (namespace scan + import walk) | 8.6 s, not split | |
+| lex + parse | 0.22 s | 3.49 s |
+| module resolution (name layer) | 0.49 s | 1.74 s |
+| type declarations, templates, defaults, signatures, type resolution | 0.03 s | 0.10 s |
+| body type check | 0.09 s | 0.47 s |
+| monomorphization | 0.91 s | 0.10 s |
+| specialization routing, semantic analysis, lowering | 0.13 s | 10.10 s |
+
+Monomorphization runs from one worklist, so its split by origin is the
+module entered last, not where the work is. A hello-world project (the
+standard library's reach alone) takes 1.1 s. The standard library is under
+2 s of the 26.4: caching it alone would not be felt.
+
+**Where the time goes, and what each cache would be.**
+
+1. *Discovery, 8.6 s.* `ModuleLoader::scan_file_namespace` lexes every
+   project file whole to read its `namespace`, the import walk lexes each
+   reached file again for its imports, and the frontend's Lexing pass lexes
+   it a third time. A cache of each file's scan result (its namespace, its
+   import paths, its `public module` lines) keyed by the file's path and
+   content hash, held by the server across analyses and handed to the loader
+   through `BuildOptions` (null for the command line, like the yield hook),
+   removes the first two lexes for every file not changed since the last
+   analysis. The entries are plain strings, not identities, so they can
+   outlive an analysis's arena if they are allocated outside it. Measure the
+   split between reading, lexing and the directory walk before building it;
+   one lex instead of three may also be had without a cache, by letting the
+   scan keep its tokens for the frontend.
+2. *Lex and parse, 3.7 s.* Per file, keyed by content hash. Tokens are safe
+   to reuse; a parsed tree is not, because later stages write into it
+   (stamps, `resolved_type`, pins) and monomorphization writes
+   specializations into the owning module's tree. Reusing a tree means
+   cloning a pristine copy (the cloner exists) - measure clone against
+   parse before choosing.
+3. *Semantic analysis and lowering, 10.1 s.* The largest share, and the one
+   the command line already caches per module (the object cache's key: the
+   module's own source hash folded with every source hash in its import
+   closure and the prelude's, or the global digest for a module that owns
+   specializations). That key is the right invalidation for the editor too:
+   a module's results stand while nothing it can see changed. What it
+   cannot do in the editor is reuse them, because sema's results are not
+   data a later analysis can read - see the tables below. The stage is
+   several passes per module (semantic analysis, generic validation, move
+   checking, dead-code analysis, drop insertion, type lowering), and
+   `check` and the editor's mode run the same ones; splitting the 10 s by
+   pass comes first, since a pass whose output the editor neither shows nor
+   reads (drop insertion is the candidate) could be left out of its mode
+   outright.
+
+**Invalidation.** Per file for discovery and tokens (content hash; a file
+created or deleted under a scanned directory invalidates that directory's
+scan). Per module for anything after name resolution, by the object cache's
+import-closure key. An edit to a module therefore re-analyses it and every
+module whose closure reaches it; an edit to the standard library (rare in an
+editing session) invalidates everything.
+
+**Why per-module reuse past parsing is hard: the shared tables.** Every
+answer is an identity, and every identity is a position in a table one
+analysis builds and the next rebuilds from nothing: the `InternTable`
+(`SymbolStr`), `DefTable` (`DefId` by slot), the `Resolver`'s scopes,
+symbols and per-module exports (`ScopeID`, `SymbolID`), the `TypeArena`
+(`TypeRef` keys, with instances created during type checking and
+monomorphization), the `DeclarationIndex` (overload families, the type of
+each definition, the declaration store), the `ModuleGraph`, the
+`ConstTable`, and the trees themselves, which carry stamps into all of
+these. A module's results name other modules' identities, so they cannot be
+kept while those are rebuilt. All of it lives in the analysis's arena,
+which the server releases whole. Process-global state (the compile tallies,
+`mangled_name::set_lsp_safe`) is reset per analysis.
+
+So reuse after parsing needs one of: identities stable across analyses
+(a definition keyed by its path rather than its slot, a type by its
+structure), or one long-lived context updated in place, with every table
+able to retract a module's entries. Either is a compiler architecture
+project, not an editor feature.
+
+**Recommendation.** Build in this order, each measured before and after on
+the compiler project: (0) split the semantic stage by pass and drop from
+the editor's mode what it does not use; (1) one lex per file, then the
+discovery cache;
+(2) the token cache, and the tree cache only if a clone is measurably
+cheaper than a parse; (3) per-module reuse after name resolution only as
+part of stable identities, on the roadmap. Steps 1 and 2 together target
+about 12 of the 26 s; the 10 s of semantic analysis stays until (3).
 
 ### Step 11. Close-out
 
