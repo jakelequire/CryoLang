@@ -29,7 +29,7 @@ checks.json:
       "checks": [
         {"name": "...", "method": "definition", "at": "src/main.cryo@marker",
          "expect": "src/b.cryo@marker" | null},
-        {"name": "...", "method": "hover", "at": "...",
+        {"name": "...", "method": "hover" | "expandHover", "at": "...",
          "contains": ["..."], "excludes": ["..."]}   or "expect": null
         {"name": "...", "method": "completion", "at": "...",
          "includes": ["..."], "excludes": ["..."]},
@@ -53,6 +53,11 @@ document is changed by replacing the first `from` with `to`, the check runs
 against the changed text and its markers, and the document is changed back.
 That is how a check asks about a buffer mid-typing.  With `"save": true` the
 edit, and the change back, are each followed by a save.
+
+A position check may carry `"quiet_stderr": true`: it then also fails when the
+server writes to stderr while answering, which an analysis of a buffer that
+does not parse always does.  `expandHover` asks `cryo/expandHover`, the
+editor's longer hover.
 
 Usage:
     python tools/CryoLSP/tests/smoke.py [path/to/cryolsp[.exe]] [--fixture NAME]
@@ -393,7 +398,18 @@ def run_check(srv, fx, chk, c):
         params["context"] = {"triggerKind": 1}
     if method == "references":
         params["context"] = {"includeDeclaration": chk.get("declaration", False)}
-    resp = srv.request("textDocument/" + method, params)
+    wire = "cryo/expandHover" if method == "expandHover" else "textDocument/" + method
+    stderr_before = len(srv._stderr)
+    resp = srv.request(wire, params)
+    if chk.get("quiet_stderr"):
+        # An analysis of a buffer that does not parse reports it on stderr,
+        # so a request answered without one leaves stderr as it was.  The
+        # pause lets the reader thread catch a line written before the reply.
+        time.sleep(0.5)
+        if len(srv._stderr) != stderr_before:
+            c.ok(False, name, "the server wrote to stderr while answering: %r"
+                 % srv._stderr[stderr_before:][:5])
+            return
     if resp is None:
         c.ok(False, name, "no response (server %s)" % ("alive" if srv.alive() else "dead"))
         return
@@ -408,7 +424,7 @@ def run_check(srv, fx, chk, c):
         else:
             c.ok(location_matches(result, fx, chk["expect"]), name,
                  "want %s, got %s" % (chk["expect"], describe_location(result)))
-    elif method == "hover":
+    elif method in ("hover", "expandHover"):
         text = hover_text(result)
         if "expect" in chk and chk["expect"] is None:
             c.ok(text is None, name, "got %r" % text)

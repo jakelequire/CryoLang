@@ -352,12 +352,39 @@ steps.
   call's, a field's (its declaration, a literal's initializer, a read
   through `this`), a local's highlight, an outline, a workspace search.
 
-### Step 6. Completion from the snapshot plus the current line
+### Step 6. Completion from the snapshot plus the current line (landed)
 
-- Member, path (absolute and relative), bare identifiers from the scope at
-  the cursor, module paths after `import`, keywords. Deletes the placeholder
-  splice, the analysis per completion, and `lookup_type_name` if unused.
-- Checks: B6; completion in a broken buffer; completion runs no analysis.
+- The cursor's line, up to the cursor, is read as a receiver before `.`
+  (`a.b().c[0].`), a path before `::`, a module path after `import`, or a
+  bare name. The scope is `Resolver::scope_at` at the cursor's position in
+  the snapshot; a cursor on an edited line is placed on the analysed line no
+  further than the text the two share, or at the start of the edit.
+- A receiver's head through `lookup_value` (a local's or parameter's type
+  read off its declaration, a global's, a function's return) or `this` (the
+  type whose declaration or block holds the method); each `.f` through
+  `MemberResolver::field_of`, each `.m()` through `lookup_family_entries`.
+  A path's head through `type_binding`, then `modules_written_as`; later
+  segments through `exports_named`, then `modules_written_as` under the
+  module. An import's path through `ModuleGraph::module_of_written_path`.
+- C6 needed no compiler change: a type's members are its declaration's,
+  the methods of every block whose stamped target it is, and its base
+  class's (`handlers/members.cryo`); a module's are `Resolver::get_exports`
+  and the modules nested under it. A bare name lists `visible_bindings`
+  (not a type body's fields, methods or variants, which a bare name never
+  reaches, nor a local declared after the cursor), the prelude's exports,
+  the imported modules and the keywords.
+- Not read: a receiver whose head is a path (`T::make().`); an import path
+  that names no loaded module (`import Probe::` where only `Probe::A` and
+  `Probe::B` exist). The client filters by the typed prefix.
+- `cryo/expandHover` lists a type's members under its hover again.
+- Deleted: the placeholder splice, the analysis per completion
+  (`Projects::analyse_buffer`, the project's scratch analysis), the
+  spelling-matched member walks and their 3 `![allow]`s. The compiler
+  project answers a completion in under 5 ms.
+- Checks: B6 (a module path, a type path, an enum, a bare name in a
+  function and in a method), member completion with a syntax error
+  elsewhere in the buffer and nothing written to stderr, `this.`, an
+  import's path, the extended hover.
 
 ### Step 7. Semantic tokens and lenses from stamps
 

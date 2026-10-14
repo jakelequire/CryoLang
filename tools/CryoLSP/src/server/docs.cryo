@@ -208,6 +208,36 @@ type struct Docs {
         }
     }
 
+    /// The position in the current analysis whose scope a cursor is in.  A
+    /// cursor on a line the analysis read is at its own position.  On the
+    /// first line edited since, it is placed on the analysed line, no
+    /// further along than the text the two lines share; further into the
+    /// edit, at the start of that line, which every scope still open at the
+    /// edit holds.
+    scope_pos(&this, uri: str::Str, line: u32, character: u32) -> CompilerPos {
+        const exact: CompilerPos = this.to_compiler(uri, line, character);
+        if (exact.line != 0) { return exact; }
+        match (this.get(uri)) {
+            Option::Some(doc) => {
+                const sh: SharedLines = doc.shared_lines();
+                const at: u32 = (sh.prefix + 1) as u32;
+                if (line as u64 != sh.prefix || sh.prefix + sh.suffix >= sh.snap_lines) {
+                    return CompilerPos { line: at, col: 1 };
+                }
+                const cur: str::Str = doc.line_text(line);
+                const old: str::Str = doc.snap_line_text(line);
+                const cb: u8* = cur.as_ptr();
+                const ob: u8* = old.as_ptr();
+                mut k: u64 = 0;
+                while (k < cur.length() && k < old.length() && cb[k] == ob[k]) { k = k + 1; }
+                mut b: u64 = Columns::wire_to_byte(cur, character, this.utf8);
+                if (b > k) { b = k; }
+                return CompilerPos { line: at, col: Columns::byte_to_compiler(old, b) };
+            }
+            Option::None => { return exact; }
+        }
+    }
+
     /// Byte offset into document `doc` of wire position (`line`, `character`).
     byte_offset(&this, doc: &Document, line: u32, character: u32) -> u64 {
         const b: u64 = Columns::wire_to_byte(doc.line_text(line), character, this.utf8);

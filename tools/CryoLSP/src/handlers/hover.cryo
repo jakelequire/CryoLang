@@ -18,8 +18,8 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::ast::{ NodeKind };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumDeclNode, FieldDeclNode, FunctionDeclNode,
-    IntrinsicDeclNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
+    DeclarationNode, EnumVariantNode, FieldDeclNode, FunctionDeclNode, IntrinsicDeclNode,
+    MethodNode, VarDeclNode
 };
 import compiler::resolver::res::{ DefId, DefKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
@@ -29,6 +29,7 @@ import compiler::types::type_ref::{ TypeRef };
 import lsp::handlers::definition::{ Declared };
 import lsp::handlers::identity::{ Answer, Asked, Target };
 import lsp::handlers::keyword_docs;
+import lsp::handlers::members::{ Member, Members };
 import lsp::server::docs;
 import lsp::server::session;
 import lsp::protocol::lsp;
@@ -37,31 +38,14 @@ import lsp::protocol::lsp;
 /// `textDocument/hover`.
 public function handle_hover(docs: mut &docs::Docs, projects: mut &session::Projects,
                               params: &value::JsonValue) -> value::JsonValue {
-    const asked: Asked = Asked::from(docs, projects, params);
-    if (asked.ctx != null && !asked.answer.target.is_nothing()) {
-        mut shown: Shown = Shown::new(asked.ctx);
-        shown.answer(&asked.answer);
-        if (shown.text.length() > 0) {
-            return shown.reply(docs, &asked.answer);
-        }
-    }
-    match (docs.get(asked.uri)) {
-        Option::Some(doc) => {
-            match (keyword_docs::try_keyword_hover(docs, doc, asked.line, asked.character)) {
-                Option::Some(json) => { return json; }
-                Option::None       => { }
-            }
-        }
-        Option::None => { }
-    }
-    return value::JsonValue::Null;
+    return Shown::hover(docs, projects, params, false);
 }
 
-/// `cryo/expandHover`, the editor's request for a longer hover: the same
-/// answer.
+/// `cryo/expandHover`, the editor's request for a longer hover: a type's
+/// hover lists its members.
 public function handle_hover_verbose(docs: mut &docs::Docs, projects: mut &session::Projects,
                                       params: &value::JsonValue) -> value::JsonValue {
-    return handle_hover(docs, projects, params);
+    return Shown::hover(docs, projects, params, true);
 }
 
 
@@ -74,6 +58,38 @@ type struct Shown {
 
     static new(ctx: CompilationContext*) -> Shown {
         return Shown { ctx: ctx, text: "", doc: "" };
+    }
+
+    /// The hover at the request's position; `expanded`, a type's members
+    /// listed under it.
+    static hover(docs: mut &docs::Docs, projects: mut &session::Projects,
+                 params: &value::JsonValue, expanded: boolean) -> value::JsonValue {
+        const asked: Asked = Asked::from(docs, projects, params);
+        if (asked.ctx != null && !asked.answer.target.is_nothing()) {
+            mut shown: Shown = Shown::new(asked.ctx);
+            shown.answer(&asked.answer);
+            if (expanded && !asked.answer.receiver) {
+                match (&asked.answer.target) {
+                    Target::Def(d) => {
+                        if (asked.ctx.defs.kind_of(d) == DefKind::Type) { shown.members(d); }
+                    }
+                    _ => { }
+                }
+            }
+            if (shown.text.length() > 0) {
+                return shown.reply(docs, &asked.answer);
+            }
+        }
+        match (docs.get(asked.uri)) {
+            Option::Some(doc) => {
+                match (keyword_docs::try_keyword_hover(docs, doc, asked.line, asked.character)) {
+                    Option::Some(json) => { return json; }
+                    Option::None       => { }
+                }
+            }
+            Option::None => { }
+        }
+        return value::JsonValue::Null;
     }
 
     answer(mut &this, a: &Answer) -> void {
@@ -182,19 +198,7 @@ type struct Shown {
     }
 
     field(mut &this, owner: DefId, index: i64) -> void {
-        const decl: ASTNode* = this.ctx.decl_index.declaration_of(owner);
-        if (decl == null || index < 0) { return; }
-        mut fd: FieldDeclNode* = null;
-        if (decl.kind == NodeKind::StructDeclaration) {
-            const sd: StructDeclNode* = decl as StructDeclNode*;
-            if (index < sd.fields.length) { fd = sd.fields[index]; }
-        } else if (decl.kind == NodeKind::ClassDeclaration) {
-            const cd: ClassDeclNode* = decl as ClassDeclNode*;
-            if (index < cd.fields.length) { fd = cd.fields[index]; }
-        } else if (decl.kind == NodeKind::UnionDeclaration) {
-            const ud: UnionDeclNode* = decl as UnionDeclNode*;
-            if (index < ud.fields.length) { fd = ud.fields[index]; }
-        }
+        const fd: FieldDeclNode* = Members::field_decl(this.ctx, owner, index);
         if (fd == null) { return; }
         this.text = "field " + this.path(owner) + "::" + this.ctx.intern_table.resolve(fd.name)
             + ": " + this.type_text(fd.resolved_type);
@@ -202,12 +206,39 @@ type struct Shown {
     }
 
     variant(mut &this, owner: DefId, ordinal: i64) -> void {
-        const decl: ASTNode* = this.ctx.decl_index.declaration_of(owner);
-        if (decl == null || decl.kind != NodeKind::EnumDeclaration || ordinal < 0) { return; }
-        const ed: EnumDeclNode* = decl as EnumDeclNode*;
-        if (ordinal >= ed.variants.length) { return; }
-        this.text = this.path(owner) + "::" + this.ctx.intern_table.resolve(ed.variants[ordinal].name);
-        this.doc = ed.variants[ordinal].documentation;
+        const v: EnumVariantNode* = Members::variant_decl(this.ctx, owner, ordinal);
+        if (v == null) { return; }
+        this.text = this.path(owner) + "::" + this.ctx.intern_table.resolve(v.name);
+        this.doc = v.documentation;
+    }
+
+    /// The members of the type `d`, one line each, for the extended hover:
+    /// a field's name and type, a variant's name, a method's signature.
+    members(mut &this, d: DefId) -> void {
+        const all: Member[] = Members::of_type(this.ctx, d);
+        mut out: String = String::from_str(str::Str::from(this.text));
+        for (mut i: i64 = 0; i < all.length; i++) {
+            mut line: Shown = Shown::new(this.ctx);
+            match (&all[i]) {
+                Member::Field(o, k) => {
+                    const fd: FieldDeclNode* = Members::field_decl(this.ctx, o, k);
+                    if (fd != null) {
+                        line.text = this.ctx.intern_table.resolve(fd.name) + ": " + this.type_text(fd.resolved_type);
+                    }
+                }
+                Member::Variant(o, k) => {
+                    const v: EnumVariantNode* = Members::variant_decl(this.ctx, o, k);
+                    if (v != null) { line.text = this.ctx.intern_table.resolve(v.name); }
+                }
+                Member::Method(m) => {
+                    if (m.func.def.is_valid()) { line.def(m.func.def); }
+                }
+            }
+            if (line.text.length() == 0) { continue; }
+            out.push("\n    ");
+            out.push(line.text);
+        }
+        this.text = out.into_raw();
     }
 
     /// The hover reply: the text in a Cryo block, then the doc comment.

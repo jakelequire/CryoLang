@@ -95,9 +95,6 @@ type struct Project {
     config:  String;
     /// The analysis that answers questions; `ctx` null until one parsed.
     current: Analysis;
-    /// Completion's analysis of a buffer with a placeholder spliced in.  It
-    /// never answers anything else, and lives until the next completion.
-    scratch: Analysis;
     /// An open or a save made an analysis owed.
     owed:    boolean;
     /// An analysis has run, whether or not it parsed.
@@ -117,7 +114,6 @@ type struct Project {
             key:         String::from_str(key),
             config:      PathFinder::build_cstring_buffer(config),
             current:     Analysis::none(),
-            scratch:     Analysis::none(),
             owed:        false,
             analysed:    false,
             unpublished: false,
@@ -128,9 +124,8 @@ type struct Project {
     }
 
     /// Run one analysis of the project, with every open buffer in place of
-    /// its file and `replace_uri`'s buffer replaced by `replace_text` when
-    /// one is given.  The analysis is returned unadopted.
-    analyse(mut &this, docs: &docs::Docs, replace_uri: str::Str, replace_text: str::Str) -> Analysis {
+    /// its file.  The analysis is returned unadopted.
+    analyse(mut &this, docs: &docs::Docs) -> Analysis {
         mut a: Analysis = Analysis::none();
 
         // Everything the context points into is made here, with arena
@@ -141,11 +136,7 @@ type struct Project {
         mut overlay_texts: Array<string> = Array::<string>::new();
         for (d in docs.by_uri.values_ref()) {
             const path_c: String = PathFinder::build_cstring_buffer(d.path.as_str());
-            const text_c: String = if (replace_uri.length() > 0 && d.uri.as_str().equals(&replace_uri)) {
-                PathFinder::build_cstring_buffer(replace_text)
-            } else {
-                PathFinder::build_cstring_buffer(d.text.as_str())
-            };
+            const text_c: String = PathFinder::build_cstring_buffer(d.text.as_str());
             overlay_paths.push(path_c.as_ptr() as string);
             overlay_texts.push(text_c.as_ptr() as string);
             a.keep.push(path_c);
@@ -185,7 +176,7 @@ type struct Project {
     /// is kept for publishing; it becomes the one that answers when its
     /// whole tree parsed, and then each open buffer's text is what it read.
     refresh(mut &this, docs: mut &docs::Docs) -> void {
-        mut a: Analysis = this.analyse(docs, str::Str::from(""), str::Str::from(""));
+        mut a: Analysis = this.analyse(docs);
         this.owed = false;
         this.analysed = true;
         this.unpublished = true;
@@ -297,25 +288,6 @@ type struct Projects {
         if (p.owed) { p.refresh(docs); }
         p.current.publish_arena();
         return p.current.ctx;
-    }
-
-    /// Analyse `uri`'s project with `text` in place of its buffer, for a
-    /// question about text that is being typed.  The analysis answers only
-    /// the caller, and lives until the next one; its arena is published.
-    analyse_buffer(mut &this, docs: &docs::Docs, uri: str::Str, text: str::Str)
-            -> compilation_context::CompilationContext* {
-        const doc: Option<docs::Document*> = docs.get(uri);
-        if (!doc.is_some()) { return null; }
-        const d: docs::Document* = doc.unwrap_or(null);
-        const p: Project* = this.project_for(d.path.as_str());
-        if (p == null) { return null; }
-        if (p.focus.length() == 0) { p.set_focus(d.path.as_str()); }
-        p.scratch.release();
-        mut a: Analysis = p.analyse(docs, uri, text);
-        mem::swap(&p.scratch, &a);
-        mem::drop(a);
-        p.scratch.publish_arena();
-        return p.scratch.ctx;
     }
 
     /// Run every owed analysis, and return each project whose diagnostics

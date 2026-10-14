@@ -1,770 +1,700 @@
-///! Completion handler.
+///! Completion, from the last analysis and the line being typed.
 ///!
-///! Provides type-aware auto-complete triggered by `.` (dot access)
-///! and `::` (scope resolution).
-///!
-///! Dot completion:
-///!   - Finds the AST node under the cursor (position of the receiver
-///!     expression before the dot).
-///!   - Reads the node's `resolved_type`, unwraps Reference/Pointer/
-///!     InstantiatedType wrappers, and maps the carrier TypeRef to a
-///!     SymbolStr via `decl_index.lookup_type_name`.
-///!   - Walks all modules to enumerate fields and non-static methods
-///!     declared on matching struct/class/impl blocks.
-///!
-///! Scope-resolution completion:
-///!   - Reads the whole scope path before `::` - every `seg::` group, not
-///!     just the last segment, so `types::Foo::` and a bare `Foo::` stay
-///!     distinct scopes.
-///!   - Resolves that path to a qualified declaration name: an already-
-///!     qualified path is taken at face value, a bare leaf is what the name
-///!     layer binds it to in the editing file's module (`Resolver::lookup`
-///!     from that module's scope).
-///!   - Walks all modules to enumerate static methods (struct/class/impl)
-///!     and enum variants on that declaration.
-///!   - When the path names a namespace rather than a type, enumerates the
-///!     declarations that namespace contains.
-///!
-///! Both member walks match a declaration on its module namespace AND its
-///! leaf whenever the target is qualified.  Matching on the leaf alone
-///! merges every same-named declaration in the program into one list, which
-///! is what made scope completion appear to work only sometimes.
-///!
-///! Falls back to a static keyword list when type info is unavailable.
-///!
-///! Member enumeration + item building hang off `CompletionEngine`, a
-///! per-request object holding the module graph / intern table / type
-///! arena / declaration index.  `handle_completion` is the only free
-///! function.
-
+///! The text before the cursor on its own line says what is being
+///! completed: a member after `.` (`wb.get().`), a path after `::`
+///! (`B::Item::`), a module path after `import`, or a bare name.  What was
+///! written before the cursor is resolved through the doors, in the scope
+///! the analysis has at the cursor; what can follow it is enumerated by
+///! identity (`members`).  No analysis runs for a completion: the line being
+///! typed is never compiled, only read.
 namespace lsp::handlers::completion;
 
 import std::core::option;
-import std::core::primitives;
 import std::core::mem;
 import std::collections::str;
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::array;
 import std::collections::array::{ Array };
+import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
 import std::json::value;
 
-import compiler::compilation_context;
-import compiler::decl_index;
-import compiler::ast;
-import compiler::ast::node;
-import compiler::ast::expression;
-import compiler::ast::statement;
-import compiler::ast::declaration;
-import compiler::ast::node_locator;
-import compiler::diag::source_span;
-import compiler::resolver::symbol_str;
-import compiler::resolver::intern_table;
-import compiler::resolver::resolver;
-import compiler::resolver::symbol_id;
-import compiler::module_graph::{ ModulePath };
+import compiler::compilation_context::{ CompilationContext };
+import compiler::ast::{ NodeKind };
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::declaration::{
+    ClassDeclNode, EnumDeclNode, FieldDeclNode, FunctionDeclNode, ImplBlockNode, MethodNode,
+    StructDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::module_graph::{ ModulePath, ModuleSpellingMatch };
+import compiler::resolver::res::{ DefId, DefKind, FamilyOwner };
 import compiler::resolver::scope::{ ScopeID };
-import compiler::types::type_ref;
-import compiler::types::arena;
+import compiler::resolver::symbol::{ Symbol, SymbolKind };
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::decl_index::{ OverloadId };
+import compiler::sema::member_resolver::{ FieldAnswer, MemberResolver };
+import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types;
+import compiler::types::type_ref::{ TypeRef };
 import compiler::types::type_base;
 import compiler::types::compound;
-import compiler::types::generic;
-import compiler::module_graph;
+import compiler::types::user_defined::{ ClassType };
 
+import lsp::handlers::definition::{ Declared };
+import lsp::handlers::hover::{ Shown };
+import lsp::handlers::identity::{ Asked, Locator };
+import lsp::handlers::members::{ Member, Members };
 import lsp::server::docs;
-import lsp::server::line_index;
+import lsp::server::line_index::{ Columns };
 import lsp::server::session;
-import lsp::protocol::lsp;
-import lsp::protocol::conv;
-import std::ffi::libc;
 
 
-// LSP CompletionItemKind constants
-
+// The protocol's CompletionItemKind numbers.
 const CK_METHOD:      i64 = 2;
 const CK_FUNCTION:    i64 = 3;
 const CK_FIELD:       i64 = 5;
+const CK_VARIABLE:    i64 = 6;
 const CK_CLASS:       i64 = 7;
 const CK_INTERFACE:   i64 = 8;
+const CK_MODULE:      i64 = 9;
 const CK_ENUM:        i64 = 13;
 const CK_KEYWORD:     i64 = 14;
 const CK_ENUM_MEMBER: i64 = 20;
+const CK_CONSTANT:    i64 = 21;
 const CK_STRUCT:      i64 = 22;
+const CK_TYPE_PARAM:  i64 = 25;
 
 
-// Public entry point
-
+/// `textDocument/completion`.
 public function handle_completion(docs: mut &docs::Docs, projects: mut &session::Projects,
                                    params: &value::JsonValue) -> value::JsonValue {
-    // 1. Extract textDocument.uri
-    const td_opt: Option<value::JsonValue*> = params.get(str::Str::from("textDocument"));
-    if (!td_opt.is_some()) { return CompletionEngine::make_keyword_list(); }
-    const td: value::JsonValue* = td_opt.unwrap_or(null);
-    if (td == null) { return CompletionEngine::make_keyword_list(); }
-
-    const uri_opt: Option<value::JsonValue*> = td.get(str::Str::from("uri"));
-    if (!uri_opt.is_some()) { return CompletionEngine::make_keyword_list(); }
-    const uri_val: value::JsonValue* = uri_opt.unwrap_or(null);
-    if (uri_val == null) { return CompletionEngine::make_keyword_list(); }
-
-    const uri_str_opt: Option<str::Str> = uri_val.as::<str::Str>();
-    if (!uri_str_opt.is_some()) { return CompletionEngine::make_keyword_list(); }
-    const uri: str::Str = uri_str_opt.unwrap_or(str::Str::from(""));
-
-    // 2. Extract position
-    const pos_opt: Option<value::JsonValue*> = params.get(str::Str::from("position"));
-    if (!pos_opt.is_some()) { return CompletionEngine::make_keyword_list(); }
-    const pos: value::JsonValue* = pos_opt.unwrap_or(null);
-    if (pos == null) { return CompletionEngine::make_keyword_list(); }
-    const line:      u32 = CompletionEngine::json_u32_field(pos, "line");
-    const character: u32 = CompletionEngine::json_u32_field(pos, "character");
-
-    // 3. Get document text
-    const doc_opt: Option<docs::Document*> = docs.get(uri);
-    if (!doc_opt.is_some()) { return CompletionEngine::make_keyword_list(); }
-    const doc: docs::Document* = doc_opt.unwrap_or(null);
-    if (doc == null) { return CompletionEngine::make_keyword_list(); }
-
-    const text: str::Str = doc.text.as_str();
-    const len: u64 = text.length();
-    if (len == 0) { return CompletionEngine::make_keyword_list(); }
-    const ptr: u8* = text.as_ptr();
-
-    const byte_off: u64 = docs.byte_offset(doc, line, character);
-    if (byte_off == 0 || byte_off > len) { return CompletionEngine::make_keyword_list(); }
-
-    // 4. Detect trigger character
-    const DOT:   u8 = 46 as u8;
-    const COLON: u8 = 58 as u8;
-
-    mut is_dot:   boolean = false;
-    mut is_scope: boolean = false;
-
-    if (byte_off >= 1 && ptr[byte_off - 1] == DOT) {
-        is_dot = true;
-    } else if (byte_off >= 2 && ptr[byte_off - 1] == COLON && ptr[byte_off - 2] == COLON) {
-        is_scope = true;
-    } else {
-        return CompletionEngine::make_keyword_list();
-    }
-
-    // 5. Extract identifier immediately before the trigger
-    //    For dot  : identifier ends at byte_off-2 (inclusive); dot at byte_off-1
-    //    For ::   : identifier ends at byte_off-3 (inclusive); :: at byte_off-2..byte_off-1
-    mut ident_end_excl: u64 = 0;
-    if (is_dot) {
-        if (byte_off < 2) { return CompletionEngine::make_keyword_list(); }
-        ident_end_excl = byte_off - 1;
-    } else {
-        if (byte_off < 3) { return CompletionEngine::make_keyword_list(); }
-        ident_end_excl = byte_off - 2;
-    }
-
-    mut ident_start: u64 = ident_end_excl;
-    while (ident_start > 0 && CompletionEngine::is_ident_byte(ptr[ident_start - 1])) {
-        ident_start = ident_start - 1;
-    }
-    if (ident_start == ident_end_excl) { return CompletionEngine::make_keyword_list(); }
-
-    // For `::` the qualifier is part of the name: keep walking back over
-    // preceding `seg::` groups so the whole path is captured.  Scraping only
-    // the last segment makes `A::Foo::` and `B::Foo::` indistinguishable.
-    if (is_scope) {
-        while (ident_start >= 2 && ptr[ident_start - 1] == COLON
-                                && ptr[ident_start - 2] == COLON) {
-            mut seg_start: u64 = ident_start - 2;
-            while (seg_start > 0 && CompletionEngine::is_ident_byte(ptr[seg_start - 1])) {
-                seg_start = seg_start - 1;
-            }
-            // A `::` with no identifier before it is not part of the path.
-            if (seg_start == ident_start - 2) { break; }
-            ident_start = seg_start;
+    const asked: Asked = Asked::from(docs, projects, params);
+    mut c: Completer = Completer::new(asked.ctx, asked.module_idx);
+    match (docs.get(asked.uri)) {
+        Option::Some(doc) => {
+            const line: str::Str = doc.line_text(asked.line);
+            const end: u64 = Columns::wire_to_byte(line, asked.character, docs.utf8);
+            const pos: docs::CompilerPos = docs.scope_pos(asked.uri, asked.line, asked.character);
+            c.complete(line, end, pos);
         }
+        Option::None => { c.keywords(); }
     }
-
-    // Build NUL-terminated C-string from the identifier bytes
-    const ident_len: u64 = ident_end_excl - ident_start;
-    mut ident_buf: String = String::with_capacity(ident_len + 1);
-    ident_buf.push(text.sub_bytes(ident_start, ident_end_excl));
-    ident_buf.push_byte(0 as u8);
-    ident_buf.truncate(ident_len);
-    const ident_cstr: string = ident_buf.as_ptr() as string;
-
-    // 6. Build a parseable "completion buffer".  LSP completion always
-    // fires on syntactically incomplete code - the dangling `f.` / `Foo::`
-    // the user just typed - and Cryo's parser aborts the whole frontend on
-    // it, so a clean compile yields no AST/types and we'd only ever reach
-    // the keyword fallback.  Splice a placeholder identifier in at the
-    // cursor so the receiver (`f`) / scope (`Foo`) parses and gets a real
-    // type stamped; the enumerators below then read it exactly as they do
-    // for a valid buffer.  Positions before the cursor are untouched, so
-    // the receiver/scope the resolver looks up keeps its coordinates.
-    mut patched: String = CompletionEngine::build_completion_buffer(text, byte_off);
-
-    // 7. Analyse the project with that buffer in place of this document's.
-    // The analysis answers this completion only; the project's own
-    // analysis, which answers everything else, is untouched.
-    const ctx: compilation_context::CompilationContext* =
-        projects.analyse_buffer(docs, uri, patched.as_str());
-    mem::drop(patched);
-    if (ctx == null || ctx.intern_table == null) {
-        mem::drop(ident_buf);
-        return CompletionEngine::make_keyword_list();
-    }
-
-    // 7. Resolve the file URI to a module AST
-    mut fs_path_owned: String = conv::UriPath::uri_to_fs_path(uri);
-    const fs_path: str::Str = fs_path_owned.as_str();
-    mut path_buf: String = String::with_capacity(fs_path.length() + 1);
-    path_buf.push(fs_path);
-    path_buf.push_byte(0 as u8);
-    mem::drop(fs_path_owned);
-    const path_buf_len: u64 = path_buf.length() - 1;
-    path_buf.truncate(path_buf_len);
-    const path_cstr: string = path_buf.as_ptr() as string;
-
-    const mod_idx: i64 = ctx.module_graph.find_module_by_path(path_cstr);
-    mem::drop(path_buf);
-    if (mod_idx < 0) {
-        mem::drop(ident_buf);
-        return CompletionEngine::make_keyword_list();
-    }
-    const ast: node::ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
-    if (ast == null) {
-        mem::drop(ident_buf);
-        return CompletionEngine::make_keyword_list();
-    }
-
-    // 8. Build completion items
-    mut eng: CompletionEngine = CompletionEngine::new(ctx);
-    mut items: Array<value::JsonValue> = Array::<value::JsonValue>::with_capacity(64);
-
-    if (is_dot) {
-        // Dot completion: enumerate instance members of the receiver type.
-        // Convert the last byte of the identifier from LSP 0-based coords to
-        // compiler 1-based coords so node_locator can find the right node.
-        const cursor_line: u32 = line + 1 as u32;
-        const line_start_off: u64 = doc.line_index.line_start(line);
-        const ident_last_byte: u64 = ident_end_excl - 1 - line_start_off;
-        const lookup_char: u32 = line_index::Columns::byte_to_compiler(doc.line_text(line), ident_last_byte);
-
-        const node: node::ASTNode* = node_locator::find_innermost_node_at(
-            ast, cursor_line, lookup_char);
-        if (node != null) {
-            const ty: type_ref::TypeRef = node_locator::resolved_type_of(node);
-            if (ty.is_valid() && ctx.decl_index != null) {
-                const recv_ty: type_ref::TypeRef = eng.unwrap_to_carrier(ty);
-                if (recv_ty.is_valid()) {
-                    const type_sym: symbol_str::SymbolStr =
-                        ctx.decl_index.lookup_type_name(recv_ty);
-                    if (type_sym.is_valid()) {
-                        eng.collect_instance_members(type_sym, &items);
-                    }
-                }
-            }
-        }
-    } else {
-        // Scope-resolution completion: resolve the scraped path the way the
-        // editing module would, then enumerate static methods + enum variants
-        // on the declaration it names.
-        const target: symbol_str::SymbolStr = eng.resolve_scope_path(ident_cstr, ctx.module_graph.get_module(mod_idx).path());
-        if (target.is_valid()) {
-            eng.collect_scope_members(target, &items);
-        }
-        // A path that names no declaration may still name a namespace.
-        if (items.length == 0) {
-            eng.collect_namespace_members(ident_cstr, &items);
-        }
-    }
-
-    mem::drop(ident_buf);
-
-    if (items.length == 0) {
-        mem::drop(items);
-        return CompletionEngine::make_keyword_list();
-    }
-    return CompletionEngine::make_completion_list(items);
+    return c.reply();
 }
 
 
-// CompletionEngine - per-request member enumeration + item building
-//
-// Holds the compilation pointers (module `graph`, `intern` table, type
-// `arena`).  Member-collection walks are `&this` methods; the pure item
-// builders + string/AST utilities are `static` methods.
+/// What a path written before the cursor names.
+type enum Place {
+    Nothing;
+    Module(ModulePath);
+    Type(DefId);
+}
 
-type struct CompletionEngine {
-    graph:  module_graph::ModuleGraph*;
-    intern: intern_table::InternTable*;
-    arena:  arena::TypeArena*;
-    decl:   decl_index::DeclarationIndex*;
-    res:    resolver::Resolver*;
+/// One `.name` (or the head) of a receiver written before a `.`, and the
+/// text of the calls and indexings written after it (`(4)[0]`).
+type struct Step {
+    name: str::Str;
+    ops:  str::Str;
 
-    static new(ctx: compilation_context::CompilationContext*) -> CompletionEngine {
-        return CompletionEngine {
-            graph:  ctx.module_graph,
-            intern: ctx.intern_table,
-            arena:  ctx.type_arena,
-            decl:   ctx.decl_index,
-            res:    ctx.resolver,
+    /// The brackets opening each call (`(`) and indexing (`[`) in `ops`,
+    /// in order.
+    op_list(&this) -> u8[] {
+        mut out: u8[] = [];
+        const b: u8* = this.ops.as_ptr();
+        mut depth: i64 = 0;
+        for (mut i: u64 = 0; i < this.ops.length(); i++) {
+            const c: u8 = b[i];
+            if (c == '(' as u8 || c == '[' as u8) {
+                if (depth == 0) { out.push(c); }
+                depth = depth + 1;
+            }
+            if (c == ')' as u8 || c == ']' as u8) { depth = depth - 1; }
+        }
+        return out;
+    }
+}
+
+
+type struct Completer {
+    ctx:    CompilationContext*;
+    module: ModulePath;
+    scope:  ScopeID;
+    pos:    docs::CompilerPos;
+    items:  Array<value::JsonValue>;
+    /// The labels already offered.
+    labels: HashMap<String, i64>;
+
+    static new(ctx: CompilationContext*, module_idx: i64) -> Completer {
+        mut m: ModulePath = ModulePath::none();
+        if (ctx != null && module_idx >= 0) { m = ctx.module_graph.get_module(module_idx).path(); }
+        return Completer { ctx: ctx, module: m, scope: ScopeID::invalid(),
+                           pos: docs::CompilerPos { line: 0, col: 0 },
+                           items: Array::<value::JsonValue>::with_capacity(64),
+                           labels: HashMap::<String, i64>::new() };
+    }
+
+    /// Complete at byte `end` of `line`, the cursor's line in the buffer;
+    /// `pos` is where the analysis has the cursor's scope.
+    complete(mut &this, line: str::Str, end: u64, pos: docs::CompilerPos) -> void {
+        this.pos = pos;
+        if (this.ctx != null && this.module.is_valid() && pos.line != 0) {
+            this.scope = this.ctx.resolver.scope_at(this.module, pos.line, pos.col);
+        }
+        const b: u8* = line.as_ptr();
+        mut p: u64 = end;
+        while (p > 0 && Completer::is_ident(b[p - 1])) { p = p - 1; }
+        if (p >= 1 && b[p - 1] == '.' as u8) {
+            this.member(line, p - 1);
+            return;
+        }
+        if (p >= 2 && b[p - 1] == ':' as u8 && b[p - 2] == ':' as u8) {
+            const start: u64 = Completer::path_start(line, p - 2);
+            if (Completer::after_import(line, start)) {
+                this.import_path(line.sub_bytes(start, p - 2));
+            } else {
+                this.path(line, start, p - 2);
+            }
+            return;
+        }
+        if (Completer::after_import(line, p)) {
+            this.modules_under(ModulePath::none());
+            return;
+        }
+        this.bare();
+        this.keywords();
+    }
+
+    // -- What was written --
+
+    /// Where the path ending at byte `end` (`A::B` before a `::`) starts.
+    static path_start(line: str::Str, end: u64) -> u64 {
+        const b: u8* = line.as_ptr();
+        mut s: u64 = end;
+        loop {
+            while (s > 0 && Completer::is_ident(b[s - 1])) { s = s - 1; }
+            if (s >= 2 && b[s - 1] == ':' as u8 && b[s - 2] == ':' as u8
+                    && s >= 3 && Completer::is_ident(b[s - 3])) {
+                s = s - 2;
+                continue;
+            }
+            return s;
+        }
+        return s;
+    }
+
+    /// Whether the text before byte `at` is the keyword `import` or
+    /// `export` and blanks.
+    static after_import(line: str::Str, at: u64) -> boolean {
+        const b: u8* = line.as_ptr();
+        mut e: u64 = at;
+        while (e > 0 && (b[e - 1] == ' ' as u8 || b[e - 1] == '\t' as u8)) { e = e - 1; }
+        if (e == at) { return false; }
+        mut s: u64 = e;
+        while (s > 0 && Completer::is_ident(b[s - 1])) { s = s - 1; }
+        mut k: u64 = s;
+        while (k > 0 && (b[k - 1] == ' ' as u8 || b[k - 1] == '\t' as u8)) { k = k - 1; }
+        if (k != 0) { return false; }
+        const word: str::Str = line.sub_bytes(s, e);
+        return word.equals(&str::Str::from("import")) || word.equals(&str::Str::from("export"));
+    }
+
+    /// The segments of `text`, split at `::`.
+    static segments(text: str::Str) -> str::Str[] {
+        mut out: str::Str[] = [];
+        const b: u8* = text.as_ptr();
+        const n: u64 = text.length();
+        mut s: u64 = 0;
+        mut i: u64 = 0;
+        while (i < n) {
+            if (i + 1 < n && b[i] == ':' as u8 && b[i + 1] == ':' as u8) {
+                out.push(text.sub_bytes(s, i));
+                i = i + 2;
+                s = i;
+                continue;
+            }
+            i = i + 1;
+        }
+        out.push(text.sub_bytes(s, n));
+        return out;
+    }
+
+    // -- `a.b().` --
+
+    /// Members of the receiver written before the `.` at byte `dot`.
+    member(mut &this, line: str::Str, dot: u64) -> void {
+        if (this.ctx == null || !this.scope.is_valid()) { return; }
+        mut steps: Step[] = [];
+        const b: u8* = line.as_ptr();
+        mut q: u64 = dot;
+        loop {
+            const ops_end: u64 = q;
+            while (q > 0 && (b[q - 1] == ')' as u8 || b[q - 1] == ']' as u8)) {
+                const at: i64 = Completer::opening(line, q - 1);
+                if (at < 0) { return; }
+                q = at as u64;
+            }
+            mut s: u64 = q;
+            while (s > 0 && Completer::is_ident(b[s - 1])) { s = s - 1; }
+            if (s == q) { return; }
+            steps.push(Step { name: line.sub_bytes(s, q), ops: line.sub_bytes(q, ops_end) });
+            q = s;
+            if (q > 0 && b[q - 1] == '.' as u8) {
+                q = q - 1;
+                continue;
+            }
+            // A receiver whose head is a path (`T::make().`) is not read.
+            if (q >= 2 && b[q - 1] == ':' as u8 && b[q - 2] == ':' as u8) { return; }
+            break;
+        }
+        mut ty: TypeRef = this.head_type(&steps[steps.length - 1]);
+        for (mut i: i64 = steps.length - 2; i >= 0 && ty.is_valid(); i--) {
+            ty = this.step_type(ty, &steps[i]);
+        }
+        if (!ty.is_valid()) { return; }
+        const d: DefId = this.type_def(ty);
+        if (!d.is_valid()) { return; }
+        const all: Member[] = Members::of_type(this.ctx, d);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            if (Members::is_instance(&all[i])) { this.member_item(&all[i]); }
+        }
+    }
+
+    /// The byte of the bracket opening the one closing at byte `close`, or
+    /// -1 when this line holds none.
+    static opening(line: str::Str, close: u64) -> i64 {
+        const b: u8* = line.as_ptr();
+        mut depth: i64 = 0;
+        mut i: i64 = close as i64;
+        while (i >= 0) {
+            const c: u8 = b[i];
+            if (c == ')' as u8 || c == ']' as u8) { depth = depth + 1; }
+            if (c == '(' as u8 || c == '[' as u8) {
+                depth = depth - 1;
+                if (depth == 0) { return i; }
+            }
+            i = i - 1;
+        }
+        return -1;
+    }
+
+    /// The type of a receiver's head: `this`, or a name the scope binds.
+    head_type(&this, s: &Step) -> TypeRef {
+        const ops: u8[] = s.op_list();
+        mut ty: TypeRef = TypeRef::invalid();
+        mut from: i64 = 0;
+        if (s.name.equals(&str::Str::from("this"))) {
+            ty = this.receiver_type();
+        } else {
+            const bound: SymbolID = this.ctx.resolver.value_target(
+                this.ctx.resolver.lookup_value(this.intern(s.name), this.scope));
+            if (!bound.is_valid()) { return ty; }
+            const sym: Symbol = this.ctx.resolver.get_symbol(bound);
+            if (sym.kind == SymbolKind::Function) {
+                if (ops.length == 0 || ops[0] != '(' as u8) { return ty; }
+                const decl: ASTNode* = this.ctx.decl_index.declaration_of(sym.def);
+                if (decl == null || decl.kind != NodeKind::FunctionDeclaration) { return ty; }
+                ty = (decl as FunctionDeclNode*).resolved_return_type;
+                from = 1;
+            } else if (sym.def.is_valid()) {
+                const decl: ASTNode* = this.ctx.decl_index.declaration_of(sym.def);
+                if (decl == null || decl.kind != NodeKind::VariableDeclaration) { return ty; }
+                ty = (decl as VarDeclNode*).resolved_type;
+            } else if (sym.kind == SymbolKind::Variable || sym.kind == SymbolKind::Parameter) {
+                ty = Declared::binding_type(this.ctx, bound);
+            }
+        }
+        return this.apply_ops(ty, &ops, from);
+    }
+
+    /// The type `this` has at the cursor: the type whose declaration or
+    /// implementation block holds the instance method around it.
+    receiver_type(&this) -> TypeRef {
+        const program: ProgramNode* = this.ctx.module_graph.get_module_ast(
+            this.ctx.module_graph.find_module_index(this.module) as u32);
+        mut loc: Locator = Locator::new(this.ctx, this.pos.line, this.pos.col);
+        loc.descend(program);
+        mut in_method: boolean = false;
+        for (mut i: i64 = loc.chain.length - 1; i >= 0; i--) {
+            const n: ASTNode* = loc.chain[i];
+            if (!in_method) {
+                if (n.kind == NodeKind::MethodDeclaration) {
+                    if ((n as MethodNode*).is_static) { return TypeRef::invalid(); }
+                    in_method = true;
+                }
+                continue;
+            }
+            const d: DefId = Completer::declared_type(n);
+            if (d.is_valid()) { return this.ctx.decl_index.type_of_def(d); }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// The type a type declaration or an implementation block is for, or
+    /// invalid for any other node.
+    static declared_type(n: ASTNode*) -> DefId {
+        return match (n.kind) {
+            NodeKind::StructDeclaration    => { (n as StructDeclNode*).def }
+            NodeKind::ClassDeclaration     => { (n as ClassDeclNode*).def }
+            NodeKind::UnionDeclaration     => { (n as UnionDeclNode*).def }
+            NodeKind::EnumDeclaration      => { (n as EnumDeclNode*).def }
+            NodeKind::ImplementationBlock  => { (n as ImplBlockNode*).target_def() }
+            _                              => { DefId::invalid() }
         };
     }
 
-
-    // Scope-path resolution
-
-    /// Resolve the scope path scraped before `::` to the qualified
-    /// declaration name it refers to.  An already-qualified path is taken at
-    /// face value; a bare leaf is what the name layer binds it to in the
-    /// module `use_site` - that module's own declarations and imports,
-    /// then the prelude - so the members offered are the ones this file
-    /// would actually bind.  The binding is read from the module's scope,
-    /// not from a node at the cursor, so a half-typed `Foo::` that parsed
-    /// into no node still resolves.
-    ///
-    /// A leaf the module does not bind yields the bare name unchanged.  The
-    /// collectors key off whether the result carries a qualifier, so an
-    /// unresolved name degrades to a leaf match - the widest list that can be
-    /// offered honestly - rather than to nothing.
-    resolve_scope_path(&this, path: string, use_site: ModulePath) -> symbol_str::SymbolStr {
-        if (this.intern == null) { return symbol_str::SymbolStr::empty(); }
-        const bare: symbol_str::SymbolStr = this.intern.intern(path);
-        if (this.res == null || this.decl == null || CompletionEngine::has_scope_separator(path)) {
-            return bare;
+    /// The type of `.name` on a value of type `ty`, then its calls and
+    /// indexings.
+    step_type(&this, ty: TypeRef, s: &Step) -> TypeRef {
+        const ops: u8[] = s.op_list();
+        if (ops.length > 0 && ops[0] == '(' as u8) {
+            return this.apply_ops(this.method_return(ty, this.intern(s.name)), &ops, 1);
         }
-        const sid: u64 = this.res.find_module_scope(use_site);
-        if (sid == 0) { return bare; }
-        const bound: symbol_id::SymbolID = this.res.lookup(bare, ScopeID { id: sid });
-        if (!bound.is_valid()) { return bare; }
-        const q: symbol_str::SymbolStr = this.decl.defs.path_of(this.res.get_symbol(bound).def).spelling();
-        if (!q.is_valid()) { return bare; }
-        return q;
+        mut types_: TypeUtils = TypeUtils { arena: this.ctx.type_arena, intern: this.ctx.intern_table,
+                                            ctx: this.ctx, checker: null };
+        mut mr: MemberResolver = MemberResolver::null();
+        mr.arena = this.ctx.type_arena;
+        mr.intern = this.ctx.intern_table;
+        mr.ctx = this.ctx;
+        mr.types = &types_;
+        const fa: FieldAnswer = mr.field_of(ty, this.intern(s.name));
+        return this.apply_ops(fa.ty, &ops, 0);
     }
 
-
-    // Member collection
-
-    /// Walk all modules and add fields + non-static methods that belong to
-    /// `type_sym` into `items`.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    collect_instance_members(&this, type_sym: symbol_str::SymbolStr,
-                             items: mut &Array<value::JsonValue>) -> void {
-        if (this.graph == null || this.intern == null) { return; }
-        const target: string   = this.intern.resolve(type_sym);
-        const leaf: string     = CompletionEngine::leaf_after_separator(target);
-        const exact: boolean   = CompletionEngine::has_scope_separator(target);
-
-        const n: u32 = this.graph.module_count();
-        for (mut mi: u32 = 0; mi < n; mi++) {
-            const mod_ast: node::ProgramNode* = this.graph.get_module_ast(mi);
-            if (mod_ast == null) { continue; }
-            const mod_ns: string = mod_ast.namespace_name;
-            for (mut si: i64 = 0; si < mod_ast.statements.length; si++) {
-                const stmt: node::ASTNode* = CompletionEngine::unwrap_top_decl(mod_ast.statements[si]);
-                if (stmt == null) { continue; }
-                if (stmt.kind == ast::NodeKind::StructDeclaration) {
-                    const d: declaration::StructDeclNode* = stmt as declaration::StructDeclNode*;
-                    if (!this.decl_matches(d.name, mod_ns, target, leaf, exact)) { continue; }
-                    this.add_fields(&d.fields, items);
-                    this.add_instance_methods(&d.methods, items);
-                } else if (stmt.kind == ast::NodeKind::ClassDeclaration) {
-                    const d: declaration::ClassDeclNode* = stmt as declaration::ClassDeclNode*;
-                    if (!this.decl_matches(d.name, mod_ns, target, leaf, exact)) { continue; }
-                    this.add_fields(&d.fields, items);
-                    this.add_instance_methods(&d.methods, items);
-                } else if (stmt.kind == ast::NodeKind::ImplementationBlock) {
-                    const d: declaration::ImplBlockNode* = stmt as declaration::ImplBlockNode*;
-                    if (!this.impl_matches(d, target, leaf, exact)) { continue; }
-                    this.add_instance_methods(&d.methods, items);
-                }
-            }
+    /// The return type the methods named `leaf` of type `ty` declare, through
+    /// its base classes; invalid when none or when they disagree.
+    method_return(&this, ty: TypeRef, leaf: SymbolStr) -> TypeRef {
+        mut types_: TypeUtils = TypeUtils { arena: this.ctx.type_arena, intern: this.ctx.intern_table,
+                                            ctx: this.ctx, checker: null };
+        mut owner: TypeRef = types_.method_owner_ref(this.carrier(ty));
+        for (mut depth: i64 = 0; depth < 16 && owner.is_valid(); depth++) {
+            const entries: OverloadId[] = this.ctx.decl_index.lookup_family_entries(
+                FamilyOwner::Type(owner), leaf);
+            if (entries.length > 0) { return this.shared_return(&entries); }
+            const t: type_base::Type* = this.ctx.type_arena.lookup(owner);
+            if (t == null || t.kind != types::TypeKind::Class) { return TypeRef::invalid(); }
+            const cls: ClassType* = t as ClassType*;
+            if (!cls.has_base) { return TypeRef::invalid(); }
+            owner = cls.base_class;
         }
+        return TypeRef::invalid();
     }
 
-    /// Walk all modules and add static methods + enum variants that belong to
-    /// `name_sym` into `items`.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    collect_scope_members(&this, name_sym: symbol_str::SymbolStr,
-                          items: mut &Array<value::JsonValue>) -> void {
-        if (this.graph == null || this.intern == null) { return; }
-        const target: string = this.intern.resolve(name_sym);
-        const leaf: string   = CompletionEngine::leaf_after_separator(target);
-        const exact: boolean = CompletionEngine::has_scope_separator(target);
-
-        const n: u32 = this.graph.module_count();
-        for (mut mi: u32 = 0; mi < n; mi++) {
-            const mod_ast: node::ProgramNode* = this.graph.get_module_ast(mi);
-            if (mod_ast == null) { continue; }
-            const mod_ns: string = mod_ast.namespace_name;
-            for (mut si: i64 = 0; si < mod_ast.statements.length; si++) {
-                const stmt: node::ASTNode* = CompletionEngine::unwrap_top_decl(mod_ast.statements[si]);
-                if (stmt == null) { continue; }
-                if (stmt.kind == ast::NodeKind::EnumDeclaration) {
-                    const d: declaration::EnumDeclNode* = stmt as declaration::EnumDeclNode*;
-                    if (!this.decl_matches(d.name, mod_ns, target, leaf, exact)) { continue; }
-                    this.add_enum_variants(&d.variants, items);
-                } else if (stmt.kind == ast::NodeKind::StructDeclaration) {
-                    const d: declaration::StructDeclNode* = stmt as declaration::StructDeclNode*;
-                    if (!this.decl_matches(d.name, mod_ns, target, leaf, exact)) { continue; }
-                    this.add_static_methods(&d.methods, items);
-                } else if (stmt.kind == ast::NodeKind::ClassDeclaration) {
-                    const d: declaration::ClassDeclNode* = stmt as declaration::ClassDeclNode*;
-                    if (!this.decl_matches(d.name, mod_ns, target, leaf, exact)) { continue; }
-                    this.add_static_methods(&d.methods, items);
-                } else if (stmt.kind == ast::NodeKind::ImplementationBlock) {
-                    const d: declaration::ImplBlockNode* = stmt as declaration::ImplBlockNode*;
-                    if (!this.impl_matches(d, target, leaf, exact)) { continue; }
-                    this.add_static_methods(&d.methods, items);
-                }
-            }
+    shared_return(&this, entries: &OverloadId[]) -> TypeRef {
+        mut ret: TypeRef = TypeRef::invalid();
+        for (mut k: i64 = 0; k < entries.length; k++) {
+            const sig: type_base::Type* = this.ctx.type_arena.lookup(
+                this.ctx.decl_index.entry_signature(entries[k]));
+            if (sig == null || sig.kind != types::TypeKind::Function) { return TypeRef::invalid(); }
+            const r: TypeRef = (sig as compound::FunctionType*).return_type;
+            if (ret.is_valid() && !ret.equals(r)) { return TypeRef::invalid(); }
+            ret = r;
         }
+        return ret;
     }
 
-    /// Walk all modules whose namespace is exactly `ns` and add the
-    /// declarations they contain.  This is what makes a path that names a
-    /// namespace (`compiler::types::`) complete to its contents instead of
-    /// falling through to the keyword list.
-    collect_namespace_members(&this, ns: string, items: mut &Array<value::JsonValue>) -> void {
-        if (this.graph == null || this.intern == null) { return; }
-        if (libc::strlen(ns) == 0) { return; }
-
-        const n: u32 = this.graph.module_count();
-        for (mut mi: u32 = 0; mi < n; mi++) {
-            const mod_ast: node::ProgramNode* = this.graph.get_module_ast(mi);
-            if (mod_ast == null) { continue; }
-            if (libc::strcmp(mod_ast.namespace_name, ns) != 0) { continue; }
-            for (mut si: i64 = 0; si < mod_ast.statements.length; si++) {
-                const stmt: node::ASTNode* = CompletionEngine::unwrap_top_decl(mod_ast.statements[si]);
-                if (stmt == null) { continue; }
-                if (stmt.kind == ast::NodeKind::StructDeclaration) {
-                    const d: declaration::StructDeclNode* = stmt as declaration::StructDeclNode*;
-                    CompletionEngine::push_item(items, this.intern.resolve(d.name),
-                                                "struct", CK_STRUCT);
-                } else if (stmt.kind == ast::NodeKind::ClassDeclaration) {
-                    const d: declaration::ClassDeclNode* = stmt as declaration::ClassDeclNode*;
-                    CompletionEngine::push_item(items, this.intern.resolve(d.name),
-                                                "class", CK_CLASS);
-                } else if (stmt.kind == ast::NodeKind::EnumDeclaration) {
-                    const d: declaration::EnumDeclNode* = stmt as declaration::EnumDeclNode*;
-                    CompletionEngine::push_item(items, this.intern.resolve(d.name),
-                                                "enum", CK_ENUM);
-                } else if (stmt.kind == ast::NodeKind::TraitDeclaration) {
-                    const d: declaration::TraitDeclNode* = stmt as declaration::TraitDeclNode*;
-                    CompletionEngine::push_item(items, this.intern.resolve(d.name),
-                                                "trait", CK_INTERFACE);
-                } else if (stmt.kind == ast::NodeKind::FunctionDeclaration) {
-                    const d: declaration::FunctionDeclNode* = stmt as declaration::FunctionDeclNode*;
-                    const detail: string = if (this.arena != null) {
-                        "(...) -> " + this.arena.resolve_display_name_short(d.resolved_return_type)
-                    } else { "" };
-                    CompletionEngine::push_item(items, this.intern.resolve(d.name),
-                                                detail, CK_FUNCTION);
-                }
-            }
-        }
-    }
-
-    add_fields(&this, fields: &declaration::FieldDeclNode*[], items: mut &Array<value::JsonValue>) -> void {
-        if (this.arena == null) { return; }
-        for (mut i: i64 = 0; i < fields.length; i++) {
-            const f: declaration::FieldDeclNode* = fields[i];
-            if (f == null) { continue; }
-            const label: string = this.arena.intern_table.resolve(f.name);
-            const detail: string = this.arena.resolve_display_name_short(f.resolved_type);
-            CompletionEngine::push_item(items, label, detail, CK_FIELD);
-        }
-    }
-
-    add_instance_methods(&this, methods: &declaration::MethodNode*[], items: mut &Array<value::JsonValue>) -> void {
-        if (this.arena == null || this.intern == null) { return; }
-        for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: declaration::MethodNode* = methods[i];
-            if (m == null || m.func == null) { continue; }
-            if (m.is_static || m.is_constructor) { continue; }
-            const label: string = this.intern.resolve(m.func.name);
-            const detail: string = "(...) -> "
-                + this.arena.resolve_display_name_short(m.func.resolved_return_type);
-            CompletionEngine::push_item(items, label, detail, CK_METHOD);
-        }
-    }
-
-    add_static_methods(&this, methods: &declaration::MethodNode*[], items: mut &Array<value::JsonValue>) -> void {
-        if (this.arena == null || this.intern == null) { return; }
-        for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: declaration::MethodNode* = methods[i];
-            if (m == null || m.func == null) { continue; }
-            if (!m.is_static && !m.is_constructor) { continue; }
-            const label: string = this.intern.resolve(m.func.name);
-            const detail: string = "(...) -> "
-                + this.arena.resolve_display_name_short(m.func.resolved_return_type);
-            CompletionEngine::push_item(items, label, detail, CK_FUNCTION);
-        }
-    }
-
-    add_enum_variants(&this, variants: &declaration::EnumVariantNode*[], items: mut &Array<value::JsonValue>) -> void {
-        if (this.intern == null) { return; }
-        for (mut i: i64 = 0; i < variants.length; i++) {
-            const v: declaration::EnumVariantNode* = variants[i];
-            if (v == null) { continue; }
-            const label: string = this.intern.resolve(v.name);
-            CompletionEngine::push_item(items, label, "", CK_ENUM_MEMBER);
-        }
-    }
-
-    /// Strip `Reference`, `Pointer`, and `InstantiatedType` wrappers from
-    /// `ty` until the carrier struct/class/enum TypeRef is reached.
-    /// Mirrors `unwrap_to_carrier` in `lsp::handlers::hover`.
-    unwrap_to_carrier(&this, ty: type_ref::TypeRef) -> type_ref::TypeRef {
-        if (this.arena == null) { return ty; }
-        mut cur: type_ref::TypeRef = ty;
-        mut hops: i64 = 0;
-        while (hops < 6) {
-            if (!cur.is_valid()) { return cur; }
-            const t: type_base::Type* = this.arena.lookup(cur);
-            if (t == null) { return cur; }
-            if (t.kind == types::TypeKind::Reference) {
-                const rt: compound::ReferenceType* = t as compound::ReferenceType*;
-                cur = rt.referent;
-            } else if (t.kind == types::TypeKind::Pointer) {
-                const pt: compound::PointerType* = t as compound::PointerType*;
-                cur = pt.pointee;
-            } else if (t.kind == types::TypeKind::InstantiatedType) {
-                const it: generic::InstantiatedType* = t as generic::InstantiatedType*;
-                cur = it.generic_base;
-            } else {
-                return cur;
-            }
-            hops = hops + 1;
+    /// `ty` after the calls and indexings in `ops` from position `from`: an
+    /// index takes an array's element; a call on a value is not followed.
+    apply_ops(&this, ty: TypeRef, ops: &u8[], from: i64) -> TypeRef {
+        mut cur: TypeRef = ty;
+        for (mut i: i64 = from; i < ops.length && cur.is_valid(); i++) {
+            if (ops[i] != '[' as u8) { return TypeRef::invalid(); }
+            const t: type_base::Type* = this.ctx.type_arena.lookup(this.carrier(cur));
+            if (t == null || t.kind != types::TypeKind::Array) { return TypeRef::invalid(); }
+            cur = (t as compound::ArrayType*).element;
         }
         return cur;
     }
 
-    /// True when the declaration `decl_name`, declared in module namespace
-    /// `mod_ns`, is the one `target` names.
-    ///
-    /// With a qualified target the namespace must agree as well as the leaf.
-    /// Leaf-only matching merges every same-named declaration in the program
-    /// into a single completion list; it is kept as the fallback for an
-    /// unqualified target, which is either a name that did not resolve or a
-    /// builtin registered without a namespace.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    decl_matches(&this, decl_name: symbol_str::SymbolStr, mod_ns: string, target: string,
-                 target_leaf: string, exact: boolean) -> boolean {
-        if (this.intern == null) { return false; }
-        const dn: string = this.intern.resolve(decl_name);
-        if (!exact) {
-            if (libc::strlen(target_leaf) == 0) { return false; }
-            return libc::strcmp(dn, target_leaf) == 0;
-        }
-        // `target` must read exactly "<mod_ns>::<dn>".
-        const nl: i64 = libc::strlen(mod_ns) as i64;
-        if (nl == 0) { return false; }
-        for (mut i: i64 = 0; i < nl; i++) {
-            if (target[i] == 0 || target[i] != mod_ns[i]) { return false; }
-        }
-        if (target[nl] != ':' || target[nl + 1] != ':') { return false; }
-        return libc::strcmp(dn, target + nl + 2) == 0;
+    carrier(&this, ty: TypeRef) -> TypeRef {
+        const loc: Locator = Locator::new(this.ctx, 0, 0);
+        return loc.carrier(ty);
     }
 
-    /// True when an `implement` block is for the declaration `target` names.
-    /// The block's target is the one its head was stamped with when it was
-    /// resolved - a written block's definition, or, for a block the
-    /// monomorphizer placed for an instantiation (which carries no stamp),
-    /// the instantiation's own type.  Either names the target whatever the
-    /// head spelled and wherever the block sits.
-    impl_matches(&this, d: declaration::ImplBlockNode*, target: string,
-                 target_leaf: string, exact: boolean) -> boolean {
-        if (this.intern == null || this.decl == null || d == null) { return false; }
-        mut owner: symbol_str::SymbolStr = this.decl.defs.path_of(d.target_def()).spelling();
-        if (!owner.is_valid() && d.spec_owner.is_valid()) {
-            owner = this.decl.lookup_type_name(d.spec_owner);
-        }
-        if (!owner.is_valid()) { return false; }
-        const on: string = this.intern.resolve(owner);
-        if (!exact) {
-            if (libc::strlen(target_leaf) == 0) { return false; }
-            return libc::strcmp(CompletionEngine::leaf_after_separator(on), target_leaf) == 0;
-        }
-        return libc::strcmp(on, target) == 0;
+    /// The type definition a value of type `ty` is an instance of; a
+    /// built-in array's is the library type that carries its methods.
+    type_def(&this, ty: TypeRef) -> DefId {
+        const c: TypeRef = this.carrier(ty);
+        const d: DefId = this.ctx.decl_index.def_of(c, this.ctx.type_arena);
+        if (d.is_valid()) { return d; }
+        mut types_: TypeUtils = TypeUtils { arena: this.ctx.type_arena, intern: this.ctx.intern_table,
+                                            ctx: this.ctx, checker: null };
+        return this.ctx.decl_index.def_of(types_.method_owner_ref(c), this.ctx.type_arena);
     }
 
-    /// True when `s` contains a `::` scope separator.
-    static has_scope_separator(s: string) -> boolean {
-        const len: i64 = libc::strlen(s) as i64;
-        for (mut i: i64 = 0; i + 1 < len; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') { return true; }
+    // -- `A::B::` --
+
+    /// What can follow the path written in bytes `start`..`end` of `line`.
+    path(mut &this, line: str::Str, start: u64, end: u64) -> void {
+        if (this.ctx == null || !this.scope.is_valid()) { return; }
+        const segs: str::Str[] = Completer::segments(line.sub_bytes(start, end));
+        mut place: Place = this.head_place(segs[0]);
+        for (mut i: i64 = 1; i < segs.length; i++) {
+            place = this.next_place(&place, segs[i]);
         }
-        return false;
+        match (place) {
+            Place::Module(m) => {
+                const syms: SymbolID[] = Members::exports_of(this.ctx, m);
+                for (mut i: i64 = 0; i < syms.length; i++) { this.symbol_item(syms[i]); }
+                this.modules_under(m);
+            }
+            Place::Type(d) => {
+                const all: Member[] = Members::of_type(this.ctx, d);
+                for (mut i: i64 = 0; i < all.length; i++) {
+                    if (!Members::is_instance(&all[i])) { this.member_item(&all[i]); }
+                }
+            }
+            Place::Nothing => { }
+        }
     }
 
+    /// What a path's first segment names in the cursor's scope: the type
+    /// the scope binds it to, or the module it spells there.
+    head_place(&this, seg: str::Str) -> Place {
+        const name: SymbolStr = this.intern(seg);
+        const bound: SymbolID = this.ctx.resolver.type_binding(name, this.scope);
+        if (bound.is_valid()) {
+            mut s: Symbol = this.ctx.resolver.get_symbol(bound);
+            if (s.kind == SymbolKind::Import) {
+                if (s.def.is_valid() && this.ctx.defs.kind_of(s.def) == DefKind::Module) {
+                    return Place::Module(this.ctx.module_graph.module_of_def(s.def));
+                }
+                s = this.ctx.resolver.get_symbol(this.ctx.resolver.declaration_of(bound));
+            }
+            return this.place_of(&s);
+        }
+        const m: ModuleSpellingMatch = this.ctx.modules_written_as(
+            this.cstr(seg), this.module, ModulePath::none());
+        if (m.visible == 1) { return Place::Module(m.found); }
+        return Place::Nothing;
+    }
 
-    // Item builders (statics)
+    /// What segment `seg` names after `place`: a type the module exports,
+    /// or a module under it.
+    next_place(&this, place: &Place, seg: str::Str) -> Place {
+        match (place) {
+            Place::Module(m) => {
+                const found: SymbolID[] = this.ctx.resolver.exports_named(m, this.intern(seg));
+                for (mut i: i64 = 0; i < found.length; i++) {
+                    const s: Symbol = this.ctx.resolver.get_symbol(found[i]);
+                    const p: Place = this.place_of(&s);
+                    match (p) {
+                        Place::Nothing => { }
+                        _              => { return p; }
+                    }
+                }
+                const sub: ModuleSpellingMatch = this.ctx.modules_written_as(this.cstr(seg), this.module, m);
+                if (sub.visible == 1) { return Place::Module(sub.found); }
+                return Place::Nothing;
+            }
+            _ => { return Place::Nothing; }
+        }
+    }
 
-    /// Append a single CompletionItem with the given label, optional detail,
-    /// and LSP kind.
-    static push_item(items: mut &Array<value::JsonValue>, label: string,
-                     detail: string, kind: i64) -> void {
+    place_of(&this, s: &Symbol) -> Place {
+        if (s.kind == SymbolKind::Type || s.kind == SymbolKind::TypeAlias) {
+            if (s.def.is_valid()) { return Place::Type(s.def); }
+        }
+        if (s.kind == SymbolKind::Namespace && s.def.is_valid()) {
+            return Place::Module(this.ctx.module_graph.module_of_def(s.def));
+        }
+        return Place::Nothing;
+    }
+
+    // -- `import A::B::` --
+
+    /// The modules under the module an import's written path names.
+    import_path(mut &this, written: str::Str) -> void {
+        if (this.ctx == null) { return; }
+        const m: ModulePath = this.ctx.module_graph.module_of_written_path(this.intern(written));
+        if (m.is_valid()) { this.modules_under(m); }
+    }
+
+    modules_under(mut &this, m: ModulePath) -> void {
+        if (this.ctx == null) { return; }
+        const subs: string[] = Members::submodules_of(this.ctx, m);
+        for (mut i: i64 = 0; i < subs.length; i++) { this.push(subs[i], "", CK_MODULE); }
+    }
+
+    // -- A bare name --
+
+    /// Every name the cursor's scope can see: its bindings, innermost
+    /// first, less a local declared after the cursor; the prelude's; and
+    /// the modules the file imports.
+    bare(mut &this) -> void {
+        if (this.ctx == null || !this.scope.is_valid()) { return; }
+        const seen: SymbolID[] = this.ctx.resolver.visible_bindings(this.scope);
+        for (mut i: i64 = 0; i < seen.length; i++) {
+            // A type body binds its fields, methods and variants, which a
+            // bare name never reaches: they are written through `this` or
+            // the type.
+            const k: SymbolKind = this.ctx.resolver.get_symbol(seen[i]).kind;
+            if (k == SymbolKind::Field || k == SymbolKind::Method || k == SymbolKind::EnumVariant) {
+                continue;
+            }
+            if (this.declared_after_cursor(seen[i])) { continue; }
+            this.symbol_item(seen[i]);
+        }
+        const prelude: &ModulePath[] = &this.ctx.resolver.prelude_modules;
+        for (mut p: i64 = 0; p < prelude.length; p++) {
+            const syms: SymbolID[] = Members::exports_of(this.ctx, prelude[p]);
+            for (mut i: i64 = 0; i < syms.length; i++) { this.symbol_item(syms[i]); }
+        }
+        const n: u32 = this.ctx.module_graph.module_count();
+        for (mut i: u32 = 0; i < n; i++) {
+            const p: ModulePath = this.ctx.module_graph.get_module(i as i64).path();
+            if (p.equals(this.module) || !this.ctx.module_graph.imports(this.module, p)) { continue; }
+            const full: string = this.ctx.intern_table.shown(p.decl_name());
+            this.push(Completer::last_segment(full), "", CK_MODULE);
+        }
+    }
+
+    /// Whether `id` is a local the cursor's function declares after the
+    /// cursor.
+    declared_after_cursor(&this, id: SymbolID) -> boolean {
+        const s: Symbol = this.ctx.resolver.get_symbol(id);
+        if (!s.scope_id.is_valid() || this.ctx.resolver.get_scope(s.scope_id).kind.is_module_level()) {
+            return false;
+        }
+        const at: u32 = s.declaring_span.start_line;
+        return at > this.pos.line || (at == this.pos.line && s.declaring_span.start_col > this.pos.col);
+    }
+
+    static last_segment(path: string) -> string {
+        const n: i64 = path.length() as i64;
+        mut s: i64 = n;
+        while (s > 1 && !(path[s - 1] == ':' && path[s - 2] == ':')) { s = s - 1; }
+        if (s <= 1) { return path; }
+        return path.substr(s, n - s);
+    }
+
+    // -- Items --
+
+    /// An item for a binding, or for the declaration an import binds.
+    symbol_item(mut &this, id: SymbolID) -> void {
+        mut s: Symbol = this.ctx.resolver.get_symbol(id);
+        const label: string = this.ctx.intern_table.resolve(s.name);
+        if (s.kind == SymbolKind::Import) {
+            const target: SymbolID = this.ctx.resolver.declaration_of(id);
+            if (target.equals(id)) { return; }
+            s = this.ctx.resolver.get_symbol(target);
+        }
+        mut shown: Shown = Shown::new(this.ctx);
+        mut kind: i64 = CK_VARIABLE;
+        match (s.kind) {
+            SymbolKind::Variable  => {
+                if (s.def.is_valid()) { shown.def(s.def); } else { shown.local(s.id, Declared::binding_type(this.ctx, s.id)); }
+            }
+            SymbolKind::Parameter => { shown.local(s.id, Declared::binding_type(this.ctx, s.id)); }
+            SymbolKind::Constant  => { kind = CK_CONSTANT; shown.def(s.def); }
+            SymbolKind::Function  => { kind = CK_FUNCTION; shown.def(s.def); }
+            SymbolKind::Intrinsic => { kind = CK_FUNCTION; shown.def(s.def); }
+            SymbolKind::Method    => { kind = CK_METHOD; shown.def(s.def); }
+            SymbolKind::Type      => { kind = this.type_kind(s.def); shown.def(s.def); }
+            SymbolKind::TypeAlias => { kind = CK_CLASS; shown.def(s.def); }
+            SymbolKind::EnumVariant => { kind = CK_ENUM_MEMBER; }
+            SymbolKind::Namespace => { kind = CK_MODULE; }
+            SymbolKind::GenericParam => { kind = CK_TYPE_PARAM; }
+            SymbolKind::Field     => { kind = CK_FIELD; }
+            _                     => { return; }
+        }
+        this.push(label, shown.text, kind);
+    }
+
+    type_kind(&this, d: DefId) -> i64 {
+        const decl: ASTNode* = this.ctx.decl_index.declaration_of(d);
+        if (decl == null) { return CK_CLASS; }
+        return match (decl.kind) {
+            NodeKind::StructDeclaration => { CK_STRUCT }
+            NodeKind::UnionDeclaration  => { CK_STRUCT }
+            NodeKind::EnumDeclaration   => { CK_ENUM }
+            NodeKind::TraitDeclaration  => { CK_INTERFACE }
+            _                           => { CK_CLASS }
+        };
+    }
+
+    member_item(mut &this, m: &Member) -> void {
+        mut shown: Shown = Shown::new(this.ctx);
+        match (m) {
+            Member::Field(o, i) => {
+                const fd: FieldDeclNode* = Members::field_decl(this.ctx, o, i);
+                if (fd == null) { return; }
+                shown.field(o, i);
+                this.push(this.ctx.intern_table.resolve(fd.name), shown.text, CK_FIELD);
+            }
+            Member::Variant(o, i) => {
+                const decl: ASTNode* = this.ctx.decl_index.declaration_of(o);
+                if (decl == null || decl.kind != NodeKind::EnumDeclaration) { return; }
+                shown.variant(o, i);
+                this.push(this.ctx.intern_table.resolve((decl as EnumDeclNode*).variants[i].name),
+                          shown.text, CK_ENUM_MEMBER);
+            }
+            Member::Method(md) => {
+                if (md.func.def.is_valid()) { shown.def(md.func.def); }
+                const kind: i64 = if (md.is_static || md.is_constructor) { CK_FUNCTION } else { CK_METHOD };
+                this.push(this.ctx.intern_table.resolve(md.func.name), shown.text, kind);
+            }
+        }
+    }
+
+    /// The keywords a statement or an expression can start with.
+    keywords(mut &this) -> void {
+        const words: string[] = [
+            "function", "return", "if", "else", "while", "for", "loop", "match", "break",
+            "continue", "type", "struct", "union", "enum", "trait", "implement", "import",
+            "namespace", "const", "mut", "move", "asm", "this", "true", "false", "null"
+        ];
+        for (mut i: i64 = 0; i < words.length; i++) { this.push(words[i], "", CK_KEYWORD); }
+    }
+
+    /// Add an item, unless one already carries `label`: an inner binding
+    /// hides an outer one of the same name.
+    push(mut &this, label: string, detail: string, kind: i64) -> void {
+        const l: str::Str = str::Str::from(label);
+        mut key: String = String::from_str(l);
+        match (this.labels.get_ref(&key)) {
+            Option::Some(_) => { mem::drop(key); return; }
+            Option::None    => { }
+        }
+        this.labels.insert(key, 0);
         mut o: value::JsonObject = value::JsonObject::new();
-
-        mut label_s: String = String::new();
-        label_s.push(label);
-        o.put("label", value::JsonValue::String(label_s));
-
+        o.put("label", value::JsonValue::String(String::from_str(l)));
         o.put("kind", value::JsonValue::int_value(kind));
-
-        if (libc::strlen(detail) > 0) {
-            mut detail_s: String = String::new();
-            detail_s.push(detail);
-            o.put("detail", value::JsonValue::String(detail_s));
+        if (detail != null && detail.length() > 0) {
+            o.put("detail", value::JsonValue::String(String::from_str(str::Str::from(detail))));
         }
-
-        items.push(value::JsonValue::Object(o));
+        this.items.push(value::JsonValue::Object(o));
     }
 
-    /// Append one CompletionItem of kind=Keyword (LSP kind 14).
-    static push_keyword(items: mut &Array<value::JsonValue>, label: string) -> void {
-        CompletionEngine::push_item(items, label, "", CK_KEYWORD);
-    }
-
-    /// Build the static keyword completion list (fallback).
-    static make_keyword_list() -> value::JsonValue {
-        mut items: Array<value::JsonValue> = Array::<value::JsonValue>::with_capacity(20);
-        CompletionEngine::push_keyword(&items, "function");
-        CompletionEngine::push_keyword(&items, "return");
-        CompletionEngine::push_keyword(&items, "if");
-        CompletionEngine::push_keyword(&items, "else");
-        CompletionEngine::push_keyword(&items, "while");
-        CompletionEngine::push_keyword(&items, "for");
-        CompletionEngine::push_keyword(&items, "loop");
-        CompletionEngine::push_keyword(&items, "match");
-        CompletionEngine::push_keyword(&items, "break");
-        CompletionEngine::push_keyword(&items, "continue");
-        CompletionEngine::push_keyword(&items, "type");
-        CompletionEngine::push_keyword(&items, "struct");
-        CompletionEngine::push_keyword(&items, "union");
-        CompletionEngine::push_keyword(&items, "enum");
-        CompletionEngine::push_keyword(&items, "trait");
-        CompletionEngine::push_keyword(&items, "implement");
-        CompletionEngine::push_keyword(&items, "import");
-        CompletionEngine::push_keyword(&items, "namespace");
-        CompletionEngine::push_keyword(&items, "const");
-        CompletionEngine::push_keyword(&items, "mut");
-        CompletionEngine::push_keyword(&items, "move");
-        CompletionEngine::push_keyword(&items, "asm");
-        return CompletionEngine::make_completion_list(items);
-    }
-
-    /// Wrap an items array into a LSP `CompletionList` object.
-    static make_completion_list(items: Array<value::JsonValue>) -> value::JsonValue {
+    reply(mut &this) -> value::JsonValue {
+        mut items: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+        mem::swap(&items, &this.items);
         mut out: value::JsonObject = value::JsonObject::new();
         out.put("isIncomplete", value::JsonValue::Bool(false));
         out.put("items", value::JsonValue::Array(items));
         return value::JsonValue::Object(out);
     }
 
+    // -- Text --
 
-    // String / AST utilities (statics)
-
-    /// `ProgramNode.statements` may wrap top-level decls in a
-    /// `DeclStmtNode`; unwrap so callers can branch on the inner kind.
-    /// Mirrors `unwrap_decl_stmt` in `compiler::ast::node_locator`
-    /// (kept private there).
-    static unwrap_top_decl(node: node::ASTNode*) -> node::ASTNode* {
-        if (node == null) { return null; }
-        if (node.kind != ast::NodeKind::DeclarationStatement) { return node; }
-        const d: statement::DeclStmtNode* = node as statement::DeclStmtNode*;
-        return d.declaration as node::ASTNode*;
+    /// A written name as the interner holds it.  Interning is the door text
+    /// becomes a `SymbolStr` through; a name the analysis never saw is added
+    /// to its table and binds nothing.
+    intern(&this, s: str::Str) -> SymbolStr {
+        return this.ctx.intern_table.intern(this.cstr(s));
     }
 
-    static json_u32_field(obj: &value::JsonValue, key: string) -> u32 {
-        match (obj.get(str::Str::from(key))) {
-            Option::Some(v) => {
-                match (v) {
-                    value::JsonValue::Number(n) => {
-                        match (n) {
-                            value::JsonNumber::Int(i)   => {
-                                if (i < 0) { return 0 as u32; }
-                                return i as u32;
-                            }
-                            value::JsonNumber::UInt(u)  => { return u as u32; }
-                            value::JsonNumber::Float(f) => {
-                                if (f < 0.0) { return 0 as u32; }
-                                return f as u32;
-                            }
-                        }
-                    }
-                    _ => { return 0 as u32; }
-                }
-            }
-            Option::None => { return 0 as u32; }
-        }
+    /// `s` as a NUL-terminated copy.
+    cstr(&this, s: str::Str) -> string {
+        mut buf: String = String::with_capacity(s.length() + 1);
+        buf.push(s);
+        buf.push_byte(0 as u8);
+        return buf.into_raw();
     }
 
-    /// Return everything after the final `::` in `s`, or `s` itself when
-    /// there is no `::`.  Mirrors `leaf_after_separator` in
-    /// `lsp::handlers::hover` (kept private there).
-    static leaf_after_separator(s: string) -> string {
-        const len: i64 = libc::strlen(s) as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < len; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') { last_sep = i; }
-        }
-        if (last_sep < 0) { return s; }
-        const start: i64 = last_sep + 2;
-        if (start >= len) { return ""; }
-        return s + start;
-    }
-
-    /// True when `b` is a valid identifier byte (a-z, A-Z, 0-9, _).
-    /// Mirrors `is_ident_byte` in `lsp::handlers::keyword_docs`.
-    static is_ident_byte(b: u8) -> boolean {
-        if (b >= 97 as u8 && b <= 122 as u8) { return true; }
-        if (b >= 65 as u8 && b <= 90 as u8)  { return true; }
-        if (b >= 48 as u8 && b <= 57 as u8)  { return true; }
-        if (b == 95 as u8) { return true; }
-        return false;
-    }
-
-    /// Build a parseable copy of `text` with the placeholder identifier
-    /// `__cryo_completion__` spliced in at byte offset `cursor` (right after
-    /// the `.` / `::` the user just typed).  This turns the incomplete
-    ///   f.            ->  f.__cryo_completion__;
-    ///   Foo::         ->  Foo::__cryo_completion__;
-    /// into something the compiler parses cleanly, so the receiver / scope
-    /// before the cursor gets a real type and the enumerators resolve it.
-    ///
-    /// The trailing `;` is appended only when the rest of the cursor's line
-    /// is blank (statement position).  In an in-progress expression such as
-    /// `bar(f.)` the remainder is non-blank, so no `;` is added and the
-    /// result `bar(f.__cryo_completion__)` still parses; inserting a `;`
-    /// there would break it.  The placeholder name is never matched against
-    /// anything - the resolver reads the receiver/scope, which sits before
-    /// the splice - so a collision with a real member is harmless.
-    static build_completion_buffer(text: str::Str, cursor: u64) -> String {
-        const len: u64 = text.length();
-        const ptr: u8* = text.as_ptr();
-        const LF:  u8 = 10 as u8;
-        const SP:  u8 = 32 as u8;
-        const TAB: u8 = 9 as u8;
-        const CR:  u8 = 13 as u8;
-
-        // Statement position if every byte from the cursor to the next
-        // newline (or EOF) is whitespace.
-        mut rest_blank: boolean = true;
-        mut i: u64 = cursor;
-        while (i < len) {
-            const b: u8 = ptr[i];
-            if (b == LF) { break; }
-            if (b != SP && b != TAB && b != CR) { rest_blank = false; break; }
-            i = i + 1;
-        }
-
-        mut out: String = String::with_capacity(len + 24);
-        if (cursor > 0)   { out.push(text.sub_bytes(0, cursor)); }
-        out.push("__cryo_completion__");
-        if (rest_blank)   { out.push_byte(59 as u8); }         // ';'
-        if (cursor < len) { out.push(text.sub_bytes(cursor, len)); }
-        return out;
+    static is_ident(b: u8) -> boolean {
+        return (b >= 'a' as u8 && b <= 'z' as u8) || (b >= 'A' as u8 && b <= 'Z' as u8)
+            || (b >= '0' as u8 && b <= '9' as u8) || b == '_' as u8;
     }
 }

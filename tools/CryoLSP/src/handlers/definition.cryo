@@ -14,17 +14,18 @@ import std::collections::string::{ String };
 import std::json::value;
 
 import compiler::compilation_context::{ CompilationContext };
-import compiler::ast::{ NodeKind, PatternElement };
+import compiler::ast::{ NodeKind, PatternBinding, PatternElement };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::node_locator;
-import compiler::ast::declaration::{ ClassDeclNode, EnumDeclNode, StructDeclNode, UnionDeclNode, VarDeclNode };
+import compiler::ast::declaration::{ EnumVariantNode, FieldDeclNode, VarDeclNode };
 import compiler::ast::pattern::{ EnumPatternNode, PatternNode };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::res::{ DefId, DefKind };
-import compiler::resolver::symbol::{ Symbol };
 import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::types::type_ref::{ TypeRef };
 
 import lsp::handlers::identity::{ Asked, Locator, Target };
+import lsp::handlers::members::{ Members };
 import lsp::server::docs;
 import lsp::server::session;
 import lsp::protocol::lsp;
@@ -92,13 +93,8 @@ type struct Declared {
     /// A binding's own name: the declaration whose binding it is, found
     /// at the span the name layer declared it with.
     static binding_span(ctx: CompilationContext*, s: SymbolID) -> SourceSpan {
-        const sym: Symbol = ctx.resolver.get_symbol(s);
-        const at: SourceSpan = sym.declaring_span;
-        if (at.start_line == 0) { return at; }
-        const m: i64 = ctx.module_graph.find_module_by_path(at.file);
-        if (m < 0) { return at; }
-        const program: ProgramNode* = ctx.module_graph.get_module_ast(m as u32);
-        const n: ASTNode* = Locator::node_at(ctx, program, at.start_line, at.start_col);
+        const at: SourceSpan = ctx.resolver.get_symbol(s).declaring_span;
+        const n: ASTNode* = Declared::binding_node(ctx, s);
         if (n != null && n.kind == NodeKind::VariableDeclaration) {
             const v: VarDeclNode* = n as VarDeclNode*;
             if (v.sym_id.equals(s) && v.name_span.start_line != 0) { return v.name_span; }
@@ -106,55 +102,72 @@ type struct Declared {
         return at;
     }
 
+    /// The innermost node at the span the name layer declared binding `s`
+    /// with: its variable declaration, parameter or pattern.
+    static binding_node(ctx: CompilationContext*, s: SymbolID) -> ASTNode* {
+        const at: SourceSpan = ctx.resolver.get_symbol(s).declaring_span;
+        if (at.start_line == 0) { return null; }
+        const m: i64 = ctx.module_graph.find_module_by_path(at.file);
+        if (m < 0) { return null; }
+        const program: ProgramNode* = ctx.module_graph.get_module_ast(m as u32);
+        return Locator::node_at(ctx, program, at.start_line, at.start_col);
+    }
+
     /// Whether a binding is one a pattern declares: a match arm's name, or
     /// a name inside a variant's pattern.
     static is_pattern_binding(ctx: CompilationContext*, s: SymbolID) -> boolean {
-        const at: SourceSpan = ctx.resolver.get_symbol(s).declaring_span;
-        if (at.start_line == 0) { return false; }
-        const m: i64 = ctx.module_graph.find_module_by_path(at.file);
-        if (m < 0) { return false; }
-        const program: ProgramNode* = ctx.module_graph.get_module_ast(m as u32);
-        const n: ASTNode* = Locator::node_at(ctx, program, at.start_line, at.start_col);
+        const n: ASTNode* = Declared::binding_node(ctx, s);
         if (n == null) { return false; }
         if (n.kind == NodeKind::Pattern) {
             return (n as PatternNode*).binding_sym.equals(s);
         }
-        if (n.kind != NodeKind::EnumPattern) { return false; }
+        return Declared::element_binding(n, s) != null;
+    }
+
+    /// The binding `s` among an enum pattern's elements, or null.
+    static element_binding(n: ASTNode*, s: SymbolID) -> PatternBinding* {
+        if (n.kind != NodeKind::EnumPattern) { return null; }
         const ep: EnumPatternNode* = n as EnumPatternNode*;
         for (mut i: i64 = 0; i < ep.elements.length; i++) {
             match (ep.elements[i]) {
                 PatternElement::Binding(b) => {
-                    if (b != null && b.sym_id.equals(s)) { return true; }
+                    if (b != null && b.sym_id.equals(s)) { return b; }
                 }
                 _ => { }
             }
         }
-        return false;
+        return null;
+    }
+
+    /// The type the compiler gave binding `s` where it is declared;
+    /// invalid when it gave none.
+    static binding_type(ctx: CompilationContext*, s: SymbolID) -> TypeRef {
+        const n: ASTNode* = Declared::binding_node(ctx, s);
+        if (n == null) { return TypeRef::invalid(); }
+        if (n.kind == NodeKind::VariableDeclaration) {
+            const v: VarDeclNode* = n as VarDeclNode*;
+            if (v.sym_id.equals(s)) { return v.resolved_type; }
+            return TypeRef::invalid();
+        }
+        if (n.kind == NodeKind::Pattern) {
+            const p: PatternNode* = n as PatternNode*;
+            if (p.binding_sym.equals(s)) { return p.binding_type; }
+            return TypeRef::invalid();
+        }
+        const b: PatternBinding* = Declared::element_binding(n, s);
+        if (b != null) { return b.resolved_type; }
+        return TypeRef::invalid();
     }
 
     static field_span(ctx: CompilationContext*, owner: DefId, index: i64) -> SourceSpan {
-        const decl: ASTNode* = ctx.decl_index.declaration_of(owner);
-        if (decl == null || index < 0) { return SourceSpan::none(); }
-        if (decl.kind == NodeKind::StructDeclaration) {
-            const sd: StructDeclNode* = decl as StructDeclNode*;
-            if (index < sd.fields.length) { return sd.fields[index].name_span; }
-        } else if (decl.kind == NodeKind::ClassDeclaration) {
-            const cd: ClassDeclNode* = decl as ClassDeclNode*;
-            if (index < cd.fields.length) { return cd.fields[index].name_span; }
-        } else if (decl.kind == NodeKind::UnionDeclaration) {
-            const ud: UnionDeclNode* = decl as UnionDeclNode*;
-            if (index < ud.fields.length) { return ud.fields[index].name_span; }
-        }
-        return SourceSpan::none();
+        const fd: FieldDeclNode* = Members::field_decl(ctx, owner, index);
+        if (fd == null) { return SourceSpan::none(); }
+        return fd.name_span;
     }
 
     static variant_span(ctx: CompilationContext*, owner: DefId, ordinal: i64) -> SourceSpan {
-        const decl: ASTNode* = ctx.decl_index.declaration_of(owner);
-        if (decl == null || decl.kind != NodeKind::EnumDeclaration || ordinal < 0) {
-            return SourceSpan::none();
-        }
-        const ed: EnumDeclNode* = decl as EnumDeclNode*;
-        if (ordinal >= ed.variants.length) { return SourceSpan::none(); }
-        return ed.variants[ordinal].name_span;
+        const v: EnumVariantNode* = Members::variant_decl(ctx, owner, ordinal);
+        if (v == null) { return SourceSpan::none(); }
+        return v.name_span;
     }
 }
