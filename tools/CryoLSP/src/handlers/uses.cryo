@@ -33,17 +33,21 @@ import compiler::ast::statement::{
 };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::res::{ DefId };
+import compiler::types::type_ref::{ TypeRef };
 
 import lsp::handlers::identity::{ Locator, Target };
 
 
 /// One written name: where it is, what it names, whether it is the name's
 /// declaration, and whether it declares a method's receiver (`&this`).
+/// `inferred` is the type the compiler gave a variable declared with no
+/// type written, invalid otherwise.
 type struct Use {
     span:     SourceSpan;
     target:   Target;
     decl:     boolean;
     receiver: boolean;
+    inferred: TypeRef;
 }
 
 
@@ -102,7 +106,8 @@ type struct Uses {
     push(mut &this, span: SourceSpan, target: Target, decl: boolean, receiver: boolean) -> void {
         if (span.start_line == 0 || target.is_nothing()) { return; }
         if (span.file == null || !span.file.eq(this.file)) { return; }
-        this.out.push(Use { span: span, target: target, decl: decl, receiver: receiver });
+        this.out.push(Use { span: span, target: target, decl: decl, receiver: receiver,
+                            inferred: TypeRef::invalid() });
     }
 
     /// A name written at `span` and spelled with `length` bytes, whose
@@ -294,7 +299,11 @@ type struct Uses {
     var_decl(mut &this, v: VarDeclNode*) -> void {
         if (v == null) { return; }
         const t: Target = if (v.is_global) { Locator::def_target(v.def) } else { Target::Local(v.sym_id) };
+        const before: i64 = this.out.length;
         this.add(v.name_span, t, true);
+        if (this.out.length > before && v.type_annotation == null) {
+            this.out[before].inferred = v.resolved_type;
+        }
         this.annotation(v.type_annotation);
         this.expr(v.initializer, null);
     }

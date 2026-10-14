@@ -52,6 +52,14 @@ checks.json:
       ]
     }
 
+An `inlayHints` check ("file", "expect": {"file@marker+N": ": T" | null})
+asks for the whole file's hints and names, per position, the label of the
+hint that must sit there, or null for none.
+
+A `signatureHelp` check ("at", "contains", "excludes", "active", "param",
+or "expect": null) reads the active signature's label, the active
+parameter's index, and that parameter's label as its offsets cut it.
+
 A rename check compares the set of edits' starts with the markers', and
 every edit must replace exactly `old`'s width with `new_name`.  A refusal
 check passes only on an error reply whose message holds `refused`.
@@ -471,6 +479,30 @@ def run_check(srv, fx, chk, c):
     if method in ("prepareRename", "rename"):
         run_rename_check(srv, fx, chk, c, name)
         return
+    if method == "signatureHelp":
+        run_signature_check(srv, fx, chk, c, name)
+        return
+    if method == "inlayHints":
+        uri = fx.uri(chk["file"])
+        resp = srv.request("textDocument/inlayHint",
+                           {"textDocument": {"uri": uri},
+                            "range": {"start": {"line": 0, "character": 0},
+                                      "end": {"line": 100000, "character": 0}}})
+        if resp is None or "error" in resp:
+            c.ok(False, name, "no result: %r" % (resp,))
+            return
+        hints = {}
+        for h in resp.get("result") or []:
+            p = h["position"]
+            hints[(p["line"], p["character"])] = h["label"]
+        bad = []
+        for ref, want in chk["expect"].items():
+            _, pos = fx.at(ref)
+            got = hints.get((pos["line"], pos["character"]))
+            if got != want:
+                bad.append("%s: want %r, got %r" % (ref, want, got))
+        c.ok(not bad, name, "; ".join(bad))
+        return
 
     rel, pos = fx.at(chk["at"])
     params = {"textDocument": {"uri": fx.uri(rel)}, "position": pos}
@@ -573,6 +605,42 @@ def run_rename_check(srv, fx, chk, c, name):
         want.append(position_key(fx.uri(mrel), mpos))
     c.ok(sorted(got) == sorted(want) and not bad, name,
          "want %r, got %r; edits not replacing %r: %r" % (sorted(want), sorted(got), chk["old"], bad))
+
+
+def run_signature_check(srv, fx, chk, c, name):
+    rel, pos = fx.at(chk["at"])
+    resp = srv.request("textDocument/signatureHelp",
+                       {"textDocument": {"uri": fx.uri(rel)}, "position": pos})
+    if resp is None:
+        c.ok(False, name, "no response (server %s)" % ("alive" if srv.alive() else "dead"))
+        return
+    if "error" in resp:
+        c.ok(False, name, "error %r" % resp["error"])
+        return
+    result = resp.get("result")
+    if chk.get("expect", "") is None:
+        c.ok(result is None, name, "got %r" % result)
+        return
+    sigs = (result or {}).get("signatures") or []
+    if not sigs:
+        c.ok(False, name, "no signature: %r" % result)
+        return
+    sig = sigs[result.get("activeSignature", 0)]
+    label = sig.get("label", "")
+    active = result.get("activeParameter", 0)
+    bad = [s for s in chk.get("contains", []) if s not in label]
+    bad += ["has %r" % s for s in chk.get("excludes", []) if s in label]
+    if active != chk["active"]:
+        bad.append("active parameter %r, want %r" % (active, chk["active"]))
+    if "param" in chk:
+        params = sig.get("parameters") or []
+        got = None
+        if 0 <= active < len(params):
+            lo, hi = params[active]["label"]
+            got = label[lo:hi]
+        if got != chk["param"]:
+            bad.append("active parameter's label %r, want %r" % (got, chk["param"]))
+    c.ok(not bad, name, "label %r: %s" % (label, "; ".join(bad)))
 
 
 def initialize(srv, root, c, label):

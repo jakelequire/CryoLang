@@ -138,10 +138,7 @@ type struct Completer {
     /// Complete at byte `end` of `line`, the cursor's line in the buffer;
     /// `pos` is where the analysis has the cursor's scope.
     complete(mut &this, line: str::Str, end: u64, pos: docs::CompilerPos) -> void {
-        this.pos = pos;
-        if (this.ctx != null && this.module.is_valid() && pos.line != 0) {
-            this.scope = this.ctx.resolver.scope_at(this.module, pos.line, pos.col);
-        }
+        this.place_cursor(pos);
         const b: u8* = line.as_ptr();
         mut p: u64 = end;
         while (p > 0 && Completer::is_ident(b[p - 1])) { p = p - 1; }
@@ -164,6 +161,14 @@ type struct Completer {
         }
         this.bare();
         this.keywords();
+    }
+
+    /// Take the cursor's scope from where the analysis has it, `pos`.
+    place_cursor(mut &this, pos: docs::CompilerPos) -> void {
+        this.pos = pos;
+        if (this.ctx != null && this.module.is_valid() && pos.line != 0) {
+            this.scope = this.ctx.resolver.scope_at(this.module, pos.line, pos.col);
+        }
     }
 
     // -- What was written --
@@ -224,34 +229,7 @@ type struct Completer {
 
     /// Members of the receiver written before the `.` at byte `dot`.
     member(mut &this, line: str::Str, dot: u64) -> void {
-        if (this.ctx == null || !this.scope.is_valid()) { return; }
-        mut steps: Step[] = [];
-        const b: u8* = line.as_ptr();
-        mut q: u64 = dot;
-        loop {
-            const ops_end: u64 = q;
-            while (q > 0 && (b[q - 1] == ')' as u8 || b[q - 1] == ']' as u8)) {
-                const at: i64 = Completer::opening(line, q - 1);
-                if (at < 0) { return; }
-                q = at as u64;
-            }
-            mut s: u64 = q;
-            while (s > 0 && Completer::is_ident(b[s - 1])) { s = s - 1; }
-            if (s == q) { return; }
-            steps.push(Step { name: line.sub_bytes(s, q), ops: line.sub_bytes(q, ops_end) });
-            q = s;
-            if (q > 0 && b[q - 1] == '.' as u8) {
-                q = q - 1;
-                continue;
-            }
-            // A receiver whose head is a path (`T::make().`) is not read.
-            if (q >= 2 && b[q - 1] == ':' as u8 && b[q - 2] == ':' as u8) { return; }
-            break;
-        }
-        mut ty: TypeRef = this.head_type(&steps[steps.length - 1]);
-        for (mut i: i64 = steps.length - 2; i >= 0 && ty.is_valid(); i--) {
-            ty = this.step_type(ty, &steps[i]);
-        }
+        const ty: TypeRef = this.receiver_before(line, dot);
         if (!ty.is_valid()) { return; }
         const d: DefId = this.type_def(ty);
         if (!d.is_valid()) { return; }
@@ -259,6 +237,40 @@ type struct Completer {
         for (mut i: i64 = 0; i < all.length; i++) {
             if (Members::is_instance(&all[i])) { this.member_item(&all[i]); }
         }
+    }
+
+    /// The type of the receiver written before the `.` at byte `dot`, or
+    /// invalid when it is not read.
+    receiver_before(&this, line: str::Str, dot: u64) -> TypeRef {
+        if (this.ctx == null || !this.scope.is_valid()) { return TypeRef::invalid(); }
+        mut steps: Step[] = [];
+        const b: u8* = line.as_ptr();
+        mut q: u64 = dot;
+        loop {
+            const ops_end: u64 = q;
+            while (q > 0 && (b[q - 1] == ')' as u8 || b[q - 1] == ']' as u8)) {
+                const at: i64 = Completer::opening(line, q - 1);
+                if (at < 0) { return TypeRef::invalid(); }
+                q = at as u64;
+            }
+            mut s: u64 = q;
+            while (s > 0 && Completer::is_ident(b[s - 1])) { s = s - 1; }
+            if (s == q) { return TypeRef::invalid(); }
+            steps.push(Step { name: line.sub_bytes(s, q), ops: line.sub_bytes(q, ops_end) });
+            q = s;
+            if (q > 0 && b[q - 1] == '.' as u8) {
+                q = q - 1;
+                continue;
+            }
+            // A receiver whose head is a path (`T::make().`) is not read.
+            if (q >= 2 && b[q - 1] == ':' as u8 && b[q - 2] == ':' as u8) { return TypeRef::invalid(); }
+            break;
+        }
+        mut ty: TypeRef = this.head_type(&steps[steps.length - 1]);
+        for (mut i: i64 = steps.length - 2; i >= 0 && ty.is_valid(); i--) {
+            ty = this.step_type(ty, &steps[i]);
+        }
+        return ty;
     }
 
     /// The byte of the bracket opening the one closing at byte `close`, or
@@ -351,6 +363,12 @@ type struct Completer {
         if (ops.length > 0 && ops[0] == '(' as u8) {
             return this.apply_ops(this.method_return(ty, this.intern(s.name)), &ops, 1);
         }
+        return this.apply_ops(this.field_type(ty, this.intern(s.name)), &ops, 0);
+    }
+
+    /// The type of field `leaf` of type `ty`, through its base classes, or
+    /// invalid when it has none.
+    field_type(&this, ty: TypeRef, leaf: SymbolStr) -> TypeRef {
         mut types_: TypeUtils = TypeUtils { arena: this.ctx.type_arena, intern: this.ctx.intern_table,
                                             ctx: this.ctx, checker: null };
         mut mr: MemberResolver = MemberResolver::null();
@@ -358,27 +376,35 @@ type struct Completer {
         mr.intern = this.ctx.intern_table;
         mr.ctx = this.ctx;
         mr.types = &types_;
-        const fa: FieldAnswer = mr.field_of(ty, this.intern(s.name));
-        return this.apply_ops(fa.ty, &ops, 0);
+        const fa: FieldAnswer = mr.field_of(ty, leaf);
+        return fa.ty;
     }
 
     /// The return type the methods named `leaf` of type `ty` declare, through
     /// its base classes; invalid when none or when they disagree.
     method_return(&this, ty: TypeRef, leaf: SymbolStr) -> TypeRef {
+        const entries: OverloadId[] = this.method_entries(ty, leaf);
+        if (entries.length == 0) { return TypeRef::invalid(); }
+        return this.shared_return(&entries);
+    }
+
+    /// The methods named `leaf` of type `ty`, from the first of it and its
+    /// base classes that declares any.
+    method_entries(&this, ty: TypeRef, leaf: SymbolStr) -> OverloadId[] {
         mut types_: TypeUtils = TypeUtils { arena: this.ctx.type_arena, intern: this.ctx.intern_table,
                                             ctx: this.ctx, checker: null };
         mut owner: TypeRef = types_.method_owner_ref(this.carrier(ty));
         for (mut depth: i64 = 0; depth < 16 && owner.is_valid(); depth++) {
             const entries: OverloadId[] = this.ctx.decl_index.lookup_family_entries(
                 FamilyOwner::Type(owner), leaf);
-            if (entries.length > 0) { return this.shared_return(&entries); }
+            if (entries.length > 0) { return entries; }
             const t: type_base::Type* = this.ctx.type_arena.lookup(owner);
-            if (t == null || t.kind != types::TypeKind::Class) { return TypeRef::invalid(); }
+            if (t == null || t.kind != types::TypeKind::Class) { return []; }
             const cls: ClassType* = t as ClassType*;
-            if (!cls.has_base) { return TypeRef::invalid(); }
+            if (!cls.has_base) { return []; }
             owner = cls.base_class;
         }
-        return TypeRef::invalid();
+        return [];
     }
 
     shared_return(&this, entries: &OverloadId[]) -> TypeRef {
@@ -427,12 +453,7 @@ type struct Completer {
 
     /// What can follow the path written in bytes `start`..`end` of `line`.
     path(mut &this, line: str::Str, start: u64, end: u64) -> void {
-        if (this.ctx == null || !this.scope.is_valid()) { return; }
-        const segs: str::Str[] = Completer::segments(line.sub_bytes(start, end));
-        mut place: Place = this.head_place(segs[0]);
-        for (mut i: i64 = 1; i < segs.length; i++) {
-            place = this.next_place(&place, segs[i]);
-        }
+        const place: Place = this.place_of_path(line.sub_bytes(start, end));
         match (place) {
             Place::Module(m) => {
                 const syms: SymbolID[] = Members::exports_of(this.ctx, m);
@@ -447,6 +468,17 @@ type struct Completer {
             }
             Place::Nothing => { }
         }
+    }
+
+    /// What the path `written` (`A::B`) names in the cursor's scope.
+    place_of_path(&this, written: str::Str) -> Place {
+        if (this.ctx == null || !this.scope.is_valid()) { return Place::Nothing; }
+        const segs: str::Str[] = Completer::segments(written);
+        mut place: Place = this.head_place(segs[0]);
+        for (mut i: i64 = 1; i < segs.length; i++) {
+            place = this.next_place(&place, segs[i]);
+        }
+        return place;
     }
 
     /// What a path's first segment names in the cursor's scope: the type

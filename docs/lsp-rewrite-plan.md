@@ -477,6 +477,24 @@ steps.
   The scope check is conservative: a qualified use (`B::helper()`) is
   checked against the bare names its scope sees, which a rename cannot
   disturb.
+- Signature help (`handlers/signature_help.cryo`, on `(` and `,`): read like
+  completion, from the line as typed and the scope the snapshot has at the
+  cursor, not from the snapshot's `CalleePin` - a call being typed is on a
+  line the snapshot does not have, and that is when the editor asks. The
+  innermost unclosed `(` before the cursor (string and character literals
+  skipped), the callee before it through completion's readers (a receiver's
+  type and `method_entries`, a path's `Place`, or `lookup_value`), every
+  overload offered, the receiver left out of a method's parameters, the
+  active parameter counted by commas at the call's depth. A call whose `(`
+  is on an earlier line is not read.
+- Inlay hints (`handlers/inlay_hints.cryo`): the uses index carries, on a
+  `const` or `mut` declared with no type written, the type the compiler
+  gave it, shown after the name; none on a line edited since the analysis,
+  and none for a type whose definition the compiler minted (a lambda's
+  closure struct, `NameOrigin::Generated`). Parameter names at call sites
+  are not shown.
+- C13 is not done: the qualified-name suggestion needs new diagnostic text,
+  which waits for a decision on its wording.
 
 ### Step 10. Module caching: the design
 

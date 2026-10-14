@@ -14,7 +14,6 @@
 namespace lsp::handlers::rename;
 
 import std::core::option;
-import std::core::mem;
 import std::collections::str;
 import std::collections::string;
 import std::collections::string::{ String };
@@ -32,17 +31,16 @@ import compiler::ast::declaration::{ MethodNode };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::lex::{ TokenType };
 import compiler::module_graph::{ ModuleOrigin, ModulePath };
-import compiler::resolver::res::{ DefId, DefKind, FamilyOwner };
+import compiler::resolver::res::{ DefId, DefKind };
 import compiler::resolver::scope::{ ScopeID };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::sema::member_resolver::{ MemberResolver };
-import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::type_base;
-import compiler::types::user_defined::{ ClassType, EnumType };
+import compiler::types::user_defined::{ EnumType };
 import utils::keyword::{ Keyword };
 
+import lsp::handlers::completion::{ Completer };
 import lsp::handlers::identity::{ Asked, Target };
 import lsp::handlers::uses::{ Use, Uses };
 import lsp::server::docs;
@@ -338,30 +336,12 @@ type struct Renaming {
     member_collision(&this, owner: DefId, name: SymbolStr) -> SourceSpan {
         const ty: TypeRef = this.ctx.decl_index.type_of_def(owner);
         if (!ty.is_valid()) { return SourceSpan::none(); }
-        mut types_: TypeUtils = TypeUtils { arena: this.ctx.type_arena, intern: this.ctx.intern_table,
-                                            ctx: this.ctx, checker: null };
-        mut mr: MemberResolver = MemberResolver::null();
-        mr.arena = this.ctx.type_arena;
-        mr.intern = this.ctx.intern_table;
-        mr.ctx = this.ctx;
-        mr.types = &types_;
         const at: SourceSpan = this.sites[0].span;
-        if (mr.field_of(ty, name).ty.is_valid()) { return at; }
-        mut cur: TypeRef = types_.method_owner_ref(ty);
-        for (mut depth: i64 = 0; depth < 16 && cur.is_valid(); depth++) {
-            if (this.ctx.decl_index.lookup_family_entries(FamilyOwner::Type(cur), name).length > 0) {
-                return at;
-            }
-            const t: type_base::Type* = this.ctx.type_arena.lookup(cur);
-            if (t == null) { break; }
-            if (t.kind == types::TypeKind::Enum) {
-                if ((t as EnumType*).variant_index(name) >= 0) { return at; }
-                break;
-            }
-            if (t.kind != types::TypeKind::Class) { break; }
-            const cls: ClassType* = t as ClassType*;
-            if (!cls.has_base) { break; }
-            cur = cls.base_class;
+        const c: Completer = Completer::new(this.ctx, -1);
+        if (c.field_type(ty, name).is_valid() || c.method_entries(ty, name).length > 0) { return at; }
+        const t: type_base::Type* = this.ctx.type_arena.lookup(ty);
+        if (t != null && t.kind == types::TypeKind::Enum && (t as EnumType*).variant_index(name) >= 0) {
+            return at;
         }
         return SourceSpan::none();
     }
