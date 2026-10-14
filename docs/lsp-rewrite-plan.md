@@ -175,7 +175,7 @@ changes what a program compiles to or what a diagnostic says.
 | C7. The uses index | none | In the server, built from stamps (ruling 326). |
 | C8. A qualified annotation's span covers its whole path | **[behaviour]** | ruling 328: diagnostic underlines move; negative tests whose columns move are re-annotated. |
 | C9. A mark on parser-synthesized nodes (f-string runtime calls), or `NameOrigin::Generated` | [neutral] | Replaces two spelling checks in semantic tokens. Built as `ASTNode.generated` (step 7). |
-| C10. A yield hook between modules in the stage drivers, null in the CLI | [neutral] | ruling 329. The server swaps the published arena around the callback, as it already does between analyses. |
+| C10. A yield hook between modules in the stage drivers, null in the CLI | [neutral] | ruling 329. The server swaps the published arena around the callback, as it already does between analyses. Built as `BuildOptions.yield_hook` (step 8). |
 | C11. Module caching | design only in the first release | ruling 329. The stages run stage-major over all modules and mutate shared tables, and monomorphization writes specializations into the tree. The standard library is about 1 s of the compiler project's 40 s; the rest needs per-module reuse. |
 | C12. Parsing that continues in `CompileMode::Lsp` | **[behaviour]**, after the first release | ruling 330. |
 | C13. The import suggestion for an already-imported module is not machine-applicable and suggests the qualified name | **[behaviour]** | ruling 332 (`sema/diagnostics.cryo:357-380`). |
@@ -424,11 +424,31 @@ steps.
   `fmt_append_display`, and listed a captured local's use twice (the closure
   struct's copy of the lambda body).
 
-### Step 8. Long analyses do not freeze the editor
+### Step 8. Long analyses do not freeze the editor (landed)
 
-- C10, and `$/cancelRequest` for queued requests. Measured: a hover sent
-  during a save's analysis of the compiler project answers from the
-  snapshot.
+- C10 is `BuildOptions.yield_hook` / `yield_client`, null for the command
+  line, handed down by `CompilerInstance`. It is called before each file
+  the module loader lexes for namespaces or discovers, before each module
+  of the frontend, and in `load_module`, which every later stage enters a
+  module through.
+- The server's hook (`Server::serve_waiting`) handles every message
+  already waiting on stdin: allocations go to the heap, a request is
+  answered from the current snapshot (`Projects::analysing` stops it
+  starting another analysis), an edit or save updates the buffers or owes
+  the next analysis, and the building analysis's arena is published again
+  before the compiler resumes. An analysis adopts, for each buffer, the
+  text it read, not the buffer as the analysis ends.
+- `$/cancelRequest` for the request an analysis runs for (the only one
+  that can wait) makes its answer the cancellation error (-32800).
+- Measured on the compiler project (a 30 s analysis after a save): 27
+  hovers sent a second apart during it were each answered from the
+  snapshot, the longest wait 0.88 s. Before the discovery and namespace
+  scan had yield points the first 8.3 s answered nothing.
+- Checks (a `during analysis` run on `two_modules`): a request sent
+  behind the one that starts an analysis is answered first, from the
+  snapshot; the first is answered after; a cancelled one answers
+  -32800. The order is fixed by what is in the pipe when the analysis
+  starts, not by time.
 
 ### Step 9. Rename, signature help, inlay hints
 

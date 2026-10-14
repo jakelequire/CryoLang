@@ -27,9 +27,13 @@ import std::io::stdio;
 import std::io::error;
 import std::io::traits;
 import std::json::value;
+import std::json::serializer;
+import std::alloc::arena;
 import std::env;
 import std::ffi::libc;
 import std::sys::syscall;
+
+import compiler::codegen::ast_arena;
 
 import lsp::protocol::framing;
 import lsp::protocol::jsonrpc;
@@ -59,6 +63,13 @@ type struct Server {
     writer:     stdio::Stdout;
     /// Id allocator for server->client requests (e.g. semanticTokens/refresh).
     outbound:   text_sync::OutboundRequests;
+    /// The id of the request being answered outside the compiler's hook -
+    /// the one an analysis may be running for - and whether the client
+    /// cancelled it while the analysis ran.
+    serving:    value::JsonValue;
+    cancelled:  boolean;
+    /// Inside the compiler's hook (`between_modules`).
+    in_yield:   boolean;
 
     static new() -> Server {
         return Server {
@@ -69,7 +80,61 @@ type struct Server {
             reader:     stdio::stdin(),
             writer:     stdio::stdout(),
             outbound:   text_sync::OutboundRequests::new(),
+            serving:    value::JsonValue::Null,
+            cancelled:  false,
+            in_yield:   false,
         };
+    }
+
+    /// The compiler's hook between two modules of an analysis; `client` is
+    /// the server.
+    static between_modules(client: void*) -> void {
+        const s: Server* = client as Server*;
+        s.serve_waiting();
+    }
+
+    /// Handle every message already waiting on stdin, while an analysis is
+    /// suspended between modules: a request is answered from the last
+    /// analysis (`Projects::analysing` keeps it from starting another), an
+    /// edit or a save updates the buffers or owes the next analysis, and a
+    /// cancellation marks the request the analysis runs for.  Allocations
+    /// go to the heap meanwhile, and the analysis's arena is published
+    /// again before the compiler resumes.
+    serve_waiting(mut &this) -> void {
+        if (this.in_yield || !Server::poll_stdin_readable(0 as i32)) { return; }
+        const building: arena::Arena* = this.projects.building();
+        this.in_yield = true;
+        ast_arena::cryo_alloc_arena_set_active(false);
+        mut more: boolean = true;
+        while (more && Server::poll_stdin_readable(0 as i32)) {
+            match (framing::FrameCodec::read_message(&this.reader)) {
+                Result::Ok(maybe) => {
+                    match (maybe) {
+                        Option::Some(body) => {
+                            mut owned: String = body;
+                            this.handle(owned.as_str());
+                            mem::drop(owned);
+                        }
+                        // End of input: the main loop reads it again and stops.
+                        Option::None => { more = false; }
+                    }
+                }
+                Result::Err(_) => { more = false; }
+            }
+        }
+        if (building != null) { ast_arena::cryo_ast_arena_set_current(building); }
+        ast_arena::cryo_alloc_arena_set_active(true);
+        this.in_yield = false;
+    }
+
+    /// Whether two request ids are the same id.
+    static same_id(a: &value::JsonValue, b: &value::JsonValue) -> boolean {
+        mut sa: String = serializer::stringify(a);
+        mut sb: String = serializer::stringify(b);
+        const same: boolean = sa.as_str().equals(&sb.as_str());
+        mem::drop(sa);
+        mem::drop(sb);
+        return same;
     }
 
     /// Run until either `exit` or stdin closes.  Returns the process
@@ -82,6 +147,8 @@ type struct Server {
     /// request that needs the analysis runs it at once
     /// (`Projects::analysis_for`).
     run(mut &this) -> i32 {
+        this.projects.yield_hook = Server::between_modules;
+        this.projects.yield_client = &this as void*;
         loop {
             // Debounce window: only enter it while an analysis or its
             // publishing is owed, so an otherwise-idle server still blocks
@@ -135,7 +202,20 @@ type struct Server {
     handle(mut &this, body: str::Str) -> void {
         mut msg: jsonrpc::IncomingMessage = jsonrpc::JsonRpcCodec::parse_incoming(body);
         match (&msg) {
-            jsonrpc::IncomingMessage::Request(_)      => { this.dispatch_request(&msg); }
+            jsonrpc::IncomingMessage::Request(req) => {
+                // Inside the hook a request is answered at once; outside it,
+                // it may wait on an analysis, during which it can be
+                // cancelled.
+                if (this.in_yield) {
+                    this.dispatch_request(&msg);
+                } else {
+                    this.serving = jsonrpc::JsonRpcCodec::clone_value(&req.id);
+                    this.cancelled = false;
+                    this.dispatch_request(&msg);
+                    this.serving = value::JsonValue::Null;
+                    this.cancelled = false;
+                }
+            }
             jsonrpc::IncomingMessage::Notification(_) => { this.dispatch_notification(&msg); }
             jsonrpc::IncomingMessage::Response        => { }
             jsonrpc::IncomingMessage::Invalid(inv)    => {
@@ -326,15 +406,13 @@ type struct Server {
                     return;
                 }
 
-                // `$/cancelRequest`: the client asks us to abandon an
-                // in-flight request.  This server is synchronous - a
-                // request is fully computed before the next frame is even
-                // read - so by the time we could observe a cancellation
-                // the request has already been answered.  Per the spec a
-                // server that can't cancel simply responds normally, so
-                // this is a deliberate no-op (kept explicit rather than
-                // falling into the catch-all below for documentation).
+                // `$/cancelRequest`: read while an analysis runs for the
+                // request being answered, it turns that request's answer
+                // into a cancellation.  Any other request was answered
+                // before the cancellation could be read.
                 if (method.equals(&str::Str::from("$/cancelRequest"))) {
+                    const id: value::JsonValue* = notif.params.get(str::Str::from("id")).unwrap_or(null);
+                    if (id != null && Server::same_id(id, &this.serving)) { this.cancelled = true; }
                     return;
                 }
 
@@ -348,6 +426,12 @@ type struct Server {
     // Replies
 
     reply_ok(mut &this, id: &value::JsonValue, result: value::JsonValue) -> void {
+        if (this.cancelled && !this.in_yield && Server::same_id(id, &this.serving)) {
+            mut dropped: value::JsonValue = result;
+            mem::drop(dropped);
+            this.reply_error(id, jsonrpc::REQUEST_CANCELLED, str::Str::from("request cancelled"));
+            return;
+        }
         const id_clone: value::JsonValue = jsonrpc::JsonRpcCodec::clone_value(id);
         const resp: jsonrpc::ResponseMessage =
             jsonrpc::ResponseMessage::success(id_clone, result);

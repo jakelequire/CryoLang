@@ -124,6 +124,7 @@ class Server:
         self._next_id = 0
         self._lock = threading.Condition()
         self._responses = {}
+        self._arrived = []
         self._notifications = []
         self._eof = False
         self._stderr = []
@@ -165,6 +166,7 @@ class Server:
                     return
                 if "id" in msg and "method" not in msg:
                     self._responses[msg["id"]] = msg
+                    self._arrived.append(msg["id"])
                 elif "method" in msg:
                     self._notifications.append(msg)
                 self._lock.notify_all()
@@ -186,11 +188,24 @@ class Server:
 
     def request(self, method, params, timeout=COLD_TIMEOUT):
         """Send a request; return its response, or None if none arrives."""
+        rid = self.send_request(method, params)
+        if rid is None:
+            return None
+        return self.wait_response(rid, timeout)
+
+    def send_request(self, method, params):
+        """Send a request without waiting; its id, or None if it could not
+        be sent."""
         self._next_id += 1
         rid = self._next_id
         if not self.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}):
             return None
-        return self.wait_response(rid, timeout)
+        return rid
+
+    def order(self):
+        """The ids of the responses received so far, in arrival order."""
+        with self._lock:
+            return list(self._arrived)
 
     def wait_response(self, rid, timeout):
         deadline = time.time() + timeout
@@ -713,6 +728,54 @@ def run_protocol_errors(server_path, c):
         report_stderr(srv, c, failed_before)
 
 
+def run_during_analysis(server_path, c):
+    """Requests sent behind one that starts an analysis.  The analysis
+    stops between modules to read them, so a request behind it is answered
+    from the last analysis before the first one's answer, and a cancellation
+    of the first one is honoured.  The order is decided by what is already
+    in the pipe when the analysis starts, not by time."""
+    label = "during analysis"
+    print(label)
+    fx = Fixture(os.path.join(FIXTURES, "two_modules"))
+    srv = Server(server_path, fx.root)
+    try:
+        initialize(srv, fx.root, c, label)
+        for rel in fx.spec.get("open", []):
+            srv.notify("textDocument/didOpen", {"textDocument": {
+                "uri": fx.uri(rel), "languageId": "cryo", "version": 1, "text": fx.text[rel]}})
+        rel, pos = fx.at("src/main.cryo@local_x_use")
+        at = {"textDocument": {"uri": fx.uri(rel)}, "position": pos}
+        save = {"textDocument": {"uri": fx.uri(rel)}}
+        first = srv.request("textDocument/definition", at)
+        c.ok(first is not None and location_matches(first.get("result"), fx, "src/main.cryo@local_x"),
+             "%s: the first analysis answers" % label)
+
+        srv.notify("textDocument/didSave", save)
+        a = srv.send_request("textDocument/definition", at)
+        b = srv.send_request("textDocument/hover", at)
+        ra = srv.wait_response(a, COLD_TIMEOUT)
+        rb = srv.wait_response(b, COLD_TIMEOUT)
+        order = srv.order()
+        c.ok(ra is not None and rb is not None and order.index(b) < order.index(a),
+             "%s: a request behind one that starts an analysis is answered first" % label,
+             "order %r, a=%r b=%r" % (order, a, b))
+        c.ok(rb is not None and "local_x" in (hover_text(rb.get("result")) or ""),
+             "%s: it is answered from the last analysis" % label, "got %r" % (rb,))
+        c.ok(ra is not None and location_matches(ra.get("result"), fx, "src/main.cryo@local_x"),
+             "%s: the request that started the analysis is answered after it" % label)
+
+        srv.notify("textDocument/didSave", save)
+        a = srv.send_request("textDocument/definition", at)
+        srv.notify("$/cancelRequest", {"id": a})
+        ra = srv.wait_response(a, COLD_TIMEOUT)
+        code = ((ra or {}).get("error") or {}).get("code")
+        c.ok(code == -32800, "%s: a request cancelled while its analysis runs answers as cancelled" % label,
+             "got %r" % (ra,))
+        shutdown(srv, c, label)
+    finally:
+        srv.stop()
+
+
 def main():
     args = sys.argv[1:]
     only = None
@@ -733,6 +796,7 @@ def main():
     if only is None:
         run_protocol(server_path, c)
         run_protocol_errors(server_path, c)
+        run_during_analysis(server_path, c)
     for name in sorted(os.listdir(FIXTURES)):
         root = os.path.join(FIXTURES, name)
         if only is not None and name != only:

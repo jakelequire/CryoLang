@@ -48,7 +48,7 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::module_graph::{ ModulePath, RecordedEdge };
-import compiler::compilation_context::{ SourceOverride };
+import compiler::compilation_context::{ BuildOptions, SourceOverride };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 import std::core::mem;
@@ -104,6 +104,9 @@ public:
     /// which would leave the modules they reach undiscovered.  Empty
     /// outside the language server.
     lsp_overrides: SourceOverride[];
+    /// The compilation's options (`set_options`); null when discovery runs
+    /// outside a compilation.
+    options: BuildOptions*;
 
     /// Vendor library resolution.  `import vendor::Name` consults this
     /// registry (loaded once via `set_vendor_context`) and resolves to the
@@ -144,6 +147,7 @@ public:
             ns_map:        HashMap::<string, string>::new(),
             vendor_modules: HashMap::<string, string>::new(),
             lsp_overrides:    [],
+            options:          null,
             vendor_registry:  VendorRegistry::empty(),
             vendor_triple:    "",
             used_vendor_keys: [],
@@ -188,6 +192,12 @@ public:
     /// `discover_project`.
     set_lsp_overrides(mut &this, overlays: SourceOverride[]) -> void {
         this.lsp_overrides = overlays;
+    }
+
+    /// The compilation's options, whose hook discovery calls before each
+    /// file it reads.  Called once, before `discover_project`.
+    set_options(mut &this, options: BuildOptions*) -> void {
+        this.options = options;
     }
 
     /// Load the source text for `file_path`: an open buffer's when one
@@ -352,6 +362,7 @@ public:
     /// Lex a single .cryo file, extract the namespace declaration,
     /// and register it in ns_map.
     scan_file_namespace(mut &this, intern: InternTable*, file_path: string) -> void {
+        if (this.options != null) { this.options.yield_between_modules(); }
         // An open buffer needs no file on disk: `source_for` hands the lexer
         // the buffer (the file may be new and unsaved).
         const is_override: boolean =
@@ -611,6 +622,9 @@ public:
         if (this.is_loading(norm_path)) {
             return true;
         }
+
+        // A file not read yet: nothing is half done between two files.
+        if (this.options != null) { this.options.yield_between_modules(); }
 
         // Verify the file exists, unless an open buffer holds its content.
         const is_override: boolean =

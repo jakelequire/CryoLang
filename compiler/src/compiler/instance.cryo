@@ -348,10 +348,16 @@ type struct ProjectBuild {
 
 type struct CompilerInstance {
     config: CompilerConfig;
+    /// Handed to every compilation's `BuildOptions` (see there); null
+    /// unless the language server sets it.
+    yield_hook:   (void*) -> void;
+    yield_client: void*;
 
     static new(config: CompilerConfig) -> CompilerInstance {
         return CompilerInstance {
-            config: config,
+            config:       config,
+            yield_hook:   null,
+            yield_client: null,
         };
     }
 
@@ -702,6 +708,9 @@ type struct CompilerInstance {
     /// Also restores the saved resolver scope if available.
     static load_module(ctx: CompilationContext*, intern: InternTable*,
                        ast_buf: void*, mod_idx: u32, mod_count: u32) -> void {
+        // Between two modules nothing of the last one is half done, so the
+        // language server may run here.
+        ctx.options.yield_between_modules();
         // Set source file, namespace, resolver module
         ctx.switch_to_module(mod_idx as i64);
         // Load AST from local buffer
@@ -1025,6 +1034,8 @@ type struct CompilerInstance {
             config.target_triple);
         options.static_link = this.config.release_static;
         options.source_overrides = overlays;
+        options.yield_hook = this.yield_hook;
+        options.yield_client = this.yield_client;
 
         // An independent clone, so the local `config` stays usable below.
         const _box_config: Box<ProjectConfig> = Box::<ProjectConfig>::new(config.clone());
@@ -1163,6 +1174,7 @@ type struct CompilerInstance {
             overlays.push(ctx.options.source_overrides[oi]);
         }
         loader.set_lsp_overrides(overlays);
+        loader.set_options(&ctx.options);
 
         const discovery_ok: boolean = loader.discover_project(
             ctx.intern_table, ctx.module_graph, ctx.diagnostics,
@@ -2708,6 +2720,7 @@ type struct CompilerInstance {
 
         for (mut i: u32 = 0; i < n; i++) {
             const mod_idx: u32 = order[i];
+            ctx.options.yield_between_modules();
             ctx.switch_to_module(mod_idx as i64);
             if (!pipeline.run_all(ctx)) {
                 fmt::eprintln(f"error: frontend pipeline failed for module {i}");

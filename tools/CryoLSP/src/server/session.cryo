@@ -12,7 +12,10 @@
 ///! files is saved, and when a `.cryo` file changes on disk.  Edits between
 ///! saves change only the buffers; positions are carried between a buffer
 ///! and the text its analysis read by `docs::Document`.  Every analysis
-///! reads every open buffer in place of its file.
+///! reads every open buffer in place of its file.  While one runs, the
+///! compiler calls the server's hook before each file and module, and
+///! requests waiting then are answered from the last analysis
+///! (`Projects::analysing`).
 ///!
 ///! Each analysis lives in its own arena, so releasing one reclaims the
 ///! whole context at once.  The compiler routes frees and reallocations by
@@ -53,10 +56,24 @@ import std::ffi::libc;
 type struct Analysis {
     ctx:   compilation_context::CompilationContext*;
     arena: arena::Arena*;
+    /// The overlays' paths and texts, in pairs, then the focus and the
+    /// standard library's paths.
     keep:  Array<String>;
+    /// How many path/text pairs open `keep`.
+    overlays: u64;
 
     static none() -> Analysis {
-        return Analysis { ctx: null, arena: null, keep: Array::<String>::new() };
+        return Analysis { ctx: null, arena: null, keep: Array::<String>::new(), overlays: 0 };
+    }
+
+    /// The text this analysis read for the open buffer of file `path`.
+    text_read(&this, path: str::Str) -> Option<str::Str> {
+        for (mut i: u64 = 0; i < this.overlays; i++) {
+            const p: String* = this.keep.get_ref(2 * i).unwrap_or(null);
+            const t: String* = this.keep.get_ref(2 * i + 1).unwrap_or(null);
+            if (p != null && t != null && p.as_str().equals(&path)) { return Option::Some(t.as_str()); }
+        }
+        return Option::None;
     }
 
     /// Make this analysis's arena the published one before its context is
@@ -108,6 +125,9 @@ type struct Project {
     /// target view of a configuration with several.
     focus:   String;
     instance: instance::CompilerInstance;
+    /// The arena of the analysis running now, null between analyses: the
+    /// one to publish again when the compiler resumes after its hook.
+    building: arena::Arena*;
 
     static new(key: str::Str, config: str::Str) -> Project {
         return Project {
@@ -120,12 +140,14 @@ type struct Project {
             last:        Analysis::none(),
             focus:       String::new(),
             instance:    instance::CompilerInstance::new(instance::CompilerConfig::default()),
+            building:    null,
         };
     }
 
     /// Run one analysis of the project, with every open buffer in place of
-    /// its file.  The analysis is returned unadopted.
-    analyse(mut &this, docs: &docs::Docs) -> Analysis {
+    /// its file.  The analysis is returned unadopted.  The compiler calls
+    /// `hook` with `client` between modules.
+    analyse(mut &this, docs: &docs::Docs, hook: (void*) -> void, client: void*) -> Analysis {
         mut a: Analysis = Analysis::none();
 
         // Everything the context points into is made here, with arena
@@ -141,6 +163,7 @@ type struct Project {
             overlay_texts.push(text_c.as_ptr() as string);
             a.keep.push(path_c);
             a.keep.push(text_c);
+            a.overlays = a.overlays + 1;
         }
         this.instance.config.stdlib_path_override = if (stdlib_c.length() > 0) {
             stdlib_c.as_ptr() as string
@@ -154,6 +177,9 @@ type struct Project {
         const box_arena: Box<arena::Arena> = Box::<arena::Arena>::new(
             arena::Arena::with_chunk_size(8 * 1024 * 1024));
         a.arena = box_arena.leak();
+        this.building = a.arena;
+        this.instance.yield_hook = hook;
+        this.instance.yield_client = client;
         ast_arena::cryo_ast_arena_set_current(a.arena);
         ast_arena::cryo_alloc_arena_set_active(true);
         mut overlays: SourceOverride[] = [];
@@ -166,6 +192,7 @@ type struct Project {
         const build: instance::ProjectBuild = this.instance.compile_for_lsp_project(
             this.config.as_ptr() as string, focus_s, overlays);
         ast_arena::cryo_alloc_arena_set_active(false);
+        this.building = null;
         a.ctx = build.ctx;
         mem::drop(overlay_paths);
         mem::drop(overlay_texts);
@@ -175,17 +202,22 @@ type struct Project {
     /// Analyse the project as its files and buffers are now.  The analysis
     /// is kept for publishing; it becomes the one that answers when its
     /// whole tree parsed, and then each open buffer's text is what it read.
-    refresh(mut &this, docs: mut &docs::Docs) -> void {
-        mut a: Analysis = this.analyse(docs);
+    refresh(mut &this, docs: mut &docs::Docs, hook: (void*) -> void, client: void*) -> void {
+        // Owed no longer: a save while this one runs owes the next.
         this.owed = false;
+        mut a: Analysis = this.analyse(docs, hook, client);
         this.analysed = true;
         this.unpublished = true;
         this.last.release();
         if (a.ctx != null && a.ctx.frontend_complete) {
             this.current.release();
             mem::swap(&this.current, &a);
+            // A buffer edited while the analysis ran has moved on from the
+            // text it read: the snapshot is the text read.
             for (d in docs.by_uri.values_ref()) {
-                if (this.owns(d.path.as_str())) { d.adopt_snapshot(); }
+                if (!this.owns(d.path.as_str())) { continue; }
+                const read: Option<str::Str> = this.current.text_read(d.path.as_str());
+                if (read.is_some()) { d.adopt_text(read.unwrap_or(str::Str::from(""))); }
             }
         } else {
             mem::swap(&this.last, &a);
@@ -221,9 +253,33 @@ implement trait Drop for Project {
 
 type struct Projects {
     by_key: HashMap<String, Project>;
+    /// Called by the compiler between modules of an analysis, with
+    /// `yield_client`: the server answering what it can meanwhile.
+    yield_hook:   (void*) -> void;
+    yield_client: void*;
+    /// An analysis is running: a request answered from inside it is
+    /// answered from the last analysis, never by starting another.
+    analysing: boolean;
 
     static new() -> Projects {
-        return Projects { by_key: HashMap::<String, Project>::new() };
+        return Projects { by_key: HashMap::<String, Project>::new(), yield_hook: null,
+                          yield_client: null, analysing: false };
+    }
+
+    /// Run project `p`'s owed analysis, unless one is already running.
+    refresh(mut &this, p: Project*, docs: mut &docs::Docs) -> void {
+        if (!p.owed || this.analysing) { return; }
+        this.analysing = true;
+        p.refresh(docs, this.yield_hook, this.yield_client);
+        this.analysing = false;
+    }
+
+    /// The arena of the analysis running now, or null.
+    building(&this) -> arena::Arena* {
+        for (p in this.by_key.values_ref()) {
+            if (p.building != null) { return p.building; }
+        }
+        return null;
     }
 
     /// The key of the project `path` belongs to: the nearest cryoconfig at
@@ -285,7 +341,7 @@ type struct Projects {
         const d: docs::Document* = doc.unwrap_or(null);
         const p: Project* = this.project_for(d.path.as_str());
         if (p == null) { return null; }
-        if (p.owed) { p.refresh(docs); }
+        this.refresh(p, docs);
         p.current.publish_arena();
         return p.current.ctx;
     }
@@ -293,9 +349,15 @@ type struct Projects {
     /// Run every owed analysis, and return each project whose diagnostics
     /// are unpublished (`Project::published_analysis` says from which).
     take_unpublished(mut &this, docs: mut &docs::Docs) -> Array<Project*> {
+        // Collected first: an analysis answers requests between modules,
+        // and a document opened meanwhile can add a project to the map.
+        mut all: Array<Project*> = Array::<Project*>::new();
+        for (p in this.by_key.values_ref()) { all.push(p); }
         mut out: Array<Project*> = Array::<Project*>::new();
-        for (p in this.by_key.values_ref()) {
-            if (p.owed) { p.refresh(docs); }
+        for (mut i: u64 = 0; i < all.length(); i++) {
+            const p: Project* = all.get(i).unwrap_or(null);
+            if (p == null) { continue; }
+            this.refresh(p, docs);
             if (p.unpublished) {
                 p.unpublished = false;
                 out.push(p);
