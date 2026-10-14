@@ -247,6 +247,8 @@ Internal, called by pin: pin-linux-impl, pin-windows-impl, _pin-windows-do.
 
 Side effects beyond the named output
   stdlib          deletes stdlib/.bin/<triple>/ and a flat stdlib/.bin/libcryo.a.
+  release-windows rebuilds stdlib/.bin/x86_64-pc-windows-gnu/ (the zip's
+                  stdlib archive, cross-built).
   lsp             overwrites bin/cryolsp; fails while an editor holds it open.
   install-lsp     uninstalls the VS Code extension it replaces.
   pin             rewrites both pins; copies LLVM-C.dll and libclang.dll to bin/.

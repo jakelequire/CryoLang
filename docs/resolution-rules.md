@@ -230,6 +230,23 @@ yet is recorded with the change that builds it, not here.
      generator declare `namespace vendor::<Name>` or changing how a vendor
      import is written)
 
+319. **The Windows release zip ships a Windows stdlib archive, built on the
+     Linux release runner** for the windows triple.  The release's wine
+     smoke test links with llvm-mingw's `clang.exe`, which the job already
+     fetches and selfhost-check's wine arm already uses.  (Jake)
+
+320. **selfhost-check's wine arm is made to run** by putting `LLVM-C.dll`,
+     and whatever else it needs, where wine finds it, and is then measured
+     again on CI; ruling 270 had the arm measured on CI before its fate is
+     decided.  (Jake)
+
+321. **On CI, the object comparison runs against the previous commit and
+     reports its differences without failing the job.**  (Jake)
+
+322. **A compiler flag that stops a build at object files,** so cross-check
+     can run on a Linux host, goes on the roadmap; it is not built now.
+     (Jake)
+
 ### 2026-10-12
 
 247. **The compiler's `![allow]`s that named the deleted lint, and the

@@ -22,11 +22,14 @@
 #            lists), a C toolchain with static libstdc++ (gcc), make, tar.
 #            (Alpine/musl: llvm20-static llvm20-dev clang lld musl-dev
 #             libstdc++-dev + the static C++ runtime; gcompat to run the pin.)
-#   windows: x86_64-w64-mingw32-gcc + the fetched .toolchains (run
-#            scripts/fetch-windows-llvm.sh first), zip.
+#   windows: x86_64-w64-mingw32-gcc + binutils (the archiver for the windows
+#            stdlib archive), the fetched .toolchains (run
+#            scripts/fetch-windows-llvm.sh first; llvm-mingw's clang.exe
+#            drives the smoke link under wine), wine, zip.
 #
 # WINDOWS is NOT static (no official static windows-gnu libLLVM): the zip
-# ships cryo.exe next to LLVM-C.dll (its runtime dep).
+# ships cryo.exe next to LLVM-C.dll (its runtime dep).  Its stdlib archive is
+# cross-built here for the windows triple.
 
 set -euo pipefail
 
@@ -56,8 +59,15 @@ echo "[build-release] cryo v${VER} -> ${PLATFORM}-x86_64"
 mkdir -p "$DIST"
 
 stage_common() {
-    # $1 = staging dir.  Copies the stdlib (source + archive), LICENSE, VERSION.
-    local stage="$1"
+    # $1 = staging dir, $2 = the stdlib archive built for the archive's target.
+    # Copies the stdlib (source + archive), LICENSE, VERSION.
+    #
+    # The archive is a hard requirement on BOTH platforms: a host build - which
+    # is what the shipped compiler does on the machine it is installed on -
+    # puts `<stdlib>/.bin/libcryo.a` on every link line, so a tree without it
+    # cannot link a program.
+    local stage="$1" archive="$2"
+    [ -f "$archive" ] || { echo "error: stdlib archive missing at ${archive} - user programs would not link" >&2; exit 1; }
     mkdir -p "${stage}/stdlib"
     # stdlib SOURCE only; the archive is placed explicitly below.
     ( cd "${ROOT}/stdlib" && tar --exclude='.bin' -cf - . ) | ( cd "${stage}/stdlib" && tar -xf - )
@@ -67,19 +77,34 @@ stage_common() {
     # construction.  Staging flat rather than shipping the per-triple tree is
     # what keeps the release working when the installing host's toolchain probe
     # names its triple differently from the build host's.
-    local _triple _archive
-    _triple="$("${ROOT}/bin/cryo" version --triple 2>/dev/null || true)"
-    _archive="${ROOT}/stdlib/.bin/libcryo.a"
-    if [ -n "$_triple" ] && [ -f "${ROOT}/stdlib/.bin/${_triple}/libcryo.a" ]; then
-        _archive="${ROOT}/stdlib/.bin/${_triple}/libcryo.a"
-    fi
-    if [ -f "$_archive" ]; then
-        mkdir -p "${stage}/stdlib/.bin"
-        cp "$_archive" "${stage}/stdlib/.bin/libcryo.a"
-    fi
+    mkdir -p "${stage}/stdlib/.bin"
+    cp "$archive" "${stage}/stdlib/.bin/libcryo.a"
     [ -f "${ROOT}/LICENSE" ] && cp "${ROOT}/LICENSE" "${stage}/LICENSE" || true
     stage_third_party_licenses "$stage"
     echo "$VER" > "${stage}/VERSION"
+}
+
+host_stdlib_archive() {
+    # The archive `make stdlib` built for this host, at `.bin/<triple>/`.
+    local triple
+    triple="$("${ROOT}/bin/cryo" version --triple 2>/dev/null || true)"
+    [ -n "$triple" ] || { echo "error: bin/cryo printed no triple" >&2; exit 1; }
+    echo "${ROOT}/stdlib/.bin/${triple}/libcryo.a"
+}
+
+build_windows_stdlib() {
+    # Cross-builds the stdlib archive for the windows triple, with the
+    # compiler cryo.exe was built from, into `.bin/<triple>/` beside the host's.
+    # `--target` compiles with the windows side of every config gate, so the
+    # archive holds the same modules and symbols as one built on Windows.  The
+    # mingw archiver writes the symbol index in the format the objects are in.
+    local triple="x86_64-pc-windows-gnu"
+    local cryo="${ROOT}/compiler/build/cryo"
+    echo "[build-release] building the stdlib archive for ${triple}" >&2
+    rm -rf "${ROOT}/stdlib/.bin/${triple}"
+    ( cd "${ROOT}/stdlib" && CRYO_AR=x86_64-w64-mingw32-ar "$cryo" build --target="$triple" \
+        --no-incremental --build-dir=".bin/${triple}" >/dev/null )
+    echo "${ROOT}/stdlib/.bin/${triple}/libcryo.a"
 }
 
 stage_runtime_tiers() {
@@ -121,7 +146,8 @@ stage_runtime_tiers() {
 }
 
 smoke_stage() {
-    # $1 = staging dir, $2 = exe name, $3 = 1 when the artifact is foreign here.
+    # $1 = staging dir, $2 = exe name, $3 = 1 when the artifact is foreign here,
+    # $4 = the link driver a foreign compiler runs, when it needs one.
     #
     # Nothing executed a release artifact before it was published: the tag
     # workflow builds the archive, uploads it and attaches it, and the verify
@@ -131,11 +157,19 @@ smoke_stage() {
     #
     # This compiles a hello-world with the staged tree and runs it, before the
     # archive is packaged, so a tree that cannot compile is never wrapped up.
-    local stage="$1" exe="$2" foreign="$3"
-    local runner=()
+    local stage="$1" exe="$2" foreign="$3" driver="${4:-}"
+    local runner=() smoke_env=()
     if [ "$foreign" = 1 ]; then
         if command -v wine >/dev/null 2>&1; then
             runner=(wine)
+            # The staged cryo.exe builds as a Windows host, whose link driver
+            # is `cc`, and wine has none.  A Windows program has to drive the
+            # link: the compiler launches it through `cmd /c`, so its path is
+            # spelled as wine's Z: drive sees the host filesystem.
+            if [ -n "$driver" ]; then
+                [ -f "$driver" ] || { echo "error: link driver ${driver} missing - run scripts/fetch-windows-llvm.sh first" >&2; exit 1; }
+                smoke_env=("CRYO_CC=Z:$(printf '%s' "$driver" | tr '/' '\\')")
+            fi
         elif [ "$ALLOW_UNSMOKED" = 1 ]; then
             echo "[build-release] NOT SMOKED: ${exe} cannot run on this host and"                  "no wine is installed (--allow-unsmoked).  The archive is being"                  "packaged without ever having compiled anything." >&2
             return 0
@@ -146,7 +180,7 @@ smoke_stage() {
             exit 1
         fi
     fi
-    bash "${ROOT}/scripts/release-smoke.sh" "$stage" "$exe" "${runner[@]}"
+    env "${smoke_env[@]}" bash "${ROOT}/scripts/release-smoke.sh" "$stage" "$exe" "${runner[@]}"
 }
 
 host_is() {   # $1 = linux|windows
@@ -205,7 +239,9 @@ build_linux() {
         fi
     fi
 
-    stage_common "$stage"
+    local archive
+    archive="$(host_stdlib_archive)"
+    stage_common "$stage" "$archive"
     stage_runtime_tiers "$stage" "x86_64-unknown-linux-gnu"
 
     if host_is linux; then smoke_stage "$stage" "cryo" 0; else smoke_stage "$stage" "cryo" 1; fi
@@ -236,16 +272,16 @@ build_windows() {
     # libclang.dll: runtime dep of the C-import engine (Compiler::Bindgen).
     cp "$clang_dll" "${stage}/bin/libclang.dll"
 
-    # Windows uses per-build stdlib .o (use_stdlib_archive:false for the
-    # windows-gnu triple), so ship stdlib SOURCE only - no libcryo.a needed.
-    mkdir -p "${stage}/stdlib"
-    ( cd "${ROOT}/stdlib" && tar --exclude='.bin' -cf - . ) | ( cd "${stage}/stdlib" && tar -xf - )
-    [ -f "${ROOT}/LICENSE" ] && cp "${ROOT}/LICENSE" "${stage}/LICENSE" || true
-    stage_third_party_licenses "$stage"
+    local stdlib_archive
+    stdlib_archive="$(build_windows_stdlib)"
+    stage_common "$stage" "$stdlib_archive"
     stage_runtime_tiers "$stage" "x86_64-pc-windows-gnu"
-    echo "$VER" > "${stage}/VERSION"
 
-    if host_is windows; then smoke_stage "$stage" "cryo.exe" 0; else smoke_stage "$stage" "cryo.exe" 1; fi
+    if host_is windows; then
+        smoke_stage "$stage" "cryo.exe" 0
+    else
+        smoke_stage "$stage" "cryo.exe" 1 "${ROOT}/.toolchains/llvm-mingw/bin/clang.exe"
+    fi
 
     local archive="${DIST}/cryo-${VER}-windows-x86_64.zip"
     rm -f "$archive"

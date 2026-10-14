@@ -69,14 +69,6 @@ itself cannot be checked object-for-object against `main`; compare against
 `naming-impl`'s tip instead.
 
 **Known red or unexercised.**
-- `scripts/release-smoke.sh` fails for the Windows archive, and with it
-  CI's windows smoke job, which runs it through `build-release.sh windows`.
-  The staged `cryo.exe` (under wine on the runner) builds the hello-world
-  as a Windows host build: it puts the flat `stdlib/.bin/libcryo.a` on the
-  link line, which the staging excludes on the belief that Windows links
-  per-build stdlib objects (true only of a Linux-to-Windows cross build),
-  and it calls `cc`, which wine does not have.  wine itself runs the 64-bit
-  `cryo.exe` there: it compiled the program's 54 modules first.
 - `selfhost-check`'s wine path, measured on the CI runner (ruling 270) by
   the dispatch-only `selfhost-wine-arm` job: it stops at its first command.
   `wine bin/cryo.exe version --triple` exits 53 and prints nothing.  The

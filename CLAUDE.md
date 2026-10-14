@@ -126,13 +126,13 @@ not done. The remaining limits are here so nobody rediscovers them:
   A Windows PE carries a link timestamp - two clean builds of one unchanged
   source differ - so the gate refuses on this host rather than reporting a
   matrix of failures that blame incremental compilation for the linker.
-- **Nothing runs the release ARCHIVE.** The verify job exercises a different
-  binary by a different link (`make cryo` is not `--release-static`), and
-  `windows-smoke` asks the artifact for `--version` - whether it starts,
-  not whether it works. `scripts/release-smoke.sh` now compiles and runs a
-  hello-world with the staged tree before it is packaged, and it FAILS
-  today: the shipped Windows archive has no `stdlib/.bin/libcryo.a` and
-  the compiler puts one on the link line.
+- **The release smoke runs the STAGED tree, and the Windows one under
+  wine.** `scripts/release-smoke.sh` compiles and runs a hello-world with
+  the staged tree before it is zipped, not with the archive itself; the
+  verify job exercises a different binary by a different link (`make cryo`
+  is not `--release-static`).  The Windows tree is smoked under wine with
+  llvm-mingw's `clang.exe` driving the link, not on a Windows host with the
+  mingw `gcc` an installed `cryo.exe` finds there.
 - **A tag off `main` gets `release.yml`'s verify job and nothing else** - CI
   fires only on `main` or a manual dispatch. That job is the last gate before
   a published artifact; keep it in step with what the archive ships.
