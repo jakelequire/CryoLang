@@ -298,6 +298,7 @@ public:
     /// symbol), so the declaration and its uses agree by construction.
     stamp_function_def(&this, fn_node: FunctionDeclNode*, sym_id: SymbolID) -> void {
         fn_node.def = this.resolver.get_symbol(sym_id).def;
+        this.ctx.decl_index.keep_declaration(fn_node.def, fn_node as ASTNode*);
     }
 
     /// The definition a type declaration's binding was registered as, for
@@ -600,6 +601,27 @@ public:
                 // Other nodes don't introduce module-level names, skip
             }
         }
+        this.keep_declared(node);
+    }
+
+    /// Keep a type, alias, global or intrinsic declaration as the one its
+    /// definition was registered for (`DeclarationIndex::declaration_of`),
+    /// once the declaring walk has stamped it.  Functions are kept where
+    /// they are stamped, extern ones included (`stamp_function_def`).
+    keep_declared(&this, node: ASTNode*) -> void {
+        const d: DefId = match (node.kind) {
+            NodeKind::StructDeclaration    => { (node as StructDeclNode*).def }
+            NodeKind::UnionDeclaration     => { (node as UnionDeclNode*).def }
+            NodeKind::EnumDeclaration      => { (node as EnumDeclNode*).def }
+            NodeKind::ClassDeclaration     => { (node as ClassDeclNode*).def }
+            NodeKind::TraitDeclaration     => { (node as TraitDeclNode*).def }
+            NodeKind::TypeAliasDeclaration => { (node as TypeAliasDeclNode*).def }
+            NodeKind::VariableDeclaration  => { (node as VarDeclNode*).def }
+            NodeKind::IntrinsicDeclaration => { (node as IntrinsicDeclNode*).def }
+            NodeKind::IntrinsicConstDeclaration => { (node as IntrinsicConstDeclNode*).def }
+            _ => { DefId::invalid() }
+        };
+        this.ctx.decl_index.keep_declaration(d, node);
     }
 
 
@@ -845,12 +867,24 @@ public:
         return false;
     }
 
+    /// What a function's scope spans: its first token to the end of its
+    /// body, so `Resolver::scope_at` finds the scope at a position in the
+    /// parameters or the body.  A method's own span covers only its name.
+    static function_extent(node: FunctionDeclNode*) -> SourceSpan {
+        if (node.body == null) { return node.span; }
+        const b: SourceSpan = node.body.span;
+        if (b.start_line == 0) { return node.span; }
+        return SourceSpan::new(node.span.file, node.span.start_line, node.span.start_col,
+            b.end_line, b.end_col);
+    }
+
     // -- Declarations --
     override visit(node: FunctionDeclNode*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] visit(FunctionDecl) name='%s' generics=%d",
             this.resolver.intern_table.resolve(node.name), node.generic_params.length);
         // Enter function scope
-        this.resolver.enter_scope(ScopeKind::Function, this.resolver.intern_table.resolve(node.name), node.span);
+        this.resolver.enter_scope(ScopeKind::Function, this.resolver.intern_table.resolve(node.name),
+            NameResolver::function_extent(node));
 
         // Declare generic params
         this.declare_generics(node.generic_params);
@@ -1495,17 +1529,14 @@ public:
     /// the function's outer edge.
     visible_local_names(&this) -> string[] {
         mut out: string[] = [];
-        mut scope_id: ScopeID = this.resolver.current_scope;
-        while (scope_id.is_valid()) {
-            const scope: Scope* = this.resolver.get_scope(scope_id);
-            if (scope.kind.is_module_level()) { break; }
-            for (mut i: i64 = 0; i < scope.binding_count(); i++) {
-                const s: Symbol = this.resolver.get_symbol(scope.binding_at(i));
-                if (s.kind == SymbolKind::Variable || s.kind == SymbolKind::Parameter) {
-                    out.push(this.resolver.intern_table.resolve(s.name));
-                }
+        const seen: SymbolID[] = this.resolver.visible_bindings(this.resolver.current_scope);
+        for (mut i: i64 = 0; i < seen.length; i++) {
+            const s: Symbol = this.resolver.get_symbol(seen[i]);
+            if (s.kind != SymbolKind::Variable && s.kind != SymbolKind::Parameter) { continue; }
+            if (!s.scope_id.is_valid() || this.resolver.get_scope(s.scope_id).kind.is_module_level()) {
+                continue;
             }
-            scope_id = scope.parent_id;
+            out.push(this.resolver.intern_table.resolve(s.name));
         }
         return out;
     }
@@ -1514,20 +1545,16 @@ public:
     /// own declarations and its imports that name a function, by leaf.
     visible_function_names(&this) -> string[] {
         mut out: string[] = [];
-        mut scope_id: ScopeID = this.resolver.current_scope;
-        while (scope_id.is_valid()) {
-            const scope: Scope* = this.resolver.get_scope(scope_id);
-            for (mut i: i64 = 0; i < scope.binding_count(); i++) {
-                mut s: Symbol = this.resolver.get_symbol(scope.binding_at(i));
-                if (s.kind == SymbolKind::Import) {
-                    const decl: SymbolID = this.resolver.import_target(&s, Namespace::Value);
-                    if (decl.is_valid()) { s = this.resolver.get_symbol(decl); }
-                }
-                if (s.kind == SymbolKind::Function || s.kind == SymbolKind::Intrinsic) {
-                    out.push(this.resolver.intern_table.resolve(s.name));
-                }
+        const seen: SymbolID[] = this.resolver.visible_bindings(this.resolver.current_scope);
+        for (mut i: i64 = 0; i < seen.length; i++) {
+            mut s: Symbol = this.resolver.get_symbol(seen[i]);
+            if (s.kind == SymbolKind::Import) {
+                const decl: SymbolID = this.resolver.import_target(&s, Namespace::Value);
+                if (decl.is_valid()) { s = this.resolver.get_symbol(decl); }
             }
-            scope_id = scope.parent_id;
+            if (s.kind == SymbolKind::Function || s.kind == SymbolKind::Intrinsic) {
+                out.push(this.resolver.intern_table.resolve(s.name));
+            }
         }
         return out;
     }
@@ -1678,16 +1705,12 @@ public:
             "isize", "usize",
             "f32", "f64",
         ];
-        mut scope_id: ScopeID = this.resolver.current_scope;
-        while (scope_id.is_valid()) {
-            const scope: Scope* = this.resolver.get_scope(scope_id);
-            for (mut i: i64 = 0; i < scope.binding_count(); i++) {
-                const s: Symbol = this.resolver.get_symbol(scope.binding_at(i));
-                if (this.symbol_names_type(&s)) {
-                    out.push(this.resolver.intern_table.resolve(s.name));
-                }
+        const seen: SymbolID[] = this.resolver.visible_bindings(this.resolver.current_scope);
+        for (mut i: i64 = 0; i < seen.length; i++) {
+            const s: Symbol = this.resolver.get_symbol(seen[i]);
+            if (this.symbol_names_type(&s)) {
+                out.push(this.resolver.intern_table.resolve(s.name));
             }
-            scope_id = scope.parent_id;
         }
         for (mut p: i64 = 0; p < this.resolver.prelude_modules.length; p++) {
             const ex: SymbolID[] = this.resolver.get_exports(this.resolver.prelude_modules[p]);
@@ -3761,6 +3784,7 @@ public:
             this.refuse_unknown_module_import(node, module_path);
             return;
         }
+        if (imported_idx >= 0) { node.resolved_module = imported; }
 
         const exports: SymbolID[] = this.resolver.get_exports(imported);
 

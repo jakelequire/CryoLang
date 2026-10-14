@@ -1179,6 +1179,59 @@ type struct Resolver {
         return &this.scopes[id.id - 1];
     }
 
+    /// The innermost scope the name layer entered, in module `m`, around
+    /// the position (`line`, `col`): a function, block, arm or type body whose
+    /// written span holds it, or the module's own scope when none does.
+    /// Invalid for a module with no scope.  Where two scopes are siblings
+    /// holding the same position, the one entered first answers.
+    scope_at(&this, m: ModulePath, line: u32, col: u32) -> ScopeID {
+        const sid: u64 = this.find_module_scope(m);
+        if (sid == 0) { return ScopeID::invalid(); }
+        mut at: ScopeID = ScopeID { id: sid };
+        mut deeper: boolean = true;
+        while (deeper) {
+            deeper = false;
+            const scope: Scope* = this.get_scope(at);
+            for (mut i: i64 = 0; i < scope.child_scope_ids.length; i++) {
+                const child: ScopeID = scope.child_scope_ids[i];
+                const child_scope: Scope* = this.get_scope(child);
+                if (Resolver::span_holds(&child_scope.span, line, col)) {
+                    at = child;
+                    deeper = true;
+                    break;
+                }
+            }
+        }
+        return at;
+    }
+
+    /// Whether `span` holds the position (`line`, `col`), ends inclusive.
+    static span_holds(span: &SourceSpan, line: u32, col: u32) -> boolean {
+        if (span.start_line == 0) { return false; }
+        if (line < span.start_line || line > span.end_line) { return false; }
+        if (line == span.start_line && col < span.start_col) { return false; }
+        if (line == span.end_line && col > span.end_col) { return false; }
+        return true;
+    }
+
+    /// Every binding visible from scope `s` along its rib chain, innermost
+    /// scope first and each scope's in the order it bound them, out to the
+    /// global scope: locals, parameters, the module's own declarations and
+    /// its imports.  A name bound in two scopes appears once per scope; the
+    /// first is the one a bare use binds.
+    visible_bindings(&this, s: ScopeID) -> SymbolID[] {
+        mut out: SymbolID[] = [];
+        mut scope_id: ScopeID = s;
+        while (scope_id.is_valid()) {
+            const scope: Scope* = this.get_scope(scope_id);
+            for (mut i: i64 = 0; i < scope.binding_count(); i++) {
+                out.push(scope.binding_at(i));
+            }
+            scope_id = scope.parent_id;
+        }
+        return out;
+    }
+
     /// Total number of symbols declared.
     symbol_count(&this) -> i64 {
         return this.symbols.length;

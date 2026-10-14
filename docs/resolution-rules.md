@@ -77,7 +77,7 @@ or reads the store by identity.  Locked so far:
 
 | store | file | its door(s) | readers outside |
 |---|---|---|---|
-| the scope ribs (`Scope`, `ScopeEntry`) | `compiler/src/compiler/resolver/resolver.cryo` | `scope-value`, `scope-type` | by identity: `Scope::binding_count`, `binding_at`; a module's own binding by leaf: `Resolver::module_binding` |
+| the scope ribs (`Scope`, `ScopeEntry`) | `compiler/src/compiler/resolver/resolver.cryo` | `scope-value`, `scope-type` | by identity: `Scope::binding_count`, `binding_at`, `Resolver::visible_bindings` (a scope's rib chain), `Resolver::scope_at` (the scope around a position in a module); a module's own binding by leaf: `Resolver::module_binding` |
 | an enum type's variants (`EnumVariantInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-variant` (`EnumType::variant_index`) | text for a message: `EnumVariantInfo::display_name` |
 | the declaration index's families and module globals (`overload_index`, `func_type_refs`, `refused_methods`, `overload_func_family`, `overload_func_mangled`, `module_global_leaves`, `module_global_extern_syms`, `extern_symbol_first`, `family_slot`) | `compiler/src/compiler/decl_index.cryo` | `member-function`, `member-global` | none |
 | the interner (`strings`, `lookup`) | `compiler/src/compiler/resolver/intern_table.cryo` | `intern` | `resolve`, `shown` |
@@ -132,6 +132,17 @@ caller of a door, or an identity lookup.
 Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
+
+### 2026-10-14
+
+333. **One project's analysis covers every target of its cryoconfig, and
+     the target whose view it takes is chosen by the file opened or saved
+     last.**  This stays until a real project needs a separate view per
+     target.  (Jake)
+
+334. **The editor's identity lookups come before its definition and hover
+     rebuild,** and their work starts by measuring that the name layer's
+     stamps are filled in when the editor runs the compiler.  (Jake)
 
 ### 2026-10-13
 

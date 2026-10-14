@@ -265,19 +265,50 @@ steps.
   unchanged lines; a line inserted above, unsaved, moves the answer with it;
   a line edited since the analysis answers nothing.
 
-### Step 3. The compiler's identity doors
+### Step 3. The compiler's identity lookups (landed, C6 moved to step 6)
 
-- First instrument that every stamp the features read is populated in
-  `CompileMode::Lsp` at the fixture's markers, and how often a method call's
-  pin is not `Decl`.
-- C3, C4, C5, C6. Proven `--require-identical`.
+- Measured first (ruling 334) with a probe linking the compiler library and
+  walking the trees `compile_for_lsp_project` leaves, over the `two_modules`
+  fixture and the compiler project (247 modules). Outside specializations,
+  every identifier, `this`, path scope segment, path used as a value, path
+  call, method call, struct literal, `new`, pattern and impl target written
+  in the compiler project and the standard library it reaches carries its
+  stamp. What carries none:
+  - imports: 0 of 4,066 (no field; C4 below makes it 4,066 of 4,066);
+  - `.length` on a built-in array: 3,634 accesses, no member pin and no
+    declaration to point at - the answer is the array type's;
+  - a class constructor called by the class's name, `Parser(...)`: 13 calls
+    with the identifier stamped with the class and no call pin;
+  - a call through a field holding a function, `this.f(x)`: 2;
+  - about 79 type names inside specialized type declarations, which carry
+    `pre_resolved` instead.
+  Method calls: 24,625 pinned `Decl`, 608 carried by another slot
+  (`template_method`, `resolved_template`, `named_method`, a bound's trait).
+  With a type error in the project only the refused call loses its stamp.
+- **A position lookup must skip specializations.** A module's tree holds
+  its templates and also their monomorphized copies: 32,089 functions marked
+  `is_specialization` and 12,501 cloned nodes whose spans name another file,
+  every one carrying a template's spans. The innermost node at a position can
+  be a copy.
+- C3: `DefTable::span_of`; `DeclarationIndex::declaration_of`, the store the
+  methods' declarations already used, now kept for every type, function,
+  global and intrinsic the name layer declares (`method_decl_of` answers it
+  for a method only, as before).
+- C4: `ImportDeclNode.resolved_module`, written where the name layer
+  resolves the path.
+- C5: `Resolver::scope_at(module, line, col)` and
+  `Resolver::visible_bindings(scope)`; the did-you-mean pools are filters
+  over `visible_bindings`. A scope already kept its span and children.
+- C8 (from step 4): a qualified type name's span covers its whole path.
+  Negative tests pin lines, not columns, so none moved.
+- C6 lands with completion (step 6), its only reader.
 
 ### Step 4. Definition and hover from stamps
 
 - New definition and hover on the single path. Receivers by
   `is_receiver()` / `is_this_keyword`; match arms by `const_res` /
   `binding_sym`; generic parameters by `SymbolID` and
-  `GenericParamType.param_sym`; imports by C4. C8 lands here.
+  `GenericParamType.param_sym`; imports by C4.
 - Deletes `handlers/hover.cryo`, `handlers/definition.cryo`,
   `handlers/decl_finder.cryo`, the name-returning walks in `node_locator.cryo`
   (`find_method_owner`, `find_enclosing_method_owner`, `enclosing_owner_of`,
