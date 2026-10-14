@@ -237,18 +237,33 @@ steps.
   after shutdown, exit 0) and a `positions` fixture (tab-indented lines,
   text outside ASCII, a warning on a tab-indented line).
 
-### Step 2. One project, all overlays, on save, last-good snapshot
+### Step 2. One project, all overlays, on save, last-good snapshot (landed)
 
-- C1, C2. `Projects` replaces the per-document `SessionMap` and its LRU.
-  Analysis on open, save (advertised) and watched-file change. The
-  double-buffered snapshot. Diagnostics published per file with the
-  document's version.
-- Deletes the single-file fallback, `ensure_fresh`, `needs_recompile`,
-  `flush_pending`.
-- Checks: an unsaved edit in one file reaches another file's diagnostics
-  after a save; a syntax error leaves definitions on unchanged lines
-  answering from the last good snapshot. Memory with three compiler files
-  open is at most two analyses.
+- Compiler: `BuildOptions.source_overrides` is a list, and
+  `SourceOverride::content_for` is the one lookup the loader and the Lexing
+  pass both ask. `compile_for_lsp_project(config, focus, overlays)` takes an
+  empty config to mean the focus file is its own project (ruling 331),
+  through `single_file_config`, which `compile_file` and `check` now share.
+  `compile_for_lsp_content`, `build_frontend_pipeline` and
+  `TokenStream.source_content` are gone. `CompilationContext.frontend_complete`
+  says every module parsed, so the name layer ran over the whole tree. The
+  three process tallies are reset at the start of each compilation (C2: read,
+  not measured: nothing reset them).
+- Server: `session::Projects` (one per cryoconfig, or per lone file)
+  replaces the per-document `SessionMap` and its LRU. Every analysis reads
+  every open buffer. Analyses run on a project's first open, on save
+  (advertised) and on a watched `.cryo` change; edits only update `Docs`. An
+  analysis is adopted when `frontend_complete`; otherwise it publishes its
+  diagnostics and is released. Each open document keeps the text the current
+  analysis read, and positions are carried between it and the buffer by
+  shared leading and trailing lines; a line inside the edited region gets no
+  answer. Completion's placeholder analysis is a separate scratch analysis.
+- Measured with three compiler files open: before, 86.7 s and 5.57 GB (one
+  full analysis per document); after, 28.6 s and 1.86 GB (one analysis).
+- Checks: an edit to one open file reaches another file's diagnostics when
+  saved; a saved syntax error leaves the last analysis answering on
+  unchanged lines; a line inserted above, unsaved, moves the answer with it;
+  a line edited since the analysis answers nothing.
 
 ### Step 3. The compiler's identity doors
 

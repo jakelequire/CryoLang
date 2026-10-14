@@ -95,7 +95,7 @@ const CK_STRUCT:      i64 = 22;
 
 // Public entry point
 
-public function handle_completion(docs: &docs::Docs, sessions: mut &session::SessionMap,
+public function handle_completion(docs: mut &docs::Docs, projects: mut &session::Projects,
                                    params: &value::JsonValue) -> value::JsonValue {
     // 1. Extract textDocument.uri
     const td_opt: Option<value::JsonValue*> = params.get(str::Str::from("textDocument"));
@@ -202,22 +202,12 @@ public function handle_completion(docs: &docs::Docs, sessions: mut &session::Ses
     // the receiver/scope the resolver looks up keeps its coordinates.
     mut patched: String = CompletionEngine::build_completion_buffer(text, byte_off);
 
-    // 7. Compile that buffer into this URI's session.  We bypass
-    // `ensure_fresh` (which compiles the *clean* buffer) and drive
-    // `recompile` with the patched source directly.  This compile resets
-    // the shared AST arena, so we flag the session dirty immediately: the
-    // next hover / diagnostic request rebuilds from the clean editor buffer
-    // and never sees the placeholder.
-    const session: session::CompilerSession* = sessions.get_or_create(uri);
-    if (session == null) {
-        mem::drop(patched);
-        mem::drop(ident_buf);
-        return CompletionEngine::make_keyword_list();
-    }
-    session.recompile(uri, patched.as_str());
+    // 7. Analyse the project with that buffer in place of this document's.
+    // The analysis answers this completion only; the project's own
+    // analysis, which answers everything else, is untouched.
+    const ctx: compilation_context::CompilationContext* =
+        projects.analyse_buffer(docs, uri, patched.as_str());
     mem::drop(patched);
-    session.needs_recompile = true;
-    const ctx: compilation_context::CompilationContext* = session.context();
     if (ctx == null || ctx.intern_table == null) {
         mem::drop(ident_buf);
         return CompletionEngine::make_keyword_list();

@@ -61,7 +61,7 @@ import compiler::ast::declaration::{
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
-import compiler::compilation_context::{ CompilationContext, LangRef };
+import compiler::compilation_context::{ CompilationContext, LangRef, SourceOverride };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::module_graph::{ ModuleGraph };
@@ -303,37 +303,6 @@ type struct PassRegistry {
     // through imported namespaces is historically brittle at codegen time;
     // static methods resolve reliably.
 
-    /// Frontend-only pipeline for LSP: lex -> parse -> specialize -> analyze (no codegen).
-    static build_frontend_pipeline() -> PassRegistry {
-        mut reg: PassRegistry = PassRegistry::new();
-        reg.set_passes([
-            PassID::Lexing,
-            PassID::Parsing,
-            PassID::ConfigGating,
-            PassID::ASTValidation,
-            PassID::CHeaderImport,
-            PassID::AutoImport,
-            PassID::ImportResolution,
-            PassID::NameDeclaration,
-            PassID::NameResolution,
-            PassID::TypeDeclaration,
-            PassID::FunctionSignature,
-            PassID::TemplateRegistration,
-            PassID::DefaultExpansion,
-            PassID::TypeResolution,
-            PassID::StructFieldTypeSync,
-            PassID::DirectiveProcessing,
-            PassID::FunctionBodyTypeCheck,
-            PassID::Monomorphization,
-            PassID::GenericExpressionResolution,
-            PassID::GenericValidation,
-            PassID::MoveCheck,
-            PassID::DropInsertion,
-            PassID::TypeLowering,
-        ]);
-        return reg;
-    }
-
     /// Raw pipeline: no auto-imports or module resolution.
     static build_raw_pipeline() -> PassRegistry {
         mut reg: PassRegistry = PassRegistry::new();
@@ -487,46 +456,16 @@ type struct PassRegistry {
             cdebug("[Lexing] Tokenizing: %s\n", source_path);
         }
 
-        // LSP in-memory mode.  Two sources of in-memory content:
-        //
-        //   (a) Single-file LSP entry (`compile_for_lsp_content`)
-        //       pre-populates `ctx.artifacts.tokens.source_content` for the
-        //       one file it knows about.  Used by tooling that drives the
-        //       compiler against a single buffer with no project context.
-        //
-        //   (b) Multi-module LSP entry (`compile_for_lsp_project`)
-        //       sets `ctx.lsp_override_path` and `ctx.lsp_override_content`
-        //       so the orchestrator can keep iterating every module from
-        //       disk while the ONE module the user is editing reads from
-        //       the editor buffer instead.  This is the path that gives
-        //       the LSP cross-file type info: every sibling module is
-        //       parsed and analysed normally, only the active buffer is
-        //       overridden.
-        //
-        // In-memory content (LSP override / single-buffer entry) is fed to
-        // the lexer verbatim; otherwise the source is read from disk and
-        // leaked as a NUL-terminated `string` (via `into_raw`) so token
-        // lexemes pointing into it stay valid for the rest of compilation.
-        mut inmem_content: string = "";
-        mut overridden: boolean = false;
-        match (ctx.options.source_override) {
-            Option::Some(o) => {
-                if (o.path.length() > 0 && o.path.eq(source_path)) {
-                    inmem_content = o.content;
-                    overridden = true;
-                }
-            }
-            Option::None => { }
-        }
-        if (!overridden && ctx.artifacts.tokens.source_content != "") {
-            inmem_content = ctx.artifacts.tokens.source_content;
-        }
-        const inmem_mode: boolean =
-            (inmem_content != "" && inmem_content.length() > 0 as u64);
-
+        // A module the language server has open is lexed from its buffer,
+        // the same text module discovery read (`SourceOverride::content_for`
+        // answers both).  Otherwise the source is read from disk and leaked
+        // as a NUL-terminated `string` (via `into_raw`) so token lexemes
+        // pointing into it stay valid for the rest of compilation.
         mut source: string = "";
-        if (inmem_mode) {
-            source = inmem_content;
+        const overlay: Option<string> =
+            SourceOverride::content_for(&ctx.options.source_overrides, source_path);
+        if (overlay.is_some()) {
+            source = overlay.unwrap_or("");
         } else {
             if (!metadata::exists(Path::from(source_path))) {
                 ctx.emit_error(ErrorCode::E0800_FILE_NOT_FOUND,
@@ -633,7 +572,7 @@ type struct PassRegistry {
         }
 
         // Store results in artifacts
-        ctx.artifacts.tokens = TokenStream::new(final_tokens, source_path, "");
+        ctx.artifacts.tokens = TokenStream::new(final_tokens, source_path);
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
 

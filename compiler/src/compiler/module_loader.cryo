@@ -48,6 +48,7 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::module_graph::{ ModulePath, RecordedEdge };
+import compiler::compilation_context::{ SourceOverride };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 import std::core::mem;
@@ -97,16 +98,12 @@ private:
     vendor_modules: HashMap<string, string>;
 
 public:
-    /// LSP-mode editor-buffer override.  When `lsp_override_path` is
-    /// non-empty and matches the file the loader is about to read, the
-    /// loader feeds `lsp_override_content` to the lexer instead of
-    /// reading the file from disk.  This makes import discovery see
-    /// the imports the user is *currently typing*; the on-disk copy
-    /// may not have them yet, which would leave referenced stdlib
-    /// modules undiscovered and break name resolution downstream.
-    /// Both empty in non-LSP builds.
-    lsp_override_path:    string;
-    lsp_override_content: string;
+    /// The language server's open buffers.  A file one of them names is
+    /// read from the buffer instead of the disk, so import discovery sees
+    /// the imports being typed now; the copy on disk may not have them yet,
+    /// which would leave the modules they reach undiscovered.  Empty
+    /// outside the language server.
+    lsp_overrides: SourceOverride[];
 
     /// Vendor library resolution.  `import vendor::Name` consults this
     /// registry (loaded once via `set_vendor_context`) and resolves to the
@@ -146,8 +143,7 @@ public:
             scanned_ns:    HashMap::<string, string>::new(),
             ns_map:        HashMap::<string, string>::new(),
             vendor_modules: HashMap::<string, string>::new(),
-            lsp_override_path:    "",
-            lsp_override_content: "",
+            lsp_overrides:    [],
             vendor_registry:  VendorRegistry::empty(),
             vendor_triple:    "",
             used_vendor_keys: [],
@@ -188,24 +184,22 @@ public:
         return this.vendor_triple;
     }
 
-    /// Wire the LSP editor-buffer override.  Called once, before
-    /// `discover_project`, when running under `CompileMode::Lsp`.  No-op
-    /// when `path` is empty.
-    set_lsp_override(mut &this, path: string, content: string) -> void {
-        this.lsp_override_path    = path;
-        this.lsp_override_content = content;
+    /// Wire the language server's open buffers.  Called once, before
+    /// `discover_project`.
+    set_lsp_overrides(mut &this, overlays: SourceOverride[]) -> void {
+        this.lsp_overrides = overlays;
     }
 
-    /// Load the source text for `file_path`, substituting the LSP editor
-    /// buffer when the path matches the configured override.  Mirrors
-    /// the same gate the Lexing pass uses (see `pass_registry.cryo`).
-    /// On-disk reads are leaked as a NUL-terminated `string` (via
-    /// `into_raw`) so token lexemes pointing into it stay valid; an
-    /// unreadable file yields "" (the lexer then produces only EOF).
+    /// Load the source text for `file_path`: an open buffer's when one
+    /// names it (`SourceOverride::content_for`, which the Lexing pass asks
+    /// too), otherwise the file's.  On-disk reads are leaked as a
+    /// NUL-terminated `string` (via `into_raw`) so token lexemes pointing
+    /// into it stay valid; an unreadable file yields "" (the lexer then
+    /// produces only EOF).
     source_for(&this, file_path: string) -> string {
-        if (this.lsp_override_path.length() > 0
-                && this.lsp_override_path.eq(file_path)) {
-            return this.lsp_override_content;
+        match (SourceOverride::content_for(&this.lsp_overrides, file_path)) {
+            Option::Some(content) => { return content; }
+            Option::None          => { }
         }
         match (file::read_to_string(Path::from(file_path))) {
             Result::Ok(s)  => { return s.into_raw(); }
@@ -358,12 +352,10 @@ public:
     /// Lex a single .cryo file, extract the namespace declaration,
     /// and register it in ns_map.
     scan_file_namespace(mut &this, intern: InternTable*, file_path: string) -> void {
-        // Skip the on-disk existence check when the file is the LSP
-        // override target; `file_for` will hand the lexer the editor
-        // buffer regardless of what's on disk (file may be unsaved).
+        // An open buffer needs no file on disk: `source_for` hands the lexer
+        // the buffer (the file may be new and unsaved).
         const is_override: boolean =
-            (this.lsp_override_path.length() > 0
-                && this.lsp_override_path.eq(file_path));
+            SourceOverride::content_for(&this.lsp_overrides, file_path).is_some();
         if (!is_override && !metadata::exists(Path::from(file_path))) { return; }
 
         mut scan_sink: DiagnosticSink = DiagnosticSink::new();
@@ -620,11 +612,9 @@ public:
             return true;
         }
 
-        // Verify file exists.  Skip the check for the LSP override
-        // target; its content lives in the editor buffer, not on disk.
+        // Verify the file exists, unless an open buffer holds its content.
         const is_override: boolean =
-            (this.lsp_override_path.length() > 0
-                && this.lsp_override_path.eq(file_path));
+            SourceOverride::content_for(&this.lsp_overrides, file_path).is_some();
         if (!is_override && !metadata::exists(Path::from(file_path))) {
             const msg: string = fmt::format("module file not found: '%s'", file_path);
             sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, msg));

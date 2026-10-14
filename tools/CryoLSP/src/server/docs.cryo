@@ -1,9 +1,9 @@
 ///! Open-document store.
 ///!
-///! Maps `URI -> Document`.  A document holds the current editor
-///! buffer (text + version + LineIndex); whoever owns it is also
-///! responsible for keeping the per-doc CompilerSession in sync -
-///! the two structures are paired by URI in `Server`.
+///! Maps `URI -> Document`.  A document holds the current editor buffer
+///! (text + version + LineIndex) and the text its project's current
+///! analysis read, and `Docs` converts positions between the wire, the
+///! buffer and that analysis.
 ///!
 ///! Lookup returns a borrow (`Document*`) so handlers can read the
 ///! text and line index without cloning the whole buffer.  The borrow
@@ -39,6 +39,14 @@ type struct Document {
     version:    i32;
     text:       String;
     line_index: line_index::LineIndex;
+    /// The text the project's current analysis read for this file.  Answers
+    /// come from that analysis while the buffer moves on, so positions are
+    /// carried between the two texts by `snap_line_of` / `cur_line_of`.
+    /// Without one (`has_snap` false) the analysis read what the buffer
+    /// holds: the file was opened after it, unedited since.
+    snap_text:  String;
+    snap_index: line_index::LineIndex;
+    has_snap:   boolean;
 
     static new(uri: String, text: String, version: i32) -> Document {
         const idx: line_index::LineIndex = line_index::LineIndex::build(text.as_str());
@@ -49,11 +57,84 @@ type struct Document {
             version:    version,
             text:       text,
             line_index: idx,
+            snap_text:  String::new(),
+            snap_index: line_index::LineIndex::build(str::Str::from("")),
+            has_snap:   false,
         };
     }
 
     line_text(&this, line: u32) -> str::Str {
         return Columns::line_of(this.text.as_str(), &this.line_index, line);
+    }
+
+    snap_line_text(&this, line: u32) -> str::Str {
+        return Columns::line_of(this.snap_text.as_str(), &this.snap_index, line);
+    }
+
+    /// The buffer as it is now is what a new analysis read.
+    adopt_snapshot(mut &this) -> void {
+        mut old: String = String::from_str(this.text.as_str());
+        mem::swap(&old, &this.snap_text);
+        mem::drop(old);
+        mut old_index: line_index::LineIndex = line_index::LineIndex::build(this.snap_text.as_str());
+        mem::swap(&old_index, &this.snap_index);
+        mem::drop(old_index);
+        this.has_snap = true;
+    }
+
+    /// Lines the buffer and the analysed text share at the start, and at
+    /// the end.  Between them is the edited region, whose lines have no
+    /// counterpart.
+    shared_lines(&this) -> SharedLines {
+        const nc: u64 = this.line_index.line_count();
+        const ns: u64 = this.snap_index.line_count();
+        mut lim: u64 = nc;
+        if (ns < lim) { lim = ns; }
+        mut p: u64 = 0;
+        while (p < lim && this.line_text(p as u32).equals(&this.snap_line_text(p as u32))) {
+            p = p + 1;
+        }
+        mut s: u64 = 0;
+        while (s < lim - p
+               && this.line_text((nc - 1 - s) as u32).equals(&this.snap_line_text((ns - 1 - s) as u32))) {
+            s = s + 1;
+        }
+        return SharedLines { prefix: p, suffix: s, cur_lines: nc, snap_lines: ns };
+    }
+
+    /// The analysed text's line for buffer line `line`, or -1 when the line
+    /// was edited since the analysis.
+    snap_line_of(&this, line: u32) -> i64 {
+        if (!this.has_snap) { return line as i64; }
+        const sh: SharedLines = this.shared_lines();
+        const l: u64 = line as u64;
+        if (l < sh.prefix) { return l as i64; }
+        if (l + sh.suffix >= sh.cur_lines && l < sh.cur_lines) {
+            return (l + sh.snap_lines - sh.cur_lines) as i64;
+        }
+        return -1;
+    }
+
+    /// The buffer's line for analysed line `line`, or -1 when the line was
+    /// edited since the analysis.
+    buffer_line_of(&this, line: u32) -> i64 {
+        if (!this.has_snap) { return line as i64; }
+        const sh: SharedLines = this.shared_lines();
+        const l: u64 = line as u64;
+        if (l < sh.prefix) { return l as i64; }
+        if (l + sh.suffix >= sh.snap_lines && l < sh.snap_lines) {
+            return (l + sh.cur_lines - sh.snap_lines) as i64;
+        }
+        return -1;
+    }
+
+    /// The buffer's line for analysed line `line`; a line inside the edited
+    /// region is placed on the region's first line, so a range into it
+    /// still points near what it named.
+    cur_line_of(&this, line: u32) -> u32 {
+        const b: i64 = this.buffer_line_of(line);
+        if (b >= 0) { return b as u32; }
+        return this.shared_lines().prefix as u32;
     }
 
     /// Replace the buffer (full sync) - drops the previous text, then
@@ -69,7 +150,18 @@ type struct Document {
     }
 }
 
-/// A position in the compiler's terms: 1-based line, 1-based column.
+/// Lines a buffer shares with its analysed text: `prefix` at the start,
+/// `suffix` at the end.
+type struct SharedLines {
+    prefix:     u64;
+    suffix:     u64;
+    cur_lines:  u64;
+    snap_lines: u64;
+}
+
+/// A position in the compiler's terms: 1-based line, 1-based column.  Line
+/// 0 is no position: the cursor's line was edited since the analysis, so no
+/// node of it answers.
 type struct CompilerPos {
     line: u32;
     col:  u32;
@@ -80,9 +172,14 @@ type struct Docs {
     /// Wire columns count bytes (the client offered `utf-8`) rather than
     /// UTF-16 code units.  Set once by `initialize`.
     utf8:   boolean;
+    /// Spans being converted come from an analysis of the buffers as they
+    /// are now, not from the current snapshot: set only while the
+    /// diagnostics of an analysis that was not adopted are published.
+    measure_buffers: boolean;
 
     static new() -> Docs {
-        return Docs { by_uri: HashMap::<String, Document>::new(), utf8: false };
+        return Docs { by_uri: HashMap::<String, Document>::new(), utf8: false,
+                      measure_buffers: false };
     }
 
     /// The open document whose file is `path`, compared as the compiler
@@ -94,15 +191,18 @@ type struct Docs {
         return Option::None;
     }
 
-    /// The compiler position of wire position (`line`, `character`) in the
-    /// open document `uri`.  A document that is not open has no buffer to
-    /// measure, so its column is taken as given.
+    /// The position in the current analysis of wire position (`line`,
+    /// `character`) in the open document `uri`.  A document that is not
+    /// open has no buffer to measure, so its column is taken as given.
     to_compiler(&this, uri: str::Str, line: u32, character: u32) -> CompilerPos {
         match (this.get(uri)) {
             Option::Some(doc) => {
+                const snap_line: i64 = doc.snap_line_of(line);
+                if (snap_line < 0) { return CompilerPos { line: 0, col: 0 }; }
                 const text: str::Str = doc.line_text(line);
                 const b: u64 = Columns::wire_to_byte(text, character, this.utf8);
-                return CompilerPos { line: line + 1, col: Columns::byte_to_compiler(text, b) };
+                return CompilerPos { line: (snap_line + 1) as u32,
+                                     col: Columns::byte_to_compiler(text, b) };
             }
             Option::None => { return CompilerPos { line: line + 1, col: character + 1 }; }
         }
@@ -122,7 +222,8 @@ type struct Docs {
     }
 
     /// Wire range of a compiler span.  The columns are measured against
-    /// the text the span's file has: its open buffer, or the file on disk
+    /// the text the analysis read for the span's file - an open document's
+    /// analysed text, carried to the buffer's lines, or the file on disk
     /// when it is not open.  A span with no location is (0,0)-(0,0).
     range_of_span(&this, span: source_span::SourceSpan) -> lsp::Range {
         if (span.start_line == 0) {
@@ -141,9 +242,18 @@ type struct Docs {
         }
         match (this.by_path(fpath)) {
             Option::Some(doc) => {
+                if (this.measure_buffers || !doc.has_snap) {
+                    return lsp::Range::new(
+                        this.wire_of(doc.text.as_str(), &doc.line_index, span.start_line, span.start_col),
+                        this.wire_of(doc.text.as_str(), &doc.line_index, end_line, end_col));
+                }
+                const s: lsp::Position =
+                    this.wire_of(doc.snap_text.as_str(), &doc.snap_index, span.start_line, span.start_col);
+                const e: lsp::Position =
+                    this.wire_of(doc.snap_text.as_str(), &doc.snap_index, end_line, end_col);
                 return lsp::Range::new(
-                    this.wire_of(doc.text.as_str(), &doc.line_index, span.start_line, span.start_col),
-                    this.wire_of(doc.text.as_str(), &doc.line_index, end_line, end_col));
+                    lsp::Position::new(doc.cur_line_of(s.line), s.character),
+                    lsp::Position::new(doc.cur_line_of(e.line), e.character));
             }
             Option::None => { }
         }

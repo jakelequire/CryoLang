@@ -51,7 +51,7 @@ import lsp::handlers::rendered_diagnostic;
 type struct Server {
     state:      state::ServerState;
     docs:       docs::Docs;
-    sessions:   session::SessionMap;
+    projects:   session::Projects;
     diag_cache: diag_render_cache::DiagRenderCache;
     reader:     stdio::Stdin;
     writer:     stdio::Stdout;
@@ -62,7 +62,7 @@ type struct Server {
         return Server {
             state:      state::ServerState::new(),
             docs:       docs::Docs::new(),
-            sessions:   session::SessionMap::new(),
+            projects:   session::Projects::new(),
             diag_cache: diag_render_cache::DiagRenderCache::new(),
             reader:     stdio::stdin(),
             writer:     stdio::stdout(),
@@ -73,24 +73,22 @@ type struct Server {
     /// Run until either `exit` or stdin closes.  Returns the process
     /// exit code (0 on a clean shutdown, 1 otherwise).
     ///
-    /// Edit notifications (didOpen/didChange) don't compile inline; they
-    /// queue the URI (see `TextSync`).  When the queue is non-empty the
-    /// loop waits up to `DEBOUNCE_MS` for more input before flushing, so
-    /// a burst of keystrokes collapses into a single whole-project
-    /// compile instead of one per keystroke.  Interleaved requests still
-    /// see fresh state - each handler routes through `ensure_fresh`.
+    /// An open or a save makes an analysis owed rather than running one
+    /// inline.  While one is owed the loop waits up to `DEBOUNCE_MS` for
+    /// more input before running it, so a burst of notifications (the
+    /// editor opening several files, a save-all) becomes one analysis.  A
+    /// request that needs the analysis runs it at once
+    /// (`Projects::analysis_for`).
     run(mut &this) -> i32 {
         loop {
-            // Debounce window: only enter it while a compile is owed, so
-            // an otherwise-idle server still blocks indefinitely on the
-            // read below (no busy-loop) when there's nothing pending.
-            if (this.sessions.has_pending()) {
+            // Debounce window: only enter it while an analysis or its
+            // publishing is owed, so an otherwise-idle server still blocks
+            // on the read below (no busy-loop).
+            if (this.projects.has_owed()) {
                 if (!Server::poll_stdin_readable(DEBOUNCE_MS)) {
-                    // Input went quiet: the edit burst is over.  Compile
-                    // and publish the coalesced set, then loop.
-                    text_sync::flush_pending(&this.docs, &this.sessions,
-                                             &this.writer, &this.diag_cache,
-                                             &this.outbound);
+                    text_sync::flush(&this.docs, &this.projects,
+                                     &this.writer, &this.diag_cache,
+                                     &this.outbound);
                     continue;
                 }
                 // Input is ready - fall through and read it, deferring the
@@ -192,7 +190,7 @@ type struct Server {
                     // the wire-shape `lsp::protocol::lsp::Hover` struct.
                     const result: value::JsonValue =
                         lsp::handlers::hover::handle_hover(
-                            &this.docs, &this.sessions, &req.params);
+                            &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
@@ -203,28 +201,28 @@ type struct Server {
                 if (method.equals(&str::Str::from("cryo/expandHover"))) {
                     const result: value::JsonValue =
                         lsp::handlers::hover::handle_hover_verbose(
-                            &this.docs, &this.sessions, &req.params);
+                            &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/definition"))) {
                     const result: value::JsonValue =
                         lsp::handlers::definition::handle_definition(
-                            &this.docs, &this.sessions, &req.params);
+                            &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/completion"))) {
                     const result: value::JsonValue =
                         lsp::handlers::completion::handle_completion(
-                            &this.docs, &this.sessions, &req.params);
+                            &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/semanticTokens/full"))) {
                     const result: value::JsonValue =
                         lsp::handlers::semantic_tokens::handle_semantic_tokens(
-                            &this.docs, &this.sessions, &req.params);
+                            &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
@@ -235,7 +233,7 @@ type struct Server {
                 }
                 if (method.equals(&str::Str::from("textDocument/codeLens"))) {
                     const result: value::JsonValue =
-                        code_lens::handle_code_lens(&this.docs, &this.sessions, &req.params);
+                        code_lens::handle_code_lens(&this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
@@ -278,18 +276,23 @@ type struct Server {
                 if (!this.state.initialized) { return; }
 
                 if (method.equals(&str::Str::from("textDocument/didOpen"))) {
-                    text_sync::did_open(&this.docs, &this.sessions,
-                                        &notif.params);
+                    text_sync::did_open(&this.docs, &this.projects, &notif.params);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/didChange"))) {
-                    text_sync::did_change(&this.docs, &this.sessions,
-                                          &notif.params);
+                    text_sync::did_change(&this.docs, &notif.params);
+                    return;
+                }
+                if (method.equals(&str::Str::from("textDocument/didSave"))) {
+                    text_sync::did_save(&this.projects, &notif.params);
+                    return;
+                }
+                if (method.equals(&str::Str::from("workspace/didChangeWatchedFiles"))) {
+                    text_sync::did_change_watched_files(&this.projects, &notif.params);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/didClose"))) {
-                    text_sync::did_close(&this.docs, &this.sessions,
-                                         &this.writer, &notif.params);
+                    text_sync::did_close(&this.docs, &this.writer, &notif.params);
                     return;
                 }
 

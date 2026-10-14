@@ -69,21 +69,21 @@ import std::ffi::libc;
 
 
 /// Standard `textDocument/hover` entry point - base (non-verbose) hover.
-public function handle_hover(docs: &docs::Docs, sessions: mut &session::SessionMap,
+public function handle_hover(docs: mut &docs::Docs, projects: mut &session::Projects,
                               params: &value::JsonValue) -> value::JsonValue {
-    return handle_hover_ex(docs, sessions, params, false);
+    return handle_hover_ex(docs, projects, params, false);
 }
 
 /// `cryo/expandHover` entry point - the expanded hover the extension
 /// requests when the user raises the hover verbosity.  Identical to the
 /// base hover except a struct/class type-decl body additionally lists the
 /// type's method signatures.
-public function handle_hover_verbose(docs: &docs::Docs, sessions: mut &session::SessionMap,
+public function handle_hover_verbose(docs: mut &docs::Docs, projects: mut &session::Projects,
                                       params: &value::JsonValue) -> value::JsonValue {
-    return handle_hover_ex(docs, sessions, params, true);
+    return handle_hover_ex(docs, projects, params, true);
 }
 
-public function handle_hover_ex(docs: &docs::Docs, sessions: mut &session::SessionMap,
+public function handle_hover_ex(docs: mut &docs::Docs, projects: mut &session::Projects,
                                  params: &value::JsonValue, verbose: boolean) -> value::JsonValue {
     // -- Extract URI + 0-based (line, character) from the params ------
     // Use stepwise extraction with early returns; deeply nested
@@ -120,19 +120,13 @@ public function handle_hover_ex(docs: &docs::Docs, sessions: mut &session::Sessi
     // (single-file buffer, pre-compile), `node` stays null and the
     // keyword-doc path runs exactly as it did before.
     //
-    // `ensure_fresh` recompiles this document if another document's edit
-    // reset the shared AST arena since this session last compiled, so the
-    // ctx we walk below is never dangling (see Session.cryo).
+    // The analysis first: it may run now, and the cursor is carried into
+    // the text it read.
+    mut ctx: compilation_context::CompilationContext* = projects.analysis_for(docs, uri);
+    mut node: node::ASTNode* = null;
     const cursor: docs::CompilerPos = docs.to_compiler(uri, line, character);
     const cursor_line: u32 = cursor.line;
     const cursor_char: u32 = cursor.col;
-
-    mut ctx: compilation_context::CompilationContext* = null;
-    mut node: node::ASTNode* = null;
-    const session: session::CompilerSession* = sessions.ensure_fresh(docs, uri);
-    if (session != null) {
-        ctx = session.context();
-    }
     if (ctx != null) {
         // Strip `file://` to get the filesystem path the loader stored.
         mut fs_path_owned: String = conv::UriPath::uri_to_fs_path(uri);

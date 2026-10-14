@@ -39,9 +39,10 @@ checks.json:
     }
 
 Any check may carry `"edit": {"file": ..., "from": ..., "to": ...}`: the
-document is changed (not saved) by replacing the first `from` with `to`, the
-check runs against the changed text and its markers, and the document is
-changed back.  That is how a check asks about a buffer mid-typing.
+document is changed by replacing the first `from` with `to`, the check runs
+against the changed text and its markers, and the document is changed back.
+That is how a check asks about a buffer mid-typing.  With `"save": true` the
+edit, and the change back, are each followed by a save.
 
 Usage:
     python tools/CryoLSP/tests/smoke.py [path/to/cryolsp[.exe]] [--fixture NAME]
@@ -431,11 +432,11 @@ def run_fixture(server_path, fx, c):
                 raise KeyError("%s: edit text %r not in %s" % (fx.name, edit["from"], rel))
             fx.set_text(rel, original.replace(edit["from"], edit["to"], 1))
             version += 1
-            change(srv, fx, rel, version)
+            change(srv, fx, rel, version, edit.get("save", False))
             run_check(srv, fx, chk, c)
             fx.set_text(rel, original)
             version += 1
-            change(srv, fx, rel, version)
+            change(srv, fx, rel, version, edit.get("save", False))
         if srv.alive():
             shutdown(srv, c, fx.name)
     finally:
@@ -443,10 +444,14 @@ def run_fixture(server_path, fx, c):
         report_stderr(srv, c, failed_before)
 
 
-def change(srv, fx, rel, version):
+def change(srv, fx, rel, version, save):
     srv.notify("textDocument/didChange", {
         "textDocument": {"uri": fx.uri(rel), "version": version},
         "contentChanges": [{"text": fx.text[rel]}]})
+    if save:
+        # The file on disk is never written: an open buffer is what every
+        # analysis reads, saved or not, so a save only says "analyse now".
+        srv.notify("textDocument/didSave", {"textDocument": {"uri": fx.uri(rel)}})
 
 
 def report_stderr(srv, c, failed_before):

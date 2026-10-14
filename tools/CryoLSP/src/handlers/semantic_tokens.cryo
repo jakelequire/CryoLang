@@ -109,6 +109,9 @@ type struct SemanticTokenizer {
     doc_file:         string;
     /// Wire columns count bytes rather than UTF-16 code units.
     utf8:             boolean;
+    /// The open document, which carries a line of the analysed text to the
+    /// buffer's line; null when the document is not open.
+    doc:              docs::Document*;
     tokens:           Array<SemanticToken>;
 
     /// Build a tokenizer for one request.  Pre-interns the receiver-name
@@ -129,6 +132,7 @@ type struct SemanticTokenizer {
             doc_text_length:  0 as u64,
             doc_file:         doc_file,
             utf8:             docs.utf8,
+            doc:              null,
             tokens:           Array::<SemanticToken>::new(),
         };
         if (intern != null) {
@@ -137,12 +141,21 @@ type struct SemanticTokenizer {
             t.sym_mut_this     = intern.intern("mut &this");
             t.sym_amp_mut_this = intern.intern("&mut this");
         }
+        // Spans are positions in the text the analysis read: measure them
+        // there, and carry each token's line to the buffer (`doc`).
         match (docs.get(uri)) {
             Option::Some(doc) => {
                 if (doc != null) {
-                    t.line_index      = &doc.line_index;
-                    t.doc_text        = doc.text.as_ptr() as string;
-                    t.doc_text_length = doc.text.length();
+                    t.doc = doc;
+                    if (doc.has_snap) {
+                        t.line_index      = &doc.snap_index;
+                        t.doc_text        = doc.snap_text.as_ptr() as string;
+                        t.doc_text_length = doc.snap_text.length();
+                    } else {
+                        t.line_index      = &doc.line_index;
+                        t.doc_text        = doc.text.as_ptr() as string;
+                        t.doc_text_length = doc.text.length();
+                    }
                 }
             }
             Option::None => { }
@@ -1077,7 +1090,20 @@ type struct SemanticTokenizer {
         };
         if (length == 0 as u32) { return; }
 
-        this.tokens.push(SemanticToken::new(line, start_byte, length, type_id, modifiers));
+        this.push_token(line, start_byte, length, type_id, modifiers);
+    }
+
+    /// Push a token on line `line` of the analysed text, moved to the
+    /// buffer's line; a line edited since the analysis gets no token.
+    push_token(mut &this, line: u32, start_char: u32, length: u32,
+               type_id: u32, modifiers: u32) -> void {
+        mut out_line: u32 = line;
+        if (this.doc != null) {
+            const cur: i64 = this.doc.buffer_line_of(line);
+            if (cur < 0) { return; }
+            out_line = cur as u32;
+        }
+        this.tokens.push(SemanticToken::new(out_line, start_char, length, type_id, modifiers));
     }
 
 
@@ -1100,7 +1126,7 @@ type struct SemanticTokenizer {
     emit_raw(mut &this, line0: u32, start_char: u32, length: u32,
              type_id: u32, modifiers: u32) -> void {
         if (length == 0 as u32) { return; }
-        this.tokens.push(SemanticToken::new(line0, start_char, length, type_id, modifiers));
+        this.push_token(line0, start_char, length, type_id, modifiers);
     }
 
     walk_asm_block(mut &this, node: statement::AsmBlockStmtNode*) -> void {
@@ -1608,7 +1634,7 @@ implement trait Clone for struct SemanticToken {
 
 // Entry point
 
-public function handle_semantic_tokens(docs: &docs::Docs, sessions: mut &session::SessionMap,
+public function handle_semantic_tokens(docs: mut &docs::Docs, projects: mut &session::Projects,
                                         params: &value::JsonValue) -> value::JsonValue {
     // -- Extract URI from textDocument.uri ----------------------------
     const td_opt: Option<value::JsonValue*> = params.get(str::Str::from("textDocument"));
@@ -1625,12 +1651,8 @@ public function handle_semantic_tokens(docs: &docs::Docs, sessions: mut &session
     if (!uri_str_opt.is_some()) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
     const uri: str::Str = uri_str_opt.unwrap_or(str::Str::from(""));
 
-    // -- Resolve session -> CompilationContext -> ProgramNode -----------
-    // Recompile-if-stale (see hover.cryo) so we never tokenize against a
-    // ctx whose shared-arena AST was recycled by another doc's compile.
-    const session: session::CompilerSession* = sessions.ensure_fresh(docs, uri);
-    if (session == null) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
-    const ctx: compilation_context::CompilationContext* = session.context();
+    // -- The project's analysis -> ProgramNode --------------------------
+    const ctx: compilation_context::CompilationContext* = projects.analysis_for(docs, uri);
     if (ctx == null) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
 
     mut fs_path_owned: String = conv::UriPath::uri_to_fs_path(uri);

@@ -1,30 +1,23 @@
-///! Per-document compiler session.
+///! Projects and their analyses.
 ///!
-///! Wraps a long-lived `CompilationContext` so hover / definition /
-///! completion handlers can walk the AST + resolver + type arena
-///! between recompiles.  Each `recompile()` builds a *fresh* context
-///! (the previous one is leaked - see `Drop` impl); the cost of
-///! re-parsing the project per keystroke beats fighting per-pass
-///! reset semantics across the multi-module orchestrator.
+///! A project is the cryoconfig a file's directory or one of its parents
+///! holds, or, for a file under no cryoconfig, the file alone as its own
+///! entry point.  Each project has one analysis that answers questions: the
+///! last one whose every module lexed and parsed, so the name layer stamped
+///! the whole tree.  An analysis of a buffer that does not parse publishes
+///! its diagnostics and is then released, leaving the previous answers in
+///! place - a half-typed line does not take every answer away.
 ///!
-///! Two compile paths:
+///! An analysis runs when a project's first file is opened, when one of its
+///! files is saved, and when a `.cryo` file changes on disk.  Edits between
+///! saves change only the buffers; positions are carried between a buffer
+///! and the text its analysis read by `docs::Document`.  Every analysis
+///! reads every open buffer in place of its file.
 ///!
-///!   - Multi-module - when `cryoconfig` is found by walking up from
-///!     the edited file, the WHOLE project is compiled with one
-///!     module's source overridden by the editor buffer.  This is
-///!     what gives the LSP cross-file type info, real diagnostics,
-///!     and the populated type arena that hover/completion need.
-///!
-///!   - Single-file fallback - when no cryoconfig is found, fall
-///!     back to compiling just the editor buffer.  Cross-file types
-///!     resolve to invalid TypeRefs and the post-NameResolution
-///!     pipeline can't run; only lex / parse / name diagnostics are
-///!     emitted.
-///!
-///! The session also owns the NUL-terminated buffer strings backing
-///! the context's `TokenStream::source_file` / `source_content` and
-///! the cryoconfig path.  Those are raw `string` (i.e. C `char*`)
-///! pointers; the buffers must outlive the context.
+///! Each analysis lives in its own arena, so releasing one reclaims the
+///! whole context at once.  The compiler routes frees and reallocations by
+///! the published arena, so the arena of the analysis being read is
+///! published before it is walked (`Projects::analysis_for`).
 
 namespace lsp::server::session;
 
@@ -40,456 +33,313 @@ import std::collections::array;
 import std::collections::array::{ Array };
 import std::collections::hashmap;
 import std::collections::hashmap::{ HashMap };
+import std::io::stdio;
 
 import std::alloc::arena;
 
 import compiler::compilation_context;
+import compiler::compilation_context::{ SourceOverride };
 import compiler::instance;
 import compiler::codegen::ast_arena;
 
 import lsp::protocol::conv;
 import lsp::server::docs;
+import lsp::server::diag_render_cache;
 import std::ffi::libc;
 
 
-// Per-session arenas (persistent contexts).
-//
-// Each open document owns its OWN bump arena (`CompilerSession.arena`), so a
-// recompile of document B never touches the memory document A's `ctx` points
-// into.  A context therefore stays valid for as long as its session is live -
-// hover / go-to-def on an already-compiled file answer instantly, with no
-// re-parse, even after edits to other files.  Before compiling OR reading a
-// session, the daemon makes that session's arena the current one via
-// `ast_arena::cryo_ast_arena_set_current` (see the note there on why reads must
-// publish too: `GlobalAlloc`'s free/realloc key on the published arena).
-//
-// A single shared arena would need a per-recompile reset guarded by a
-// compile-epoch check that invalidates EVERY other document's context on any
-// edit - correct, but it means a full whole-project recompile (~10-30s for
-// the compiler) on every file switch and every edit, blocking the handler.
-// Per-session arenas trade that latency for memory bounded by the number
-// of LIVE contexts, which `SessionMap` caps with an LRU (see `MAX_LIVE_CTX`).
+/// One analysis of a project: a context in its own arena, and the
+/// NUL-terminated buffers the context's `string`s point into.
+type struct Analysis {
+    ctx:   compilation_context::CompilationContext*;
+    arena: arena::Arena*;
+    keep:  Array<String>;
 
-
-type struct CompilerSession {
-    instance:    instance::CompilerInstance;
-    /// Heap-allocated CompilationContext - null until the first
-    /// `recompile()`.  Replaced (and the old one leaked) on every
-    /// subsequent recompile.
-    ctx:         compilation_context::CompilationContext*;
-    /// NUL-terminated copy of the absolute file path, keep-alive for
-    /// `ctx` and used as the LSP override path when a project is
-    /// detected.
-    path_buf:    String;
-    /// NUL-terminated copy of the editor buffer, keep-alive for `ctx`.
-    content_buf: String;
-    /// NUL-terminated copy of the discovered cryoconfig path (or
-    /// empty when no project context was found).
-    config_buf:  String;
-    /// NUL-terminated copy of the discovered stdlib root.  Held alive
-    /// for the session because `instance.config.stdlib_path_override`
-    /// is a `string` (raw `char*`) pointer into this buffer.
-    stdlib_buf:  String;
-    /// This session's OWN bump arena, holding `ctx` and everything the
-    /// compile allocated.  Heap-boxed + leaked so it outlives the compile
-    /// call; owned by the session and reclaimed on `evict()` / `drop()`.
-    /// `null` until the first `recompile()`, and again after an LRU
-    /// eviction (which nulls `ctx` too, so the next request recompiles).
-    arena:       arena::Arena*;
-    /// Set when the editor buffer changed since `ctx` was last built, so
-    /// a compile is owed.  The per-keystroke recompile is coalesced: edits
-    /// only flip this flag (and enqueue the URI in `SessionMap::pending`);
-    /// the actual recompile happens either on the next request that needs
-    /// the session (`ensure_fresh`) or when the edit burst subsides
-    /// (`flush_pending`).  Cleared at the end of every `recompile()`.
-    needs_recompile: boolean;
-
-    static new() -> CompilerSession {
-        return CompilerSession {
-            instance:        instance::CompilerInstance::new(instance::CompilerConfig::default()),
-            ctx:             null,
-            path_buf:        String::new(),
-            content_buf:     String::new(),
-            config_buf:      String::new(),
-            stdlib_buf:      String::new(),
-            arena:           null,
-            needs_recompile: false,
-        };
+    static none() -> Analysis {
+        return Analysis { ctx: null, arena: null, keep: Array::<String>::new() };
     }
 
-    /// Reclaim this session's context in bulk by releasing its arena, and
-    /// null both `arena` and `ctx` so the next request recompiles from the
-    /// live editor buffer.  Keeps the backing buffers + `needs_recompile`
-    /// untouched: an evicted session is still a valid, just-uncompiled one.
-    /// Used by the LRU cap and by `Drop`.
-    release_ctx(mut &this) -> void {
+    /// Make this analysis's arena the published one before its context is
+    /// read: frees and reallocations route by the published arena.
+    publish_arena(&this) -> void {
+        if (this.arena != null) { ast_arena::cryo_ast_arena_set_current(this.arena); }
+    }
+
+    /// Reclaim the context in bulk, then the buffers it pointed into.
+    release(mut &this) -> void {
         if (this.arena != null) {
-            // Retract before releasing.  `GlobalArena` holds a raw pointer to
-            // the published arena and dereferences it on every deallocation,
-            // so freeing a still-published arena makes the next `free`
-            // anywhere in the process a wild read - and in `drop` that next
-            // free is a few lines below, dropping this session's own buffers.
+            // Retract first: the allocator dereferences the published arena
+            // on every free, so releasing it while published makes the next
+            // free anywhere a wild read.
             ast_arena::cryo_ast_arena_retract(this.arena);
-            // `ctx` and every container it owns live inside this arena, so
-            // releasing the chunks frees them all at once; free the Arena
-            // struct itself (libc-allocated, see `recompile`) afterwards.
             this.arena.release();
             libc::free(this.arena as void*);
             this.arena = null;
         }
         this.ctx = null;
-    }
-
-    /// Borrow the current `CompilationContext`.  Returns `null` if no
-    /// `recompile()` has run yet - handlers should bail in that case
-    /// since there's no AST / resolver / type arena to walk.
-    context(&this) -> compilation_context::CompilationContext* {
-        return this.ctx;
-    }
-
-    /// Re-run the full LSP pipeline on the given source.  Allocates
-    /// a fresh CompilationContext, finds the project's cryoconfig,
-    /// and either drives the whole-project compile (preferred) or
-    /// falls back to single-file mode if no cryoconfig is reachable.
-    recompile(mut &this, uri: str::Str, content: str::Str) -> instance::CompilationResult {
-        // Editor-side `uri` is `file://<absolute-path>` (percent-encoded);
-        // decode + normalize to a real filesystem path the loader accepts.
-        mut fs_path_owned: String = conv::UriPath::uri_to_fs_path(uri);
-        const fs_path: str::Str = fs_path_owned.as_str();
-
-        // Replace backing buffers.  The previous `ctx` (if any) holds
-        // raw `string` pointers into the OLD buffers, but we leak the
-        // ctx anyway (see `Drop` impl) so the buffer aliasing is a
-        // non-issue.
-        mut old_path: String = PathFinder::build_cstring_buffer(fs_path);
-        mem::swap(&old_path, &this.path_buf);
-        mem::drop(old_path);
-        mut old_content: String = PathFinder::build_cstring_buffer(content);
-        mem::swap(&old_content, &this.content_buf);
-        mem::drop(old_content);
-        mut old_config: String = PathFinder::discover_project_cryoconfig(fs_path);
-        mem::swap(&old_config, &this.config_buf);
-        mem::drop(old_config);
-        mut old_stdlib: String = PathFinder::discover_stdlib_root(fs_path);
-        mem::swap(&old_stdlib, &this.stdlib_buf);
-        mem::drop(old_stdlib);
-        mem::drop(fs_path_owned);                    // fs_path (borrow) unused below
-
-        // Wire the discovered stdlib path through to the compiler's
-        // `--stdlib=` equivalent.  If `stdlib_buf` is empty the
-        // compiler falls back to its own search (binary-relative,
-        // env var, etc.) - same chain as `cryo build` with no flag.
-        const stdlib_cstr: string = if (this.stdlib_buf.length() > 0) {
-            this.stdlib_buf.as_ptr() as string
-        } else {
-            ""
-        };
-        this.instance.config.stdlib_path_override = stdlib_cstr;
-
-        const path_cstr:    string = this.path_buf.as_ptr() as string;
-        const content_cstr: string = this.content_buf.as_ptr() as string;
-
-        // -- Per-recompile arena lifecycle (this session's OWN arena) --
-        // The compiler routes AST nodes and - while active - the whole container
-        // heap (intern strings, resolver maps, type arena, decl index, module
-        // graph, and every `T[]`/`HashMap`/`Box`/`String`) through a bump arena
-        // published via `AstArena`.  This session owns its arena outright, so no
-        // OTHER document's compile ever disturbs the `ctx` we build here - the
-        // context stays valid for hover/def until this session is recompiled,
-        // evicted, or dropped.  Create the arena on first use (libc-backed:
-        // routing is still OFF here, so the `Box<Arena>` and the buffers above
-        // stay in libc and are safe to free explicitly).
-        if (this.arena == null) {
-            const arena_box: Box<arena::Arena> = Box::<arena::Arena>::new(
-                arena::Arena::with_chunk_size(8 * 1024 * 1024));
-            this.arena = arena_box.leak();
-        }
-        // Make THIS session's arena the current AST + container arena, then
-        // reset it to reclaim this session's PREVIOUS compile in bulk before
-        // building the fresh one.  Reset (not release) keeps the chunks: this
-        // arena only ever compiles the SAME document's project, so the per-
-        // recompile footprint is stable and the chunks are reused cleanly (no
-        // capacity creep - that only happened when one shared arena hosted
-        // differently-sized projects back to back).
-        ast_arena::cryo_ast_arena_set_current(this.arena);
-        this.arena.reset();
-        // ACTIVATE routing so the `CompilationContext::new` below - and
-        // everything the compile allocates - is arena-backed rather than libc.
-        // Deactivated before returning so per-request handler allocations
-        // (hover/completion strings) land in libc and are freed as usual.
-        ast_arena::cryo_alloc_arena_set_active(true);
-
-        // The compile makes its context with routing active, so it - and the
-        // whole context - lands in `this.arena`.
-        this.ctx = null;
-        // `ctx` will reflect `content`; clear the pending-edit flag.
-        this.needs_recompile = false;
-
-        if (this.config_buf.length() == 0) {
-            // No project context - fall back to single-file mode.  The
-            // user gets lex / parse / AST-validation / name-resolution
-            // diagnostics; later passes can't run because cross-file
-            // types are invalid.
-            const b_sf: instance::ProjectBuild = this.instance.compile_for_lsp_content(
-                path_cstr, content_cstr);
-            this.ctx = b_sf.ctx;
-            // Compile done: turn routing OFF so handler-side allocations between
-            // now and the next recompile use libc (and are freed as usual),
-            // leaving the arena holding only this compile's ctx for the handlers
-            // to walk until the next recompile's reset reclaims it.
-            ast_arena::cryo_alloc_arena_set_active(false);
-            return b_sf.result;
-        }
-
-        const config_cstr: string = this.config_buf.as_ptr() as string;
-        const b_proj: instance::ProjectBuild = this.instance.compile_for_lsp_project(
-            config_cstr, path_cstr, content_cstr);
-        this.ctx = b_proj.ctx;
-        ast_arena::cryo_alloc_arena_set_active(false);
-        return b_proj.result;
+        mut old: Array<String> = Array::<String>::new();
+        mem::swap(&old, &this.keep);
+        mem::drop(old);
     }
 }
 
+implement trait Drop for Analysis {
+    drop(mut &this) -> void { this.release(); }
+}
 
-// SessionMap - per-URI sessions
 
-/// Map URI -> CompilerSession.  Same lookup-by-borrow pattern as
-/// `Docs`: `get` returns a `CompilerSession*` so handlers can mutate
-/// the contained session (recompile) without copying it out.
-type struct SessionMap {
-    by_uri: HashMap<String, CompilerSession>;
-    /// URIs with edits owed a compile+publish, awaiting the next
-    /// `flush_pending`.  Deduped: a burst of edits to one file adds one
-    /// entry.  Small - bounded by the number of open documents.
-    pending: Array<String>;
-    /// URIs whose session currently holds a LIVE context (arena + `ctx`),
-    /// in least-recently-used order (front = oldest).  Every session owns a
-    /// full-project context, so this is capped at `MAX_LIVE_CTX`: the moment
-    /// a fresh compile pushes the count over, the oldest context is evicted
-    /// (its arena released, `ctx` nulled) so the process holds at most a few
-    /// project footprints at once.  An evicted document recompiles on its
-    /// next request - it just loses the "instant" property until then.
-    live_order: Array<String>;
+type struct Project {
+    /// The cryoconfig's path, or the lone file's path.
+    key:     String;
+    /// NUL-terminated cryoconfig path; empty for a lone file.
+    config:  String;
+    /// The analysis that answers questions; `ctx` null until one parsed.
+    current: Analysis;
+    /// Completion's analysis of a buffer with a placeholder spliced in.  It
+    /// never answers anything else, and lives until the next completion.
+    scratch: Analysis;
+    /// An open or a save made an analysis owed.
+    owed:    boolean;
+    /// An analysis has run, whether or not it parsed.
+    analysed: boolean;
+    /// An analysis ran and its diagnostics are not published yet.
+    unpublished: boolean;
+    /// The last analysis when it was not adopted (its tree did not parse):
+    /// held only until its diagnostics are published.
+    last:    Analysis;
+    /// The file whose open or save made the analysis owed; it picks the
+    /// target view of a configuration with several.
+    focus:   String;
+    instance: instance::CompilerInstance;
 
-    static new() -> SessionMap {
-        return SessionMap {
-            by_uri:     HashMap::<String, CompilerSession>::new(),
-            pending:    Array::<String>::new(),
-            live_order: Array::<String>::new(),
+    static new(key: str::Str, config: str::Str) -> Project {
+        return Project {
+            key:         String::from_str(key),
+            config:      PathFinder::build_cstring_buffer(config),
+            current:     Analysis::none(),
+            scratch:     Analysis::none(),
+            owed:        false,
+            analysed:    false,
+            unpublished: false,
+            last:        Analysis::none(),
+            focus:       String::new(),
+            instance:    instance::CompilerInstance::new(instance::CompilerConfig::default()),
         };
     }
 
-    /// Mark `uri` as the most-recently-used live context, then evict the
-    /// oldest live contexts back down to `MAX_LIVE_CTX`.  Called by
-    /// `ensure_fresh` after a session's `ctx` is confirmed live (whether it
-    /// was just compiled or already cached).  The current `uri` is always the
-    /// most-recent entry, so it is never the one evicted here.
-    touch_live(mut &this, uri: str::Str) -> void {
-        this.forget_live(uri);                       // dedup: drop any prior entry
-        this.live_order.push(String::from_str(uri));
-        // Evict from the front (oldest) while over the cap.  `remove` returns
-        // the owned URI String, which we drop after using it.
-        while (this.live_order.length() > MAX_LIVE_CTX) {
-            mut evicted: String = this.live_order.remove(0 as u64);
-            // Release that document's context; it stays in `by_uri` (with a
-            // null ctx) so its buffers/dirty flag survive and a later request
-            // recompiles it cleanly.
-            match (this.get(evicted.as_str())) {
-                Option::Some(s) => { s.release_ctx(); }
-                Option::None    => { }
+    /// Run one analysis of the project, with every open buffer in place of
+    /// its file and `replace_uri`'s buffer replaced by `replace_text` when
+    /// one is given.  The analysis is returned unadopted.
+    analyse(mut &this, docs: &docs::Docs, replace_uri: str::Str, replace_text: str::Str) -> Analysis {
+        mut a: Analysis = Analysis::none();
+
+        // Everything the context points into is made here, with arena
+        // routing off, so it lives in libc and outlives the arena.
+        const focus_c: String = PathFinder::build_cstring_buffer(this.focus.as_str());
+        const stdlib_c: String = PathFinder::discover_stdlib_root(this.focus.as_str());
+        mut overlay_paths: Array<string> = Array::<string>::new();
+        mut overlay_texts: Array<string> = Array::<string>::new();
+        for (d in docs.by_uri.values_ref()) {
+            const path_c: String = PathFinder::build_cstring_buffer(d.path.as_str());
+            const text_c: String = if (replace_uri.length() > 0 && d.uri.as_str().equals(&replace_uri)) {
+                PathFinder::build_cstring_buffer(replace_text)
+            } else {
+                PathFinder::build_cstring_buffer(d.text.as_str())
+            };
+            overlay_paths.push(path_c.as_ptr() as string);
+            overlay_texts.push(text_c.as_ptr() as string);
+            a.keep.push(path_c);
+            a.keep.push(text_c);
+        }
+        this.instance.config.stdlib_path_override = if (stdlib_c.length() > 0) {
+            stdlib_c.as_ptr() as string
+        } else {
+            ""
+        };
+        const focus_s: string = focus_c.as_ptr() as string;
+        a.keep.push(focus_c);
+        a.keep.push(stdlib_c);
+
+        const box_arena: Box<arena::Arena> = Box::<arena::Arena>::new(
+            arena::Arena::with_chunk_size(8 * 1024 * 1024));
+        a.arena = box_arena.leak();
+        ast_arena::cryo_ast_arena_set_current(a.arena);
+        ast_arena::cryo_alloc_arena_set_active(true);
+        mut overlays: SourceOverride[] = [];
+        for (mut i: u64 = 0; i < overlay_paths.length(); i++) {
+            overlays.push(SourceOverride {
+                path:    overlay_paths.get(i).unwrap_or(""),
+                content: overlay_texts.get(i).unwrap_or(""),
+            });
+        }
+        const build: instance::ProjectBuild = this.instance.compile_for_lsp_project(
+            this.config.as_ptr() as string, focus_s, overlays);
+        ast_arena::cryo_alloc_arena_set_active(false);
+        a.ctx = build.ctx;
+        mem::drop(overlay_paths);
+        mem::drop(overlay_texts);
+        return a;
+    }
+
+    /// Analyse the project as its files and buffers are now.  The analysis
+    /// is kept for publishing; it becomes the one that answers when its
+    /// whole tree parsed, and then each open buffer's text is what it read.
+    refresh(mut &this, docs: mut &docs::Docs) -> void {
+        mut a: Analysis = this.analyse(docs, str::Str::from(""), str::Str::from(""));
+        this.owed = false;
+        this.analysed = true;
+        this.unpublished = true;
+        this.last.release();
+        if (a.ctx != null && a.ctx.frontend_complete) {
+            this.current.release();
+            mem::swap(&this.current, &a);
+            for (d in docs.by_uri.values_ref()) {
+                if (this.owns(d.path.as_str())) { d.adopt_snapshot(); }
             }
-            mem::drop(evicted);
+        } else {
+            mem::swap(&this.last, &a);
+        }
+        mem::drop(a);
+    }
+
+    /// Whether file `path` belongs to this project.
+    owns(&this, path: str::Str) -> boolean {
+        mut k: String = Projects::key_for(path);
+        const yes: boolean = k.as_str().equals(&this.key.as_str());
+        mem::drop(k);
+        return yes;
+    }
+
+    /// The analysis whose diagnostics are owed: the last one, adopted or not.
+    published_analysis(&this) -> Analysis* {
+        if (this.last.ctx != null) { return &this.last; }
+        return &this.current;
+    }
+
+    set_focus(mut &this, path: str::Str) -> void {
+        mut old: String = String::from_str(path);
+        mem::swap(&old, &this.focus);
+        mem::drop(old);
+    }
+}
+
+implement trait Drop for Project {
+    drop(mut &this) -> void { }
+}
+
+
+type struct Projects {
+    by_key: HashMap<String, Project>;
+
+    static new() -> Projects {
+        return Projects { by_key: HashMap::<String, Project>::new() };
+    }
+
+    /// The key of the project `path` belongs to: the nearest cryoconfig at
+    /// or above its directory, or the path itself when there is none.
+    static key_for(path: str::Str) -> String {
+        const cfg: String = PathFinder::discover_project_cryoconfig(path);
+        if (cfg.length() > 0) { return cfg; }
+        mem::drop(cfg);
+        return String::from_str(path);
+    }
+
+    project_for(mut &this, path: str::Str) -> Project* {
+        mut key: String = Projects::key_for(path);
+        match (this.by_key.get_ref(&key)) {
+            Option::Some(p) => { mem::drop(key); return p; }
+            Option::None    => { }
+        }
+        const lone: boolean = key.as_str().equals(&path);
+        const config: str::Str = if (lone) { str::Str::from("") } else { key.as_str() };
+        const p: Project = Project::new(key.as_str(), config);
+        this.by_key.insert(String::from_str(key.as_str()), p);
+        match (this.by_key.get_ref(&key)) {
+            Option::Some(q) => { mem::drop(key); return q; }
+            Option::None    => { mem::drop(key); return null; }
         }
     }
 
-    /// Drop `uri` from the live-order list if present (linear scan; the list
-    /// is at most `MAX_LIVE_CTX` long).  Does NOT release the context - used
-    /// both as the dedup step in `touch_live` and on close/removal.
-    forget_live(mut &this, uri: str::Str) -> void {
-        const n: u64 = this.live_order.length();
-        for (mut i: u64 = 0; i < n; i++) {
-            match (this.live_order.get_ref(i)) {
-                Option::Some(p) => {
-                    if (p.as_str().equals(&uri)) {
-                        mut gone: String = this.live_order.remove(i);
-                        mem::drop(gone);
-                        return;
-                    }
-                }
-                Option::None => { }
-            }
-        }
+    /// A document was opened: its project is analysed if it never was.
+    note_open(mut &this, path: str::Str) -> void {
+        const p: Project* = this.project_for(path);
+        if (p == null) { return; }
+        if (!p.analysed) { Projects::owe(p, path); }
     }
 
-    /// True when at least one document is awaiting a coalesced compile.
-    has_pending(&this) -> boolean {
-        return this.pending.length() > 0 as u64;
+    /// A file was saved, or changed on disk: its project is analysed again.
+    note_saved(mut &this, path: str::Str) -> void {
+        const p: Project* = this.project_for(path);
+        if (p != null) { Projects::owe(p, path); }
     }
 
-    /// Record that `uri`'s buffer changed: flip the session's
-    /// `needs_recompile` flag (creating the session if needed) and
-    /// enqueue the URI for the next flush.  Does NOT compile - that is
-    /// deferred so a burst of keystrokes collapses to a single compile.
-    mark_dirty(mut &this, uri: str::Str) -> void {
-        const session: CompilerSession* = this.get_or_create(uri);
-        if (session != null) { session.needs_recompile = true; }
-        if (!this.pending_contains(uri)) {
-            this.pending.push(String::from_str(uri));
-        }
+    static owe(p: Project*, path: str::Str) -> void {
+        p.owed = true;
+        p.set_focus(path);
     }
 
-    /// Whether `uri` is already queued (linear scan; `pending` is tiny).
-    pending_contains(&this, uri: str::Str) -> boolean {
-        for (mut i: u64 = 0; i < this.pending.length(); i++) {
-            match (this.pending.get_ref(i)) {
-                Option::Some(p) => {
-                    if (p.as_str().equals(&uri)) { return true; }
-                }
-                Option::None => { }
-            }
+    has_owed(&this) -> boolean {
+        for (p in this.by_key.values_ref()) {
+            if (p.owed || p.unpublished) { return true; }
         }
         return false;
     }
 
-    /// Take ownership of the pending set and reset it to empty.  The
-    /// caller drains it (recompile + publish each URI) and drops it.
-    take_pending(mut &this) -> Array<String> {
-        mut out: Array<String> = this.pending;
-        this.pending = Array::<String>::new();
+    /// The analysis that answers for document `uri`, analysing its project
+    /// first when an open or a save is owed; null when none has parsed.  Its
+    /// arena is published on return.
+    analysis_for(mut &this, docs: mut &docs::Docs, uri: str::Str) -> compilation_context::CompilationContext* {
+        const doc: Option<docs::Document*> = docs.get(uri);
+        if (!doc.is_some()) { return null; }
+        const d: docs::Document* = doc.unwrap_or(null);
+        const p: Project* = this.project_for(d.path.as_str());
+        if (p == null) { return null; }
+        if (p.owed) { p.refresh(docs); }
+        p.current.publish_arena();
+        return p.current.ctx;
+    }
+
+    /// Analyse `uri`'s project with `text` in place of its buffer, for a
+    /// question about text that is being typed.  The analysis answers only
+    /// the caller, and lives until the next one; its arena is published.
+    analyse_buffer(mut &this, docs: &docs::Docs, uri: str::Str, text: str::Str)
+            -> compilation_context::CompilationContext* {
+        const doc: Option<docs::Document*> = docs.get(uri);
+        if (!doc.is_some()) { return null; }
+        const d: docs::Document* = doc.unwrap_or(null);
+        const p: Project* = this.project_for(d.path.as_str());
+        if (p == null) { return null; }
+        if (p.focus.length() == 0) { p.set_focus(d.path.as_str()); }
+        p.scratch.release();
+        mut a: Analysis = p.analyse(docs, uri, text);
+        mem::swap(&p.scratch, &a);
+        mem::drop(a);
+        p.scratch.publish_arena();
+        return p.scratch.ctx;
+    }
+
+    /// Run every owed analysis, and return each project whose diagnostics
+    /// are unpublished (`Project::published_analysis` says from which).
+    take_unpublished(mut &this, docs: mut &docs::Docs) -> Array<Project*> {
+        mut out: Array<Project*> = Array::<Project*>::new();
+        for (p in this.by_key.values_ref()) {
+            if (p.owed) { p.refresh(docs); }
+            if (p.unpublished) {
+                p.unpublished = false;
+                out.push(p);
+            }
+        }
         return out;
-    }
-
-    /// Drop `uri` from the pending set (used on didClose so a flush
-    /// doesn't try to compile a document that's been closed).
-    clear_pending_for(mut &this, uri: str::Str) -> void {
-        mut kept: Array<String> = Array::<String>::new();
-        const n: u64 = this.pending.length();
-        for (mut i: u64 = 0; i < n; i++) {
-            match (this.pending.get_ref(i)) {
-                Option::Some(p) => {
-                    if (p.as_str().equals(&uri)) {
-                        continue;                    // drop this one
-                    }
-                    kept.push(String::from_str(p.as_str()));
-                }
-                Option::None => { }
-            }
-        }
-        mem::swap(&kept, &this.pending);
-        mem::drop(kept);
-    }
-
-    /// Insert a fresh session for `uri`.  If one already exists it is
-    /// dropped.  Use `get_or_create` for the common case where you
-    /// want to recompile an already-open document.
-    insert(mut &this, uri: str::Str, session: CompilerSession) -> void {
-        const key: String = String::from_str(uri);
-        match (this.by_uri.insert(key, session)) {
-            Option::Some(prev) => { mem::drop(prev); }
-            Option::None       => { }
-        }
-    }
-
-    get(&this, uri: str::Str) -> Option<CompilerSession*> {
-        const key: String = String::from_str(uri);
-        const result: Option<CompilerSession*> = this.by_uri.get_ref(&key);
-        mut owned: String = key;
-        mem::drop(owned);
-        return result;
-    }
-
-    /// Return a borrow of the session at `uri`, creating one if
-    /// absent.  The created session has `ctx == null`; the caller is
-    /// expected to call `recompile()` next.
-    get_or_create(mut &this, uri: str::Str) -> CompilerSession* {
-        match (this.get(uri)) {
-            Option::Some(p) => { return p; }
-            Option::None    => { }
-        }
-        this.insert(uri, CompilerSession::new());
-        match (this.get(uri)) {
-            Option::Some(p) => { return p; }
-            Option::None    => { return null; }      // unreachable
-        }
-    }
-
-    /// Return the session for `uri` with a `ctx` that is guaranteed valid to
-    /// walk RIGHT NOW.  Because each session owns its arena, a context stays
-    /// valid across other documents' compiles - so a cached, unedited session
-    /// is returned WITHOUT recompiling; only a never-compiled, LRU-evicted, or
-    /// edited session is rebuilt from the live editor buffer.  Either way, this
-    /// session's arena is made the current published one before returning, so
-    /// `GlobalAlloc`'s free/realloc (which key on the published arena) stay
-    /// correct for the context the handler is about to walk, and the session is
-    /// promoted to most-recently-used in the LRU.
-    ///
-    /// Read handlers must go through this rather than `get()` + `context()`.
-    ///
-    /// Returns `null` only if the session can't be created.  A non-null
-    /// return may still have a null `context()` when no buffer is open
-    /// for `uri` to recompile from - callers already null-check ctx.
-    ensure_fresh(mut &this, docs: &docs::Docs, uri: str::Str) -> CompilerSession* {
-        const session: CompilerSession* = this.get_or_create(uri);
-        if (session == null) { return null; }
-
-        if (session.ctx != null && !session.needs_recompile) {
-            // Cached + up to date: re-publish this session's arena (a compile
-            // or read of another document may have made a different arena
-            // current) so pointers in `ctx` are the ones `holds()` recognises.
-            if (session.arena != null) {
-                ast_arena::cryo_ast_arena_set_current(session.arena);
-            }
-            this.touch_live(uri);
-            return session;
-        }
-
-        // Never compiled, evicted, or edited since last compile: rebuild from
-        // the live editor buffer (this also clears needs_recompile and makes
-        // the session's arena current).
-        match (docs.get(uri)) {
-            Option::Some(doc) => {
-                session.recompile(uri, doc.text.as_str());
-                if (session.ctx != null) { this.touch_live(uri); }
-            }
-            Option::None => {
-                // No open buffer to compile from; leave ctx as-is (the
-                // caller null-checks it).
-            }
-        }
-        return session;
-    }
-
-    remove(mut &this, uri: str::Str) -> boolean {
-        this.forget_live(uri);                       // drop any live-order entry
-        const key: String = String::from_str(uri);
-        match (this.by_uri.remove(&key)) {
-            Option::Some(session) => {
-                mut s: CompilerSession = session;
-                mem::drop(s);
-                mut k: String = key;
-                mem::drop(k);
-                return true;
-            }
-            Option::None => {
-                mut k: String = key;
-                mem::drop(k);
-                return false;
-            }
-        }
     }
 }
 
+implement trait Drop for Projects {
+    drop(mut &this) -> void { }
+}
 
-// Helpers
-//
-// URI helpers live in `lsp::protocol::conv` (`UriPath::uri_to_fs_path`).
 
 // PathFinder - project discovery + path utilities for the LSP.
 // Static methods: they walk the filesystem from a path, holding no state.
-//
-// (Follow-up: these hand-roll parent-walk + existence checks with raw
-// `intrinsics::access`; a pass to route through `std::fs` path/metadata
-// helpers is a possible consolidation, deferred to keep behaviour fixed.)
 
 type struct PathFinder {
 
@@ -612,30 +462,3 @@ static build_cstring_buffer(s: str::Str) -> String {
     return out;
 }
 }
-
-
-// Drop trait impls - see lsp::server::docs for the rationale.
-
-implement trait Drop for CompilerSession {
-    drop(mut &this) -> void {
-        // Release this session's arena (frees `ctx` and every container it
-        // owns in one shot) and free the Arena struct itself.  The ctx lives
-        // in a session-owned region, so closing/dropping the session
-        // reclaims it directly.  The backing buffers the ctx pointed into
-        // are released by their fields after this returns.
-        this.release_ctx();
-    }
-}
-
-implement trait Drop for SessionMap {
-    drop(mut &this) -> void { }
-}
-
-
-/// Cap on the number of documents that may hold a LIVE full-project context
-/// at once.  Each context is a whole compile's footprint, so this bounds peak
-/// memory at roughly `MAX_LIVE_CTX` project footprints.  The active document
-/// plus a couple of recently-viewed ones stay instant; older ones recompile on
-/// their next request.  Tunable - raise for more instant files at higher peak
-/// memory, lower to trade responsiveness for a tighter footprint.
-const MAX_LIVE_CTX: u64 = 3 as u64;

@@ -145,6 +145,18 @@ type enum HeapBackend {
 type struct SourceOverride {
     path:    string;
     content: string;
+
+    /// The content an overlay gives `path`, compared as spelled.  Every
+    /// reader of a source file asks here, so a module reads the same text
+    /// whichever stage reads it.
+    static content_for(overlays: &SourceOverride[], path: string) -> Option<string> {
+        for (mut i: i64 = 0; i < overlays.length; i++) {
+            if (overlays[i].path.length() > 0 && overlays[i].path.eq(path)) {
+                return Option::Some(overlays[i].content);
+            }
+        }
+        return Option::None;
+    }
 }
 
 /// An injected specialization and the module its template is declared in.
@@ -198,8 +210,8 @@ public:
     /// `--release-static`: link libLLVM and the C++ runtime statically.
     static_link:   boolean;
     output:        OutputOverride;
-    /// The LSP's unsaved buffer for one module.
-    source_override: Option<SourceOverride>;
+    /// The language server's open buffers, each replacing its file on disk.
+    source_overrides: SourceOverride[];
 
     static defaults(mode: CompileMode) -> BuildOptions {
         return BuildOptions {
@@ -215,7 +227,7 @@ public:
             target_triple:   LTargetMachine::get_default_triple(),
             static_link:     false,
             output:          OutputOverride::Default,
-            source_override: Option::None,
+            source_overrides: [],
         };
     }
 
@@ -309,6 +321,12 @@ public:
     // recompile), so it needs no explicit reset.
     inactive_spans: SourceSpan[];
 
+    // Every module was lexed and parsed without error, so the name layer ran
+    // over the whole tree and its stamps are there to read.  The language
+    // server keeps an analysis as its answer for later questions only when
+    // this is set.
+    frontend_complete: boolean;
+
     // -- Type system (initialized lazily by TypeDeclaration pass) --
     type_arena: TypeArena*;
 
@@ -384,6 +402,7 @@ public:
             alias_paths:          [],
             c_refs:               [],
             inactive_spans:       [],
+            frontend_complete:    false,
             type_arena:    arena_ptr,
 
             project_config:      project_config,

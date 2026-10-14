@@ -519,13 +519,7 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
 
-        mut config: ProjectConfig = ProjectConfig::default();
-        config.project_root = source.parent_dir();
-        config.entry_point  = source.basename();
-        config.project_name = source.stem();
-        config.no_std       = this.config.no_std;
-        config.no_runtime   = this.config.no_runtime;
-        config.panic        = this.config.panic;
+        mut config: ProjectConfig = this.single_file_config(source);
         config.emit_llvm    = this.config.emit_llvm;
         // Artifacts land NEXT TO THE SOURCE FILE, not in the invoking
         // directory: output_dir is consumed as-is by the build-layout
@@ -537,12 +531,8 @@ type struct CompilerInstance {
                 && !config.project_root.eq(".")) {
             config.output_dir = fmt::format("%s/build", config.project_root);
         }
-        // CLI `--target=TRIPLE`; `--opt-level` / `-g` / profile flags
-        // flow through `this.config` inside run_project,
-        // exactly as they do for a cryoconfig build.
-        if (this.config.target_triple_override.length() > 0) {
-            config.target_triple = this.config.target_triple_override;
-        }
+        // `--opt-level` / `-g` / profile flags flow through `this.config`
+        // inside run_project, exactly as they do for a cryoconfig build.
         mut result: CompilationResult = this.compile_project_with_config(config);
         // `-o PATH`: the user's artifact lives at PATH (the mirrored
         // executable for Exe; the entry module's object/asm/IR dump for
@@ -609,9 +599,24 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
 
-        // Synthesize the same single-file project view `compile_file` builds,
-        // so module discovery finds this file as the entry point and follows
-        // its imports (including the prelude + stdlib) into the module graph.
+        // The same single-file project view `compile_file` builds, so module
+        // discovery finds this file as the entry point and follows its
+        // imports (including the prelude + stdlib) into the module graph.
+        const config: ProjectConfig = this.single_file_config(source);
+
+        const root_path: string = config.discovery_root_path();
+        if (!metadata::exists(Path::from(root_path))) {
+            fmt::eprintln(f"error: entry point not found: {root_path}");
+            return CompilationResult::failed(1, 0);
+        }
+
+        return this.compile_project_to_context(config, CompileMode::Check, []).result;
+    }
+
+    /// The project a single source file makes on its own: the file is the
+    /// entry point and its directory the root.  `compile_file`, `check` and
+    /// the language server's file outside any project all build this view.
+    single_file_config(&this, source: string) -> ProjectConfig {
         mut config: ProjectConfig = ProjectConfig::default();
         config.project_root = source.parent_dir();
         config.entry_point  = source.basename();
@@ -622,64 +627,30 @@ type struct CompilerInstance {
         if (this.config.target_triple_override.length() > 0) {
             config.target_triple = this.config.target_triple_override;
         }
-
-        const root_path: string = config.discovery_root_path();
-        if (!metadata::exists(Path::from(root_path))) {
-            fmt::eprintln(f"error: entry point not found: {root_path}");
-            return CompilationResult::failed(1, 0);
-        }
-
-        return this.compile_project_to_context(config, CompileMode::Check, Option::None).result;
+        return config;
     }
 
-
-    /// Compile for LSP, returning the context to the caller.
-    /// Single-file mode: parses + type-checks just the one file the
-    /// editor is showing, with no project context.  Cross-file
-    /// references resolve to invalid TypeRefs; in LSP-safe mode the
-    /// mangler emits a poison sentinel instead of panicking, so this
-    /// path can run post-NameResolution passes without crashing the
-    /// daemon.  Used as a fallback when we can't find a cryoconfig.
-    /// For real diagnostics, route through `compile_for_lsp_project`.
-    compile_for_lsp_content(&this, virtual_path_text: string,
-                            content_text: string) -> ProjectBuild {
-        mangled_name::set_lsp_safe(true);
-        const _box_ctx: Box<CompilationContext> = Box::<CompilationContext>::new(
-            CompilationContext::new(BuildOptions::defaults(CompileMode::Lsp),
-                                    virtual_path_text, null));
-        mut ctx: CompilationContext* = _box_ctx.leak();
-        // Same risk as the multi-target build path: TypeArena.next_id
-        // resets every compile, so without clearing the (TypeRef.id ->
-        // LLVMTypeRef) cache between LSP recompiles every fresh TypeRef
-        // would alias a stale entry from a prior keystroke's compile.
-        compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
-        // NB: the arena is NOT reset here.  The LSP session owns the arena
-        // lifecycle - it resets + activates routing before calling this, so
-        // `ctx` and its whole container heap are arena-backed and reclaimed by
-        // the next recompile.  Resetting here would free them mid-compile.
-        ctx.artifacts.tokens = TokenStream::new([], virtual_path_text, content_text);
-        mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
-        const result: CompilationResult = this.run_pipeline(ctx, &pipeline, "");
-        return ProjectBuild { result: result, ctx: ctx };
-    }
-
-    /// Compile a whole project for the LSP, with one module's source
-    /// overridden by the editor buffer.  Discovers every `.cryo` in
-    /// the project (per the cryoconfig at `config_path`), parses and
-    /// type-checks the lot, but reads `override_path`'s content from
-    /// `override_content` instead of the file on disk.
+    /// Analyse a whole project for the language server: every module the
+    /// project reaches is parsed and checked, with each file an `overlays`
+    /// entry names read from that editor buffer instead of the disk.  The
+    /// project is the cryoconfig at `config_path_text`, or, when that is
+    /// empty, the single file `focus_path_text` as its own entry point.
+    /// For a configuration with several targets, `focus_path_text` also
+    /// picks the view whose graph reaches the file being edited.
     ///
     /// The resulting `CompilationContext` has the same populated AST,
-    /// resolver, type arena, and decl index that a real build would
-    /// The LSP uses this for diagnostics, hover, go-to-def, and
-    /// completion.  Codegen is gated off via `CompileMode::Lsp` so
-    /// no LLVM IR is emitted; everything stops cleanly at TypeLowering.
+    /// resolver, type arena, and decl index that a real build would.
+    /// Codegen is gated off via `CompileMode::Lsp`, so everything stops
+    /// cleanly at TypeLowering.
     compile_for_lsp_project(&this, config_path_text: string,
-                            override_path_text: string,
-                            override_content_text: string) -> ProjectBuild {
-        const override_content: string = override_content_text;
-        const override_path: string = override_path_text;
+                            focus_path_text: string,
+                            overlays: SourceOverride[]) -> ProjectBuild {
+        const focus_path: string = focus_path_text;
         mangled_name::set_lsp_safe(true);
+        if (config_path_text.length() == 0) {
+            return this.compile_project_to_context(this.single_file_config(focus_path),
+                                                   CompileMode::Lsp, overlays);
+        }
         mut config: ProjectConfig = ProjectConfig::parse(config_path_text);
         if (this.config.output_dir_override != ""
                 && this.config.output_dir_override.length() > 0) {
@@ -698,7 +669,7 @@ type struct CompilerInstance {
         // module under the lib's `_module.cryo` imports.
         //
         // Heuristic:
-        //   1. If override matches a `[[bin]]` entry_point, use that bin view.
+        //   1. If the focus is a `[[bin]]` entry_point, use that bin view.
         //   2. Else if a `[lib]` is present, use the lib view.
         //   3. Else use the first `[[bin]]`.
         // Single-target configs fall through unchanged.
@@ -707,7 +678,7 @@ type struct CompilerInstance {
             for (mut bi: i64 = 0; bi < config.bins.length; bi++) {
                 const bin_full: string = fmt::format("%s/%s",
                     config.project_root, config.bins[bi].entry_point);
-                if (bin_full.eq(override_path)) {
+                if (bin_full.eq(focus_path)) {
                     chosen = bi;
                     break;
                 }
@@ -724,8 +695,7 @@ type struct CompilerInstance {
                 config = CompilerInstance::make_bin_view(config, sel);
             }
         }
-        return this.compile_project_to_context(config, CompileMode::Lsp,
-            Option::Some(SourceOverride { path: override_path, content: override_content }));
+        return this.compile_project_to_context(config, CompileMode::Lsp, overlays);
     }
 
     /// Switch to a module AND load its AST from the local buffers.
@@ -959,7 +929,7 @@ type struct CompilerInstance {
                 _                   => { CompileMode::MultiModule }
             }
         };
-        const build: ProjectBuild = this.compile_project_to_context(config, mode, Option::None);
+        const build: ProjectBuild = this.compile_project_to_context(config, mode, []);
         mut result: CompilationResult = build.result;
         // Per-target teardown.  Copy the survivor strings out of any
         // context-owned (interned) storage FIRST, then reclaim this target's
@@ -984,7 +954,12 @@ type struct CompilerInstance {
     /// returned so the language server can walk it after the compile; it is
     /// null when the build failed before one was made.
     compile_project_to_context(&this, mut config: ProjectConfig, mode: CompileMode,
-                               source_override: Option<SourceOverride>) -> ProjectBuild {
+                               overlays: SourceOverride[]) -> ProjectBuild {
+        // The tallies count one compilation's defects; a process that
+        // compiles again (each target of a build, every analysis of the
+        // language server) must not report the last one's.
+        res::reset_compile_tallies();
+
         // Precedence: CLI `--release`/`--dev`/`--profile=NAME` > cryoconfig
         // `[profile] default` > built-in `release`.  Set before the clone
         // below, so the per-profile cache subtree is the same everywhere.
@@ -1049,7 +1024,7 @@ type struct CompilerInstance {
         options.target_triple = LTargetMachine::resolve_effective_triple(
             config.target_triple);
         options.static_link = this.config.release_static;
-        options.source_override = source_override;
+        options.source_overrides = overlays;
 
         // An independent clone, so the local `config` stays usable below.
         const _box_config: Box<ProjectConfig> = Box::<ProjectConfig>::new(config.clone());
@@ -1180,15 +1155,14 @@ type struct CompilerInstance {
         loader.set_vendor_context(
             config.target_triple, &config.vendor_pins, vendor_build_root);
 
-        // LSP mode: feed the loader the editor buffer for the active
-        // file so import-discovery sees the imports the user is typing
-        // *now*, not whatever's on disk.  Without this, a freshly
-        // typed `import std::collections::str` is invisible to the
-        // discovery walk and `Str::from` fails to resolve.
-        match (ctx.options.source_override) {
-            Option::Some(o) => { loader.set_lsp_override(o.path, o.content); }
-            Option::None    => { }
+        // The language server's open buffers: discovery reads them, so a
+        // freshly typed `import std::collections::str` reaches its module
+        // before the file is saved.
+        mut overlays: SourceOverride[] = [];
+        for (mut oi: i64 = 0; oi < ctx.options.source_overrides.length; oi++) {
+            overlays.push(ctx.options.source_overrides[oi]);
         }
+        loader.set_lsp_overrides(overlays);
 
         const discovery_ok: boolean = loader.discover_project(
             ctx.intern_table, ctx.module_graph, ctx.diagnostics,
@@ -1686,6 +1660,7 @@ type struct CompilerInstance {
         if (!this.run_frontend(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
         }
+        ctx.frontend_complete = true;
         if (!this.run_module_resolution(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
         }
