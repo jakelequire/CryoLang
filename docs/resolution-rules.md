@@ -144,6 +144,22 @@ yet is recorded with the change that builds it, not here.
      rebuild,** and their work starts by measuring that the name layer's
      stamps are filled in when the editor runs the compiler.  (Jake)
 
+335. **Hover on a name a pattern binds labels it a binding** - a match arm
+     `Ready` that binds the matched value hovers as `binding Ready: i64`, at
+     the arm and at every use - not as a `const`.  (Jake)
+
+336. **The editor's workspace symbol search may match the typed query
+     against declaration names.**  It is a text search the user asked for,
+     not name resolution: nothing it finds is used as a binding, so it is
+     not a door and breaks no rule above.  (Jake)
+
+337. **Find-references builds its index of uses per request,** with no
+     cache, until a measurement on the compiler project shows that it needs
+     one.  (Jake)
+
+338. **Work on a branch does not run or wait on CI;** the local gates are
+     its proof, and CI is watched on `main` only.  (Jake)
+
 ### 2026-10-13
 
 299. **Before the merge, the scratch directories are deleted:** `.objcmp/`,

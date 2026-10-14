@@ -14,10 +14,11 @@ import std::collections::string::{ String };
 import std::json::value;
 
 import compiler::compilation_context::{ CompilationContext };
-import compiler::ast::{ NodeKind };
+import compiler::ast::{ NodeKind, PatternElement };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::node_locator;
 import compiler::ast::declaration::{ ClassDeclNode, EnumDeclNode, StructDeclNode, UnionDeclNode, VarDeclNode };
+import compiler::ast::pattern::{ EnumPatternNode, PatternNode };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::res::{ DefId, DefKind };
 import compiler::resolver::symbol::{ Symbol };
@@ -103,6 +104,32 @@ type struct Declared {
             if (v.sym_id.equals(s) && v.name_span.start_line != 0) { return v.name_span; }
         }
         return at;
+    }
+
+    /// Whether a binding is one a pattern declares: a match arm's name, or
+    /// a name inside a variant's pattern.
+    static is_pattern_binding(ctx: CompilationContext*, s: SymbolID) -> boolean {
+        const at: SourceSpan = ctx.resolver.get_symbol(s).declaring_span;
+        if (at.start_line == 0) { return false; }
+        const m: i64 = ctx.module_graph.find_module_by_path(at.file);
+        if (m < 0) { return false; }
+        const program: ProgramNode* = ctx.module_graph.get_module_ast(m as u32);
+        const n: ASTNode* = Locator::node_at(ctx, program, at.start_line, at.start_col);
+        if (n == null) { return false; }
+        if (n.kind == NodeKind::Pattern) {
+            return (n as PatternNode*).binding_sym.equals(s);
+        }
+        if (n.kind != NodeKind::EnumPattern) { return false; }
+        const ep: EnumPatternNode* = n as EnumPatternNode*;
+        for (mut i: i64 = 0; i < ep.elements.length; i++) {
+            match (ep.elements[i]) {
+                PatternElement::Binding(b) => {
+                    if (b != null && b.sym_id.equals(s)) { return true; }
+                }
+                _ => { }
+            }
+        }
+        return false;
     }
 
     static field_span(ctx: CompilationContext*, owner: DefId, index: i64) -> SourceSpan {
