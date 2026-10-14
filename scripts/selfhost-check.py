@@ -518,9 +518,9 @@ def _config_without_bin(text: str) -> str:
 # HARD REQUIREMENT: a self-host LINKS a runnable compiler at stages 2/4/6 (each
 # stage's cryo.exe builds the next, then we run it).  So the Windows toolchain
 # must compile + archive + LINK cryo.exe: a C driver (CRYO_CC), an archiver, a
-# linker, and LLVM-C.dll.  wine has no linker, so under wine this needs the
-# fetched .toolchains/llvm-win bits and still can't link the bin - it's meant
-# to run on a native Windows host.
+# linker, and LLVM-C.dll.  wine has none of them, so under wine the arm takes
+# all four from the fetched .toolchains (scripts/fetch-windows-llvm.sh):
+# llvm-mingw's clang.exe and llvm-ar.exe, and llvm-win's DLLs.
 # ---------------------------------------------------------------------------
 WIN_BOOT = ROOT / "bin" / "cryo.exe"
 
@@ -663,7 +663,13 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
             print(f"      wine + the fetched llvm-mingw (clang/ld.lld) and llvm-win (LLVM-C) bits.{C.RESET}")
             return ("skip", "missing " + ", ".join(missing))
         zwin = lambda p: "Z:" + str(p).replace("/", "\\")
+        # bin/cryo.exe loads LLVM-C.dll and libclang.dll at start-up, and a
+        # checkout has neither beside it (bin/'s copies are untracked).
+        # Without them wine exits 53 having printed nothing, before the boot
+        # compiler answers its first command.  WINEPATH puts the fetched
+        # pair on the DLL search path of every stage.
         env = {"WINEDEBUG": "-all",
+               "WINEPATH": zwin(WIN_LLVM_DLL.parent),
                "CRYO_STDLIB": "Z:" + str(ROOT / "stdlib").replace("\\", "/"),
                "CRYO_CC": zwin(WIN_CLANG),
                "CRYO_AR": zwin(WIN_AR),

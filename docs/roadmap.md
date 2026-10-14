@@ -49,7 +49,7 @@ fires only on `main` and on a manual dispatch.  As it stands:
 | `incremental-check` | no | yes |
 | `vendor-check` | no | yes |
 | `api-index-check` | no | yes |
-| `selfhost-check` | no | yes, Linux arm, `--allow-skipped-arm` |
+| `selfhost-check` | no | yes, both arms: the Windows chain under wine on the Linux runner |
 
 So the first CI run on `main` exercises six gates the branch's sessions
 did not run as routine; a red one there is not evidence that the merge broke
@@ -69,13 +69,6 @@ itself cannot be checked object-for-object against `main`; compare against
 `naming-impl`'s tip instead.
 
 **Known red or unexercised.**
-- `selfhost-check`'s wine path, measured on the CI runner (ruling 270) by
-  the dispatch-only `selfhost-wine-arm` job: it stops at its first command.
-  `wine bin/cryo.exe version --triple` exits 53 and prints nothing.  The
-  likely cause, not yet confirmed: the boot compiler has no `LLVM-C.dll`
-  beside it on a fresh checkout (a developer's `bin/` holds an untracked
-  copy), and nothing puts one there or on wine's DLL path.  Whether to make
-  it run or delete it is open.
 - `make release`, `install` and `uninstall` are POSIX recipes with no
   Windows branch; on a Windows host they fail with a cmd parse error rather
   than a refusal.
@@ -157,9 +150,6 @@ normalised before the comparison.
   `tools/CryoLSP/tests/smoke.py` starts the server and asks it questions;
   nothing calls it today (ruling 269: it stays and is wired into the LSP
   check after the merge).
-- **selfhost-check's wine path is measured on the CI runner** before it is
-  kept or deleted (ruling 270: measure first, then decide).  It cannot run
-  under WSL, and CI passes `--allow-skipped-arm` to tolerate its absence.
 - **The language server reports the stamped version** (`serverInfo`) that
   `cryo version` prints.
 - **`cryo version --verbose` shows the binary's sha256,** once the standard

@@ -164,45 +164,9 @@ jobs:
     # Runs on PRs and pushes to main: a change that breaks the self-host
     # fixed point must fail the PR that introduces it, not surface only
     # after merge.
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - name: Restore the LLVM toolchain cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/cryo-ci
-          key: llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/llvm-version.env', 'scripts/ci/install-llvm.sh') }}
-
-      - name: Install the LLVM toolchain (apt.llvm.org on cache miss)
-        run: ./scripts/ci/install-llvm.sh
-
-      # ubuntu-latest has no wine and no fetched windows toolchain, so the
-      # Windows arm cannot run here and this job verifies the LINUX arm only.
-      # The flag says so out loud: without it a skipped arm fails the gate,
-      # which is how it used to exit 0 having run half of itself. Both arms
-      # are verified on a Windows host, where WSL supplies the Linux one.
-      - name: Run selfhost-check (linux arm; windows arm needs a Windows host)
-        run: make selfhost-check ARGS=--allow-skipped-arm
-
-      - name: Upload stage logs on failure
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: selfhost-check-logs
-          path: build-logs/
-          if-no-files-found: ignore
-
-  # selfhost-check's Windows arm under wine, provisioned the way windows-smoke
-  # provisions its cross build.  It has never been seen to run - not under
-  # WSL, not here - so it runs on a manual dispatch only, as a measurement:
-  # what it does on this runner decides whether the arm is kept as a gate or
-  # deleted.  Until then it gates nothing on a push.
-  selfhost-wine-arm:
-    name: selfhost-check windows arm under wine (dispatch only, measurement)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    timeout-minutes: 90
+    # Both arms: the Linux chain natively, the Windows chain booted from
+    # bin/cryo.exe under wine, linking with the fetched llvm-mingw.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -229,19 +193,19 @@ jobs:
       - name: Fetch the windows LLVM bits and llvm-mingw
         run: ./scripts/fetch-windows-llvm.sh
 
-      # Both arms, no --allow-skipped-arm: a skipped Windows arm fails, so
-      # the result says whether the arm ran, not only whether it passed.
+      # No --allow-skipped-arm: a skipped Windows arm fails, so the result
+      # says whether each arm ran, not only whether it passed.
       - name: Run selfhost-check, both arms
         env:
           WINEDEBUG: "-all"
           WINEDLLOVERRIDES: "mscoree,mshtml="
         run: make selfhost-check
 
-      - name: Upload stage logs
-        if: always()
+      - name: Upload stage logs on failure
+        if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: selfhost-wine-arm-logs
+          name: selfhost-check-logs
           path: build-logs/
           if-no-files-found: ignore
 
