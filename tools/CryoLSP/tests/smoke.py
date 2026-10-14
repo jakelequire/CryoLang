@@ -201,6 +201,10 @@ class Server:
         if self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
+        try:
+            self.proc.stdin.close()          # a dead server's pipe cannot flush
+        except OSError:
+            pass
 
 
 class Checks:
@@ -513,6 +517,76 @@ def run_protocol(server_path, c):
         report_stderr(srv, c, failed_before)
 
 
+def run_protocol_errors(server_path, c):
+    """Every error reply is answered, and the server lives on after it."""
+    print("protocol errors")
+    failed_before = len(c.failed)
+    root = os.path.join(FIXTURES, "two_modules")
+    srv = Server(server_path, root)
+    try:
+        early = srv.request("textDocument/hover", {
+            "textDocument": {"uri": uri_for(os.path.join(root, "src", "main.cryo"))},
+            "position": {"line": 0, "character": 0}}, timeout=30)
+        c.ok(early is not None and (early.get("error") or {}).get("code") == -32002,
+             "protocol: a request before initialize is refused as not initialized",
+             "got %r" % (early,))
+        initialize(srv, root, c, "protocol errors")
+
+        for i, method in enumerate(("cryo/noSuchMethod", "textDocument/noSuchMethod")):
+            resp = srv.request(method, {}, timeout=30)
+            c.ok(resp is not None and (resp.get("error") or {}).get("code") == -32601,
+                 "protocol: unknown method %d is answered with method-not-found" % (i + 1),
+                 "got %r (server %s)" % (resp, "alive" if srv.alive() else "dead"))
+
+        srv.send({"jsonrpc": "2.0", "id": "bad-1", "params": {}})
+        bad = srv.wait_response("bad-1", 30)
+        c.ok(bad is not None and (bad.get("error") or {}).get("code") == -32600,
+             "protocol: a request with no method is answered as invalid, under its id",
+             "got %r" % (bad,))
+
+        srv.send_raw(b"{ this is not json")
+        parse = srv.wait_response(None, 30)
+        c.ok(parse is not None and (parse.get("error") or {}).get("code") == -32700,
+             "protocol: a body that is not JSON is answered with a parse error",
+             "got %r" % (parse,))
+
+        main_uri = uri_for(os.path.join(root, "src", "main.cryo"))
+        with open(os.path.join(root, "src", "main.cryo"), "r", encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        srv.notify("textDocument/didOpen", {"textDocument": {
+            "uri": main_uri, "languageId": "cryo", "version": 1, "text": text}})
+        after = srv.request("textDocument/hover", {
+            "textDocument": {"uri": main_uri}, "position": {"line": 0, "character": 0}})
+        c.ok(after is not None and "error" not in after,
+             "protocol: answers a real request after the error replies",
+             "got %r (server %s)" % (after, "alive" if srv.alive() else "dead"))
+
+        published = srv.wait_notification(
+            "textDocument/publishDiagnostics",
+            lambda p: same_uri(p.get("uri", ""), main_uri), timeout=COLD_TIMEOUT)
+        refresh = srv.wait_notification("workspace/semanticTokens/refresh",
+                                         lambda p: True, timeout=0)
+        c.ok(published is not None and refresh is None,
+             "protocol: no semantic-token refresh is sent to a client that did not declare it",
+             "published %r, refresh %r" % (published is not None, refresh is not None))
+
+        sd = srv.request("shutdown", {}, timeout=60)
+        c.ok(sd is not None and "result" in sd, "protocol errors: shutdown returns a result")
+        late = srv.request("textDocument/hover", {
+            "textDocument": {"uri": main_uri}, "position": {"line": 0, "character": 0}}, timeout=30)
+        c.ok(late is not None and (late.get("error") or {}).get("code") == -32600,
+             "protocol: a request after shutdown is refused as invalid", "got %r" % (late,))
+        srv.notify("exit", {})
+        try:
+            rc = srv.proc.wait(timeout=20)
+            c.ok(rc == 0, "protocol errors: exits 0 after shutdown and exit", "rc=%r" % rc)
+        except subprocess.TimeoutExpired:
+            c.ok(False, "protocol errors: exits 0 after shutdown and exit", "timed out")
+    finally:
+        srv.stop()
+        report_stderr(srv, c, failed_before)
+
+
 def main():
     args = sys.argv[1:]
     only = None
@@ -532,6 +606,7 @@ def main():
     fixtures = 0
     if only is None:
         run_protocol(server_path, c)
+        run_protocol_errors(server_path, c)
     for name in sorted(os.listdir(FIXTURES)):
         root = os.path.join(FIXTURES, name)
         if only is not None and name != only:

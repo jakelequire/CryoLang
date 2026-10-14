@@ -211,17 +211,31 @@ First fixture, `two_modules`: two modules declaring the same `Item`, `make`,
 constant arm, locals and a parameter. Its other questions are asked by later
 steps.
 
-### Step 1. Protocol hardening and positions
+### Step 1. Protocol hardening and positions (landed)
 
-- Instrument B1 first, then fix the ownership on the error-reply path.
-- Reply `InvalidRequest` / `ParseError` when an id can be recovered; honour
-  the post-shutdown gate; strict `Content-Length` digits.
-- `PositionMap`: one conversion between UTF-16 columns, byte offsets and the
-  compiler's columns (a tab advances to the next 4-column stop), used by
-  every handler and by diagnostics. UTF-8 when the client offers it.
-- `workspace/semanticTokens/refresh` only when the client declares it.
-- Checks: unknown methods, a malformed request, a request after shutdown;
-  a `positions` fixture with tab-indented lines and text outside ASCII.
+- B1's cause, measured with a probe: `match (resp.error)` through a
+  reference moves the `Option` payload out and releases it at the end of the
+  arm, and the caller then releases the response again (no move checking
+  yet). `match (&...)` borrows; the two other by-value field matches in the
+  protocol layer (`Hover.range`, `CompletionItem.detail`) are borrowed too.
+- Every invalid frame is answered: a parse error under `null`, a request
+  with no method as invalid under its own id; a client's response to a
+  server request is read and dropped. Requests after `shutdown` are
+  refused. `Content-Length` takes digits and surrounding blanks only.
+- `line_index::Columns` is the one conversion between wire columns (UTF-16,
+  or bytes under `utf-8`), byte offsets and compiler columns (a tab advances
+  to the next 4-column stop). `Docs` applies it: a cursor to a compiler
+  position, a byte offset to a wire position, a span to a wire range
+  measured against the span's file (its open buffer, or the file on disk).
+  Diagnostics, related information, suggestions, inactive regions, hover and
+  definition ranges, code lenses and semantic tokens all go through it.
+- `workspace/semanticTokens/refresh` is sent only to a client that declares
+  it.
+- Checks: a `protocol errors` run (a request before initialize, two unknown
+  methods, a request with no method, a body that is not JSON, a real request
+  after them, no refresh to a client that did not declare it, a request
+  after shutdown, exit 0) and a `positions` fixture (tab-indented lines,
+  text outside ASCII, a warning on a tab-indented line).
 
 ### Step 2. One project, all overlays, on save, last-good snapshot
 

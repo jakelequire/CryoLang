@@ -39,6 +39,7 @@ import compiler::module_graph;
 import lsp::server::session;
 import lsp::server::docs;
 import lsp::protocol::conv;
+import lsp::protocol::lsp;
 import std::fmt;
 
 
@@ -79,7 +80,7 @@ public function handle_code_lens(docs: &docs::Docs, sessions: mut &session::Sess
         if (!conv::DiagnosticConverter::diag_is_for_path(&diags[i], fs_path)) { continue; }
         if (!diags[i].span.has_location())               { continue; }
         mut id: String = conv::DiagnosticConverter::build_diag_id(&diags[i]);
-        lenses.push(CodeLensBuilder::build_lens(&diags[i], id.as_str()));
+        lenses.push(CodeLensBuilder::build_lens(docs, &diags[i], id.as_str()));
         mem::drop(id);
     }
     mem::drop(fs_path_owned);
@@ -88,7 +89,7 @@ public function handle_code_lens(docs: &docs::Docs, sessions: mut &session::Sess
     // trait declaration in this document, counting impl blocks across the
     // whole module graph.  Clicking it opens a reference peek listing each
     // implementation (client command `cryo.showImplementations`).
-    ImplLensBuilder::append_impl_lenses(&lenses, ctx, uri.as_str());
+    ImplLensBuilder::append_impl_lenses(&lenses, ctx, uri.as_str(), docs);
 
     return value::JsonValue::Array(lenses);
 }
@@ -107,7 +108,8 @@ type struct ImplLensBuilder {
     /// No-op when the module isn't in the graph (single-file fallback for
     /// a URI outside the project) or carries no type/trait decls.
     static append_impl_lenses(lenses: mut &Array<value::JsonValue>,
-                               ctx: compilation_context::CompilationContext*, uri: str::Str) -> void {
+                               ctx: compilation_context::CompilationContext*, uri: str::Str,
+                               positions: &docs::Docs) -> void {
         if (ctx == null || ctx.module_graph == null) { return; }
         const ast: node::ProgramNode* = ImplLensBuilder::module_ast_for_uri(ctx, uri);
         if (ast == null) { return; }
@@ -160,7 +162,7 @@ type struct ImplLensBuilder {
             const name_span: source_span::SourceSpan = node_locator::name_span_of(stmt);
             if (!name_span.has_location()) { continue; }
 
-            lenses.push(ImplLensBuilder::build_impl_lens(uri, name_span, &spans));
+            lenses.push(ImplLensBuilder::build_impl_lens(positions, uri, name_span, &spans));
         }
     }
 
@@ -189,20 +191,22 @@ type struct ImplLensBuilder {
     /// name span; the command fires `cryo.showImplementations` with
     /// `[anchorUri, anchorPosition, locations]` so the client extension
     /// can hand them to VS Code's `editor.action.showReferences` peek.
-    static build_impl_lens(uri: str::Str, name_span: source_span::SourceSpan,
+    static build_impl_lens(positions: &docs::Docs, uri: str::Str, name_span: source_span::SourceSpan,
                             spans: &source_span::SourceSpan[]) -> value::JsonValue {
         const count: i64 = spans.length;
 
         // command.arguments[2] = [ Location, ... ]
         mut locs: Array<value::JsonValue> = Array::<value::JsonValue>::with_capacity(count as u64);
         for (mut i: i64 = 0; i < spans.length; i++) {
-            locs.push(ImplLensBuilder::location_json(spans[i]));
+            locs.push(ImplLensBuilder::location_json(positions, spans[i]));
         }
 
-        // command.arguments = [ anchorUri, anchorPosition, locations ]
+        // command.arguments = [ anchorUri, anchorPosition, locations ]: the
+        // anchor is where the reference peek opens, the name's start.
+        const name_range: lsp::Range = positions.range_of_span(name_span);
         mut args: Array<value::JsonValue> = Array::<value::JsonValue>::with_capacity(3);
         args.push(value::JsonValue::from(uri));
-        args.push(ImplLensBuilder::position_json(name_span));
+        args.push(name_range.start.to_json());
         args.push(value::JsonValue::Array(locs));
 
         const title: string = if (count == 1) {
@@ -217,27 +221,17 @@ type struct ImplLensBuilder {
         cmd.put("arguments", value::JsonValue::Array(args));
 
         mut lens: value::JsonObject = value::JsonObject::new();
-        lens.put("range", conv::DiagnosticConverter::range_json_from_span(name_span));
+        lens.put("range", name_range.to_json());
         lens.put("command", value::JsonValue::Object(cmd));
         return value::JsonValue::Object(lens);
     }
 
     /// LSP `Location` JSON (`{ uri, range }`) for an implementation site.
-    static location_json(span: source_span::SourceSpan) -> value::JsonValue {
+    static location_json(positions: &docs::Docs, span: source_span::SourceSpan) -> value::JsonValue {
         mut loc: value::JsonObject = value::JsonObject::new();
         loc.put("uri",   value::JsonValue::String(conv::UriPath::uri_string_from_fs_path(span.file)));
-        loc.put("range", conv::DiagnosticConverter::range_json_from_span(span));
+        loc.put("range", conv::DiagnosticConverter::range_json_from_span(positions, span));
         return value::JsonValue::Object(loc);
-    }
-
-    /// LSP `Position` JSON at the 0-based start of `span` - the anchor the
-    /// reference peek opens over.
-    static position_json(span: source_span::SourceSpan) -> value::JsonValue {
-        mut sl: u32 = 0;
-        mut sc: u32 = 0;
-        if (span.start_line > 0) { sl = span.start_line - 1; }
-        if (span.start_col  > 0) { sc = span.start_col  - 1; }
-        return conv::DiagnosticConverter::pos_json(sl, sc);
     }
 }
 
@@ -270,7 +264,7 @@ type struct CodeLensBuilder {
     /// `range` is the diagnostic's primary span; the `command` fires
     /// the client-side `cryo.openRenderedDiagnostic` with the
     /// diagnostic id as a single argument.
-    static build_lens(diag: &diagnostic::Diagnostic, id: str::Str) -> value::JsonValue {
+    static build_lens(positions: &docs::Docs, diag: &diagnostic::Diagnostic, id: str::Str) -> value::JsonValue {
         const title:  string = "Show full diagnostic";
         const cmd_id: string = "cryo.openRenderedDiagnostic";
 
@@ -284,7 +278,7 @@ type struct CodeLensBuilder {
         cmd.put("arguments", value::JsonValue::Array(args));
 
         mut lens: value::JsonObject = value::JsonObject::new();
-        lens.put("range", conv::DiagnosticConverter::range_json_from_span(diag.span));
+        lens.put("range", conv::DiagnosticConverter::range_json_from_span(positions, diag.span));
         lens.put("command", value::JsonValue::Object(cmd));
         return value::JsonValue::Object(lens);
     }

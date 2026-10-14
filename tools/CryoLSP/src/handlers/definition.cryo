@@ -113,9 +113,9 @@ public function handle_definition(docs: &docs::Docs, sessions: mut &session::Ses
     if (ast == null) { return value::JsonValue::Null; }
 
     // -- Walk to the innermost node -----------------------------------
-    // Compiler spans are 1-based; LSP positions are 0-based.
-    const cursor_line: u32 = line + 1 as u32;
-    const cursor_char: u32 = character + 1 as u32;
+    const cursor: docs::CompilerPos = docs.to_compiler(uri, line, character);
+    const cursor_line: u32 = cursor.line;
+    const cursor_char: u32 = cursor.col;
     const node: node::ASTNode* = node_locator::find_innermost_node_at(
         ast, cursor_line, cursor_char);
     if (node == null) { return value::JsonValue::Null; }
@@ -148,7 +148,7 @@ public function handle_definition(docs: &docs::Docs, sessions: mut &session::Ses
         const seg_idx: i64 = DefinitionEngine::import_segment_at(imp, cursor_line, cursor_char);
         if (seg_idx >= 0 && ctx.intern_table != null) {
             const literal: string = eng.build_import_segment_path(imp, seg_idx);
-            const result: value::JsonValue = eng.jump_to_namespace(literal);
+            const result: value::JsonValue = eng.jump_to_namespace(literal, docs);
             if (!result.is_null()) { return result; }
         }
     }
@@ -162,7 +162,7 @@ public function handle_definition(docs: &docs::Docs, sessions: mut &session::Ses
         const seg_idx: i64 = DefinitionEngine::module_decl_segment_at(md, cursor_line, cursor_char);
         if (seg_idx >= 0 && ctx.intern_table != null) {
             const literal: string = eng.build_module_decl_path(md, seg_idx);
-            const result: value::JsonValue = eng.jump_to_namespace(literal);
+            const result: value::JsonValue = eng.jump_to_namespace(literal, docs);
             if (!result.is_null()) { return result; }
         }
     }
@@ -354,7 +354,7 @@ public function handle_definition(docs: &docs::Docs, sessions: mut &session::Ses
     if (target_span.file == "")       { return value::JsonValue::Null; }
     if (libc::strlen(target_span.file) == 0 as u64) { return value::JsonValue::Null; }
 
-    return DefinitionEngine::build_location_json(target_span);
+    return DefinitionEngine::build_location_json(docs, target_span);
 }
 
 
@@ -407,7 +407,7 @@ type struct DefinitionEngine {
     /// otherwise falls back to deriving the file path from a loaded
     /// descendant + checking disk.  Returns `JsonValue::Null` when no
     /// target found, so callers can chain.
-    jump_to_namespace(&this, literal: string) -> value::JsonValue {
+    jump_to_namespace(&this, literal: string, positions: &docs::Docs) -> value::JsonValue {
         const std_path: string = "std::" + literal;
 
         mut prog: node::ProgramNode* = node_locator::find_program_by_namespace(this.graph, literal);
@@ -417,7 +417,7 @@ type struct DefinitionEngine {
         if (prog != null) {
             const span: source_span::SourceSpan = DefinitionEngine::first_namespace_decl_span(prog);
             if (span.has_location() && libc::strlen(span.file) > 0 as u64) {
-                return DefinitionEngine::build_location_json(span);
+                return DefinitionEngine::build_location_json(positions, span);
             }
         }
 
@@ -659,12 +659,12 @@ type struct DefinitionEngine {
     /// field carries the absolute filesystem path (the parser stamps
     /// every span with the source it came from).  Reconstructs the URI
     /// by prepending `file://` - the inverse of `uri_to_fs_path`.
-    static build_location_json(span: source_span::SourceSpan) -> value::JsonValue {
+    static build_location_json(positions: &docs::Docs, span: source_span::SourceSpan) -> value::JsonValue {
         // Reconstruct the URI via the shared builder so Windows drive paths
         // get the `file:///C:/...` form (see UriPath::uri_string_from_fs_path).
         mut uri_buf: String = conv::UriPath::uri_string_from_fs_path(span.file);
 
-        const range: lsp::Range = DefinitionEngine::range_from_span(span);
+        const range: lsp::Range = positions.range_of_span(span);
         const loc: lsp::Location = lsp::Location { uri: uri_buf, range: range };
         const result: value::JsonValue = loc.to_json();
         mut l: lsp::Location = loc;
@@ -697,18 +697,5 @@ type struct DefinitionEngine {
             }
             Option::None => { return 0 as u32; }
         }
-    }
-
-    /// Convert a 1-based compiler `SourceSpan` to a 0-based LSP `Range`.
-    static range_from_span(span: source_span::SourceSpan) -> lsp::Range {
-        mut sl: u32 = 0;
-        mut sc: u32 = 0;
-        mut el: u32 = 0;
-        mut ec: u32 = 0;
-        if (span.start_line > 0) { sl = span.start_line - 1; }
-        if (span.start_col  > 0) { sc = span.start_col  - 1; }
-        if (span.end_line   > 0) { el = span.end_line   - 1; }
-        if (span.end_col    > 0) { ec = span.end_col    - 1; }
-        return lsp::protocol::lsp::Range::new(lsp::Position::new(sl, sc), lsp::Position::new(el, ec));
     }
 }

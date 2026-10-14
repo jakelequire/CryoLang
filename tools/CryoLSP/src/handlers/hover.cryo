@@ -123,8 +123,9 @@ public function handle_hover_ex(docs: &docs::Docs, sessions: mut &session::Sessi
     // `ensure_fresh` recompiles this document if another document's edit
     // reset the shared AST arena since this session last compiled, so the
     // ctx we walk below is never dangling (see Session.cryo).
-    const cursor_line: u32 = line + 1 as u32;
-    const cursor_char: u32 = character + 1 as u32;
+    const cursor: docs::CompilerPos = docs.to_compiler(uri, line, character);
+    const cursor_line: u32 = cursor.line;
+    const cursor_char: u32 = cursor.col;
 
     mut ctx: compilation_context::CompilationContext* = null;
     mut node: node::ASTNode* = null;
@@ -168,7 +169,7 @@ public function handle_hover_ex(docs: &docs::Docs, sessions: mut &session::Sessi
         match (doc_opt) {
             Option::Some(doc) => {
                 const kw_hover: Option<value::JsonValue> =
-                    keyword_docs::try_keyword_hover(doc, line, character);
+                    keyword_docs::try_keyword_hover(docs, doc, line, character);
                 match (kw_hover) {
                     Option::Some(json) => { return json; }
                     Option::None       => { }
@@ -1098,7 +1099,7 @@ public function handle_hover_ex(docs: &docs::Docs, sessions: mut &session::Sessi
     const contents: lsp::MarkupContent = lsp::MarkupContent::markdown(value_buf);
     const hover: lsp::Hover = lsp::Hover {
         contents: contents,
-        range:    Option::Some(HoverEngine::range_from_span(hover_span)),
+        range:    Option::Some(docs.range_of_span(hover_span)),
     };
     const result: value::JsonValue = hover.to_json();
     mut h: lsp::Hover = hover;
@@ -3228,20 +3229,6 @@ type struct HoverEngine {
         return false;
     }
 
-    /// Convert a 1-based compiler `SourceSpan` to a 0-based LSP `Range`.
-    /// Used so the editor highlights the matched token while the tooltip
-    /// is open - without a range the hover anchors to a single point.
-    static range_from_span(span: source_span::SourceSpan) -> lsp::Range {
-        mut sl: u32 = 0;
-        mut sc: u32 = 0;
-        mut el: u32 = 0;
-        mut ec: u32 = 0;
-        if (span.start_line > 0) { sl = span.start_line - 1; }
-        if (span.start_col  > 0) { sc = span.start_col  - 1; }
-        if (span.end_line   > 0) { el = span.end_line   - 1; }
-        if (span.end_col    > 0) { ec = span.end_col    - 1; }
-        return lsp::protocol::lsp::Range::new(lsp::Position::new(sl, sc), lsp::Position::new(el, ec));
-    }
 
     /// Render a literal-bearing expression to its source-level text.
     /// Handles bare `LiteralNode` and `-<literal>` UnaryExpressions

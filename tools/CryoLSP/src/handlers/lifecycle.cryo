@@ -44,14 +44,12 @@ public function handle_initialize(state: mut &state::ServerState, params: &value
 
     state.initialized = true;
 
-    // Position-encoding negotiation.  LSP defaults `character` offsets to
-    // UTF-16 code units, but our line index and handlers count raw UTF-8
-    // bytes.  When the client advertises `utf-8` support we advertise it
-    // back, which makes the existing byte math correct on the wire.  If
-    // the client only offers UTF-16, we leave the field unset (defaulting
-    // to UTF-16) - positions on non-ASCII lines are then off by the usual
-    // UTF-8/UTF-16 unit delta until real UTF-16 counting lands.
+    // Position encoding: `utf-8` when the client offers it, otherwise the
+    // protocol's default, UTF-16 code units.  Either way the columns are
+    // converted in one place (`line_index::Columns`).
     const advertise_utf8: boolean = LspCapabilities::client_offers_utf8(params);
+    state.utf8_positions = advertise_utf8;
+    state.semantic_tokens_refresh = LspCapabilities::client_supports_tokens_refresh(params);
     return LspCapabilities::build_initialize_result(advertise_utf8);
 }
 
@@ -67,6 +65,35 @@ public function handle_shutdown(state: mut &state::ServerState) -> value::JsonVa
 // LspCapabilities - client-capability probing + InitializeResult building.
 
 type struct LspCapabilities {
+
+    /// True when the client declares
+    /// `capabilities.workspace.semanticTokens.refreshSupport: true`.
+    static client_supports_tokens_refresh(params: &value::JsonValue) -> boolean {
+        match (params.get(str::Str::from("capabilities"))) {
+            Option::Some(caps) => {
+                match (caps.get(str::Str::from("workspace"))) {
+                    Option::Some(ws) => {
+                        match (ws.get(str::Str::from("semanticTokens"))) {
+                            Option::Some(st) => {
+                                match (st.get(str::Str::from("refreshSupport"))) {
+                                    Option::Some(flag) => {
+                                        match (flag) {
+                                            value::JsonValue::Bool(b) => { return b; }
+                                            _ => { return false; }
+                                        }
+                                    }
+                                    Option::None => { return false; }
+                                }
+                            }
+                            Option::None => { return false; }
+                        }
+                    }
+                    Option::None => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+    }
 
     /// True when the client's `initialize` params advertise support for the
     /// `utf-8` position encoding (`capabilities.general.positionEncodings`

@@ -134,14 +134,12 @@ type struct Server {
     /// reply against.
     handle(mut &this, body: str::Str) -> void {
         mut msg: jsonrpc::IncomingMessage = jsonrpc::JsonRpcCodec::parse_incoming(body);
-        match (msg) {
+        match (&msg) {
             jsonrpc::IncomingMessage::Request(_)      => { this.dispatch_request(&msg); }
             jsonrpc::IncomingMessage::Notification(_) => { this.dispatch_notification(&msg); }
-            jsonrpc::IncomingMessage::Invalid(_)      => {
-                // Drop the parse-failure reason on the floor - the
-                // alternative is logging to stderr, which is fine
-                // but adds dependency on `eprintln`.  Add when
-                // surface area justifies it.
+            jsonrpc::IncomingMessage::Response        => { }
+            jsonrpc::IncomingMessage::Invalid(inv)    => {
+                this.reply_error(&inv.id, inv.code, inv.reason.as_str());
             }
         }
         mem::drop(msg);
@@ -165,9 +163,19 @@ type struct Server {
                     return;
                 }
 
+                // After `shutdown`, only `exit` (a notification) is honoured.
+                if (this.state.shutdown_requested) {
+                    this.reply_error(&req.id,
+                        jsonrpc::INVALID_REQUEST,
+                        str::Str::from("server is shutting down"));
+                    return;
+                }
+
                 if (method.equals(&str::Str::from("initialize"))) {
                     const result: value::JsonValue =
                         lifecycle::handle_initialize(&this.state, &req.params);
+                    this.docs.utf8 = this.state.utf8_positions;
+                    this.outbound.refresh_supported = this.state.semantic_tokens_refresh;
                     this.reply_ok(&req.id, result);
                     return;
                 }

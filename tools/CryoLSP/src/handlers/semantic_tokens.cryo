@@ -107,6 +107,8 @@ type struct SemanticTokenizer {
     doc_text:         string;
     doc_text_length:  u64;
     doc_file:         string;
+    /// Wire columns count bytes rather than UTF-16 code units.
+    utf8:             boolean;
     tokens:           Array<SemanticToken>;
 
     /// Build a tokenizer for one request.  Pre-interns the receiver-name
@@ -126,6 +128,7 @@ type struct SemanticTokenizer {
             doc_text:         "",
             doc_text_length:  0 as u64,
             doc_file:         doc_file,
+            utf8:             docs.utf8,
             tokens:           Array::<SemanticToken>::new(),
         };
         if (intern != null) {
@@ -1019,11 +1022,9 @@ type struct SemanticTokenizer {
         }
         const line: u32   = span.start_line - 1 as u32;
 
-        // The lexer reports columns as TAB-EXPANDED visual cells (tab advances
-        // to the next multiple of 4, see `SourceLocation::increment_char`),
-        // but the LSP wire format wants character offsets (= bytes for ASCII
-        // source).  Walk the line content to translate.  Without the buffer,
-        // fall back to byte=cell which is correct for tab-free lines.
+        // Compiler columns become wire columns through `Columns`, measured
+        // against the live buffer.  Without the buffer there is nothing to
+        // measure, and the compiler's columns are used as they are.
         mut start_byte: u32 = if (span.start_col > 0 as u32) {
             span.start_col - 1 as u32
         } else {
@@ -1055,20 +1056,18 @@ type struct SemanticTokenizer {
                 if (last_byte == 13 as u8) { line_bytes = line_bytes - 1; }
             }
 
-            // Translate cell-columns to byte-columns by walking the line.
-            const line_ptr: string = this.doc_text + line_start as i64;
-            start_byte = SemanticTokenizer::cell_col_to_byte_col(line_ptr, line_bytes, span.start_col);
+            const line_text: str::Str = str::Str::from_raw((this.doc_text + line_start as i64) as u8*, line_bytes);
+            const sb: u64 = line_index::Columns::compiler_to_byte(line_text, span.start_col);
+            mut eb: u64 = sb + 1;
             if (span.end_line == span.start_line && span.end_col > span.start_col) {
-                end_byte_opt = SemanticTokenizer::cell_col_to_byte_col(line_ptr, line_bytes, span.end_col);
-            } else {
-                end_byte_opt = start_byte + 1 as u32;
+                eb = line_index::Columns::compiler_to_byte(line_text, span.end_col);
             }
 
             // Validate the resolved byte range against the live line length.
-            if (start_byte as u64 >= line_bytes && line_bytes > 0 as u64) { return; }
-            if ((end_byte_opt as u64) > line_bytes) {
-                end_byte_opt = line_bytes as u32;
-            }
+            if (sb >= line_bytes && line_bytes > 0 as u64) { return; }
+            if (eb > line_bytes) { eb = line_bytes; }
+            start_byte = line_index::Columns::byte_to_wire(line_text, sb, this.utf8);
+            end_byte_opt = line_index::Columns::byte_to_wire(line_text, eb, this.utf8);
         }
 
         mut length: u32 = if (end_byte_opt > start_byte) {
@@ -1576,32 +1575,6 @@ type struct SemanticTokenizer {
             i = i + 1;
         }
         return false;
-    }
-
-    /// Walk `line` (byte length `line_bytes`) counting tab-expanded visual
-    /// cells and return the 0-indexed BYTE offset corresponding to the
-    /// 1-indexed cell column `target_cell`.  Mirrors the lexer's column
-    /// accounting (`SourceLocation::increment_char`): tab jumps to the
-    /// next multiple of 4 (1-indexed -> 1, 5, 9, ...), every other byte
-    /// advances one cell.  This is the inverse used by the LSP to map
-    /// parser-reported columns back to wire-format character offsets.
-    static cell_col_to_byte_col(line: string, line_bytes: u64, target_cell: u32) -> u32 {
-        if (target_cell <= 1 as u32) { return 0 as u32; }
-        mut cell: u32 = 1 as u32;
-        mut byte: u32 = 0 as u32;
-        while ((byte as u64) < line_bytes && cell < target_cell) {
-            const b: u8 = line[byte as i64] as u8;
-            if (b == 9 as u8) {
-                // tab: jump to next 4-cell stop (1-indexed: 5, 9, 13, ...).
-                const cell_zero: u32 = cell - 1 as u32;
-                const next_stop: u32 = ((cell_zero / 4 as u32) + 1 as u32) * 4 as u32 + 1 as u32;
-                cell = next_stop;
-            } else {
-                cell = cell + 1 as u32;
-            }
-            byte = byte + 1 as u32;
-        }
-        return byte;
     }
 
     static token_lt(a: &SemanticToken, b: &SemanticToken) -> boolean {

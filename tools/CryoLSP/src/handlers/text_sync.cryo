@@ -134,9 +134,9 @@ public function flush_pending(docs: &docs::Docs, sessions: mut &session::Session
                         Option::None      => { -1 }
                     };
                     diagnostics::DiagnosticPublisher::publish_for(writer, uri,
-                                              session.context(), cache);
+                                              session.context(), cache, docs);
                     inactive_regions::InactiveRegionsPublisher::publish_for(writer, uri,
-                                              session.context(), version);
+                                              session.context(), version, docs);
                     outbound.send_semantic_tokens_refresh(writer);
                 }
             }
@@ -233,9 +233,12 @@ type struct TextFields {
 /// counter lives on a struct field instead of a module global.
 type struct OutboundRequests {
     next: i64;
+    /// The client declared `workspace.semanticTokens.refreshSupport`; a
+    /// refresh request to a client that did not is an unknown method to it.
+    refresh_supported: boolean;
 
     static new() -> OutboundRequests {
-        return OutboundRequests { next: 1 as i64 };
+        return OutboundRequests { next: 1 as i64, refresh_supported: false };
     }
 
     /// Hand out the next request id and advance the counter.
@@ -254,6 +257,7 @@ type struct OutboundRequests {
     /// stale span colours on top of TextMate, producing the "broken-up,
     /// overlapping" highlighting the user reports.
     send_semantic_tokens_refresh(mut &this, writer: mut &stdio::Stdout) -> void {
+        if (!this.refresh_supported) { return; }
         const id: i64 = this.next_id();
         mut body: String = jsonrpc::JsonRpcCodec::encode_request(
             id,

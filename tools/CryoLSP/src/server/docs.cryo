@@ -21,23 +21,39 @@ import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::hashmap;
 import std::collections::hashmap::{ HashMap };
+import std::fs::file;
+import std::fs::path;
+import std::ffi::libc;
+import compiler::diag::source_span;
 import lsp::server::line_index;
+import lsp::server::line_index::{ Columns };
+import lsp::protocol::lsp;
+import lsp::protocol::conv;
 
 
 type struct Document {
     uri:        String;
+    /// The filesystem path the URI names, spelled as the compiler spells a
+    /// span's file, so a span is matched to its document by comparing paths.
+    path:       String;
     version:    i32;
     text:       String;
     line_index: line_index::LineIndex;
 
     static new(uri: String, text: String, version: i32) -> Document {
         const idx: line_index::LineIndex = line_index::LineIndex::build(text.as_str());
+        const p: String = conv::UriPath::uri_to_fs_path(uri.as_str());
         return Document {
             uri:        uri,
+            path:       p,
             version:    version,
             text:       text,
             line_index: idx,
         };
+    }
+
+    line_text(&this, line: u32) -> str::Str {
+        return Columns::line_of(this.text.as_str(), &this.line_index, line);
     }
 
     /// Replace the buffer (full sync) - drops the previous text, then
@@ -53,11 +69,116 @@ type struct Document {
     }
 }
 
+/// A position in the compiler's terms: 1-based line, 1-based column.
+type struct CompilerPos {
+    line: u32;
+    col:  u32;
+}
+
 type struct Docs {
     by_uri: HashMap<String, Document>;
+    /// Wire columns count bytes (the client offered `utf-8`) rather than
+    /// UTF-16 code units.  Set once by `initialize`.
+    utf8:   boolean;
 
     static new() -> Docs {
-        return Docs { by_uri: HashMap::<String, Document>::new() };
+        return Docs { by_uri: HashMap::<String, Document>::new(), utf8: false };
+    }
+
+    /// The open document whose file is `path`, compared as the compiler
+    /// spells a span's file.
+    by_path(&this, path: str::Str) -> Option<Document*> {
+        for (d in this.by_uri.values_ref()) {
+            if (d.path.as_str().equals(&path)) { return Option::Some(d); }
+        }
+        return Option::None;
+    }
+
+    /// The compiler position of wire position (`line`, `character`) in the
+    /// open document `uri`.  A document that is not open has no buffer to
+    /// measure, so its column is taken as given.
+    to_compiler(&this, uri: str::Str, line: u32, character: u32) -> CompilerPos {
+        match (this.get(uri)) {
+            Option::Some(doc) => {
+                const text: str::Str = doc.line_text(line);
+                const b: u64 = Columns::wire_to_byte(text, character, this.utf8);
+                return CompilerPos { line: line + 1, col: Columns::byte_to_compiler(text, b) };
+            }
+            Option::None => { return CompilerPos { line: line + 1, col: character + 1 }; }
+        }
+    }
+
+    /// Byte offset into document `doc` of wire position (`line`, `character`).
+    byte_offset(&this, doc: &Document, line: u32, character: u32) -> u64 {
+        const b: u64 = Columns::wire_to_byte(doc.line_text(line), character, this.utf8);
+        return doc.line_index.line_start(line) + b;
+    }
+
+    /// Wire position of byte offset `offset` into document `doc`.
+    position_of_byte(&this, doc: &Document, offset: u64) -> lsp::Position {
+        const p: lsp::Position = doc.line_index.position_of(offset);
+        const ch: u32 = Columns::byte_to_wire(doc.line_text(p.line), p.character as u64, this.utf8);
+        return lsp::Position::new(p.line, ch);
+    }
+
+    /// Wire range of a compiler span.  The columns are measured against
+    /// the text the span's file has: its open buffer, or the file on disk
+    /// when it is not open.  A span with no location is (0,0)-(0,0).
+    range_of_span(&this, span: source_span::SourceSpan) -> lsp::Range {
+        if (span.start_line == 0) {
+            return lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0));
+        }
+        const file_name: string = span.file;
+        if (file_name == "" || libc::strlen(file_name) == 0) {
+            return lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0));
+        }
+        const fpath: str::Str = str::Str::from(file_name);
+        mut end_line: u32 = span.end_line;
+        mut end_col: u32 = span.end_col;
+        if (end_line == 0) {
+            end_line = span.start_line;
+            end_col = span.start_col;
+        }
+        match (this.by_path(fpath)) {
+            Option::Some(doc) => {
+                return lsp::Range::new(
+                    this.wire_of(doc.text.as_str(), &doc.line_index, span.start_line, span.start_col),
+                    this.wire_of(doc.text.as_str(), &doc.line_index, end_line, end_col));
+            }
+            Option::None => { }
+        }
+        match (file::read_to_string(path::Path::from(fpath))) {
+            Result::Ok(t) => {
+                mut owned: String = t;
+                mut idx: line_index::LineIndex = line_index::LineIndex::build(owned.as_str());
+                const r: lsp::Range = lsp::Range::new(
+                    this.wire_of(owned.as_str(), &idx, span.start_line, span.start_col),
+                    this.wire_of(owned.as_str(), &idx, end_line, end_col));
+                mem::drop(idx);
+                mem::drop(owned);
+                return r;
+            }
+            Result::Err(_) => {
+                // No text to measure: the compiler's columns are the best
+                // statement of where the span is.
+                return lsp::Range::new(
+                    lsp::Position::new(span.start_line - 1, Docs::col0(span.start_col)),
+                    lsp::Position::new(end_line - 1, Docs::col0(end_col)));
+            }
+        }
+    }
+
+    /// Wire position of the compiler's (`line`, `col`) in `text`.
+    wire_of(&this, text: str::Str, index: &line_index::LineIndex, line: u32, col: u32) -> lsp::Position {
+        if (line == 0) { return lsp::Position::new(0, 0); }
+        const lt: str::Str = Columns::line_of(text, index, line - 1);
+        const b: u64 = Columns::compiler_to_byte(lt, col);
+        return lsp::Position::new(line - 1, Columns::byte_to_wire(lt, b, this.utf8));
+    }
+
+    static col0(col: u32) -> u32 {
+        if (col == 0) { return 0; }
+        return col - 1;
     }
 
     /// Insert a freshly-built document.  If a document already exists

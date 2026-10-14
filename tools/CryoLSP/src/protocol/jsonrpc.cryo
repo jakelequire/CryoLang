@@ -61,12 +61,27 @@ implement trait Drop for struct NotificationMessage {
     drop(mut &this) -> void { }
 }
 
+/// A frame that is not a valid request or notification.  It is answered
+/// with an error carrying `code` and `id` - the request's own id when one
+/// could be read, otherwise `null`, as JSON-RPC requires.
+type struct InvalidMessage {
+    code:   i32;
+    id:     value::JsonValue;
+    reason: String;
+}
+
+implement trait Drop for struct InvalidMessage {
+    drop(mut &this) -> void { }
+}
+
 type enum IncomingMessage {
     Request(RequestMessage);
     Notification(NotificationMessage);
+    /// The client's answer to a request the server sent.  Nothing the
+    /// server sends waits for one, so it is read and dropped.
+    Response;
     /// Body could not be decoded into a valid JSON-RPC message.
-    /// `reason` is a human-readable explanation we can log.
-    Invalid(String);
+    Invalid(InvalidMessage);
 }
 
 implement trait Drop for enum IncomingMessage {
@@ -138,7 +153,9 @@ type struct JsonRpcCodec {
                 reason.push("json parse failed: ");
                 reason.push(err.msg.as_str());
                 mem::drop(err);
-                return IncomingMessage::Invalid(reason);
+                return IncomingMessage::Invalid(InvalidMessage {
+                    code: PARSE_ERROR, id: value::JsonValue::Null, reason: reason,
+                });
             }
         }
     }
@@ -147,19 +164,23 @@ type struct JsonRpcCodec {
     /// out of it; the value itself is released by its owner.
     static classify(v: mut &value::JsonValue) -> IncomingMessage {
         if (!v.is_object()) {
-            return JsonRpcCodec::invalid_msg("body is not a JSON object");
+            return JsonRpcCodec::invalid_msg(v, "body is not a JSON object");
         }
 
         // jsonrpc must be the literal string "2.0".
         if (!JsonRpcCodec::field_equals(v, "jsonrpc", "2.0")) {
-            return JsonRpcCodec::invalid_msg("missing or wrong 'jsonrpc' field");
+            return JsonRpcCodec::invalid_msg(v, "missing or wrong 'jsonrpc' field");
         }
 
-        // method must be a string.
+        // method must be a string.  With none, a message carrying `result`
+        // or `error` is a response to one of the server's own requests.
         const method: String = match (JsonRpcCodec::clone_string_field(v, "method")) {
             Option::Some(s) => { s }
             Option::None    => {
-                return JsonRpcCodec::invalid_msg("missing 'method' field");
+                if (JsonRpcCodec::has_field(v, "result") || JsonRpcCodec::has_field(v, "error")) {
+                    return IncomingMessage::Response;
+                }
+                return JsonRpcCodec::invalid_msg(v, "missing 'method' field");
             }
         };
 
@@ -187,10 +208,32 @@ type struct JsonRpcCodec {
         }
     }
 
-    static invalid_msg(reason: string) -> IncomingMessage {
+    /// An invalid request, answered under its own id when it has a usable
+    /// one (a string or a number), otherwise under `null`.
+    static invalid_msg(v: &value::JsonValue, reason: string) -> IncomingMessage {
         mut s: String = String::new();
         s.push(reason);
-        return IncomingMessage::Invalid(s);
+        mut id: value::JsonValue = value::JsonValue::Null;
+        if (v.is_object()) {
+            match (v.get(str::Str::from("id"))) {
+                Option::Some(idv) => {
+                    match (idv) {
+                        value::JsonValue::String(_) => { id = JsonRpcCodec::clone_value(idv); }
+                        value::JsonValue::Number(_) => { id = JsonRpcCodec::clone_value(idv); }
+                        _ => { }
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        return IncomingMessage::Invalid(InvalidMessage { code: INVALID_REQUEST, id: id, reason: s });
+    }
+
+    static has_field(obj: &value::JsonValue, key: string) -> boolean {
+        match (obj.get(str::Str::from(key))) {
+            Option::Some(_) => { return true; }
+            Option::None    => { return false; }
+        }
     }
 
     static field_equals(obj: &value::JsonValue, key: string, expected: string) -> boolean {
@@ -284,7 +327,9 @@ type struct JsonRpcCodec {
         obj.put("jsonrpc", value::JsonValue::from("2.0"));
         obj.put("id", JsonRpcCodec::clone_value(&resp.id));
 
-        match (resp.error) {
+        // Borrowed: matching the field by value would release the error's
+        // message here and again when the caller drops the response.
+        match (&resp.error) {
             Option::Some(err) => {
                 mut err_obj: value::JsonObject = value::JsonObject::new();
                 err_obj.put("code", value::JsonValue::int_value(err.code as i64));
