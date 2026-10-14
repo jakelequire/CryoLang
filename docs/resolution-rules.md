@@ -160,6 +160,20 @@ yet is recorded with the change that builds it, not here.
 338. **Work on a branch does not run or wait on CI;** the local gates are
      its proof, and CI is watched on `main` only.  (Jake)
 
+339. **The editor's completion goes only through the compiler's lookups.**
+     The typed prefix is not matched as text against module names; the
+     text search ruling 336 allows stays limited to workspace symbol
+     search.  So `import Probe::` with `Probe` only a prefix of real
+     modules offers nothing, until the module graph can list a module
+     path's children by identity through a door.  (Jake)
+
+340. **The compiler fields `ASTNode.generated` and
+     `BuildOptions.yield_hook` keep their names.**  (Jake)
+
+341. **The names inside an import's braces get their positions and the
+     definitions they name before the editor's rename is built,** so a
+     rename reaches every import of what it renames.  (Jake)
+
 ### 2026-10-13
 
 299. **Before the merge, the scratch directories are deleted:** `.objcmp/`,

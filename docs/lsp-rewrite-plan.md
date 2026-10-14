@@ -455,6 +455,12 @@ steps.
 - Rename from the uses index (refusing to rename into the standard library
   or a vendored module); signature help from `CalleePin`; inlay hints from
   `resolved_type`. C13.
+- First (ruling 341), an import's brace entries: `ImportDeclNode` keeps
+  where each entry's name and alias are written (`specific_spans`,
+  `specific_alias_spans`), and the name layer records the definitions each
+  entry bound (`specific_defs`, by entry), a sub-module's included. The
+  uses index lists an entry and its alias under each; definition and hover
+  answer on them. No compiled output moved.
 
 ### Step 10. Module caching: the design
 
