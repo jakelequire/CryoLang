@@ -303,19 +303,32 @@ steps.
   Negative tests pin lines, not columns, so none moved.
 - C6 lands with completion (step 6), its only reader.
 
-### Step 4. Definition and hover from stamps
+### Step 4. Definition and hover from stamps (landed)
 
-- New definition and hover on the single path. Receivers by
-  `is_receiver()` / `is_this_keyword`; match arms by `const_res` /
-  `binding_sym`; generic parameters by `SymbolID` and
-  `GenericParamType.param_sym`; imports by C4.
-- Deletes `handlers/hover.cryo`, `handlers/definition.cryo`,
-  `handlers/decl_finder.cryo`, the name-returning walks in `node_locator.cryo`
-  (`find_method_owner`, `find_enclosing_method_owner`, `enclosing_owner_of`,
-  `find_program_by_namespace`), the server's reads of
-  `Resolver::resolve(span)`, `TraitDeclNode::lookup_method` if unused, and
-  every `![allow]` on deleted code.
-- Checks: B2-B5 on `two_modules`.
+- `handlers/identity.cryo`: a position's chain of nodes, from the module's
+  first top-level statement holding it (a monomorphized copy is skipped)
+  down through `NodeLocator::first_covering_child`, and the target the
+  innermost node's stamp names: a definition, a local or binding, a type
+  parameter, a primitive, a field (owner and position) or a variant (enum and
+  ordinal). Receivers by `is_this_keyword` and the receiver's type; calls by
+  their pin, `template_method` or a bound's trait and slot; paths by
+  `scope_res` and `member_def`; match arms by `binding_sym` / `const_res`;
+  annotations by `NamedAnnotation.res`; imports by `resolved_module`.
+- `definition.cryo` answers the target's declared name
+  (`DeclarationIndex::declaration_of`, then `DefTable::span_of`; a binding's
+  own declaration; a module's `namespace`), `hover.cryo` the declaration it
+  names. The implementations lens counts the blocks whose stamped target or
+  trait is the declaration's definition.
+- Deleted: the old hover (3,595 lines) and definition, `decl_finder.cryo`,
+  34 of the 39 `![allow(lookup_by_spelling)]` (19 in hover, 15 in the
+  finders; completion's 3 and semantic tokens' 2 remain), the walks in
+  `node_locator.cryo` nothing calls now, `Resolver::resolve(span)`,
+  `ResolutionMap::resolve`, `TraitDeclNode::lookup_method`.
+- Not kept: the expanded hover's method list (`cryo/expandHover` answers the
+  ordinary hover until C6 lands); hovers on expressions that name nothing
+  (a literal's type).
+- Checks: B2-B5 and the lens's targets on `two_modules`, plus a field
+  through `this`, a variant path, a type parameter and an import.
 
 ### Step 5. References, document highlight, document and workspace symbols
 
