@@ -17,8 +17,8 @@ other items are not ordered yet.
 
 ## Merge notes
 
-For the person merging `naming-impl` into `main`.  It has served its purpose
-once CI runs verify's gate list.
+`naming-impl` is merged into `main`, and CI runs verify's gate list.  These
+notes keep what the gates mean and what is still red or unexercised.
 
 **What the local gates mean.**  `make check-fast` runs verify's self-test,
 verify-pin's self-test and `make verify-pin` (each pin's sha256 and stamped
@@ -40,7 +40,7 @@ manual dispatch.  As it stands:
 | census (`test-census`) | yes | yes, both hosts |
 | examples build | yes | yes, both hosts |
 | `lsp-check` | yes | yes, both hosts |
-| `cross-check` | yes | windows native only: a Linux host links the windows-gnu build and needs mingw and the LLVM-C import lib |
+| `cross-check` | yes | windows native only: a Linux host links the windows-gnu build and needs mingw and the LLVM-C import lib, until `cryo build` can stop at objects (below) |
 | `incremental-instance-check` | yes | yes, both hosts |
 | `check-fast` (the two self-tests) | yes | yes, both hosts |
 | object comparison against a baseline | yes | Linux, against the previous commit, report only: a moved object is listed and does not fail the job (ruling 321) |
@@ -51,10 +51,10 @@ manual dispatch.  As it stands:
 | `api-index-check` | no | yes |
 | `selfhost-check` | no | yes, both arms: the Windows chain under wine on the Linux runner |
 
-So the first CI run on `main` exercises six gates the branch's sessions
-did not run as routine; a red one there is not evidence that the merge broke
-it, and is worth checking against the branch tip first.  Aligning the two
-lists is the first housekeeping after the merge.
+Every CI job is green on `main`.  The rows `make verify` does not run are
+CI's alone, so a local green does not cover them.  CI also builds the
+Windows release zip and builds and runs a hello-world with it under wine,
+the way the release workflow does before it publishes.
 
 **Warnings.**  A clean build of the compiler, the standard library's own
 build and the editor's build each report 0 warnings.  Compare warnings only
@@ -69,6 +69,13 @@ itself cannot be checked object-for-object against `main`; compare against
 `naming-impl`'s tip instead.
 
 **Known red or unexercised.**
+- `make cross-check`, and with it `make verify`, cannot pass on a Linux
+  host: the compiler links the windows-gnu build there rather than stopping
+  at objects.  Run verify from Windows, or pass `--only` to leave cross out.
+- The release smoke runs the STAGED tree, not the archive, and the Windows
+  tree under wine with llvm-mingw's `clang.exe` driving the link; nothing
+  runs the zip on a Windows host with the mingw `gcc` an installed
+  `cryo.exe` finds there.
 - `make release`, `install` and `uninstall` are POSIX recipes with no
   Windows branch; on a Windows host they fail with a cmd parse error rather
   than a refusal.
