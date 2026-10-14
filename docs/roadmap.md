@@ -75,7 +75,8 @@ itself cannot be checked object-for-object against `main`; compare against
 - The release smoke runs the STAGED tree, not the archive, and the Windows
   tree under wine with llvm-mingw's `clang.exe` driving the link; nothing
   runs the zip on a Windows host with the mingw `gcc` an installed
-  `cryo.exe` finds there.
+  `cryo.exe` finds there.  That stays so for now; a test of the zip on a
+  real Windows host is added before the first tagged release (ruling 323).
 - `make release`, `install` and `uninstall` are POSIX recipes with no
   Windows branch; on a Windows host they fail with a cmd parse error rather
   than a refusal.
@@ -97,7 +98,9 @@ the branch.
 The first project after the merge, on its own branch (ruling 316).  The
 language server answers from the compiler's own identities - the
 definitions, types and module identities the name layer stamps - instead
-of finding declarations by their spelling.
+of finding declarations by their spelling.  The plan, its steps and what
+each one proves are in `docs/lsp-rewrite-plan.md`, which is folded back
+into this roadmap and deleted when the work is done.
 
 - **On-save analysis.**  The compiler analyses a file when it is saved, not
   on every keystroke.
@@ -153,10 +156,6 @@ normalised before the comparison.
 - **`scripts/` is restructured** into `gates/`, `pin/`, `release/`,
   `toolchain/` and `dev/` (ruling 273: the restructure happens after the
   merge).  Renames only, with every caller updated in the same commit.
-- **The language server's smoke test runs in the LSP check.**
-  `tools/CryoLSP/tests/smoke.py` starts the server and asks it questions;
-  nothing calls it today (ruling 269: it stays and is wired into the LSP
-  check after the merge).
 - **`cryo build` can stop at object files** (ruling 322: on the roadmap,
   not built yet).  A Linux host links a windows-gnu build rather than
   stopping at objects, so `make cross-check` there needs mingw and the
@@ -164,6 +163,10 @@ normalised before the comparison.
   cross-check from the Windows job only.  A flag that ends the build before
   the link lets the gate check what it claims to, objects only, from either
   host.
+- **The Windows release zip is tested on a real Windows host before the
+  first tagged release** (ruling 323): unpacked, and a hello-world built and
+  run with the mingw `gcc` an installed `cryo.exe` finds there.  Until then
+  the release smoke stays the staged tree under wine.
 - **The language server reports the stamped version** (`serverInfo`) that
   `cryo version` prints.
 - **`cryo version --verbose` shows the binary's sha256,** once the standard

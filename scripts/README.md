@@ -17,7 +17,7 @@ one; the history keeps it.
 | `examples-gate.py` | Builds every `examples/` project; refuses a sweep that found none, or fewer than `--min` | `make examples`, `verify.py` (examples), CI |
 | `check-examples-output.sh` | Builds and runs four examples and diffs their stdout against `examples/<name>/expected.out` (bash, POSIX only) | `make examples-golden`, CI |
 | `valgrind-check.sh` | Runs the same four examples under valgrind (Linux only) | `make valgrind-check`, CI |
-| `lsp-gate.py` | Builds `tools/CryoLSP` with the compiler under test into its own directory | `make lsp-check`, `verify.py` (lsp), CI |
+| `lsp-gate.py` | Builds `tools/CryoLSP` with the compiler under test into its own directory, then runs that binary through `tools/CryoLSP/tests/smoke.py` (protocol checks and every fixture's checks) | `make lsp-check`, `verify.py` (lsp), CI |
 | `cross-check.py` | Compiles runtime, stdlib, compiler and CryoLSP for the other OS's triple, objects only from a Windows host (a Linux host links the windows-gnu build and needs mingw plus the LLVM-C import lib) | `make cross-check`, `verify.py` (cross), CI (windows native) |
 | `incremental-check.py` | Incremental build == clean build, byte for byte, over an edit matrix (refuses on Windows) | `make incremental-check`, CI |
 | `incremental-instance-check.py` | An edit asking a cached module for a new generic instance still links and reuses the cache | `make incremental-instance-check`, `verify.py` (incr), CI |

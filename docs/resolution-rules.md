@@ -247,6 +247,43 @@ yet is recorded with the change that builds it, not here.
      can run on a Linux host, goes on the roadmap; it is not built now.
      (Jake)
 
+323. **The release smoke test stays wine-only for now;** a test of the
+     Windows zip on a real Windows host is added before the first tagged
+     release.  (Jake)
+
+324. **The editor's behavioural harness grows with each step of its
+     rewrite,** and each step's commit shows the previous server failing
+     the checks it adds.  (Jake)
+
+325. **The editor's new lookups by identity are named
+     `DefTable::span_of`, `DeclarationIndex::declaration_of`,
+     `Resolver::scope_at` and `Resolver::visible_bindings`.**  (Jake)
+
+326. **The index of every use of a definition lives in the editor,** built
+     from the stamps the name layer writes.  (Jake)
+
+327. **An `ImportDeclNode` records the module its import resolved to.**
+     (Jake)
+
+328. **A qualified type name's span covers its whole path,** and every
+     negative test whose annotated columns move is re-annotated.  (Jake)
+
+329. **In the editor's first release, module caching is a design only:**
+     each save analyses the whole project, and a hook in the compiler lets
+     the editor answer from its last analysis while a long one runs.
+     (Jake)
+
+330. **The editor gets parsing that continues past an error only after its
+     first release,** and only if the last good analysis proves not to be
+     enough.  (Jake)
+
+331. **A file outside any project is analysed as its own entry point.**
+     (Jake)
+
+332. **The suggestion to import a module that is already imported stops
+     being machine-applicable,** and suggests the qualified name instead.
+     (Jake)
+
 ### 2026-10-12
 
 247. **The compiler's `![allow]`s that named the deleted lint, and the

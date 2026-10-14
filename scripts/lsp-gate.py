@@ -31,11 +31,23 @@ compiler stated the population it built - the "N local, M std, K dep
 module(s)" line - and that population clears --min-modules.  An "up to date"
 build is a refusal here, not a pass; the gate cannot report what it did not
 watch happen.
+
+Then it runs the server it linked
+---------------------------------
+A server that compiles can still crash on its first request or answer with
+the wrong declaration.  So the binary this gate just built is driven through
+`tools/CryoLSP/tests/smoke.py`: protocol checks, then every fixture's checks.
+The gate passes only when that run reports no failure and at least
+--min-checks passing checks, so a run that lost its fixtures, or executed
+nothing, is a refusal and not a pass.  `--no-run` skips it, for building
+alone.
 """
 import argparse, os, re, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT = os.path.join(ROOT, "tools", "CryoLSP")
+SMOKE = os.path.join(PROJECT, "tests", "smoke.py")
+SMOKE_SUMMARY = re.compile(r"^lsp-smoke: (\d+) passed, (\d+) failed \((\d+) fixtures\)")
 
 # "Building cryolsp [release]: 24 local, 81 std, 161 dep module(s)"
 POPULATION = re.compile(
@@ -62,6 +74,10 @@ def main():
                     help="do not remove the build directory first.  Only for "
                          "exercising the refusal an incremental build triggers; "
                          "a gate run must not use it.")
+    ap.add_argument("--min-checks", type=int, default=21,
+                    help="fail if the behavioural run passes fewer checks than this")
+    ap.add_argument("--no-run", action="store_true",
+                    help="build only; do not run the behavioural checks")
     args = ap.parse_args()
 
     cryo = os.path.abspath(args.cryo)
@@ -136,9 +152,36 @@ def main():
     if not os.path.isfile(abs_bin):
         return fail("build named %s but no such file exists" % binary)
 
-    print("lsp-gate: OK -- compiled %d module(s) (%d local, %d std, %d dep), "
-          "0 errors, %d warning(s); linked %s"
-          % (total, modules[0], modules[1], modules[2], warnings, binary))
+    built = ("compiled %d module(s) (%d local, %d std, %d dep), 0 errors, "
+             "%d warning(s); linked %s"
+             % (total, modules[0], modules[1], modules[2], warnings, binary))
+    if args.no_run:
+        print("lsp-gate: OK -- %s; behavioural checks NOT run (--no-run)" % built)
+        return 0
+
+    r = subprocess.run([sys.executable, SMOKE, abs_bin], cwd=ROOT,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    run_lines = r.stdout.decode("utf-8", "replace").splitlines()
+    summary = None
+    for ln in run_lines:
+        m = SMOKE_SUMMARY.match(ln)
+        if m:
+            summary = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    if summary is None or summary[1] != 0 or r.returncode != 0:
+        print("lsp-gate: the server built, and its behavioural run failed")
+        for ln in run_lines:
+            if not ln.startswith("  ok "):
+                print("        | %s" % ln)
+        if summary is None:
+            return fail("the behavioural run printed no summary (exit %d)" % r.returncode)
+        return fail("%d of %d behavioural check(s) failed"
+                    % (summary[1], summary[0] + summary[1]))
+    if summary[0] < args.min_checks:
+        return fail("the behavioural run passed %d check(s) over %d fixture(s); "
+                    "expected at least %d" % (summary[0], summary[2], args.min_checks))
+
+    print("lsp-gate: OK -- %s; %d behavioural check(s) passed over %d fixture(s)"
+          % (built, summary[0], summary[2]))
     return 0
 
 

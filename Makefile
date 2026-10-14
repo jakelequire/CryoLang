@@ -204,7 +204,9 @@ Tests and gates
   make verify-selftest   verify's judges and verify-pin's checks, driven
                          through fixtures they must accept and refuse.
   make lsp-check         tools/CryoLSP builds with the compiler under test
-                         (into its own directory; installs nothing).
+                         (into its own directory; installs nothing), and
+                         the binary passes its behavioural checks
+                         (tools/CryoLSP/tests/smoke.py).
   make cross-check       runtime, stdlib, compiler and CryoLSP for the other
                          OS's triple, objects only (ARGS=--triple=...).
   make examples          Build every examples/ project.
