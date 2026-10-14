@@ -32,8 +32,8 @@ incremental new-instance fixture and check-fast, all concurrently; with
 object moved.
 
 **CI runs verify's gate list** (ruling 266: CI is aligned with verify's
-gate list first thing after the merge), but for the object comparison.  CI
-fires only on `main` and on a manual dispatch.  As it stands:
+gate list first thing after the merge).  CI fires only on `main` and on a
+manual dispatch.  As it stands:
 
 | gate | `make verify` | CI |
 |---|---|---|
@@ -43,7 +43,7 @@ fires only on `main` and on a manual dispatch.  As it stands:
 | `cross-check` | yes | windows native only: a Linux host links the windows-gnu build and needs mingw and the LLVM-C import lib |
 | `incremental-instance-check` | yes | yes, both hosts |
 | `check-fast` (the two self-tests) | yes | yes, both hosts |
-| object comparison against a baseline | yes | no: which revision CI compares against, and whether a moved object fails, is not decided |
+| object comparison against a baseline | yes | Linux, against the previous commit, report only: a moved object is listed and does not fail the job (ruling 321) |
 | `roster-check` | no (the census reads the same golden) | yes |
 | `examples-golden`, `valgrind-check`, `verify-freestanding` | no (POSIX only) | yes |
 | `incremental-check` | no | yes |
@@ -150,6 +150,13 @@ normalised before the comparison.
   `tools/CryoLSP/tests/smoke.py` starts the server and asks it questions;
   nothing calls it today (ruling 269: it stays and is wired into the LSP
   check after the merge).
+- **`cryo build` can stop at object files** (ruling 322: on the roadmap,
+  not built yet).  A Linux host links a windows-gnu build rather than
+  stopping at objects, so `make cross-check` there needs mingw and the
+  LLVM-C import lib, and `make verify` cannot pass on Linux; CI runs
+  cross-check from the Windows job only.  A flag that ends the build before
+  the link lets the gate check what it claims to, objects only, from either
+  host.
 - **The language server reports the stamped version** (`serverInfo`) that
   `cryo version` prints.
 - **`cryo version --verbose` shows the binary's sha256,** once the standard

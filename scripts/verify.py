@@ -248,11 +248,14 @@ def build_inputs(cwd=ROOT):
 
 
 def copy_over(a, b):
-    """Copy a -> b, clearing a read-only attribute git may have left on b."""
+    """Copy a -> b, clearing a read-only attribute git may have left on b.
+    The mode is copied too: a POSIX executable copied as bytes alone cannot
+    be run."""
     os.makedirs(os.path.dirname(b), exist_ok=True)
     if os.path.exists(b):
         os.chmod(b, 0o644)
     shutil.copyfile(a, b)
+    shutil.copymode(a, b)
 
 
 def sync_clone(src, sha):
@@ -318,7 +321,7 @@ def baseline_compiler(rev, env):
     for f in os.listdir(os.path.join(ROOT, "bin")):
         if f.lower().endswith(".dll"):
             shutil.copyfile(os.path.join(ROOT, "bin", f), os.path.join(home, f))
-    shutil.copyfile(built, exe)
+    copy_over(built, exe)
     return exe, home, sha
 
 
