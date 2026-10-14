@@ -330,10 +330,24 @@ steps.
 - Checks: B2-B5 and the lens's targets on `two_modules`, plus a field
   through `this`, a variant path, a type parameter and an import.
 
-### Step 5. References, document highlight, document and workspace symbols
+### Step 5. References, document highlight, document and workspace symbols (landed)
 
-- The uses index (ruling 326). Checks: reference sets that tell A's `Item`
-  from B's; a symbol outline.
+- `handlers/uses.cryo` (ruling 326): every name a module's tree holds where
+  it is written, with its target, read by the same stamp readers
+  `identity.cryo` uses at one position, and whether it is the declaration.
+  A struct literal's type and its initializers' fields have no span of
+  their own; their range is the written name's length from where the node
+  starts. A method's receiver annotation, which the parser writes, is not a
+  use. The index is built per request and not kept: not measured on a large
+  project yet.
+- `references.cryo`: `textDocument/references` (with `includeDeclaration`)
+  over every module, `documentHighlight` over the document's.
+  `symbols.cryo`: `documentSymbol` (members nested under their type,
+  implementation blocks as containers) and `workspace/symbol` (a name
+  holding the query, ignoring case, at most 200). All four advertised.
+- Checks: B's `Item` references without A's and A's without B's, a method
+  call's, a field's (its declaration, a literal's initializer, a read
+  through `this`), a local's highlight, an outline, a workspace search.
 
 ### Step 6. Completion from the snapshot plus the current line
 

@@ -1,0 +1,469 @@
+///! Every name written in an analysis, with what it names: the uses index
+///! references and document highlights are answered from.  Built from the
+///! stamps by the same reads `identity` makes at one position, over every
+///! node a module's tree holds where it is written - a monomorphized copy,
+///! or a node copied in from another file, is not written there.
+namespace lsp::handlers::uses;
+
+import std::core::mem;
+
+import compiler::compilation_context::{ CompilationContext };
+import compiler::ast;
+import compiler::ast::{ MemberPin, NodeKind, PatternElement, PatternKind, TypeAnnotation };
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::declaration::{
+    ClassDeclNode, DestructureDeclNode, EnumDeclNode, ExternBlockNode, FieldDeclNode,
+    FunctionDeclNode, ImplBlockNode, ImportDeclNode, IntrinsicDeclNode, MethodNode,
+    StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode, CallExprNode,
+    CastExprNode, DeleteExprNode, ExpressionNode, IdentifierNode, IfExprNode, LambdaExprNode,
+    MatchExprNode, MemberAccessNode, NewExprNode, ScopeResolutionNode, SizeofExprNode,
+    StaticMatchExprNode, StructLiteralNode, TernaryExprNode, TryExprNode, TupleLiteralNode,
+    TypeofExprNode, UnaryExprNode, YieldExprNode, AlignofExprNode
+};
+import compiler::ast::pattern::{ EnumPatternNode, MatchArmNode, PatternNode };
+import compiler::ast::statement::{
+    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
+    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
+    WhileStmtNode
+};
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::res::{ DefId };
+
+import lsp::handlers::identity::{ Locator, Target };
+
+
+/// One written name: where it is, what it names, and whether it is the
+/// name's declaration.
+type struct Use {
+    span:   SourceSpan;
+    target: Target;
+    decl:   boolean;
+}
+
+
+/// The walk that collects a module's uses.
+type struct Uses {
+    loc:  Locator;
+    file: string;
+    out:  Use[];
+
+    /// Every use written in every module of `ctx` naming `target`.
+    static of_target(ctx: CompilationContext*, target: &Target, with_decl: boolean) -> Use[] {
+        mut found: Use[] = [];
+        const n: u32 = ctx.module_graph.module_count();
+        for (mut m: u32 = 0; m < n; m++) {
+            const all: Use[] = Uses::in_module(ctx, m as i64);
+            for (mut i: i64 = 0; i < all.length; i++) {
+                if (!all[i].target.same(target)) { continue; }
+                if (all[i].decl && !with_decl) { continue; }
+                found.push(all[i]);
+            }
+        }
+        return found;
+    }
+
+    /// Every use written in module `m`.
+    static in_module(ctx: CompilationContext*, m: i64) -> Use[] {
+        mut w: Uses = Uses {
+            loc:  Locator::new(ctx, 0, 0),
+            file: ctx.module_graph.modules[m].file_path,
+            out:  [],
+        };
+        const program: ProgramNode* = ctx.module_graph.get_module_ast(m as u32);
+        if (program != null) {
+            for (mut i: i64 = 0; i < program.statements.length; i++) { w.node(program.statements[i]); }
+        }
+        mut found: Use[] = [];
+        mem::swap(&found, &w.out);
+        return found;
+    }
+
+    /// Record `target` at `span` when the span is written in this module.
+    add(mut &this, span: SourceSpan, target: Target, decl: boolean) -> void {
+        if (span.start_line == 0 || target.is_nothing()) { return; }
+        if (span.file == null || !span.file.eq(this.file)) { return; }
+        this.out.push(Use { span: span, target: target, decl: decl });
+    }
+
+    /// A name written at `span` and spelled with `length` bytes, whose
+    /// node's span starts where the name does.
+    static head(span: SourceSpan, length: u64) -> SourceSpan {
+        return SourceSpan::new(span.file, span.start_line, span.start_col,
+            span.start_line, span.start_col + length as u32);
+    }
+
+    // -- Annotations --
+
+    annotation(mut &this, ann: TypeAnnotation*) -> void {
+        if (ann == null) { return; }
+        match (*ann) {
+            TypeAnnotation::Named(n) => {
+                if (n != null) { this.add(n.span, this.loc.res_target(&n.res), false); }
+            }
+            TypeAnnotation::Pointer(p)   => { if (p != null) { this.annotation(p.inner); } }
+            TypeAnnotation::Reference(r) => { if (r != null) { this.annotation(r.inner); } }
+            TypeAnnotation::Array(a) => {
+                if (a != null) { this.annotation(a.element); this.expr(a.size_expr, null); }
+            }
+            TypeAnnotation::Function(f) => {
+                if (f != null) { this.annotations(&f.parameters); this.annotation(f.return_type); }
+            }
+            TypeAnnotation::Tuple(t) => { if (t != null) { this.annotations(&t.elements); } }
+            TypeAnnotation::Generic(g) => {
+                if (g != null) { this.annotation(g.base); this.annotations(&g.args); }
+            }
+            TypeAnnotation::ImplTrait(it) => { if (it != null) { this.annotations(&it.bounds); } }
+            TypeAnnotation::Projection(p) => { if (p != null) { this.annotation(p.base); } }
+            _ => { }
+        }
+    }
+
+    annotations(mut &this, anns: &TypeAnnotation*[]) -> void {
+        for (mut i: i64 = 0; i < anns.length; i++) { this.annotation(anns[i]); }
+    }
+
+    // -- Declarations and statements --
+
+    node(mut &this, n: ASTNode*) -> void {
+        if (n == null) { return; }
+        match (n.kind) {
+            NodeKind::ImportDeclaration => {
+                const imp: ImportDeclNode* = n as ImportDeclNode*;
+                const last: i64 = imp.path_segment_spans.length - 1;
+                if (last >= 0 && imp.resolved_module.is_valid()) {
+                    const d: DefId = this.loc.ctx.module_graph.module_def(imp.resolved_module);
+                    this.add(imp.path_segment_spans[last], Locator::def_target(d), false);
+                }
+            }
+            NodeKind::VariableDeclaration => { this.var_decl(n as VarDeclNode*); }
+            NodeKind::DestructureDeclaration => {
+                const d: DestructureDeclNode* = n as DestructureDeclNode*;
+                this.annotation(d.type_annotation);
+                this.expr(d.initializer, null);
+            }
+            NodeKind::FunctionDeclaration => { this.function(n as FunctionDeclNode*, false); }
+            NodeKind::MethodDeclaration => { this.method(n as MethodNode*); }
+            NodeKind::IntrinsicDeclaration => {
+                const d: IntrinsicDeclNode* = n as IntrinsicDeclNode*;
+                this.add(d.name_span, Locator::def_target(d.def), true);
+                for (mut i: i64 = 0; i < d.parameters.length; i++) { this.var_decl(d.parameters[i]); }
+                this.annotation(d.return_type_annotation);
+                this.node(d.body as ASTNode*);
+            }
+            NodeKind::StructDeclaration => {
+                const d: StructDeclNode* = n as StructDeclNode*;
+                this.add(d.name_span, Locator::def_target(d.def), true);
+                this.fields(&d.fields, d.def);
+                this.methods(&d.methods);
+            }
+            NodeKind::UnionDeclaration => {
+                const d: UnionDeclNode* = n as UnionDeclNode*;
+                this.add(d.name_span, Locator::def_target(d.def), true);
+                this.fields(&d.fields, d.def);
+                this.methods(&d.methods);
+            }
+            NodeKind::ClassDeclaration => {
+                const d: ClassDeclNode* = n as ClassDeclNode*;
+                this.add(d.name_span, Locator::def_target(d.def), true);
+                this.add(d.base_span, this.loc.res_target(&d.base_res), false);
+                this.fields(&d.fields, d.def);
+                this.methods(&d.methods);
+            }
+            NodeKind::TraitDeclaration => {
+                const d: TraitDeclNode* = n as TraitDeclNode*;
+                this.add(d.name_span, Locator::def_target(d.def), true);
+                for (mut i: i64 = 0; i < d.methods.length; i++) { this.function(d.methods[i], false); }
+            }
+            NodeKind::TypeAliasDeclaration => {
+                const d: TypeAliasDeclNode* = n as TypeAliasDeclNode*;
+                this.add(d.name_span, Locator::def_target(d.def), true);
+                this.annotation(d.target_annotation);
+            }
+            NodeKind::EnumDeclaration => {
+                const d: EnumDeclNode* = n as EnumDeclNode*;
+                this.add(d.name_span, Locator::def_target(d.def), true);
+                for (mut i: i64 = 0; i < d.variants.length; i++) {
+                    if (d.variants[i] == null) { continue; }
+                    this.add(d.variants[i].name_span, Target::Variant(d.def, i), true);
+                    this.annotations(&d.variants[i].associated_types);
+                }
+            }
+            NodeKind::ImplementationBlock => {
+                const d: ImplBlockNode* = n as ImplBlockNode*;
+                this.add(d.target_type_span, this.loc.res_target(&d.res), false);
+                this.annotations(&d.target_args);
+                this.annotation(d.trait_annotation);
+                this.methods(&d.methods);
+            }
+            NodeKind::ExternBlock => {
+                const d: ExternBlockNode* = n as ExternBlockNode*;
+                for (mut i: i64 = 0; i < d.functions.length; i++) { this.function(d.functions[i], false); }
+                for (mut i: i64 = 0; i < d.globals.length; i++) { this.var_decl(d.globals[i]); }
+            }
+            NodeKind::BlockStatement => {
+                const b: BlockStmtNode* = n as BlockStmtNode*;
+                for (mut i: i64 = 0; i < b.statements.length; i++) { this.node(b.statements[i] as ASTNode*); }
+            }
+            NodeKind::UnsafeBlockStatement => { this.node((n as UnsafeBlockStmtNode*).block as ASTNode*); }
+            NodeKind::ReturnStatement => { this.expr((n as ReturnStmtNode*).expression, null); }
+            NodeKind::IfStatement => {
+                const s: IfStmtNode* = n as IfStmtNode*;
+                this.expr(s.condition, null);
+                this.node(s.then_stmt as ASTNode*);
+                this.node(s.else_stmt as ASTNode*);
+            }
+            NodeKind::WhileStatement => {
+                const s: WhileStmtNode* = n as WhileStmtNode*;
+                this.expr(s.condition, null);
+                this.node(s.body as ASTNode*);
+            }
+            NodeKind::DoWhileStatement => {
+                const s: DoWhileStmtNode* = n as DoWhileStmtNode*;
+                this.node(s.body as ASTNode*);
+                this.expr(s.condition, null);
+            }
+            NodeKind::ForStatement => {
+                const s: ForStmtNode* = n as ForStmtNode*;
+                this.node(s.init);
+                this.expr(s.condition, null);
+                this.expr(s.update, null);
+                this.node(s.body as ASTNode*);
+            }
+            NodeKind::MatchStatement => {
+                const s: MatchStmtNode* = n as MatchStmtNode*;
+                this.expr(s.subject, null);
+                this.arms(&s.arms);
+            }
+            NodeKind::StaticMatchStatement => {
+                const s: StaticMatchStmtNode* = n as StaticMatchStmtNode*;
+                this.annotation(s.scrutinee);
+                for (mut i: i64 = 0; i < s.arms.length; i++) {
+                    if (s.arms[i] == null) { continue; }
+                    this.annotations(&s.arms[i].type_patterns);
+                    this.node(s.arms[i].body as ASTNode*);
+                }
+            }
+            NodeKind::ExpressionStatement => { this.expr((n as ExprStmtNode*).expression, null); }
+            NodeKind::DeclarationStatement => { this.node((n as DeclStmtNode*).declaration as ASTNode*); }
+            NodeKind::LoopStatement => { this.node((n as LoopStmtNode*).body as ASTNode*); }
+            _ => {
+                if (n.kind.is_expression()) { this.expr(n as ExpressionNode*, null); }
+            }
+        }
+    }
+
+    var_decl(mut &this, v: VarDeclNode*) -> void {
+        if (v == null) { return; }
+        const t: Target = if (v.is_global) { Locator::def_target(v.def) } else { Target::Local(v.sym_id) };
+        this.add(v.name_span, t, true);
+        this.annotation(v.type_annotation);
+        this.expr(v.initializer, null);
+    }
+
+    /// A function's name, parameters and body.  A method's receiver is
+    /// typed by an annotation the parser wrote for it, which names the
+    /// owner where nothing is written; it is not walked.
+    function(mut &this, f: FunctionDeclNode*, receiver: boolean) -> void {
+        if (f == null || f.is_specialization) { return; }
+        this.add(f.name_span, Locator::def_target(f.def), true);
+        for (mut i: i64 = 0; i < f.parameters.length; i++) {
+            const p: VarDeclNode* = f.parameters[i];
+            if (p == null) { continue; }
+            if (i == 0 && receiver) {
+                this.add(p.name_span, Target::Local(p.sym_id), true);
+                continue;
+            }
+            this.var_decl(p);
+        }
+        this.annotation(f.return_type_annotation);
+        this.node(f.body as ASTNode*);
+    }
+
+    method(mut &this, m: MethodNode*) -> void {
+        if (m == null) { return; }
+        this.function(m.func, !m.is_static);
+        this.exprs(&m.base_ctor_args);
+    }
+
+    methods(mut &this, ms: &MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < ms.length; i++) { this.method(ms[i]); }
+    }
+
+    fields(mut &this, fs: &FieldDeclNode*[], owner: DefId) -> void {
+        for (mut i: i64 = 0; i < fs.length; i++) {
+            if (fs[i] == null) { continue; }
+            if (owner.is_valid()) { this.add(fs[i].name_span, Target::Field(owner, i), true); }
+            this.annotation(fs[i].type_annotation);
+            this.expr(fs[i].default_value, null);
+        }
+    }
+
+    arms(mut &this, arms: &MatchArmNode*[]) -> void {
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: MatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            for (mut p: i64 = 0; p < arm.patterns.length; p++) { this.pattern(arm.patterns[p]); }
+            this.expr(arm.guard, null);
+            this.node(arm.body as ASTNode*);
+        }
+    }
+
+    pattern(mut &this, p: PatternNode*) -> void {
+        if (p == null) { return; }
+        const at: SourceSpan = (p as ASTNode*).span;
+        if ((p as ASTNode*).kind == NodeKind::EnumPattern) {
+            const ep: EnumPatternNode* = p as EnumPatternNode*;
+            const owner: DefId = this.loc.res_def(&ep.res);
+            this.add(ep.enum_span, this.loc.res_target(&ep.res), false);
+            match (&ep.resolved_member) {
+                MemberPin::Variant(ord) => {
+                    if (owner.is_valid()) { this.add(ep.variant_span, Target::Variant(owner, ord), false); }
+                }
+                _ => { }
+            }
+            for (mut i: i64 = 0; i < ep.elements.length; i++) {
+                match (ep.elements[i]) {
+                    PatternElement::Binding(b) => {
+                        if (b != null) { this.add(b.span, Target::Local(b.sym_id), true); }
+                    }
+                    PatternElement::Sub(s) => {
+                        if (s != null) { this.pattern(s.pattern as PatternNode*); }
+                    }
+                    _ => { }
+                }
+            }
+            return;
+        }
+        if (p.binding_name.is_valid()) {
+            this.add(at, Target::Local(p.binding_sym), true);
+        } else if (p.pattern_kind == PatternKind::Identifier) {
+            this.add(at, this.loc.res_target(&p.const_res), false);
+        }
+    }
+
+    // -- Expressions --
+
+    exprs(mut &this, es: &ExpressionNode*[]) -> void {
+        for (mut i: i64 = 0; i < es.length; i++) { this.expr(es[i], null); }
+    }
+
+    /// An expression; `call` is the call it is the callee of, or null.
+    expr(mut &this, e: ExpressionNode*, call: CallExprNode*) -> void {
+        if (e == null) { return; }
+        const n: ASTNode* = e as ASTNode*;
+        match (n.kind) {
+            NodeKind::Identifier => {
+                const id: IdentifierNode* = e as IdentifierNode*;
+                if (!id.is_this_keyword) { this.add(n.span, this.loc.res_target(&id.res), false); }
+                this.annotations(&id.generic_args);
+            }
+            NodeKind::ScopeResolution => {
+                const s: ScopeResolutionNode* = e as ScopeResolutionNode*;
+                if (!s.scope_is_this_type) {
+                    this.add(s.scope_span, this.loc.res_target(&s.scope_res), false);
+                }
+                this.add(s.member_span, this.loc.path_member(s, call), false);
+                this.annotations(&s.generic_args);
+                this.annotations(&s.scope_generic_args);
+            }
+            NodeKind::MemberAccess => {
+                const m: MemberAccessNode* = e as MemberAccessNode*;
+                this.expr(m.object, null);
+                this.add(m.member_span, this.loc.member_target(m, call), false);
+                this.annotations(&m.generic_args);
+            }
+            NodeKind::CallExpression => {
+                const c: CallExprNode* = e as CallExprNode*;
+                this.expr(c.callee, c);
+                this.exprs(&c.arguments);
+                this.annotations(&c.generic_args);
+            }
+            NodeKind::BinaryExpression => {
+                const b: BinaryExprNode* = e as BinaryExprNode*;
+                this.expr(b.left, null);
+                this.expr(b.right, null);
+            }
+            NodeKind::UnaryExpression => { this.expr((e as UnaryExprNode*).operand, null); }
+            NodeKind::TernaryExpression => {
+                const t: TernaryExprNode* = e as TernaryExprNode*;
+                this.expr(t.condition, null); this.expr(t.true_expr, null); this.expr(t.false_expr, null);
+            }
+            NodeKind::IfExpression => {
+                const t: IfExprNode* = e as IfExprNode*;
+                this.expr(t.condition, null); this.expr(t.then_expr, null); this.expr(t.else_expr, null);
+            }
+            NodeKind::MatchExpression => {
+                const m: MatchExprNode* = e as MatchExprNode*;
+                this.expr(m.subject, null);
+                this.arms(&m.arms);
+            }
+            NodeKind::StaticMatchExpression => {
+                const m: StaticMatchExprNode* = e as StaticMatchExprNode*;
+                this.annotation(m.scrutinee);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] == null) { continue; }
+                    this.annotations(&m.arms[i].type_patterns);
+                    this.node(m.arms[i].body as ASTNode*);
+                }
+            }
+            NodeKind::NewExpression => {
+                const ne: NewExprNode* = e as NewExprNode*;
+                this.annotations(&ne.generic_args);
+                this.exprs(&ne.arguments);
+                this.expr(ne.array_size, null);
+                this.expr(ne.struct_init as ExpressionNode*, null);
+            }
+            NodeKind::SizeofExpression => { this.annotation((e as SizeofExprNode*).type_ann); }
+            NodeKind::AlignofExpression => { this.annotation((e as AlignofExprNode*).type_ann); }
+            NodeKind::CastExpression => {
+                const c: CastExprNode* = e as CastExprNode*;
+                this.expr(c.expression, null);
+                this.annotation(c.target_annotation);
+            }
+            NodeKind::StructLiteral => {
+                const sl: StructLiteralNode* = e as StructLiteralNode*;
+                const name_len: u64 = this.loc.ctx.intern_table.resolve(sl.struct_type).length();
+                this.add(Uses::head(n.span, name_len), this.loc.res_target(&sl.res), false);
+                this.annotations(&sl.generic_args);
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                    match (&sl.field_inits[i].pin) {
+                        MemberPin::Field(depth, index) => {
+                            const field_len: u64 =
+                                this.loc.ctx.intern_table.resolve(sl.field_inits[i].field_name).length();
+                            this.add(Uses::head(sl.field_inits[i].span, field_len),
+                                this.loc.field_target(e.resolved_type, depth, index), false);
+                        }
+                        _ => { }
+                    }
+                    this.expr(sl.field_inits[i].value, null);
+                }
+            }
+            NodeKind::ArrayLiteral => {
+                const a: ArrayLiteralNode* = e as ArrayLiteralNode*;
+                this.exprs(&a.elements);
+                this.expr(a.repeat_count_expr, null);
+            }
+            NodeKind::TupleLiteral => { this.exprs(&(e as TupleLiteralNode*).elements); }
+            NodeKind::LambdaExpression => {
+                const l: LambdaExprNode* = e as LambdaExprNode*;
+                for (mut i: i64 = 0; i < l.parameters.length; i++) { this.var_decl(l.parameters[i]); }
+                this.annotation(l.return_type_ann);
+                this.node(l.body as ASTNode*);
+            }
+            NodeKind::ArrayAccess => {
+                const a: ArrayAccessNode* = e as ArrayAccessNode*;
+                this.expr(a.array, null);
+                this.expr(a.index, null);
+            }
+            NodeKind::TypeofExpression => { this.expr((e as TypeofExprNode*).operand, null); }
+            NodeKind::DeleteExpression => { this.expr((e as DeleteExprNode*).operand, null); }
+            NodeKind::AwaitExpression => { this.expr((e as AwaitExprNode*).operand, null); }
+            NodeKind::YieldExpression => { this.expr((e as YieldExprNode*).operand, null); }
+            NodeKind::TryExpression => { this.expr((e as TryExprNode*).operand, null); }
+            _ => { }
+        }
+    }
+}

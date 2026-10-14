@@ -70,6 +70,32 @@ implement enum Target {
             _               => { false }
         };
     }
+
+    /// Whether two targets are one identity.  `Nothing` is no identity and
+    /// is the same as nothing.
+    same(&this, other: &Target) -> boolean {
+        match (&this) {
+            Target::Def(a) => {
+                return match (other) { Target::Def(b) => { a.equals(b) } _ => { false } };
+            }
+            Target::Local(a) => {
+                return match (other) { Target::Local(b) => { a.equals(b) } _ => { false } };
+            }
+            Target::TypeParam(a) => {
+                return match (other) { Target::TypeParam(b) => { a.equals(b) } _ => { false } };
+            }
+            Target::Prim(a) => {
+                return match (other) { Target::Prim(b) => { a.equals(b) } _ => { false } };
+            }
+            Target::Field(o, i) => {
+                return match (other) { Target::Field(p, j) => { o.equals(p) && i == j } _ => { false } };
+            }
+            Target::Variant(o, i) => {
+                return match (other) { Target::Variant(p, j) => { o.equals(p) && i == j } _ => { false } };
+            }
+            Target::Nothing => { return false; }
+        }
+    }
 }
 
 /// The target at a position, where its name is written, and the type the
@@ -96,16 +122,17 @@ type struct Answer {
 /// A position request (`textDocument/definition`, `textDocument/hover`):
 /// the analysis answering it and the answer at its position.
 type struct Asked {
-    ctx:       CompilationContext*;
-    answer:    Answer;
-    uri:       str::Str;
-    line:      u32;
-    character: u32;
+    ctx:        CompilationContext*;
+    answer:     Answer;
+    uri:        str::Str;
+    line:       u32;
+    character:  u32;
+    module_idx: i64;
 
     static from(docs: mut &docs::Docs, projects: mut &session::Projects,
                 params: &value::JsonValue) -> Asked {
         mut asked: Asked = Asked { ctx: null, answer: Answer::nothing(), uri: str::Str::from(""),
-                                   line: 0, character: 0 };
+                                   line: 0, character: 0, module_idx: -1 };
         const td: Option<value::JsonValue*> = params.get(str::Str::from("textDocument"));
         const td_v: value::JsonValue* = td.unwrap_or(null);
         if (td_v == null) { return asked; }
@@ -114,10 +141,6 @@ type struct Asked {
         const uri: Option<str::Str> = uri_v.as::<str::Str>();
         if (!uri.is_some()) { return asked; }
         asked.uri = uri.unwrap_or(str::Str::from(""));
-        const pos: value::JsonValue* = params.get(str::Str::from("position")).unwrap_or(null);
-        if (pos == null) { return asked; }
-        asked.line = Asked::u32_field(pos, "line");
-        asked.character = Asked::u32_field(pos, "character");
 
         asked.ctx = projects.analysis_for(docs, asked.uri);
         if (asked.ctx == null) { return asked; }
@@ -126,10 +149,16 @@ type struct Asked {
         path_buf.push(fs_path.as_str());
         path_buf.push_byte(0 as u8);
         mem::drop(fs_path);
-        const module_idx: i64 = asked.ctx.module_graph.find_module_by_path(path_buf.as_ptr() as string);
+        asked.module_idx = asked.ctx.module_graph.find_module_by_path(path_buf.as_ptr() as string);
         mem::drop(path_buf);
+
+        // A request about a whole document carries no position.
+        const pos: value::JsonValue* = params.get(str::Str::from("position")).unwrap_or(null);
+        if (pos == null) { return asked; }
+        asked.line = Asked::u32_field(pos, "line");
+        asked.character = Asked::u32_field(pos, "character");
         const cursor: docs::CompilerPos = docs.to_compiler(asked.uri, asked.line, asked.character);
-        asked.answer = Locator::answer_at(asked.ctx, module_idx, cursor.line, cursor.col);
+        asked.answer = Locator::answer_at(asked.ctx, asked.module_idx, cursor.line, cursor.col);
         return asked;
     }
 
@@ -306,40 +335,43 @@ type struct Locator {
             return Answer::of(this.res_target(&s.scope_res), s.scope_span, TypeRef::invalid());
         }
         if (!this.holds(s.member_span)) { return Answer::nothing(); }
-        if (s.member_def.is_valid()) {
-            return Answer::of(Target::Def(s.member_def), s.member_span, ty);
-        }
-        const call: CallExprNode* = this.call_of(s as ASTNode*);
+        return Answer::of(this.path_member(s, this.call_of(s as ASTNode*)), s.member_span, ty);
+    }
+
+    /// What a path's member segment names; `call` is the call the path is
+    /// the callee of, or null.
+    path_member(&this, s: ScopeResolutionNode*, call: CallExprNode*) -> Target {
+        if (s.member_def.is_valid()) { return Target::Def(s.member_def); }
         if (call != null) {
             const t: Target = this.call_target(call);
-            if (!t.is_nothing()) { return Answer::of(t, s.member_span, ty); }
+            if (!t.is_nothing()) { return t; }
         }
         match (&s.resolved_member) {
             MemberPin::Variant(ord) => {
                 const owner: DefId = this.res_def(&s.scope_res);
-                if (owner.is_valid()) {
-                    return Answer::of(Target::Variant(owner, ord), s.member_span, ty);
-                }
+                if (owner.is_valid()) { return Target::Variant(owner, ord); }
             }
             _ => { }
         }
-        return Answer::of(this.pin_target(&s.resolved_callee), s.member_span, ty);
+        return this.pin_target(&s.resolved_callee);
     }
 
     member(&this, m: MemberAccessNode*) -> Answer {
         if (!this.holds(m.member_span)) { return Answer::nothing(); }
         const ty: TypeRef = (m as ExpressionNode*).resolved_type;
-        const call: CallExprNode* = this.call_of(m as ASTNode*);
-        if (call != null) {
-            return Answer::of(this.call_target(call), m.member_span, ty);
-        }
+        return Answer::of(this.member_target(m, this.call_of(m as ASTNode*)), m.member_span, ty);
+    }
+
+    /// What a member access names: the method the call it is the callee of
+    /// names, or the field its pin holds.
+    member_target(&this, m: MemberAccessNode*, call: CallExprNode*) -> Target {
+        if (call != null) { return this.call_target(call); }
         match (&m.resolved_member) {
             MemberPin::Field(depth, index) => {
-                if (m.object == null) { return Answer::nothing(); }
-                return Answer::of(this.field_target(m.object.resolved_type, depth, index),
-                    m.member_span, ty);
+                if (m.object == null) { return Target::Nothing; }
+                return this.field_target(m.object.resolved_type, depth, index);
             }
-            _ => { return Answer::nothing(); }
+            _ => { return Target::Nothing; }
         }
     }
 

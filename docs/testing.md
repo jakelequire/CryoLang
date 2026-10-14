@@ -394,7 +394,10 @@ Positions are named by markers, not by line and column:
   completion cursor sits (`wb./*^after_dot*/`).
 
 A check refers to a marker as `file@name`. A missing marker fails the run, so
-editing a fixture cannot quietly move a check onto another token. The check
+editing a fixture cannot quietly move a check onto another token. A comment
+between the segments of an import's path stops the import compiling, so a
+marker on an import's last segment is written after it, `import
+Probe::B/*^name*/;`. The check
 kinds and the `edit` field (ask about an unsaved, half-typed buffer) are
 described at the top of `smoke.py`.
 

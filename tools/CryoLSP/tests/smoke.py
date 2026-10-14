@@ -34,9 +34,19 @@ checks.json:
         {"name": "...", "method": "completion", "at": "...",
          "includes": ["..."], "excludes": ["..."]},
         {"name": "...", "method": "diagnostics", "file": "src/main.cryo",
-         "expect": [{"code": "W0001", "at": "src/main.cryo@marker"}]}
+         "expect": [{"code": "W0001", "at": "src/main.cryo@marker"}]},
+        {"name": "...", "method": "references" | "documentHighlight",
+         "at": "...", "declaration": true, "expect": ["src/b.cryo@marker", ...]},
+        {"name": "...", "method": "documentSymbol", "file": "src/b.cryo",
+         "includes": ["Item", "Item/get"], "excludes": ["..."]},
+        {"name": "...", "method": "workspaceSymbol", "query": "...",
+         "includes": ["..."], "excludes": ["..."]}
       ]
     }
+
+A references or highlight check compares the set of locations' starts with
+the markers'; `declaration` asks for the declaration too.  A symbol check
+names a nested symbol by its path from the top, `Parent/child`.
 
 Any check may carry `"edit": {"file": ..., "from": ..., "to": ...}`: the
 document is changed by replacing the first `from` with `to`, the check runs
@@ -233,6 +243,22 @@ def same_uri(a, b):
     return a.replace("%3A", ":").replace("%3a", ":").lower() == b.lower()
 
 
+def position_key(uri, pos):
+    """A location's file and start, comparable whatever the URI's escaping."""
+    file = uri.replace("%3A", ":").replace("%3a", ":").lower().rsplit("/", 1)[-1]
+    return (file, pos["line"], pos["character"])
+
+
+def symbol_names(symbols, prefix=""):
+    """Every symbol's name, a nested one as `Parent/child`."""
+    out = []
+    for s in symbols:
+        full = prefix + s.get("name", "")
+        out.append(full)
+        out.extend(symbol_names(s.get("children", []), full + "/"))
+    return out
+
+
 # ---- fixtures --------------------------------------------------------------
 
 class Fixture:
@@ -345,10 +371,28 @@ def run_check(srv, fx, chk, c):
             c.ok(True, name)
         return
 
+    if method in ("documentSymbol", "workspaceSymbol"):
+        if method == "documentSymbol":
+            resp = srv.request("textDocument/documentSymbol",
+                               {"textDocument": {"uri": fx.uri(chk["file"])}})
+        else:
+            resp = srv.request("workspace/symbol", {"query": chk["query"]})
+        if resp is None or "error" in resp:
+            c.ok(False, name, "no result: %r" % (resp,))
+            return
+        names = symbol_names(resp.get("result") or [])
+        missing = [s for s in chk.get("includes", []) if s not in names]
+        present = [s for s in chk.get("excludes", []) if s in names]
+        c.ok(not missing and not present, name,
+             "symbols %r; missing %r, unwanted %r" % (names[:40], missing, present))
+        return
+
     rel, pos = fx.at(chk["at"])
     params = {"textDocument": {"uri": fx.uri(rel)}, "position": pos}
     if method == "completion":
         params["context"] = {"triggerKind": 1}
+    if method == "references":
+        params["context"] = {"includeDeclaration": chk.get("declaration", False)}
     resp = srv.request("textDocument/" + method, params)
     if resp is None:
         c.ok(False, name, "no response (server %s)" % ("alive" if srv.alive() else "dead"))
@@ -379,6 +423,15 @@ def run_check(srv, fx, chk, c):
         present = [s for s in chk.get("excludes", []) if s in labels]
         c.ok(not missing and not present, name,
              "items %r; missing %r, unwanted %r" % (labels[:30], missing, present))
+    elif method in ("references", "documentHighlight"):
+        default_uri = fx.uri(rel)
+        got = sorted(position_key(r.get("uri", default_uri), r["range"]["start"])
+                     for r in (result or []))
+        want = []
+        for marker in chk["expect"]:
+            mrel, mpos = fx.at(marker)
+            want.append(position_key(fx.uri(mrel), mpos))
+        c.ok(got == sorted(want), name, "want %r, got %r" % (sorted(want), got))
     else:
         raise ValueError("%s: unknown check method %r" % (fx.name, method))
 
