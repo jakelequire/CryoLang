@@ -574,9 +574,7 @@ type struct CompilerInstance {
         // Raw mode runs full codegen (IRGen/ObjectEmission), so it shares the
         // process-wide (TypeRef.id -> LLVMTypeRef) cache. TypeArena.next_id
         // resets to 1 per compile, so a prior compile's entries would alias
-        // unrelated types here. Every other codegen entry resets it
-        // (run_project, compile_for_lsp_content); raw was the
-        // one that didn't.
+        // unrelated types here, so every codegen entry resets it first.
         compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
         compiler::codegen::ast_arena::cryo_ast_arena_reset();
         mut pipeline: PassRegistry = PassRegistry::build_raw_pipeline();
@@ -1101,19 +1099,17 @@ type struct CompilerInstance {
         const root_path: string = config.discovery_root_path();
         const stdlib_root: string = ctx.options.stdlib_root;
 
-        // NB (LSP): the language server owns the per-recompile arena lifecycle at
-        // the SESSION level (`CompilerSession::recompile`): it resets the arena
-        // and activates routing BEFORE constructing this `ctx`, so the whole
-        // context - including its sub-components (DeclarationIndex, ModuleGraph,
-        // InternTable, DiagnosticSink) and everything discovery/frontend/sema/mono
-        // allocate below - is arena-backed and reclaimed in bulk by the next
-        // recompile's reset, then deactivates routing when this returns.  Routing
-        // is therefore already ACTIVE here in LSP mode; the `set_active(true)` at
-        // the codegen boundary (~1396) is a no-op for LSP and the real activation
-        // for builds, and the reset at the top of this method is gated OFF for LSP
-        // (resetting here would free the session-owned `ctx` mid-compile).  The
-        // compile-epoch guard makes this safe: a stale session always recompiles
-        // before any handler reads its ctx, so nothing is read across a reset.
+        // NB (LSP): the language server owns each analysis's arena: it makes a
+        // fresh one and turns routing on BEFORE constructing this `ctx`, so the
+        // whole context - its DeclarationIndex, ModuleGraph, InternTable,
+        // DiagnosticSink and everything discovery/frontend/sema/mono allocate
+        // below - lives in that arena, which the server keeps as the analysis's
+        // snapshot and releases whole when a newer analysis replaces it.
+        // Routing is therefore already ACTIVE here in LSP mode; the
+        // `set_active(true)` at the codegen boundary is a no-op for LSP and the
+        // real activation for builds, and the reset at the top of this method
+        // is gated OFF for LSP (resetting here would free the server's `ctx`
+        // mid-compile).
 
         // Effective scan roots = own [project].source_paths, then a
         // resolved view of each [dependencies] entry's source roots.
@@ -1644,10 +1640,10 @@ type struct CompilerInstance {
         // here (before any LLVM type is built - frontend/mono/sema/codegen all
         // follow) and disposed on every exit path alongside the arena flip.
         //
-        // LSP mode skips this: codegen is gated off (line ~1726) and the only
+        // LSP mode skips this: codegen is gated off and the only
         // passes that run - frontend/sema/mono + the Cryo-side TypeLowering
         // (layouts, recursive-type + static_assert checks; no LLVM types) - never
-        // touch the codegen context.  Creating an LLVMContext per keystroke and
+        // touch the codegen context.  Creating an LLVMContext per analysis and
         // disposing it frees back to LLVM's libc allocator, which retains the
         // pages (RSS never drops), so an editing session climbs even though the
         // context is logically freed each compile.  Skipping the create avoids

@@ -1,22 +1,22 @@
 /// AST Position Lookup
 ///
-/// `find_innermost_node_at(root, line, character)` walks the AST and
-/// returns the deepest `ASTNode*` whose `span` covers (line, character),
-/// or `null` when no node matches.  Both inputs are 1-based to match
-/// the compiler's `SourceSpan` convention; LSP callers convert their
-/// 0-based positions before invoking.
+/// `NodeLocator::first_covering_child(node, line, character)` returns the
+/// first child of a node whose `span` covers (line, character), or `null`;
+/// a caller walks down by repeating it, which is how the language server
+/// finds the innermost node at a cursor.  Positions are 1-based to match
+/// the compiler's `SourceSpan` convention; the server converts its
+/// 0-based positions before asking.
 ///
 /// Dispatch is by `NodeKind` rather than the visitor pattern.  The
 /// visitor needs ~50 method overrides per concrete walker; this file
 /// recurses inline through the children that actually exist for each
 /// kind, which keeps the walk in one place.  Kinds with no children
-/// (Identifier, Literal, the various leaf statements) terminate the
-/// recursion automatically; `descend` returns null and the caller
-/// keeps the current node as the innermost match.
+/// (Identifier, Literal, the various leaf statements) have no covering
+/// child, so the walk stops at them.
 ///
-/// "Innermost" semantics: we descend into the FIRST child whose span
-/// covers the cursor.  Two siblings with overlapping spans is normally
-/// a parser bug; if it happens, we pick the leftmost one.
+/// "Innermost" semantics: the walk descends into the FIRST child whose
+/// span covers the cursor.  Two siblings with overlapping spans is
+/// normally a parser bug; if it happens, the leftmost one is taken.
 namespace compiler::ast::node_locator;
 
 import compiler::ast;
@@ -25,8 +25,6 @@ import compiler::ast::{
 };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
-import compiler::types::type_ref;
-import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::pattern;
 import compiler::ast::pattern::{ MatchArmNode, PatternNode, StaticMatchArmNode };
 import compiler::ast::declaration::{
@@ -41,7 +39,7 @@ import compiler::ast::expression::{
     TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
     YieldExprNode
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ ASTNode };
 import compiler::ast::statement::{
     BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
     LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
@@ -61,66 +59,6 @@ public function span_contains(span: SourceSpan, line: u32, character: u32) -> bo
     return true;
 }
 
-
-/// Walk `root` and return the innermost `ASTNode*` whose span covers
-/// (line, character).  Returns `null` when the cursor falls outside
-/// every top-level statement (typical for cursor-on-blank-line above
-/// the first declaration).
-public function find_innermost_node_at(root: ProgramNode*,
-                                        line: u32, character: u32) -> ASTNode* {
-    if (root == null) { return null; }
-    for (mut i: i64 = 0; i < root.statements.length; i++) {
-        const stmt: ASTNode* = root.statements[i];
-        if (stmt == null) { continue; }
-        if (!span_contains(stmt.span, line, character)) { continue; }
-        return NodeLocator::walk_node(stmt, line, character);
-    }
-    return null;
-}
-
-
-// pick*: scan a small fixed set of children + return the first that
-// covers the cursor.  Avoids the boilerplate of writing the same
-// `if (a != null && contains) return a;` chain per node kind.
-
-
-// Per-node-kind type extraction for hover.
-//
-// Most expressions stash their resolved type on `ExpressionNode.resolved_type`
-// (which the LSP can read after sema completes); declarations store theirs
-// on the per-class field (`VarDeclNode.resolved_type`,
-// `FunctionDeclNode.resolved_return_type`).  Returning `TypeRef::invalid()`
-// signals "no type info available"; the hover handler renders nothing
-// in that case rather than guessing.
-
-public function resolved_type_of(node: ASTNode*) -> TypeRef {
-    if (node == null) { return TypeRef::invalid(); }
-
-    // All ExpressionNode subclasses carry resolved_type on the base.
-    // The compiler treats Expression / its concrete kinds uniformly,
-    // so a single downcast suffices for the whole expression family.
-    if (node.kind.is_expression()) {
-        const e: ExpressionNode* = node as ExpressionNode*;
-        return e.resolved_type;
-    }
-
-    match (node.kind) {
-        NodeKind::VariableDeclaration => {
-            const d: VarDeclNode* = node as VarDeclNode*;
-            return d.resolved_type;
-        }
-        NodeKind::FunctionDeclaration => {
-            const d: FunctionDeclNode* = node as FunctionDeclNode*;
-            return d.resolved_return_type;
-        }
-        NodeKind::MethodDeclaration => {
-            const d: MethodNode* = node as MethodNode*;
-            if (d.func == null) { return TypeRef::invalid(); }
-            return d.func.resolved_return_type;
-        }
-        _ => { return TypeRef::invalid(); }
-    }
-}
 
 /// Span of a `TypeAnnotation*`: every variant carries a `span`
 /// field stamped by the parser, but it's tucked inside the variant
@@ -219,20 +157,8 @@ public function find_named_annotation_at(ann: TypeAnnotation*,
 }
 
 
-/// The position walk's per-kind descent, as stateless `static`s; the
-/// `public function`s above dispatch into these.
+/// The position walk's per-kind descent, as stateless `static`s.
 type struct NodeLocator {
-
-    /// Generic descent: given an `ASTNode*` known to cover the position,
-    /// look for a child whose span ALSO covers it.  When one is found,
-    /// recurse; otherwise return the input as the innermost match.
-    static walk_node(node: ASTNode*, line: u32, character: u32) -> ASTNode* {
-        if (node == null) { return null; }
-
-        const child: ASTNode* = NodeLocator::first_covering_child(node, line, character);
-        if (child == null) { return node; }
-        return NodeLocator::walk_node(child, line, character);
-    }
 
     /// Return the first child of `node` whose span covers (line, character),
     /// or `null` if no child does.  Per-kind dispatch: each branch knows

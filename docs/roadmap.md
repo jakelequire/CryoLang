@@ -9,9 +9,10 @@ rulings that constrain an item are in the appendix of
 
 **Order.**  CI is aligned with `make verify`'s gate list first, as
 housekeeping (ruling 266: CI matches verify's gate list first thing after
-the merge).  The first project is the editor's rewrite, on a branch named
+the merge).  The first project was the editor's rewrite, on a branch named
 `lsp-rewrite` (ruling 316: the editor's rewrite comes first, before the
-type-syntax update and the class removal).  Then the type-syntax update
+type-syntax update and the class removal); what it built and what it left
+are under "The language server".  Then the type-syntax update
 (the array syntax below), then the class removal, then trait objects; the
 other items are not ordered yet.
 
@@ -93,28 +94,72 @@ its caller.  `make clean` removes every build output and gate state the
 targets write.  The untracked plans in `docs/` and `.todo/` are not part of
 the branch.
 
-## First: the editor's rewrite (`lsp-rewrite`)
+## The language server
 
-The first project after the merge, on its own branch (ruling 316).  The
-language server answers from the compiler's own identities - the
-definitions, types and module identities the name layer stamps - instead
-of finding declarations by their spelling.  The plan, its steps and what
-each one proves are in `docs/lsp-rewrite-plan.md`, which is folded back
-into this roadmap and deleted when the work is done.
+Rewritten on the `lsp-rewrite` branch (ruling 316).  `tools/CryoLSP`
+answers from the identities the compiler stamps, never by a declaration's
+spelling: a position finds its node, the node's stamp names a definition,
+and every answer is read from that definition.  One analysis per project
+runs on open and on save, with every open buffer in place of its file; the
+last analysis that parsed answers while a buffer is broken or being typed,
+and answers requests between modules while the next one runs.  It serves
+diagnostics, hover, definition, references and highlights, document and
+workspace symbols, completion, semantic tokens, the implementations lens,
+rename, signature help and inlay hints.  `make lsp-check` drives the
+server through `tools/CryoLSP/tests/smoke.py` over its fixtures and
+refuses below its floor of passing checks (`docs/testing.md` section 9).
 
-- **On-save analysis.**  The compiler analyses a file when it is saved, not
-  on every keystroke.
-- **A last-good snapshot.**  The editor keeps the most recent analysis that
-  succeeded, so a half-typed line does not take every answer away.
-- **Completion** comes from that snapshot plus the line being typed.
-- **Module caching on the compiler side**, so a save re-analyses what
-  changed rather than the whole program.
-- **The editor's allows are gone.**  Its 39 `![allow]`s naming the deleted
-  spelling lint were deleted in this work (ruling 184), with the bare-name
-  finders (D38) and the fallback for a file with no project (D63).
+What is left:
 
-Open: how the snapshot is invalidated when an imported module changes; and
-whether the cache is per module or per file.
+- **Module caching** (ruling 329: a design only in the first release; each
+  save analyses the whole project).  Measured on the compiler project with
+  `cryo check` (166 local and 81 standard library modules, 26.4 s):
+  discovery 8.6 s, the project's own lex and parse 3.5 s, name resolution
+  1.7 s, semantic analysis through lowering 10.1 s, the standard library
+  under 2 s in all; a hello-world takes 1.1 s.  In order:
+  1. Split the semantic stage by pass and leave out of the editor's mode
+     what it neither shows nor reads (drop insertion is the candidate).
+  2. Lex each file once: discovery lexes every project file whole for its
+     `namespace`, again for its imports, and the frontend lexes it a third
+     time.  Then a cache of each file's scan result (namespace, import
+     paths, `public module` lines) keyed by path and content hash, held by
+     the server across analyses and handed to the loader through
+     `BuildOptions` as the yield hook is.  Its entries are strings, not
+     identities, so they can outlive an analysis's arena.
+  3. A token cache per file by content hash; a parsed-tree cache only if
+     cloning a pristine tree measures cheaper than parsing, since later
+     stages write stamps into the tree and monomorphization writes
+     specializations into the owning module's.
+  4. Per-module reuse after name resolution, as part of identities that
+     are stable across analyses.  Invalidation would be the object cache's
+     key: a module's source hash folded with every hash in its import
+     closure and the prelude's.  What stops it today is that every identity
+     (`SymbolStr`, `DefId`, `ScopeID`, `SymbolID`, `TypeRef`) is a position
+     in a table one analysis builds and the next rebuilds, all in the
+     analysis's arena, and a module's results name other modules'
+     identities.  Either identities keyed by path and structure, or one
+     long-lived context whose tables can retract a module's entries: a
+     compiler architecture project.
+- **Parsing that continues past an error** (ruling 330), only if the last
+  good analysis proves not to be enough.
+- **Completion after a partial module path** (ruling 339): `import Probe::`
+  where `Probe` names no module but prefixes `Probe::A` and `Probe::B`
+  offers nothing, until the module graph can list a path's children by
+  identity through a door.  Completion is not read for a receiver whose
+  head is a path (`T::make().`).
+- **The import suggestion for a module already imported** (ruling 332)
+  becomes not machine-applicable and suggests the qualified name.  It
+  changes a diagnostic's text, which waits for its wording to be decided.
+- **Rename** refuses a module (its name is its namespace declaration and
+  its file's place), a method a trait declares or implements (the trait's
+  and every implementation's would move together), and a name at an
+  import's alias.  Its collision check asks the bare-name lookups at every
+  use, a qualified use (`B::helper()`) included, which can refuse a rename
+  that would have been safe there.
+- **Signature help** reads a call whose `(` is on the cursor's line only;
+  **inlay hints** show inferred types, not parameter names at call sites.
+- **The uses index** is built per request (ruling 337); a cache waits for a
+  measurement that needs one.
 
 ## CI
 
