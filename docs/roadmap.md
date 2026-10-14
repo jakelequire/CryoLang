@@ -109,11 +109,9 @@ into this roadmap and deleted when the work is done.
 - **Completion** comes from that snapshot plus the line being typed.
 - **Module caching on the compiler side**, so a save re-analyses what
   changed rather than the whole program.
-- **The editor's remaining allows go then.**  Its 39 `![allow]`s naming the
-  deleted spelling lint are inert today and are deleted in this work (ruling
-  184: the editor's allows are deleted during its own work after the
-  merge).  The bare-name finders the editor still carries (D38) and its
-  fallback for a file with no project (D63) go in the same work.
+- **The editor's allows are gone.**  Its 39 `![allow]`s naming the deleted
+  spelling lint were deleted in this work (ruling 184), with the bare-name
+  finders (D38) and the fallback for a file with no project (D63).
 
 Open: how the snapshot is invalidated when an imported module changes; and
 whether the cache is per module or per file.

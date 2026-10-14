@@ -1,8 +1,10 @@
 ///! Every name written in an analysis, with what it names: the uses index
-///! references and document highlights are answered from.  Built from the
-///! stamps by the same reads `identity` makes at one position, over every
-///! node a module's tree holds where it is written - a monomorphized copy,
-///! or a node copied in from another file, is not written there.
+///! references, document highlights and semantic tokens are answered from.
+///! Built from the stamps by the same reads `identity` makes at one
+///! position, over every node a module's tree holds where it is written - a
+///! monomorphized copy, a node copied in from another file, or a node the
+///! compiler wrote (`generated`) is not written there, though written code
+///! a compiler-written expression wraps is.
 namespace lsp::handlers::uses;
 
 import std::core::mem;
@@ -25,7 +27,7 @@ import compiler::ast::expression::{
 };
 import compiler::ast::pattern::{ EnumPatternNode, MatchArmNode, PatternNode };
 import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
+    AsmBlockStmtNode, BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
     LoopStmtNode, MatchStmtNode, ReturnStmtNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
     WhileStmtNode
 };
@@ -35,12 +37,13 @@ import compiler::resolver::res::{ DefId };
 import lsp::handlers::identity::{ Locator, Target };
 
 
-/// One written name: where it is, what it names, and whether it is the
-/// name's declaration.
+/// One written name: where it is, what it names, whether it is the name's
+/// declaration, and whether it declares a method's receiver (`&this`).
 type struct Use {
-    span:   SourceSpan;
-    target: Target;
-    decl:   boolean;
+    span:     SourceSpan;
+    target:   Target;
+    decl:     boolean;
+    receiver: boolean;
 }
 
 
@@ -49,6 +52,9 @@ type struct Uses {
     loc:  Locator;
     file: string;
     out:  Use[];
+    /// The inline assembly blocks written in the module, whose text names
+    /// nothing the compiler stamps.
+    asm:  AsmBlockStmtNode*[];
 
     /// Every use written in every module of `ctx` naming `target`.
     static of_target(ctx: CompilationContext*, target: &Target, with_decl: boolean) -> Use[] {
@@ -67,25 +73,36 @@ type struct Uses {
 
     /// Every use written in module `m`.
     static in_module(ctx: CompilationContext*, m: i64) -> Use[] {
-        mut w: Uses = Uses {
-            loc:  Locator::new(ctx, 0, 0),
-            file: ctx.module_graph.modules[m].file_path,
-            out:  [],
-        };
-        const program: ProgramNode* = ctx.module_graph.get_module_ast(m as u32);
-        if (program != null) {
-            for (mut i: i64 = 0; i < program.statements.length; i++) { w.node(program.statements[i]); }
-        }
+        mut w: Uses = Uses::scan(ctx, m);
         mut found: Use[] = [];
         mem::swap(&found, &w.out);
         return found;
     }
 
+    /// The walk over module `m`, done.
+    static scan(ctx: CompilationContext*, m: i64) -> Uses {
+        mut w: Uses = Uses {
+            loc:  Locator::new(ctx, 0, 0),
+            file: ctx.module_graph.modules[m].file_path,
+            out:  [],
+            asm:  [],
+        };
+        const program: ProgramNode* = ctx.module_graph.get_module_ast(m as u32);
+        if (program != null) {
+            for (mut i: i64 = 0; i < program.statements.length; i++) { w.node(program.statements[i]); }
+        }
+        return w;
+    }
+
     /// Record `target` at `span` when the span is written in this module.
     add(mut &this, span: SourceSpan, target: Target, decl: boolean) -> void {
+        this.push(span, target, decl, false);
+    }
+
+    push(mut &this, span: SourceSpan, target: Target, decl: boolean, receiver: boolean) -> void {
         if (span.start_line == 0 || target.is_nothing()) { return; }
         if (span.file == null || !span.file.eq(this.file)) { return; }
-        this.out.push(Use { span: span, target: target, decl: decl });
+        this.out.push(Use { span: span, target: target, decl: decl, receiver: receiver });
     }
 
     /// A name written at `span` and spelled with `length` bytes, whose
@@ -129,7 +146,18 @@ type struct Uses {
 
     node(mut &this, n: ASTNode*) -> void {
         if (n == null) { return; }
+        // A declaration the compiler wrote holds copies of written code
+        // (a closure struct's method holds the lambda's body), which is
+        // walked where it is written.
+        if (n.generated && !n.kind.is_expression()) { return; }
         match (n.kind) {
+            NodeKind::AsmBlockStatement => {
+                const a: AsmBlockStmtNode* = n as AsmBlockStmtNode*;
+                for (mut i: i64 = 0; i < a.operands.length; i++) {
+                    if (a.operands[i] != null) { this.expr(a.operands[i].expr, null); }
+                }
+                if (a.span.file != null && a.span.file.eq(this.file)) { this.asm.push(a); }
+            }
             NodeKind::ImportDeclaration => {
                 const imp: ImportDeclNode* = n as ImportDeclNode*;
                 const last: i64 = imp.path_segment_spans.length - 1;
@@ -273,7 +301,7 @@ type struct Uses {
             const p: VarDeclNode* = f.parameters[i];
             if (p == null) { continue; }
             if (i == 0 && receiver) {
-                this.add(p.name_span, Target::Local(p.sym_id), true);
+                this.push(p.name_span, Target::Local(p.sym_id), true, true);
                 continue;
             }
             this.var_decl(p);
@@ -354,6 +382,14 @@ type struct Uses {
     expr(mut &this, e: ExpressionNode*, call: CallExprNode*) -> void {
         if (e == null) { return; }
         const n: ASTNode* = e as ASTNode*;
+        if (n.generated) {
+            // The compiler wrote it, so it names nothing; the written code
+            // it wraps - an f-string's holes, a converted operand - is
+            // walked.
+            if (n.kind == NodeKind::CallExpression) { this.exprs(&(e as CallExprNode*).arguments); }
+            if (n.kind == NodeKind::UnaryExpression) { this.expr((e as UnaryExprNode*).operand, null); }
+            return;
+        }
         match (n.kind) {
             NodeKind::Identifier => {
                 const id: IdentifierNode* = e as IdentifierNode*;

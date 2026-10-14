@@ -40,9 +40,17 @@ checks.json:
         {"name": "...", "method": "documentSymbol", "file": "src/b.cryo",
          "includes": ["Item", "Item/get"], "excludes": ["..."]},
         {"name": "...", "method": "workspaceSymbol", "query": "...",
-         "includes": ["..."], "excludes": ["..."]}
+         "includes": ["..."], "excludes": ["..."]},
+        {"name": "...", "method": "semanticTokens", "file": "src/main.cryo",
+         "expect": {"src/main.cryo@marker": "variable.readonly", "...": null}}
       ]
     }
+
+A semantic-tokens check names, per position, the token that must start
+there: its type, then any modifiers it must carry (it may carry more), or
+null for no token.  A marker reference may add `+N` columns
+(`src/main.cryo@fstr+5`), for a position inside a string, where no comment
+can sit.
 
 A references or highlight check compares the set of locations' starts with
 the markers'; `declaration` asks for the declaration too.  A symbol check
@@ -300,14 +308,20 @@ class Fixture:
         return uri_for(os.path.join(self.root, rel))
 
     def at(self, ref):
-        """`file@marker` -> (rel, position).  A missing marker is an error."""
+        """`file@marker` -> (rel, position).  A missing marker is an error.
+        `file@marker+N` is N columns further along the marker's line, for a
+        position no comment can sit in front of (inside a string)."""
+        offset = 0
+        if "+" in ref:
+            ref, extra = ref.rsplit("+", 1)
+            offset = int(extra)
         rel = ref.split("@", 1)[0]
         if rel not in self.text:
             self.load(rel)
         if ref not in self.markers:
             raise KeyError("%s: no marker %s" % (self.name, ref))
         line, ch = self.markers[ref]
-        return rel, {"line": line, "character": ch}
+        return rel, {"line": line, "character": ch + offset}
 
 
 def position_of(text, offset):
@@ -349,6 +363,21 @@ def hover_text(result):
     return str(c)
 
 
+def decode_tokens(data, legend):
+    """Semantic tokens' wire data -> {(line, start): (type, {modifiers})}."""
+    types = legend.get("tokenTypes", [])
+    mods = legend.get("tokenModifiers", [])
+    out = {}
+    line = start = 0
+    for k in range(0, len(data) - 4, 5):
+        dl, ds, _length, ty, bits = data[k:k + 5]
+        line += dl
+        start = start + ds if dl == 0 else ds
+        names = {mods[b] for b in range(len(mods)) if bits & (1 << b)}
+        out[(line, start)] = (types[ty] if ty < len(types) else str(ty), names)
+    return out
+
+
 def completion_labels(result):
     items = result.get("items", []) if isinstance(result, dict) else (result or [])
     return [i.get("label") for i in items]
@@ -374,6 +403,28 @@ def run_check(srv, fx, chk, c):
             c.ok(False, name, "want %r, last published %r" % (want, got_of(last) if last else None))
         else:
             c.ok(True, name)
+        return
+
+    if method == "semanticTokens":
+        resp = srv.request("textDocument/semanticTokens/full",
+                           {"textDocument": {"uri": fx.uri(chk["file"])}})
+        if resp is None or "error" in resp or not isinstance(resp.get("result"), dict):
+            c.ok(False, name, "no result: %r" % (resp,))
+            return
+        tokens = decode_tokens(resp["result"].get("data", []), fx.legend)
+        bad = []
+        for ref, want in chk["expect"].items():
+            _, pos = fx.at(ref)
+            got = tokens.get((pos["line"], pos["character"]))
+            if want is None:
+                if got is not None:
+                    bad.append("%s: want no token, got %s" % (ref, ".".join([got[0]] + sorted(got[1]))))
+                continue
+            parts = want.split(".")
+            if got is None or got[0] != parts[0] or not set(parts[1:]) <= got[1]:
+                shown = None if got is None else ".".join([got[0]] + sorted(got[1]))
+                bad.append("%s: want %s, got %s" % (ref, want, shown))
+        c.ok(not bad, name, "; ".join(bad))
         return
 
     if method in ("documentSymbol", "workspaceSymbol"):
@@ -480,7 +531,8 @@ def run_fixture(server_path, fx, c):
     failed_before = len(c.failed)
     srv = Server(server_path, fx.root)
     try:
-        initialize(srv, fx.root, c, fx.name)
+        caps = initialize(srv, fx.root, c, fx.name)
+        fx.legend = (caps.get("semanticTokensProvider") or {}).get("legend", {})
         for rel in fx.spec.get("open", []):
             srv.notify("textDocument/didOpen", {"textDocument": {
                 "uri": fx.uri(rel), "languageId": "cryo", "version": 1, "text": fx.text[rel]}})

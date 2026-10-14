@@ -174,7 +174,7 @@ changes what a program compiles to or what a diagnostic says.
 | C6. Enumerate a type's members and a module's exports by identity | [neutral] | Enumeration takes no spelling, so it is not a door. |
 | C7. The uses index | none | In the server, built from stamps (ruling 326). |
 | C8. A qualified annotation's span covers its whole path | **[behaviour]** | ruling 328: diagnostic underlines move; negative tests whose columns move are re-annotated. |
-| C9. A mark on parser-synthesized nodes (f-string runtime calls), or `NameOrigin::Generated` | [neutral] | Replaces two spelling checks in semantic tokens. |
+| C9. A mark on parser-synthesized nodes (f-string runtime calls), or `NameOrigin::Generated` | [neutral] | Replaces two spelling checks in semantic tokens. Built as `ASTNode.generated` (step 7). |
 | C10. A yield hook between modules in the stage drivers, null in the CLI | [neutral] | ruling 329. The server swaps the published arena around the callback, as it already does between analyses. |
 | C11. Module caching | design only in the first release | ruling 329. The stages run stage-major over all modules and mutate shared tables, and monomorphization writes specializations into the tree. The standard library is about 1 s of the compiler project's 40 s; the rest needs per-module reuse. |
 | C12. Parsing that continues in `CompileMode::Lsp` | **[behaviour]**, after the first release | ruling 330. |
@@ -386,10 +386,43 @@ steps.
   elsewhere in the buffer and nothing written to stderr, `this.`, an
   import's path, the extended hover.
 
-### Step 7. Semantic tokens and lenses from stamps
+### Step 7. Semantic tokens and lenses from stamps (landed)
 
-- Tokens coloured from stamps; synthesized nodes by C9; the implementations
-  lens by `ImplBlockNode.res`. The `![allow]` count reaches zero.
+- C9 is `ASTNode.generated`: the compiler wrote the node where the source
+  spells nothing, with the span of the source it stands for. Set on an
+  f-string's lowering (its calls, their callees, its literal runs and the
+  `&` around each hole), an implicit conversion's call and callee, a
+  lambda's closure struct and its `Drop` block; the cloner keeps it. A
+  marked expression is looked through to the written code it wraps (the
+  holes, the converted operand); a marked declaration is skipped whole,
+  since the closure struct's method holds the lambda's body, which is
+  written where the lambda is. `NodeLocator`'s picks look through marked
+  nodes.
+- Tokens are the uses index (`uses.cryo`) coloured by identity: a module,
+  a type by its declaration's kind, a function, a method (static or not), a
+  global (`readonly` when constant), a local or parameter (`readonly` when
+  not `mut`), a type parameter, a field, a variant; `declaration` on a
+  declaring name. A method's receiver and `this` keep the grammar's keyword
+  colour (the receiver is marked in the index, not compared by spelling).
+  Import and namespace path segments are namespaces; inline assembly keeps
+  its lexer, its `${...}` operands now in the uses index. The
+  implementations lens already counted blocks by stamp; it now skips
+  compiler-written blocks.
+- Deleted: the syntax-driven walker and its spelling checks (`__Closure`
+  in a struct's name, receiver names, f-string runtime callee names, the
+  span-shape test for a conversion) with the last 2 `![allow]`s - the
+  server has none.
+- Checks (a third fixture, `generated`: an f-string, a capturing lambda, a
+  converted literal): tokens for a parameter, type parameter, constant,
+  local, call, capture and a name in an f-string's hole, none at a lambda
+  or a converted literal; hover, definition and references through an
+  f-string's hole; references of a captured local; tokens on
+  `two_modules` (module path, type path, match arm binding and constant,
+  parameter, static and instance calls). The previous server coloured a
+  parameter as a variable and a module path as a type, left match arms and
+  f-string holes uncoloured, answered hover inside a hole with
+  `fmt_append_display`, and listed a captured local's use twice (the closure
+  struct's copy of the lambda body).
 
 ### Step 8. Long analyses do not freeze the editor
 
