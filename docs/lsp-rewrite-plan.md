@@ -461,6 +461,22 @@ steps.
   entry bound (`specific_defs`, by entry), a sub-module's included. The
   uses index lists an entry and its alias under each; definition and hover
   answer on them. No compiled output moved.
+- Rename (`handlers/rename.cryo`, with `prepareRename`): the target at the
+  cursor, its uses from the index, and at each use the name's own span -
+  the last identifier of the use's span when it spells the declared name. A
+  use spelled otherwise reaches the target through an import's alias, which
+  is kept. Refused, with the reason as the error: a target declared in a
+  module that is not the project's own (the standard library, a dependency,
+  a vendored module), a module, a primitive, `this`, a method a trait
+  declares or implements, the cursor on an alias, a new name that is no
+  identifier or is a keyword (the lexer's table), a file to rewrite that
+  changed since the analysis read it, and a new name the compiler already
+  answers: `lookup_value` or `type_binding` in the scope at every use, the
+  declaring module's `exports_named`, or for a member `field_of`,
+  `lookup_family_entries` and `variant_index` on its type and base classes.
+  The scope check is conservative: a qualified use (`B::helper()`) is
+  checked against the bare names its scope sees, which a rename cannot
+  disturb.
 
 ### Step 10. Module caching: the design
 

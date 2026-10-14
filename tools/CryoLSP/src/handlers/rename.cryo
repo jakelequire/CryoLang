@@ -1,0 +1,447 @@
+///! Rename: every place the target at the position is written, from the uses
+///! index (`uses`), rewritten to the new name.
+///!
+///! A rename is refused rather than done partly: for a target declared
+///! outside the project (the standard library, a dependency, a vendored
+///! module), a module, a primitive, `this`, a method a trait declares or
+///! implements, a name that is not a plain identifier or is a keyword, a
+///! file the analysis read before its unsaved edits, and a new name the
+///! compiler's lookups already answer in a scope the rename reaches.
+///!
+///! A use is rewritten where it spells the declared name: the last segment
+///! of a path, or the whole name.  A use spelled otherwise reaches the
+///! target through an import's alias, and keeps the alias.
+namespace lsp::handlers::rename;
+
+import std::core::option;
+import std::core::mem;
+import std::collections::str;
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::fs::file;
+import std::fs::path;
+import std::fmt;
+import std::json::value;
+
+import compiler::compilation_context::{ CompilationContext };
+import compiler::ast::{ NodeKind };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::declaration::{ MethodNode };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::lex::{ TokenType };
+import compiler::module_graph::{ ModuleOrigin, ModulePath };
+import compiler::resolver::res::{ DefId, DefKind, FamilyOwner };
+import compiler::resolver::scope::{ ScopeID };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::sema::member_resolver::{ MemberResolver };
+import compiler::sema::type_utils::{ TypeUtils };
+import compiler::types;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::type_base;
+import compiler::types::user_defined::{ ClassType, EnumType };
+import utils::keyword::{ Keyword };
+
+import lsp::handlers::identity::{ Asked, Target };
+import lsp::handlers::uses::{ Use, Uses };
+import lsp::server::docs;
+import lsp::server::line_index;
+import lsp::server::line_index::{ Columns };
+import lsp::server::session;
+import lsp::protocol::conv;
+
+
+/// A use to rewrite, and the module it is written in.
+type struct Site {
+    span:   SourceSpan;
+    module: i64;
+}
+
+
+/// A file's text as the current analysis read it: an open document's
+/// analysed text, or the file on disk.
+type struct Source {
+    path:  String;
+    text:  String;
+    index: line_index::LineIndex;
+}
+
+
+/// The rename at a position, worked out: the sites to rewrite, or why it is
+/// refused.
+type struct Renaming {
+    ctx:     CompilationContext*;
+    target:  Target;
+    /// The name as its declaration writes it.
+    old:     String;
+    /// Where the name is written at the cursor.
+    at:      SourceSpan;
+    /// Every place the name is written as `old`, the declaration's included.
+    sites:   Site[];
+    /// The module the declaration is written in.
+    home:    i64;
+    /// Why the rename is refused; empty when it is not.
+    refusal: String;
+    sources: Source[];
+
+    /// The rename at the request's position, refused or not, before any new
+    /// name is known.
+    static prepare(docs: mut &docs::Docs, projects: mut &session::Projects,
+                          params: &value::JsonValue) -> Renaming {
+        const asked: Asked = Asked::from(docs, projects, params);
+        mut r: Renaming = Renaming {
+            ctx: asked.ctx, target: asked.answer.target, old: String::new(),
+            at: asked.answer.span, sites: [], home: -1, refusal: String::new(), sources: [],
+        };
+        if (asked.ctx == null) {
+            r.refusal = String::from_string("this file has no analysis yet");
+        } else if (asked.answer.target.is_nothing()) {
+            r.refusal = String::from_string("nothing here can be renamed");
+        } else if (asked.answer.receiver) {
+            r.refusal = String::from_string("`this` is a keyword and cannot be renamed");
+        } else {
+            r.refusal = String::from_string(r.kind_refusal());
+            if (!r.refused()) { r.collect(docs); }
+        }
+        return r;
+    }
+
+    refused(&this) -> boolean { return this.refusal.length() > 0; }
+
+    /// Why the kind of target cannot be renamed at all, or "".
+    kind_refusal(&this) -> string {
+        match (&this.target) {
+            Target::Prim(_) => { return "a primitive type is declared nowhere and cannot be renamed"; }
+            Target::Def(d) => {
+                const kind: DefKind = this.ctx.defs.kind_of(d);
+                if (kind == DefKind::Module) {
+                    return "a module cannot be renamed: its name is written in its namespace declaration and the place of its file";
+                }
+                if (kind == DefKind::Primitive || kind == DefKind::Instance) {
+                    return "this name is declared nowhere in the project";
+                }
+                if (kind == DefKind::Method && this.trait_method(d)) {
+                    return "a method a trait declares or implements cannot be renamed on its own";
+                }
+                return "";
+            }
+            _ => { return ""; }
+        }
+    }
+
+    /// Whether method `d` is declared by a trait or implements one.
+    trait_method(&this, d: DefId) -> boolean {
+        const owner: ASTNode* = this.ctx.decl_index.declaration_of(this.ctx.defs.parent_of(d));
+        if (owner != null && owner.kind == NodeKind::TraitDeclaration) { return true; }
+        const decl: ASTNode* = this.ctx.decl_index.declaration_of(d);
+        if (decl == null || decl.kind != NodeKind::MethodDeclaration) { return false; }
+        const m: MethodNode* = decl as MethodNode*;
+        return m.func != null && m.func.origin_trait.is_valid();
+    }
+
+    /// Every use of the target, every one in a module of the project, and
+    /// the name its declaration writes.
+    collect(mut &this, docs: &docs::Docs) -> void {
+        mut found: Site[] = [];
+        mut decl: SourceSpan = SourceSpan::none();
+        const n: u32 = this.ctx.module_graph.module_count();
+        for (mut m: u32 = 0; m < n; m++) {
+            const all: Use[] = Uses::in_module(this.ctx, m as i64);
+            for (mut i: i64 = 0; i < all.length; i++) {
+                if (!all[i].target.same(&this.target)) { continue; }
+                if (this.ctx.module_graph.modules[m as i64].origin != ModuleOrigin::Local) {
+                    this.refusal = String::from_string(
+                        "this is declared outside the project (the standard library, a dependency or a vendored module)");
+                    return;
+                }
+                if (all[i].decl && decl.start_line == 0) {
+                    decl = all[i].span;
+                    this.home = m as i64;
+                }
+                found.push(Site { span: all[i].span, module: m as i64 });
+            }
+        }
+        if (decl.start_line == 0) {
+            this.refusal = String::from_string("its declaration is not written in this project");
+            return;
+        }
+        const written: str::Str = this.tail_of(docs, decl);
+        if (written.length() == 0) {
+            this.refusal = String::from_string("its declaration's name could not be read");
+            return;
+        }
+        this.old = String::from_str(written);
+        // The cursor must stand on the name itself, not on an alias of it.
+        if (this.name_span(docs, this.at).start_line == 0) {
+            this.refusal = String::from_string(fmt::format(
+                "this is another name for `%s`; rename `%s` where it is declared",
+                Renaming::cstr(written), Renaming::cstr(written)));
+            return;
+        }
+        for (mut i: i64 = 0; i < found.length; i++) {
+            const s: SourceSpan = this.name_span(docs, found[i].span);
+            if (s.start_line == 0 || this.has_site(s)) { continue; }
+            this.sites.push(Site { span: s, module: found[i].module });
+        }
+    }
+
+    has_site(&this, s: SourceSpan) -> boolean {
+        for (mut i: i64 = 0; i < this.sites.length; i++) {
+            const t: SourceSpan = this.sites[i].span;
+            if (t.start_line == s.start_line && t.start_col == s.start_col && t.file.eq(s.file)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // -- The text --
+
+    /// The identifier that ends span `s` (one line), or empty.
+    tail_of(mut &this, docs: &docs::Docs, s: SourceSpan) -> str::Str {
+        if (s.start_line == 0 || s.file == null) { return str::Str::from(""); }
+        const end_line: u32 = if (s.end_line == 0) { s.start_line } else { s.end_line };
+        if (end_line != s.start_line) { return str::Str::from(""); }
+        const src: Source* = this.source(docs, s.file);
+        if (src == null) { return str::Str::from(""); }
+        const line: str::Str = Columns::line_of(src.text.as_str(), &src.index, s.start_line - 1);
+        const from: u64 = Columns::compiler_to_byte(line, s.start_col);
+        const to: u64 = Columns::compiler_to_byte(line, s.end_col);
+        if (to <= from) { return str::Str::from(""); }
+        const b: u8* = line.as_ptr();
+        mut p: u64 = to;
+        while (p > from && Renaming::is_ident(b[p - 1])) { p = p - 1; }
+        return line.sub_bytes(p, to);
+    }
+
+    /// The span of the declared name where `s` writes it as its last
+    /// identifier; `none()` when `s` spells it otherwise.
+    name_span(mut &this, docs: &docs::Docs, s: SourceSpan) -> SourceSpan {
+        const t: str::Str = this.tail_of(docs, s);
+        if (t.length() == 0 || !t.equals(&this.old.as_str())) { return SourceSpan::none(); }
+        const end_col: u32 = s.end_col;
+        // A name holds no tab, so its compiler columns are its bytes.
+        return SourceSpan::new(s.file, s.start_line, end_col - t.length() as u32, s.start_line, end_col);
+    }
+
+    /// The analysed text of `file`, read once.
+    source(mut &this, docs: &docs::Docs, file: string) -> Source* {
+        const p: str::Str = str::Str::from(file);
+        for (mut i: i64 = 0; i < this.sources.length; i++) {
+            if (this.sources[i].path.as_str().equals(&p)) { return &this.sources[i]; }
+        }
+        mut text: String = String::new();
+        match (docs.by_path(p)) {
+            Option::Some(doc) => {
+                text = String::from_str(if (doc.has_snap) { doc.snap_text.as_str() } else { doc.text.as_str() });
+            }
+            Option::None => {
+                match (file::read_to_string(path::Path::from(p))) {
+                    Result::Ok(t) => { text = t; }
+                    Result::Err(_) => { return null; }
+                }
+            }
+        }
+        const idx: line_index::LineIndex = line_index::LineIndex::build(text.as_str());
+        this.sources.push(Source { path: String::from_str(p), text: text, index: idx });
+        return &this.sources[this.sources.length - 1];
+    }
+
+    static is_ident(b: u8) -> boolean {
+        return (b >= 'a' as u8 && b <= 'z' as u8) || (b >= 'A' as u8 && b <= 'Z' as u8)
+            || (b >= '0' as u8 && b <= '9' as u8) || b == '_' as u8;
+    }
+
+    // -- The new name --
+
+    /// Refuse `new_name` when it is no identifier, is a keyword, or the
+    /// compiler already answers it where the rename reaches; or when a file
+    /// to rewrite has changed since the analysis read it.
+    check(mut &this, docs: &docs::Docs, new_name: str::Str) -> void {
+        if (!Renaming::is_identifier(new_name)) {
+            this.refusal = String::from_string(fmt::format("`%s` is not an identifier", Renaming::cstr(new_name)));
+            return;
+        }
+        const raw: string = Renaming::cstr(new_name);
+        if (TokenType::from_keyword(Keyword::new(raw)) != TokenType::Unknown) {
+            this.refusal = String::from_string(fmt::format("`%s` is a keyword", raw));
+            return;
+        }
+        for (mut i: i64 = 0; i < this.sites.length; i++) {
+            match (docs.by_path(str::Str::from(this.sites[i].span.file))) {
+                Option::Some(doc) => {
+                    if (doc.has_snap && !doc.text.as_str().equals(&doc.snap_text.as_str())) {
+                        this.refusal = String::from_string(fmt::format(
+                            "%s has changed since it was analysed; save it before renaming",
+                            this.sites[i].span.file));
+                        return;
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        if (new_name.equals(&this.old.as_str())) { return; }
+        const name: SymbolStr = this.ctx.intern_table.intern(raw);
+        const clash: SourceSpan = this.collision(name);
+        if (clash.start_line != 0) {
+            this.refusal = String::from_string(fmt::format(
+                "`%s` already names something where `%s` is used (%s:%d)",
+                raw, Renaming::cstr(this.old.as_str()), clash.file, clash.start_line as i64));
+        }
+    }
+
+    /// Where `name` already answers in a scope the rename reaches, or
+    /// `none()`.  A member is asked of its type; any other name of the
+    /// lookup that finds it, at every place the target is written, and a
+    /// declaration of a module of its module's exports.
+    collision(&this, name: SymbolStr) -> SourceSpan {
+        match (&this.target) {
+            Target::Field(owner, _) => { return this.member_collision(owner, name); }
+            Target::Variant(owner, _) => { return this.member_collision(owner, name); }
+            Target::Def(d) => {
+                const kind: DefKind = this.ctx.defs.kind_of(d);
+                if (kind == DefKind::Method) {
+                    return this.member_collision(this.ctx.defs.parent_of(d), name);
+                }
+                const home: ModulePath = this.ctx.module_graph.get_module(this.home).path();
+                if (this.ctx.defs.kind_of(this.ctx.defs.parent_of(d)) == DefKind::Module
+                    && this.ctx.resolver.exports_named(home, name).length > 0) {
+                    return this.sites[0].span;
+                }
+                return this.scope_collision(name, kind == DefKind::Type);
+            }
+            Target::TypeParam(_) => { return this.scope_collision(name, true); }
+            _ => { return this.scope_collision(name, false); }
+        }
+    }
+
+    /// The first site where the scope's lookup answers `name`: the type
+    /// lookup for a type, the value lookup otherwise.
+    scope_collision(&this, name: SymbolStr, is_type: boolean) -> SourceSpan {
+        for (mut i: i64 = 0; i < this.sites.length; i++) {
+            const s: SourceSpan = this.sites[i].span;
+            const m: ModulePath = this.ctx.module_graph.get_module(this.sites[i].module).path();
+            const scope: ScopeID = this.ctx.resolver.scope_at(m, s.start_line, s.start_col);
+            const found: boolean = if (is_type) {
+                this.ctx.resolver.type_binding(name, scope).is_valid()
+            } else {
+                this.ctx.resolver.lookup_value(name, scope).is_valid()
+            };
+            if (found) { return s; }
+        }
+        return SourceSpan::none();
+    }
+
+    /// The declaration's site when type `owner` (or a base class) already
+    /// has a field, method or variant `name`.
+    member_collision(&this, owner: DefId, name: SymbolStr) -> SourceSpan {
+        const ty: TypeRef = this.ctx.decl_index.type_of_def(owner);
+        if (!ty.is_valid()) { return SourceSpan::none(); }
+        mut types_: TypeUtils = TypeUtils { arena: this.ctx.type_arena, intern: this.ctx.intern_table,
+                                            ctx: this.ctx, checker: null };
+        mut mr: MemberResolver = MemberResolver::null();
+        mr.arena = this.ctx.type_arena;
+        mr.intern = this.ctx.intern_table;
+        mr.ctx = this.ctx;
+        mr.types = &types_;
+        const at: SourceSpan = this.sites[0].span;
+        if (mr.field_of(ty, name).ty.is_valid()) { return at; }
+        mut cur: TypeRef = types_.method_owner_ref(ty);
+        for (mut depth: i64 = 0; depth < 16 && cur.is_valid(); depth++) {
+            if (this.ctx.decl_index.lookup_family_entries(FamilyOwner::Type(cur), name).length > 0) {
+                return at;
+            }
+            const t: type_base::Type* = this.ctx.type_arena.lookup(cur);
+            if (t == null) { break; }
+            if (t.kind == types::TypeKind::Enum) {
+                if ((t as EnumType*).variant_index(name) >= 0) { return at; }
+                break;
+            }
+            if (t.kind != types::TypeKind::Class) { break; }
+            const cls: ClassType* = t as ClassType*;
+            if (!cls.has_base) { break; }
+            cur = cls.base_class;
+        }
+        return SourceSpan::none();
+    }
+
+    static is_identifier(s: str::Str) -> boolean {
+        if (s.length() == 0) { return false; }
+        const b: u8* = s.as_ptr();
+        if (b[0] >= '0' as u8 && b[0] <= '9' as u8) { return false; }
+        for (mut i: u64 = 0; i < s.length(); i++) {
+            if (!Renaming::is_ident(b[i])) { return false; }
+        }
+        return true;
+    }
+
+    /// `s` as a NUL-terminated copy.
+    static cstr(s: str::Str) -> string {
+        mut buf: String = String::with_capacity(s.length() + 1);
+        buf.push(s);
+        buf.push_byte(0 as u8);
+        return buf.into_raw();
+    }
+
+    // -- Answers --
+
+    /// `textDocument/prepareRename`'s result: the name at the cursor and
+    /// the name itself.
+    prepare_json(&this, docs: &docs::Docs) -> value::JsonValue {
+        const s: SourceSpan = this.cursor_site();
+        mut out: value::JsonObject = value::JsonObject::new();
+        out.put("range", docs.range_of_span(s).to_json());
+        out.put("placeholder", value::JsonValue::from(this.old.as_str()));
+        return value::JsonValue::Object(out);
+    }
+
+    /// The site holding the cursor's answer.
+    cursor_site(&this) -> SourceSpan {
+        for (mut i: i64 = 0; i < this.sites.length; i++) {
+            const s: SourceSpan = this.sites[i].span;
+            if (s.file.eq(this.at.file) && s.start_line == this.at.start_line
+                && s.start_col >= this.at.start_col && s.end_col <= this.at.end_col) {
+                return s;
+            }
+        }
+        return this.at;
+    }
+
+    /// `textDocument/rename`'s result: a workspace edit rewriting every
+    /// site, one list per file.
+    edit_json(&this, docs: &docs::Docs, new_name: str::Str) -> value::JsonValue {
+        mut changes: value::JsonObject = value::JsonObject::new();
+        mut done: i64[] = [];
+        for (mut i: i64 = 0; i < this.sites.length; i++) {
+            if (Renaming::listed(&done, i)) { continue; }
+            const file: string = this.sites[i].span.file;
+            mut edits: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+            for (mut j: i64 = i; j < this.sites.length; j++) {
+                if (!this.sites[j].span.file.eq(file)) { continue; }
+                done.push(j);
+                mut e: value::JsonObject = value::JsonObject::new();
+                e.put("range", docs.range_of_span(this.sites[j].span).to_json());
+                e.put("newText", value::JsonValue::from(new_name));
+                edits.push(value::JsonValue::Object(e));
+            }
+            changes.insert(conv::UriPath::uri_string_from_fs_path(file), value::JsonValue::Array(edits));
+        }
+        mut out: value::JsonObject = value::JsonObject::new();
+        out.put("changes", value::JsonValue::Object(changes));
+        return value::JsonValue::Object(out);
+    }
+
+    static listed(done: &i64[], i: i64) -> boolean {
+        for (mut k: i64 = 0; k < done.length; k++) { if (done[k] == i) { return true; } }
+        return false;
+    }
+}
+
+
+/// The new name a `textDocument/rename` asks for, or empty.
+public function new_name_of(params: &value::JsonValue) -> str::Str {
+    const v: value::JsonValue* = params.get(str::Str::from("newName")).unwrap_or(null);
+    if (v == null) { return str::Str::from(""); }
+    return v.as::<str::Str>().unwrap_or(str::Str::from(""));
+}

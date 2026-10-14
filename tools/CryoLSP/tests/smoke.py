@@ -42,9 +42,19 @@ checks.json:
         {"name": "...", "method": "workspaceSymbol", "query": "...",
          "includes": ["..."], "excludes": ["..."]},
         {"name": "...", "method": "semanticTokens", "file": "src/main.cryo",
-         "expect": {"src/main.cryo@marker": "variable.readonly", "...": null}}
+         "expect": {"src/main.cryo@marker": "variable.readonly", "...": null}},
+        {"name": "...", "method": "prepareRename", "at": "...",
+         "expect": "src/main.cryo@marker", "placeholder": "name"},
+        {"name": "...", "method": "rename", "at": "...", "new_name": "...",
+         "old": "name", "expect": ["src/main.cryo@marker", ...]},
+        {"name": "...", "method": "rename" | "prepareRename", "at": "...",
+         "new_name": "...", "refused": "part of the reason"}
       ]
     }
+
+A rename check compares the set of edits' starts with the markers', and
+every edit must replace exactly `old`'s width with `new_name`.  A refusal
+check passes only on an error reply whose message holds `refused`.
 
 A semantic-tokens check names, per position, the token that must start
 there: its type, then any modifiers it must carry (it may carry more), or
@@ -458,6 +468,10 @@ def run_check(srv, fx, chk, c):
              "symbols %r; missing %r, unwanted %r" % (names[:40], missing, present))
         return
 
+    if method in ("prepareRename", "rename"):
+        run_rename_check(srv, fx, chk, c, name)
+        return
+
     rel, pos = fx.at(chk["at"])
     params = {"textDocument": {"uri": fx.uri(rel)}, "position": pos}
     if method == "completion":
@@ -516,6 +530,49 @@ def run_check(srv, fx, chk, c):
         c.ok(got == sorted(want), name, "want %r, got %r" % (sorted(want), got))
     else:
         raise ValueError("%s: unknown check method %r" % (fx.name, method))
+
+
+def run_rename_check(srv, fx, chk, c, name):
+    method = chk["method"]
+    rel, pos = fx.at(chk["at"])
+    params = {"textDocument": {"uri": fx.uri(rel)}, "position": pos}
+    if method == "rename":
+        params["newName"] = chk["new_name"]
+    resp = srv.request("textDocument/" + method, params)
+    if resp is None:
+        c.ok(False, name, "no response (server %s)" % ("alive" if srv.alive() else "dead"))
+        return
+    if "refused" in chk:
+        message = (resp.get("error") or {}).get("message", "")
+        c.ok("error" in resp and chk["refused"] in message, name,
+             "want a refusal saying %r, got %r" % (chk["refused"], resp))
+        return
+    if "error" in resp:
+        c.ok(False, name, "error %r" % resp["error"])
+        return
+    result = resp.get("result") or {}
+    if method == "prepareRename":
+        erel, epos = fx.at(chk["expect"])
+        start = (result.get("range") or {}).get("start")
+        c.ok(start == epos and result.get("placeholder") == chk["placeholder"], name,
+             "want %s %r, got %r" % (chk["expect"], chk["placeholder"], result))
+        return
+    got = []
+    bad = []
+    for uri, edits in (result.get("changes") or {}).items():
+        for e in edits:
+            r = e["range"]
+            got.append(position_key(uri, r["start"]))
+            width = r["end"]["character"] - r["start"]["character"]
+            if (r["end"]["line"] != r["start"]["line"] or width != len(chk["old"])
+                    or e["newText"] != chk["new_name"]):
+                bad.append(e)
+    want = []
+    for marker in chk["expect"]:
+        mrel, mpos = fx.at(marker)
+        want.append(position_key(fx.uri(mrel), mpos))
+    c.ok(sorted(got) == sorted(want) and not bad, name,
+         "want %r, got %r; edits not replacing %r: %r" % (sorted(want), sorted(got), chk["old"], bad))
 
 
 def initialize(srv, root, c, label):
