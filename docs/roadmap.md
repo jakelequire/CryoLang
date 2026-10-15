@@ -262,7 +262,10 @@ array.
 
 The first phase changes nothing: it re-measures the corpus - every array
 type written in `compiler/`, `stdlib/`, `tools/`, `tests/` and `examples/`
-- so the conversion is planned from today's numbers, not old ones.
+- so the conversion is planned from today's numbers, not old ones.  That
+measurement, the slices and the decisions they wait on are in
+`docs/type-syntax-plan.md`, which is folded back into this item and deleted
+when the work lands.
 
 Open: whether `T[]` stays accepted for a transition period or is refused
 at once; how a fixed-size array's length is written when it is a constant
