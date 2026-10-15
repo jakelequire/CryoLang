@@ -93,13 +93,13 @@ const PROBE_PREFIX: string = "__cryo_macro_probe_";
 type struct ImportReport {
     /// LOST: a construct we *could* bind but don't yet - real API surface the
     /// import failed to translate.  This is the headline number.
-    skipped:      string[];
-    approximated: string[];
+    skipped:      [string];
+    approximated: [string];
     /// IGNORED: a `#define`/decl that is never bindable API in the first place - 
     /// a header guard, a marker macro (`RLAPI`, `extern`), a function-like macro.
     /// Tracked so it doesn't inflate the "not bound" headline; surfaced as a
     /// single count line, with detail only under `--debug`.
-    ignored:      string[];
+    ignored:      [string];
 
     static new() -> ImportReport {
         return ImportReport { skipped: [], approximated: [], ignored: [] };
@@ -192,16 +192,16 @@ type struct Importer {
     functions_only: boolean;
     /// Names already emitted as a top-level type decl (alias-namespaced),
     /// for dedup across struct/enum/typedef (they share the alias namespace).
-    seen_names:     SymbolStr[];
+    seen_names:     [SymbolStr];
     /// Parallel map (name -> emitted StructDeclNode) so a struct's defining
     /// cursor can populate the empty node left by an earlier forward-decl
     /// cursor (libclang visits `struct Foo;` then `struct Foo {...}`).
-    struct_names:   SymbolStr[];
-    struct_nodes:   StructDeclNode*[];
+    struct_names:   [SymbolStr];
+    struct_nodes:   [StructDeclNode*];
     /// Every type declaration this import emitted, by its C tag - the
     /// import's own namespace - for pinning the references it made to them.
-    type_decl_tags:  SymbolStr[];
-    type_decl_nodes: ASTNode*[];
+    type_decl_tags:  [SymbolStr];
+    type_decl_nodes: [ASTNode*];
     /// CXType -> Cryo annotation mapper, built once per TU (carries ctx+alias).
     types:          CTypeMapper;
     /// Transient targets for the nested walks (set just before the synchronous
@@ -217,25 +217,25 @@ type struct Importer {
     /// diverted to a namespaced alias `const` (emitted AFTER the enum decl so the
     /// type is in scope).  `cur_enum_values`/`cur_enum_value_names` are the
     /// per-enum seen set; `cur_enum_dup_*` queue the pending alias consts.
-    cur_enum_values:      i64[];
-    cur_enum_value_names: SymbolStr[];
-    cur_enum_dup_names:   SymbolStr[];
-    cur_enum_dup_values:  i64[];
-    cur_enum_dup_firsts:  SymbolStr[];
+    cur_enum_values:      [i64];
+    cur_enum_value_names: [SymbolStr];
+    cur_enum_dup_names:   [SymbolStr];
+    cur_enum_dup_values:  [i64];
+    cur_enum_dup_firsts:  [SymbolStr];
     /// Transient: a record's child member cursors (plain fields AND anonymous
     /// struct/union members), collected by `visit_collect_member` and then
     /// processed with look-ahead so a run of bitfields can be spanned by one
     /// storage blob.  Reset at the start of each record.
-    field_cursors:  CXCursor[];
+    field_cursors:  [CXCursor];
     /// Transient: a union/anon-record member's FieldDecl cursors, collected by
     /// `visit_collect_acc_member` to build reinterpret accessors.  Kept separate
     /// from `field_cursors` so an anon-member walk can run mid-iteration of the
     /// parent record's `field_cursors` without clobbering it.
-    acc_members:    CXCursor[];
+    acc_members:    [CXCursor];
     /// Transient (C++ only): a class/struct's member-function cursors, collected
     /// by `visit_collect_cxx_method` and processed by `emit_cxx_methods` into a
     /// body-less `implement` block.  Reset at the start of each class.
-    cxx_method_cursors: CXCursor[];
+    cxx_method_cursors: [CXCursor];
     /// Honesty channel: every construct this import skipped or approximated.
     report:         ImportReport;
     /// W1: macro-definition cursors deferred from the decl walk so they emit
@@ -243,23 +243,23 @@ type struct Importer {
     /// with a detailed-preprocessing-record TU).  Processed in two sub-passes:
     /// simple literal macros first (which populate `mac_*`), then
     /// alias/compound/arithmetic macros that resolve against the full tables.
-    macro_cursors:  CXCursor[];
+    macro_cursors:  [CXCursor];
     /// Enum-constant table (named-enum VARIANTS + anonymous-enum consts):
     /// name -> (i64 value, owning enum bare tag, or empty tag for an anon-enum
     /// const).  Lets an identifier-alias `#define` resolve to a bound constant.
-    ec_names:       SymbolStr[];
-    ec_values:      i64[];
-    ec_enum_tags:   SymbolStr[];
+    ec_names:       [SymbolStr];
+    ec_values:      [i64];
+    ec_enum_tags:   [SymbolStr];
     /// Object-like `#define` constant table built by the simple-macro pass:
     /// name -> (Cryo type name, literal text, is-float).  Lets a later alias or
     /// arithmetic macro copy / numerically reference an earlier macro const.
-    mac_names:      SymbolStr[];
-    mac_types:      string[];
-    mac_texts:      string[];
-    mac_floats:     boolean[];
+    mac_names:      [SymbolStr];
+    mac_types:      [string];
+    mac_texts:      [string];
+    mac_floats:     [boolean];
     /// Bound type names (struct / enum / typedef bare tags) for type-alias
     /// `#define`s (`#define Foo Bar` where Bar is a bound type).
-    type_names:     SymbolStr[];
+    type_names:     [SymbolStr];
     /// True on the `cryo vendor` path (a generated `namespace <Name>;` file),
     /// false on the inline `extern module := "C"` path.  Function-alias
     /// forwarding wrappers are a bodied top-level function with no
@@ -277,23 +277,23 @@ type struct Importer {
     /// these out so the generator can write an include-graph `.deps` sidecar for
     /// cache provenance.  Stays empty on the inline `#include` path (which never
     /// calls `clang_getInclusions`).
-    inputs:         string[];
+    inputs:         [string];
     /// The same set as `inputs`, held as libclang CXFile handles.  This is what
     /// the macro filter tests: a CXFile is unique per file within a TU, so
     /// pointer identity answers "did one of the library's own headers write
     /// this?" without comparing path spellings.  Collected on EVERY path (not
     /// just the vendor one), because the filter needs it whenever a macro is
     /// considered.
-    input_files:    void*[];
+    input_files:    [void*];
     /// Macros neither token pass could bind, held back from the report until the
     /// constant-folding probe has had its turn (reporting them at classification
     /// time would announce a loss the probe is about to recover).
     /// `probe_reasons[i]` is the line to report if the probe also fails, and
     /// `probe_lost[i]` selects its bucket: true = API we could bind but didn't,
     /// false = inherently-unbindable noise.
-    probe_names:    SymbolStr[];
-    probe_reasons:  string[];
-    probe_lost:     boolean[];
+    probe_names:    [SymbolStr];
+    probe_reasons:  [string];
+    probe_lost:     [boolean];
 
     /// Build a per-TU importer.  The alias's canonical namespace and
     /// `functions_only` are derived from the extern block; the type mapper is
@@ -577,7 +577,7 @@ type struct Importer {
         mut func: FunctionDeclNode* = new FunctionDeclNode(name_sym, SourceSpan::none());
         func.return_type_annotation = this.types.map(clang::clang_getCursorResultType(cursor));
 
-        mut params: VarDeclNode*[] = [];
+        mut params: [VarDeclNode*] = [];
         for (mut i: i32 = 0; i < nargs; i++) {
             const arg: CXCursor = clang::clang_Cursor_getArgument(cursor, i as u32);
             const ptype: TypeAnnotation* = this.types.map(clang::clang_getCursorType(arg));
@@ -1627,7 +1627,7 @@ type struct Importer {
     /// only itself.
     probe_macro_constants(mut &this, index: void*, source_filename: u8*,
                           unsaved: CXUnsavedFile*, num_unsaved: u32,
-                          args: &u8*[]) -> void {
+                          args: &[u8*]) -> void {
         if (this.probe_names.length == 0) { return; }
 
         // Reproduce this TU's own entry exactly: a real header is included by
@@ -1869,8 +1869,8 @@ type struct Importer {
         wrapper.is_public = true;
         wrapper.return_type_annotation = target_fn.return_type_annotation;
 
-        mut params: VarDeclNode*[] = [];
-        mut call_args: ExpressionNode*[] = [];
+        mut params: [VarDeclNode*] = [];
+        mut call_args: [ExpressionNode*] = [];
         for (mut i: i64 = 0; i < target_fn.parameters.length; i++) {
             const tp: VarDeclNode* = target_fn.parameters[i];
             mut pname: SymbolStr = tp.name;
@@ -1946,7 +1946,7 @@ type struct Importer {
 
         // Collect the literal values inside the braces (commas are punctuation
         // and are skipped); each must be a numeric literal.
-        mut vals: string[] = [];
+        mut vals: [string] = [];
         for (mut i: i64 = bo + 1; i < bc; i++) {
             if (clang::clang_getTokenKind(*(toks + i)) != clang::TOKEN_LITERAL) { continue; }
             vals.push((*(toks + i)).spelling(this.tu, this.ctx));
@@ -2274,7 +2274,7 @@ type struct Importer {
     static import_local_header(resolved_path_text: string, extern_node: ExternBlockNode*,
                                ctx: CompilationContext*) -> i32 {
         const resolved_path: string = resolved_path_text;
-        mut no_extra: u8*[] = [];
+        mut no_extra: [u8*] = [];
         return Importer::collect_from_tu(resolved_path as u8*, null, 0,
                                          &no_extra, resolved_path_text, extern_node, ctx, null, null,
                                          "c", "");
@@ -2300,7 +2300,7 @@ type struct Importer {
             contents: content as u8*,
             length:   content.length()
         };
-        mut no_extra: u8*[] = [];
+        mut no_extra: [u8*] = [];
         return Importer::collect_from_tu("cryo_syshdr.c" as u8*, &uf, 1,
                                          &no_extra, header_text, extern_node, ctx, null, null,
                                          "c", "");
@@ -2344,9 +2344,9 @@ type struct Importer {
     /// for the generator's include-graph `.deps` sidecar; null on the inline
     /// path skips the inclusion walk entirely.
     static collect_from_tu(source_filename: u8*, unsaved: CXUnsavedFile*, num_unsaved: u32,
-                           extra_args: &u8*[], label: string, extern_node: ExternBlockNode*,
+                           extra_args: &[u8*], label: string, extern_node: ExternBlockNode*,
                            ctx: CompilationContext*, out_report: ImportReport*,
-                           out_inputs: string[]*, lang_text: string, cpp_std_text: string) -> i32 {
+                           out_inputs: [string]*, lang_text: string, cpp_std_text: string) -> i32 {
         const cpp_std: string = cpp_std_text;
         const lang: string = lang_text;
         const index: void* = clang::clang_createIndex(0, 0);
@@ -2362,7 +2362,7 @@ type struct Importer {
         // `extra_args` carries the vendor generator's `-I<dir>` / `-D<def>` flags
         // (empty for the inline `#include` path).
         const is_cpp: boolean = (lang as string) == "c++";
-        mut args: u8*[] = [];
+        mut args: [u8*] = [];
         args.push("-x" as u8*);
         if (is_cpp) {
             args.push("c++" as u8*);

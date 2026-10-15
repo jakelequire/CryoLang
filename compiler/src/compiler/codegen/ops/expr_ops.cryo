@@ -124,8 +124,8 @@ type struct ExprOps {
     /// begin, so CallEmitter truncates them once that call is fully built (the
     /// callee now owns them). Populated only under a hosted unwind build, so the
     /// default abort path allocates nothing and its IR is unchanged.
-    arg_temp_drops:  ASTNode*[];
-    arg_temp_frames: i64[];
+    arg_temp_drops:  [ASTNode*];
+    arg_temp_frames: [i64];
 
     /// Set while a cleanup landing pad replays its drops. The synthesized
     /// `<name>.drop()` calls route back through the ordinary call path, whose
@@ -647,7 +647,7 @@ type struct ExprOps {
     /// supplied value.  Use `TypeRef::invalid()` for slots where the
     /// type isn't known (low-level callers wiring up malloc/free/abort
     /// with already-matched widths); invalid slots fall back to `zext`.
-    codegen_call(mut &this, callee: LValue, callee_type: LType, args: Pair<LValue, TypeRef>[], name: string) -> LValue {
+    codegen_call(mut &this, callee: LValue, callee_type: LType, args: [Pair<LValue, TypeRef>], name: string) -> LValue {
         // Phase 1 - sret marshalling.  If the callee was declared with
         // `sret(%T)` on parameter slot 0, the LLVM-level signature is
         // `void f(ptr sret(%T), ...source params...)`.  Allocate a result
@@ -672,7 +672,7 @@ type struct ExprOps {
                 fn_for_alloca, "sret.tmp", sret_pointee);
 
             // Build the marshalled arg list: [slot, ...args].
-            mut marshalled: Pair<LValue, TypeRef>[] = [];
+            mut marshalled: [Pair<LValue, TypeRef>] = [];
             marshalled.push(Pair::<LValue, TypeRef>::new(slot, TypeRef::invalid()));
             for (mut ai: i64 = 0; ai < args.length; ai++) {
                 // Reconstruct from the (Copy) members rather than copying the
@@ -710,7 +710,7 @@ type struct ExprOps {
     /// the sret slot when applicable.  The `callee_type` must equal
     /// `plan.llvm_fn_type`.
     codegen_call_with_plan(mut &this, callee: LValue, callee_type: LType,
-                           plan: SignaturePlan, args: Pair<LValue, TypeRef>[],
+                           plan: SignaturePlan, args: [Pair<LValue, TypeRef>],
                            name: string) -> LValue {
         const sret_pointee: LType = if (plan.sret_slot) {
             plan.return_plan.pointee_ty
@@ -730,7 +730,7 @@ type struct ExprOps {
             const slot: LValue = this.flow.create_entry_alloca(
                 fn_for_alloca, "sret.tmp", sret_pointee);
 
-            mut marshalled: Pair<LValue, TypeRef>[] = [];
+            mut marshalled: [Pair<LValue, TypeRef>] = [];
             marshalled.push(Pair::<LValue, TypeRef>::new(slot, TypeRef::invalid()));
             for (mut ai: i64 = 0; ai < args.length; ai++) {
                 // Reconstruct from the (Copy) members rather than copying the
@@ -1133,7 +1133,7 @@ type struct ExprOps {
     /// so a drop that itself unwinds propagates without re-entering this pad; the
     /// arg-temp invoke path is suppressed across both replays so a drop-call does
     /// not re-drop the stack.
-    emit_cleanup_landingpad_sched(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
+    emit_cleanup_landingpad_sched(mut &this, visitor: ASTVisitor*, sched: [ASTNode*]*,
                                   cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
         const saved_bb: LBasicBlock = this.builder.get_insert_block();
         const pers: LValue = this.get_or_decl_personality();
@@ -1165,7 +1165,7 @@ type struct ExprOps {
     /// Either way it diverges (`unreachable` on the normal edge).  Callers gate
     /// this on `ctx.options.unwinds()` and keep the `abort` trap on the
     /// default path, so emitted IR is unchanged there.
-    emit_panic_diverge_cleanup(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
+    emit_panic_diverge_cleanup(mut &this, visitor: ASTVisitor*, sched: [ASTNode*]*,
                                msg: LValue, file: LValue, line: LValue) -> void {
         const panic_fn: LValue = this.intrinsics.get_or_decl_cryo_panic();
         if (!panic_fn.is_valid()) { return; }
@@ -1213,7 +1213,7 @@ type struct ExprOps {
     /// compile-time `message` and the origin's `span`, then raise + clean up via
     /// `emit_panic_diverge_cleanup`.  The shared body of every synthesized-check
     /// raise (div-by-zero, non-exhaustive match, `new[]` overflow).
-    emit_check_raise(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
+    emit_check_raise(mut &this, visitor: ASTVisitor*, sched: [ASTNode*]*,
                      span: SourceSpan, message: string) -> void {
         const msg: LValue = this.builder.build_global_string_ptr(message, "check.msg");
         mut filename: string = span.file;
@@ -1227,7 +1227,7 @@ type struct ExprOps {
     /// the callee's expected param types, then `build_call`.  Split out
     /// of `codegen_call` so the sret-marshalling wrapper can call
     /// through to the same coercion logic.
-    codegen_call_direct(mut &this, callee: LValue, callee_type: LType, args: Pair<LValue, TypeRef>[], name: string) -> LValue {
+    codegen_call_direct(mut &this, callee: LValue, callee_type: LType, args: [Pair<LValue, TypeRef>], name: string) -> LValue {
         mut out_value: LValue = LValue::null();
         const n: u32 = args.length as u32;
 
@@ -1327,7 +1327,7 @@ type struct ExprOps {
     /// `codegen_call_direct` (when `expected_count > n`); ordinary
     /// Cryo-internal calls hit this, not just extern-C.
     codegen_call_direct_dp_expand(mut &this, callee: LValue, callee_type: LType,
-                                  args: Pair<LValue, TypeRef>[],
+                                  args: [Pair<LValue, TypeRef>],
                                   param_types_buf: void*, expected_count: u32,
                                   name: string) -> LValue {
         const n: u32 = args.length as u32;
@@ -1510,7 +1510,7 @@ type struct ExprOps {
     /// `append_entry` is the `append` a string `+` was bound to where it is
     /// written (`BinaryExprNode::append_entry`).
     codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef, rhs_type: TypeRef,
-                   append_entry: OverloadId, visitor: ASTVisitor*, div_sched: ASTNode*[]*, div_span: SourceSpan) -> LValue {
+                   append_entry: OverloadId, visitor: ASTVisitor*, div_sched: [ASTNode*]*, div_span: SourceSpan) -> LValue {
         mut out_value: LValue = LValue::null();
         if (!lhs_val.is_valid() || !rhs_val.is_valid()) {
             out_value = LValue::null();
@@ -1583,7 +1583,7 @@ type struct ExprOps {
                 const this_ty: LType = LType::pointer_to(LType::i8());
                 const this_slot: LValue = this.coercion_slot(this_ty, "strcat.this");
                 this.builder.build_store(lhs_val, this_slot);
-                mut args: Pair<LValue, TypeRef>[] = [];
+                mut args: [Pair<LValue, TypeRef>] = [];
                 args.push(Pair::<LValue, TypeRef>::new(this_slot, TypeRef::invalid()));
                 args.push(Pair::<LValue, TypeRef>::new(rhs_val, TypeRef::invalid()));
                 out_value = this.codegen_call(fn_val, fn_ty, args, "strcat");
@@ -2079,7 +2079,7 @@ type struct ExprOps {
     /// builds (default), so the guard has no steady-state runtime cost
     /// when the compiler can prove safety statically.
     emit_int_div_guard(mut &this, lhs: LValue, rhs: LValue, is_signed: boolean,
-                       visitor: ASTVisitor*, div_sched: ASTNode*[]*, div_span: SourceSpan) -> void {
+                       visitor: ASTVisitor*, div_sched: [ASTNode*]*, div_span: SourceSpan) -> void {
         const rhs_ty_raw: void* = llvm::LLVMTypeOf(rhs.raw);
         if (rhs_ty_raw == null) { return; }
         const rhs_ty: LType = LType { raw: rhs_ty_raw };
@@ -2130,7 +2130,7 @@ type struct ExprOps {
         if (this.ctx.options.unwinds() && !this.intrinsics.no_runtime) {
             this.emit_check_raise(visitor, div_sched, div_span, "attempt to divide by zero");
         } else {
-            mut dz_ops: LValue[] = [];
+            mut dz_ops: [LValue] = [];
             this.intrinsics.emit_check_sink(MangledName::new("__cryo_panic_div_zero"), div_span, &dz_ops);
         }
 
@@ -2152,7 +2152,7 @@ type struct ExprOps {
     /// can never overflow, so the guard is elided. Leaves the builder at the
     /// ok block; mirrors `emit_int_div_guard`'s trap shape.
     emit_array_mul_guard(mut &this, count_i64: LValue, elem_size: u64,
-                         visitor: ASTVisitor*, ovf_sched: ASTNode*[]*, ovf_span: SourceSpan) -> void {
+                         visitor: ASTVisitor*, ovf_sched: [ASTNode*]*, ovf_span: SourceSpan) -> void {
         if (elem_size <= (1 as u64)) { return; }
         const u64_max: u64 = (0 as u64) - (1 as u64);
         const max_count: u64 = u64_max / elem_size;
@@ -2179,7 +2179,7 @@ type struct ExprOps {
             // `op` 2 = multiply: this guard is the array-size product. The
             // handler formats "arithmetic overflow (op 2): <lhs>, <rhs>", so it
             // takes the raw operands rather than a pre-baked message.
-            mut ovf_ops: LValue[] = [
+            mut ovf_ops: [LValue] = [
                 LType::const_int(LType::i32(), 2, false),
                 count_i64,
                 LType::const_int(LType::i64(), elem_size, false)
@@ -2274,7 +2274,7 @@ type struct ExprOps {
         const malloc_fn: LValue = this.lang_function(LangItem::Malloc);
         if (!malloc_fn.is_valid()) { return val; }
         const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-        mut malloc_args: Pair<LValue, TypeRef>[] = [];
+        mut malloc_args: [Pair<LValue, TypeRef>] = [];
         malloc_args.push(Pair::<LValue, TypeRef>::new(total_bytes_val, TypeRef::invalid()));
         mut data_ptr: LValue = LValue::null();
         data_ptr = this.codegen_call(malloc_fn, malloc_ty, malloc_args, "arrlit.heap");
@@ -2334,7 +2334,7 @@ type struct ExprOps {
 
         if (alloc_fn.is_valid()) {
             const alloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(alloc_fn.raw) };
-            mut alloc_args: Pair<LValue, TypeRef>[] = [];
+            mut alloc_args: [Pair<LValue, TypeRef>] = [];
             alloc_args.push(Pair::<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
             alloc_args.push(Pair::<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
             return this.codegen_call(alloc_fn, alloc_ty, alloc_args, label);
@@ -2343,7 +2343,7 @@ type struct ExprOps {
         const raw_fn: LValue = this.lang_function(LangItem::Alloc);
         if (raw_fn.is_valid()) {
             const raw_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(raw_fn.raw) };
-            mut raw_args: Pair<LValue, TypeRef>[] = [];
+            mut raw_args: [Pair<LValue, TypeRef>] = [];
             raw_args.push(Pair::<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
             raw_args.push(Pair::<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
             return this.codegen_call(raw_fn, raw_ty, raw_args, label);
@@ -2358,7 +2358,7 @@ type struct ExprOps {
             const rt_fn: LValue = this.intrinsics.get_or_decl_cryo_alloc();
             if (rt_fn.is_valid()) {
                 const rt_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(rt_fn.raw) };
-                mut rt_args: Pair<LValue, TypeRef>[] = [];
+                mut rt_args: [Pair<LValue, TypeRef>] = [];
                 rt_args.push(Pair::<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
                 rt_args.push(Pair::<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
                 return this.codegen_call(rt_fn, rt_ty, rt_args, label);
@@ -2377,7 +2377,7 @@ type struct ExprOps {
                 fmt::format("codegen: %s: failed to retrieve malloc function type", what), span);
             return LValue::null();
         }
-        mut malloc_args: Pair<LValue, TypeRef>[] = [];
+        mut malloc_args: [Pair<LValue, TypeRef>] = [];
         malloc_args.push(Pair::<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
         return this.codegen_call(malloc_fn, malloc_ty, malloc_args, label);
     }
@@ -2400,7 +2400,7 @@ type struct ExprOps {
                 const rt_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(rt_fn.raw) };
                 const rt_ptr: LValue = this.builder.build_pointer_cast(
                     ptr, LType::pointer_to(LType::i8()), "delcast");
-                mut rt_args: Pair<LValue, TypeRef>[] = [];
+                mut rt_args: [Pair<LValue, TypeRef>] = [];
                 rt_args.push(Pair::<LValue, TypeRef>::new(rt_ptr, TypeRef::invalid()));
                 rt_args.push(Pair::<LValue, TypeRef>::new(
                     LType::const_int(LType::i64(), 0, false), TypeRef::invalid()));
@@ -2427,7 +2427,7 @@ type struct ExprOps {
                 span);
             return;
         }
-        mut free_args: Pair<LValue, TypeRef>[] = [];
+        mut free_args: [Pair<LValue, TypeRef>] = [];
         free_args.push(Pair::<LValue, TypeRef>::new(void_ptr, TypeRef::invalid()));
         if (free_via_shim) {
             const align_val: LValue = LType::const_int(LType::i64(), align, false);
@@ -2523,7 +2523,7 @@ type struct ExprOps {
             fn_val, this.resolve(args_name), va_list_ty);
         const va_start_fn: LValue = this.declare_va_start();
         const va_start_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(va_start_fn.raw) };
-        mut sargs: Pair<LValue, TypeRef>[] = [];
+        mut sargs: [Pair<LValue, TypeRef>] = [];
         sargs.push(Pair::<LValue, TypeRef>::new(va_list_alloca, TypeRef::invalid()));
         mut _result: LValue = LValue::null();
         _result = this.codegen_call(va_start_fn, va_start_ty, sargs, "");
@@ -2540,7 +2540,7 @@ type struct ExprOps {
         if (!va_list_alloca.is_valid()) { return; }
         const va_end_fn: LValue = this.declare_va_end();
         const va_end_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(va_end_fn.raw) };
-        mut args: Pair<LValue, TypeRef>[] = [];
+        mut args: [Pair<LValue, TypeRef>] = [];
         args.push(Pair::<LValue, TypeRef>::new(va_list_alloca, TypeRef::invalid()));
         mut _result: LValue = LValue::null();
         _result = this.codegen_call(va_end_fn, va_end_ty, args, "");
@@ -2750,7 +2750,7 @@ type struct ExprOps {
                 return val;
             }
             const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-            mut malloc_args: Pair<LValue, TypeRef>[] = [];
+            mut malloc_args: [Pair<LValue, TypeRef>] = [];
             malloc_args.push(Pair::<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
             mut data_ptr: LValue = LValue::null();
             data_ptr = this.codegen_call(malloc_fn, malloc_ty, malloc_args, "ret.data");

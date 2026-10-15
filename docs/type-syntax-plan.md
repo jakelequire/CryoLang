@@ -543,6 +543,32 @@ commit that runs it and is deleted in the next.
   exactly those, and each must differ only in a source-location column.  A
   moved object outside that list is a rewrite that changed a type.
 
+**3a landed.**  `scripts/array-codemod.py` takes its positions from the
+parser (a trace patch prints each postfix array's start, `[` and `]`) and
+checks every position against the text before writing.  `cryo check` on a
+lone file cannot resolve a project dependency and then parses nothing, so
+the language server, the runtime and one test project are built instead.
+Counted by the same trace: 2,411 dynamic array types rewritten in 161
+files, 5 more by hand where no trace reaches (the language server's
+`positions` fixture, whose markers must stay on the element, and
+`build_stamp_version_format`), 5 in the docs' code blocks; 16 remain, all
+in the two tests whose subject is the postfix spelling
+(`array_type_circumfix`, `E0206_array_spellings_one_signature`), kept until
+slice 4.  Every rewritten file kept its line count.  `make verify` moved 0
+of 9785 / 1126 objects; the standard library (154), the compiler (247) and
+the language server (277) built from the old and the new source at the same
+path by the same compiler also moved 0, and a one-literal change in one
+server file moved exactly that object.
+
+**Columns are not in hosted objects.**  A check site's `(file, line,
+column)` constant is emitted only for the freestanding runtime tiers
+(`intrinsic_emitter.cryo` `emit_source_loc_ptr`, reached from the check
+handlers), and `LINE` / `FILE` carry no column; debug info carries one only
+in a debug build.  A one-column shift in a hosted file left its object
+byte-identical.  So 3b moves no test or example object, and can move a
+runtime object only where a check site follows a rewritten fixed type on
+its line.
+
 Order inside slice 3: `compiler/src`, `stdlib`, `runtime` (need the slice-1
 pin), then `tools/CryoLSP`, `tests`, `examples`.  `legacy/` is not touched.
 

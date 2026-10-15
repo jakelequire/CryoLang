@@ -340,7 +340,7 @@ An array type is written in brackets: `[T]` is a dynamic array and `[T; N]` a fi
 
 ```cryo
 const buf:    int[16];     // raw fixed-size buffer of 16 ints
-const dyn:    int[];       // raw dynamic array (FFI / unsized)
+const dyn:    [int];       // raw dynamic array (FFI / unsized)
 mut   v:      Array<int>;  // growable, heap-backed; from collections::array
 ```
 
@@ -621,7 +621,7 @@ variable, parameter, return type, struct field, and generic argument.
 const slot: int? = Option::Some(7);   // int?  is  Option<int>
 const back: Option<int> = slot;       // interchangeable both ways
 
-function first(xs: int[]) -> int? {   // optional return
+function first(xs: [int]) -> int? {   // optional return
     if (xs.length == 0) { return Option::None; }
     return Option::Some(xs[0]);
 }

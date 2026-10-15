@@ -44,7 +44,7 @@ types directly to make that decision.
 type struct ParamPlan {
     cryo_type:  TypeRef;     // original source type
     cls:        ArgClass;    // Direct | DirectPair | Indirect | Ignore
-    llvm_slots: LType[];     // 0, 1, or 2 LLVM-level slots
+    llvm_slots: [LType];     // 0, 1, or 2 LLVM-level slots
     attr:       AbiAttr;     // None | ByVal | SRet
     pointee_ty: LType;       // for Indirect: the pointee type
                              // for Direct-with-coercion: the source struct
@@ -57,7 +57,7 @@ the assembled LLVM function type:
 ```cryo
 type struct SignaturePlan {
     return_plan:  ParamPlan;
-    param_plans:  ParamPlan[];
+    param_plans:  [ParamPlan];
     llvm_fn_type: LType;
     sret_slot:    boolean;  // true => LLVM param 0 is the result pointer
     is_variadic:  boolean;
