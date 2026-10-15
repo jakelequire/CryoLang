@@ -449,6 +449,7 @@ public:
         while (this.check(TokenType::KwAs)) {
             this.advance();
             mut target: TypeAnnotation* = null;
+            const target_tok: Token = this.current();
             // `as const T*` casts to a pointer-to-const; the const binds
             // to the first pointer suffix (threaded via
             // parse_type_suffixes_q).
@@ -477,9 +478,9 @@ public:
             // start an expression (;  )  }  ]  ,  as  EOF); otherwise it is
             // multiplication.  Other suffixes ([], ?) are unambiguous.
             if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
-                target = this.parse_type_suffixes_q(target, pending_const);
+                target = this.parse_type_suffixes_q(target, pending_const, target_tok);
             } else if (!this.check(TokenType::Star)) {
-                target = this.parse_type_suffixes_q(target, pending_const);
+                target = this.parse_type_suffixes_q(target, pending_const, target_tok);
             }
             const span: SourceSpan = ParserBase::merge_spans(expr.span, this.current_span());
             expr = new CastExprNode(expr, target, span);
@@ -2756,9 +2757,10 @@ public:
         // The suffixes after the `)` apply to the whole group:
         // `(i32, i32)[]`, and `((i32) -> i32)[]` for an array of functions.
         if (this.check(TokenType::LParen)) {
+            const open: Token = this.current();
             const group: TypeAnnotation* = this.parse_paren_type();
             if (group == null) { return null; }
-            return this.parse_type_suffixes(group);
+            return this.parse_type_suffixes(group, open);
         }
 
         // Bracket tuple types `[T, U]` are not supported; tuples use the
@@ -2787,16 +2789,17 @@ public:
         // following `*` has no representation on a value type and is dropped,
         // matching C (top-level const on a by-value param is meaningless).
         if (this.check(TokenType::KwConst)) {
-            this.advance(); // consume `const`
+            const const_tok: Token = this.advance();
             const cbase: TypeAnnotation* = this.parse_base_type();
             if (cbase == null) { return null; }
-            return this.parse_type_suffixes_q(cbase, true);
+            return this.parse_type_suffixes_q(cbase, true, const_tok);
         }
 
         // Base type + optional suffixes
+        const base_tok: Token = this.current();
         const base: TypeAnnotation* = this.parse_base_type();
         if (base == null) { return null; }
-        return this.parse_type_suffixes(base);
+        return this.parse_type_suffixes(base, base_tok);
     }
 
     /// Parse `implement Trait + Trait2 + ...`. Each bound is a base type
@@ -3018,15 +3021,17 @@ public:
         return false;
     }
 
-    /// Parse type suffixes: *, [], [N], ?
-    parse_type_suffixes(base: TypeAnnotation*) -> TypeAnnotation* {
-        return this.parse_type_suffixes_q(base, false);
+    /// Parse type suffixes: *, [], [N], ?.  `start` is the first token of the
+    /// type the suffixes apply to (a group's `(`, a `const`); each wrapper's
+    /// span runs from it through the suffix's last token.
+    parse_type_suffixes(base: TypeAnnotation*, start: Token) -> TypeAnnotation* {
+        return this.parse_type_suffixes_q(base, false, start);
     }
 
     /// As `parse_type_suffixes`, but `pending_const` marks the pointee of the
     /// nearest `*` suffix as const (`const T*`). The flag is consumed by the
     /// first pointer only; subsequent levels default to non-const.
-    parse_type_suffixes_q(base: TypeAnnotation*, pending_const: boolean) -> TypeAnnotation* {
+    parse_type_suffixes_q(base: TypeAnnotation*, pending_const: boolean, start: Token) -> TypeAnnotation* {
         mut result: TypeAnnotation* = base;
         mut ptr_const: boolean = pending_const;
 
@@ -3051,7 +3056,7 @@ public:
                 const ptr_ann: PointerAnnotation* = new PointerAnnotation {
                     inner:    result,
                     is_const: ptr_const,
-                    span:     this.current_span(),
+                    span:     this.span_from(start),
                 };
                 ptr_const = false; // const binds to the innermost pointer only
                 result = new TypeAnnotation::Pointer(ptr_ann);
@@ -3066,7 +3071,7 @@ public:
                         element:   result,
                         size:      ArrayAnnotation::heap_dynamic_size(),
                         size_expr: null,
-                        span:      this.current_span(),
+                        span:      this.span_from(start),
                     };
                     result = new TypeAnnotation::Array(arr_ann);
                 } else {
@@ -3110,7 +3115,7 @@ public:
                         element:   result,
                         size:      size,
                         size_expr: size_expr,
-                        span:      this.current_span(),
+                        span:      this.span_from(start),
                     };
                     result = new TypeAnnotation::Array(arr_ann);
                 }
@@ -3122,11 +3127,11 @@ public:
             // with `Option<T>` for free. `Option` resolves via the prelude from
             // any module, exactly as a hand-written `Option<T>` does.
             else if (this.check(TokenType::Question)) {
-                this.advance();
+                const question: Token = this.advance();
                 const opt_base: TypeAnnotation* = new TypeAnnotation::Named(
                     new NamedAnnotation {
                         name:         this.ctx.intern("Option"),
-                        span:         this.current_span(),
+                        span:         this.span_from_token(question),
                         pre_resolved: TypeRef::invalid(),
                         res: ResSlot::Pending,
                     }
@@ -3136,7 +3141,7 @@ public:
                 const opt_gen: GenericAnnotation* = new GenericAnnotation {
                     base: opt_base,
                     args: opt_args,
-                    span: this.current_span(),
+                    span: this.span_from(start),
                 };
                 result = new TypeAnnotation::Generic(opt_gen);
             }

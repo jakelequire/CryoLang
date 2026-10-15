@@ -134,6 +134,38 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-15
+
+347. **Fixed-size arrays change syntax with dynamic ones:** `T[N]` is
+     written `[T; N]`, so the language has one array syntax.  (Jake)
+
+348. **The postfix array forms are refused once the tree is migrated,**
+     with no period in which both are accepted.  (Jake)
+
+349. **Diagnostics, the language server, the demangler and generated
+     bindings print array types in the circumfix form,** `[T]` and
+     `[T; N]`.  (Jake)
+
+350. **`[T]` means exactly the type `T[]` names today,** so the change is
+     pure syntax, provable with no compiled output changed.  Unifying the
+     builtin dynamic array with `Array<T>` is a separate step, done before
+     the class removal.  (Jake)
+
+351. **`new u8[n]` keeps its spelling:** it is an allocation expression
+     yielding a pointer, not an array type.  (Jake)
+
+352. **A postfix array type is refused with "array types are written
+     `[T]`: write `[i32]`"** (filled in with the type actually written) and
+     an automatic fix, under a code of the existing parser error family
+     rather than a new one.  (Jake approved the wording; the code choice was
+     delegated)
+
+353. **`[i32, i32]` keeps its message asking for `(T, U)`** once `[` starts
+     an array type.  (Jake)
+
+354. **The rulings stay as written records:** an old spelling inside a past
+     ruling is not respelled.  (Jake)
+
 ### 2026-10-14
 
 333. **One project's analysis covers every target of its cryoconfig, and

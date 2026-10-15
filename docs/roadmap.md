@@ -267,10 +267,23 @@ measurement, the slices and the decisions they wait on are in
 `docs/type-syntax-plan.md`, which is folded back into this item and deleted
 when the work lands.
 
-Open: whether `T[]` stays accepted for a transition period or is refused
-at once; how a fixed-size array's length is written when it is a constant
-expression; and what the conversion does with arrays of function types,
-which today need parentheses (`((i32) -> i32)[]`).
+The postfix forms are refused once the tree is migrated, with no transition
+period; a constant-expression length is written after the `;`
+(`[T; CHUNK * 2]`), as the repeat expression `[value; N]` writes it; an
+array of functions is `[(i32) -> i32]`.
+
+## One dynamic array type
+
+`[T]` names the builtin dynamic array that `T[]` names today, and that is
+not `Array<T>`: the two mangle differently, refuse each other by value,
+only the builtin indexes with `[]`, and an array literal initialises only
+the builtin.  The builtin borrows its methods from `Array<T>`, and nested
+builtin arrays crash at run time where `Array<Array<T>>` does not.  The two
+are made one type in a change of its own, after the array syntax and
+before the class removal, so the class removal writes its thousands of
+array types against the type that remains.  Open: which of the two is the
+end state, and what that does to mangling and to `&[T]` as against
+`Slice<T>`.
 
 ## The class removal
 

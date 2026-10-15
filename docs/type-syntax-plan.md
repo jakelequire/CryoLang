@@ -263,11 +263,14 @@ around `T[][]`.
   text today - `E0200_array_literal_widening_element.cryo` (`expected
   `i64[2]`, found `i32[2]``).  None of the `//~` annotations quote array
   type text.
-- **Spans.**  `ArrayAnnotation.span` and `PointerAnnotation.span` are
-  `this.current_span()` taken *after* the closing token
-  (`expr_parser.cryo:3054, 3069, 3113`): they point at the token after the
-  type, not at the type.  A span-driven codemod cannot use them as they are,
-  and the editor's locator (`node_locator.cryo:75`) inherits the error.
+- **Spans (fixed).**  `ArrayAnnotation.span`, `PointerAnnotation.span` and
+  the `Option<…>` a `?` desugars to were taken *after* the closing token, so
+  they pointed at the token after the type.  The editor's locator could not
+  walk into them (definition and hover on `Node` in `xs: Node[]` answered
+  nothing).  Each now runs from the type's first token - a group's `(`, a
+  `const` - through the suffix; six language-server checks pin it, and the
+  diagnostics that label such a type now underline the whole type (four
+  negative files' carets moved, no `//~` line changed, 0 objects moved).
 
 ### 2.10 Which array the class removal should write (the open question)
 
@@ -364,6 +367,27 @@ codegen, ownership or drop insertion** - unless D7 chooses otherwise.
 ## 5. Decisions
 
 None of these are settled by a spec.  Each says which slice it blocks.
+
+**Decided by Jake on 2026-10-15** (rulings 347-354 in
+`docs/resolution-rules.md`):
+
+- **D1 (a)** - fixed arrays migrate: `T[N]` becomes `[T; N]` (347).
+- **D2 (a)** - the postfix forms are refused once the tree is migrated; no
+  alias period (348).
+- **D4 (a)** - diagnostics, the language server, the demangler and
+  generated bindings print the new form (349).
+- **D7 (c)** - `[T]` is exactly today's `T[]`; unifying the builtin with
+  `Array<T>` is a separate step before the class removal, on the roadmap
+  (350).
+- **D8 (a)** - `new u8[n]` stays (351).
+- **D9** - wording "array types are written `[T]`: write `[i32]`" with the
+  type filled in, an automatic fix, and a code of the existing parser error
+  family; the code is chosen in slice 4 (352).
+- **D10 (a)** - `[i32, i32]` keeps the "use `(T, U)`" message; the E0104
+  test's follow-on annotation is re-annotated with the reason (353).
+- **D11 (a)** - rulings are not respelled (354).
+
+D3, D5 and D6 stand as written below.
 
 | # | Decision | Options | Lean (judgment) | Blocks |
 |---|---|---|---|---|
