@@ -31,8 +31,9 @@ import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID, SymbolIds, SymbolKey };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::module_graph::{ ModuleKey, ModulePath };
-import std::collections::hashmap::{ HashMap };
+import std::collections::hashmap::{ HashMap, HashMapIter };
 import std::collections::pair::{ Pair };
+import std::core::mem;
 
 /// One name bound directly in a scope, with the TIER it occupies.  A scope's
 /// bindings are ordered:
@@ -352,6 +353,11 @@ type struct Resolver {
 
     // Resolution map
     resolution_map:     ResolutionMap;
+    /// `referenced_declarations`' set, and the map's record count and the
+    /// symbol count it was built at (-1: never built).
+    referenced:         HashMap<u64, boolean>;
+    referenced_records: u64;
+    referenced_symbols: i64;
 
     // Cross-module exports: Pair<SymbolID, ModulePath>[] avoids T[][] codegen
     // paths.  SymbolID[][] and HashMap<K, SymbolID[]>
@@ -433,6 +439,9 @@ type struct Resolver {
             global_scope:         global_id,
             current_scope:        global_id,
             resolution_map:       ResolutionMap::new(),
+            referenced:           HashMap::<u64, boolean>::new(),
+            referenced_records:   0,
+            referenced_symbols:   -1,
             exports:              [],
             current_module:       ModulePath::none(),
             prelude_modules:      [],
@@ -1065,6 +1074,38 @@ type struct Resolver {
     /// Record that a span resolved to a specific symbol.
     record_resolution(mut &this, span: SourceSpan, sym_id: SymbolID) -> void {
         this.resolution_map.record(span, sym_id);
+    }
+
+    /// The key (`ResolutionMap::make_key`) of the declaring span of every
+    /// symbol some span resolves to, less the entry a declaration records
+    /// for itself, so a declaration is never a use of itself.  The set is
+    /// the whole program's: it is built once and rebuilt only after the map
+    /// records again or a symbol is added.
+    referenced_declarations(mut &this) -> HashMap<u64, boolean>* {
+        const n: u64 = this.symbols.length as u64;
+        if (this.referenced_symbols == n as i64
+                && this.referenced_records == this.resolution_map.records) {
+            return &this.referenced;
+        }
+        mut fresh: HashMap<u64, boolean> = HashMap::<u64, boolean>::new();
+        mut it: HashMapIter<u64, SymbolID> = this.resolution_map.singles.iter();
+        loop {
+            match (it.next()) {
+                Option::Some(pair) => {
+                    const ref_key: u64  = pair.first;
+                    const sid: SymbolID = pair.second;
+                    if (!sid.is_valid() || sid.key() > n) { continue; }
+                    const decl_key: u64 = ResolutionMap::make_key(this.get_symbol(sid).declaring_span);
+                    if (ref_key != decl_key) { fresh.insert(decl_key, true); }
+                }
+                Option::None => { break; }
+            }
+        }
+        mem::swap(&fresh, &this.referenced);
+        mem::drop(fresh);
+        this.referenced_records = this.resolution_map.records;
+        this.referenced_symbols = n as i64;
+        return &this.referenced;
     }
 
 

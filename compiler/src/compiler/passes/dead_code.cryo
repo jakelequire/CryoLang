@@ -59,11 +59,9 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
 import compiler::resolver;
-import compiler::resolver::{ resolver, symbol, symbol_id, symbol_str, resolution_map };
+import compiler::resolver::{ resolver, symbol, symbol_str, resolution_map };
 import std::collections::hashmap;
-import std::collections::hashmap::{ HashMap, HashMapIter };
-import std::core::option;
-import std::core::option::{ Option };
+import std::collections::hashmap::{ HashMap };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureDeclNode, FunctionDeclNode, ImplBlockNode,
@@ -87,7 +85,6 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::resolution_map::{ ResolutionMap };
 import compiler::resolver::resolver::{ Resolver };
-import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::decl_index::{ OverloadId };
 import utils::keyword::{ Keyword };
 
@@ -97,10 +94,10 @@ type struct DeadCodeChecker {
 
     /// Set of declaration-span keys (see `ResolutionMap::make_key`) that are
     /// referenced somewhere.  A binding counts as "used" when its declaring
-    /// span key is in this set.  Built once from the resolution map by
-    /// `build_used`.  Covers identifier references: local variables and
-    /// free-function callees.
-    used: HashMap<u64, boolean>;
+    /// span key is in this set.  The resolver's, shared by every module's
+    /// check; null without a resolver.  Covers identifier references: local
+    /// variables and free-function callees.
+    used: HashMap<u64, boolean>*;
 
     /// Set of method/function declaration-span keys that are the target of a
     /// resolved call.  Populated by `harvest_module` from the methods every
@@ -124,7 +121,7 @@ type struct DeadCodeChecker {
     static new(ctx: CompilationContext*) -> DeadCodeChecker {
         return DeadCodeChecker {
             ctx:           ctx,
-            used:          HashMap::<u64, boolean>::new(),
+            used:          null,
             method_used:   HashMap::<u64, boolean>::new(),
             body_resolved: true,
         };
@@ -132,31 +129,17 @@ type struct DeadCodeChecker {
 
     // -- Usage set --
 
-    /// Populate `used` from the resolution map.  Each entry maps a reference
-    /// span -> the SymbolID it resolves to; we record the *declaration* span
-    /// key of every referenced symbol, EXCLUDING the entry a declaration
-    /// records for itself (whose key equals the declaring span), so a
-    /// declaration never counts as a use of itself.
+    /// Read `used` from the resolver: the declaration of everything some
+    /// span resolves to (`Resolver::referenced_declarations`).
     build_used(mut &this) -> void {
         const resolver: Resolver* = this.ctx.get_resolver();
         if (resolver == null) { return; }
-        const n: u64 = resolver.symbols.length as u64;
-        mut it: HashMapIter<u64, SymbolID> = resolver.resolution_map.singles.iter();
-        loop {
-            match (it.next()) {
-                Option::Some(pair) => {
-                    const ref_key: u64  = pair.first;
-                    const sid: SymbolID = pair.second;
-                    if (!sid.is_valid() || sid.key() > n) { continue; }
-                    const decl_span: SourceSpan = resolver.get_symbol(sid).declaring_span;
-                    const decl_key: u64 = ResolutionMap::make_key(decl_span);
-                    if (ref_key != decl_key) {
-                        this.used.insert(decl_key, true);
-                    }
-                }
-                Option::None => { break; }
-            }
-        }
+        this.used = resolver.referenced_declarations();
+    }
+
+    /// Whether some span resolves to the declaration whose span key is `key`.
+    is_referenced(&this, key: u64) -> boolean {
+        return this.used != null && this.used.contains_key(&key);
     }
 
     // -- Module walk (both lints) --
@@ -289,7 +272,7 @@ type struct DeadCodeChecker {
         if (name == "" || name.starts_with("_")) { return; }
 
         const key: u64 = ResolutionMap::make_key(vd.span);
-        if (this.used.contains_key(&key)) { return; }
+        if (this.is_referenced(key)) { return; }
 
         mut diag: Diagnostic = Diagnostic::warning(
             ErrorCode::W0001_UNUSED_VARIABLE,
@@ -664,7 +647,7 @@ type struct DeadCodeChecker {
     /// True if this call target's declaration span is referenced anywhere.
     is_target_used(&this, span: SourceSpan) -> boolean {
         const key: u64 = ResolutionMap::make_key(span);
-        return this.method_used.contains_key(&key) || this.used.contains_key(&key);
+        return this.method_used.contains_key(&key) || this.is_referenced(key);
     }
 
     report_function(mut &this, func: FunctionDeclNode*) -> void {
