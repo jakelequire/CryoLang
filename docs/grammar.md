@@ -427,7 +427,11 @@ PatElem            ::= "_" | "mut"? Ident | Literal
 Type               ::= BaseType "*"+                       (* pointer *)
                      | "&" "mut"? Type                     (* reference *)
                      | "mut" "&" Type                      (* mut-ref alt form *)
-                     | BaseType ("[" NumLit? "]")+         (* array *)
+                     | "[" Type "]"                        (* dynamic array *)
+                     | "[" Type ";" Expr "]"               (* fixed array; the length is a
+                                                              compile-time integer *)
+                     | BaseType ("[" Expr? "]")+           (* postfix spelling of the two
+                                                              array forms above *)
                      | "(" Type ("," Type)* ","? ")"       (* tuple - needs >=2 elements
                                                               OR a trailing comma; `(T)`
                                                               is grouping, not a 1-tuple *)

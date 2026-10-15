@@ -463,9 +463,11 @@ public:
             // orphaned 8.  A parenthesized base - function `(T) -> R`, tuple
             // `(T, U)`, unit `()`, grouping `(T)` - is read by the paren
             // parser the annotation grammar uses; parse_base_type has no
-            // `(` branch.
+            // `(` branch.  A bracketed array type `[T; N]` likewise.
             if (this.check(TokenType::LParen)) {
                 target = this.parse_paren_type();
+            } else if (this.check(TokenType::LSquare)) {
+                target = this.parse_bracket_array_type();
             } else {
                 target = this.parse_base_type();
             }
@@ -2763,16 +2765,13 @@ public:
             return this.parse_type_suffixes(group, open);
         }
 
-        // Bracket tuple types `[T, U]` are not supported; tuples use the
-        // parenthesized form `(T, U)`. A *leading* `[` in type
-        // position is unambiguously the bracket-tuple form (array suffixes
-        // `T[]`/`T[N]` are postfix, handled by parse_type_suffixes), so emit a
-        // targeted diagnostic instead of letting it fall through to
-        // a generic "expected type" error.
+        // Array types `[T]` and `[T; N]`.  The suffixes after the `]` apply
+        // to the whole array: `[T]*`, `[T]?`.
         if (this.check(TokenType::LSquare)) {
-            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                "bracket tuple types '[T, U]' are no longer supported; use '(T, U)'");
-            return null;
+            const open_sq: Token = this.current();
+            const arr: TypeAnnotation* = this.parse_bracket_array_type();
+            if (arr == null) { return null; }
+            return this.parse_type_suffixes(arr, open_sq);
         }
 
         // `implement Trait + Trait2` opaque type. `implement` is already a
@@ -3064,60 +3063,10 @@ public:
             // Array suffix: T[] or T[N]
             else if (this.check(TokenType::LSquare)) {
                 this.advance();
-                if (this.check(TokenType::RSquare)) {
-                    // Heap-backed dynamic array: T[]
-                    this.advance();
-                    const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
-                        element:   result,
-                        size:      ArrayAnnotation::heap_dynamic_size(),
-                        size_expr: null,
-                        span:      this.span_from(start),
-                    };
-                    result = new TypeAnnotation::Array(arr_ann);
+                if (this.match_tok(TokenType::RSquare)) {
+                    result = this.dynamic_array_type(result, start);
                 } else {
-                    // Fixed-size array: T[N], T[CONST_NAME], T[CONST * 2]
-                    //
-                    // A plain numeric literal is decoded here; anything else is
-                    // kept as an expression for the type resolver to constant-
-                    // fold once names are bound.  The expression MUST be
-                    // retained: discarding it leaves the size permanently
-                    // unknown, and an array whose size never resolves is
-                    // emitted as a descriptor with no storage behind it.
-                    const size_tok: Token = this.current();
-                    mut size: i64 = 0;
-                    mut size_expr: ExpressionNode* = null;
-                    if (size_tok.kind == TokenType::NumericConstant) {
-                        // Decode the full numeric lexeme: this honours the
-                        // `0x`/`0o`/`0b` base prefixes and `_` separators that
-                        // a hand-rolled decimal scan would silently drop (e.g.
-                        // `T[0xFF]` must be 255, not 0).
-                        // A size that needs more than 64 bits would saturate to
-                        // a meaningless value; reject it up front rather than
-                        // build a garbage array type.
-                        if (ParserBase::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
-                            this.report_error(ErrorCode::E0010_NUMBER_TOO_LARGE,
-                                fmt::format("array size `%s` does not fit in 64 bits",
-                                    size_tok.lexeme));
-                        }
-                        size = ParserBase::parse_numeric_lexeme_i64(size_tok.lexeme);
-                        this.advance();
-                    } else {
-                        // Named constant or computed size: T[BTREE_MAX_KEYS],
-                        // T[CHUNK * 2].  Marked fixed-pending until the type
-                        // resolver folds `size_expr` - distinct from a
-                        // heap-backed `T[]` so ownership analysis does not free
-                        // its (nonexistent) heap buffer.
-                        size      = ArrayAnnotation::fixed_pending_size();
-                        size_expr = this.parse_expression();
-                    }
-                    this.consume(TokenType::RSquare, "']'");
-                    const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
-                        element:   result,
-                        size:      size,
-                        size_expr: size_expr,
-                        span:      this.span_from(start),
-                    };
-                    result = new TypeAnnotation::Array(arr_ann);
+                    result = this.finish_fixed_array_type(result, start);
                 }
             }
             // Optional suffix: `T?` is sugar for `Option<T>`. Desugar here in
@@ -3151,6 +3100,101 @@ public:
         }
 
         return result;
+    }
+
+    /// Parse an array type written in brackets: `[T]` (dynamic) or `[T; N]`
+    /// (fixed).  Each builds the annotation its postfix spelling builds,
+    /// `T[]` or `T[N]`, so the two spellings are one type.  The element is a
+    /// whole type, so `[&T]` is an array of references and `[[u64; 2]; 3]`
+    /// is three rows of `[u64; 2]`.
+    ///
+    /// `[T, U]` is the removed bracket tuple.  It is reported at its `[` and
+    /// read through its `]` as the tuple `(T, U)` it spells, so the
+    /// declaration around it parses on with no follow-on error.
+    parse_bracket_array_type() -> TypeAnnotation* {
+        const open: Token = this.advance(); // consume `[`
+        const element: TypeAnnotation* = this.parse_type_annotation();
+        if (element == null) { return null; }
+        if (this.check(TokenType::Comma)) {
+            this.report_invalid_at(ErrorCode::E0104_EXPECTED_TYPE,
+                "bracket tuple types '[T, U]' are no longer supported; use '(T, U)'",
+                this.span_from_token(open));
+            mut elements: TypeAnnotation*[] = [];
+            elements.push(element);
+            while (this.match_tok(TokenType::Comma)) {
+                if (this.check(TokenType::RSquare)) { break; }
+                const next: TypeAnnotation* = this.parse_type_annotation();
+                if (next == null) { return null; }
+                elements.push(next);
+            }
+            this.consume(TokenType::RSquare, "']'");
+            const tup_ann: TupleAnnotation* = new TupleAnnotation {
+                elements: elements,
+                span:     this.span_from(open),
+            };
+            return new TypeAnnotation::Tuple(tup_ann);
+        }
+        if (this.match_tok(TokenType::Semicolon)) {
+            return this.finish_fixed_array_type(element, open);
+        }
+        this.consume(TokenType::RSquare, "']'");
+        return this.dynamic_array_type(element, open);
+    }
+
+    /// The heap-backed dynamic array of `element`, its closing `]` consumed;
+    /// the span runs from `start`.
+    dynamic_array_type(element: TypeAnnotation*, start: Token) -> TypeAnnotation* {
+        const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
+            element:   element,
+            size:      ArrayAnnotation::heap_dynamic_size(),
+            size_expr: null,
+            span:      this.span_from(start),
+        };
+        return new TypeAnnotation::Array(arr_ann);
+    }
+
+    /// The fixed-size array of `element` whose length is at the current
+    /// token, through the closing `]`: `N`, `CONST_NAME` or `CONST * 2`.
+    ///
+    /// A plain numeric literal is decoded here; anything else is kept as an
+    /// expression for the type resolver to constant-fold once names are
+    /// bound.  The expression MUST be retained: discarding it leaves the size
+    /// permanently unknown, and an array whose size never resolves is emitted
+    /// as a descriptor with no storage behind it.
+    finish_fixed_array_type(element: TypeAnnotation*, start: Token) -> TypeAnnotation* {
+        const size_tok: Token = this.current();
+        mut size: i64 = 0;
+        mut size_expr: ExpressionNode* = null;
+        if (size_tok.kind == TokenType::NumericConstant) {
+            // Decode the full numeric lexeme: this honours the `0x`/`0o`/`0b`
+            // base prefixes and `_` separators that a hand-rolled decimal
+            // scan would silently drop (`0xFF` must be 255, not 0).  A size
+            // that needs more than 64 bits would saturate to a meaningless
+            // value; reject it up front rather than build a garbage array
+            // type.
+            if (ParserBase::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
+                this.report_error(ErrorCode::E0010_NUMBER_TOO_LARGE,
+                    fmt::format("array size `%s` does not fit in 64 bits",
+                        size_tok.lexeme));
+            }
+            size = ParserBase::parse_numeric_lexeme_i64(size_tok.lexeme);
+            this.advance();
+        } else {
+            // A named constant or computed size is fixed-pending until the
+            // type resolver folds `size_expr` - distinct from a heap-backed
+            // dynamic array, so ownership analysis does not free its
+            // (nonexistent) heap buffer.
+            size      = ArrayAnnotation::fixed_pending_size();
+            size_expr = this.parse_expression();
+        }
+        this.consume(TokenType::RSquare, "']'");
+        const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
+            element:   element,
+            size:      size,
+            size_expr: size_expr,
+            span:      this.span_from(start),
+        };
+        return new TypeAnnotation::Array(arr_ann);
     }
 
     /// Parse a reference type: `&T` or `&mut T`. The leading `&` is at

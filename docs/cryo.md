@@ -336,6 +336,8 @@ Reading the value a reference refers to is explicit in arithmetic and comparison
 
 Two distinct things share the word "array" in Cryo: the **raw array type** (a low-level fixed buffer) and the **growable `Array<T>`** in the standard library.
 
+An array type is written in brackets: `[T]` is a dynamic array and `[T; N]` a fixed one of `N` elements.  The postfix spellings `T[]` and `T[N]` name the same two types.  The element between the brackets is a whole type, so `[&Node]` is an array of references, `&[Node*]` a reference to an array of pointers, `[(i32) -> i32]` an array of functions, and `[[u64; 2]; 3]` three rows of `[u64; 2]` - the length written nearest the element belongs to the inner array, as in the postfix `u64[2][3]`.  A `,` after the first type, `[T, U]`, is refused (E0104): a tuple is written `(T, U)`.
+
 ```cryo
 const buf:    int[16];     // raw fixed-size buffer of 16 ints
 const dyn:    int[];       // raw dynamic array (FFI / unsized)

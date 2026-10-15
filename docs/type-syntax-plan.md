@@ -473,6 +473,20 @@ object or output moves, the new branch reached a path it should not.
 
 **Exit:** verify OK; selfhost x2; `make pin` (both OS); commit.
 
+**Landed** as predicted, with three differences.  The tests are a run
+project, `tests/tests/projects/array_type_circumfix` (13 checks), declared
+in `tests/started-compiling`: a unit file the baseline cannot parse fails
+the baseline's whole unit build, and a unit failure is never declarable.
+The bracket tuple is reported at its `[` and read through its `]`, so the
+E0104 test's cascade annotation is deleted rather than reworded - the
+declaration parses on and nothing follows the one error.  And identity is
+also pinned at the signature: `E0206_array_spellings_one_signature` refuses
+`g([i32])` beside `g(i32[])`, with `i32[]` beside `Array<i32>` as the
+accepted control.  `[T;]` and `[T; ]` are one token stream, so one file
+covers both.  Writing the first version of the project found a defect
+unrelated to the syntax and logged in `.bug-report/`: a struct field passed
+by value in an `if` condition is released twice.
+
 ### Slice 2 - display switches (D4)
 
 Sites: `types/arena.cryo:1137-1139` and `:1280-1281` (two display
