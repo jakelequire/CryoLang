@@ -511,6 +511,17 @@ objects); compile-fail output differs in exactly one file
 `make vendor-check` and any committed generated bindings move only in array
 text.
 
+**Landed** as predicted.  The arena's two printers and the language
+server's relative printer share one `ArrayType::spelled`; the demangler
+prints `&[i64]` and `[[u64; 2]; 3]`; the AST dump prints the length it was
+written with (it printed `[]` for every array).  Four language-server
+checks pin the new text (hover on a dynamic and a fixed local and on a
+reference to an array of pointers, and signature help); the server before
+the switch fails all four.  Compile-fail output moved in exactly the one
+predicted file, whose `//~` lines quote no array text, so no annotation
+changed.  No committed binding contains an array type; `vendor-check` and
+`api-index-check` pass unchanged.  Nothing tests the demangler's output.
+
 ### Slice 3 - migrate the tree (codemod)
 
 The pin from slice 1 reads both forms.  The codemod rewrites **only** array
