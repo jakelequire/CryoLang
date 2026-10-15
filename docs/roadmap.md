@@ -111,14 +111,26 @@ refuses below its floor of passing checks (`docs/testing.md` section 9).
 
 What is left:
 
-- **Module caching** (ruling 329: a design only in the first release; each
-  save analyses the whole project).  Measured on the compiler project with
-  `cryo check` (166 local and 81 standard library modules, 26.4 s):
-  discovery 8.6 s, the project's own lex and parse 3.5 s, name resolution
-  1.7 s, semantic analysis through lowering 10.1 s, the standard library
-  under 2 s in all; a hello-world takes 1.1 s.  In order:
-  1. Split the semantic stage by pass and leave out of the editor's mode
-     what it neither shows nor reads (drop insertion is the candidate).
+- **Module caching** (ruling 345: the standard library analysed once per
+  server process as a frozen base layer; whole-module reuse waits for the
+  intermediate representation work).  Measured in the server, a save of
+  the compiler project (166 local and 81 standard library modules) takes
+  about 8 s and holds 1.6 GB, 3.1 GB at its peak while the next analysis
+  runs beside the last: discovery 2.4 s, name resolution 2.3 s,
+  monomorphization 0.9 s, the standard library's passes 1.8 s in all.  A
+  file under no project takes 0.85 s, all but a few milliseconds of it the
+  standard library: discovery 0.33 s, name resolution 0.19 s.  Every pass
+  after semantic analysis reports diagnostics the editor shows (move
+  checking, the dead-code lint, E0456 from drop insertion, E0236 and E0237
+  from type lowering), so the editor's mode skips none of them.  In order:
+  1. The frozen standard library layer.  Every table of an analysis lives
+     in one context and one arena, and monomorphization routes the
+     specializations a project asks for into the standard library's own
+     module trees, so the library's state after an analysis depends on the
+     project.  A frozen layer needs the library to finish the stages before
+     monomorphization ahead of the project's modules, every table to
+     retract to a mark, the arena split in two, and specializations kept
+     out of the frozen trees.
   2. Lex each file once: discovery lexes every project file whole for its
      `namespace`, again for its imports, and the frontend lexes it a third
      time.  Then a cache of each file's scan result (namespace, import
@@ -146,9 +158,6 @@ What is left:
   (`T::make().`).  After an import's path it lists only the modules the
   last analysis loaded, so `import std::` offers the standard library's
   modules the project reaches, not every one on disk.
-- **The import suggestion for a module already imported** (ruling 332)
-  becomes not machine-applicable and suggests the qualified name.  It
-  changes a diagnostic's text, which waits for its wording to be decided.
 - **Rename** refuses a module (its name is its namespace declaration and
   its file's place), a method a trait declares or implements (the trait's
   and every implementation's would move together), and a name at an
@@ -210,7 +219,8 @@ normalised before the comparison.
   run with the mingw `gcc` an installed `cryo.exe` finds there.  Until then
   the release smoke stays the staged tree under wine.
 - **The language server reports the stamped version** (`serverInfo`) that
-  `cryo version` prints.
+  `cryo version` prints, with the matching change in the VS Code extension
+  (ruling 343).
 - **`cryo version --verbose` shows the binary's sha256,** once the standard
   library has a sha256; it has sha1 only today.
 - **`make verify ARGS="--baseline REV"` works for a revision from before

@@ -54,6 +54,16 @@ import compiler::types::compound::{ PointerType, ReferenceType };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ ClassType, EnumType, MethodInfo, StructType };
+import compiler::module_graph::{ ModulePath };
+import compiler::ast::{ ImportStyle };
+import compiler::ast::declaration::{ ImportDeclNode };
+
+/// Another type of a refused name's spelling: its path, as text for the
+/// message, and the module it is declared in.
+type struct ShadowCandidate {
+    path:   string;
+    module: ModulePath;
+}
 
 type struct Diagnostics {
     arena:  TypeArena*;
@@ -334,14 +344,14 @@ type struct Diagnostics {
     /// (import-shadow detection); `resolved_type` is excluded.
     /// Capped at 4 candidates.
     find_shadowed_type_candidates(&this, simple_name: SymbolStr, member_name: SymbolStr,
-                                  resolved_type: TypeRef) -> string[] {
+                                  resolved_type: TypeRef) -> ShadowCandidate[] {
         const needle: string = if (simple_name.is_valid()) {
             this.intern.resolve(simple_name)
         } else {
             QualifiedName::leaf_of(this.intern.shown(this.arena.get_qualified_name(resolved_type)))
         };
         if (needle == "") { return []; }
-        mut results: string[] = [];
+        mut results: ShadowCandidate[] = [];
         const filter_member: boolean = member_name.is_valid();
         const n: i64 = this.arena.type_count();
         for (mut i: i64 = 0; i < n; i++) {
@@ -349,20 +359,24 @@ type struct Diagnostics {
             if (t == null) { continue; }
             if (resolved_type.is_valid() && t.id == resolved_type.key()) { continue; }
             mut qname: DeclName = DeclName::empty();
+            mut declared_in: ModulePath = ModulePath::none();
             mut has_member: boolean = !filter_member;
             const no_methods: MethodInfo[] = [];
             mut methods: &MethodInfo[] = &no_methods;
             if (t.kind == TypeKind::Struct) {
                 const st: StructType* = t as StructType*;
                 qname = st.qualified_name;
+                declared_in = st.declared_in;
                 methods = &st.methods;
             } else if (t.kind == TypeKind::Class) {
                 const ct: ClassType* = t as ClassType*;
                 qname = ct.qualified_name;
+                declared_in = ct.declared_in;
                 methods = &ct.methods;
             } else if (t.kind == TypeKind::Enum) {
                 const et: EnumType* = t as EnumType*;
                 qname = et.qualified_name;
+                declared_in = et.declared_in;
                 methods = &et.methods;
                 if (filter_member && et.variant_index(member_name) >= 0) { has_member = true; }
             } else {
@@ -377,10 +391,10 @@ type struct Diagnostics {
             if (leaf != needle) { continue; }
             mut dup: boolean = false;
             for (mut j: i64 = 0; j < results.length; j++) {
-                if (results[j] == qstr) { dup = true; break; }
+                if (results[j].path == qstr) { dup = true; break; }
             }
             if (dup) { continue; }
-            results.push(qstr);
+            results.push(ShadowCandidate { path: qstr, module: declared_in });
             if (results.length >= 4) { break; }
         }
         return results;
@@ -405,11 +419,13 @@ type struct Diagnostics {
         return SourceSpan::new(anchor.file, anchor.end_line, anchor.end_col, anchor.end_line, anchor.end_col);
     }
 
-    /// Attach an "import the right type" note + quickfix for each shadowed
-    /// candidate path `find_shadowed_type_candidates` answered with
+    /// Attach a note for each shadowed candidate `find_shadowed_type_candidates`
+    /// answered with, and the way to reach it: when the file already imports
+    /// the candidate's module, a help naming the qualified spelling, which is
+    /// not applied for the user; otherwise a quickfix importing the module
     /// (MachineApplicable for a single candidate, else MaybeIncorrect).
     attach_shadow_import_suggestions(&this, diag: Diagnostic, simple_name_str: string,
-                                     candidates: string[]) -> Diagnostic {
+                                     candidates: ShadowCandidate[]) -> Diagnostic {
         if (candidates.length == 0) { return diag; }
         mut out: Diagnostic = diag;
         const insert_span: SourceSpan = this.find_import_insertion_span();
@@ -418,20 +434,64 @@ type struct Diagnostics {
         } else {
             Applicability::MaybeIncorrect
         };
+        mut any_to_import: boolean = false;
         for (mut i: i64 = 0; i < candidates.length; i++) {
-            const cand_str: string = candidates[i];
+            const cand_str: string = candidates[i].path;
             out = out.with_note(fmt::format("another `%s` exists: `%s`", simple_name_str, cand_str));
             const import_path: string = QualifiedName::parent_of(cand_str);
             if (import_path == "") { continue; }
+            const bound: string = this.module_import_name(candidates[i].module);
+            if (bound != "") {
+                out = out.help(fmt::format("`%s` is already imported; write `%s::%s`",
+                    import_path, bound, simple_name_str));
+                continue;
+            }
+            any_to_import = true;
             if (insert_span.has_location()) {
                 const insertion: string = fmt::format("\nimport %s;", import_path);
                 const msg: string = fmt::format("import `%s`", import_path);
                 out = out.suggest(Suggestion::single(insert_span, insertion, msg, apply));
             }
         }
-        out = out.help(fmt::format(
-            "the unqualified name `%s` resolved to a different type than the one you meant; import the intended module to disambiguate",
-            simple_name_str));
+        if (any_to_import) {
+            out = out.help(fmt::format(
+                "the unqualified name `%s` resolved to a different type than the one you meant; import the intended module to disambiguate",
+                simple_name_str));
+        }
         return out;
+    }
+
+    /// The name the current file's import of the whole module `m` binds it
+    /// under - its alias, or the path's last segment - or "" when no such
+    /// import names `m`.
+    module_import_name(&this, m: ModulePath) -> string {
+        if (this.ctx == null || !m.is_valid()) { return ""; }
+        const root: ProgramNode* = this.ctx.artifacts.ast.root;
+        if (root == null) { return ""; }
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null || stmt.kind != NodeKind::ImportDeclaration) { continue; }
+            const imp: ImportDeclNode* = stmt as ImportDeclNode*;
+            // `import A::B as C;` is one entry naming the sub-module.
+            if (imp.path_entry) {
+                for (mut k: i64 = 0; k < imp.specific_defs.length; k++) {
+                    if (!this.ctx.module_graph.module_of_def(imp.specific_defs[k]).equals(m)) { continue; }
+                    const e: i64 = imp.specific_def_entries[k];
+                    if (e < imp.specific_aliases.length && imp.specific_aliases[e].is_valid()) {
+                        return this.intern.resolve(imp.specific_aliases[e]);
+                    }
+                    return this.intern.resolve(imp.specific_imports[e]);
+                }
+                continue;
+            }
+            match (imp.style) {
+                ImportStyle::Module => { }
+                _ => { continue; }
+            }
+            if (!imp.resolved_module.equals(m)) { continue; }
+            if (imp.alias.is_valid()) { return this.intern.resolve(imp.alias); }
+            return QualifiedName::leaf_of(this.intern.shown(m.decl_name()));
+        }
+        return "";
     }
 }
