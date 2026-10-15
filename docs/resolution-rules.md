@@ -166,6 +166,23 @@ yet is recorded with the change that builds it, not here.
 354. **The rulings stay as written records:** an old spelling inside a past
      ruling is not respelled.  (Jake)
 
+355. **The pins are refreshed after a change to what the compiler accepts or
+     what it compiles a program to.**  A change only to text the compiler
+     prints needs no repin.  (Jake)
+
+356. **The refused postfix array type is E0104** ("expected type"), worded
+     as 352 states, with the type actually written filled in, and carries
+     its bracketed spelling as an automatic fix.  (Jake)
+
+357. **Code comments that spell an array type postfix are respelled** in
+     the brackets once the postfix form is refused.  (Jake)
+
+358. **A struct field passed by value inside an `if` condition is not
+     released twice:** the defect is fixed on the branch that changes the
+     array syntax, where it was found.  (Jake)
+
+359. **The demangler's output is pinned by a test.**  (Jake)
+
 ### 2026-10-14
 
 333. **One project's analysis covers every target of its cryoconfig, and

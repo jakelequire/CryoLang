@@ -25,6 +25,8 @@ import compiler::ast::{
     ProjectionAnnotation, ReferenceAnnotation, statement, ThisTypeAnnotation,
     TupleAnnotation, TypeAnnotation, TypeofAnnotation
 };
+import compiler::ast::node_locator;
+import compiler::ast::node_locator::{ annotation_span };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::resolver::{ symbol_str, qualified_name };
@@ -478,7 +480,7 @@ public:
             }
             // `*` is a pointer suffix when followed by a token that cannot
             // start an expression (;  )  }  ]  ,  as  EOF); otherwise it is
-            // multiplication.  Other suffixes ([], ?) are unambiguous.
+            // multiplication.  `?` is unambiguous.
             if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
                 target = this.parse_type_suffixes_q(target, pending_const, target_tok);
             } else if (!this.check(TokenType::Star)) {
@@ -2756,8 +2758,8 @@ public:
         // Parenthesized types: tuple `(T, U)`, 1-tuple `(T,)`, grouping `(T)`,
         // unit `()`, or function `(T, U) -> R`. Disambiguated by the trailing
         // comma (grouping vs 1-tuple) and a following `->` (function type).
-        // The suffixes after the `)` apply to the whole group:
-        // `(i32, i32)[]`, and `((i32) -> i32)[]` for an array of functions.
+        // The suffixes after the `)` apply to the whole group: `(&T)*`,
+        // `(&T)?`.
         if (this.check(TokenType::LParen)) {
             const open: Token = this.current();
             const group: TypeAnnotation* = this.parse_paren_type();
@@ -3020,7 +3022,7 @@ public:
         return false;
     }
 
-    /// Parse type suffixes: *, [], [N], ?.  `start` is the first token of the
+    /// Parse type suffixes: `*` and `?`.  `start` is the first token of the
     /// type the suffixes apply to (a group's `(`, a `const`); each wrapper's
     /// span runs from it through the suffix's last token.
     parse_type_suffixes(base: TypeAnnotation*, start: Token) -> TypeAnnotation* {
@@ -3030,9 +3032,18 @@ public:
     /// As `parse_type_suffixes`, but `pending_const` marks the pointee of the
     /// nearest `*` suffix as const (`const T*`). The flag is consumed by the
     /// first pointer only; subsequent levels default to non-const.
+    ///
+    /// A `[` after a type is an array written postfix, `T[]` or `T[N]`,
+    /// which is refused: one E0104 for the whole suffix run, carrying the
+    /// run rewritten in brackets as its fix.  The run is still read into the
+    /// array it spells, so the declaration around it parses on with no
+    /// follow-on error.
     parse_type_suffixes_q(base: TypeAnnotation*, pending_const: boolean, start: Token) -> TypeAnnotation* {
         mut result: TypeAnnotation* = base;
         mut ptr_const: boolean = pending_const;
+        // The suffix run rewritten in brackets, once a postfix `[` is read.
+        mut postfix_array: boolean = false;
+        mut rewritten: string = "";
 
         // Pointer/array/optional suffixes (`T*`, `T[]`, `T?`) are consumed
         // iteratively here, but each wraps `result` in a new node, so a long
@@ -3047,7 +3058,7 @@ public:
             if (suffix_len > 256) {
                 this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
                     "type nesting too deep (pointer/array suffix limit exceeded)");
-                return result;
+                break;
             }
             // Pointer suffix: T*
             if (this.check(TokenType::Star)) {
@@ -3059,14 +3070,24 @@ public:
                 };
                 ptr_const = false; // const binds to the innermost pointer only
                 result = new TypeAnnotation::Pointer(ptr_ann);
+                if (postfix_array) { rewritten = rewritten + "*"; }
             }
-            // Array suffix: T[] or T[N]
+            // Refused postfix array: T[] or T[N].  Each one wraps what is
+            // written so far, so `u64[2][3]` becomes `[[u64; 2]; 3]`.
             else if (this.check(TokenType::LSquare)) {
+                if (!postfix_array) {
+                    postfix_array = true;
+                    rewritten = this.postfix_element_text(base, result, start);
+                }
                 this.advance();
                 if (this.match_tok(TokenType::RSquare)) {
                     result = this.dynamic_array_type(result, start);
+                    rewritten = "[" + rewritten + "]";
                 } else {
+                    const length_from: i64 = this.pos;
                     result = this.finish_fixed_array_type(result, start);
+                    rewritten = "[" + rewritten + "; "
+                        + this.tokens_text(length_from, this.last_consumed_index()) + "]";
                 }
             }
             // Optional suffix: `T?` is sugar for `Option<T>`. Desugar here in
@@ -3093,13 +3114,42 @@ public:
                     span: this.span_from(start),
                 };
                 result = new TypeAnnotation::Generic(opt_gen);
+                if (postfix_array) { rewritten = rewritten + "?"; }
             }
             else {
                 break;
             }
         }
 
+        if (postfix_array) {
+            const written: SourceSpan = this.span_from(start);
+            this.error_count += 1;
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0104_EXPECTED_TYPE,
+                fmt::format("array types are written `[T]`: write `%s`", rewritten));
+            diag = diag.at(written);
+            diag = diag.suggest(Suggestion::machine_applicable(written, rewritten,
+                fmt::format("write `%s`", rewritten)));
+            this.ctx.emit_diagnostic(diag);
+        }
         return result;
+    }
+
+    /// The written type a postfix array's brackets go around: the tokens
+    /// from `start` up to the first `[`.  A grouping's parentheses are left
+    /// out when the array is the first suffix after them, since brackets
+    /// group by themselves: `(&T)[]` is `[&T]`.  A group that is a tuple or
+    /// a function type keeps them; its annotation's span starts at the `(`.
+    postfix_element_text(base: TypeAnnotation*, result: TypeAnnotation*, start: Token) -> string {
+        const from: i64 = this.consumed_index_of(start);
+        const to: i64 = this.last_consumed_index() + 1;
+        if (result == base && start.kind == TokenType::LParen) {
+            const inner: SourceSpan = annotation_span(base);
+            if (inner.start_line != start.line as u32 || inner.start_col != start.column as u32) {
+                return this.tokens_text(from + 1, to - 1);
+            }
+        }
+        return this.tokens_text(from, to);
     }
 
     /// Parse an array type written in brackets: `[T]` (dynamic) or `[T; N]`

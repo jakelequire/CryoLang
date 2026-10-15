@@ -384,17 +384,7 @@ public:
     /// `namespace X;` followed by `///` doc comments on later lines
     /// gets a span ending at the last doc comment instead of `;`.
     span_from(start: Token) -> SourceSpan {
-        mut idx: i64 = this.pos - 1;
-        while (idx >= 0 && idx < this.tokens.length) {
-            const k: TokenType = this.tokens[idx].kind;
-            if (k == TokenType::Comment
-                    || k == TokenType::DocCommentLine
-                    || k == TokenType::DocCommentBlock) {
-                idx -= 1;
-                continue;
-            }
-            break;
-        }
+        const idx: i64 = this.last_consumed_index();
         if (idx >= 0 && idx < this.tokens.length) {
             const end_tok: Token = this.tokens[idx];
             const end_col: u32 = end_tok.column as u32 + end_tok.source_length as u32;
@@ -405,6 +395,58 @@ public:
             );
         }
         return this.span_from_token(start);
+    }
+
+    /// The index of the last token consumed.  `advance()` steps over the
+    /// comments after each real token, so `tokens[pos - 1]` may be one of
+    /// those; this walks back past them.  -1 before the first token.
+    last_consumed_index() -> i64 {
+        mut idx: i64 = this.pos - 1;
+        while (idx >= 0 && idx < this.tokens.length && ParserBase::is_comment(this.tokens[idx].kind)) {
+            idx -= 1;
+        }
+        return idx;
+    }
+
+    /// The index of `tok`, a token already consumed: the one at its line
+    /// and column, searched back from the cursor.
+    consumed_index_of(tok: Token) -> i64 {
+        mut idx: i64 = this.pos - 1;
+        while (idx >= 0) {
+            const at: Token = this.tokens[idx];
+            if (at.line == tok.line && at.column == tok.column) { return idx; }
+            idx -= 1;
+        }
+        return 0;
+    }
+
+    /// The written text of the tokens from `from` up to but not including
+    /// `to`, comments left out and one space wherever the source had any
+    /// between two tokens: a construct quoted back in a diagnostic, or the
+    /// pieces a suggested rewrite is assembled from.
+    tokens_text(from: i64, to: i64) -> string {
+        mut text: string = "";
+        mut have_prev: boolean = false;
+        mut prev_line: int = 0;
+        mut prev_end: int = 0;
+        for (mut i: i64 = from; i < to && i < this.tokens.length; i++) {
+            const tok: Token = this.tokens[i];
+            if (ParserBase::is_comment(tok.kind)) { continue; }
+            if (have_prev && (tok.line != prev_line || tok.column > prev_end)) {
+                text = text + " ";
+            }
+            text = text + tok.lexeme;
+            have_prev = true;
+            prev_line = tok.line;
+            prev_end = tok.column + tok.source_length;
+        }
+        return text;
+    }
+
+    static is_comment(kind: TokenType) -> boolean {
+        return kind == TokenType::Comment
+            || kind == TokenType::DocCommentLine
+            || kind == TokenType::DocCommentBlock;
     }
 
     /// Parse a numeric-constant token's lexeme as a signed 64-bit integer.

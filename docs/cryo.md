@@ -336,7 +336,9 @@ Reading the value a reference refers to is explicit in arithmetic and comparison
 
 Two distinct things share the word "array" in Cryo: the **raw array type** (a low-level fixed buffer) and the **growable `Array<T>`** in the standard library.
 
-An array type is written in brackets: `[T]` is a dynamic array and `[T; N]` a fixed one of `N` elements.  The postfix spellings `T[]` and `T[N]` name the same two types.  The element between the brackets is a whole type, so `[&Node]` is an array of references, `&[Node*]` a reference to an array of pointers, `[(i32) -> i32]` an array of functions, and `[[u64; 2]; 3]` three rows of `[u64; 2]` - the length written nearest the element belongs to the inner array, as in the postfix `u64[2][3]`.  A `,` after the first type, `[T, U]`, is refused (E0104): a tuple is written `(T, U)`.
+An array type is written in brackets: `[T]` is a dynamic array and `[T; N]` a fixed one of `N` elements.  The element between the brackets is a whole type, so `[&Node]` is an array of references, `&[Node*]` a reference to an array of pointers, `[(i32) -> i32]` an array of functions, and `[[u64; 2]; 3]` three rows of `[u64; 2]` - the length written nearest the element belongs to the inner array.  A `,` after the first type, `[T, U]`, is refused (E0104): a tuple is written `(T, U)`.
+
+An array is never written after its element: a type followed by `[` is refused (E0104, "array types are written `[T]`: write `[i64]`"), and the diagnostic carries the bracketed spelling as a fix that an editor can apply.  The fix writes nested lengths outside-in, so `u64[2][3]` becomes `[[u64; 2]; 3]`, and drops parentheses the brackets make unnecessary, so `(&Node)[]` becomes `[&Node]`.  `new u8[n]` is not an array type but an allocation yielding a pointer ([section 15](#15-pointers-and-memory)), and keeps its spelling.
 
 ```cryo
 const buf:    [int; 16];   // raw fixed-size buffer of 16 ints
@@ -344,9 +346,9 @@ const dyn:    [int];       // raw dynamic array (FFI / unsized)
 mut   v:      Array<int>;  // growable, heap-backed; from collections::array
 ```
 
-For everything except FFI and stack-allocated scratch buffers, prefer `Array<T>` from the standard library. The shorthand `T[]` desugars to `Array<T>` in expression position when the prelude is loaded.
+For everything except FFI and stack-allocated scratch buffers, prefer `Array<T>` from the standard library. The shorthand `[T]` desugars to `Array<T>` in expression position when the prelude is loaded.
 
-The `N` in `T[N]` is a **compile-time integer**: an integer literal, a named `const` (declared in this module or another, written bare or qualified), an enum variant, a cast between integer types, or arithmetic, comparison, logical, and bitwise operators over those. The repeat expression `[value; N]` accepts exactly the same set and yields `T[N]`, so a field and the initializer that fills it can share one name for their length; a count that is *not* a compile-time integer is legal there and yields a dynamic `T[]` sized at run time. A size that is neither is E0239.
+The `N` in `[T; N]` is a **compile-time integer**: an integer literal, a named `const` (declared in this module or another, written bare or qualified), an enum variant, a cast between integer types, or arithmetic, comparison, logical, and bitwise operators over those. The repeat expression `[value; N]` accepts exactly the same set and yields `[T; N]`, so a field and the initializer that fills it can share one name for their length; a count that is *not* a compile-time integer is legal there and yields a dynamic `[T]` sized at run time. A size that is neither is E0239.
 
 ```cryo
 const CAPACITY: i64 = 512;
@@ -560,10 +562,8 @@ equivalent `t[0]`, `t[1]`) - and the index is checked against the tuple's arity
 at compile time. Chained access like `t.1.0` works (element 1, then element 0 of
 that).
 
-> **Note:** a pre-1.0 bracket spelling, `[T, U]`, was previously accepted in
-> type position. It has been removed - a leading `[` in a type is now an error.
-> Write `(T, U)`. (The array suffixes `T[]` / `T[N]` are unaffected: they are
-> postfix on an existing type, not a leading bracket.)
+> **Note:** a leading `[` in a type starts an array type, `[T]` or `[T; N]`,
+> so `[T, U]` is refused (E0104). Write `(T, U)`.
 
 ### 2.7 The Unit Type
 
@@ -1136,7 +1136,7 @@ The scrutinee may be:
 - An **`Iterator`** directly - a type that `implement trait Iterator<T>`, including the stdlib's `Range<T>` / `RangeInclusive<T>`, or a type parameter bounded by `Iterator`. A method that is merely spelled `next` does not make a type iterable: the loop refuses it (`E0306`, "does not implement `Iterator`").
 - A **range literal** `a..b` (half-open) or `a..=b` (inclusive). These are sugar for `Range::new(a, b)` / `RangeInclusive::new(a, b)`; see the precedence table in [section 5.7](#57-operator-precedence).
 - An **iterable** that exposes `iter()` returning an iterator - `Array<T>` and `Slice<T>` (their `iter()` is gated `where T: Copy`). The lowering inserts the `.iter()` call.
-- A **fixed-size array** `T[N]`. The lowering views it as a `Slice<T>` over its `N` elements.
+- A **fixed-size array** `[T; N]`. The lowering views it as a `Slice<T>` over its `N` elements.
 
 ```cryo
 mut sum: i32 = 0;
@@ -3948,8 +3948,8 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::primitives`   | Methods on built-in types (`(-5 as i32).abs()`, `(2.0).sqrt()`, `x.clamp(lo, hi)`, `char::is_digit`, ...)             |
 | `core::varargs`      | `VaArgs`, the compiler-assigned type of a function's `args...` bucket                                                 |
 | `core::drop`, `core::marker`, `core::cmp`, `core::clone` | `Drop`, the marker traits (`Copy`, `Send`, `Sync`), `Eq` / `Ord` / `Ordering`, `Clone` |
-| `collections::array` | `Array<T>`, needed because `T[]` desugars to `Array<T>`                                                               |
-| `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: T[N]`)                   |
+| `collections::array` | `Array<T>`, needed because `[T]` desugars to `Array<T>`                                                               |
+| `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: [T; N]`)                 |
 | `core::ops`          | `Range` / `RangeInclusive`, backing range literals (`a..b` desugars to `Range::new`)                                  |
 | `core::iter`         | `Iterator`, the trait the for-in sugar drives the scrutinee through                                                   |
 | `alloc::box`         | `Box<T>`                                                                                                              |
