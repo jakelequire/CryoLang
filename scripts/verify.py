@@ -7,7 +7,7 @@ build:
 
     census     scripts/test-census.py    the three suites, counts reconciled
     examples   scripts/examples-gate.py  every examples/ project builds
-    lsp        scripts/lsp-gate.py       tools/CryoLSP builds
+    lsp        scripts/lsp-gate.py       tools/CryoLSP builds and answers
     cross      scripts/cross-check.py    the other OS's gated half compiles
     incr       scripts/incremental-instance-check.py
                                          an edit asking a cached module for a

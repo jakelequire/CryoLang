@@ -77,7 +77,7 @@ or reads the store by identity.  Locked so far:
 
 | store | file | its door(s) | readers outside |
 |---|---|---|---|
-| the scope ribs (`Scope`, `ScopeEntry`) | `compiler/src/compiler/resolver/resolver.cryo` | `scope-value`, `scope-type` | by identity: `Scope::binding_count`, `binding_at`; a module's own binding by leaf: `Resolver::module_binding` |
+| the scope ribs (`Scope`, `ScopeEntry`) | `compiler/src/compiler/resolver/resolver.cryo` | `scope-value`, `scope-type` | by identity: `Scope::binding_count`, `binding_at`, `Resolver::visible_bindings` (a scope's rib chain), `Resolver::scope_at` (the scope around a position in a module); a module's own binding by leaf: `Resolver::module_binding` |
 | an enum type's variants (`EnumVariantInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-variant` (`EnumType::variant_index`) | text for a message: `EnumVariantInfo::display_name` |
 | the declaration index's families and module globals (`overload_index`, `func_type_refs`, `refused_methods`, `overload_func_family`, `overload_func_mangled`, `module_global_leaves`, `module_global_extern_syms`, `extern_symbol_first`, `family_slot`) | `compiler/src/compiler/decl_index.cryo` | `member-function`, `member-global` | none |
 | the interner (`strings`, `lookup`) | `compiler/src/compiler/resolver/intern_table.cryo` | `intern` | `resolve`, `shown` |
@@ -103,6 +103,7 @@ or reads the store by identity.  Locked so far:
 | `trait-method` | `GenericRegistry::trait_item_slot` | `compiler/src/compiler/types/generic_registry.cryo` | member: a trait's declared method, by trait identity and leaf, to its position in the trait |
 | `assoc-type` | `TraitDeclNode::assoc_type_index` | `compiler/src/compiler/AST/declaration.cryo` | member: a trait's associated type, by the trait's declaration and leaf, to its position among the trait's associated types |
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
+| `module-by-path` | `ModuleGraph::module_path_over` | `compiler/src/compiler/module_graph.cryo` | an import's written path to itself as a path to list modules within, when the graph holds a module at it or under it, whether or not it names a module (`import std::`) |
 | `module-by-path` | `ModuleGraph::modules_in_view` | `compiler/src/compiler/module_graph.cryo` | a path written in a body to the modules it names, among those the writing file can see: its own, the ones it imports, the prelude, or a package root written whole |
 | `loader-path` | `ModuleLoader::resolve_import_path` | `compiler/src/compiler/module_loader.cryo` | a module path written in an `import`, an `export` or a `public module` to the file of the module it names: a vendored library, a file declaring the namespace, or a file at the path on disk |
 | `loader-path` | `ModuleLoader::binding_of` | `compiler/src/compiler/module_loader.cryo` | a body path's head to the import of the file that binds it |
@@ -132,6 +133,79 @@ caller of a door, or an identity lookup.
 Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
+
+### 2026-10-14
+
+333. **One project's analysis covers every target of its cryoconfig, and
+     the target whose view it takes is chosen by the file opened or saved
+     last.**  This stays until a real project needs a separate view per
+     target.  (Jake)
+
+334. **The editor's identity lookups come before its definition and hover
+     rebuild,** and their work starts by measuring that the name layer's
+     stamps are filled in when the editor runs the compiler.  (Jake)
+
+335. **Hover on a name a pattern binds labels it a binding** - a match arm
+     `Ready` that binds the matched value hovers as `binding Ready: i64`, at
+     the arm and at every use - not as a `const`.  (Jake)
+
+336. **The editor's workspace symbol search may match the typed query
+     against declaration names.**  It is a text search the user asked for,
+     not name resolution: nothing it finds is used as a binding, so it is
+     not a door and breaks no rule above.  (Jake)
+
+337. **Find-references builds its index of uses per request,** with no
+     cache, until a measurement on the compiler project shows that it needs
+     one.  (Jake)
+
+338. **Work on a branch does not run or wait on CI;** the local gates are
+     its proof, and CI is watched on `main` only.  (Jake)
+
+339. **The editor's completion goes only through the compiler's lookups.**
+     The typed prefix is not matched as text against module names; the
+     text search ruling 336 allows stays limited to workspace symbol
+     search.  So `import Probe::` with `Probe` only a prefix of real
+     modules offers nothing, until the module graph can list a module
+     path's children by identity through a door.  (Jake)
+
+340. **The compiler fields `ASTNode.generated` and
+     `BuildOptions.yield_hook` keep their names.**  (Jake)
+
+341. **The names inside an import's braces get their positions and the
+     definitions they name before the editor's rename is built,** so a
+     rename reaches every import of what it renames.  (Jake)
+
+342. **The suggestion for a module that is already imported reads
+     "`Probe::A` is already imported; write `A::Item`"** and is not applied
+     automatically.  (Jake)
+
+343. **The language server's `serverInfo.version` from the build stamp
+     stays on the roadmap;** it needs a matching change in the VS Code
+     extension.  (Jake)
+
+344. **Signature help reads the typed text only for its structure** - which
+     call the cursor is in, and which argument.  It resolves the callee
+     through the compiler's doors in the scope at the cursor, as completion
+     resolves a path, and takes the signature from the callee's identity;
+     it never matches the callee's text against names.  It shows every
+     overload and highlights the one that fits the argument count so far.
+     (Jake)
+
+345. **Ruling 329 is amended: the editor analyses the standard library
+     once per server process** and reuses it as a frozen base layer, and in
+     the editor's mode the passes the editor does not need are skipped.
+     Whole-module reuse between saves stays on the roadmap, folded into the
+     intermediate representation work with stable identities.  (Jake)
+
+346. **The editor's text prints names relative to the cursor's scope, by
+     identity, and leaves out defaulted type arguments.**  Hover, signature
+     help, completion details and inlay hints write each definition and
+     type in the shortest form that names the same identity from the
+     cursor, decided through the doors and compared by identity, never by
+     trimming text; a short name that would name something else there, or
+     nothing, keeps enough of its path.  A type argument equal to the
+     default its template declares is left out.  The expanded hover keeps
+     every path in full.  (Dispatch, delegated, at Jake's request)
 
 ### 2026-10-13
 
@@ -245,6 +319,43 @@ yet is recorded with the change that builds it, not here.
 
 322. **A compiler flag that stops a build at object files,** so cross-check
      can run on a Linux host, goes on the roadmap; it is not built now.
+     (Jake)
+
+323. **The release smoke test stays wine-only for now;** a test of the
+     Windows zip on a real Windows host is added before the first tagged
+     release.  (Jake)
+
+324. **The editor's behavioural harness grows with each step of its
+     rewrite,** and each step's commit shows the previous server failing
+     the checks it adds.  (Jake)
+
+325. **The editor's new lookups by identity are named
+     `DefTable::span_of`, `DeclarationIndex::declaration_of`,
+     `Resolver::scope_at` and `Resolver::visible_bindings`.**  (Jake)
+
+326. **The index of every use of a definition lives in the editor,** built
+     from the stamps the name layer writes.  (Jake)
+
+327. **An `ImportDeclNode` records the module its import resolved to.**
+     (Jake)
+
+328. **A qualified type name's span covers its whole path,** and every
+     negative test whose annotated columns move is re-annotated.  (Jake)
+
+329. **In the editor's first release, module caching is a design only:**
+     each save analyses the whole project, and a hook in the compiler lets
+     the editor answer from its last analysis while a long one runs.
+     (Jake)
+
+330. **The editor gets parsing that continues past an error only after its
+     first release,** and only if the last good analysis proves not to be
+     enough.  (Jake)
+
+331. **A file outside any project is analysed as its own entry point.**
+     (Jake)
+
+332. **The suggestion to import a module that is already imported stops
+     being machine-applicable,** and suggests the qualified name instead.
      (Jake)
 
 ### 2026-10-12

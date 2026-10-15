@@ -1,32 +1,20 @@
-///! Semantic-tokens handler (LSP section 3.6.27 - `textDocument/semanticTokens/full`).
+///! Semantic tokens (`textDocument/semanticTokens/full`).
 ///!
-///! Walks the override-file's AST and emits one `SemanticToken` per
-///! identifier-bearing span, classified by what the AST says the name
-///! actually IS - function, method, type, parameter, field, etc. - not
-///! by lexer token kind.  This is what fixes the "`from` colors as a
-///! keyword inside `static from(...)`" bug: even though the lexer sees
-///! `KwFrom`, the AST sees a `MethodNode` whose `name_span` covers those
-///! bytes, so the handler emits a `method` token there and the VS Code
-///! renderer applies it on top of the TextMate keyword color.
+///! Every name written in the document is coloured by what it names: the
+///! uses index (`uses`) holds each one with the identity its stamp gives - a
+///! module, a type of some kind, a function or method, a global, a local or
+///! parameter, a type parameter, a field, a variant - and whether it is the
+///! declaration.  A node the compiler wrote (an f-string's lowering, a
+///! closure struct) is not in the index, so nothing paints over the source
+///! it stands for; a method's receiver and `this` are left to the grammar's
+///! keyword colour.  Beside the names, the segments of an import's or a
+///! namespace's path are namespaces, and an inline assembly block's text is
+///! coloured by a small assembly lexer.
 ///!
-///! Order of operations:
-///!   1. Resolve URI -> session -> CompilationContext -> ProgramNode.
-///!   2. Walk the program's top-level statements; for each declaration
-///!      or expression that owns an identifier span, emit a
-///!      `SemanticToken` into the collector.
-///!   3. Sort the collector by (line, char) - token emission order
-///!      across the walk isn't guaranteed to be in source order.
-///!   4. Encode as the LSP delta-line wire format.
-///!
-///! Spans coming back from the compiler are 1-based; LSP wants 0-based.
-///! The conversion happens inside `SemanticTokenizer::emit_span()`.  We
-///! also clamp the length to the maximum that fits on the start line so a
-///! multi-line span (rare for identifiers, but possible for ill-formed
-///! AST) doesn't produce a delta that runs past the line boundary.
-///!
-///! All per-request tokenizer state lives on the `SemanticTokenizer`
-///! struct (built once per call), not in module globals - the handler is
-///! therefore re-entrant and carries no cross-request state.
+///! Spans are positions in the text the analysis read: each token is
+///! measured there and carried to the buffer's line, and a line edited since
+///! the analysis gets none.  Tokens are sorted and overlapping ones dropped
+///! before the wire encoding.
 
 namespace lsp::handlers::semantic_tokens;
 
@@ -40,106 +28,69 @@ import std::collections::array;
 import std::collections::array::{ Array };
 import std::json::value;
 
-import compiler::compilation_context;
-import compiler::ast;
-import compiler::ast::node;
-import compiler::ast::expression;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::ast::{ NodeKind };
+import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::statement;
-import compiler::ast::declaration;
-import compiler::ast::pattern;
+import compiler::ast::statement::{ DeclStmtNode };
+import compiler::ast::declaration::{ ImportDeclNode, MethodNode, ModuleDeclNode, VarDeclNode };
 import compiler::diag::source_span;
-import compiler::module_graph;
-import compiler::resolver::symbol_str;
-import compiler::resolver::intern_table;
+import compiler::resolver::res::{ DefId, DefKind };
+import compiler::resolver::symbol::{ Symbol, SymbolKind };
 
+import lsp::handlers::identity::{ Target };
+import lsp::handlers::uses::{ Use, Uses };
 import lsp::server::docs;
 import lsp::server::session;
 import lsp::server::line_index;
 import lsp::protocol::semantic_tokens;
 import lsp::protocol::semantic_tokens::{ SemanticToken };
 import lsp::protocol::conv;
-import std::ffi::libc;
 
 
-// SemanticTokenizer - per-request tokenizer state + AST walk
-//
-// One instance is built per `handle_semantic_tokens` call and owns:
-//
-//   - The four interned receiver-name symbols (`this`, `&this`,
-//     `mut &this`, `&mut this`).  Receiver parameters and the bare `this`
-//     expression land in the AST as VarDeclNodes / IdentifierNodes whose
-//     name is the literal source lexeme (parser.cryo:1138).  Emitting a
-//     `parameter` / `variable` token there overlays the wrong colour onto
-//     the `this` keyword.  Interning once and comparing SymbolStr equality
-//     is O(1) per check; a string compare every time would be measurably
-//     slower on large stdlib files.
-//
-//   - `intern`: the current request's InternTable, used to resolve
-//     SymbolStr -> string for sub-span work (e.g. the field-name sub-span
-//     inside a struct literal's `name: value` span, stored by the AST as a
-//     single span).
-//
-//   - `line_index` / `doc_text` / `doc_text_length`: the live editor
-//     buffer.  The compiler may hold a STALE parse (recompile lags fast
-//     keystrokes, or the parse failed and spans point past the buffer's
-//     end); `emit_span` validates every span against this index and drops
-//     the ones that don't fit.  `doc_text` also drives the TAB-EXPANDED ->
-//     BYTE column translation (the lexer advances columns to the next
-//     multiple of 4 on a tab, so a tab-indented identifier reports a
-//     visual-cell column the LSP wire format doesn't want).
-//
-//   - `doc_file`: the absolute path of the file we're emitting tokens for.
-//     The monomorphization pass APPENDS specialized AST nodes (many from
-//     stdlib templates) onto the current file's ProgramNode, carrying the
-//     TEMPLATE's span.  `emit_span` drops every span whose file doesn't
-//     match this path, so those injected nodes don't paint at unrelated
-//     coordinates in the open buffer.
-//
-//   - `tokens`: the collector the walk pushes into.
-
+/// One request's tokens, and what they are measured against: the text the
+/// analysis read for the document (`line_index`, `doc_text`), carried to
+/// the buffer's lines through `doc`.
 type struct SemanticTokenizer {
-    sym_this:         symbol_str::SymbolStr;
-    sym_amp_this:     symbol_str::SymbolStr;
-    sym_mut_this:     symbol_str::SymbolStr;
-    sym_amp_mut_this: symbol_str::SymbolStr;
-    intern:           intern_table::InternTable*;
+    ctx:              CompilationContext*;
     line_index:       line_index::LineIndex*;
     doc_text:         string;
     doc_text_length:  u64;
     doc_file:         string;
+    /// Wire columns count bytes rather than UTF-16 code units.
+    utf8:             boolean;
+    /// The open document, which carries a line of the analysed text to the
+    /// buffer's line; null when the document is not open.
+    doc:              docs::Document*;
     tokens:           Array<SemanticToken>;
 
-    /// Build a tokenizer for one request.  Pre-interns the receiver-name
-    /// strings (O(1) skip checks during the walk) and picks up the live
-    /// editor buffer's line index + text for span validation.  Repopulated
-    /// each request because the InternTable is per-CompilationContext and a
-    /// recompile recreates it.
-    static new(intern: intern_table::InternTable*, docs: &docs::Docs, uri: str::Str,
+    static new(ctx: CompilationContext*, docs: &docs::Docs, uri: str::Str,
                doc_file: string) -> SemanticTokenizer {
         mut t: SemanticTokenizer = SemanticTokenizer {
-            sym_this:         symbol_str::SymbolStr::empty(),
-            sym_amp_this:     symbol_str::SymbolStr::empty(),
-            sym_mut_this:     symbol_str::SymbolStr::empty(),
-            sym_amp_mut_this: symbol_str::SymbolStr::empty(),
-            intern:           intern,
+            ctx:              ctx,
             line_index:       null,
             doc_text:         "",
             doc_text_length:  0 as u64,
             doc_file:         doc_file,
+            utf8:             docs.utf8,
+            doc:              null,
             tokens:           Array::<SemanticToken>::new(),
         };
-        if (intern != null) {
-            t.sym_this         = intern.intern("this");
-            t.sym_amp_this     = intern.intern("&this");
-            t.sym_mut_this     = intern.intern("mut &this");
-            t.sym_amp_mut_this = intern.intern("&mut this");
-        }
+        // Spans are positions in the text the analysis read: measure them
+        // there, and carry each token's line to the buffer (`doc`).
         match (docs.get(uri)) {
             Option::Some(doc) => {
                 if (doc != null) {
-                    t.line_index      = &doc.line_index;
-                    t.doc_text        = doc.text.as_ptr() as string;
-                    t.doc_text_length = doc.text.length();
+                    t.doc = doc;
+                    if (doc.has_snap) {
+                        t.line_index      = &doc.snap_index;
+                        t.doc_text        = doc.snap_text.as_ptr() as string;
+                        t.doc_text_length = doc.snap_text.length();
+                    } else {
+                        t.line_index      = &doc.line_index;
+                        t.doc_text        = doc.text.as_ptr() as string;
+                        t.doc_text_length = doc.text.length();
+                    }
                 }
             }
             Option::None => { }
@@ -148,841 +99,122 @@ type struct SemanticTokenizer {
     }
 
 
-    // Walker - recurses through declarations + statements + expressions
+    // What is written in module `m`
 
-    walk_program(mut &this, prog: node::ProgramNode*) -> void {
-        if (prog == null) { return; }
-        for (mut i: i64 = 0; i < prog.statements.length; i++) {
-            this.st_walk_node(prog.statements[i]);
-        }
-    }
-
-    st_walk_node(mut &this, node: node::ASTNode*) -> void {
-        if (node == null) { return; }
-
-        // Declarations
-        if (node.kind == ast::NodeKind::FunctionDeclaration) {
-            this.walk_function_decl(node as declaration::FunctionDeclNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::MethodDeclaration) {
-            this.walk_method_decl(node as declaration::MethodNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::StructDeclaration) {
-            this.walk_struct_decl(node as declaration::StructDeclNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::ClassDeclaration) {
-            this.walk_class_decl(node as declaration::ClassDeclNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::EnumDeclaration) {
-            this.walk_enum_decl(node as declaration::EnumDeclNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::TraitDeclaration) {
-            this.walk_trait_decl(node as declaration::TraitDeclNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::TypeAliasDeclaration) {
-            this.walk_typealias_decl(node as declaration::TypeAliasDeclNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::ImplementationBlock) {
-            this.walk_impl_block(node as declaration::ImplBlockNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::ExternBlock) {
-            this.walk_extern_block(node as declaration::ExternBlockNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::VariableDeclaration) {
-            this.walk_var_decl(node as declaration::VarDeclNode*, false);
-            return;
-        }
-        if (node.kind == ast::NodeKind::FieldDeclaration) {
-            this.walk_field_decl(node as declaration::FieldDeclNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::EnumVariant) {
-            this.walk_enum_variant(node as declaration::EnumVariantNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::ImportDeclaration) {
-            this.walk_import_decl(node as declaration::ImportDeclNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::ModuleDeclaration) {
-            this.walk_module_decl(node as declaration::ModuleDeclNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::DeclarationStatement) {
-            const ds: statement::DeclStmtNode* = node as statement::DeclStmtNode*;
-            this.st_walk_node(ds.declaration as node::ASTNode*);
-            return;
-        }
-
-        // Statements
-        if (node.kind == ast::NodeKind::BlockStatement) {
-            const blk: statement::BlockStmtNode* = node as statement::BlockStmtNode*;
-            for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                this.st_walk_node(blk.statements[i] as node::ASTNode*);
+    colour(mut &this, m: i64) -> void {
+        const w: Uses = Uses::scan(this.ctx, m);
+        for (mut i: i64 = 0; i < w.out.length; i++) { this.use_token(&w.out[i]); }
+        const program: ProgramNode* = this.ctx.module_graph.get_module_ast(m as u32);
+        if (program != null) {
+            for (mut i: i64 = 0; i < program.statements.length; i++) {
+                this.path_segments(program.statements[i]);
             }
-            return;
         }
-        if (node.kind == ast::NodeKind::UnsafeBlockStatement) {
-            const us: statement::UnsafeBlockStmtNode* = node as statement::UnsafeBlockStmtNode*;
-            this.st_walk_node(us.block as node::ASTNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::AsmBlockStatement) {
-            this.walk_asm_block(node as statement::AsmBlockStmtNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::ReturnStatement) {
-            const rs: statement::ReturnStmtNode* = node as statement::ReturnStmtNode*;
-            this.walk_expr(rs.expression);
-            return;
-        }
-        if (node.kind == ast::NodeKind::IfStatement) {
-            const is: statement::IfStmtNode* = node as statement::IfStmtNode*;
-            this.walk_expr(is.condition);
-            this.st_walk_node(is.then_stmt as node::ASTNode*);
-            this.st_walk_node(is.else_stmt as node::ASTNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::WhileStatement) {
-            const ws: statement::WhileStmtNode* = node as statement::WhileStmtNode*;
-            this.walk_expr(ws.condition);
-            this.st_walk_node(ws.body as node::ASTNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::DoWhileStatement) {
-            const ds: statement::DoWhileStmtNode* = node as statement::DoWhileStmtNode*;
-            this.st_walk_node(ds.body as node::ASTNode*);
-            this.walk_expr(ds.condition);
-            return;
-        }
-        if (node.kind == ast::NodeKind::ForStatement) {
-            const fs: statement::ForStmtNode* = node as statement::ForStmtNode*;
-            this.st_walk_node(fs.init);
-            this.walk_expr(fs.condition);
-            this.walk_expr(fs.update);
-            this.st_walk_node(fs.body as node::ASTNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::LoopStatement) {
-            const ls: statement::LoopStmtNode* = node as statement::LoopStmtNode*;
-            this.st_walk_node(ls.body as node::ASTNode*);
-            return;
-        }
-        if (node.kind == ast::NodeKind::MatchStatement) {
-            const ms: statement::MatchStmtNode* = node as statement::MatchStmtNode*;
-            this.walk_expr(ms.subject);
-            for (mut i: i64 = 0; i < ms.arms.length; i++) {
-                this.walk_match_arm(ms.arms[i]);
-            }
-            return;
-        }
-        if (node.kind == ast::NodeKind::ExpressionStatement) {
-            const es: statement::ExprStmtNode* = node as statement::ExprStmtNode*;
-            this.walk_expr(es.expression);
-            return;
-        }
-
-        // Expressions reaching the top-level walker (rare - usually they
-        // come in via walk_expr from a containing statement).  Forward to
-        // the expression walker.
-        this.walk_expr(node as expression::ExpressionNode*);
+        for (mut i: i64 = 0; i < w.asm.length; i++) { this.asm_body(w.asm[i]); }
     }
 
-
-    // Declaration walkers
-
-    walk_function_decl(mut &this, f: declaration::FunctionDeclNode*) -> void {
-        if (f == null) { return; }
-        if (f.has_name_span()) {
-            this.emit_span(f.name_span, lsp::protocol::semantic_tokens::TYPE_FUNCTION,
-                           lsp::protocol::semantic_tokens::MOD_DECLARATION);
-        }
-        // Parameters
-        for (mut i: i64 = 0; i < f.parameters.length; i++) {
-            this.walk_var_decl(f.parameters[i], true);
-        }
-        // Return-type annotation
-        this.walk_type_annotation(f.return_type_annotation);
-        // Body
-        this.st_walk_node(f.body as node::ASTNode*);
-    }
-
-    walk_method_decl(mut &this, m: declaration::MethodNode*) -> void {
-        if (m == null || m.func == null) { return; }
-        const f: declaration::FunctionDeclNode* = m.func;
-        if (f.has_name_span()) {
-            // The method name span - this is where `from` / `new` / `delete`
-            // are coloured `method` instead of `keyword`, because we know
-            // contextually that this token site IS a method declaration.
-            const mods: u32 = if (m.is_static) {
-                lsp::protocol::semantic_tokens::MOD_DECLARATION
-                    | lsp::protocol::semantic_tokens::MOD_STATIC
-            } else {
-                lsp::protocol::semantic_tokens::MOD_DECLARATION
-            };
-            this.emit_span(f.name_span,
-                           lsp::protocol::semantic_tokens::TYPE_METHOD, mods);
-        }
-        for (mut i: i64 = 0; i < f.parameters.length; i++) {
-            this.walk_var_decl(f.parameters[i], true);
-        }
-        this.walk_type_annotation(f.return_type_annotation);
-        this.st_walk_node(f.body as node::ASTNode*);
-    }
-
-    /// True when `name` resolves to a compiler-synthesized closure struct
-    /// (`<ns>::__Closure_<N>`, minted by sema::synthesize_closure_struct).  Sema
-    /// appends these to the ProgramNode so later passes see them, but they are NOT
-    /// user source: every synthesized node (the capture fields and the `__call__`
-    /// method whose body holds `this.<capture>` accesses + the inlined lambda body)
-    /// carries the originating lambda's span.  Walking them emits semantic tokens
-    /// across the whole `move (...) -> ... { ... }` expression, and dedup_overlapping
-    /// then drops the real narrow tokens in favour of that wide one - flooding the
-    /// line with a single colour.  Skip the subtree entirely.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    is_synthesized_closure_name(&this, name: symbol_str::SymbolStr) -> boolean {
-        if (this.intern == null || !name.is_valid()) { return false; }
-        const hay: string = this.intern.resolve(name);
-        if (hay == null) { return false; }
-        const needle: string = "__Closure";
-        const nlen: u64 = libc::strlen(needle);
-        const hlen: u64 = libc::strlen(hay);
-        if (hlen < nlen) { return false; }
-        mut i: u64 = 0;
-        while (i + nlen <= hlen) {
-            mut j: u64 = 0;
-            while (j < nlen && hay[(i + j) as i64] == needle[j as i64]) { j = j + 1; }
-            if (j == nlen) { return true; }
-            i = i + 1;
-        }
-        return false;
-    }
-
-    walk_struct_decl(mut &this, s: declaration::StructDeclNode*) -> void {
-        if (s == null) { return; }
-        // Compiler-synthesized closure structs aren't user source; their nodes
-        // carry the lambda's span and would flood the line (see helper above).
-        if (this.is_synthesized_closure_name(s.name)) { return; }
-        if (s.has_name_span()) {
-            this.emit_span(s.name_span, lsp::protocol::semantic_tokens::TYPE_STRUCT,
-                           lsp::protocol::semantic_tokens::MOD_DECLARATION);
-        }
-        for (mut i: i64 = 0; i < s.fields.length; i++) {
-            this.walk_field_decl(s.fields[i]);
-        }
-        for (mut i: i64 = 0; i < s.methods.length; i++) {
-            this.walk_method_decl(s.methods[i]);
-        }
-    }
-
-    walk_class_decl(mut &this, c: declaration::ClassDeclNode*) -> void {
-        if (c == null) { return; }
-        if (c.has_name_span()) {
-            this.emit_span(c.name_span, lsp::protocol::semantic_tokens::TYPE_CLASS,
-                           lsp::protocol::semantic_tokens::MOD_DECLARATION);
-        }
-        for (mut i: i64 = 0; i < c.fields.length; i++) {
-            this.walk_field_decl(c.fields[i]);
-        }
-        for (mut i: i64 = 0; i < c.methods.length; i++) {
-            this.walk_method_decl(c.methods[i]);
-        }
-    }
-
-    walk_enum_decl(mut &this, e: declaration::EnumDeclNode*) -> void {
-        if (e == null) { return; }
-        if (e.has_name_span()) {
-            this.emit_span(e.name_span, lsp::protocol::semantic_tokens::TYPE_ENUM,
-                           lsp::protocol::semantic_tokens::MOD_DECLARATION);
-        }
-        for (mut i: i64 = 0; i < e.variants.length; i++) {
-            this.walk_enum_variant(e.variants[i]);
-        }
-    }
-
-    walk_trait_decl(mut &this, t: declaration::TraitDeclNode*) -> void {
-        if (t == null) { return; }
-        if (t.has_name_span()) {
-            this.emit_span(t.name_span, lsp::protocol::semantic_tokens::TYPE_INTERFACE,
-                           lsp::protocol::semantic_tokens::MOD_DECLARATION);
-        }
-        for (mut i: i64 = 0; i < t.methods.length; i++) {
-            // Trait methods are FunctionDeclNode in the AST but represent
-            // methods semantically - colour them as methods.
-            const fn: declaration::FunctionDeclNode* = t.methods[i];
-            if (fn != null && fn.has_name_span()) {
-                this.emit_span(fn.name_span,
-                               lsp::protocol::semantic_tokens::TYPE_METHOD,
-                               lsp::protocol::semantic_tokens::MOD_DECLARATION);
-            }
-            if (fn != null) {
-                for (mut j: i64 = 0; j < fn.parameters.length; j++) {
-                    this.walk_var_decl(fn.parameters[j], true);
+    /// A name, coloured by what it names.
+    use_token(mut &this, u: &Use) -> void {
+        if (u.receiver) { return; }
+        const decl: u32 = if (u.decl) {
+            lsp::protocol::semantic_tokens::MOD_DECLARATION
+        } else {
+            lsp::protocol::semantic_tokens::MOD_NONE
+        };
+        match (&u.target) {
+            Target::Def(d) => { this.def_token(u.span, d, decl); }
+            Target::Local(s) => {
+                const sym: Symbol = this.ctx.resolver.get_symbol(s);
+                if (sym.kind == SymbolKind::Parameter) {
+                    this.emit_span(u.span, lsp::protocol::semantic_tokens::TYPE_PARAMETER, decl);
+                    return;
                 }
-                this.walk_type_annotation(fn.return_type_annotation);
-                this.st_walk_node(fn.body as node::ASTNode*);
-            }
-        }
-    }
-
-    walk_typealias_decl(mut &this, t: declaration::TypeAliasDeclNode*) -> void {
-        if (t == null) { return; }
-        if (t.has_name_span()) {
-            this.emit_span(t.name_span, lsp::protocol::semantic_tokens::TYPE_TYPE,
-                           lsp::protocol::semantic_tokens::MOD_DECLARATION);
-        }
-        this.walk_type_annotation(t.target_annotation);
-    }
-
-    walk_impl_block(mut &this, b: declaration::ImplBlockNode*) -> void {
-        if (b == null) { return; }
-        if (b.target_type_span.has_location()) {
-            this.emit_span(b.target_type_span,
-                           lsp::protocol::semantic_tokens::TYPE_TYPE,
-                           lsp::protocol::semantic_tokens::MOD_NONE);
-        }
-        this.walk_type_annotation(b.trait_annotation);
-        for (mut i: i64 = 0; i < b.methods.length; i++) {
-            this.walk_method_decl(b.methods[i]);
-        }
-    }
-
-    /// `import std::core::default;` - emit a `namespace` token over each
-    /// path segment.  Without this the segments carry NO semantic token and
-    /// fall through to the TextMate grammar, which colours keyword-lexemes
-    /// (`default`, `type`, `from`, ...) used as module names with the keyword
-    /// colour.  The parser records each segment's exact span in
-    /// `path_segment_spans` (same data the hover handler dispatches on), so we
-    /// paint them all as `namespace`.  Specific-import names (`{X, Y}`) and the
-    /// `as Alias` identifier have no per-name span on the node, so they're left
-    /// to the TextMate grammar (their lexemes are user identifiers / types, not
-    /// keywords, so no mis-colouring results).
-    walk_import_decl(mut &this, imp: declaration::ImportDeclNode*) -> void {
-        if (imp == null) { return; }
-        for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
-            const sp: source_span::SourceSpan = imp.path_segment_spans[i];
-            if (sp.has_location()) {
-                this.emit_span(sp,
-                               lsp::protocol::semantic_tokens::TYPE_NAMESPACE,
-                               lsp::protocol::semantic_tokens::MOD_NONE);
-            }
-        }
-    }
-
-    /// `namespace X::Y::default;` / `public module A::B;` - same segment-level
-    /// `namespace` overlay as `walk_import_decl`, so a keyword-lexeme segment in
-    /// a namespace/module declaration doesn't render as a keyword.
-    walk_module_decl(mut &this, m: declaration::ModuleDeclNode*) -> void {
-        if (m == null) { return; }
-        for (mut i: i64 = 0; i < m.path_segment_spans.length; i++) {
-            const sp: source_span::SourceSpan = m.path_segment_spans[i];
-            if (sp.has_location()) {
-                this.emit_span(sp,
-                               lsp::protocol::semantic_tokens::TYPE_NAMESPACE,
-                               lsp::protocol::semantic_tokens::MOD_NONE);
-            }
-        }
-    }
-
-    walk_extern_block(mut &this, e: declaration::ExternBlockNode*) -> void {
-        if (e == null) { return; }
-        for (mut i: i64 = 0; i < e.functions.length; i++) {
-            this.walk_function_decl(e.functions[i]);
-        }
-    }
-
-    walk_var_decl(mut &this, v: declaration::VarDeclNode*, is_parameter: boolean) -> void {
-        if (v == null) { return; }
-        const is_receiver: boolean = this.is_receiver_name(v.name);
-        // Receiver parameters (`&this`, `mut &this`, `this`, ...) keep the
-        // literal source bytes as the parameter name.  Don't emit a
-        // `parameter` semantic token for them - the underlying TextMate
-        // grammar already renders `this` as a keyword, and our overlay
-        // would replace that with the parameter colour.
-        if (v.has_name_span() && !is_receiver) {
-            const type_id: u32 = if (is_parameter) {
-                lsp::protocol::semantic_tokens::TYPE_PARAMETER
-            } else {
-                lsp::protocol::semantic_tokens::TYPE_VARIABLE
-            };
-            this.emit_span(v.name_span, type_id,
-                           lsp::protocol::semantic_tokens::MOD_DECLARATION);
-        }
-        // For receivers, also skip the type annotation: the parser
-        // synthesises a `Reference(Named(<EnclosingType>))` annotation
-        // whose Named.span covers the WHOLE `mut &this` source lexeme
-        // (parser.cryo:670-687).  Walking it emits a `type` semantic token
-        // across the entire `&this` / `mut &this`, overlaying the `this`
-        // keyword with the type colour.  The source has no user-written
-        // type annotation here anyway, so there's nothing to highlight.
-        if (!is_receiver) {
-            this.walk_type_annotation(v.type_annotation);
-        }
-        this.walk_expr(v.initializer);
-    }
-
-    /// True when `name` matches one of the receiver-parameter forms the
-    /// parser stamps for the implicit-self argument:
-    /// `this`, `&this`, `mut &this`, `&mut this`.  Symbol comparison is
-    /// O(1) because the SymbolStrs were pre-interned in the constructor.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    is_receiver_name(&this, name: symbol_str::SymbolStr) -> boolean {
-        if (!name.is_valid()) { return false; }
-        if (this.sym_this.is_valid()         && name.equals(this.sym_this))         { return true; }
-        if (this.sym_amp_this.is_valid()     && name.equals(this.sym_amp_this))     { return true; }
-        if (this.sym_mut_this.is_valid()     && name.equals(this.sym_mut_this))     { return true; }
-        if (this.sym_amp_mut_this.is_valid() && name.equals(this.sym_amp_mut_this)) { return true; }
-        return false;
-    }
-
-    walk_field_decl(mut &this, f: declaration::FieldDeclNode*) -> void {
-        if (f == null) { return; }
-        if (f.has_name_span()) {
-            this.emit_span(f.name_span, lsp::protocol::semantic_tokens::TYPE_PROPERTY,
-                           lsp::protocol::semantic_tokens::MOD_DECLARATION);
-        }
-        this.walk_field_type_annotation(f);
-        this.walk_expr(f.default_value);
-    }
-
-    walk_field_type_annotation(mut &this, f: declaration::FieldDeclNode*) -> void {
-        // FieldDeclNode owns a `type_annotation: TypeAnnotation*`; walk it
-        // via the shared TypeAnnotation walker so generic args inside the
-        // annotation also receive type tokens.
-        this.walk_type_annotation(f.type_annotation);
-    }
-
-    walk_enum_variant(mut &this, v: declaration::EnumVariantNode*) -> void {
-        if (v == null) { return; }
-        if (v.has_name_span()) {
-            this.emit_span(v.name_span,
-                           lsp::protocol::semantic_tokens::TYPE_ENUM_MEMBER,
-                           lsp::protocol::semantic_tokens::MOD_DECLARATION);
-        }
-        for (mut i: i64 = 0; i < v.associated_types.length; i++) {
-            this.walk_type_annotation(v.associated_types[i]);
-        }
-    }
-
-
-    // Expression walker
-
-    walk_expr(mut &this, e: expression::ExpressionNode*) -> void {
-        if (e == null) { return; }
-
-        if (e.kind == ast::NodeKind::Identifier) {
-            const id: expression::IdentifierNode* = e as expression::IdentifierNode*;
-            // `this` in expression position is parsed as an IdentifierNode
-            // (expr_parser.cryo:317) with name "this".  Skip the
-            // `variable` overlay so the TextMate grammar's keyword colour
-            // stands.  Same check covers the rare `&this` / `mut &this`
-            // forms that surface as identifiers.
-            if (!this.is_receiver_name(id.name)) {
-                this.emit_span(id.span,
-                               lsp::protocol::semantic_tokens::TYPE_VARIABLE,
-                               lsp::protocol::semantic_tokens::MOD_NONE);
-            }
-            return;
-        }
-        if (e.kind == ast::NodeKind::BinaryExpression) {
-            const b: expression::BinaryExprNode* = e as expression::BinaryExprNode*;
-            this.walk_expr(b.left);
-            this.walk_expr(b.right);
-            return;
-        }
-        if (e.kind == ast::NodeKind::UnaryExpression) {
-            const u: expression::UnaryExprNode* = e as expression::UnaryExprNode*;
-            this.walk_expr(u.operand);
-            return;
-        }
-        if (e.kind == ast::NodeKind::TernaryExpression) {
-            const t: expression::TernaryExprNode* = e as expression::TernaryExprNode*;
-            this.walk_expr(t.condition);
-            this.walk_expr(t.true_expr);
-            this.walk_expr(t.false_expr);
-            return;
-        }
-        if (e.kind == ast::NodeKind::IfExpression) {
-            const ie: expression::IfExprNode* = e as expression::IfExprNode*;
-            this.walk_expr(ie.condition);
-            this.walk_expr(ie.then_expr);
-            this.walk_expr(ie.else_expr);
-            return;
-        }
-        if (e.kind == ast::NodeKind::MatchExpression) {
-            const me: expression::MatchExprNode* = e as expression::MatchExprNode*;
-            this.walk_expr(me.subject);
-            for (mut i: i64 = 0; i < me.arms.length; i++) {
-                this.walk_match_arm(me.arms[i]);
-            }
-            return;
-        }
-        if (e.kind == ast::NodeKind::CallExpression) {
-            this.walk_call_expr(e as expression::CallExprNode*);
-            return;
-        }
-        if (e.kind == ast::NodeKind::NewExpression) {
-            this.walk_new_expr(e as expression::NewExprNode*);
-            return;
-        }
-        if (e.kind == ast::NodeKind::CastExpression) {
-            // `expr as Type` - walk the operand and paint the target type
-            // name.  Without this the operand's identifiers get no semantic
-            // token and fall back to the TextMate grammar.
-            const ce: expression::CastExprNode* = e as expression::CastExprNode*;
-            this.walk_expr(ce.expression);
-            this.walk_type_annotation(ce.target_annotation);
-            return;
-        }
-        if (e.kind == ast::NodeKind::TryExpression) {
-            // `expr?` - descend into the operand.  Missing this branch left
-            // every identifier under a `?` (e.g. the `INITIAL_BUCKETS` arg in
-            // `this.resize_buckets(INITIAL_BUCKETS)?`) with no semantic token,
-            // so the TextMate grammar's uppercase-as-type rule mis-painted
-            // constants green.
-            const te: expression::TryExprNode* = e as expression::TryExprNode*;
-            this.walk_expr(te.operand);
-            return;
-        }
-        if (e.kind == ast::NodeKind::AwaitExpression) {
-            const ae: expression::AwaitExprNode* = e as expression::AwaitExprNode*;
-            this.walk_expr(ae.operand);
-            return;
-        }
-        if (e.kind == ast::NodeKind::YieldExpression) {
-            const ye: expression::YieldExprNode* = e as expression::YieldExprNode*;
-            this.walk_expr(ye.operand);
-            return;
-        }
-        if (e.kind == ast::NodeKind::StructLiteral) {
-            this.walk_struct_literal(e as expression::StructLiteralNode*);
-            return;
-        }
-        if (e.kind == ast::NodeKind::ArrayLiteral) {
-            const a: expression::ArrayLiteralNode* = e as expression::ArrayLiteralNode*;
-            for (mut i: i64 = 0; i < a.elements.length; i++) {
-                this.walk_expr(a.elements[i]);
-            }
-            this.walk_expr(a.repeat_count_expr);
-            return;
-        }
-        if (e.kind == ast::NodeKind::TupleLiteral) {
-            const t: expression::TupleLiteralNode* = e as expression::TupleLiteralNode*;
-            for (mut i: i64 = 0; i < t.elements.length; i++) {
-                this.walk_expr(t.elements[i]);
-            }
-            return;
-        }
-        if (e.kind == ast::NodeKind::LambdaExpression) {
-            const l: expression::LambdaExprNode* = e as expression::LambdaExprNode*;
-            for (mut i: i64 = 0; i < l.parameters.length; i++) {
-                this.walk_var_decl(l.parameters[i], true);
-            }
-            this.walk_type_annotation(l.return_type_ann);
-            this.st_walk_node(l.body as node::ASTNode*);
-            return;
-        }
-        if (e.kind == ast::NodeKind::ArrayAccess) {
-            const aa: expression::ArrayAccessNode* = e as expression::ArrayAccessNode*;
-            this.walk_expr(aa.array);
-            this.walk_expr(aa.index);
-            return;
-        }
-        if (e.kind == ast::NodeKind::MemberAccess) {
-            this.walk_member_access(e as expression::MemberAccessNode*, false);
-            return;
-        }
-        if (e.kind == ast::NodeKind::ScopeResolution) {
-            this.walk_scope_resolution(e as expression::ScopeResolutionNode*, false);
-            return;
-        }
-        if (e.kind == ast::NodeKind::DeleteExpression) {
-            const de: expression::DeleteExprNode* = e as expression::DeleteExprNode*;
-            this.walk_expr(de.operand);
-            return;
-        }
-        // Literals, TypeofExpression, SizeofExpression, AlignofExpression,
-        // AwaitExpression, YieldExpression: nothing identifier-bearing for
-        // v1 to mark up here.  Future work: alignof/sizeof type names.
-    }
-
-    /// True when `c` is a call into the f-string desugar runtime
-    /// (`fmt_new` / `fmt_append_lit` / `fmt_append_display` / `fmt_append_debug`,
-    /// see std::fmt::interp).  The parser lowers `f"...{expr}..."` to a chain of
-    /// these at PARSE time, and every synthesized node carries the f-string
-    /// token's span; the hole sub-expressions are sub-parsed with spans relative
-    /// to the hole text.  Walking that subtree would paint `function` tokens
-    /// across the whole f-string and mis-place hole tokens.  We detect the
-    /// outermost call by callee name and skip the entire subtree, leaving the
-    /// f-string to the TextMate grammar's interpolation rule (which colours the
-    /// literal parts as a string and the `{...}` holes as embedded code).
-    is_fstring_runtime_call(&this, c: expression::CallExprNode*) -> boolean {
-        if (c == null || c.callee == null || this.intern == null) { return false; }
-        if (c.callee.kind != ast::NodeKind::Identifier) { return false; }
-        const id: expression::IdentifierNode* = c.callee as expression::IdentifierNode*;
-        if (!id.name.is_valid()) { return false; }
-        const name: string = this.intern.resolve(id.name);
-        if (name == null) { return false; }
-        return libc::strcmp(name, "fmt_new") == 0
-            || libc::strcmp(name, "fmt_append_lit") == 0
-            || libc::strcmp(name, "fmt_append_display") == 0
-            || libc::strcmp(name, "fmt_append_debug") == 0;
-    }
-
-    walk_call_expr(mut &this, c: expression::CallExprNode*) -> void {
-        if (c == null) { return; }
-        // f-string desugar: skip the whole subtree (see helper above).  The
-        // TextMate grammar handles f-string colouring.
-        if (this.is_fstring_runtime_call(c)) { return; }
-        // Compiler-synthesized implicit conversion: sema rewrites an
-        // initializer whose type needs conversion (e.g. a `string` literal
-        // assigned to a `String`) into a `String::from_string("...")` call
-        // whose synthetic callee inherits the ORIGINAL operand's span (see
-        // sema call_resolver `build_implicit_conversion`).  Overlaying that
-        // callee would paint the string literal like a function/method.
-        // Detect the shape - a single argument whose span exactly equals the
-        // callee's span - and skip the callee overlay, walking only the real
-        // argument so it keeps its own (string) colour.
-        if (SemanticTokenizer::is_synthetic_conversion(c)) {
-            for (mut i: i64 = 0; i < c.arguments.length; i++) {
-                this.walk_expr(c.arguments[i]);
-            }
-            return;
-        }
-        // Override the callee's classification: it's a callable, so the
-        // callee name should be `function` or `method`, not `variable` or
-        // `property`.
-        if (c.callee != null) {
-            if (c.callee.kind == ast::NodeKind::Identifier) {
-                const id: expression::IdentifierNode* = c.callee as expression::IdentifierNode*;
-                // Don't overlay `function` on a bare `this` call site -
-                // the AST shape `this(args)` is unusual but parses
-                // legally and would otherwise paint over the keyword.
-                if (!this.is_receiver_name(id.name)) {
-                    this.emit_span(id.span,
-                                   lsp::protocol::semantic_tokens::TYPE_FUNCTION,
-                                   lsp::protocol::semantic_tokens::MOD_NONE);
-                }
-            } else if (c.callee.kind == ast::NodeKind::MemberAccess) {
-                this.walk_member_access(c.callee as expression::MemberAccessNode*, true);
-            } else if (c.callee.kind == ast::NodeKind::ScopeResolution) {
-                this.walk_scope_resolution(c.callee as expression::ScopeResolutionNode*, true);
-            } else {
-                this.walk_expr(c.callee);
-            }
-        }
-        for (mut i: i64 = 0; i < c.arguments.length; i++) {
-            this.walk_expr(c.arguments[i]);
-        }
-        for (mut i: i64 = 0; i < c.generic_args.length; i++) {
-            this.walk_type_annotation(c.generic_args[i]);
-        }
-    }
-
-    walk_new_expr(mut &this, n: expression::NewExprNode*) -> void {
-        if (n == null) { return; }
-        // NewExprNode doesn't carry a separate span for the type name;
-        // the full `new TypeName(...)` span starts at `new`.  Skip
-        // type-name highlighting here for v1 - the TextMate grammar's
-        // `[A-Z][a-zA-Z0-9_]*` rule handles bare type names well.
-        for (mut i: i64 = 0; i < n.generic_args.length; i++) {
-            this.walk_type_annotation(n.generic_args[i]);
-        }
-        for (mut i: i64 = 0; i < n.arguments.length; i++) {
-            this.walk_expr(n.arguments[i]);
-        }
-        this.walk_expr(n.array_size);
-        if (n.struct_init != null) {
-            this.walk_struct_literal(n.struct_init);
-        }
-    }
-
-    walk_struct_literal(mut &this, s: expression::StructLiteralNode*) -> void {
-        if (s == null) { return; }
-        for (mut i: i64 = 0; i < s.generic_args.length; i++) {
-            this.walk_type_annotation(s.generic_args[i]);
-        }
-        for (mut i: i64 = 0; i < s.field_inits.length; i++) {
-            const fi: expression::FieldInit = s.field_inits[i];
-            // FieldInit's span covers the whole `name: value` source range.
-            // Emitting `property` over that range overlaps the value tokens
-            // (numbers, strings, etc.), and the LSP semantic-tokens client
-            // resolves overlaps by the first-claim winning - which paints
-            // literals with the property colour.  Trim to the field-name
-            // sub-span using the interned name length so the value keeps
-            // its own classification (or its TextMate colour if the walker
-            // doesn't classify literals).
-            if (fi.span.has_location() && this.intern != null) {
-                const name_str: string = this.intern.resolve(fi.field_name);
-                const name_len: u32 = libc::strlen(name_str) as u32;
-                if (name_len > 0 as u32) {
-                    const name_span: source_span::SourceSpan = source_span::SourceSpan::new(
-                        fi.span.file,
-                        fi.span.start_line,
-                        fi.span.start_col,
-                        fi.span.start_line,
-                        fi.span.start_col + name_len);
-                    this.emit_span(name_span,
-                                   lsp::protocol::semantic_tokens::TYPE_PROPERTY,
-                                   lsp::protocol::semantic_tokens::MOD_NONE);
-                }
-            }
-            this.walk_expr(fi.value);
-        }
-    }
-
-    walk_member_access(mut &this, m: expression::MemberAccessNode*, is_callee: boolean) -> void {
-        if (m == null) { return; }
-        this.walk_expr(m.object);
-        if (m.member_span.has_location()) {
-            const type_id: u32 = if (is_callee) {
-                lsp::protocol::semantic_tokens::TYPE_METHOD
-            } else {
-                lsp::protocol::semantic_tokens::TYPE_PROPERTY
-            };
-            this.emit_span(m.member_span, type_id,
-                           lsp::protocol::semantic_tokens::MOD_NONE);
-        }
-        for (mut i: i64 = 0; i < m.generic_args.length; i++) {
-            this.walk_type_annotation(m.generic_args[i]);
-        }
-    }
-
-    walk_scope_resolution(mut &this, s: expression::ScopeResolutionNode*, is_callee: boolean) -> void {
-        if (s == null) { return; }
-        // ScopeResolutionNode doesn't store separate spans for `scope_name`
-        // and `member_name`; only the combined `span` over `Scope::Member`.
-        // We synthesize sub-spans from the interned string lengths:
-        //   - scope: starts at span.start_col, length = strlen(scope_name)
-        //   - member: ends at span.end_col, length = strlen(member_name)
-        // The `::` separator and any generic-arg list (`<T,U>`) between
-        // them are left to the TextMate grammar.  This is enough to give
-        // `Vec` and `new` the right colors in `Vec<T>::new(...)`.
-        if (s.span.has_location() && this.intern != null) {
-            const scope_str: string = this.intern.resolve(s.scope_name);
-            const scope_len: u32 = libc::strlen(scope_str) as u32;
-            if (scope_len > 0 as u32 && !s.scope_name.is_empty()) {
-                const scope_span: source_span::SourceSpan = source_span::SourceSpan::new(
-                    s.span.file,
-                    s.span.start_line,
-                    s.span.start_col,
-                    s.span.start_line,
-                    s.span.start_col + scope_len);
-                this.emit_span(scope_span,
-                               lsp::protocol::semantic_tokens::TYPE_TYPE,
-                               lsp::protocol::semantic_tokens::MOD_NONE);
-            }
-
-            // Member emit: skip only when generic args sit AFTER the member
-            // (`Foo::bar<U>`), where the parser's reported span.end_col can cover
-            // the `<U>` too and we can't reliably back up `member_len` bytes to
-            // find `bar`.  Generics on the SCOPE (`Foo<T>::bar`) are consumed
-            // before the member and don't move span.end_col off the member name,
-            // so they must NOT block the member token (this is what gives `new`
-            // the function color in `Foo<int>::new()`).
-            const has_generics: boolean = s.generic_args.length > 0;
-            const member_str: string = this.intern.resolve(s.member_name);
-            const member_len: u32 = libc::strlen(member_str) as u32;
-            if (!has_generics && member_len > 0 as u32 && !s.member_name.is_empty()
-                    && s.span.end_line == s.span.start_line
-                    && s.span.end_col > member_len) {
-                const member_type: u32 = if (is_callee) {
-                    lsp::protocol::semantic_tokens::TYPE_FUNCTION
+                const ro: u32 = if (sym.is_mutable) {
+                    lsp::protocol::semantic_tokens::MOD_NONE
                 } else {
-                    lsp::protocol::semantic_tokens::TYPE_ENUM_MEMBER
+                    lsp::protocol::semantic_tokens::MOD_READONLY
                 };
-                const member_span: source_span::SourceSpan = source_span::SourceSpan::new(
-                    s.span.file,
-                    s.span.end_line,
-                    s.span.end_col - member_len,
-                    s.span.end_line,
-                    s.span.end_col);
-                this.emit_span(member_span, member_type,
+                this.emit_span(u.span, lsp::protocol::semantic_tokens::TYPE_VARIABLE, decl | ro);
+            }
+            Target::TypeParam(_) => {
+                this.emit_span(u.span, lsp::protocol::semantic_tokens::TYPE_TYPE_PARAM, decl);
+            }
+            Target::Field(_, _) => {
+                this.emit_span(u.span, lsp::protocol::semantic_tokens::TYPE_PROPERTY, decl);
+            }
+            Target::Variant(_, _) => {
+                this.emit_span(u.span, lsp::protocol::semantic_tokens::TYPE_ENUM_MEMBER, decl);
+            }
+            // A primitive keeps the grammar's colour.
+            _ => { }
+        }
+    }
+
+    /// A definition's name: its kind, and for a type the kind of type its
+    /// declaration is.
+    def_token(mut &this, span: source_span::SourceSpan, d: DefId, decl: u32) -> void {
+        const node: ASTNode* = this.ctx.decl_index.declaration_of(d);
+        match (this.ctx.defs.kind_of(d)) {
+            DefKind::Module => {
+                this.emit_span(span, lsp::protocol::semantic_tokens::TYPE_NAMESPACE, decl);
+            }
+            DefKind::Type => {
+                mut ty: u32 = lsp::protocol::semantic_tokens::TYPE_TYPE;
+                if (node != null) {
+                    ty = match (node.kind) {
+                        NodeKind::StructDeclaration => { lsp::protocol::semantic_tokens::TYPE_STRUCT }
+                        NodeKind::UnionDeclaration  => { lsp::protocol::semantic_tokens::TYPE_STRUCT }
+                        NodeKind::ClassDeclaration  => { lsp::protocol::semantic_tokens::TYPE_CLASS }
+                        NodeKind::EnumDeclaration   => { lsp::protocol::semantic_tokens::TYPE_ENUM }
+                        NodeKind::TraitDeclaration  => { lsp::protocol::semantic_tokens::TYPE_INTERFACE }
+                        _                           => { lsp::protocol::semantic_tokens::TYPE_TYPE }
+                    };
+                }
+                this.emit_span(span, ty, decl);
+            }
+            DefKind::Function => {
+                this.emit_span(span, lsp::protocol::semantic_tokens::TYPE_FUNCTION, decl);
+            }
+            DefKind::Method => {
+                mut mods: u32 = decl;
+                if (node != null && node.kind == NodeKind::MethodDeclaration
+                        && (node as MethodNode*).is_static) {
+                    mods = mods | lsp::protocol::semantic_tokens::MOD_STATIC;
+                }
+                this.emit_span(span, lsp::protocol::semantic_tokens::TYPE_METHOD, mods);
+            }
+            DefKind::Value => {
+                mut mods: u32 = decl;
+                if (node != null && node.kind == NodeKind::VariableDeclaration
+                        && !(node as VarDeclNode*).is_mutable) {
+                    mods = mods | lsp::protocol::semantic_tokens::MOD_READONLY;
+                }
+                this.emit_span(span, lsp::protocol::semantic_tokens::TYPE_VARIABLE, mods);
+            }
+            _ => { }
+        }
+    }
+
+    /// Each segment of an import's path, or of the path a `namespace` or
+    /// `public module` declares, is a namespace.
+    path_segments(mut &this, stmt: ASTNode*) -> void {
+        mut n: ASTNode* = stmt;
+        if (n != null && n.kind == NodeKind::DeclarationStatement) {
+            n = (n as DeclStmtNode*).declaration as ASTNode*;
+        }
+        if (n == null || n.generated) { return; }
+        if (n.kind == NodeKind::ImportDeclaration) {
+            const imp: ImportDeclNode* = n as ImportDeclNode*;
+            for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
+                this.emit_span(imp.path_segment_spans[i], lsp::protocol::semantic_tokens::TYPE_NAMESPACE,
                                lsp::protocol::semantic_tokens::MOD_NONE);
             }
-        }
-
-        for (mut i: i64 = 0; i < s.scope_generic_args.length; i++) {
-            this.walk_type_annotation(s.scope_generic_args[i]);
-        }
-        for (mut i: i64 = 0; i < s.generic_args.length; i++) {
-            this.walk_type_annotation(s.generic_args[i]);
-        }
-    }
-
-    walk_match_arm(mut &this, arm: pattern::MatchArmNode*) -> void {
-        if (arm == null) { return; }
-        this.st_walk_node(arm.body as node::ASTNode*);
-    }
-
-
-    // Type-annotation walker - emits `type` tokens for named annotations
-
-    walk_type_annotation(mut &this, ann: ast::TypeAnnotation*) -> void {
-        if (ann == null) { return; }
-        match (*ann) {
-            ast::TypeAnnotation::Primitive(p) => {
-                // Primitives (`i32`, `bool`, ...) are TextMate-coloured as
-                // types already; emitting again here would double-paint.
-                // Skip.
+        } else if (n.kind == NodeKind::ModuleDeclaration) {
+            const md: ModuleDeclNode* = n as ModuleDeclNode*;
+            for (mut i: i64 = 0; i < md.path_segment_spans.length; i++) {
+                this.emit_span(md.path_segment_spans[i], lsp::protocol::semantic_tokens::TYPE_NAMESPACE,
+                               lsp::protocol::semantic_tokens::MOD_NONE);
             }
-            ast::TypeAnnotation::Named(n) => {
-                if (n.span.has_location()) {
-                    this.emit_span(n.span,
-                                   lsp::protocol::semantic_tokens::TYPE_TYPE,
-                                   lsp::protocol::semantic_tokens::MOD_NONE);
-                }
-            }
-            ast::TypeAnnotation::Pointer(p) => {
-                this.walk_type_annotation(p.inner);
-            }
-            ast::TypeAnnotation::Reference(r) => {
-                this.walk_type_annotation(r.inner);
-            }
-            ast::TypeAnnotation::Array(a) => {
-                this.walk_type_annotation(a.element);
-            }
-            ast::TypeAnnotation::Function(f) => {
-                for (mut i: i64 = 0; i < f.parameters.length; i++) {
-                    this.walk_type_annotation(f.parameters[i]);
-                }
-                this.walk_type_annotation(f.return_type);
-            }
-            ast::TypeAnnotation::Tuple(t) => {
-                for (mut i: i64 = 0; i < t.elements.length; i++) {
-                    this.walk_type_annotation(t.elements[i]);
-                }
-            }
-            ast::TypeAnnotation::Generic(g) => {
-                this.walk_type_annotation(g.base);
-                for (mut i: i64 = 0; i < g.args.length; i++) {
-                    this.walk_type_annotation(g.args[i]);
-                }
-            }
-            ast::TypeAnnotation::ThisType(_) => {
-                // The `This` placeholder is highlighted by the TextMate
-                // `keyword.other.cryo` rule.  No override needed.
-            }
-            ast::TypeAnnotation::Typeof(t) => {
-                // `typeof(expr)` wraps an expression, not a nested type
-                // annotation, so there is nothing to recurse into here; the
-                // operand is highlighted by the expression walker.
-            }
-            ast::TypeAnnotation::ImplTrait(i) => {
-                for (mut j: i64 = 0; j < i.bounds.length; j++) {
-                    this.walk_type_annotation(i.bounds[j]);
-                }
-            }
-            ast::TypeAnnotation::Projection(p) => { /* TODO */ }
         }
     }
 
@@ -992,38 +224,19 @@ type struct SemanticTokenizer {
     /// Emit a single token for `span`, classified as (`type_id`, `modifiers`).
     /// Converts compiler 1-based line/col to LSP 0-based, and clamps the
     /// length so a multi-line span (rare for identifiers) reports just the
-    /// portion on the start line.
-    ///
-    /// Validates the span against the editor buffer's line index when one
-    /// is available: a token whose target line doesn't exist in the live
-    /// source - or whose start column sits past the line's end - is
-    /// silently dropped.  This is the safety net for stale spans coming
-    /// out of a parse failure or a lagged recompile, which would otherwise
-    /// paint at the wrong place after the user inserts a newline or shrinks
-    /// a line.
+    /// portion on the start line.  A span in another file, or one that does
+    /// not fit the analysed text, is dropped.
     emit_span(mut &this, span: source_span::SourceSpan, type_id: u32, modifiers: u32) -> void {
         if (!span.has_location()) { return; }
         if (span.start_line == 0 as u32) { return; }
-        // Reject spans whose source file isn't the one we're currently
-        // rendering tokens for.  The specialization pass appends
-        // monomorphized AST nodes from generic templates (often in stdlib)
-        // onto whatever ProgramNode triggered the instantiation, so a
-        // ProgramNode for `main.cryo` ends up containing nodes whose spans
-        // point into `option.cryo`, `array.cryo`, etc.  Without this guard
-        // the walker emits tokens at those line/col positions in the open
-        // editor buffer, which lands them on entirely unrelated source -
-        // exactly the catastrophic mis-coloring (e.g., a struct token
-        // landing on `int = 5;`) the user reported.
         if (this.doc_file != "" && span.file != "" && !SemanticTokenizer::file_paths_equal(span.file, this.doc_file)) {
             return;
         }
         const line: u32   = span.start_line - 1 as u32;
 
-        // The lexer reports columns as TAB-EXPANDED visual cells (tab advances
-        // to the next multiple of 4, see `SourceLocation::increment_char`),
-        // but the LSP wire format wants character offsets (= bytes for ASCII
-        // source).  Walk the line content to translate.  Without the buffer,
-        // fall back to byte=cell which is correct for tab-free lines.
+        // Compiler columns become wire columns through `Columns`, measured
+        // against the analysed text.  Without it there is nothing to
+        // measure, and the compiler's columns are used as they are.
         mut start_byte: u32 = if (span.start_col > 0 as u32) {
             span.start_col - 1 as u32
         } else {
@@ -1055,20 +268,18 @@ type struct SemanticTokenizer {
                 if (last_byte == 13 as u8) { line_bytes = line_bytes - 1; }
             }
 
-            // Translate cell-columns to byte-columns by walking the line.
-            const line_ptr: string = this.doc_text + line_start as i64;
-            start_byte = SemanticTokenizer::cell_col_to_byte_col(line_ptr, line_bytes, span.start_col);
+            const line_text: str::Str = str::Str::from_raw((this.doc_text + line_start as i64) as u8*, line_bytes);
+            const sb: u64 = line_index::Columns::compiler_to_byte(line_text, span.start_col);
+            mut eb: u64 = sb + 1;
             if (span.end_line == span.start_line && span.end_col > span.start_col) {
-                end_byte_opt = SemanticTokenizer::cell_col_to_byte_col(line_ptr, line_bytes, span.end_col);
-            } else {
-                end_byte_opt = start_byte + 1 as u32;
+                eb = line_index::Columns::compiler_to_byte(line_text, span.end_col);
             }
 
-            // Validate the resolved byte range against the live line length.
-            if (start_byte as u64 >= line_bytes && line_bytes > 0 as u64) { return; }
-            if ((end_byte_opt as u64) > line_bytes) {
-                end_byte_opt = line_bytes as u32;
-            }
+            // Validate the resolved byte range against the line's length.
+            if (sb >= line_bytes && line_bytes > 0 as u64) { return; }
+            if (eb > line_bytes) { eb = line_bytes; }
+            start_byte = line_index::Columns::byte_to_wire(line_text, sb, this.utf8);
+            end_byte_opt = line_index::Columns::byte_to_wire(line_text, eb, this.utf8);
         }
 
         mut length: u32 = if (end_byte_opt > start_byte) {
@@ -1078,7 +289,20 @@ type struct SemanticTokenizer {
         };
         if (length == 0 as u32) { return; }
 
-        this.tokens.push(SemanticToken::new(line, start_byte, length, type_id, modifiers));
+        this.push_token(line, start_byte, length, type_id, modifiers);
+    }
+
+    /// Push a token on line `line` of the analysed text, moved to the
+    /// buffer's line; a line edited since the analysis gets no token.
+    push_token(mut &this, line: u32, start_char: u32, length: u32,
+               type_id: u32, modifiers: u32) -> void {
+        mut out_line: u32 = line;
+        if (this.doc != null) {
+            const cur: i64 = this.doc.buffer_line_of(line);
+            if (cur < 0) { return; }
+            out_line = cur as u32;
+        }
+        this.tokens.push(SemanticToken::new(out_line, start_char, length, type_id, modifiers));
     }
 
 
@@ -1086,43 +310,28 @@ type struct SemanticTokenizer {
     //
     // The parser does NOT keep per-token spans for the assembly body - it
     // stores a list of reconstructed text `pieces` (see AsmBlockStmtNode).
-    // So the AST walk can't drive colouring the way it does for real Cryo
-    // spans.  Instead we re-scan the block's source region straight out of
-    // the live editor buffer (which the tokenizer already holds for span
-    // validation) with a small asm-aware lexer, emitting tokens in 0-based
+    // So the block's source region is re-scanned straight out of the
+    // analysed text with a small asm-aware lexer, emitting tokens in 0-based
     // BYTE coordinates via `emit_raw` (asm is ASCII, so byte == LSP char and
     // there's no tab-cell translation to do).  The `${expr}` operands ARE
-    // real Cryo expressions with spans, so those go through `walk_expr`.
+    // real Cryo expressions with spans, and are names in the uses index.
 
     /// Push a token in 0-based LSP coordinates.  Used by the asm re-scanner,
-    /// which reads live-buffer bytes and therefore already has valid
+    /// which reads the analysed text's bytes and therefore already has valid
     /// character offsets - no cell-column translation or span validation
     /// needed (positions come from within a known-good line).
     emit_raw(mut &this, line0: u32, start_char: u32, length: u32,
              type_id: u32, modifiers: u32) -> void {
         if (length == 0 as u32) { return; }
-        this.tokens.push(SemanticToken::new(line0, start_char, length, type_id, modifiers));
+        this.push_token(line0, start_char, length, type_id, modifiers);
     }
 
-    walk_asm_block(mut &this, node: statement::AsmBlockStmtNode*) -> void {
+    asm_body(mut &this, node: statement::AsmBlockStmtNode*) -> void {
         if (node == null) { return; }
-        // `${expr}` operands are real Cryo code - colour (and hover) them
-        // through the normal expression walker.
-        for (mut oi: i64 = 0; oi < node.operands.length; oi++) {
-            const op: statement::AsmOperand* = node.operands[oi];
-            if (op != null) { this.walk_expr(op.expr); }
-        }
-        // Body colouring re-scans the source; it needs the live buffer.
         if (this.line_index == null || this.doc_text == "") { return; }
         const span: source_span::SourceSpan = node.span;
         if (!span.has_location()) { return; }
         if (span.start_line == 0 as u32) { return; }
-        // Same cross-file guard as emit_span: monomorphization can graft
-        // asm nodes from other files onto this ProgramNode.
-        if (this.doc_file != "" && span.file != ""
-                && !SemanticTokenizer::file_paths_equal(span.file, this.doc_file)) {
-            return;
-        }
         const intel: boolean = match (node.dialect) {
             statement::AsmDialect::Intel => { true }
             statement::AsmDialect::ATT   => { false }
@@ -1143,7 +352,8 @@ type struct SemanticTokenizer {
     /// immediates and `$sym` address-of, bare numbers, `.directives`,
     /// `label:` definitions, instruction mnemonics, symbol references,
     /// comments (`#`, `//`, and `;` in Intel), string literals, and
-    /// punctuation.  `${...}` operand refs are skipped (walk_expr owns them).
+    /// punctuation.  `${...}` operand refs are skipped (their names are
+    /// coloured from the uses index).
     scan_asm_line(mut &this, line0: u32, intel: boolean) -> void {
         if (line0 as u64 >= this.line_index.line_count()) { return; }
         const line_start: u64 = this.line_index.line_start(line0);
@@ -1197,8 +407,8 @@ type struct SemanticTokenizer {
                     lsp::protocol::semantic_tokens::MOD_NONE);
                 return;
             }
-            // `${...}` operand reference - walk_expr already coloured the
-            // inner expression; skip the whole `${...}` span here.
+            // `${...}` operand reference - its names come from the uses
+            // index; skip the whole `${...}` span here.
             if (c == 36 as u8 && i + (1 as u32) < n
                     && (base[(i + 1 as u32) as i64] as u8) == 123 as u8) {   // '${'
                 mut depth: i64 = 0;
@@ -1456,28 +666,17 @@ type struct SemanticTokenizer {
     /// In-place insertion sort by (line, start_char).  Token counts per
     /// file are modest (a few thousand at most for stdlib-sized files);
     /// insertion sort's O(n2) is fine and avoids allocating a temporary.
-    /// Stable: ties preserve emission order, which matters for sub-token
-    /// emissions on the same span (a future enhancement could legitimately
-    /// emit overlapping tokens - e.g. modifier-stacking - and stable order
-    /// keeps the result deterministic).
+    /// Stable: ties keep emission order.
     sort_tokens(mut &this) -> void {
-        // Index/mutate through the raw element pointer.  Cryo's `mut &this`
-        // receiver doesn't support `this.tokens[i]` directly - only method
-        // calls (push/get/length) - so we drop to the underlying buffer for
-        // the in-place sort.  No element is dropped or replaced wholesale,
-        // so the Array invariants stay intact.
+        // Index/mutate through the raw element pointer: no element is
+        // dropped or replaced wholesale, so the Array invariants stay intact.
         const data: SemanticToken* = this.tokens.as_ptr();
         const n: i64 = this.tokens.length() as i64;
         for (mut i: i64 = 1; i < n; i++) {
             const t: SemanticToken = data[i];
             mut j: i64 = i - 1;
-            // `token_lt` takes its operands by reference: a by-value pass is
-            // flagged as a move by the post-closures move-check tightening
-            // (SemanticToken is POD/Copy by-spec, but the by-name argument
-            // is still classified as a storage-duplicating move here), and
-            // the subsequent `data[j + 1] = t` is then a use-after-move.
-            // The comparator never consumes its operands anyway - references
-            // are the semantically right shape.
+            // The comparator takes its operands by reference: a by-value
+            // pass would read as a move of `t`, used again below.
             while (j >= 0 && SemanticTokenizer::token_lt(&t, &data[j])) {
                 data[j + 1] = data[j];
                 j = j - 1;
@@ -1526,8 +725,7 @@ type struct SemanticTokenizer {
         }
 
         // Array has no truncate(); pop the trailing items we've already
-        // copied forward.  SemanticToken is Copy so the pop's returned
-        // Option<T> doesn't need explicit dropping.
+        // copied forward.
         mut to_drop: u64 = n - write;
         while (to_drop > 0 as u64) {
             this.tokens.pop();
@@ -1538,33 +736,8 @@ type struct SemanticTokenizer {
 
     // Stateless helpers (statics)
 
-    /// Byte-compare two NUL-terminated C strings.  Both a tokenizer's
-    /// `doc_file` and a span's `file` are raw `string` (`char*`) handles from
-    /// the parser's intern table or the request's URI conversion;
-    /// pointer-equality is NOT reliable (different code paths produce different
-    /// copies of the same logical path), so we walk and compare bytes until a
-    /// NUL.
-    /// True when `c` is a compiler-synthesized implicit-conversion call.
-    /// Sema wraps an operand needing conversion in a call (e.g.
-    /// `String::from_string(<literal>)`) and stamps the synthetic callee AND
-    /// the wrapping call with the ORIGINAL operand's span, then adds that
-    /// operand as the sole argument.  So the tell-tale shape is: exactly one
-    /// argument whose span is co-located with the callee's span.  A genuine
-    /// user call `f(x)` never has its callee and argument at the same span.
-    static is_synthetic_conversion(c: expression::CallExprNode*) -> boolean {
-        if (c == null || c.callee == null) { return false; }
-        if (c.arguments.length != 1)       { return false; }
-        const arg: expression::ExpressionNode* = c.arguments[0];
-        if (arg == null)                   { return false; }
-        const cs: source_span::SourceSpan = c.callee.span;
-        const as_: source_span::SourceSpan = arg.span;
-        if (!cs.has_location() || !as_.has_location()) { return false; }
-        return cs.start_line == as_.start_line
-            && cs.start_col  == as_.start_col
-            && cs.end_line   == as_.end_line
-            && cs.end_col    == as_.end_col;
-    }
-
+    /// Byte-compare two NUL-terminated paths: the same file reaches here
+    /// as different copies, so pointer equality does not decide it.
     static file_paths_equal(a: string, b: string) -> boolean {
         if (a == b) { return true; }                      // same pointer
         mut i: u64 = 0;
@@ -1578,49 +751,19 @@ type struct SemanticTokenizer {
         return false;
     }
 
-    /// Walk `line` (byte length `line_bytes`) counting tab-expanded visual
-    /// cells and return the 0-indexed BYTE offset corresponding to the
-    /// 1-indexed cell column `target_cell`.  Mirrors the lexer's column
-    /// accounting (`SourceLocation::increment_char`): tab jumps to the
-    /// next multiple of 4 (1-indexed -> 1, 5, 9, ...), every other byte
-    /// advances one cell.  This is the inverse used by the LSP to map
-    /// parser-reported columns back to wire-format character offsets.
-    static cell_col_to_byte_col(line: string, line_bytes: u64, target_cell: u32) -> u32 {
-        if (target_cell <= 1 as u32) { return 0 as u32; }
-        mut cell: u32 = 1 as u32;
-        mut byte: u32 = 0 as u32;
-        while ((byte as u64) < line_bytes && cell < target_cell) {
-            const b: u8 = line[byte as i64] as u8;
-            if (b == 9 as u8) {
-                // tab: jump to next 4-cell stop (1-indexed: 5, 9, 13, ...).
-                const cell_zero: u32 = cell - 1 as u32;
-                const next_stop: u32 = ((cell_zero / 4 as u32) + 1 as u32) * 4 as u32 + 1 as u32;
-                cell = next_stop;
-            } else {
-                cell = cell + 1 as u32;
-            }
-            byte = byte + 1 as u32;
-        }
-        return byte;
-    }
-
     static token_lt(a: &SemanticToken, b: &SemanticToken) -> boolean {
         if (a.line < b.line) { return true; }
         if (a.line > b.line) { return false; }
         if (a.start_char != b.start_char) { return a.start_char < b.start_char; }
-        // Same (line, start_char): wider tokens first.  Combined with the
-        // subsequent dedup pass - which drops anything overlapping with the
-        // previously-kept token - this collapses two identical-start tokens
-        // to whichever covers more bytes.  That matches VS Code's TextMate
-        // fallback for the non-covered tail: if our narrow emit also got an
-        // equally-narrow duplicate, the wider one wins and we lose nothing.
+        // Same (line, start_char): wider tokens first, so the dedup pass
+        // keeps the one covering more bytes.
         return a.length > b.length;
     }
 }
 
 /// SemanticTokenizer owns its `tokens` Array on the heap; the explicit
 /// `drop` releases it at end of request (the other fields are non-owning
-/// pointers / POD symbols).
+/// pointers).
 implement trait Drop for struct SemanticTokenizer {
     drop(mut &this) -> void { }
 }
@@ -1635,35 +778,22 @@ implement trait Clone for struct SemanticToken {
 
 // Entry point
 
-public function handle_semantic_tokens(docs: &docs::Docs, sessions: mut &session::SessionMap,
+public function handle_semantic_tokens(docs: mut &docs::Docs, projects: mut &session::Projects,
                                         params: &value::JsonValue) -> value::JsonValue {
-    // -- Extract URI from textDocument.uri ----------------------------
-    const td_opt: Option<value::JsonValue*> = params.get(str::Str::from("textDocument"));
-    if (!td_opt.is_some()) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
-    const td: value::JsonValue* = td_opt.unwrap_or(null);
+    const td: value::JsonValue* = params.get(str::Str::from("textDocument")).unwrap_or(null);
     if (td == null) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
-
-    const uri_opt: Option<value::JsonValue*> = td.get(str::Str::from("uri"));
-    if (!uri_opt.is_some()) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
-    const uri_val: value::JsonValue* = uri_opt.unwrap_or(null);
+    const uri_val: value::JsonValue* = td.get(str::Str::from("uri")).unwrap_or(null);
     if (uri_val == null) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
-
     const uri_str_opt: Option<str::Str> = uri_val.as::<str::Str>();
     if (!uri_str_opt.is_some()) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
     const uri: str::Str = uri_str_opt.unwrap_or(str::Str::from(""));
 
-    // -- Resolve session -> CompilationContext -> ProgramNode -----------
-    // Recompile-if-stale (see hover.cryo) so we never tokenize against a
-    // ctx whose shared-arena AST was recycled by another doc's compile.
-    const session: session::CompilerSession* = sessions.ensure_fresh(docs, uri);
-    if (session == null) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
-    const ctx: compilation_context::CompilationContext* = session.context();
+    const ctx: CompilationContext* = projects.analysis_for(docs, uri);
     if (ctx == null) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
 
     mut fs_path_owned: String = conv::UriPath::uri_to_fs_path(uri);
-    const fs_path: str::Str = fs_path_owned.as_str();
-    mut path_buf: String = String::with_capacity(fs_path.length() + 1);
-    path_buf.push(fs_path);
+    mut path_buf: String = String::with_capacity(fs_path_owned.length() + 1);
+    path_buf.push(fs_path_owned.as_str());
     path_buf.push_byte(0 as u8);
     mem::drop(fs_path_owned);
     const path_buf_len: u64 = path_buf.length() - 1;
@@ -1673,39 +803,16 @@ public function handle_semantic_tokens(docs: &docs::Docs, sessions: mut &session
     const mod_idx: i64 = ctx.module_graph.find_module_by_path(path_cstr);
     if (mod_idx < 0) { mem::drop(path_buf); return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
 
-    const ast: node::ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
-    if (ast == null) { mem::drop(path_buf); return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
-
-    // -- Build the per-request tokenizer and walk the AST -------------
-    // path_cstr backs the tokenizer's doc_file for the duration of the
-    // walk, so path_buf must outlive it (dropped at the bottom).
-    mut tokenizer: SemanticTokenizer = SemanticTokenizer::new(ctx.intern_table, docs, uri, path_cstr);
-    tokenizer.walk_program(ast);
-
-    // -- Sort by (line, start_char) -----------------------------------
-    // The delta-line encoding requires monotonically-non-decreasing token
-    // positions.  Emission order from the walk follows source order for
-    // most nodes, but a few - type annotations on function returns,
-    // generic params - emit a name span that sits BEFORE the body's
-    // emissions.  A stable sort keeps the result deterministic.
+    // path_cstr backs the tokenizer's doc_file, so path_buf outlives it.
+    mut tokenizer: SemanticTokenizer = SemanticTokenizer::new(ctx, docs, uri, path_cstr);
+    tokenizer.colour(mod_idx);
+    // The delta-line encoding needs tokens in position order, and the spec
+    // forbids overlapping ones.
     tokenizer.sort_tokens();
-
-    // -- Drop duplicate + overlapping tokens --------------------------
-    // The LSP semantic-tokens spec requires the wire array to be strictly
-    // non-overlapping.  Walks can produce overlaps when two walkers both
-    // classify the same span; the VS Code renderer treats overlap as
-    // undefined behaviour and produces the "multi-coloured token" artefact.
     tokenizer.dedup_overlapping();
 
-    // -- Encode as wire `data: number[]` and wrap as response ---------
     const data: value::JsonValue = lsp::protocol::semantic_tokens::SemanticTokensCodec::encode_tokens(&tokenizer.tokens);
     const resp: value::JsonValue = lsp::protocol::semantic_tokens::SemanticTokensCodec::response_json(data);
-    // path_buf backed the tokenizer's doc_file for the duration of the
-    // walk; release it now that token emission is done.  The tokenizer
-    // (and its owned token array) is auto-dropped at function return.
     mem::drop(path_buf);
     return resp;
 }
-
-
-// URI helpers live in `lsp::protocol::conv` (`UriPath::uri_to_fs_path`).

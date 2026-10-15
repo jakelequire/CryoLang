@@ -372,3 +372,37 @@ make test ARGS="--ignored some_filter"
 `make examples` is a companion smoke gate that compiles every `examples/*/`
 project with the freshly built compiler. Both `make test` and `make examples`
 run in CI on every push and pull request to `main`.
+
+## 9. The language server's tests
+
+`make lsp-check` builds `tools/CryoLSP` with the compiler under test and then
+drives the binary it linked through `tools/CryoLSP/tests/smoke.py`, over
+stdio, the way an editor does. The gate passes only when no check fails and
+at least `--min-checks` pass; a run that lost its fixtures is a refusal.
+
+A fixture is a directory under `tools/CryoLSP/tests/fixtures/`: a real
+project (a `cryoconfig` and its sources) that compiles, so the expected
+answers are what the program actually binds, plus a `checks.json`. Each
+fixture runs in its own server process. Build a fixture with the compiler
+before relying on it; the gate does not compile it to a binary.
+
+Positions are named by markers, not by line and column:
+
+- `/*@name*/` written immediately before a token names the token's first
+  character.
+- `/*^name*/` names the position where the comment starts, which is where a
+  completion cursor sits (`wb./*^after_dot*/`).
+
+A check refers to a marker as `file@name`. A missing marker fails the run, so
+editing a fixture cannot quietly move a check onto another token. A comment
+between the segments of an import's path stops the import compiling, so a
+marker on an import's last segment is written after it, `import
+Probe::B/*^name*/;`. The check
+kinds and the `edit` field (ask about an unsaved, half-typed buffer) are
+described at the top of `smoke.py`.
+
+Adding a check: write the marker, add the check, run
+`python tools/CryoLSP/tests/smoke.py <server> --fixture <name>`, and show
+the check failing on the server from before the change. Raise
+`--min-checks` in `scripts/lsp-gate.py` to the new passing count in the same
+commit.

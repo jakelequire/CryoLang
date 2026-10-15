@@ -1,0 +1,691 @@
+///! What the name at a position refers to, read off the stamp the compiler
+///! wrote on it.  Definition and hover both answer from here.
+///!
+///! The position finds the innermost node holding it in its module's tree,
+///! skipping monomorphized copies, which carry the spans of the template
+///! they were cloned from.  The stamp on that node - its `Res`, a call's
+///! pin, a member's pin, a pattern's binding - is the answer.  A node with
+///! no stamp names nothing; no name is looked up again by its spelling.
+namespace lsp::handlers::identity;
+
+import std::core::option;
+import std::core::mem;
+import std::collections::str;
+import std::collections::string;
+import std::collections::string::{ String };
+import std::json::value;
+
+import lsp::server::docs;
+import lsp::server::session;
+import lsp::protocol::conv;
+
+import compiler::compilation_context::{ CompilationContext };
+import compiler::ast;
+import compiler::ast::{ MemberPin, NamedAnnotation, NodeKind, PatternElement, PatternKind, TypeAnnotation };
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node_locator;
+import compiler::ast::node_locator::{ NodeLocator };
+import compiler::ast::declaration::{
+    ClassDeclNode, DeclarationNode, EnumDeclNode, EnumVariantNode, FieldDeclNode,
+    FunctionDeclNode, ImplBlockNode, ImportDeclNode, IntrinsicDeclNode, MethodNode,
+    ModuleDeclNode, StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::module_graph::{ ModulePath };
+import compiler::ast::expression::{
+    CallExprNode, CalleePin, CastExprNode, ExpressionNode, IdentifierNode, MemberAccessNode,
+    NewExprNode, ScopeResolutionNode, StructLiteralNode
+};
+import compiler::ast::pattern::{ EnumPatternNode, PatternNode };
+import compiler::decl_index::{ DeclarationIndex, OverloadId };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::res::{ DefId, DefKind, Res, ResBase, ResSlot };
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types;
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::type_base;
+import compiler::types::compound;
+
+
+/// What a name refers to, by identity.
+type enum Target {
+    Nothing;
+    /// A declaration: a module, type, function, method or global.
+    Def(DefId);
+    /// A local, a parameter or a pattern's binding.
+    Local(SymbolID);
+    /// A type parameter.
+    TypeParam(SymbolID);
+    /// A primitive type, which is declared nowhere.
+    Prim(SymbolStr);
+    /// Field `index` among the fields type `owner` declares.
+    Field(DefId, i64);
+    /// Variant `ordinal` of the enum `owner`.
+    Variant(DefId, i64);
+}
+
+implement enum Target {
+    is_nothing(&this) -> boolean {
+        return match (&this) {
+            Target::Nothing => { true }
+            _               => { false }
+        };
+    }
+
+    /// Whether two targets are one identity.  `Nothing` is no identity and
+    /// is the same as nothing.
+    same(&this, other: &Target) -> boolean {
+        match (&this) {
+            Target::Def(a) => {
+                return match (other) { Target::Def(b) => { a.equals(b) } _ => { false } };
+            }
+            Target::Local(a) => {
+                return match (other) { Target::Local(b) => { a.equals(b) } _ => { false } };
+            }
+            Target::TypeParam(a) => {
+                return match (other) { Target::TypeParam(b) => { a.equals(b) } _ => { false } };
+            }
+            Target::Prim(a) => {
+                return match (other) { Target::Prim(b) => { a.equals(b) } _ => { false } };
+            }
+            Target::Field(o, i) => {
+                return match (other) { Target::Field(p, j) => { o.equals(p) && i == j } _ => { false } };
+            }
+            Target::Variant(o, i) => {
+                return match (other) { Target::Variant(p, j) => { o.equals(p) && i == j } _ => { false } };
+            }
+            Target::Nothing => { return false; }
+        }
+    }
+}
+
+/// The target at a position, where its name is written, and the type the
+/// compiler gave the expression written there (invalid when it gave none).
+/// `receiver` is set for `this`, whose target is the type it is a receiver
+/// of.
+type struct Answer {
+    target:   Target;
+    span:     SourceSpan;
+    ty:       TypeRef;
+    receiver: boolean;
+
+    static nothing() -> Answer {
+        return Answer { target: Target::Nothing, span: SourceSpan::none(),
+                        ty: TypeRef::invalid(), receiver: false };
+    }
+
+    static of(target: Target, span: SourceSpan, ty: TypeRef) -> Answer {
+        return Answer { target: target, span: span, ty: ty, receiver: false };
+    }
+}
+
+
+/// A position request (`textDocument/definition`, `textDocument/hover`):
+/// the analysis answering it and the answer at its position.
+type struct Asked {
+    ctx:        CompilationContext*;
+    answer:     Answer;
+    uri:        str::Str;
+    line:       u32;
+    character:  u32;
+    module_idx: i64;
+    /// The position where the analysis has it; line 0 when none was asked.
+    cursor:     docs::CompilerPos;
+
+    static from(docs: mut &docs::Docs, projects: mut &session::Projects,
+                params: &value::JsonValue) -> Asked {
+        mut asked: Asked = Asked { ctx: null, answer: Answer::nothing(), uri: str::Str::from(""),
+                                   line: 0, character: 0, module_idx: -1,
+                                   cursor: docs::CompilerPos { line: 0, col: 0 } };
+        const td: Option<value::JsonValue*> = params.get(str::Str::from("textDocument"));
+        const td_v: value::JsonValue* = td.unwrap_or(null);
+        if (td_v == null) { return asked; }
+        const uri_v: value::JsonValue* = td_v.get(str::Str::from("uri")).unwrap_or(null);
+        if (uri_v == null) { return asked; }
+        const uri: Option<str::Str> = uri_v.as::<str::Str>();
+        if (!uri.is_some()) { return asked; }
+        asked.uri = uri.unwrap_or(str::Str::from(""));
+
+        asked.ctx = projects.analysis_for(docs, asked.uri);
+        if (asked.ctx == null) { return asked; }
+        mut fs_path: String = conv::UriPath::uri_to_fs_path(asked.uri);
+        mut path_buf: String = String::with_capacity(fs_path.length() + 1);
+        path_buf.push(fs_path.as_str());
+        path_buf.push_byte(0 as u8);
+        mem::drop(fs_path);
+        asked.module_idx = asked.ctx.module_graph.find_module_by_path(path_buf.as_ptr() as string);
+        mem::drop(path_buf);
+
+        // A request about a whole document carries no position.
+        const pos: value::JsonValue* = params.get(str::Str::from("position")).unwrap_or(null);
+        if (pos == null) { return asked; }
+        asked.line = Asked::u32_field(pos, "line");
+        asked.character = Asked::u32_field(pos, "character");
+        asked.cursor = docs.to_compiler(asked.uri, asked.line, asked.character);
+        asked.answer = Locator::answer_at(asked.ctx, asked.module_idx, asked.cursor.line, asked.cursor.col);
+        return asked;
+    }
+
+    /// A non-negative integer field of a JSON position; 0 otherwise.
+    static u32_field(obj: &value::JsonValue, key: string) -> u32 {
+        match (obj.get(str::Str::from(key))) {
+            Option::Some(v) => {
+                match (v) {
+                    value::JsonValue::Number(n) => {
+                        match (n) {
+                            value::JsonNumber::Int(i)   => { if (i < 0) { return 0; } return i as u32; }
+                            value::JsonNumber::UInt(u)  => { return u as u32; }
+                            value::JsonNumber::Float(f) => { if (f < 0.0) { return 0; } return f as u32; }
+                        }
+                    }
+                    _ => { return 0; }
+                }
+            }
+            Option::None => { return 0; }
+        }
+    }
+}
+
+
+/// Finds the answer at a position in one analysis.
+type struct Locator {
+    ctx:  CompilationContext*;
+    di:   DeclarationIndex*;
+    line: u32;
+    col:  u32;
+    /// The nodes from the top-level statement down to the innermost one
+    /// holding the position.
+    chain: ASTNode*[];
+    /// The module the position is in, when the caller named it.
+    module: ModulePath;
+
+    static new(ctx: CompilationContext*, line: u32, col: u32) -> Locator {
+        return Locator { ctx: ctx, di: ctx.decl_index, line: line, col: col, chain: [],
+                         module: ModulePath::none() };
+    }
+
+    /// The answer at (`line`, `col`), compiler coordinates, in module
+    /// `module_idx`.
+    static answer_at(ctx: CompilationContext*, module_idx: i64, line: u32, col: u32) -> Answer {
+        if (ctx == null || module_idx < 0 || line == 0) { return Answer::nothing(); }
+        mut loc: Locator = Locator::new(ctx, line, col);
+        loc.module = ctx.module_graph.get_module(module_idx).path();
+        loc.descend(ctx.module_graph.get_module_ast(module_idx as u32));
+        return loc.answer();
+    }
+
+    /// The innermost node holding the position in `program`, or null.
+    static node_at(ctx: CompilationContext*, program: ProgramNode*, line: u32, col: u32) -> ASTNode* {
+        mut loc: Locator = Locator::new(ctx, line, col);
+        loc.descend(program);
+        if (loc.chain.length == 0) { return null; }
+        return loc.chain[loc.chain.length - 1];
+    }
+
+    holds(&this, span: SourceSpan) -> boolean {
+        return node_locator::span_contains(span, this.line, this.col);
+    }
+
+    /// Fill `chain`.  A top-level copy - a monomorphized function, which
+    /// carries its template's spans - is not written where it appears, nor
+    /// is a declaration the compiler wrote.
+    descend(mut &this, program: ProgramNode*) -> void {
+        if (program == null) { return; }
+        mut cur: ASTNode* = null;
+        for (mut i: i64 = 0; i < program.statements.length; i++) {
+            const stmt: ASTNode* = program.statements[i];
+            if (stmt == null || stmt.generated || !this.holds(stmt.span)) { continue; }
+            if (stmt.kind == NodeKind::FunctionDeclaration
+                    && (stmt as FunctionDeclNode*).is_specialization) { continue; }
+            cur = stmt;
+            break;
+        }
+        while (cur != null) {
+            this.chain.push(cur);
+            cur = NodeLocator::first_covering_child(cur, this.line, this.col);
+        }
+    }
+
+    innermost(&this) -> ASTNode* {
+        if (this.chain.length == 0) { return null; }
+        return this.chain[this.chain.length - 1];
+    }
+
+    parent(&this) -> ASTNode* {
+        if (this.chain.length < 2) { return null; }
+        return this.chain[this.chain.length - 2];
+    }
+
+    /// The call `callee` is the callee of, or null.
+    call_of(&this, callee: ASTNode*) -> CallExprNode* {
+        const p: ASTNode* = this.parent();
+        if (p == null || p.kind != NodeKind::CallExpression) { return null; }
+        const call: CallExprNode* = p as CallExprNode*;
+        const called: ASTNode* = call.callee as ASTNode*;
+        if (called != callee) { return null; }
+        return call;
+    }
+
+    answer(&this) -> Answer {
+        const n: ASTNode* = this.innermost();
+        if (n == null) { return Answer::nothing(); }
+        match (n.kind) {
+            NodeKind::Identifier => { return this.identifier(n as IdentifierNode*); }
+            NodeKind::ScopeResolution => { return this.path(n as ScopeResolutionNode*); }
+            NodeKind::MemberAccess => { return this.member(n as MemberAccessNode*); }
+            NodeKind::StructLiteral => { return this.struct_literal(n as StructLiteralNode*); }
+            NodeKind::NewExpression => {
+                const ne: NewExprNode* = n as NewExprNode*;
+                return Answer::of(this.res_target(&ne.res), n.span, ne.resolved_type);
+            }
+            NodeKind::CastExpression => {
+                return this.annotation((n as CastExprNode*).target_annotation);
+            }
+            NodeKind::Pattern => { return this.pattern(n as PatternNode*); }
+            NodeKind::EnumPattern => { return this.pattern(n as PatternNode*); }
+            NodeKind::VariableDeclaration => { return this.var_decl(n as VarDeclNode*); }
+            NodeKind::FunctionDeclaration => {
+                const f: FunctionDeclNode* = n as FunctionDeclNode*;
+                if (this.holds(f.name_span)) { return this.function_decl(f, f.name_span); }
+                return this.annotation(f.return_type_annotation);
+            }
+            NodeKind::MethodDeclaration => {
+                const m: MethodNode* = n as MethodNode*;
+                if (m.func == null) { return Answer::nothing(); }
+                if (this.holds(m.func.name_span)) { return this.function_decl(m.func, m.func.name_span); }
+                return this.annotation(m.func.return_type_annotation);
+            }
+            NodeKind::FieldDeclaration => { return this.field_decl(n as FieldDeclNode*); }
+            NodeKind::EnumVariant => { return this.variant_decl(n as EnumVariantNode*); }
+            NodeKind::StructDeclaration => {
+                return this.type_decl(n, (n as StructDeclNode*).def);
+            }
+            NodeKind::UnionDeclaration => {
+                return this.type_decl(n, (n as UnionDeclNode*).def);
+            }
+            NodeKind::ClassDeclaration => {
+                return this.type_decl(n, (n as ClassDeclNode*).def);
+            }
+            NodeKind::EnumDeclaration => {
+                return this.type_decl(n, (n as EnumDeclNode*).def);
+            }
+            NodeKind::TraitDeclaration => {
+                return this.type_decl(n, (n as TraitDeclNode*).def);
+            }
+            NodeKind::TypeAliasDeclaration => {
+                const ta: TypeAliasDeclNode* = n as TypeAliasDeclNode*;
+                if (this.holds(ta.name_span)) { return this.type_decl(n, ta.def); }
+                return this.annotation(ta.target_annotation);
+            }
+            NodeKind::ImplementationBlock => { return this.impl_head(n as ImplBlockNode*); }
+            NodeKind::ImportDeclaration => { return this.import(n as ImportDeclNode*); }
+            NodeKind::ModuleDeclaration => { return this.submodule(n as ModuleDeclNode*); }
+            _ => { return Answer::nothing(); }
+        }
+    }
+
+    // -- Expressions --
+
+    identifier(&this, id: IdentifierNode*) -> Answer {
+        const at: SourceSpan = (id as ASTNode*).span;
+        if (id.is_this_keyword) {
+            // The receiver's target is the type it receives.
+            const d: DefId = this.di.def_of(this.carrier(id.resolved_type), this.ctx.type_arena);
+            if (!d.is_valid()) { return Answer::nothing(); }
+            mut a: Answer = Answer::of(Target::Def(d), at, id.resolved_type);
+            a.receiver = true;
+            return a;
+        }
+        return Answer::of(this.res_target(&id.res), at, id.resolved_type);
+    }
+
+    path(&this, s: ScopeResolutionNode*) -> Answer {
+        const ty: TypeRef = (s as ExpressionNode*).resolved_type;
+        if (this.holds(s.scope_span)) {
+            return Answer::of(this.res_target(&s.scope_res), s.scope_span, TypeRef::invalid());
+        }
+        if (!this.holds(s.member_span)) { return Answer::nothing(); }
+        return Answer::of(this.path_member(s, this.call_of(s as ASTNode*)), s.member_span, ty);
+    }
+
+    /// What a path's member segment names; `call` is the call the path is
+    /// the callee of, or null.
+    path_member(&this, s: ScopeResolutionNode*, call: CallExprNode*) -> Target {
+        if (s.member_def.is_valid()) { return Target::Def(s.member_def); }
+        if (call != null) {
+            const t: Target = this.call_target(call);
+            if (!t.is_nothing()) { return t; }
+        }
+        match (&s.resolved_member) {
+            MemberPin::Variant(ord) => {
+                const owner: DefId = this.res_def(&s.scope_res);
+                if (owner.is_valid()) { return Target::Variant(owner, ord); }
+            }
+            _ => { }
+        }
+        return this.pin_target(&s.resolved_callee);
+    }
+
+    member(&this, m: MemberAccessNode*) -> Answer {
+        if (!this.holds(m.member_span)) { return Answer::nothing(); }
+        const ty: TypeRef = (m as ExpressionNode*).resolved_type;
+        return Answer::of(this.member_target(m, this.call_of(m as ASTNode*)), m.member_span, ty);
+    }
+
+    /// What a member access names: the method the call it is the callee of
+    /// names, or the field its pin holds.
+    member_target(&this, m: MemberAccessNode*, call: CallExprNode*) -> Target {
+        if (call != null) { return this.call_target(call); }
+        match (&m.resolved_member) {
+            MemberPin::Field(depth, index) => {
+                if (m.object == null) { return Target::Nothing; }
+                return this.field_target(m.object.resolved_type, depth, index);
+            }
+            _ => { return Target::Nothing; }
+        }
+    }
+
+    struct_literal(&this, sl: StructLiteralNode*) -> Answer {
+        const ty: TypeRef = (sl as ExpressionNode*).resolved_type;
+        for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+            if (!this.holds(sl.field_inits[i].span)) { continue; }
+            match (&sl.field_inits[i].pin) {
+                MemberPin::Field(depth, index) => {
+                    return Answer::of(this.field_target(ty, depth, index),
+                        sl.field_inits[i].span, TypeRef::invalid());
+                }
+                _ => { return Answer::nothing(); }
+            }
+        }
+        return Answer::of(this.res_target(&sl.res), (sl as ASTNode*).span, ty);
+    }
+
+    /// What a call names: the entry its pin holds, or the method a generic
+    /// body or a bound selected.
+    call_target(&this, call: CallExprNode*) -> Target {
+        const pinned: Target = this.pin_target(&call.resolved_callee);
+        if (!pinned.is_nothing()) { return pinned; }
+        if (call.template_method.is_valid()) { return Target::Def(call.template_method); }
+        const ck: ASTNode* = call.callee as ASTNode*;
+        if (ck != null && ck.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
+            if (ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
+                const decl: ASTNode* = this.di.declaration_of(ma.resolved_trait);
+                if (decl != null && decl.kind == NodeKind::TraitDeclaration) {
+                    const td: TraitDeclNode* = decl as TraitDeclNode*;
+                    if (ma.resolved_trait_slot < td.methods.length) {
+                        return Locator::def_target(td.methods[ma.resolved_trait_slot].def);
+                    }
+                }
+            }
+        }
+        return Target::Nothing;
+    }
+
+    pin_target(&this, pin: &CalleePin) -> Target {
+        return match (pin) {
+            CalleePin::Decl(e)     => { this.entry_target(e) }
+            CalleePin::Instance(i) => { this.entry_target(this.di.entry_of_instance(i)) }
+            CalleePin::None        => { Target::Nothing }
+        };
+    }
+
+    /// The definition an overload entry was registered for; a copy's is
+    /// the definition it is a copy of.
+    entry_target(&this, e: OverloadId) -> Target {
+        const decl: ASTNode* = this.di.entry_decl(e);
+        if (decl == null) { return Target::Nothing; }
+        mut f: FunctionDeclNode* = null;
+        if (decl.kind == NodeKind::MethodDeclaration) { f = (decl as MethodNode*).func; }
+        if (decl.kind == NodeKind::FunctionDeclaration) { f = decl as FunctionDeclNode*; }
+        if (decl.kind == NodeKind::IntrinsicDeclaration) {
+            return Locator::def_target((decl as IntrinsicDeclNode*).def);
+        }
+        if (f == null) { return Target::Nothing; }
+        if (f.def.is_valid()) { return Target::Def(f.def); }
+        return Locator::def_target(f.copy_of);
+    }
+
+    static def_target(d: DefId) -> Target {
+        if (!d.is_valid()) { return Target::Nothing; }
+        return Target::Def(d);
+    }
+
+    /// Field `index` of the type `depth` steps up the base chain from the
+    /// type `ty` names.
+    field_target(&this, ty: TypeRef, depth: i64, index: i64) -> Target {
+        mut owner: DefId = this.di.def_of(this.carrier(ty), this.ctx.type_arena);
+        for (mut k: i64 = 0; k < depth && owner.is_valid(); k++) {
+            const decl: ASTNode* = this.di.declaration_of(owner);
+            if (decl == null || decl.kind != NodeKind::ClassDeclaration) { return Target::Nothing; }
+            owner = this.res_def(&(decl as ClassDeclNode*).base_res);
+        }
+        if (!owner.is_valid()) { return Target::Nothing; }
+        return Target::Field(owner, index);
+    }
+
+    /// The type a value of type `ty` is, through references and pointers.
+    carrier(&this, ty: TypeRef) -> TypeRef {
+        mut cur: TypeRef = ty;
+        for (mut hops: i64 = 0; hops < 8; hops++) {
+            if (!cur.is_valid()) { return cur; }
+            const t: type_base::Type* = this.ctx.type_arena.lookup(cur);
+            if (t == null) { return cur; }
+            if (t.kind == types::TypeKind::Reference) {
+                cur = (t as compound::ReferenceType*).referent;
+            } else if (t.kind == types::TypeKind::Pointer) {
+                cur = (t as compound::PointerType*).pointee;
+            } else {
+                return cur;
+            }
+        }
+        return cur;
+    }
+
+    // -- Stamps --
+
+    /// What a name-layer stamp names.  A type-relative path's target is
+    /// the type the name layer reached.
+    res_target(&this, slot: &ResSlot) -> Target {
+        match (slot) {
+            ResSlot::Answered(r) => {
+                return match (r) {
+                    Res::Def(d)          => { Locator::def_target(d) }
+                    Res::Local(s)        => { Target::Local(s) }
+                    Res::GenericParam(s) => { Target::TypeParam(s) }
+                    Res::PrimTy(p)       => { Target::Prim(p) }
+                    Res::TypeRelative(b, _) => { Locator::base_target(b) }
+                    _                    => { Target::Nothing }
+                };
+            }
+            ResSlot::Alias(d) => { return Locator::def_target(d); }
+            _ => { return Target::Nothing; }
+        }
+    }
+
+    static base_target(b: ResBase) -> Target {
+        return match (b) {
+            ResBase::Def(d)          => { Locator::def_target(d) }
+            ResBase::GenericParam(s) => { Target::TypeParam(s) }
+            ResBase::PrimTy(p)       => { Target::Prim(p) }
+        };
+    }
+
+    /// The definition a stamp names, or invalid.
+    res_def(&this, slot: &ResSlot) -> DefId {
+        return match (this.res_target(slot)) {
+            Target::Def(d) => { d }
+            _              => { DefId::invalid() }
+        };
+    }
+
+    // -- Patterns --
+
+    pattern(&this, p: PatternNode*) -> Answer {
+        const at: SourceSpan = (p as ASTNode*).span;
+        if ((p as ASTNode*).kind == NodeKind::EnumPattern) {
+            const ep: EnumPatternNode* = p as EnumPatternNode*;
+            if (this.holds(ep.enum_span)) {
+                return Answer::of(this.res_target(&ep.res), ep.enum_span, TypeRef::invalid());
+            }
+            if (this.holds(ep.variant_span)) {
+                match (&ep.resolved_member) {
+                    MemberPin::Variant(ord) => {
+                        const owner: DefId = this.res_def(&ep.res);
+                        if (owner.is_valid()) {
+                            return Answer::of(Target::Variant(owner, ord), ep.variant_span, TypeRef::invalid());
+                        }
+                    }
+                    _ => { }
+                }
+                return Answer::nothing();
+            }
+            for (mut i: i64 = 0; i < ep.elements.length; i++) {
+                match (ep.elements[i]) {
+                    PatternElement::Binding(b) => {
+                        if (b != null && this.holds(b.span)) {
+                            return Answer::of(Target::Local(b.sym_id), b.span, b.resolved_type);
+                        }
+                    }
+                    PatternElement::Sub(s) => {
+                        if (s != null && this.holds(s.span)) {
+                            return this.pattern(s.pattern as PatternNode*);
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            return Answer::nothing();
+        }
+        if (p.binding_name.is_valid()) {
+            return Answer::of(Target::Local(p.binding_sym), at, p.binding_type);
+        }
+        if (p.pattern_kind == PatternKind::Identifier) {
+            return Answer::of(this.res_target(&p.const_res), at, TypeRef::invalid());
+        }
+        return Answer::nothing();
+    }
+
+    // -- Declarations --
+
+    var_decl(&this, v: VarDeclNode*) -> Answer {
+        if (this.holds(v.name_span)) {
+            if (v.is_global) {
+                return Answer::of(Locator::def_target(v.def), v.name_span, v.resolved_type);
+            }
+            return Answer::of(Target::Local(v.sym_id), v.name_span, v.resolved_type);
+        }
+        return this.annotation(v.type_annotation);
+    }
+
+    function_decl(&this, f: FunctionDeclNode*, at: SourceSpan) -> Answer {
+        const d: DefId = if (f.def.is_valid()) { f.def } else { f.copy_of };
+        return Answer::of(Locator::def_target(d), at, TypeRef::invalid());
+    }
+
+    field_decl(&this, fd: FieldDeclNode*) -> Answer {
+        if (!this.holds(fd.name_span)) { return this.annotation(fd.type_annotation); }
+        const p: ASTNode* = this.parent();
+        if (p == null) { return Answer::nothing(); }
+        mut owner: DefId = DefId::invalid();
+        mut index: i64 = -1;
+        if (p.kind == NodeKind::StructDeclaration) {
+            const sd: StructDeclNode* = p as StructDeclNode*;
+            owner = sd.def;
+            index = Locator::field_position(&sd.fields, fd);
+        } else if (p.kind == NodeKind::ClassDeclaration) {
+            const cd: ClassDeclNode* = p as ClassDeclNode*;
+            owner = cd.def;
+            index = Locator::field_position(&cd.fields, fd);
+        } else if (p.kind == NodeKind::UnionDeclaration) {
+            const ud: UnionDeclNode* = p as UnionDeclNode*;
+            owner = ud.def;
+            index = Locator::field_position(&ud.fields, fd);
+        }
+        if (!owner.is_valid() || index < 0) { return Answer::nothing(); }
+        return Answer::of(Target::Field(owner, index), fd.name_span, fd.resolved_type);
+    }
+
+    static field_position(fields: &FieldDeclNode*[], fd: FieldDeclNode*) -> i64 {
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            if (fields[i] == fd) { return i; }
+        }
+        return -1;
+    }
+
+    variant_decl(&this, v: EnumVariantNode*) -> Answer {
+        const p: ASTNode* = this.parent();
+        if (!this.holds(v.name_span) || p == null || p.kind != NodeKind::EnumDeclaration) {
+            return Answer::nothing();
+        }
+        const ed: EnumDeclNode* = p as EnumDeclNode*;
+        for (mut i: i64 = 0; i < ed.variants.length; i++) {
+            if (ed.variants[i] == v) {
+                return Answer::of(Target::Variant(ed.def, i), v.name_span, TypeRef::invalid());
+            }
+        }
+        return Answer::nothing();
+    }
+
+    type_decl(&this, n: ASTNode*, d: DefId) -> Answer {
+        const at: SourceSpan = (n as DeclarationNode*).name_span;
+        if (!this.holds(at)) { return Answer::nothing(); }
+        return Answer::of(Locator::def_target(d), at, TypeRef::invalid());
+    }
+
+    impl_head(&this, ib: ImplBlockNode*) -> Answer {
+        if (this.holds(ib.target_type_span)) {
+            return Answer::of(this.res_target(&ib.res), ib.target_type_span, TypeRef::invalid());
+        }
+        const a: Answer = this.annotation(ib.trait_annotation);
+        if (!a.target.is_nothing()) { return a; }
+        for (mut i: i64 = 0; i < ib.target_args.length; i++) {
+            const t: Answer = this.annotation(ib.target_args[i]);
+            if (!t.target.is_nothing()) { return t; }
+        }
+        return Answer::nothing();
+    }
+
+    /// The module an import's path names, from its last segment, or the
+    /// definition a brace entry (or its alias) names.  An entry naming
+    /// several answers with the first it bound.
+    import(&this, imp: ImportDeclNode*) -> Answer {
+        for (mut k: i64 = 0; k < imp.specific_defs.length; k++) {
+            const e: i64 = imp.specific_def_entries[k];
+            const t: Target = Locator::def_target(imp.specific_defs[k]);
+            if (this.holds(imp.specific_spans[e])) {
+                return Answer::of(t, imp.specific_spans[e], TypeRef::invalid());
+            }
+            if (this.holds(imp.specific_alias_spans[e])) {
+                return Answer::of(t, imp.specific_alias_spans[e], TypeRef::invalid());
+            }
+        }
+        const last: i64 = imp.path_segment_spans.length - 1;
+        if (last < 0 || !this.holds(imp.path_segment_spans[last])) { return Answer::nothing(); }
+        if (!imp.resolved_module.is_valid()) { return Answer::nothing(); }
+        const d: DefId = this.ctx.module_graph.module_def(imp.resolved_module);
+        return Answer::of(Locator::def_target(d), imp.path_segment_spans[last], TypeRef::invalid());
+    }
+
+    /// The module a `public module` line names, from its path's last
+    /// segment: the one the loader found where the path is written.
+    submodule(&this, md: ModuleDeclNode*) -> Answer {
+        const last: i64 = md.path_segment_spans.length - 1;
+        if (!md.is_public || last < 0 || !this.holds(md.path_segment_spans[last])) {
+            return Answer::nothing();
+        }
+        const first: SourceSpan = md.path_segment_spans[0];
+        const m: ModulePath = this.ctx.module_graph.submodule_written_at(
+            this.module, first.start_line, first.start_col);
+        if (!m.is_valid()) { return Answer::nothing(); }
+        const d: DefId = this.ctx.module_graph.module_def(m);
+        return Answer::of(Locator::def_target(d), md.path_segment_spans[last], TypeRef::invalid());
+    }
+
+    /// The written type name at the position inside `ann`.
+    annotation(&this, ann: TypeAnnotation*) -> Answer {
+        const named: NamedAnnotation* = node_locator::find_named_annotation_at(ann, this.line, this.col);
+        if (named == null) { return Answer::nothing(); }
+        return Answer::of(this.res_target(&named.res), named.span, TypeRef::invalid());
+    }
+}

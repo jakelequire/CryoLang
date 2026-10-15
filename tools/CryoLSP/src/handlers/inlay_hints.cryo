@@ -1,0 +1,68 @@
+///! Inlay hints: the type the compiler gave each `const` or `mut` declared
+///! with no type written, shown after its name.  Read from the uses index
+///! (a declaration's `inferred` type) of the last analysis; a line edited
+///! since it gets none.
+namespace lsp::handlers::inlay_hints;
+
+import std::core::option;
+import std::collections::str;
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::json::value;
+
+import compiler::resolver::res::{ DefId, NameOrigin };
+
+import lsp::handlers::names::{ Names };
+import lsp::handlers::identity::{ Asked, Locator };
+import lsp::handlers::uses::{ Use, Uses };
+import lsp::protocol::lsp;
+import lsp::server::docs;
+import lsp::server::session;
+
+// The protocol's InlayHintKind for a type.
+const HINT_TYPE: i64 = 1;
+
+
+/// `textDocument/inlayHint`: hints on the lines of the request's range.
+public function handle_inlay_hints(docs: mut &docs::Docs, projects: mut &session::Projects,
+                                    params: &value::JsonValue) -> value::JsonValue {
+    const asked: Asked = Asked::from(docs, projects, params);
+    mut out: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+    if (asked.ctx == null || asked.module_idx < 0) { return value::JsonValue::Array(out); }
+    mut first: i64 = 0;
+    mut last: i64 = -1;
+    const range: value::JsonValue* = params.get(str::Str::from("range")).unwrap_or(null);
+    if (range != null) {
+        const s: value::JsonValue* = range.get(str::Str::from("start")).unwrap_or(null);
+        const e: value::JsonValue* = range.get(str::Str::from("end")).unwrap_or(null);
+        if (s != null) { first = Asked::u32_field(s, "line") as i64; }
+        if (e != null) { last = Asked::u32_field(e, "line") as i64; }
+    }
+    const doc: docs::Document* = docs.get(asked.uri).unwrap_or(null);
+    if (doc == null) { return value::JsonValue::Array(out); }
+    const loc: Locator = Locator::new(asked.ctx, 0, 0);
+    const all: Use[] = Uses::in_module(asked.ctx, asked.module_idx);
+    for (mut i: i64 = 0; i < all.length; i++) {
+        if (!all[i].decl || !all[i].inferred.is_valid()) { continue; }
+        // A type the compiler wrote (a lambda's closure struct) has no name
+        // the source could write.
+        const d: DefId = asked.ctx.decl_index.def_of(loc.carrier(all[i].inferred), asked.ctx.type_arena);
+        if (d.is_valid() && asked.ctx.defs.origin_of(d) == NameOrigin::Generated) { continue; }
+        const line: i64 = doc.buffer_line_of(all[i].span.start_line - 1);
+        if (line < 0 || line < first || (last >= 0 && line > last)) { continue; }
+        const at: lsp::Position = docs.range_of_span(all[i].span).end;
+        // Written as the scope where the binding is declared writes it.
+        const names: Names = Names::in_module(asked.ctx, asked.module_idx,
+                                              all[i].span.start_line, all[i].span.start_col);
+        mut label: String = String::from_string(": ");
+        label.push(str::Str::from(names.type_text(all[i].inferred)));
+        mut hint: value::JsonObject = value::JsonObject::new();
+        hint.put("position", at.to_json());
+        hint.put("label", value::JsonValue::from(label.as_str()));
+        hint.put("kind", value::JsonValue::int_value(HINT_TYPE));
+        out.push(value::JsonValue::Object(hint));
+    }
+    return value::JsonValue::Array(out);
+}

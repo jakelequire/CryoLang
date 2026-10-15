@@ -31,8 +31,9 @@ import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID, SymbolIds, SymbolKey };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::module_graph::{ ModuleKey, ModulePath };
-import std::collections::hashmap::{ HashMap };
+import std::collections::hashmap::{ HashMap, HashMapIter };
 import std::collections::pair::{ Pair };
+import std::core::mem;
 
 /// One name bound directly in a scope, with the TIER it occupies.  A scope's
 /// bindings are ordered:
@@ -352,6 +353,11 @@ type struct Resolver {
 
     // Resolution map
     resolution_map:     ResolutionMap;
+    /// `referenced_declarations`' set, and the map's record count and the
+    /// symbol count it was built at (-1: never built).
+    referenced:         HashMap<u64, boolean>;
+    referenced_records: u64;
+    referenced_symbols: i64;
 
     // Cross-module exports: Pair<SymbolID, ModulePath>[] avoids T[][] codegen
     // paths.  SymbolID[][] and HashMap<K, SymbolID[]>
@@ -433,6 +439,9 @@ type struct Resolver {
             global_scope:         global_id,
             current_scope:        global_id,
             resolution_map:       ResolutionMap::new(),
+            referenced:           HashMap::<u64, boolean>::new(),
+            referenced_records:   0,
+            referenced_symbols:   -1,
             exports:              [],
             current_module:       ModulePath::none(),
             prelude_modules:      [],
@@ -1067,9 +1076,36 @@ type struct Resolver {
         this.resolution_map.record(span, sym_id);
     }
 
-    /// Resolve a span to a symbol.
-    resolve(&this, span: SourceSpan) -> SymbolID {
-        return this.resolution_map.resolve(span);
+    /// The key (`ResolutionMap::make_key`) of the declaring span of every
+    /// symbol some span resolves to, less the entry a declaration records
+    /// for itself, so a declaration is never a use of itself.  The set is
+    /// the whole program's: it is built once and rebuilt only after the map
+    /// records again or a symbol is added.
+    referenced_declarations(mut &this) -> HashMap<u64, boolean>* {
+        const n: u64 = this.symbols.length as u64;
+        if (this.referenced_symbols == n as i64
+                && this.referenced_records == this.resolution_map.records) {
+            return &this.referenced;
+        }
+        mut fresh: HashMap<u64, boolean> = HashMap::<u64, boolean>::new();
+        mut it: HashMapIter<u64, SymbolID> = this.resolution_map.singles.iter();
+        loop {
+            match (it.next()) {
+                Option::Some(pair) => {
+                    const ref_key: u64  = pair.first;
+                    const sid: SymbolID = pair.second;
+                    if (!sid.is_valid() || sid.key() > n) { continue; }
+                    const decl_key: u64 = ResolutionMap::make_key(this.get_symbol(sid).declaring_span);
+                    if (ref_key != decl_key) { fresh.insert(decl_key, true); }
+                }
+                Option::None => { break; }
+            }
+        }
+        mem::swap(&fresh, &this.referenced);
+        mem::drop(fresh);
+        this.referenced_records = this.resolution_map.records;
+        this.referenced_symbols = n as i64;
+        return &this.referenced;
     }
 
 
@@ -1177,6 +1213,59 @@ type struct Resolver {
     /// and (under drop glue) double-free at the caller's scope exit.
     get_scope(&this, id: ScopeID) -> Scope* {
         return &this.scopes[id.id - 1];
+    }
+
+    /// The innermost scope the name layer entered, in module `m`, around
+    /// the position (`line`, `col`): a function, block, arm or type body whose
+    /// written span holds it, or the module's own scope when none does.
+    /// Invalid for a module with no scope.  Where two scopes are siblings
+    /// holding the same position, the one entered first answers.
+    scope_at(&this, m: ModulePath, line: u32, col: u32) -> ScopeID {
+        const sid: u64 = this.find_module_scope(m);
+        if (sid == 0) { return ScopeID::invalid(); }
+        mut at: ScopeID = ScopeID { id: sid };
+        mut deeper: boolean = true;
+        while (deeper) {
+            deeper = false;
+            const scope: Scope* = this.get_scope(at);
+            for (mut i: i64 = 0; i < scope.child_scope_ids.length; i++) {
+                const child: ScopeID = scope.child_scope_ids[i];
+                const child_scope: Scope* = this.get_scope(child);
+                if (Resolver::span_holds(&child_scope.span, line, col)) {
+                    at = child;
+                    deeper = true;
+                    break;
+                }
+            }
+        }
+        return at;
+    }
+
+    /// Whether `span` holds the position (`line`, `col`), ends inclusive.
+    static span_holds(span: &SourceSpan, line: u32, col: u32) -> boolean {
+        if (span.start_line == 0) { return false; }
+        if (line < span.start_line || line > span.end_line) { return false; }
+        if (line == span.start_line && col < span.start_col) { return false; }
+        if (line == span.end_line && col > span.end_col) { return false; }
+        return true;
+    }
+
+    /// Every binding visible from scope `s` along its rib chain, innermost
+    /// scope first and each scope's in the order it bound them, out to the
+    /// global scope: locals, parameters, the module's own declarations and
+    /// its imports.  A name bound in two scopes appears once per scope; the
+    /// first is the one a bare use binds.
+    visible_bindings(&this, s: ScopeID) -> SymbolID[] {
+        mut out: SymbolID[] = [];
+        mut scope_id: ScopeID = s;
+        while (scope_id.is_valid()) {
+            const scope: Scope* = this.get_scope(scope_id);
+            for (mut i: i64 = 0; i < scope.binding_count(); i++) {
+                out.push(scope.binding_at(i));
+            }
+            scope_id = scope.parent_id;
+        }
+        return out;
     }
 
     /// Total number of symbols declared.

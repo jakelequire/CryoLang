@@ -771,6 +771,19 @@ public:
     /// declaration `parse` names under `toml_parse`.  Empty when the entry
     /// has no `as`.
     specific_aliases: SymbolStr[];
+    /// Where each brace entry's name is written, parallel to
+    /// `specific_imports`; for `import A::B as C;` the path's last segment.
+    specific_spans:   SourceSpan[];
+    /// Where each entry's alias is written, parallel to `specific_aliases`;
+    /// `none()` when the entry has no `as`.
+    specific_alias_spans: SourceSpan[];
+    /// The definitions the entries name, as the name layer bound them where
+    /// the import is written: `specific_defs[k]` is named by the entry at
+    /// position `specific_def_entries[k]` in `specific_imports`.  One entry
+    /// can name several (a type and a function of one name, a function's
+    /// overloads), or a sub-module; an entry that names nothing has none.
+    specific_defs:        DefId[];
+    specific_def_entries: i64[];
     style:            ImportStyle;
 
     /// Per-segment metadata for `import std::collections::array;`:
@@ -808,27 +821,46 @@ public:
     /// reported from these once the graph is whole.
     private_export_entries: i64[];
 
+    /// The module `module_path` names, as the name layer resolved it where
+    /// the import is written; `none()` until then, and for a path naming no
+    /// module the graph holds (refused there).
+    resolved_module: ModulePath;
+
     ImportDeclNode(module_path: SymbolStr, style: ImportStyle, span: SourceSpan)
         : DeclarationNode(NodeKind::ImportDeclaration, span) {
         this.module_path        = module_path;
         this.alias              = SymbolStr::empty();
         this.specific_imports   = [];
         this.specific_aliases   = [];
+        this.specific_spans     = [];
+        this.specific_alias_spans = [];
+        this.specific_defs      = [];
+        this.specific_def_entries = [];
         this.style              = style;
         this.path_segments      = [];
         this.path_segment_spans = [];
         this.is_export          = false;
         this.path_entry         = false;
         this.private_export_entries = [];
+        this.resolved_module    = ModulePath::none();
     }
 
     has_alias() -> boolean { return !this.alias.is_empty(); }
 
     set_alias(a: SymbolStr) -> void { this.alias = a; }
 
-    add_specific_import(name: SymbolStr, alias: SymbolStr) -> void {
+    add_specific_import(name: SymbolStr, alias: SymbolStr,
+                        span: SourceSpan, alias_span: SourceSpan) -> void {
         this.specific_imports.push(name);
         this.specific_aliases.push(alias);
+        this.specific_spans.push(span);
+        this.specific_alias_spans.push(alias_span);
+    }
+
+    /// Records that the entry at `entry` names `def`.
+    add_entry_def(entry: i64, def: DefId) -> void {
+        this.specific_defs.push(def);
+        this.specific_def_entries.push(entry);
     }
 
     add_path_segment(name: SymbolStr, span: SourceSpan) -> void {
@@ -1254,15 +1286,6 @@ public:
     /// its associated types.
     slot_count(&this) -> i64 {
         return this.generic_params.length + this.assoc_types.length;
-    }
-
-    /// The trait's method named `n`, or null if it declares none such; the
-    /// first by declaration order where the trait overloads the leaf.
-    lookup_method(&this, n: SymbolStr) -> FunctionDeclNode* {
-        for (mut i: i64 = 0; i < this.methods.length; i++) {
-            if (this.methods[i] != null && this.methods[i].name.equals(n)) { return this.methods[i]; }
-        }
-        return null;
     }
 
     override accept(visitor: ASTVisitor*) -> void {

@@ -9,9 +9,10 @@ rulings that constrain an item are in the appendix of
 
 **Order.**  CI is aligned with `make verify`'s gate list first, as
 housekeeping (ruling 266: CI matches verify's gate list first thing after
-the merge).  The first project is the editor's rewrite, on a branch named
+the merge).  The first project was the editor's rewrite, on a branch named
 `lsp-rewrite` (ruling 316: the editor's rewrite comes first, before the
-type-syntax update and the class removal).  Then the type-syntax update
+type-syntax update and the class removal); what it built and what it left
+are under "The language server".  Then the type-syntax update
 (the array syntax below), then the class removal, then trait objects; the
 other items are not ordered yet.
 
@@ -75,7 +76,8 @@ itself cannot be checked object-for-object against `main`; compare against
 - The release smoke runs the STAGED tree, not the archive, and the Windows
   tree under wine with llvm-mingw's `clang.exe` driving the link; nothing
   runs the zip on a Windows host with the mingw `gcc` an installed
-  `cryo.exe` finds there.
+  `cryo.exe` finds there.  That stays so for now; a test of the zip on a
+  real Windows host is added before the first tagged release (ruling 323).
 - `make release`, `install` and `uninstall` are POSIX recipes with no
   Windows branch; on a Windows host they fail with a cmd parse error rather
   than a refusal.
@@ -92,28 +94,95 @@ its caller.  `make clean` removes every build output and gate state the
 targets write.  The untracked plans in `docs/` and `.todo/` are not part of
 the branch.
 
-## First: the editor's rewrite (`lsp-rewrite`)
+## The language server
 
-The first project after the merge, on its own branch (ruling 316).  The
-language server answers from the compiler's own identities - the
-definitions, types and module identities the name layer stamps - instead
-of finding declarations by their spelling.
+Rewritten on the `lsp-rewrite` branch (ruling 316) and merged into `main`.
+`tools/CryoLSP`
+answers from the identities the compiler stamps, never by a declaration's
+spelling: a position finds its node, the node's stamp names a definition,
+and every answer is read from that definition.  One analysis per project
+runs on open and on save, with every open buffer in place of its file; the
+last analysis that parsed answers while a buffer is broken or being typed,
+and answers requests between modules while the next one runs.  It serves
+diagnostics, hover, definition, references and highlights, document and
+workspace symbols, completion, semantic tokens, the implementations lens,
+rename, signature help and inlay hints, and writes names as the cursor's
+scope writes them (ruling 346).  A standard library or dependency file is
+answered from the analysis of the project that holds it.  `make lsp-check`
+drives the server through `tools/CryoLSP/tests/smoke.py` over its fixtures
+and refuses below its floor of passing checks (`docs/testing.md` section
+9).  Two open defects are in the bug log: memory that may grow across saves,
+and one unreproduced unanswered request.
 
-- **On-save analysis.**  The compiler analyses a file when it is saved, not
-  on every keystroke.
-- **A last-good snapshot.**  The editor keeps the most recent analysis that
-  succeeded, so a half-typed line does not take every answer away.
-- **Completion** comes from that snapshot plus the line being typed.
-- **Module caching on the compiler side**, so a save re-analyses what
-  changed rather than the whole program.
-- **The editor's remaining allows go then.**  Its 39 `![allow]`s naming the
-  deleted spelling lint are inert today and are deleted in this work (ruling
-  184: the editor's allows are deleted during its own work after the
-  merge).  The bare-name finders the editor still carries (D38) and its
-  fallback for a file with no project (D63) go in the same work.
+What is left:
 
-Open: how the snapshot is invalidated when an imported module changes; and
-whether the cache is per module or per file.
+- **Module caching** (ruling 345: the standard library analysed once per
+  server process as a frozen base layer; whole-module reuse waits for the
+  intermediate representation work).  Measured in the server, a save of
+  the compiler project (166 local and 81 standard library modules) takes
+  about 8 s and holds 1.6 GB, 3.1 GB at its peak while the next analysis
+  runs beside the last: discovery 2.4 s, name resolution 2.3 s,
+  monomorphization 0.9 s, the standard library's passes 1.8 s in all.  A
+  file under no project takes 0.85 s, all but a few milliseconds of it the
+  standard library: discovery 0.33 s, name resolution 0.19 s.  Every pass
+  after semantic analysis reports diagnostics the editor shows (move
+  checking, the dead-code lint, E0456 from drop insertion, E0236 and E0237
+  from type lowering), so the editor's mode skips none of them.  In order:
+  1. The frozen standard library layer.  Every table of an analysis lives
+     in one context and one arena, and monomorphization routes the
+     specializations a project asks for into the standard library's own
+     module trees, so the library's state after an analysis depends on the
+     project.  A frozen layer needs the library to finish the stages before
+     monomorphization ahead of the project's modules, every table to
+     retract to a mark, the arena split in two, and specializations kept
+     out of the frozen trees.
+  2. Lex each file once: discovery lexes every project file whole for its
+     `namespace`, again for its imports, and the frontend lexes it a third
+     time.  Then a cache of each file's scan result (namespace, import
+     paths, `public module` lines) keyed by path and content hash, held by
+     the server across analyses and handed to the loader through
+     `BuildOptions` as the yield hook is.  Its entries are strings, not
+     identities, so they can outlive an analysis's arena.
+  3. A token cache per file by content hash; a parsed-tree cache only if
+     cloning a pristine tree measures cheaper than parsing, since later
+     stages write stamps into the tree and monomorphization writes
+     specializations into the owning module's.
+  4. Per-module reuse after name resolution, as part of identities that
+     are stable across analyses.  Invalidation would be the object cache's
+     key: a module's source hash folded with every hash in its import
+     closure and the prelude's.  What stops it today is that every identity
+     (`SymbolStr`, `DefId`, `ScopeID`, `SymbolID`, `TypeRef`) is a position
+     in a table one analysis builds and the next rebuilds, all in the
+     analysis's arena, and a module's results name other modules'
+     identities.  Either identities keyed by path and structure, or one
+     long-lived context whose tables can retract a module's entries: a
+     compiler architecture project.
+- **Parsing that continues past an error** (ruling 330), only if the last
+  good analysis proves not to be enough.
+- **Completion is not read for a receiver whose head is a path**
+  (`T::make().`).  After an import's path it lists only the modules the
+  last analysis loaded, so `import std::` offers the standard library's
+  modules the project reaches, not every one on disk.
+- **Rename** refuses a module (its name is its namespace declaration and
+  its file's place), a method a trait declares or implements (the trait's
+  and every implementation's would move together), and a name at an
+  import's alias.  Its collision check asks the bare-name lookups at every
+  use, a qualified use (`B::helper()`) included, which can refuse a rename
+  that would have been safe there.
+- **Signature help** reads a call whose `(` is on the cursor's line only;
+  **inlay hints** show inferred types, not parameter names at call sites.
+- **The uses index** is built per request (ruling 337); a cache waits for a
+  measurement that needs one.
+- **A library file opened before any analysis holds it** (a standard
+  library file opened first, with no project open) is analysed as a project
+  of its own cryoconfig.  With the frozen standard library layer it would
+  be answered from that layer instead.
+- **Code the compiler writes is marked `generated`** by drop insertion, the
+  closure synthesis and the conversions the type check writes, which the
+  editor looks through.  The asynchronous lowering and the `?` desugaring
+  write locals with synthetic bindings and do not mark them; a sweep of
+  every request over async and `?` programs found no wrong answer, but
+  nothing holds the mark there.
 
 ## CI
 
@@ -153,10 +222,6 @@ normalised before the comparison.
 - **`scripts/` is restructured** into `gates/`, `pin/`, `release/`,
   `toolchain/` and `dev/` (ruling 273: the restructure happens after the
   merge).  Renames only, with every caller updated in the same commit.
-- **The language server's smoke test runs in the LSP check.**
-  `tools/CryoLSP/tests/smoke.py` starts the server and asks it questions;
-  nothing calls it today (ruling 269: it stays and is wired into the LSP
-  check after the merge).
 - **`cryo build` can stop at object files** (ruling 322: on the roadmap,
   not built yet).  A Linux host links a windows-gnu build rather than
   stopping at objects, so `make cross-check` there needs mingw and the
@@ -164,8 +229,13 @@ normalised before the comparison.
   cross-check from the Windows job only.  A flag that ends the build before
   the link lets the gate check what it claims to, objects only, from either
   host.
+- **The Windows release zip is tested on a real Windows host before the
+  first tagged release** (ruling 323): unpacked, and a hello-world built and
+  run with the mingw `gcc` an installed `cryo.exe` finds there.  Until then
+  the release smoke stays the staged tree under wine.
 - **The language server reports the stamped version** (`serverInfo`) that
-  `cryo version` prints.
+  `cryo version` prints, with the matching change in the VS Code extension
+  (ruling 343).
 - **`cryo version --verbose` shows the binary's sha256,** once the standard
   library has a sha256; it has sha1 only today.
 - **`make verify ARGS="--baseline REV"` works for a revision from before

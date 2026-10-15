@@ -1,17 +1,18 @@
 ///! Text-document synchronization.
 ///!
-///! Three notifications, all carrying a `textDocument` and (for
-///! didOpen / didChange) some text:
+///!   - didOpen   -> store the buffer; analyse its project if it never was
+///!   - didChange -> replace the buffer; nothing is analysed
+///!   - didSave   -> analyse the file's project again
+///!   - didChangeWatchedFiles -> the same, for a `.cryo` file changed on disk
+///!   - didClose  -> drop the buffer, clear its squiggles and dimming
 ///!
-///!   - didOpen   -> store doc, create session, recompile, publish
-///!   - didChange -> replace doc text, recompile, publish
-///!   - didClose  -> drop doc, drop session, publish empty diagnostics
+///! Analyses run in `flush`, when the server's input goes quiet, or sooner
+///! when a request needs one (`Projects::analysis_for`); `flush` publishes
+///! the diagnostics of every analysis that ran.
 ///!
-///! The advertised `textDocumentSync` is `1 = Full`, so editors
-///! send the whole document text on every didChange.  `did_change`
-///! pulls the LAST entry of `contentChanges` and treats its `text`
-///! field as the new document - for Full sync there's exactly one
-///! entry with no `range`, so this is correct.
+///! The advertised `textDocumentSync` change kind is `1 = Full`, so editors
+///! send the whole document on every didChange; the LAST entry of
+///! `contentChanges` is the new text.
 
 namespace lsp::handlers::text_sync;
 
@@ -21,6 +22,7 @@ import std::collections::str;
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::array;
+import std::collections::array::{ Array };
 import std::io::stdio;
 import std::json::value;
 
@@ -31,27 +33,18 @@ import lsp::handlers::diagnostics;
 import lsp::handlers::inactive_regions;
 import lsp::protocol::jsonrpc;
 import lsp::protocol::framing;
+import lsp::protocol::conv;
 
 
-public function did_open(docs: mut &docs::Docs, sessions: mut &session::SessionMap,
+public function did_open(docs: mut &docs::Docs, projects: mut &session::Projects,
                           params: &value::JsonValue) -> void {
     match (params.get(str::Str::from("textDocument"))) {
         Option::Some(td) => {
             const uri:     String = TextFields::clone_string_field_or_empty(td, "uri");
             const version: i32    = TextFields::i32_field_or(td, "version", 1 as i32);
             const text:    String = TextFields::clone_string_field_or_empty(td, "text");
-
-            // Defer the compile+publish: mark the session dirty and queue
-            // the URI.  The flush (idle window in the server loop, or the
-            // next request via ensure_fresh) turns the whole burst into a
-            // single compile.  Queuing here FIRST (it only borrows the URI)
-            // lets the freshly-extracted `uri`/`text` buffers be MOVED into
-            // `Document` below instead of copied again - under Full sync
-            // `text` is the whole file, so that saves a full-document copy
-            // per didOpen.
-            sessions.mark_dirty(uri.as_str());
-
             mut doc: docs::Document = docs::Document::new(uri, text, version);
+            projects.note_open(doc.path.as_str());
             docs.insert(doc);
         }
         Option::None => { }
@@ -59,49 +52,26 @@ public function did_open(docs: mut &docs::Docs, sessions: mut &session::SessionM
 }
 
 
-public function did_change(docs: mut &docs::Docs, sessions: mut &session::SessionMap,
-                            params: &value::JsonValue) -> void {
+public function did_change(docs: mut &docs::Docs, params: &value::JsonValue) -> void {
     match (params.get(str::Str::from("textDocument"))) {
         Option::Some(td) => {
             const uri:     String = TextFields::clone_string_field_or_empty(td, "uri");
             const version: i32    = TextFields::i32_field_or(td, "version", 1 as i32);
-
-            // Pull the LAST entry of `contentChanges` - for full-sync
-            // clients there's exactly one; for incremental clients
-            // taking this approach loses partial edits (TODO when v2).
             const new_text: String = match (params.get(str::Str::from("contentChanges"))) {
                 Option::Some(changes) => { TextFields::last_change_text(changes) }
                 Option::None          => { String::new() }
             };
-
-            // Coalesce: flag the edit and enqueue; the compile is owed
-            // but not run here (see did_open).  This is what turns a
-            // per-keystroke whole-project recompile into one compile per
-            // editing pause.  Done BEFORE consuming the buffers (it only
-            // borrows the URI) so `new_text` can be MOVED into the store
-            // below rather than copied again - under Full sync `new_text`
-            // is the whole document, so that saves a full-document copy
-            // per keystroke.
-            sessions.mark_dirty(uri.as_str());
-
-            // Update the stored document - `replace_text` rebuilds the
-            // line index, which is needed even for full sync.  `new_text`
-            // is moved into whichever path applies and isn't read after.
             match (docs.get(uri.as_str())) {
                 Option::Some(doc_ptr) => {
                     doc_ptr.replace_text(new_text, version);
                 }
                 Option::None => {
-                    // didChange before didOpen - accept it anyway by
-                    // creating the doc.
+                    // didChange before didOpen - accept it as an open.
                     mut fresh: docs::Document = docs::Document::new(
-                        String::from_str(uri.as_str()),
-                        new_text,
-                        version);
+                        String::from_str(uri.as_str()), new_text, version);
                     docs.insert(fresh);
                 }
             }
-
             mem::drop(uri);
         }
         Option::None => { }
@@ -109,54 +79,85 @@ public function did_change(docs: mut &docs::Docs, sessions: mut &session::Sessio
 }
 
 
-/// Compile + publish every document queued by `mark_dirty` since the
-/// last flush, then clear the queue.  Called by the server loop when the
-/// input stream goes idle (the edit burst has subsided).  Each URI is
-/// routed through `ensure_fresh`, so a document already recompiled by an
-/// interleaved request (hover/completion) isn't compiled twice - it just
-/// gets its diagnostics published.
-public function flush_pending(docs: &docs::Docs, sessions: mut &session::SessionMap,
-                               writer: mut &stdio::Stdout, cache: diag_render_cache::DiagRenderCache*,
-                               outbound: mut &OutboundRequests) -> void {
-    mut uris: Array<String> = sessions.take_pending();
-    const n: u64 = uris.length();
-    for (mut i: u64 = 0; i < n; i++) {
-        match (uris.get_ref(i)) {
-            Option::Some(uri_ptr) => {
-                const uri: str::Str = uri_ptr.as_str();
-                const session: session::CompilerSession* = sessions.ensure_fresh(docs, uri);
-                if (session != null && session.context() != null) {
-                    // The version `ensure_fresh` compiled from - the client
-                    // needs it to tell a fresh result from one that raced a
-                    // keystroke (see InactiveRegionsPublisher::publish_for).
-                    const version: i32 = match (docs.get(uri)) {
-                        Option::Some(doc) => { doc.version }
-                        Option::None      => { -1 }
-                    };
-                    diagnostics::DiagnosticPublisher::publish_for(writer, uri,
-                                              session.context(), cache);
-                    inactive_regions::InactiveRegionsPublisher::publish_for(writer, uri,
-                                              session.context(), version);
-                    outbound.send_semantic_tokens_refresh(writer);
-                }
-            }
-            Option::None => { }
+public function did_save(projects: mut &session::Projects, params: &value::JsonValue) -> void {
+    match (params.get(str::Str::from("textDocument"))) {
+        Option::Some(td) => {
+            mut uri: String = TextFields::clone_string_field_or_empty(td, "uri");
+            mut path: String = conv::UriPath::uri_to_fs_path(uri.as_str());
+            projects.note_saved(path.as_str());
+            mem::drop(path);
+            mem::drop(uri);
         }
+        Option::None => { }
     }
-    mem::drop(uris);
 }
 
 
-public function did_close(docs: mut &docs::Docs, sessions: mut &session::SessionMap,
-                           writer: mut &stdio::Stdout, params: &value::JsonValue) -> void {
+/// `workspace/didChangeWatchedFiles`: a `.cryo` file created, changed or
+/// deleted on disk is a reason to analyse its project again.
+public function did_change_watched_files(projects: mut &session::Projects,
+                                         params: &value::JsonValue) -> void {
+    match (params.get(str::Str::from("changes"))) {
+        Option::Some(changes) => {
+            match (changes) {
+                value::JsonValue::Array(arr) => {
+                    for (mut i: u64 = 0; i < arr.length(); i++) {
+                        match (arr.get_ref(i)) {
+                            Option::Some(ch) => {
+                                mut uri: String = TextFields::clone_string_field_or_empty(ch, "uri");
+                                if (uri.as_str().ends_with(&str::Str::from(".cryo"))) {
+                                    mut path: String = conv::UriPath::uri_to_fs_path(uri.as_str());
+                                    projects.note_saved(path.as_str());
+                                    mem::drop(path);
+                                }
+                                mem::drop(uri);
+                            }
+                            Option::None => { }
+                        }
+                    }
+                }
+                _ => { }
+            }
+        }
+        Option::None => { }
+    }
+}
+
+
+/// Run every owed analysis and publish the diagnostics and inactive regions
+/// of every analysis that ran, for each open document of its project.  An
+/// analysis that did not parse publishes its diagnostics measured against
+/// the buffers it read - the buffers as they are now - and is then released.
+public function flush(docs: mut &docs::Docs, projects: mut &session::Projects,
+                      writer: mut &stdio::Stdout, cache: diag_render_cache::DiagRenderCache*,
+                      outbound: mut &OutboundRequests) -> void {
+    mut ready: Array<session::Project*> = projects.take_unpublished(docs);
+    for (mut i: u64 = 0; i < ready.length(); i++) {
+        const p: session::Project* = ready.get(i).unwrap_or(null);
+        if (p == null) { continue; }
+        const a: session::Analysis* = p.published_analysis();
+        a.publish_arena();
+        docs.measure_buffers = (p.last.ctx != null);
+        for (d in docs.by_uri.values_ref()) {
+            if (!p.owns(d.path.as_str())) { continue; }
+            diagnostics::DiagnosticPublisher::publish_for(writer, d.uri.as_str(), a.ctx, cache, docs);
+            inactive_regions::InactiveRegionsPublisher::publish_for(writer, d.uri.as_str(),
+                                                                    a.ctx, d.version, docs);
+        }
+        docs.measure_buffers = false;
+        p.last.release();
+    }
+    if (ready.length() > 0) { outbound.send_semantic_tokens_refresh(writer); }
+    mem::drop(ready);
+}
+
+
+public function did_close(docs: mut &docs::Docs, writer: mut &stdio::Stdout,
+                           params: &value::JsonValue) -> void {
     match (params.get(str::Str::from("textDocument"))) {
         Option::Some(td) => {
             const uri: String = TextFields::clone_string_field_or_empty(td, "uri");
             docs.remove(uri.as_str());
-            sessions.remove(uri.as_str());
-            // Drop any queued-but-unflushed edit for this URI so a later
-            // flush doesn't resurrect a session for a closed document.
-            sessions.clear_pending_for(uri.as_str());
             // Clear stale squiggles + dimming in the editor.
             diagnostics::DiagnosticPublisher::publish_empty(writer, uri.as_str());
             inactive_regions::InactiveRegionsPublisher::publish_empty(writer, uri.as_str());
@@ -233,9 +234,12 @@ type struct TextFields {
 /// counter lives on a struct field instead of a module global.
 type struct OutboundRequests {
     next: i64;
+    /// The client declared `workspace.semanticTokens.refreshSupport`; a
+    /// refresh request to a client that did not is an unknown method to it.
+    refresh_supported: boolean;
 
     static new() -> OutboundRequests {
-        return OutboundRequests { next: 1 as i64 };
+        return OutboundRequests { next: 1 as i64, refresh_supported: false };
     }
 
     /// Hand out the next request id and advance the counter.
@@ -245,15 +249,11 @@ type struct OutboundRequests {
         return id;
     }
 
-    /// Send `workspace/semanticTokens/refresh` to invalidate the editor's
-    /// cached semantic tokens.  Called after every recompile so the client
-    /// re-requests tokens against the freshly-built AST.  Without this, the
-    /// editor keeps painting STALE tokens from a previous parse onto the
-    /// current text: as the user types, the cached spans drift away from
-    /// the identifiers they were meant to colour, and VS Code renders the
-    /// stale span colours on top of TextMate, producing the "broken-up,
-    /// overlapping" highlighting the user reports.
+    /// Send `workspace/semanticTokens/refresh` so the client re-requests
+    /// tokens against the new analysis instead of painting tokens from an
+    /// older one over text that has moved.
     send_semantic_tokens_refresh(mut &this, writer: mut &stdio::Stdout) -> void {
+        if (!this.refresh_supported) { return; }
         const id: i64 = this.next_id();
         mut body: String = jsonrpc::JsonRpcCodec::encode_request(
             id,

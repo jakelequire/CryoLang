@@ -148,6 +148,14 @@ public:
     }
 }
 
+/// A `public module` line: where its path starts in the declaring file, and
+/// the module it names.
+type struct SubmoduleSite {
+    line:   u32;
+    col:    u32;
+    module: ModulePath;
+}
+
 /// What one file can see under a module spelling.
 ///
 /// `visible` and `matched` are kept apart because they answer different
@@ -227,6 +235,9 @@ public:
     /// decided and measured on its own terms - not acquired as a side effect
     /// of removing a hardcoded list.
     submodules:     ModulePath[];
+    /// Each `public module` line whose path names a module the graph holds:
+    /// where the path starts in this module's file, and the module.
+    submodule_sites: SubmoduleSite[];
 
     /// Modules this module RE-EXPORTS with `export X;`.  An importer of this
     /// module sees these as if it had imported them itself, transitively.
@@ -248,6 +259,8 @@ public:
     written_dependencies: RecordedEdge[];
     written_imported:     RecordedEdge[];
     written_submodules:   RecordedEdge[];
+    /// Where each of `written_submodules` is written, parallel to it.
+    written_submodule_at: SourceSpan[];
     written_reexports:    RecordedEdge[];
     /// Every module this module can see through its imports: its
     /// dependencies and brace items, closed over re-exports.  Set once
@@ -279,10 +292,12 @@ public:
             dependencies:        [],
             imported_namespaces: [],
             submodules:          [],
+            submodule_sites:     [],
             reexports:           [],
             written_dependencies: [],
             written_imported:     [],
             written_submodules:   [],
+            written_submodule_at: [],
             written_reexports:    [],
             visible:              [],
             unresolved_dependencies: 0,
@@ -354,10 +369,12 @@ public:
         this.written_reexports.push(ns);
     }
 
-    /// Record a `public module X;` target by its resolved namespace.
+    /// Record a `public module X;` target by its resolved namespace, and
+    /// where its path is written (`at`'s start; its file is not read).
     /// See `submodules` for why this grants nothing on its own.
-    add_submodule(mut &this, ns: RecordedEdge) -> void {
+    add_submodule(mut &this, ns: RecordedEdge, at: SourceSpan) -> void {
         this.written_submodules.push(ns);
+        this.written_submodule_at.push(at);
     }
 
 
@@ -514,6 +531,19 @@ public:
         return this.module_named(written);
     }
 
+    /// The path an import writes, `std` in `import std::`, when the graph
+    /// holds a module at it or anywhere under it, whether or not the path
+    /// names a module itself; none otherwise.  What it answers is a path to
+    /// list the modules within (`ModulePath::is_within`), not a module.
+    module_path_over(&this, written: SymbolStr, intern: InternTable*) -> ModulePath {
+        if (!written.is_valid() || intern == null) { return ModulePath::none(); }
+        const m: ModulePath = ModulePath::of(written);
+        for (mut i: i64 = 0; i < this.modules.length; i++) {
+            if (ModulePath::of(this.modules[i].name).is_within(m, intern)) { return m; }
+        }
+        return ModulePath::none();
+    }
+
     /// The module nested in `m` under `leaf` - `<m>::<leaf>` - when the
     /// graph holds one; none otherwise.  A declaration of `leaf` in `m`
     /// shares that module's canonical name.
@@ -556,6 +586,18 @@ public:
     /// Record what the module at `idx` can see through its imports.
     set_visible_modules(mut &this, idx: i64, visible: ModulePath[]) -> void {
         this.modules[idx].visible = visible;
+    }
+
+    /// The module the `public module` line of module `m` whose path starts
+    /// at `line`:`col` names; none for any other position.
+    submodule_written_at(&this, m: ModulePath, line: u32, col: u32) -> ModulePath {
+        const idx: i64 = this.find_module_index(m);
+        if (idx < 0) { return ModulePath::none(); }
+        const sites: &SubmoduleSite[] = &this.modules[idx].submodule_sites;
+        for (mut k: i64 = 0; k < sites.length; k++) {
+            if (sites[k].line == line && sites[k].col == col) { return sites[k].module; }
+        }
+        return ModulePath::none();
     }
 
     /// Whether the module `use_module` can see `target` through its imports.
@@ -719,12 +761,27 @@ public:
             mut ignored: u32 = 0;
             this.modules[i].imported_namespaces = this.modules_of(&this.modules[i].written_imported, -1, true, &ignored);
             this.modules[i].submodules = this.modules_of(&this.modules[i].written_submodules, -1, true, &ignored);
+            mut sites: SubmoduleSite[] = [];
+            for (mut k: i64 = 0; k < this.modules[i].written_submodules.length; k++) {
+                const m: ModulePath = this.edge_module(&this.modules[i].written_submodules[k]);
+                if (!m.is_valid() || k >= this.modules[i].written_submodule_at.length) { continue; }
+                const at: SourceSpan = this.modules[i].written_submodule_at[k];
+                sites.push(SubmoduleSite { line: at.start_line, col: at.start_col, module: m });
+            }
+            this.modules[i].submodule_sites = sites;
+            this.modules[i].written_submodule_at = [];
             this.modules[i].reexports = this.modules_of(&this.modules[i].written_reexports, i, true, &ignored);
             this.modules[i].written_dependencies = [];
             this.modules[i].written_imported = [];
             this.modules[i].written_submodules = [];
             this.modules[i].written_reexports = [];
         }
+    }
+
+    /// The module a recorded edge names, or none when the graph holds none.
+    edge_module(&this, e: &RecordedEdge) -> ModulePath {
+        if (e.target.is_valid()) { return e.target; }
+        return this.module_named(e.written);
     }
 
     /// The modules a recorded list of namespaces names, in order; one the
@@ -736,8 +793,7 @@ public:
         mut out: ModulePath[] = [];
         mut seen: i64[] = [];
         for (mut i: i64 = 0; i < written.length; i++) {
-            const m: ModulePath =
-                if (written[i].target.is_valid()) { written[i].target } else { this.module_named(written[i].written) };
+            const m: ModulePath = this.edge_module(&written[i]);
             if (!m.is_valid()) {
                 *out_unresolved = *out_unresolved + 1;
                 continue;

@@ -32,13 +32,13 @@ import compiler::ast;
 import compiler::ast::node;
 import compiler::ast::declaration;
 import compiler::ast::node_locator;
-import lsp::handlers::decl_finder;
-import compiler::resolver::symbol_str;
+import compiler::resolver::res::{ DefId, ResSlot };
 import compiler::module_graph;
 
 import lsp::server::session;
 import lsp::server::docs;
 import lsp::protocol::conv;
+import lsp::protocol::lsp;
 import std::fmt;
 
 
@@ -46,7 +46,7 @@ import std::fmt;
 /// array to put in the response's `result` field.  An empty array
 /// (no session, no compile, no diagnostics for this URI) is a valid
 /// non-result.
-public function handle_code_lens(docs: &docs::Docs, sessions: mut &session::SessionMap,
+public function handle_code_lens(docs: mut &docs::Docs, projects: mut &session::Projects,
                                   params: &value::JsonValue) -> value::JsonValue {
     mut lenses: Array<value::JsonValue> = Array::<value::JsonValue>::new();
 
@@ -56,14 +56,7 @@ public function handle_code_lens(docs: &docs::Docs, sessions: mut &session::Sess
         return value::JsonValue::Array(lenses);
     }
 
-    // Recompile-if-stale (see hover.cryo) so the diagnostic sink we read
-    // below isn't backed by shared-arena memory recycled by another
-    // document's compile.
-    const session: session::CompilerSession* = sessions.ensure_fresh(docs, uri.as_str());
-    if (session == null) {
-        return value::JsonValue::Array(lenses);
-    }
-    const ctx: compilation_context::CompilationContext* = session.context();
+    const ctx: compilation_context::CompilationContext* = projects.analysis_for(docs, uri.as_str());
     if (ctx == null) {
         return value::JsonValue::Array(lenses);
     }
@@ -79,7 +72,7 @@ public function handle_code_lens(docs: &docs::Docs, sessions: mut &session::Sess
         if (!conv::DiagnosticConverter::diag_is_for_path(&diags[i], fs_path)) { continue; }
         if (!diags[i].span.has_location())               { continue; }
         mut id: String = conv::DiagnosticConverter::build_diag_id(&diags[i]);
-        lenses.push(CodeLensBuilder::build_lens(&diags[i], id.as_str()));
+        lenses.push(CodeLensBuilder::build_lens(docs, &diags[i], id.as_str()));
         mem::drop(id);
     }
     mem::drop(fs_path_owned);
@@ -88,7 +81,7 @@ public function handle_code_lens(docs: &docs::Docs, sessions: mut &session::Sess
     // trait declaration in this document, counting impl blocks across the
     // whole module graph.  Clicking it opens a reference peek listing each
     // implementation (client command `cryo.showImplementations`).
-    ImplLensBuilder::append_impl_lenses(&lenses, ctx, uri.as_str());
+    ImplLensBuilder::append_impl_lenses(&lenses, ctx, uri.as_str(), docs);
 
     return value::JsonValue::Array(lenses);
 }
@@ -107,61 +100,89 @@ type struct ImplLensBuilder {
     /// No-op when the module isn't in the graph (single-file fallback for
     /// a URI outside the project) or carries no type/trait decls.
     static append_impl_lenses(lenses: mut &Array<value::JsonValue>,
-                               ctx: compilation_context::CompilationContext*, uri: str::Str) -> void {
+                               ctx: compilation_context::CompilationContext*, uri: str::Str,
+                               positions: &docs::Docs) -> void {
         if (ctx == null || ctx.module_graph == null) { return; }
         const ast: node::ProgramNode* = ImplLensBuilder::module_ast_for_uri(ctx, uri);
         if (ast == null) { return; }
 
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
             const stmt: node::ASTNode* = node_locator::NodeLocator::unwrap_decl_stmt(ast.statements[si]);
-            if (stmt == null) { continue; }
+            if (stmt == null || stmt.generated) { continue; }
 
-            // Classify: which decls get a lens, and by name vs by trait.
-            mut name: symbol_str::SymbolStr = symbol_str::SymbolStr::empty();
+            // Which declarations get a lens: a type, by the implementations
+            // targeting it, and a trait, by the implementations of it.
+            mut def: DefId = DefId::invalid();
             mut is_trait: boolean = false;
-            mut wanted: boolean = true;
             match (stmt.kind) {
-                ast::NodeKind::StructDeclaration => {
-                    const d: declaration::StructDeclNode* = stmt as declaration::StructDeclNode*;
-                    name = d.name;
-                }
-                ast::NodeKind::ClassDeclaration => {
-                    const d: declaration::ClassDeclNode* = stmt as declaration::ClassDeclNode*;
-                    name = d.name;
-                }
-                ast::NodeKind::EnumDeclaration => {
-                    const d: declaration::EnumDeclNode* = stmt as declaration::EnumDeclNode*;
-                    name = d.name;
-                }
-                ast::NodeKind::UnionDeclaration => {
-                    const d: declaration::UnionDeclNode* = stmt as declaration::UnionDeclNode*;
-                    name = d.name;
-                }
-                ast::NodeKind::TraitDeclaration => {
-                    const d: declaration::TraitDeclNode* = stmt as declaration::TraitDeclNode*;
-                    name = d.name;
+                ast::NodeKind::StructDeclaration => { def = (stmt as declaration::StructDeclNode*).def; }
+                ast::NodeKind::ClassDeclaration  => { def = (stmt as declaration::ClassDeclNode*).def; }
+                ast::NodeKind::EnumDeclaration   => { def = (stmt as declaration::EnumDeclNode*).def; }
+                ast::NodeKind::UnionDeclaration  => { def = (stmt as declaration::UnionDeclNode*).def; }
+                ast::NodeKind::TraitDeclaration  => {
+                    def = (stmt as declaration::TraitDeclNode*).def;
                     is_trait = true;
                 }
-                _ => { wanted = false; }
+                _ => { }
             }
-            if (!wanted || !name.is_valid()) { continue; }
+            if (!def.is_valid()) { continue; }
 
-            // `find_impls_of_*` returns an owning array; auto-dropped at
-            // the end of this iteration (its SourceSpans are non-owning
-            // views into AST-owned strings, so nothing else frees).
-            mut spans: source_span::SourceSpan[] = [];
-            if (is_trait) {
-                spans = decl_finder::DeclFinder::find_impls_of_trait(ctx.module_graph, ctx.intern_table, name);
-            } else {
-                spans = decl_finder::DeclFinder::find_impls_of_type(ctx.module_graph, ctx.intern_table, name);
-            }
+            const spans: source_span::SourceSpan[] = ImplLensBuilder::impls_of(ctx, def, is_trait);
             if (spans.length == 0) { continue; }
 
             const name_span: source_span::SourceSpan = node_locator::name_span_of(stmt);
             if (!name_span.has_location()) { continue; }
 
-            lenses.push(ImplLensBuilder::build_impl_lens(uri, name_span, &spans));
+            lenses.push(ImplLensBuilder::build_impl_lens(positions, uri, name_span, &spans));
         }
+    }
+
+    /// Where each implementation of `def` is written: the blocks whose
+    /// target the name layer stamped with `def`, or for a trait, whose
+    /// trait it stamped with `def`.  A block copied into another module
+    /// keeps its template's spans and is counted where it is written; a
+    /// block the compiler wrote is written nowhere.
+    static impls_of(ctx: compilation_context::CompilationContext*, def: DefId,
+                    is_trait: boolean) -> source_span::SourceSpan[] {
+        mut spans: source_span::SourceSpan[] = [];
+        const n: u32 = ctx.module_graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const prog: node::ProgramNode* = ctx.module_graph.get_module_ast(mi);
+            if (prog == null) { continue; }
+            const file: string = ctx.module_graph.modules[mi as i64].file_path;
+            for (mut si: i64 = 0; si < prog.statements.length; si++) {
+                const stmt: node::ASTNode* = node_locator::NodeLocator::unwrap_decl_stmt(prog.statements[si]);
+                if (stmt == null || stmt.generated || stmt.kind != ast::NodeKind::ImplementationBlock) { continue; }
+                if (stmt.span.file == null || !stmt.span.file.eq(file)) { continue; }
+                const ib: declaration::ImplBlockNode* = stmt as declaration::ImplBlockNode*;
+                const named: DefId = if (is_trait) {
+                    ImplLensBuilder::annotation_def(ib.trait_annotation)
+                } else {
+                    ImplLensBuilder::slot_def(&ib.res)
+                };
+                if (!named.equals(def)) { continue; }
+                spans.push(if (ib.target_type_span.has_location()) { ib.target_type_span } else { stmt.span });
+            }
+        }
+        return spans;
+    }
+
+    /// The definition a type annotation's head names: `Iterator` in
+    /// `Iterator<T>`; invalid for any other shape.
+    static annotation_def(ann: ast::TypeAnnotation*) -> DefId {
+        if (ann == null) { return DefId::invalid(); }
+        return match (*ann) {
+            ast::TypeAnnotation::Named(n)   => { ImplLensBuilder::slot_def(&n.res) }
+            ast::TypeAnnotation::Generic(g) => { ImplLensBuilder::annotation_def(g.base) }
+            _                               => { DefId::invalid() }
+        };
+    }
+
+    static slot_def(slot: &ResSlot) -> DefId {
+        return match (slot) {
+            ResSlot::Answered(r) => { r.def_id() }
+            _                    => { DefId::invalid() }
+        };
     }
 
     /// Resolve `uri` to its parsed `ProgramNode`, or null when the file
@@ -189,20 +210,22 @@ type struct ImplLensBuilder {
     /// name span; the command fires `cryo.showImplementations` with
     /// `[anchorUri, anchorPosition, locations]` so the client extension
     /// can hand them to VS Code's `editor.action.showReferences` peek.
-    static build_impl_lens(uri: str::Str, name_span: source_span::SourceSpan,
+    static build_impl_lens(positions: &docs::Docs, uri: str::Str, name_span: source_span::SourceSpan,
                             spans: &source_span::SourceSpan[]) -> value::JsonValue {
         const count: i64 = spans.length;
 
         // command.arguments[2] = [ Location, ... ]
         mut locs: Array<value::JsonValue> = Array::<value::JsonValue>::with_capacity(count as u64);
         for (mut i: i64 = 0; i < spans.length; i++) {
-            locs.push(ImplLensBuilder::location_json(spans[i]));
+            locs.push(ImplLensBuilder::location_json(positions, spans[i]));
         }
 
-        // command.arguments = [ anchorUri, anchorPosition, locations ]
+        // command.arguments = [ anchorUri, anchorPosition, locations ]: the
+        // anchor is where the reference peek opens, the name's start.
+        const name_range: lsp::Range = positions.range_of_span(name_span);
         mut args: Array<value::JsonValue> = Array::<value::JsonValue>::with_capacity(3);
         args.push(value::JsonValue::from(uri));
-        args.push(ImplLensBuilder::position_json(name_span));
+        args.push(name_range.start.to_json());
         args.push(value::JsonValue::Array(locs));
 
         const title: string = if (count == 1) {
@@ -217,27 +240,17 @@ type struct ImplLensBuilder {
         cmd.put("arguments", value::JsonValue::Array(args));
 
         mut lens: value::JsonObject = value::JsonObject::new();
-        lens.put("range", conv::DiagnosticConverter::range_json_from_span(name_span));
+        lens.put("range", name_range.to_json());
         lens.put("command", value::JsonValue::Object(cmd));
         return value::JsonValue::Object(lens);
     }
 
     /// LSP `Location` JSON (`{ uri, range }`) for an implementation site.
-    static location_json(span: source_span::SourceSpan) -> value::JsonValue {
+    static location_json(positions: &docs::Docs, span: source_span::SourceSpan) -> value::JsonValue {
         mut loc: value::JsonObject = value::JsonObject::new();
         loc.put("uri",   value::JsonValue::String(conv::UriPath::uri_string_from_fs_path(span.file)));
-        loc.put("range", conv::DiagnosticConverter::range_json_from_span(span));
+        loc.put("range", conv::DiagnosticConverter::range_json_from_span(positions, span));
         return value::JsonValue::Object(loc);
-    }
-
-    /// LSP `Position` JSON at the 0-based start of `span` - the anchor the
-    /// reference peek opens over.
-    static position_json(span: source_span::SourceSpan) -> value::JsonValue {
-        mut sl: u32 = 0;
-        mut sc: u32 = 0;
-        if (span.start_line > 0) { sl = span.start_line - 1; }
-        if (span.start_col  > 0) { sc = span.start_col  - 1; }
-        return conv::DiagnosticConverter::pos_json(sl, sc);
     }
 }
 
@@ -270,7 +283,7 @@ type struct CodeLensBuilder {
     /// `range` is the diagnostic's primary span; the `command` fires
     /// the client-side `cryo.openRenderedDiagnostic` with the
     /// diagnostic id as a single argument.
-    static build_lens(diag: &diagnostic::Diagnostic, id: str::Str) -> value::JsonValue {
+    static build_lens(positions: &docs::Docs, diag: &diagnostic::Diagnostic, id: str::Str) -> value::JsonValue {
         const title:  string = "Show full diagnostic";
         const cmd_id: string = "cryo.openRenderedDiagnostic";
 
@@ -284,7 +297,7 @@ type struct CodeLensBuilder {
         cmd.put("arguments", value::JsonValue::Array(args));
 
         mut lens: value::JsonObject = value::JsonObject::new();
-        lens.put("range", conv::DiagnosticConverter::range_json_from_span(diag.span));
+        lens.put("range", conv::DiagnosticConverter::range_json_from_span(positions, diag.span));
         lens.put("command", value::JsonValue::Object(cmd));
         return value::JsonValue::Object(lens);
     }

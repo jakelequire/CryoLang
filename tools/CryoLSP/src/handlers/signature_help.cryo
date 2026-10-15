@@ -1,0 +1,229 @@
+///! Signature help: the parameters of the call the cursor is inside.
+///!
+///! Read like completion, from the cursor's line as typed and the scope the
+///! last analysis has there, so it answers while the call is being written:
+///! the innermost `(` the cursor is inside, the callee written before it
+///! (`f`, `recv.m`, `T::m`, `M::f`), resolved through the same lookups
+///! completion asks, and the commas before the cursor counting the active
+///! parameter.  Every overload of the callee is offered, the first with
+///! room for the active argument highlighted.  A call whose `(` is on an
+///! earlier line is not read.
+namespace lsp::handlers::signature_help;
+
+import std::core::option;
+import std::collections::str;
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::json::value;
+
+import compiler::compilation_context::{ CompilationContext };
+import compiler::ast::{ NodeKind };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::declaration::{ FunctionDeclNode, IntrinsicDeclNode, MethodNode, VarDeclNode };
+import compiler::decl_index::{ OverloadId };
+import compiler::resolver::symbol::{ Symbol, SymbolKind };
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::types::type_ref::{ TypeRef };
+
+import lsp::handlers::completion::{ Completer };
+import lsp::handlers::names::{ Names, Place };
+import lsp::handlers::hover::{ Shown };
+import lsp::handlers::identity::{ Asked };
+import lsp::server::docs;
+import lsp::server::line_index::{ Columns };
+import lsp::server::session;
+
+
+/// The call written before the cursor: where its `(` is and which argument
+/// the cursor is in.
+type struct OpenCall {
+    paren:  i64;
+    active: i64;
+
+    /// The innermost call left open before byte `end` of `line`, skipping
+    /// string and character literals; `paren` -1 when there is none.
+    static before(line: str::Str, end: u64) -> OpenCall {
+        const b: u8* = line.as_ptr();
+        mut parens: i64[] = [];
+        mut commas: i64[] = [];
+        mut i: u64 = 0;
+        while (i < end) {
+            const c: u8 = b[i];
+            if (c == '"' as u8 || c == '\'' as u8) {
+                i = i + 1;
+                while (i < end && b[i] != c) {
+                    if (b[i] == '\\' as u8) { i = i + 1; }
+                    i = i + 1;
+                }
+            } else if (c == '(' as u8 || c == '[' as u8 || c == '{' as u8) {
+                parens.push(if (c == '(' as u8) { i as i64 } else { -1 });
+                commas.push(0);
+            } else if (c == ')' as u8 || c == ']' as u8 || c == '}' as u8) {
+                if (parens.length > 0) {
+                    parens.pop();
+                    commas.pop();
+                }
+            } else if (c == ',' as u8 && commas.length > 0) {
+                commas[commas.length - 1] = commas[commas.length - 1] + 1;
+            }
+            i = i + 1;
+        }
+        if (parens.length == 0 || parens[parens.length - 1] < 0) {
+            return OpenCall { paren: -1, active: 0 };
+        }
+        return OpenCall { paren: parens[parens.length - 1], active: commas[commas.length - 1] };
+    }
+}
+
+
+/// One signature offered: a function's declaration and whether its first
+/// parameter is the receiver a method call does not write.
+type struct Offered {
+    func:     FunctionDeclNode*;
+    receiver: boolean;
+}
+
+
+/// `textDocument/signatureHelp`.
+public function handle_signature_help(docs: mut &docs::Docs, projects: mut &session::Projects,
+                                       params: &value::JsonValue) -> value::JsonValue {
+    const asked: Asked = Asked::from(docs, projects, params);
+    if (asked.ctx == null) { return value::JsonValue::Null; }
+    match (docs.get(asked.uri)) {
+        Option::Some(doc) => {
+            const line: str::Str = doc.line_text(asked.line);
+            const end: u64 = Columns::wire_to_byte(line, asked.character, docs.utf8);
+            const call: OpenCall = OpenCall::before(line, end);
+            if (call.paren < 0) { return value::JsonValue::Null; }
+            mut c: Completer = Completer::new(asked.ctx, asked.module_idx);
+            c.place_cursor(docs.scope_pos(asked.uri, asked.line, asked.character));
+            const offered: Offered[] = Signatures::of_callee(&c, line, call.paren as u64);
+            if (offered.length == 0) { return value::JsonValue::Null; }
+            return Signatures::reply(c.names, &offered, call.active);
+        }
+        Option::None => { return value::JsonValue::Null; }
+    }
+}
+
+
+type struct Signatures {
+    /// The functions the callee written before byte `paren` can call.
+    static of_callee(c: &Completer, line: str::Str, paren: u64) -> Offered[] {
+        const b: u8* = line.as_ptr();
+        mut e: u64 = paren;
+        while (e > 0 && (b[e - 1] == ' ' as u8 || b[e - 1] == '\t' as u8)) { e = e - 1; }
+        mut s: u64 = e;
+        while (s > 0 && Completer::is_ident(b[s - 1])) { s = s - 1; }
+        if (s == e) { return []; }
+        const leaf: str::Str = line.sub_bytes(s, e);
+        if (s >= 1 && b[s - 1] == '.' as u8) {
+            const recv: TypeRef = c.receiver_before(line, s - 1);
+            if (!recv.is_valid()) { return []; }
+            return Signatures::of_entries(c.ctx, c.method_entries(recv, c.intern(leaf)));
+        }
+        if (s >= 2 && b[s - 1] == ':' as u8 && b[s - 2] == ':' as u8) {
+            const start: u64 = Completer::path_start(line, s - 2);
+            const place: Place = c.place_of_path(line.sub_bytes(start, s - 2));
+            match (place) {
+                Place::Type(d) => {
+                    return Signatures::of_entries(c.ctx,
+                        c.method_entries(c.ctx.decl_index.type_of_def(d), c.intern(leaf)));
+                }
+                Place::Module(m) => {
+                    return Signatures::of_symbols(c.ctx, c.ctx.resolver.exports_named(m, c.intern(leaf)));
+                }
+                Place::Nothing => { return []; }
+            }
+        }
+        if (c.ctx == null || !c.scope.is_valid()) { return []; }
+        const bound: SymbolID = c.ctx.resolver.value_target(
+            c.ctx.resolver.lookup_value(c.intern(leaf), c.scope));
+        if (!bound.is_valid()) { return []; }
+        mut one: SymbolID[] = [];
+        one.push(bound);
+        return Signatures::of_symbols(c.ctx, one);
+    }
+
+    static of_entries(ctx: CompilationContext*, entries: OverloadId[]) -> Offered[] {
+        mut out: Offered[] = [];
+        for (mut k: i64 = 0; k < entries.length; k++) {
+            Signatures::add(&out, ctx.decl_index.entry_decl(entries[k]));
+        }
+        return out;
+    }
+
+    /// Every overload of the functions `syms` bind: each one's family, read
+    /// off its definition, once.
+    static of_symbols(ctx: CompilationContext*, syms: SymbolID[]) -> Offered[] {
+        mut entries: OverloadId[] = [];
+        for (mut k: i64 = 0; k < syms.length; k++) {
+            const s: Symbol = ctx.resolver.get_symbol(syms[k]);
+            if (s.kind != SymbolKind::Function || !s.def.is_valid()) { continue; }
+            const family: OverloadId[] = ctx.decl_index.family_entries_of_def(s.def);
+            for (mut f: i64 = 0; f < family.length; f++) {
+                mut seen: boolean = false;
+                for (mut e: i64 = 0; e < entries.length; e++) {
+                    if (entries[e].equals(family[f])) { seen = true; break; }
+                }
+                if (!seen) { entries.push(family[f]); }
+            }
+        }
+        return Signatures::of_entries(ctx, entries);
+    }
+
+    static add(out: mut &Offered[], decl: ASTNode*) -> void {
+        if (decl == null) { return; }
+        if (decl.kind == NodeKind::FunctionDeclaration) {
+            out.push(Offered { func: decl as FunctionDeclNode*, receiver: false });
+        }
+        if (decl.kind == NodeKind::MethodDeclaration) {
+            const m: MethodNode* = decl as MethodNode*;
+            if (m.func != null) { out.push(Offered { func: m.func, receiver: !m.is_static }); }
+        }
+    }
+
+    /// The `SignatureHelp` for `offered`, `active` the argument the cursor
+    /// is in; the first signature with that many parameters is active.
+    /// Types are written as `names` writes them.
+    static reply(names: Names, offered: &Offered[], active: i64) -> value::JsonValue {
+        const ctx: CompilationContext* = names.ctx;
+        const shown: Shown = Shown::new(names);
+        mut sigs: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+        mut chosen: i64 = -1;
+        for (mut k: i64 = 0; k < offered.length; k++) {
+            const f: FunctionDeclNode* = offered[k].func;
+            const first: i64 = if (offered[k].receiver) { 1 } else { 0 };
+            mut label: String = String::from_string(ctx.intern_table.resolve(f.name));
+            label.push(str::Str::from("("));
+            mut ps: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+            for (mut i: i64 = first; i < f.parameters.length; i++) {
+                if (i > first) { label.push(str::Str::from(", ")); }
+                const p: VarDeclNode* = f.parameters[i];
+                const from: u64 = label.length();
+                label.push(str::Str::from(ctx.intern_table.resolve(p.name)));
+                label.push(str::Str::from(": "));
+                label.push(str::Str::from(shown.type_text(p.resolved_type)));
+                mut range: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+                range.push(value::JsonValue::int_value(from as i64));
+                range.push(value::JsonValue::int_value(label.length() as i64));
+                mut pobj: value::JsonObject = value::JsonObject::new();
+                pobj.put("label", value::JsonValue::Array(range));
+                ps.push(value::JsonValue::Object(pobj));
+            }
+            label.push(str::Str::from(") -> "));
+            label.push(str::Str::from(shown.type_text(f.resolved_return_type)));
+            if (chosen < 0 && f.parameters.length - first > active) { chosen = k; }
+            mut sig: value::JsonObject = value::JsonObject::new();
+            sig.put("label", value::JsonValue::from(label.as_str()));
+            sig.put("parameters", value::JsonValue::Array(ps));
+            sigs.push(value::JsonValue::Object(sig));
+        }
+        mut out: value::JsonObject = value::JsonObject::new();
+        out.put("signatures", value::JsonValue::Array(sigs));
+        out.put("activeSignature", value::JsonValue::int_value(if (chosen < 0) { 0 } else { chosen }));
+        out.put("activeParameter", value::JsonValue::int_value(active));
+        return value::JsonValue::Object(out);
+    }
+}

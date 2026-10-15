@@ -242,10 +242,12 @@ type struct DeclarationIndex {
     // are registered in (`family_slot`); 0 for a type that registered none.
     ctor_families:  FamilySlot[];
 
-    // The definition's slot in `defs` -> the declaration the name layer
-    // registered it for: a method's `MethodNode`, or a trait's declared
-    // method's `FunctionDeclNode`; null for a slot that is no method.
-    method_decls:   ASTNode*[];
+    // The definition's slot in `defs` -> the declaration it was registered
+    // for: a method's `MethodNode`, a trait's declared method's
+    // `FunctionDeclNode`, a type's, function's or global's own node; null
+    // for a slot registered with no node (a module, a primitive, an
+    // instance).
+    declarations:   ASTNode*[];
 
     // (owner type << 32 | a method definition's slot in `defs`) -> the
     // entry of the owner's copy of that method: an instance's clone of its
@@ -409,7 +411,7 @@ public:
             def_types:           [],
             def_entries:         [],
             ctor_families:       [],
-            method_decls:        [],
+            declarations:        [],
             copy_entries:        HashMap::<CopyKey, OverloadId>::new(),
             instance_entries:    HashMap::<TypeKey, OverloadId>::new(),
             array_elem_to_type:  HashMap::<TypeKey, TypeRef>::new(),
@@ -722,12 +724,22 @@ public:
         return result;
     }
 
-    /// Keep `decl` as the declaration the method definition `d` was
-    /// registered for (`CompilationContext::define_method`).
-    keep_method_decl(mut &this, d: DefId, decl: ASTNode*) -> void {
+    /// Keep `decl` as the declaration the definition `d` was registered
+    /// for, by the registrar holding both.
+    keep_declaration(mut &this, d: DefId, decl: ASTNode*) -> void {
+        if (!d.is_valid()) { return; }
         const slot: i64 = this.defs.slot(d);
-        while (this.method_decls.length <= slot) { this.method_decls.push(null); }
-        this.method_decls[slot] = decl;
+        while (this.declarations.length <= slot) { this.declarations.push(null); }
+        this.declarations[slot] = decl;
+    }
+
+    /// The declaration the definition `d` was registered for, or null when
+    /// `d` is invalid or was registered with no node.
+    declaration_of(&this, d: DefId) -> ASTNode* {
+        if (!d.is_valid()) { return null; }
+        const slot: i64 = this.defs.slot(d);
+        if (slot >= this.declarations.length) { return null; }
+        return this.declarations[slot];
     }
 
     /// The entry of `owner`'s method for the method definition `d`: `d`'s
@@ -779,10 +791,8 @@ public:
     /// The declaration the method definition `d` was registered for, or
     /// null when `d` is invalid or names no method.
     method_decl_of(&this, d: DefId) -> ASTNode* {
-        if (!d.is_valid()) { return null; }
-        const slot: i64 = this.defs.slot(d);
-        if (slot >= this.method_decls.length) { return null; }
-        return this.method_decls[slot];
+        if (!d.is_valid() || this.defs.kind_of(d) != DefKind::Method) { return null; }
+        return this.declaration_of(d);
     }
 
     /// Refuse a method registered under the family `(owner, leaf)` whose

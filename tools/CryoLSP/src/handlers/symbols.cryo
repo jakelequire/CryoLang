@@ -1,0 +1,309 @@
+///! Document and workspace symbols: the declarations a module's tree holds
+///! where they are written, each with the kind of declaration it is.
+///! Workspace symbols match a declaration's name against the text the user
+///! typed, which is a search the user asked for, not a resolution.
+namespace lsp::handlers::symbols;
+
+import std::core::option;
+import std::collections::str;
+import std::collections::string;
+import std::collections::string::{ String };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::json::value;
+
+import compiler::compilation_context::{ CompilationContext };
+import compiler::ast::{ NodeKind };
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node_locator::{ NodeLocator };
+import compiler::ast::declaration::{
+    ClassDeclNode, DeclarationNode, EnumDeclNode, EnumVariantNode, ExternBlockNode,
+    FieldDeclNode, FunctionDeclNode, ImplBlockNode, IntrinsicDeclNode, MethodNode,
+    StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::symbol_str::{ SymbolStr };
+
+import lsp::handlers::identity::{ Asked };
+import lsp::server::docs;
+import lsp::server::session;
+import lsp::protocol::conv;
+
+
+/// The most symbols a workspace search answers with.
+const WORKSPACE_LIMIT: u64 = 200;
+
+
+/// `textDocument/documentSymbol`: the document's declarations, members
+/// nested under the type that declares them.
+public function handle_document_symbols(docs: mut &docs::Docs, projects: mut &session::Projects,
+                                         params: &value::JsonValue) -> value::JsonValue {
+    const asked: Asked = Asked::from(docs, projects, params);
+    mut out: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+    if (asked.ctx == null || asked.module_idx < 0) { return value::JsonValue::Array(out); }
+    const outline: Outline = Outline::new(asked.ctx, asked.module_idx);
+    const program: ProgramNode* = asked.ctx.module_graph.get_module_ast(asked.module_idx as u32);
+    if (program == null) { return value::JsonValue::Array(out); }
+    for (mut i: i64 = 0; i < program.statements.length; i++) {
+        outline.nested(docs, &out, NodeLocator::unwrap_decl_stmt(program.statements[i]));
+    }
+    return value::JsonValue::Array(out);
+}
+
+/// `workspace/symbol`: the declarations of every analysed project whose
+/// name holds the query, ignoring case.
+public function handle_workspace_symbols(docs: mut &docs::Docs, projects: mut &session::Projects,
+                                          params: &value::JsonValue) -> value::JsonValue {
+    mut out: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+    const q: value::JsonValue* = params.get(str::Str::from("query")).unwrap_or(null);
+    const query: str::Str = if (q == null) { str::Str::from("") } else {
+        q.as::<str::Str>().unwrap_or(str::Str::from(""))
+    };
+    for (p in projects.by_key.values_ref()) {
+        if (p.current.ctx == null) { continue; }
+        p.current.publish_arena();
+        const ctx: CompilationContext* = p.current.ctx;
+        const n: u32 = ctx.module_graph.module_count();
+        for (mut m: u32 = 0; m < n && out.length() < WORKSPACE_LIMIT; m++) {
+            const program: ProgramNode* = ctx.module_graph.get_module_ast(m);
+            if (program == null) { continue; }
+            const outline: Outline = Outline::new(ctx, m as i64);
+            for (mut i: i64 = 0; i < program.statements.length; i++) {
+                outline.flat(docs, &out, NodeLocator::unwrap_decl_stmt(program.statements[i]), query);
+            }
+        }
+    }
+    return value::JsonValue::Array(out);
+}
+
+
+/// The declarations of one module's tree.
+type struct Outline {
+    ctx:  CompilationContext*;
+    file: string;
+
+    static new(ctx: CompilationContext*, m: i64) -> Outline {
+        return Outline { ctx: ctx, file: ctx.module_graph.modules[m].file_path };
+    }
+
+    /// Whether `n` is written in this module's file: a node copied in from
+    /// another file, or a monomorphized function, is not.
+    written_here(&this, n: ASTNode*) -> boolean {
+        if (n == null || n.span.start_line == 0 || n.span.file == null) { return false; }
+        if (n.kind == NodeKind::FunctionDeclaration && (n as FunctionDeclNode*).is_specialization) {
+            return false;
+        }
+        if (n.kind == NodeKind::MethodDeclaration) {
+            const m: MethodNode* = n as MethodNode*;
+            if (m.func != null && m.func.is_specialization) { return false; }
+        }
+        return n.span.file.eq(this.file);
+    }
+
+    /// `n` with the members it declares nested under it.
+    nested(&this, docs: &docs::Docs, out: mut &Array<value::JsonValue>, n: ASTNode*) -> void {
+        if (!this.written_here(n)) { return; }
+        const kind: i64 = Outline::kind_of(n);
+        if (kind == 0) { return; }
+        const name: string = this.name_of(n);
+        if (name.length() == 0) { return; }
+        mut children: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+        const members: ASTNode*[] = Outline::members(n);
+        for (mut i: i64 = 0; i < members.length; i++) { this.nested(docs, &children, members[i]); }
+        mut s: value::JsonObject = value::JsonObject::new();
+        s.put("name", value::JsonValue::from(name));
+        s.put("kind", value::JsonValue::int_value(kind));
+        s.put("range", docs.range_of_span(this.whole_span(n)).to_json());
+        s.put("selectionRange", docs.range_of_span(this.name_span(n)).to_json());
+        s.put("children", value::JsonValue::Array(children));
+        out.push(value::JsonValue::Object(s));
+    }
+
+    /// `n` and every declaration under it whose name holds `query`, flat,
+    /// each with its location, while there is room.
+    flat(&this, docs: &docs::Docs, out: mut &Array<value::JsonValue>, n: ASTNode*, query: str::Str) -> void {
+        if (out.length() >= WORKSPACE_LIMIT || !this.written_here(n)) { return; }
+        const kind: i64 = Outline::kind_of(n);
+        if (kind == 0) { return; }
+        const name: string = this.name_of(n);
+        if (name.length() > 0 && Outline::holds(name, query)) {
+            mut loc: value::JsonObject = value::JsonObject::new();
+            loc.put("uri", value::JsonValue::String(conv::UriPath::uri_string_from_fs_path(this.file)));
+            loc.put("range", docs.range_of_span(this.name_span(n)).to_json());
+            mut s: value::JsonObject = value::JsonObject::new();
+            s.put("name", value::JsonValue::from(name));
+            s.put("kind", value::JsonValue::int_value(kind));
+            s.put("location", value::JsonValue::Object(loc));
+            out.push(value::JsonValue::Object(s));
+        }
+        const members: ASTNode*[] = Outline::members(n);
+        for (mut i: i64 = 0; i < members.length; i++) { this.flat(docs, out, members[i], query); }
+    }
+
+    /// The declarations `n` holds: a type's fields and methods, an enum's
+    /// variants, a trait's, an implementation's or an extern block's
+    /// functions.
+    static members(n: ASTNode*) -> ASTNode*[] {
+        mut out: ASTNode*[] = [];
+        match (n.kind) {
+            NodeKind::StructDeclaration => {
+                const d: StructDeclNode* = n as StructDeclNode*;
+                for (mut i: i64 = 0; i < d.fields.length; i++) { out.push(d.fields[i] as ASTNode*); }
+                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i] as ASTNode*); }
+            }
+            NodeKind::UnionDeclaration => {
+                const d: UnionDeclNode* = n as UnionDeclNode*;
+                for (mut i: i64 = 0; i < d.fields.length; i++) { out.push(d.fields[i] as ASTNode*); }
+                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i] as ASTNode*); }
+            }
+            NodeKind::ClassDeclaration => {
+                const d: ClassDeclNode* = n as ClassDeclNode*;
+                for (mut i: i64 = 0; i < d.fields.length; i++) { out.push(d.fields[i] as ASTNode*); }
+                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i] as ASTNode*); }
+            }
+            NodeKind::EnumDeclaration => {
+                const d: EnumDeclNode* = n as EnumDeclNode*;
+                for (mut i: i64 = 0; i < d.variants.length; i++) { out.push(d.variants[i] as ASTNode*); }
+            }
+            NodeKind::TraitDeclaration => {
+                const d: TraitDeclNode* = n as TraitDeclNode*;
+                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i] as ASTNode*); }
+            }
+            NodeKind::ImplementationBlock => {
+                const d: ImplBlockNode* = n as ImplBlockNode*;
+                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i] as ASTNode*); }
+            }
+            NodeKind::ExternBlock => {
+                const d: ExternBlockNode* = n as ExternBlockNode*;
+                for (mut i: i64 = 0; i < d.functions.length; i++) { out.push(d.functions[i] as ASTNode*); }
+            }
+            _ => { }
+        }
+        return out;
+    }
+
+    /// Whether `name` holds `query`, ignoring ASCII case.
+    static holds(name: string, query: str::Str) -> boolean {
+        const nl: i64 = name.length() as i64;
+        const ql: i64 = query.length() as i64;
+        if (ql == 0) { return true; }
+        const q: u8* = query.as_ptr();
+        for (mut start: i64 = 0; start + ql <= nl; start++) {
+            mut k: i64 = 0;
+            while (k < ql && Outline::lower(name[start + k] as u8) == Outline::lower(q[k])) {
+                k = k + 1;
+            }
+            if (k == ql) { return true; }
+        }
+        return false;
+    }
+
+    static lower(c: u8) -> u8 {
+        if (c >= 65 && c <= 90) { return c + 32; }
+        return c;
+    }
+
+    /// The protocol's symbol kind of a declaration; 0 for a node no outline
+    /// shows.
+    static kind_of(n: ASTNode*) -> i64 {
+        if (n.kind == NodeKind::VariableDeclaration) {
+            return if ((n as VarDeclNode*).is_mutable) { 13 } else { 14 };
+        }
+        return match (n.kind) {
+            NodeKind::StructDeclaration    => { 23 }
+            NodeKind::UnionDeclaration     => { 23 }
+            NodeKind::ClassDeclaration     => { 5 }
+            NodeKind::EnumDeclaration      => { 10 }
+            NodeKind::TraitDeclaration     => { 11 }
+            NodeKind::TypeAliasDeclaration => { 26 }
+            NodeKind::FunctionDeclaration  => { 12 }
+            NodeKind::IntrinsicDeclaration => { 12 }
+            NodeKind::MethodDeclaration    => { 6 }
+            NodeKind::FieldDeclaration     => { 8 }
+            NodeKind::EnumVariant          => { 22 }
+            NodeKind::ImplementationBlock  => { 2 }
+            NodeKind::ExternBlock          => { 2 }
+            _                              => { 0 }
+        };
+    }
+
+    /// The name a declaration is shown under: its declared name; an
+    /// implementation block's head.
+    name_of(&this, n: ASTNode*) -> string {
+        match (n.kind) {
+            NodeKind::StructDeclaration    => { return this.text((n as StructDeclNode*).name); }
+            NodeKind::UnionDeclaration     => { return this.text((n as UnionDeclNode*).name); }
+            NodeKind::ClassDeclaration     => { return this.text((n as ClassDeclNode*).name); }
+            NodeKind::EnumDeclaration      => { return this.text((n as EnumDeclNode*).name); }
+            NodeKind::TraitDeclaration     => { return this.text((n as TraitDeclNode*).name); }
+            NodeKind::TypeAliasDeclaration => { return this.text((n as TypeAliasDeclNode*).alias_name); }
+            NodeKind::FunctionDeclaration  => { return this.text((n as FunctionDeclNode*).name); }
+            NodeKind::IntrinsicDeclaration => { return this.text((n as IntrinsicDeclNode*).name); }
+            NodeKind::MethodDeclaration    => {
+                const m: MethodNode* = n as MethodNode*;
+                if (m.func == null) { return ""; }
+                return this.text(m.func.name);
+            }
+            NodeKind::FieldDeclaration     => { return this.text((n as FieldDeclNode*).name); }
+            NodeKind::EnumVariant          => { return this.text((n as EnumVariantNode*).name); }
+            NodeKind::VariableDeclaration  => { return this.text((n as VarDeclNode*).name); }
+            NodeKind::ImplementationBlock  => {
+                return "implement " + this.text((n as ImplBlockNode*).target_type);
+            }
+            NodeKind::ExternBlock          => { return "extern"; }
+            _                              => { return ""; }
+        }
+    }
+
+    text(&this, s: SymbolStr) -> string {
+        if (!s.is_valid()) { return ""; }
+        return this.ctx.intern_table.resolve(s);
+    }
+
+    /// Where a declaration's name is written; its whole span when it has
+    /// no name.
+    name_span(&this, n: ASTNode*) -> SourceSpan {
+        if (n.kind == NodeKind::MethodDeclaration) {
+            const m: MethodNode* = n as MethodNode*;
+            if (m.func != null && m.func.name_span.start_line != 0) { return m.func.name_span; }
+            return n.span;
+        }
+        if (n.kind == NodeKind::ImplementationBlock) {
+            const ib: ImplBlockNode* = n as ImplBlockNode*;
+            if (ib.target_type_span.start_line != 0) { return ib.target_type_span; }
+            return n.span;
+        }
+        if (n.kind.is_declaration()) {
+            const s: SourceSpan = (n as DeclarationNode*).name_span;
+            if (s.start_line != 0) { return s; }
+        }
+        return n.span;
+    }
+
+    /// The span a declaration covers: its own, widened to hold its name
+    /// and, for a function or method, its body.
+    whole_span(&this, n: ASTNode*) -> SourceSpan {
+        mut s: SourceSpan = n.span;
+        Outline::widen(&s, this.name_span(n));
+        if (n.kind == NodeKind::MethodDeclaration) {
+            const m: MethodNode* = n as MethodNode*;
+            if (m.func != null && m.func.body != null) { Outline::widen(&s, m.func.body.span); }
+        } else if (n.kind == NodeKind::FunctionDeclaration) {
+            const f: FunctionDeclNode* = n as FunctionDeclNode*;
+            if (f.body != null) { Outline::widen(&s, f.body.span); }
+        }
+        return s;
+    }
+
+    static widen(s: mut &SourceSpan, by: SourceSpan) -> void {
+        if (by.start_line == 0) { return; }
+        if (by.start_line < s.start_line || (by.start_line == s.start_line && by.start_col < s.start_col)) {
+            s.start_line = by.start_line;
+            s.start_col = by.start_col;
+        }
+        if (by.end_line > s.end_line || (by.end_line == s.end_line && by.end_col > s.end_col)) {
+            s.end_line = by.end_line;
+            s.end_col = by.end_col;
+        }
+    }
+}

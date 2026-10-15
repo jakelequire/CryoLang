@@ -27,9 +27,13 @@ import std::io::stdio;
 import std::io::error;
 import std::io::traits;
 import std::json::value;
+import std::json::serializer;
+import std::alloc::arena;
 import std::env;
 import std::ffi::libc;
 import std::sys::syscall;
+
+import compiler::codegen::ast_arena;
 
 import lsp::protocol::framing;
 import lsp::protocol::jsonrpc;
@@ -41,6 +45,11 @@ import lsp::handlers::lifecycle;
 import lsp::handlers::text_sync;
 import lsp::handlers::hover;
 import lsp::handlers::definition;
+import lsp::handlers::references;
+import lsp::handlers::rename;
+import lsp::handlers::signature_help;
+import lsp::handlers::inlay_hints;
+import lsp::handlers::symbols;
 import lsp::handlers::completion;
 import lsp::handlers::semantic_tokens;
 import lsp::handlers::code_action;
@@ -51,46 +60,107 @@ import lsp::handlers::rendered_diagnostic;
 type struct Server {
     state:      state::ServerState;
     docs:       docs::Docs;
-    sessions:   session::SessionMap;
+    projects:   session::Projects;
     diag_cache: diag_render_cache::DiagRenderCache;
     reader:     stdio::Stdin;
     writer:     stdio::Stdout;
     /// Id allocator for server->client requests (e.g. semanticTokens/refresh).
     outbound:   text_sync::OutboundRequests;
+    /// The id of the request being answered outside the compiler's hook -
+    /// the one an analysis may be running for - and whether the client
+    /// cancelled it while the analysis ran.
+    serving:    value::JsonValue;
+    cancelled:  boolean;
+    /// Inside the compiler's hook (`between_modules`).
+    in_yield:   boolean;
 
     static new() -> Server {
         return Server {
             state:      state::ServerState::new(),
             docs:       docs::Docs::new(),
-            sessions:   session::SessionMap::new(),
+            projects:   session::Projects::new(),
             diag_cache: diag_render_cache::DiagRenderCache::new(),
             reader:     stdio::stdin(),
             writer:     stdio::stdout(),
             outbound:   text_sync::OutboundRequests::new(),
+            serving:    value::JsonValue::Null,
+            cancelled:  false,
+            in_yield:   false,
         };
+    }
+
+    /// The compiler's hook between two modules of an analysis; `client` is
+    /// the server.
+    static between_modules(client: void*) -> void {
+        const s: Server* = client as Server*;
+        s.serve_waiting();
+    }
+
+    /// Handle every message already waiting on stdin, while an analysis is
+    /// suspended between modules: a request is answered from the last
+    /// analysis (`Projects::analysing` keeps it from starting another), an
+    /// edit or a save updates the buffers or owes the next analysis, and a
+    /// cancellation marks the request the analysis runs for.  Allocations
+    /// go to the heap meanwhile, and the analysis's arena is published
+    /// again before the compiler resumes.
+    serve_waiting(mut &this) -> void {
+        if (this.in_yield || !Server::poll_stdin_readable(0 as i32)) { return; }
+        const building: arena::Arena* = this.projects.building();
+        this.in_yield = true;
+        ast_arena::cryo_alloc_arena_set_active(false);
+        mut more: boolean = true;
+        while (more && Server::poll_stdin_readable(0 as i32)) {
+            match (framing::FrameCodec::read_message(&this.reader)) {
+                Result::Ok(maybe) => {
+                    match (maybe) {
+                        Option::Some(body) => {
+                            mut owned: String = body;
+                            this.handle(owned.as_str());
+                            mem::drop(owned);
+                        }
+                        // End of input: the main loop reads it again and stops.
+                        Option::None => { more = false; }
+                    }
+                }
+                Result::Err(_) => { more = false; }
+            }
+        }
+        if (building != null) { ast_arena::cryo_ast_arena_set_current(building); }
+        ast_arena::cryo_alloc_arena_set_active(true);
+        this.in_yield = false;
+    }
+
+    /// Whether two request ids are the same id.
+    static same_id(a: &value::JsonValue, b: &value::JsonValue) -> boolean {
+        mut sa: String = serializer::stringify(a);
+        mut sb: String = serializer::stringify(b);
+        const same: boolean = sa.as_str().equals(&sb.as_str());
+        mem::drop(sa);
+        mem::drop(sb);
+        return same;
     }
 
     /// Run until either `exit` or stdin closes.  Returns the process
     /// exit code (0 on a clean shutdown, 1 otherwise).
     ///
-    /// Edit notifications (didOpen/didChange) don't compile inline; they
-    /// queue the URI (see `TextSync`).  When the queue is non-empty the
-    /// loop waits up to `DEBOUNCE_MS` for more input before flushing, so
-    /// a burst of keystrokes collapses into a single whole-project
-    /// compile instead of one per keystroke.  Interleaved requests still
-    /// see fresh state - each handler routes through `ensure_fresh`.
+    /// An open or a save makes an analysis owed rather than running one
+    /// inline.  While one is owed the loop waits up to `DEBOUNCE_MS` for
+    /// more input before running it, so a burst of notifications (the
+    /// editor opening several files, a save-all) becomes one analysis.  A
+    /// request that needs the analysis runs it at once
+    /// (`Projects::analysis_for`).
     run(mut &this) -> i32 {
+        this.projects.yield_hook = Server::between_modules;
+        this.projects.yield_client = &this as void*;
         loop {
-            // Debounce window: only enter it while a compile is owed, so
-            // an otherwise-idle server still blocks indefinitely on the
-            // read below (no busy-loop) when there's nothing pending.
-            if (this.sessions.has_pending()) {
+            // Debounce window: only enter it while an analysis or its
+            // publishing is owed, so an otherwise-idle server still blocks
+            // on the read below (no busy-loop).
+            if (this.projects.has_owed()) {
                 if (!Server::poll_stdin_readable(DEBOUNCE_MS)) {
-                    // Input went quiet: the edit burst is over.  Compile
-                    // and publish the coalesced set, then loop.
-                    text_sync::flush_pending(&this.docs, &this.sessions,
-                                             &this.writer, &this.diag_cache,
-                                             &this.outbound);
+                    text_sync::flush(&this.docs, &this.projects,
+                                     &this.writer, &this.diag_cache,
+                                     &this.outbound);
                     continue;
                 }
                 // Input is ready - fall through and read it, deferring the
@@ -134,14 +204,25 @@ type struct Server {
     /// reply against.
     handle(mut &this, body: str::Str) -> void {
         mut msg: jsonrpc::IncomingMessage = jsonrpc::JsonRpcCodec::parse_incoming(body);
-        match (msg) {
-            jsonrpc::IncomingMessage::Request(_)      => { this.dispatch_request(&msg); }
+        match (&msg) {
+            jsonrpc::IncomingMessage::Request(req) => {
+                // Inside the hook a request is answered at once; outside it,
+                // it may wait on an analysis, during which it can be
+                // cancelled.
+                if (this.in_yield) {
+                    this.dispatch_request(&msg);
+                } else {
+                    this.serving = jsonrpc::JsonRpcCodec::clone_value(&req.id);
+                    this.cancelled = false;
+                    this.dispatch_request(&msg);
+                    this.serving = value::JsonValue::Null;
+                    this.cancelled = false;
+                }
+            }
             jsonrpc::IncomingMessage::Notification(_) => { this.dispatch_notification(&msg); }
-            jsonrpc::IncomingMessage::Invalid(_)      => {
-                // Drop the parse-failure reason on the floor - the
-                // alternative is logging to stderr, which is fine
-                // but adds dependency on `eprintln`.  Add when
-                // surface area justifies it.
+            jsonrpc::IncomingMessage::Response        => { }
+            jsonrpc::IncomingMessage::Invalid(inv)    => {
+                this.reply_error(&inv.id, inv.code, inv.reason.as_str());
             }
         }
         mem::drop(msg);
@@ -165,9 +246,19 @@ type struct Server {
                     return;
                 }
 
+                // After `shutdown`, only `exit` (a notification) is honoured.
+                if (this.state.shutdown_requested) {
+                    this.reply_error(&req.id,
+                        jsonrpc::INVALID_REQUEST,
+                        str::Str::from("server is shutting down"));
+                    return;
+                }
+
                 if (method.equals(&str::Str::from("initialize"))) {
                     const result: value::JsonValue =
                         lifecycle::handle_initialize(&this.state, &req.params);
+                    this.docs.utf8 = this.state.utf8_positions;
+                    this.outbound.refresh_supported = this.state.semantic_tokens_refresh;
                     this.reply_ok(&req.id, result);
                     return;
                 }
@@ -184,7 +275,7 @@ type struct Server {
                     // the wire-shape `lsp::protocol::lsp::Hover` struct.
                     const result: value::JsonValue =
                         lsp::handlers::hover::handle_hover(
-                            &this.docs, &this.sessions, &req.params);
+                            &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
@@ -195,28 +286,90 @@ type struct Server {
                 if (method.equals(&str::Str::from("cryo/expandHover"))) {
                     const result: value::JsonValue =
                         lsp::handlers::hover::handle_hover_verbose(
-                            &this.docs, &this.sessions, &req.params);
+                            &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/definition"))) {
                     const result: value::JsonValue =
                         lsp::handlers::definition::handle_definition(
-                            &this.docs, &this.sessions, &req.params);
+                            &this.docs, &this.projects, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+                if (method.equals(&str::Str::from("textDocument/references"))) {
+                    const result: value::JsonValue =
+                        lsp::handlers::references::handle_references(
+                            &this.docs, &this.projects, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+                if (method.equals(&str::Str::from("textDocument/documentHighlight"))) {
+                    const result: value::JsonValue =
+                        lsp::handlers::references::handle_highlight(
+                            &this.docs, &this.projects, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+                if (method.equals(&str::Str::from("textDocument/signatureHelp"))) {
+                    const result: value::JsonValue =
+                        signature_help::handle_signature_help(&this.docs, &this.projects, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+                if (method.equals(&str::Str::from("textDocument/inlayHint"))) {
+                    const result: value::JsonValue =
+                        inlay_hints::handle_inlay_hints(&this.docs, &this.projects, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+                if (method.equals(&str::Str::from("textDocument/prepareRename"))) {
+                    const r: rename::Renaming =
+                        rename::Renaming::prepare(&this.docs, &this.projects, &req.params);
+                    if (r.refused()) {
+                        this.reply_error(&req.id, jsonrpc::REQUEST_FAILED, r.refusal.as_str());
+                    } else {
+                        this.reply_ok(&req.id, r.prepare_json(&this.docs));
+                    }
+                    return;
+                }
+                if (method.equals(&str::Str::from("textDocument/rename"))) {
+                    mut r: rename::Renaming =
+                        rename::Renaming::prepare(&this.docs, &this.projects, &req.params);
+                    const new_name: str::Str = rename::new_name_of(&req.params);
+                    if (!r.refused()) { r.check(&this.docs, new_name); }
+                    if (r.refused()) {
+                        this.reply_error(&req.id, jsonrpc::REQUEST_FAILED, r.refusal.as_str());
+                    } else {
+                        this.reply_ok(&req.id, r.edit_json(&this.docs, new_name));
+                    }
+                    return;
+                }
+                if (method.equals(&str::Str::from("textDocument/documentSymbol"))) {
+                    const result: value::JsonValue =
+                        lsp::handlers::symbols::handle_document_symbols(
+                            &this.docs, &this.projects, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+                if (method.equals(&str::Str::from("workspace/symbol"))) {
+                    const result: value::JsonValue =
+                        lsp::handlers::symbols::handle_workspace_symbols(
+                            &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/completion"))) {
                     const result: value::JsonValue =
                         lsp::handlers::completion::handle_completion(
-                            &this.docs, &this.sessions, &req.params);
+                            &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/semanticTokens/full"))) {
                     const result: value::JsonValue =
                         lsp::handlers::semantic_tokens::handle_semantic_tokens(
-                            &this.docs, &this.sessions, &req.params);
+                            &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
@@ -227,7 +380,7 @@ type struct Server {
                 }
                 if (method.equals(&str::Str::from("textDocument/codeLens"))) {
                     const result: value::JsonValue =
-                        code_lens::handle_code_lens(&this.docs, &this.sessions, &req.params);
+                        code_lens::handle_code_lens(&this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
@@ -270,30 +423,33 @@ type struct Server {
                 if (!this.state.initialized) { return; }
 
                 if (method.equals(&str::Str::from("textDocument/didOpen"))) {
-                    text_sync::did_open(&this.docs, &this.sessions,
-                                        &notif.params);
+                    text_sync::did_open(&this.docs, &this.projects, &notif.params);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/didChange"))) {
-                    text_sync::did_change(&this.docs, &this.sessions,
-                                          &notif.params);
+                    text_sync::did_change(&this.docs, &notif.params);
+                    return;
+                }
+                if (method.equals(&str::Str::from("textDocument/didSave"))) {
+                    text_sync::did_save(&this.projects, &notif.params);
+                    return;
+                }
+                if (method.equals(&str::Str::from("workspace/didChangeWatchedFiles"))) {
+                    text_sync::did_change_watched_files(&this.projects, &notif.params);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/didClose"))) {
-                    text_sync::did_close(&this.docs, &this.sessions,
-                                         &this.writer, &notif.params);
+                    text_sync::did_close(&this.docs, &this.writer, &notif.params);
                     return;
                 }
 
-                // `$/cancelRequest`: the client asks us to abandon an
-                // in-flight request.  This server is synchronous - a
-                // request is fully computed before the next frame is even
-                // read - so by the time we could observe a cancellation
-                // the request has already been answered.  Per the spec a
-                // server that can't cancel simply responds normally, so
-                // this is a deliberate no-op (kept explicit rather than
-                // falling into the catch-all below for documentation).
+                // `$/cancelRequest`: read while an analysis runs for the
+                // request being answered, it turns that request's answer
+                // into a cancellation.  Any other request was answered
+                // before the cancellation could be read.
                 if (method.equals(&str::Str::from("$/cancelRequest"))) {
+                    const id: value::JsonValue* = notif.params.get(str::Str::from("id")).unwrap_or(null);
+                    if (id != null && Server::same_id(id, &this.serving)) { this.cancelled = true; }
                     return;
                 }
 
@@ -307,6 +463,12 @@ type struct Server {
     // Replies
 
     reply_ok(mut &this, id: &value::JsonValue, result: value::JsonValue) -> void {
+        if (this.cancelled && !this.in_yield && Server::same_id(id, &this.serving)) {
+            mut dropped: value::JsonValue = result;
+            mem::drop(dropped);
+            this.reply_error(id, jsonrpc::REQUEST_CANCELLED, str::Str::from("request cancelled"));
+            return;
+        }
         const id_clone: value::JsonValue = jsonrpc::JsonRpcCodec::clone_value(id);
         const resp: jsonrpc::ResponseMessage =
             jsonrpc::ResponseMessage::success(id_clone, result);
@@ -390,7 +552,6 @@ implement trait Drop for struct Server {
 }
 
 
-/// Debounce window in milliseconds: how long to wait for the next
-/// keystroke before compiling.  Small enough to feel instant, large
-/// enough that continuous typing coalesces into one compile per pause.
+/// Debounce window in milliseconds: how long an owed analysis waits for
+/// more input, so a burst of opens or a save-all becomes one analysis.
 const DEBOUNCE_MS: i32 = 40 as i32;

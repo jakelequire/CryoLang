@@ -1,32 +1,121 @@
 #!/usr/bin/env python3
-"""End-to-end smoke test for cryolsp over stdio JSON-RPC.
+"""Behavioural tests for cryolsp over stdio JSON-RPC.
 
-CryoLSP is built by neither `make test` nor `make selfhost-check`, and
-`make lsp` builds it with the PINNED compiler - which may predate the change
-under test. A checker or AST change can therefore leave the server broken
-with every gate green; that has happened more than once. This drives the real
-binary the way an editor does and asserts it answers.
+`make lsp-check` builds the server with the compiler under test and then runs
+this against the binary it linked (`scripts/lsp-gate.py`).  The build alone
+proves only that the server compiles; this proves it answers, and answers
+right.
 
-Scope is deliberately shallow: start, initialize, open a document, ask a few
-questions, shut down. It is a smoke test, not a conformance suite - the point
-is to catch "does not build / does not start / does not answer / crashes on
-this document", which is the failure class that actually escapes.
+Two kinds of check:
+
+  * Protocol checks, written in code below: the lifecycle, error replies, and
+    a server that must survive what an editor sends it.
+  * Fixture checks, one directory per fixture under `fixtures/`.  A fixture is
+    a real project that compiles, plus `checks.json`.  Each fixture gets its
+    own server process, so one crash cannot hide the rest.
+
+Positions are named by markers, never by line and column.  A marker is a block
+comment `/*@name*/` written immediately before the token it names; the
+position is the first character after the comment.  `/*^name*/` names the
+position where the comment starts instead, which is where a cursor sits for
+completion (`wb./*^after_dot*/get()`).  Either way a check refers to it as
+`file@name`.  Editing a fixture therefore cannot silently retarget a check: a
+missing marker fails the run.
+
+checks.json:
+
+    {
+      "open":   ["src/main.cryo", ...],       documents opened, in order
+      "checks": [
+        {"name": "...", "method": "definition", "at": "src/main.cryo@marker",
+         "expect": "src/b.cryo@marker" | null},
+        {"name": "...", "method": "hover" | "expandHover", "at": "...",
+         "contains": ["..."], "excludes": ["..."]}   or "expect": null
+        {"name": "...", "method": "completion", "at": "...",
+         "includes": ["..."], "excludes": ["..."]},
+        {"name": "...", "method": "diagnostics", "file": "src/main.cryo",
+         "expect": [{"code": "W0001", "at": "src/main.cryo@marker"}]},
+        {"name": "...", "method": "references" | "documentHighlight",
+         "at": "...", "declaration": true, "expect": ["src/b.cryo@marker", ...]},
+        {"name": "...", "method": "documentSymbol", "file": "src/b.cryo",
+         "includes": ["Item", "Item/get"], "excludes": ["..."]},
+        {"name": "...", "method": "workspaceSymbol", "query": "...",
+         "includes": ["..."], "excludes": ["..."]},
+        {"name": "...", "method": "semanticTokens", "file": "src/main.cryo",
+         "expect": {"src/main.cryo@marker": "variable.readonly", "...": null}},
+        {"name": "...", "method": "prepareRename", "at": "...",
+         "expect": "src/main.cryo@marker", "placeholder": "name"},
+        {"name": "...", "method": "rename", "at": "...", "new_name": "...",
+         "old": "name", "expect": ["src/main.cryo@marker", ...]},
+        {"name": "...", "method": "rename" | "prepareRename", "at": "...",
+         "new_name": "...", "refused": "part of the reason"}
+      ]
+    }
+
+An `inlayHints` check ("file", "expect": {"file@marker+N": ": T" | null})
+asks for the whole file's hints and names, per position, the label of the
+hint that must sit there, or null for none.
+
+A `signatureHelp` check ("at", "contains", "excludes", "active", "param",
+"count", or "expect": null) reads the active signature's label, the active
+parameter's index, and that parameter's label as its offsets cut it;
+"count" is how many signatures, every overload, the answer must offer.
+
+A rename check compares the set of edits' starts with the markers', and
+every edit must replace exactly `old`'s width with `new_name`.  A refusal
+check passes only on an error reply whose message holds `refused`.
+
+A semantic-tokens check names, per position, the token that must start
+there: its type, then any modifiers it must carry (it may carry more), or
+null for no token.  A marker reference may add `+N` columns
+(`src/main.cryo@fstr+5`), for a position inside a string, where no comment
+can sit.
+
+A references or highlight check compares the set of locations' starts with
+the markers'; `declaration` asks for the declaration too.  A symbol check
+names a nested symbol by its path from the top, `Parent/child`.
+
+Any check may carry `"edit": {"file": ..., "from": ..., "to": ...}`: the
+document is changed by replacing the first `from` with `to`, the check runs
+against the changed text and its markers, and the document is changed back.
+That is how a check asks about a buffer mid-typing.  With `"save": true` the
+edit, and the change back, are each followed by a save.
+
+A completion check may carry `"details": {"label": "text"}`: the item of
+that label must exist and its detail hold the text.  It may carry
+`"trigger": ":"`: it is then sent as the editor
+sends one the typed character triggered, not as one the user invoked.
+
+A position check may carry `"quiet_stderr": true`: it then also fails when the
+server writes to stderr while answering, which an analysis of a buffer that
+does not parse always does.  `expandHover` asks `cryo/expandHover`, the
+editor's longer hover.
 
 Usage:
-    python tools/CryoLSP/tests/smoke.py [path/to/cryolsp[.exe]]
+    python tools/CryoLSP/tests/smoke.py [path/to/cryolsp[.exe]] [--fixture NAME]
 
-Exit code is 0 when every check passes, 1 otherwise.
+The last line is `lsp-smoke: N passed, M failed (K fixtures)`; the exit code
+is 0 only when M is 0 and something ran.
 """
 
 import json
 import os
+import re
+import shutil
 import subprocess
+import tempfile
 import sys
 import threading
+import time
 
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))))
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+FIXTURES = os.path.join(HERE, "fixtures")
+
+# A cold compile of a fixture is the project plus the standard library.
+COLD_TIMEOUT = 180.0
+MARKER = re.compile(r"/\*([@^])([A-Za-z0-9_]+)\*/")
 
 
 def default_server_path():
@@ -34,35 +123,45 @@ def default_server_path():
     return os.path.join(REPO_ROOT, "tools", "CryoLSP", "build", exe)
 
 
-class Server:
-    """A running cryolsp with Content-Length framing on stdin/stdout."""
+def server_env():
+    """The server links LLVM-C; on Windows its DLL lives in the toolchain."""
+    env = dict(os.environ)
+    env["CRYO_STDLIB"] = os.path.join(REPO_ROOT, "stdlib")
+    extra = [os.path.join(REPO_ROOT, ".toolchains", "llvm-win", "bin"),
+             os.path.join(REPO_ROOT, "bin")]
+    extra = [p for p in extra if os.path.isdir(p)]
+    env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
+    return env
 
-    def __init__(self, path, root_uri):
+
+class Server:
+    """A running cryolsp with Content-Length framing on stdin/stdout.
+
+    One reader thread owns stdout.  Responses are filed by id; notifications
+    are kept in order so a check can wait for one.
+    """
+
+    def __init__(self, path, cwd):
         self.proc = subprocess.Popen(
             [path],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=REPO_ROOT,
+            cwd=cwd, env=server_env(),
         )
-        self.root_uri = root_uri
         self._next_id = 0
-        # Drain stderr on a thread: the server logs there, and a full pipe
-        # buffer would deadlock it mid-response.
+        self._lock = threading.Condition()
+        self._responses = {}
+        self._arrived = []
+        self._notifications = []
+        self._eof = False
         self._stderr = []
-        t = threading.Thread(target=self._drain_stderr, daemon=True)
-        t.start()
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        threading.Thread(target=self._read_loop, daemon=True).start()
 
     def _drain_stderr(self):
         for line in self.proc.stderr:
             self._stderr.append(line.decode("utf-8", "replace").rstrip())
 
-    def _send(self, obj):
-        body = json.dumps(obj).encode("utf-8")
-        self.proc.stdin.write(b"Content-Length: %d\r\n\r\n" % len(body))
-        self.proc.stdin.write(body)
-        self.proc.stdin.flush()
-
     def _read_message(self):
-        """Read one framed message, or None at EOF."""
         length = None
         while True:
             line = self.proc.stdout.readline()
@@ -70,51 +169,107 @@ class Server:
                 return None
             line = line.strip()
             if not line:
-                break                       # blank line ends the header block
+                break
             if line.lower().startswith(b"content-length:"):
                 length = int(line.split(b":", 1)[1])
         if length is None:
             return None
         buf = b""
-        while len(buf) < length:            # a pipe read may come up short
+        while len(buf) < length:
             chunk = self.proc.stdout.read(length - len(buf))
             if not chunk:
                 return None
             buf += chunk
         return json.loads(buf.decode("utf-8"))
 
-    def request(self, method, params, timeout=30.0):
-        """Send a request and return the message carrying its id.
+    def _read_loop(self):
+        while True:
+            msg = self._read_message()
+            with self._lock:
+                if msg is None:
+                    self._eof = True
+                    self._lock.notify_all()
+                    return
+                if "id" in msg and "method" not in msg:
+                    self._responses[msg["id"]] = msg
+                    self._arrived.append(msg["id"])
+                elif "method" in msg:
+                    self._notifications.append(msg)
+                self._lock.notify_all()
 
-        Notifications the server volunteers in the meantime (diagnostics,
-        log messages) are skipped rather than mistaken for the response.
-        """
+    def alive(self):
+        return self.proc.poll() is None and not self._eof
+
+    def send_raw(self, body):
+        try:
+            self.proc.stdin.write(b"Content-Length: %d\r\n\r\n" % len(body))
+            self.proc.stdin.write(body)
+            self.proc.stdin.flush()
+            return True
+        except OSError:
+            return False
+
+    def send(self, obj):
+        return self.send_raw(json.dumps(obj).encode("utf-8"))
+
+    def request(self, method, params, timeout=COLD_TIMEOUT):
+        """Send a request; return its response, or None if none arrives."""
+        rid = self.send_request(method, params)
+        if rid is None:
+            return None
+        return self.wait_response(rid, timeout)
+
+    def send_request(self, method, params):
+        """Send a request without waiting; its id, or None if it could not
+        be sent."""
         self._next_id += 1
         rid = self._next_id
-        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-        result = {}
+        if not self.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}):
+            return None
+        return rid
 
-        def pump():
-            while True:
-                msg = self._read_message()
-                if msg is None:
-                    return
-                if msg.get("id") == rid:
-                    result["msg"] = msg
-                    return
+    def order(self):
+        """The ids of the responses received so far, in arrival order."""
+        with self._lock:
+            return list(self._arrived)
 
-        t = threading.Thread(target=pump, daemon=True)
-        t.start()
-        t.join(timeout)
-        if "msg" not in result:
-            raise TimeoutError("no response to %s within %.0fs" % (method, timeout))
-        return result["msg"]
+    def wait_response(self, rid, timeout):
+        deadline = time.time() + timeout
+        with self._lock:
+            while rid not in self._responses:
+                left = deadline - time.time()
+                if left <= 0 or self._eof:
+                    return None
+                self._lock.wait(left)
+            return self._responses.pop(rid)
 
     def notify(self, method, params):
-        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+        return self.send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def wait_notification(self, method, pred, timeout=COLD_TIMEOUT):
+        """The newest notification `method` satisfying `pred`, waiting for one."""
+        deadline = time.time() + timeout
+        with self._lock:
+            while True:
+                for msg in reversed(self._notifications):
+                    if msg.get("method") == method and pred(msg.get("params") or {}):
+                        return msg.get("params")
+                left = deadline - time.time()
+                if left <= 0 or self._eof:
+                    return None
+                self._lock.wait(left)
 
     def stderr_text(self):
         return "\n".join(self._stderr)
+
+    def stop(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        try:
+            self.proc.stdin.close()          # a dead server's pipe cannot flush
+        except OSError:
+            pass
 
 
 class Checks:
@@ -138,192 +293,821 @@ def uri_for(path):
     return "file://" + p
 
 
-def main():
-    server_path = sys.argv[1] if len(sys.argv) > 1 else default_server_path()
-    if not os.path.exists(server_path):
-        print("cryolsp not found at %s" % server_path)
-        print("build it with:  cd tools/CryoLSP && cryo build")
-        return 1
+def same_uri(a, b):
+    return a.replace("%3A", ":").replace("%3a", ":").lower() == b.lower()
 
-    print("cryolsp smoke test")
-    print("  server: %s" % server_path)
 
-    c = Checks()
-    root = os.path.join(REPO_ROOT, "tools", "CryoLSP")
-    srv = Server(server_path, uri_for(root))
+def position_key(uri, pos):
+    """A location's file and start, comparable whatever the URI's escaping."""
+    file = uri.replace("%3A", ":").replace("%3a", ":").lower().rsplit("/", 1)[-1]
+    return (file, pos["line"], pos["character"])
 
-    # --- initialize -------------------------------------------------------
-    # Offer BOTH position encodings so the server picks utf-8, and separately
-    # exercise the utf-16 path below.
+
+def symbol_names(symbols, prefix=""):
+    """Every symbol's name, a nested one as `Parent/child`."""
+    out = []
+    for s in symbols:
+        full = prefix + s.get("name", "")
+        out.append(full)
+        out.extend(symbol_names(s.get("children", []), full + "/"))
+    return out
+
+
+# ---- fixtures --------------------------------------------------------------
+
+class Fixture:
+    """A fixture's files with their markers located."""
+
+    def __init__(self, root):
+        self.root = root
+        self.name = os.path.basename(root)
+        with open(os.path.join(root, "checks.json"), "r", encoding="utf-8") as fh:
+            self.spec = json.load(fh)
+        self.text = {}
+        self.markers = {}                    # "rel@name" -> (line, character)
+        for rel in self.spec.get("open", []):
+            self.load(rel)
+
+    def load(self, rel):
+        with open(os.path.join(self.root, rel), "r", encoding="utf-8", newline="") as fh:
+            self.set_text(rel, fh.read())
+
+    def set_text(self, rel, text):
+        """Make `text` the document's content and re-locate its markers."""
+        self.text[rel] = text
+        prefix = rel + "@"
+        for key in [k for k in self.markers if k.startswith(prefix)]:
+            del self.markers[key]
+        for m in MARKER.finditer(text):
+            key = "%s@%s" % (rel, m.group(2))
+            if key in self.markers:
+                raise ValueError("%s: marker %s appears twice" % (self.name, key))
+            offset = m.end() if m.group(1) == "@" else m.start()
+            self.markers[key] = position_of(text, offset)
+
+    def uri(self, rel):
+        return uri_for(os.path.join(self.root, rel))
+
+    def at(self, ref):
+        """`file@marker` -> (rel, position).  A missing marker is an error.
+        `file@marker+N` is N columns further along the marker's line, for a
+        position no comment can sit in front of (inside a string)."""
+        offset = 0
+        if "+" in ref:
+            ref, extra = ref.rsplit("+", 1)
+            offset = int(extra)
+        rel = ref.split("@", 1)[0]
+        if rel not in self.text:
+            self.load(rel)
+        if ref not in self.markers:
+            raise KeyError("%s: no marker %s" % (self.name, ref))
+        line, ch = self.markers[ref]
+        return rel, {"line": line, "character": ch + offset}
+
+
+def position_of(text, offset):
+    """LSP position of a character offset: zero-based line, UTF-16 column."""
+    line = text.count("\n", 0, offset)
+    start = text.rfind("\n", 0, offset) + 1
+    col = len(text[start:offset].encode("utf-16-le")) // 2
+    return line, col
+
+
+def describe_location(result):
+    if result is None:
+        return "null"
+    loc = result[0] if isinstance(result, list) and result else result
+    if not isinstance(loc, dict) or "uri" not in loc:
+        return repr(result)[:200]
+    s = loc["range"]["start"]
+    return "%s:%d:%d" % (loc["uri"].rsplit("/", 1)[-1], s["line"] + 1, s["character"] + 1)
+
+
+def location_matches(result, fx, expect):
+    loc = result[0] if isinstance(result, list) and len(result) == 1 else result
+    if not isinstance(loc, dict) or "uri" not in loc:
+        return False
+    rel, pos = fx.at(expect)
+    s = loc["range"]["start"]
+    return (same_uri(loc["uri"], fx.uri(rel))
+            and s["line"] == pos["line"] and s["character"] == pos["character"])
+
+
+def hover_text(result):
+    if not result:
+        return None
+    c = result.get("contents")
+    if isinstance(c, dict):
+        return c.get("value", "")
+    if isinstance(c, list):
+        return "\n".join(x.get("value", "") if isinstance(x, dict) else str(x) for x in c)
+    return str(c)
+
+
+def decode_tokens(data, legend):
+    """Semantic tokens' wire data -> {(line, start): (type, {modifiers})}."""
+    types = legend.get("tokenTypes", [])
+    mods = legend.get("tokenModifiers", [])
+    out = {}
+    line = start = 0
+    for k in range(0, len(data) - 4, 5):
+        dl, ds, _length, ty, bits = data[k:k + 5]
+        line += dl
+        start = start + ds if dl == 0 else ds
+        names = {mods[b] for b in range(len(mods)) if bits & (1 << b)}
+        out[(line, start)] = (types[ty] if ty < len(types) else str(ty), names)
+    return out
+
+
+def completion_context(trigger):
+    """A completion's context as an editor sends it: invoked, or triggered by
+    the character just typed."""
+    if trigger is None:
+        return {"triggerKind": 1}
+    return {"triggerKind": 2, "triggerCharacter": trigger}
+
+
+def completion_labels(result):
+    items = result.get("items", []) if isinstance(result, dict) else (result or [])
+    return [i.get("label") for i in items]
+
+
+def run_check(srv, fx, chk, c):
+    name = "%s: %s" % (fx.name, chk["name"])
+    method = chk["method"]
+    if method == "diagnostics":
+        uri = fx.uri(chk["file"])
+        want = sorted((d["code"],) + tuple(fx.at(d["at"])[1].values()) for d in chk["expect"])
+
+        def got_of(params):
+            return sorted((d.get("code"), d["range"]["start"]["line"],
+                           d["range"]["start"]["character"]) for d in params.get("diagnostics", []))
+        params = srv.wait_notification(
+            "textDocument/publishDiagnostics",
+            lambda p: same_uri(p.get("uri", ""), uri) and got_of(p) == want,
+            timeout=COLD_TIMEOUT)
+        if params is None:
+            last = srv.wait_notification("textDocument/publishDiagnostics",
+                                         lambda p: same_uri(p.get("uri", ""), uri), timeout=0)
+            c.ok(False, name, "want %r, last published %r" % (want, got_of(last) if last else None))
+        else:
+            c.ok(True, name)
+        return
+
+    if method == "semanticTokens":
+        resp = srv.request("textDocument/semanticTokens/full",
+                           {"textDocument": {"uri": fx.uri(chk["file"])}})
+        if resp is None or "error" in resp or not isinstance(resp.get("result"), dict):
+            c.ok(False, name, "no result: %r" % (resp,))
+            return
+        tokens = decode_tokens(resp["result"].get("data", []), fx.legend)
+        bad = []
+        for ref, want in chk["expect"].items():
+            _, pos = fx.at(ref)
+            got = tokens.get((pos["line"], pos["character"]))
+            if want is None:
+                if got is not None:
+                    bad.append("%s: want no token, got %s" % (ref, ".".join([got[0]] + sorted(got[1]))))
+                continue
+            parts = want.split(".")
+            if got is None or got[0] != parts[0] or not set(parts[1:]) <= got[1]:
+                shown = None if got is None else ".".join([got[0]] + sorted(got[1]))
+                bad.append("%s: want %s, got %s" % (ref, want, shown))
+        c.ok(not bad, name, "; ".join(bad))
+        return
+
+    if method in ("documentSymbol", "workspaceSymbol"):
+        if method == "documentSymbol":
+            resp = srv.request("textDocument/documentSymbol",
+                               {"textDocument": {"uri": fx.uri(chk["file"])}})
+        else:
+            resp = srv.request("workspace/symbol", {"query": chk["query"]})
+        if resp is None or "error" in resp:
+            c.ok(False, name, "no result: %r" % (resp,))
+            return
+        names = symbol_names(resp.get("result") or [])
+        missing = [s for s in chk.get("includes", []) if s not in names]
+        present = [s for s in chk.get("excludes", []) if s in names]
+        c.ok(not missing and not present, name,
+             "symbols %r; missing %r, unwanted %r" % (names[:40], missing, present))
+        return
+
+    if method in ("prepareRename", "rename"):
+        run_rename_check(srv, fx, chk, c, name)
+        return
+    if method == "signatureHelp":
+        run_signature_check(srv, fx, chk, c, name)
+        return
+    if method == "inlayHints":
+        uri = fx.uri(chk["file"])
+        resp = srv.request("textDocument/inlayHint",
+                           {"textDocument": {"uri": uri},
+                            "range": {"start": {"line": 0, "character": 0},
+                                      "end": {"line": 100000, "character": 0}}})
+        if resp is None or "error" in resp:
+            c.ok(False, name, "no result: %r" % (resp,))
+            return
+        hints = {}
+        for h in resp.get("result") or []:
+            p = h["position"]
+            hints[(p["line"], p["character"])] = h["label"]
+        bad = []
+        for ref, want in chk["expect"].items():
+            _, pos = fx.at(ref)
+            got = hints.get((pos["line"], pos["character"]))
+            if got != want:
+                bad.append("%s: want %r, got %r" % (ref, want, got))
+        c.ok(not bad, name, "; ".join(bad))
+        return
+
+    rel, pos = fx.at(chk["at"])
+    params = {"textDocument": {"uri": fx.uri(rel)}, "position": pos}
+    if method == "completion":
+        params["context"] = completion_context(chk.get("trigger"))
+    if method == "references":
+        params["context"] = {"includeDeclaration": chk.get("declaration", False)}
+    wire = "cryo/expandHover" if method == "expandHover" else "textDocument/" + method
+    stderr_before = len(srv._stderr)
+    resp = srv.request(wire, params)
+    if chk.get("quiet_stderr"):
+        # An analysis of a buffer that does not parse reports it on stderr,
+        # so a request answered without one leaves stderr as it was.  The
+        # pause lets the reader thread catch a line written before the reply.
+        time.sleep(0.5)
+        if len(srv._stderr) != stderr_before:
+            c.ok(False, name, "the server wrote to stderr while answering: %r"
+                 % srv._stderr[stderr_before:][:5])
+            return
+    if resp is None:
+        c.ok(False, name, "no response (server %s)" % ("alive" if srv.alive() else "dead"))
+        return
+    if "error" in resp:
+        c.ok(False, name, "error %r" % resp["error"])
+        return
+    result = resp.get("result")
+
+    if method == "definition":
+        if chk["expect"] is None:
+            c.ok(result is None or result == [], name, "got %s" % describe_location(result))
+        else:
+            c.ok(location_matches(result, fx, chk["expect"]), name,
+                 "want %s, got %s" % (chk["expect"], describe_location(result)))
+    elif method in ("hover", "expandHover"):
+        text = hover_text(result)
+        if "expect" in chk and chk["expect"] is None:
+            c.ok(text is None, name, "got %r" % text)
+            return
+        missing = [s for s in chk.get("contains", []) if text is None or s not in text]
+        present = [s for s in chk.get("excludes", []) if text is not None and s in text]
+        c.ok(not missing and not present, name,
+             "hover %r; missing %r, unwanted %r" % (text, missing, present))
+    elif method == "completion":
+        labels = completion_labels(result)
+        missing = [s for s in chk.get("includes", []) if s not in labels]
+        present = [s for s in chk.get("excludes", []) if s in labels]
+        items = result.get("items", []) if isinstance(result, dict) else (result or [])
+        detail_of = {i.get("label"): i.get("detail", "") for i in items}
+        wrong = ["%s: detail %r, want it to hold %r" % (k, detail_of.get(k), v)
+                 for k, v in chk.get("details", {}).items() if v not in (detail_of.get(k) or "")]
+        c.ok(not missing and not present and not wrong, name,
+             "items %r; missing %r, unwanted %r; %s" % (labels[:30], missing, present, "; ".join(wrong)))
+    elif method in ("references", "documentHighlight"):
+        default_uri = fx.uri(rel)
+        got = sorted(position_key(r.get("uri", default_uri), r["range"]["start"])
+                     for r in (result or []))
+        want = []
+        for marker in chk["expect"]:
+            mrel, mpos = fx.at(marker)
+            want.append(position_key(fx.uri(mrel), mpos))
+        c.ok(got == sorted(want), name, "want %r, got %r" % (sorted(want), got))
+    else:
+        raise ValueError("%s: unknown check method %r" % (fx.name, method))
+
+
+def run_rename_check(srv, fx, chk, c, name):
+    method = chk["method"]
+    rel, pos = fx.at(chk["at"])
+    params = {"textDocument": {"uri": fx.uri(rel)}, "position": pos}
+    if method == "rename":
+        params["newName"] = chk["new_name"]
+    resp = srv.request("textDocument/" + method, params)
+    if resp is None:
+        c.ok(False, name, "no response (server %s)" % ("alive" if srv.alive() else "dead"))
+        return
+    if "refused" in chk:
+        message = (resp.get("error") or {}).get("message", "")
+        c.ok("error" in resp and chk["refused"] in message, name,
+             "want a refusal saying %r, got %r" % (chk["refused"], resp))
+        return
+    if "error" in resp:
+        c.ok(False, name, "error %r" % resp["error"])
+        return
+    result = resp.get("result") or {}
+    if method == "prepareRename":
+        erel, epos = fx.at(chk["expect"])
+        start = (result.get("range") or {}).get("start")
+        c.ok(start == epos and result.get("placeholder") == chk["placeholder"], name,
+             "want %s %r, got %r" % (chk["expect"], chk["placeholder"], result))
+        return
+    got = []
+    bad = []
+    for uri, edits in (result.get("changes") or {}).items():
+        for e in edits:
+            r = e["range"]
+            got.append(position_key(uri, r["start"]))
+            width = r["end"]["character"] - r["start"]["character"]
+            if (r["end"]["line"] != r["start"]["line"] or width != len(chk["old"])
+                    or e["newText"] != chk["new_name"]):
+                bad.append(e)
+    want = []
+    for marker in chk["expect"]:
+        mrel, mpos = fx.at(marker)
+        want.append(position_key(fx.uri(mrel), mpos))
+    c.ok(sorted(got) == sorted(want) and not bad, name,
+         "want %r, got %r; edits not replacing %r: %r" % (sorted(want), sorted(got), chk["old"], bad))
+
+
+def run_signature_check(srv, fx, chk, c, name):
+    rel, pos = fx.at(chk["at"])
+    resp = srv.request("textDocument/signatureHelp",
+                       {"textDocument": {"uri": fx.uri(rel)}, "position": pos})
+    if resp is None:
+        c.ok(False, name, "no response (server %s)" % ("alive" if srv.alive() else "dead"))
+        return
+    if "error" in resp:
+        c.ok(False, name, "error %r" % resp["error"])
+        return
+    result = resp.get("result")
+    if chk.get("expect", "") is None:
+        c.ok(result is None, name, "got %r" % result)
+        return
+    sigs = (result or {}).get("signatures") or []
+    if not sigs:
+        c.ok(False, name, "no signature: %r" % result)
+        return
+    sig = sigs[result.get("activeSignature", 0)]
+    label = sig.get("label", "")
+    active = result.get("activeParameter", 0)
+    bad = [s for s in chk.get("contains", []) if s not in label]
+    bad += ["has %r" % s for s in chk.get("excludes", []) if s in label]
+    if "count" in chk and len(sigs) != chk["count"]:
+        bad.append("%d signature(s), want %d: %r" % (len(sigs), chk["count"],
+                                                      [s.get("label") for s in sigs]))
+    if active != chk["active"]:
+        bad.append("active parameter %r, want %r" % (active, chk["active"]))
+    if "param" in chk:
+        params = sig.get("parameters") or []
+        got = None
+        if 0 <= active < len(params):
+            lo, hi = params[active]["label"]
+            got = label[lo:hi]
+        if got != chk["param"]:
+            bad.append("active parameter's label %r, want %r" % (got, chk["param"]))
+    c.ok(not bad, name, "label %r: %s" % (label, "; ".join(bad)))
+
+
+def initialize(srv, root, c, label):
     init = srv.request("initialize", {
         "processId": os.getpid(),
         "rootUri": uri_for(root),
-        "capabilities": {"general": {"positionEncodings": ["utf-8", "utf-16"]}},
+        "capabilities": {"general": {"positionEncodings": ["utf-16"]}},
     })
-    caps = init.get("result", {}).get("capabilities", {})
-    c.ok("result" in init, "initialize returns a result")
-    c.ok(caps.get("positionEncoding") == "utf-8",
-         "negotiates utf-8 when the client offers it",
-         "got %r" % caps.get("positionEncoding"))
-    info = init.get("result", {}).get("serverInfo", {})
-    c.ok(bool(info.get("version")), "reports serverInfo.version",
-         "got %r" % info)
-    for cap in ("hoverProvider", "completionProvider", "definitionProvider",
-                "semanticTokensProvider"):
-        c.ok(cap in caps, "advertises %s" % cap)
-
+    c.ok(init is not None and "result" in init, "%s: initialize returns a result" % label)
     srv.notify("initialized", {})
+    return ((init or {}).get("result") or {}).get("capabilities", {})
 
-    # --- didOpen ----------------------------------------------------------
-    doc_path = os.path.join(root, "smoke_doc.cryo")
-    doc_uri = uri_for(doc_path)
-    text = (
-        "namespace Smoke::Doc;\n"
-        "\n"
-        "type struct Point {\n"
-        "    x: i32;\n"
-        "    y: i32;\n"
-        "\n"
-        "    sum(&this) -> i32 { return this.x + this.y; }\n"
-        "}\n"
-        "\n"
-        "function main() -> i32 {\n"
-        "    const p: Point = Point { x: 1, y: 2 };\n"
-        "    return p.sum();\n"
-        "}\n"
-    )
-    srv.notify("textDocument/didOpen", {
-        "textDocument": {"uri": doc_uri, "languageId": "cryo",
-                         "version": 1, "text": text},
-    })
 
-    # --- hover ------------------------------------------------------------
-    # Line 10 (0-based) is `    const p: Point = ...`; character 13 sits on
-    # `Point`.
-    hov = srv.request("textDocument/hover", {
-        "textDocument": {"uri": doc_uri},
-        "position": {"line": 10, "character": 13},
-    })
-    c.ok("error" not in hov, "hover does not error",
-         str(hov.get("error")))
-    c.ok("result" in hov, "hover returns a result")
-
-    # --- completion -------------------------------------------------------
-    comp = srv.request("textDocument/completion", {
-        "textDocument": {"uri": doc_uri},
-        "position": {"line": 11, "character": 13},
-        "context": {"triggerKind": 1},
-    })
-    c.ok("error" not in comp, "completion does not error",
-         str(comp.get("error")))
-
-    # --- semantic tokens --------------------------------------------------
-    # Against a REAL file that the project's module graph contains, not the
-    # synthetic buffer above. Tokens are produced by walking the compiled AST,
-    # which is reached via `find_module_by_path`; a document that is not on
-    # disk (or is on disk but unreachable from the entry point) has no module
-    # to walk and correctly yields an empty list. Asserting tokens on the
-    # synthetic doc tested an impossible case and failed permanently.
-    # A small example project, not CryoLSP's own source: opening the latter
-    # compiles the whole compiler library and takes far longer than a smoke
-    # test should wait.
-    real_path = os.path.join(REPO_ROOT, "examples", "03-fibonacci", "src", "main.cryo")
-    real_uri = uri_for(real_path)
-    with open(real_path, "r", encoding="utf-8") as fh:
-        real_text = fh.read()
-    srv.notify("textDocument/didOpen", {
-        "textDocument": {"uri": real_uri, "languageId": "cryo",
-                         "version": 1, "text": real_text},
-    })
-    st = srv.request("textDocument/semanticTokens/full", {
-        "textDocument": {"uri": real_uri},
-    }, timeout=120)
-    c.ok("error" not in st, "semanticTokens/full does not error",
-         str(st.get("error")))
-    data = (st.get("result") or {}).get("data")
-    c.ok(isinstance(data, list) and len(data) > 0,
-         "semanticTokens/full returns tokens",
-         "got %r len %s" % (type(data).__name__, len(data) if isinstance(data, list) else "n/a"))
-    c.ok(isinstance(data, list) and len(data) % 5 == 0,
-         "semantic token data is a multiple of 5")
-
-    # A document outside the module graph must answer cleanly rather than
-    # erroring or crashing.
-    ghost_uri = uri_for(os.path.join(REPO_ROOT, "examples", "03-fibonacci",
-                                     "src", "does_not_exist_on_disk.cryo"))
-    srv.notify("textDocument/didOpen", {
-        "textDocument": {"uri": ghost_uri, "languageId": "cryo", "version": 1,
-                         "text": "namespace Ghost::Doc;\n"},
-    })
-    gst = srv.request("textDocument/semanticTokens/full", {
-        "textDocument": {"uri": ghost_uri},
-    })
-    c.ok("error" not in gst and isinstance((gst.get("result") or {}).get("data"), list),
-         "semanticTokens on an unknown document answers cleanly")
-
-    # --- closing a document must not take the server down -----------------
-    # `did_close` releases the session's arena. That arena is also the one
-    # published to `GlobalArena`, whose `holds()` is dereferenced on every
-    # deallocation - so failing to retract it first turned the very next
-    # `free` into a wild read and killed the server mid-notification.
-    srv.notify("textDocument/didClose", {"textDocument": {"uri": ghost_uri}})
-    srv.notify("textDocument/didClose", {"textDocument": {"uri": real_uri}})
-    # Closing the example-project document sends the next request back through
-    # a full recompile of THIS project, so allow for a cold compile. A dead
-    # server never answers at all, so report that as a failed check rather than
-    # letting the harness die with a traceback.
-    try:
-        after_close = srv.request("textDocument/hover", {
-            "textDocument": {"uri": doc_uri},
-            "position": {"line": 10, "character": 13},
-        }, timeout=120)
-    except TimeoutError:
-        after_close = None
-    c.ok(after_close is not None
-         and ("result" in after_close or "error" in after_close),
-         "server survives didClose and still answers",
-         "no response - server exit code %r" % (srv.proc.poll(),))
-    if srv.proc.poll() is not None:
-        # Everything after this point would just raise on a closed pipe.
-        print("\n  server is gone (exit %r); skipping remaining checks"
-              % srv.proc.poll())
-        print("\n  passed %d, failed %d" % (c.passed, len(c.failed)))
-        return 1
-
-    # --- a document the server must not choke on --------------------------
-    # An incomplete buffer mid-edit, which is the normal state during typing.
-    srv.notify("textDocument/didChange", {
-        "textDocument": {"uri": doc_uri, "version": 2},
-        "contentChanges": [{"text": text.replace("return p.sum();", "return p.")}],
-    })
-    hov2 = srv.request("textDocument/hover", {
-        "textDocument": {"uri": doc_uri},
-        "position": {"line": 11, "character": 14},
-    })
-    c.ok("result" in hov2 or "error" in hov2,
-         "survives a mid-edit incomplete buffer")
-
-    # --- shutdown ---------------------------------------------------------
-    sd = srv.request("shutdown", {})
-    c.ok("result" in sd, "shutdown returns a result")
+def shutdown(srv, c, label):
+    sd = srv.request("shutdown", {}, timeout=60)
+    c.ok(sd is not None and "result" in sd, "%s: shutdown returns a result" % label)
     srv.notify("exit", {})
     try:
-        rc = srv.proc.wait(timeout=10)
-        c.ok(rc == 0, "exits cleanly after exit notification", "rc=%r" % rc)
+        rc = srv.proc.wait(timeout=20)
+        c.ok(rc == 0, "%s: exits 0 after shutdown and exit" % label, "rc=%r" % rc)
     except subprocess.TimeoutExpired:
-        srv.proc.kill()
-        c.ok(False, "exits cleanly after exit notification", "timed out")
+        srv.stop()
+        c.ok(False, "%s: exits 0 after shutdown and exit" % label, "timed out")
 
-    print("")
-    print("  passed %d, failed %d" % (c.passed, len(c.failed)))
-    if c.failed:
+
+def run_fixture(server_path, fx, c):
+    print("fixture %s" % fx.name)
+    failed_before = len(c.failed)
+    srv = Server(server_path, fx.root)
+    try:
+        caps = initialize(srv, fx.root, c, fx.name)
+        fx.legend = (caps.get("semanticTokensProvider") or {}).get("legend", {})
+        for rel in fx.spec.get("open", []):
+            srv.notify("textDocument/didOpen", {"textDocument": {
+                "uri": fx.uri(rel), "languageId": "cryo", "version": 1, "text": fx.text[rel]}})
+        version = 1
+        for chk in fx.spec.get("checks", []):
+            if not srv.alive():
+                c.ok(False, "%s: %s" % (fx.name, chk["name"]), "server is gone")
+                continue
+            edit = chk.get("edit")
+            if edit is None:
+                run_check(srv, fx, chk, c)
+                continue
+            # The check asks about a buffer being typed: change the document
+            # (unsaved), ask, and put it back.
+            rel = edit["file"]
+            original = fx.text[rel]
+            if edit["from"] not in original:
+                raise KeyError("%s: edit text %r not in %s" % (fx.name, edit["from"], rel))
+            fx.set_text(rel, original.replace(edit["from"], edit["to"], 1))
+            version += 1
+            change(srv, fx, rel, version, edit.get("save", False))
+            run_check(srv, fx, chk, c)
+            fx.set_text(rel, original)
+            version += 1
+            change(srv, fx, rel, version, edit.get("save", False))
+        if srv.alive():
+            shutdown(srv, c, fx.name)
+    finally:
+        srv.stop()
+        report_stderr(srv, c, failed_before)
+
+
+def change(srv, fx, rel, version, save):
+    srv.notify("textDocument/didChange", {
+        "textDocument": {"uri": fx.uri(rel), "version": version},
+        "contentChanges": [{"text": fx.text[rel]}]})
+    if save:
+        # The file on disk is never written: an open buffer is what every
+        # analysis reads, saved or not, so a save only says "analyse now".
+        srv.notify("textDocument/didSave", {"textDocument": {"uri": fx.uri(rel)}})
+
+
+def report_stderr(srv, c, failed_before):
+    if len(c.failed) > failed_before:
+        print("  server exit code %r" % srv.proc.poll())
         err = srv.stderr_text()
         if err:
-            print("\n  --- server stderr (last 40 lines) ---")
-            for line in err.split("\n")[-40:]:
-                print("  " + line)
+            print("  --- server stderr (last 20 lines) ---")
+            for line in err.split("\n")[-20:]:
+                print("  | " + line)
+
+
+# ---- protocol checks -------------------------------------------------------
+
+def run_protocol(server_path, c):
+    """Lifecycle and robustness, against the first fixture's project."""
+    print("protocol")
+    failed_before = len(c.failed)
+    root = os.path.join(FIXTURES, "two_modules")
+    srv = Server(server_path, root)
+    try:
+        caps = initialize(srv, root, c, "protocol")
+        for cap in ("hoverProvider", "completionProvider", "definitionProvider",
+                    "semanticTokensProvider"):
+            c.ok(cap in caps, "protocol: advertises %s" % cap)
+
+        main_rel = "src/main.cryo"
+        with open(os.path.join(root, main_rel), "r", encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        uri = uri_for(os.path.join(root, main_rel))
+        srv.notify("textDocument/didOpen", {"textDocument": {
+            "uri": uri, "languageId": "cryo", "version": 1, "text": text}})
+
+        st = srv.request("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
+        data = ((st or {}).get("result") or {}).get("data")
+        c.ok(isinstance(data, list) and len(data) > 0 and len(data) % 5 == 0,
+             "protocol: semanticTokens/full returns whole tokens",
+             "got %r" % (st,) if not isinstance(data, list) else "len %d" % len(data))
+
+        # A document outside the module graph answers cleanly.
+        ghost = uri_for(os.path.join(root, "src", "not_on_disk.cryo"))
+        srv.notify("textDocument/didOpen", {"textDocument": {
+            "uri": ghost, "languageId": "cryo", "version": 1, "text": "namespace Ghost::Doc;\n"}})
+        gst = srv.request("textDocument/semanticTokens/full", {"textDocument": {"uri": ghost}})
+        c.ok(gst is not None and "error" not in gst
+             and isinstance((gst.get("result") or {}).get("data"), list),
+             "protocol: semanticTokens on a document outside the project answers")
+
+        # Closing documents must not take the server down.
+        srv.notify("textDocument/didClose", {"textDocument": {"uri": ghost}})
+        after = srv.request("textDocument/hover", {
+            "textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}})
+        c.ok(after is not None, "protocol: answers after a didClose",
+             "server %s" % ("alive" if srv.alive() else "dead"))
+
+        # A half-typed line is the normal state of a buffer.
+        srv.notify("textDocument/didChange", {
+            "textDocument": {"uri": uri, "version": 2},
+            "contentChanges": [{"text": text.replace("wb./*^after_dot*//*@get_call*/get();", "wb.")}]})
+        mid = srv.request("textDocument/hover", {
+            "textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}})
+        c.ok(mid is not None, "protocol: survives a half-typed buffer")
+
+        if srv.alive():
+            shutdown(srv, c, "protocol")
+    finally:
+        srv.stop()
+        report_stderr(srv, c, failed_before)
+
+
+def run_protocol_errors(server_path, c):
+    """Every error reply is answered, and the server lives on after it."""
+    print("protocol errors")
+    failed_before = len(c.failed)
+    root = os.path.join(FIXTURES, "two_modules")
+    srv = Server(server_path, root)
+    try:
+        early = srv.request("textDocument/hover", {
+            "textDocument": {"uri": uri_for(os.path.join(root, "src", "main.cryo"))},
+            "position": {"line": 0, "character": 0}}, timeout=30)
+        c.ok(early is not None and (early.get("error") or {}).get("code") == -32002,
+             "protocol: a request before initialize is refused as not initialized",
+             "got %r" % (early,))
+        initialize(srv, root, c, "protocol errors")
+
+        for i, method in enumerate(("cryo/noSuchMethod", "textDocument/noSuchMethod")):
+            resp = srv.request(method, {}, timeout=30)
+            c.ok(resp is not None and (resp.get("error") or {}).get("code") == -32601,
+                 "protocol: unknown method %d is answered with method-not-found" % (i + 1),
+                 "got %r (server %s)" % (resp, "alive" if srv.alive() else "dead"))
+
+        srv.send({"jsonrpc": "2.0", "id": "bad-1", "params": {}})
+        bad = srv.wait_response("bad-1", 30)
+        c.ok(bad is not None and (bad.get("error") or {}).get("code") == -32600,
+             "protocol: a request with no method is answered as invalid, under its id",
+             "got %r" % (bad,))
+
+        srv.send_raw(b"{ this is not json")
+        parse = srv.wait_response(None, 30)
+        c.ok(parse is not None and (parse.get("error") or {}).get("code") == -32700,
+             "protocol: a body that is not JSON is answered with a parse error",
+             "got %r" % (parse,))
+
+        main_uri = uri_for(os.path.join(root, "src", "main.cryo"))
+        with open(os.path.join(root, "src", "main.cryo"), "r", encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        srv.notify("textDocument/didOpen", {"textDocument": {
+            "uri": main_uri, "languageId": "cryo", "version": 1, "text": text}})
+        after = srv.request("textDocument/hover", {
+            "textDocument": {"uri": main_uri}, "position": {"line": 0, "character": 0}})
+        c.ok(after is not None and "error" not in after,
+             "protocol: answers a real request after the error replies",
+             "got %r (server %s)" % (after, "alive" if srv.alive() else "dead"))
+
+        published = srv.wait_notification(
+            "textDocument/publishDiagnostics",
+            lambda p: same_uri(p.get("uri", ""), main_uri), timeout=COLD_TIMEOUT)
+        refresh = srv.wait_notification("workspace/semanticTokens/refresh",
+                                         lambda p: True, timeout=0)
+        c.ok(published is not None and refresh is None,
+             "protocol: no semantic-token refresh is sent to a client that did not declare it",
+             "published %r, refresh %r" % (published is not None, refresh is not None))
+
+        sd = srv.request("shutdown", {}, timeout=60)
+        c.ok(sd is not None and "result" in sd, "protocol errors: shutdown returns a result")
+        late = srv.request("textDocument/hover", {
+            "textDocument": {"uri": main_uri}, "position": {"line": 0, "character": 0}}, timeout=30)
+        c.ok(late is not None and (late.get("error") or {}).get("code") == -32600,
+             "protocol: a request after shutdown is refused as invalid", "got %r" % (late,))
+        srv.notify("exit", {})
+        try:
+            rc = srv.proc.wait(timeout=20)
+            c.ok(rc == 0, "protocol errors: exits 0 after shutdown and exit", "rc=%r" % rc)
+        except subprocess.TimeoutExpired:
+            c.ok(False, "protocol errors: exits 0 after shutdown and exit", "timed out")
+    finally:
+        srv.stop()
+        report_stderr(srv, c, failed_before)
+
+
+def run_during_analysis(server_path, c):
+    """Requests sent behind one that starts an analysis.  The analysis
+    stops between modules to read them, so a request behind it is answered
+    from the last analysis before the first one's answer, and a cancellation
+    of the first one is honoured.  The order is decided by what is already
+    in the pipe when the analysis starts, not by time."""
+    label = "during analysis"
+    print(label)
+    fx = Fixture(os.path.join(FIXTURES, "two_modules"))
+    srv = Server(server_path, fx.root)
+    try:
+        initialize(srv, fx.root, c, label)
+        for rel in fx.spec.get("open", []):
+            srv.notify("textDocument/didOpen", {"textDocument": {
+                "uri": fx.uri(rel), "languageId": "cryo", "version": 1, "text": fx.text[rel]}})
+        rel, pos = fx.at("src/main.cryo@local_x_use")
+        at = {"textDocument": {"uri": fx.uri(rel)}, "position": pos}
+        save = {"textDocument": {"uri": fx.uri(rel)}}
+        first = srv.request("textDocument/definition", at)
+        c.ok(first is not None and location_matches(first.get("result"), fx, "src/main.cryo@local_x"),
+             "%s: the first analysis answers" % label)
+
+        srv.notify("textDocument/didSave", save)
+        a = srv.send_request("textDocument/definition", at)
+        b = srv.send_request("textDocument/hover", at)
+        ra = srv.wait_response(a, COLD_TIMEOUT)
+        rb = srv.wait_response(b, COLD_TIMEOUT)
+        order = srv.order()
+        c.ok(ra is not None and rb is not None and order.index(b) < order.index(a),
+             "%s: a request behind one that starts an analysis is answered first" % label,
+             "order %r, a=%r b=%r" % (order, a, b))
+        c.ok(rb is not None and "local_x" in (hover_text(rb.get("result")) or ""),
+             "%s: it is answered from the last analysis" % label, "got %r" % (rb,))
+        c.ok(ra is not None and location_matches(ra.get("result"), fx, "src/main.cryo@local_x"),
+             "%s: the request that started the analysis is answered after it" % label)
+
+        srv.notify("textDocument/didSave", save)
+        a = srv.send_request("textDocument/definition", at)
+        srv.notify("$/cancelRequest", {"id": a})
+        ra = srv.wait_response(a, COLD_TIMEOUT)
+        code = ((ra or {}).get("error") or {}).get("code")
+        c.ok(code == -32800, "%s: a request cancelled while its analysis runs answers as cancelled" % label,
+             "got %r" % (ra,))
+        shutdown(srv, c, label)
+    finally:
+        srv.stop()
+
+
+def run_outside_project(server_path, c):
+    """A file under no cryoconfig, analysed as its own entry point, with an
+    import typed into it one character at a time as an editor sends it: a
+    change, then a completion for each character, `:` as a trigger.  The
+    file lives in a temporary directory, since every fixture is inside the
+    server's own project."""
+    label = "outside a project"
+    print(label)
+    failed_before = len(c.failed)
+    root = tempfile.mkdtemp(prefix="cryolsp-outside-")
+    path = os.path.join(root, "scratch.cryo")
+    body = "\nfunction main() -> i32 {\n    return 0;\n}\n"
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(body)
+    uri = uri_for(path)
+    srv = Server(server_path, root)
+    try:
+        initialize(srv, root, c, label)
+        srv.notify("textDocument/didOpen", {"textDocument": {
+            "uri": uri, "languageId": "cryo", "version": 1, "text": body}})
+        published = srv.wait_notification("textDocument/publishDiagnostics",
+                                           lambda p: same_uri(p.get("uri", ""), uri))
+        c.ok(published is not None and published.get("diagnostics") == [],
+             "%s: the file is analysed on open, with no diagnostics" % label, "got %r" % (published,))
+        answers = {}
+        typed = ""
+        version = 1
+        for ch in "import std::core::":
+            typed += ch
+            version += 1
+            srv.notify("textDocument/didChange", {
+                "textDocument": {"uri": uri, "version": version},
+                "contentChanges": [{"text": typed + body}]})
+            resp = srv.request("textDocument/completion", {
+                "textDocument": {"uri": uri}, "position": {"line": 0, "character": len(typed)},
+                "context": completion_context(ch if ch in ".:" else None)})
+            answers[typed] = completion_labels((resp or {}).get("result"))
+        c.ok(answers["import std:"] == [],
+             "%s: the first `:` of a `::` offers nothing" % label,
+             "got %r" % answers["import std:"][:12])
+        got = answers["import std::"]
+        c.ok("core" in got and "collections" in got and not [g for g in got if ":" in g],
+             "%s: `import std::` lists the modules under `std`" % label, "got %r" % got[:20])
+        got = answers["import std::core::"]
+        c.ok("option" in got and "core" not in got,
+             "%s: `import std::core::` lists the modules under `std::core`" % label, "got %r" % got[:20])
+        shutdown(srv, c, label)
+    finally:
+        srv.stop()
+        report_stderr(srv, c, failed_before)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def find_position(text, needle, offset=0):
+    """The LSP position `offset` characters into the first `needle` in
+    `text`; a missing needle is an error, as a missing marker is."""
+    at = text.find(needle)
+    if at < 0:
+        raise KeyError("text %r not found" % needle)
+    line, col = position_of(text, at + offset)
+    return {"line": line, "character": col}
+
+
+def uri_tail(uri):
+    return uri.replace("%3A", ":").replace("%3a", ":").replace("\\", "/").lower()
+
+
+def run_stdlib_files(server_path, c):
+    """A jump from a project into the standard library, followed the way an
+    editor follows it: the library's file is opened, and questions are asked
+    in it.  The library is analysed as part of the project, so its files are
+    answered from that analysis and opening one starts no analysis of its
+    own (no diagnostics are published for it).  The library's files carry no
+    markers, so positions are found by their text."""
+    label = "stdlib files"
+    print(label)
+    failed_before = len(c.failed)
+    root = os.path.join(FIXTURES, "stdlib_jump")
+    main_rel = "src/main.cryo"
+    with open(os.path.join(root, main_rel), "r", encoding="utf-8", newline="") as fh:
+        main_text = fh.read()
+    main_uri = uri_for(os.path.join(root, main_rel))
+    srv = Server(server_path, root)
+    try:
+        initialize(srv, root, c, label)
+        srv.notify("textDocument/didOpen", {"textDocument": {
+            "uri": main_uri, "languageId": "cryo", "version": 1, "text": main_text}})
+        srv.wait_notification("textDocument/publishDiagnostics",
+                              lambda p: same_uri(p.get("uri", ""), main_uri))
+
+        def ask(method, uri, pos, extra=None):
+            params = {"textDocument": {"uri": uri}, "position": pos}
+            params.update(extra or {})
+            resp = srv.request("textDocument/" + method, params, timeout=60)
+            return (resp or {}).get("result")
+
+        def first_uri(result):
+            loc = result[0] if isinstance(result, list) and result else result
+            return uri_tail(loc["uri"]) if isinstance(loc, dict) and "uri" in loc else None
+
+        got = first_uri(ask("definition", main_uri, find_position(main_text, "import std::io;", 12)))
+        c.ok(got is not None and got.endswith("stdlib/io/_module.cryo"),
+             "%s: definition of an imported library module is its file" % label, "got %r" % got)
+
+        # The editor opens the file the jump landed in.
+        std_root = os.path.join(REPO_ROOT, "stdlib")
+        n_before = len(srv._notifications)
+        opened = {}
+        for rel in ("io/_module.cryo", "io/error.cryo"):
+            path = os.path.join(std_root, *rel.split("/"))
+            with open(path, "r", encoding="utf-8", newline="") as fh:
+                opened[rel] = (uri_for(path), fh.read())
+            srv.notify("textDocument/didOpen", {"textDocument": {
+                "uri": opened[rel][0], "languageId": "cryo", "version": 1, "text": opened[rel][1]}})
+
+        mod_uri, mod_text = opened["io/_module.cryo"]
+        got = first_uri(ask("definition", mod_uri, find_position(mod_text, "public module io::error;", 18)))
+        c.ok(got is not None and got.endswith("stdlib/io/error.cryo"),
+             "%s: definition on a `public module` line is that module's file" % label, "got %r" % got)
+
+        err_uri, err_text = opened["io/error.cryo"]
+        hover = hover_text(ask("hover", err_uri, find_position(err_text, "type enum IoErrorKind", 10)))
+        c.ok(hover is not None and "IoErrorKind" in hover,
+             "%s: hover in a library file opened after a jump answers" % label, "got %r" % hover)
+        use = find_position(err_text, "kind: IoErrorKind", 6)
+        decl = find_position(err_text, "type enum IoErrorKind", 10)
+        got = ask("definition", err_uri, use)
+        loc = got[0] if isinstance(got, list) and got else got
+        c.ok(isinstance(loc, dict) and uri_tail(loc["uri"]).endswith("stdlib/io/error.cryo")
+             and loc["range"]["start"] == decl,
+             "%s: definition inside a library file is its declaration there" % label, "got %r" % got)
+        refs = ask("references", err_uri, decl, {"context": {"includeDeclaration": False}}) or []
+        c.ok(any(same_uri(r.get("uri", ""), err_uri) and r["range"]["start"] == use for r in refs)
+             and any(same_uri(r.get("uri", ""), main_uri) for r in refs),
+             "%s: references from a library file reach its own uses and the project's" % label,
+             "got %r" % [(r.get("uri", "").rsplit("/", 1)[-1], r["range"]["start"]) for r in refs][:12])
+
+        time.sleep(1.0)
+        own = [m for m in srv._notifications[n_before:]
+               if m.get("method") == "textDocument/publishDiagnostics"
+               and any(same_uri(m["params"].get("uri", ""), u) for u, _ in opened.values())]
+        c.ok(not own, "%s: opening a library file starts no analysis of its own" % label,
+             "diagnostics were published for %r" % [m["params"]["uri"] for m in own][:4])
+        shutdown(srv, c, label)
+    finally:
+        srv.stop()
+        report_stderr(srv, c, failed_before)
+
+
+def main():
+    args = sys.argv[1:]
+    only = None
+    if "--fixture" in args:
+        i = args.index("--fixture")
+        only = args[i + 1]
+        del args[i:i + 2]
+    server_path = os.path.abspath(args[0]) if args else default_server_path()
+    if not os.path.exists(server_path):
+        print("cryolsp not found at %s" % server_path)
+        print("lsp-smoke: 0 passed, 1 failed (0 fixtures)")
         return 1
-    return 0
+    print("cryolsp behavioural tests")
+    print("  server: %s" % server_path)
+
+    c = Checks()
+    fixtures = 0
+    if only is None:
+        run_protocol(server_path, c)
+        run_protocol_errors(server_path, c)
+        run_during_analysis(server_path, c)
+        run_outside_project(server_path, c)
+        run_stdlib_files(server_path, c)
+    for name in sorted(os.listdir(FIXTURES)):
+        root = os.path.join(FIXTURES, name)
+        if only is not None and name != only:
+            continue
+        if not os.path.isfile(os.path.join(root, "checks.json")):
+            continue
+        fixtures += 1
+        run_fixture(server_path, Fixture(root), c)
+
+    print("")
+    print("lsp-smoke: %d passed, %d failed (%d fixtures)" % (c.passed, len(c.failed), fixtures))
+    return 0 if (not c.failed and c.passed > 0 and fixtures > 0) else 1
 
 
 if __name__ == "__main__":
