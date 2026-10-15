@@ -2,7 +2,11 @@
 ///!
 ///! A project is the cryoconfig a file's directory or one of its parents
 ///! holds, or, for a file under no cryoconfig, the file alone as its own
-///! entry point.  Each project has one analysis that answers questions: the
+///! entry point.  A file an analysed project holds as a library module (the
+///! standard library's, a dependency's) is answered from that project's
+///! analysis instead, and is never analysed as a project of its own while
+///! one holds it: a jump into the standard library lands in the analysis
+///! the jump came from.  Each project has one analysis that answers questions: the
 ///! last one whose every module lexed and parsed, so the name layer stamped
 ///! the whole tree.  An analysis of a buffer that does not parse publishes
 ///! its diagnostics and is then released, leaving the previous answers in
@@ -42,6 +46,7 @@ import std::alloc::arena;
 
 import compiler::compilation_context;
 import compiler::compilation_context::{ SourceOverride };
+import compiler::module_graph::{ ModuleGraph, ModuleOrigin };
 import compiler::instance;
 import compiler::codegen::ast_arena;
 
@@ -116,6 +121,9 @@ type struct Project {
     owed:    boolean;
     /// An analysis has run, whether or not it parsed.
     analysed: boolean;
+    /// When the last analysis ran, as the number of analyses run before it
+    /// in this process.
+    analysed_at: u64;
     /// An analysis ran and its diagnostics are not published yet.
     unpublished: boolean;
     /// The last analysis when it was not adopted (its tree did not parse):
@@ -136,6 +144,7 @@ type struct Project {
             current:     Analysis::none(),
             owed:        false,
             analysed:    false,
+            analysed_at: 0,
             unpublished: false,
             last:        Analysis::none(),
             focus:       String::new(),
@@ -215,7 +224,7 @@ type struct Project {
             // A buffer edited while the analysis ran has moved on from the
             // text it read: the snapshot is the text read.
             for (d in docs.by_uri.values_ref()) {
-                if (!this.owns(d.path.as_str())) { continue; }
+                if (!this.owns(d.path.as_str()) && !this.holds_library(d.path.as_str())) { continue; }
                 const read: Option<str::Str> = this.current.text_read(d.path.as_str());
                 if (read.is_some()) { d.adopt_text(read.unwrap_or(str::Str::from(""))); }
             }
@@ -223,6 +232,23 @@ type struct Project {
             mem::swap(&this.last, &a);
         }
         mem::drop(a);
+    }
+
+    /// Whether this project's current analysis holds file `path` as a
+    /// module that is not the project's own: the standard library's, a
+    /// dependency's or a vendored library's.  Such a file is answered from
+    /// this analysis rather than analysed as a project of its own.
+    holds_library(&this, path: str::Str) -> boolean {
+        if (this.current.ctx == null) { return false; }
+        mut c: String = PathFinder::build_cstring_buffer(path);
+        const graph: ModuleGraph* = this.current.ctx.module_graph;
+        const idx: i64 = graph.find_module_by_path(c.as_ptr() as string);
+        mem::drop(c);
+        if (idx < 0) { return false; }
+        return match (graph.get_module(idx).origin) {
+            ModuleOrigin::Local => { false }
+            _                   => { true }
+        };
     }
 
     /// Whether file `path` belongs to this project.
@@ -260,16 +286,20 @@ type struct Projects {
     /// An analysis is running: a request answered from inside it is
     /// answered from the last analysis, never by starting another.
     analysing: boolean;
+    /// How many analyses have run in this process.
+    analyses: u64;
 
     static new() -> Projects {
         return Projects { by_key: HashMap::<String, Project>::new(), yield_hook: null,
-                          yield_client: null, analysing: false };
+                          yield_client: null, analysing: false, analyses: 0 };
     }
 
     /// Run project `p`'s owed analysis, unless one is already running.
     refresh(mut &this, p: Project*, docs: mut &docs::Docs) -> void {
         if (!p.owed || this.analysing) { return; }
         this.analysing = true;
+        this.analyses = this.analyses + 1;
+        p.analysed_at = this.analyses;
         p.refresh(docs, this.yield_hook, this.yield_client);
         this.analysing = false;
     }
@@ -291,7 +321,26 @@ type struct Projects {
         return String::from_str(path);
     }
 
+    /// The analysed project holding file `path` as a library module
+    /// (`Project::holds_library`), or null.  Of several, the one analysed
+    /// last: the editor reached the file from it.
+    library_holder(&this, path: str::Str) -> Project* {
+        mut best: Project* = null;
+        for (p in this.by_key.values_ref()) {
+            if (!p.holds_library(path)) { continue; }
+            if (best == null || p.analysed_at > best.analysed_at) { best = p; }
+        }
+        return best;
+    }
+
+    /// The project whose analysis answers for file `path`: an analysed
+    /// project holding it as a library module, or else the project its own
+    /// directory names.  A library file never becomes a project of its own
+    /// while an analysis holds it, so jumping into the standard library
+    /// starts no analysis of the library.
     project_for(mut &this, path: str::Str) -> Project* {
+        const held: Project* = this.library_holder(path);
+        if (held != null) { return held; }
         mut key: String = Projects::key_for(path);
         match (this.by_key.get_ref(&key)) {
             Option::Some(p) => { mem::drop(key); return p; }
@@ -315,9 +364,16 @@ type struct Projects {
     }
 
     /// A file was saved, or changed on disk: its project is analysed again.
+    /// A library file saved is analysed again as part of the project that
+    /// holds it, whose focus (its entry, or its target view) stays put.
     note_saved(mut &this, path: str::Str) -> void {
         const p: Project* = this.project_for(path);
-        if (p != null) { Projects::owe(p, path); }
+        if (p == null) { return; }
+        if (p.holds_library(path)) {
+            p.owed = true;
+            return;
+        }
+        Projects::owe(p, path);
     }
 
     static owe(p: Project*, path: str::Str) -> void {

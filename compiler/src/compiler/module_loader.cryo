@@ -993,14 +993,19 @@ public:
                 // Record the target's own namespace though - discovery already
                 // knows it, and dropping it here is what forced the prelude's
                 // set to be hand-transcribed into a constant in `decl_index`.
+                const sub_at: SourceSpan = if (s < scan.submodule_spans.length) {
+                    scan.submodule_spans[s]
+                } else {
+                    SourceSpan::none()
+                };
                 const sub_idx: i64 = graph.find_module_by_path(sub_resolved);
                 if (sub_idx >= 0) {
-                    info.add_submodule(RecordedEdge::to(graph.modules[sub_idx].path()));
+                    info.add_submodule(RecordedEdge::to(graph.modules[sub_idx].path()), sub_at);
                 } else {
                     // Mid-load (cycle): the graph entry is not written yet, but
                     // the namespace is known.  Same case as the import edge.
                     match (this.scanned_ns.get(&sub_resolved.to_ascii_lower())) {
-                        Option::Some(ns) => { info.add_submodule(RecordedEdge::written_as(intern.intern(ns))); }
+                        Option::Some(ns) => { info.add_submodule(RecordedEdge::written_as(intern.intern(ns)), sub_at); }
                         Option::None     => { }
                     }
                 }
@@ -1099,6 +1104,7 @@ public:
         mut export_braced: boolean[] = [];
         mut export_items: string[] = [];
         mut submodules: string[] = [];
+        mut submodule_spans: SourceSpan[] = [];
         const len: i64 = tokens.length;
         mut i: i64 = 0;
 
@@ -1267,9 +1273,13 @@ public:
                 if ((i + 1) < len) {
                     if (tokens[i + 1].kind == TokenType::KwModule) {
                         i += 2;  // consume 'public' 'module'
+                        const sub_line: int = if (i < len) { tokens[i].line } else { 0 };
+                        const sub_col:  int = if (i < len) { tokens[i].column } else { 0 };
                         const mod_path: string = ModuleLoader::collect_qualified_name(tokens, &i, len);
                         if (mod_path.length() > 0) {
                             submodules.push(mod_path);
+                            submodule_spans.push(SourceSpan::new("", sub_line as u32, sub_col as u32,
+                                                                 sub_line as u32, sub_col as u32));
                         }
                         // Skip semicolon if present
                         if (i < len) {
@@ -1378,6 +1388,7 @@ public:
             export_items:      ModuleLoader::spelled(intern, &export_items),
             export_item_count: export_item_count_val,
             submodule_paths:   ModuleLoader::spelled(intern, &submodules),
+            submodule_spans:   submodule_spans,
             submodule_count:   submodule_count_val,
             uses_fstring:      uses_fstring_val,
         };
@@ -1637,6 +1648,9 @@ type struct ModuleScanResult {
     export_items:    SymbolStr[];
     export_item_count: i64;
     submodule_paths: SymbolStr[]; // `public module` declarations (discover only, no dep edge)
+    /// Where each `public module` line's path starts, parallel to
+    /// `submodule_paths` (file unset).
+    submodule_spans: SourceSpan[];
     submodule_count: i64;
     uses_fstring:    boolean;     // file contains at least one f-string (`f"..."`)
 }

@@ -28,8 +28,9 @@ import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, EnumDeclNode, EnumVariantNode, FieldDeclNode,
     FunctionDeclNode, ImplBlockNode, ImportDeclNode, IntrinsicDeclNode, MethodNode,
-    StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+    ModuleDeclNode, StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
 };
+import compiler::module_graph::{ ModulePath };
 import compiler::ast::expression::{
     CallExprNode, CalleePin, CastExprNode, ExpressionNode, IdentifierNode, MemberAccessNode,
     NewExprNode, ScopeResolutionNode, StructLiteralNode
@@ -192,9 +193,12 @@ type struct Locator {
     /// The nodes from the top-level statement down to the innermost one
     /// holding the position.
     chain: ASTNode*[];
+    /// The module the position is in, when the caller named it.
+    module: ModulePath;
 
     static new(ctx: CompilationContext*, line: u32, col: u32) -> Locator {
-        return Locator { ctx: ctx, di: ctx.decl_index, line: line, col: col, chain: [] };
+        return Locator { ctx: ctx, di: ctx.decl_index, line: line, col: col, chain: [],
+                         module: ModulePath::none() };
     }
 
     /// The answer at (`line`, `col`), compiler coordinates, in module
@@ -202,6 +206,7 @@ type struct Locator {
     static answer_at(ctx: CompilationContext*, module_idx: i64, line: u32, col: u32) -> Answer {
         if (ctx == null || module_idx < 0 || line == 0) { return Answer::nothing(); }
         mut loc: Locator = Locator::new(ctx, line, col);
+        loc.module = ctx.module_graph.get_module(module_idx).path();
         loc.descend(ctx.module_graph.get_module_ast(module_idx as u32));
         return loc.answer();
     }
@@ -311,6 +316,7 @@ type struct Locator {
             }
             NodeKind::ImplementationBlock => { return this.impl_head(n as ImplBlockNode*); }
             NodeKind::ImportDeclaration => { return this.import(n as ImportDeclNode*); }
+            NodeKind::ModuleDeclaration => { return this.submodule(n as ModuleDeclNode*); }
             _ => { return Answer::nothing(); }
         }
     }
@@ -656,6 +662,21 @@ type struct Locator {
         if (!imp.resolved_module.is_valid()) { return Answer::nothing(); }
         const d: DefId = this.ctx.module_graph.module_def(imp.resolved_module);
         return Answer::of(Locator::def_target(d), imp.path_segment_spans[last], TypeRef::invalid());
+    }
+
+    /// The module a `public module` line names, from its path's last
+    /// segment: the one the loader found where the path is written.
+    submodule(&this, md: ModuleDeclNode*) -> Answer {
+        const last: i64 = md.path_segment_spans.length - 1;
+        if (!md.is_public || last < 0 || !this.holds(md.path_segment_spans[last])) {
+            return Answer::nothing();
+        }
+        const first: SourceSpan = md.path_segment_spans[0];
+        const m: ModulePath = this.ctx.module_graph.submodule_written_at(
+            this.module, first.start_line, first.start_col);
+        if (!m.is_valid()) { return Answer::nothing(); }
+        const d: DefId = this.ctx.module_graph.module_def(m);
+        return Answer::of(Locator::def_target(d), md.path_segment_spans[last], TypeRef::invalid());
     }
 
     /// The written type name at the position inside `ann`.

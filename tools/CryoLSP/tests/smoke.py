@@ -971,6 +971,102 @@ def run_outside_project(server_path, c):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def find_position(text, needle, offset=0):
+    """The LSP position `offset` characters into the first `needle` in
+    `text`; a missing needle is an error, as a missing marker is."""
+    at = text.find(needle)
+    if at < 0:
+        raise KeyError("text %r not found" % needle)
+    line, col = position_of(text, at + offset)
+    return {"line": line, "character": col}
+
+
+def uri_tail(uri):
+    return uri.replace("%3A", ":").replace("%3a", ":").replace("\\", "/").lower()
+
+
+def run_stdlib_files(server_path, c):
+    """A jump from a project into the standard library, followed the way an
+    editor follows it: the library's file is opened, and questions are asked
+    in it.  The library is analysed as part of the project, so its files are
+    answered from that analysis and opening one starts no analysis of its
+    own (no diagnostics are published for it).  The library's files carry no
+    markers, so positions are found by their text."""
+    label = "stdlib files"
+    print(label)
+    failed_before = len(c.failed)
+    root = os.path.join(FIXTURES, "stdlib_jump")
+    main_rel = "src/main.cryo"
+    with open(os.path.join(root, main_rel), "r", encoding="utf-8", newline="") as fh:
+        main_text = fh.read()
+    main_uri = uri_for(os.path.join(root, main_rel))
+    srv = Server(server_path, root)
+    try:
+        initialize(srv, root, c, label)
+        srv.notify("textDocument/didOpen", {"textDocument": {
+            "uri": main_uri, "languageId": "cryo", "version": 1, "text": main_text}})
+        srv.wait_notification("textDocument/publishDiagnostics",
+                              lambda p: same_uri(p.get("uri", ""), main_uri))
+
+        def ask(method, uri, pos, extra=None):
+            params = {"textDocument": {"uri": uri}, "position": pos}
+            params.update(extra or {})
+            resp = srv.request("textDocument/" + method, params, timeout=60)
+            return (resp or {}).get("result")
+
+        def first_uri(result):
+            loc = result[0] if isinstance(result, list) and result else result
+            return uri_tail(loc["uri"]) if isinstance(loc, dict) and "uri" in loc else None
+
+        got = first_uri(ask("definition", main_uri, find_position(main_text, "import std::io;", 12)))
+        c.ok(got is not None and got.endswith("stdlib/io/_module.cryo"),
+             "%s: definition of an imported library module is its file" % label, "got %r" % got)
+
+        # The editor opens the file the jump landed in.
+        std_root = os.path.join(REPO_ROOT, "stdlib")
+        n_before = len(srv._notifications)
+        opened = {}
+        for rel in ("io/_module.cryo", "io/error.cryo"):
+            path = os.path.join(std_root, *rel.split("/"))
+            with open(path, "r", encoding="utf-8", newline="") as fh:
+                opened[rel] = (uri_for(path), fh.read())
+            srv.notify("textDocument/didOpen", {"textDocument": {
+                "uri": opened[rel][0], "languageId": "cryo", "version": 1, "text": opened[rel][1]}})
+
+        mod_uri, mod_text = opened["io/_module.cryo"]
+        got = first_uri(ask("definition", mod_uri, find_position(mod_text, "public module io::error;", 18)))
+        c.ok(got is not None and got.endswith("stdlib/io/error.cryo"),
+             "%s: definition on a `public module` line is that module's file" % label, "got %r" % got)
+
+        err_uri, err_text = opened["io/error.cryo"]
+        hover = hover_text(ask("hover", err_uri, find_position(err_text, "type enum IoErrorKind", 10)))
+        c.ok(hover is not None and "IoErrorKind" in hover,
+             "%s: hover in a library file opened after a jump answers" % label, "got %r" % hover)
+        use = find_position(err_text, "kind: IoErrorKind", 6)
+        decl = find_position(err_text, "type enum IoErrorKind", 10)
+        got = ask("definition", err_uri, use)
+        loc = got[0] if isinstance(got, list) and got else got
+        c.ok(isinstance(loc, dict) and uri_tail(loc["uri"]).endswith("stdlib/io/error.cryo")
+             and loc["range"]["start"] == decl,
+             "%s: definition inside a library file is its declaration there" % label, "got %r" % got)
+        refs = ask("references", err_uri, decl, {"context": {"includeDeclaration": False}}) or []
+        c.ok(any(same_uri(r.get("uri", ""), err_uri) and r["range"]["start"] == use for r in refs)
+             and any(same_uri(r.get("uri", ""), main_uri) for r in refs),
+             "%s: references from a library file reach its own uses and the project's" % label,
+             "got %r" % [(r.get("uri", "").rsplit("/", 1)[-1], r["range"]["start"]) for r in refs][:12])
+
+        time.sleep(1.0)
+        own = [m for m in srv._notifications[n_before:]
+               if m.get("method") == "textDocument/publishDiagnostics"
+               and any(same_uri(m["params"].get("uri", ""), u) for u, _ in opened.values())]
+        c.ok(not own, "%s: opening a library file starts no analysis of its own" % label,
+             "diagnostics were published for %r" % [m["params"]["uri"] for m in own][:4])
+        shutdown(srv, c, label)
+    finally:
+        srv.stop()
+        report_stderr(srv, c, failed_before)
+
+
 def main():
     args = sys.argv[1:]
     only = None
@@ -993,6 +1089,7 @@ def main():
         run_protocol_errors(server_path, c)
         run_during_analysis(server_path, c)
         run_outside_project(server_path, c)
+        run_stdlib_files(server_path, c)
     for name in sorted(os.listdir(FIXTURES)):
         root = os.path.join(FIXTURES, name)
         if only is not None and name != only:
