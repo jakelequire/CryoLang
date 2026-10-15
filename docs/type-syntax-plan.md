@@ -543,7 +543,9 @@ commit that runs it and is deleted in the next.
   exactly those, and each must differ only in a source-location column.  A
   moved object outside that list is a rewrite that changed a type.
 
-**3a landed.**  `scripts/array-codemod.py` takes its positions from the
+**3a landed.**  The codemod, `scripts/array-codemod.py` with
+`scripts/array-codemod-trace.patch` (in `2809d263` and `29897680`, deleted
+in the commit after), takes its positions from the
 parser (a trace patch prints each postfix array's start, `[` and `]`) and
 checks every position against the text before writing.  `cryo check` on a
 lone file cannot resolve a project dependency and then parses nothing, so
