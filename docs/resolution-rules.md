@@ -183,6 +183,20 @@ yet is recorded with the change that builds it, not here.
 
 359. **The demangler's output is pinned by a test.**  (Jake)
 
+360. **Trait objects come before v1.0, borrowed only:** `virtual &T`
+     (285, 288, 289), right after or folded into the class removal, built
+     on the class vtable machinery.  Owning boxes, upcasting and generic
+     implementations coerced to an object come after v1.0.  (Jake)
+
+361. **The refused postfix fixed array keeps the wording of 352 exactly:**
+     `u8[4]` reads "array types are written `[T]`: write `[u8; 4]`".
+     (Jake)
+
+362. **A value moved in a loop's condition, or in any expression the loop
+     evaluates again at its back edge, is refused** with the existing
+     loop-carried report ("moved inside a loop is used again on the next
+     iteration").  (Jake)
+
 ### 2026-10-14
 
 333. **One project's analysis covers every target of its cryoconfig, and
