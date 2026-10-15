@@ -96,7 +96,8 @@ the branch.
 
 ## The language server
 
-Rewritten on the `lsp-rewrite` branch (ruling 316).  `tools/CryoLSP`
+Rewritten on the `lsp-rewrite` branch (ruling 316) and merged into `main`.
+`tools/CryoLSP`
 answers from the identities the compiler stamps, never by a declaration's
 spelling: a position finds its node, the node's stamp names a definition,
 and every answer is read from that definition.  One analysis per project
@@ -105,9 +106,13 @@ last analysis that parsed answers while a buffer is broken or being typed,
 and answers requests between modules while the next one runs.  It serves
 diagnostics, hover, definition, references and highlights, document and
 workspace symbols, completion, semantic tokens, the implementations lens,
-rename, signature help and inlay hints.  `make lsp-check` drives the
-server through `tools/CryoLSP/tests/smoke.py` over its fixtures and
-refuses below its floor of passing checks (`docs/testing.md` section 9).
+rename, signature help and inlay hints, and writes names as the cursor's
+scope writes them (ruling 346).  A standard library or dependency file is
+answered from the analysis of the project that holds it.  `make lsp-check`
+drives the server through `tools/CryoLSP/tests/smoke.py` over its fixtures
+and refuses below its floor of passing checks (`docs/testing.md` section
+9).  Two open defects are in the bug log: memory that may grow across saves,
+and one unreproduced unanswered request.
 
 What is left:
 
@@ -168,6 +173,16 @@ What is left:
   **inlay hints** show inferred types, not parameter names at call sites.
 - **The uses index** is built per request (ruling 337); a cache waits for a
   measurement that needs one.
+- **A library file opened before any analysis holds it** (a standard
+  library file opened first, with no project open) is analysed as a project
+  of its own cryoconfig.  With the frozen standard library layer it would
+  be answered from that layer instead.
+- **Code the compiler writes is marked `generated`** by drop insertion, the
+  closure synthesis and the conversions the type check writes, which the
+  editor looks through.  The asynchronous lowering and the `?` desugaring
+  write locals with synthetic bindings and do not mark them; a sweep of
+  every request over async and `?` programs found no wrong answer, but
+  nothing holds the mark there.
 
 ## CI
 
