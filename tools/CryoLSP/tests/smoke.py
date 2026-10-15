@@ -81,7 +81,9 @@ against the changed text and its markers, and the document is changed back.
 That is how a check asks about a buffer mid-typing.  With `"save": true` the
 edit, and the change back, are each followed by a save.
 
-A completion check may carry `"trigger": ":"`: it is then sent as the editor
+A completion check may carry `"details": {"label": "text"}`: the item of
+that label must exist and its detail hold the text.  It may carry
+`"trigger": ":"`: it is then sent as the editor
 sends one the typed character triggered, not as one the user invoked.
 
 A position check may carry `"quiet_stderr": true`: it then also fails when the
@@ -563,8 +565,12 @@ def run_check(srv, fx, chk, c):
         labels = completion_labels(result)
         missing = [s for s in chk.get("includes", []) if s not in labels]
         present = [s for s in chk.get("excludes", []) if s in labels]
-        c.ok(not missing and not present, name,
-             "items %r; missing %r, unwanted %r" % (labels[:30], missing, present))
+        items = result.get("items", []) if isinstance(result, dict) else (result or [])
+        detail_of = {i.get("label"): i.get("detail", "") for i in items}
+        wrong = ["%s: detail %r, want it to hold %r" % (k, detail_of.get(k), v)
+                 for k, v in chk.get("details", {}).items() if v not in (detail_of.get(k) or "")]
+        c.ok(not missing and not present and not wrong, name,
+             "items %r; missing %r, unwanted %r; %s" % (labels[:30], missing, present, "; ".join(wrong)))
     elif method in ("references", "documentHighlight"):
         default_uri = fx.uri(rel)
         got = sorted(position_key(r.get("uri", default_uri), r["range"]["start"])

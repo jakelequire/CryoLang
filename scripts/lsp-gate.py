@@ -74,7 +74,7 @@ def main():
                     help="do not remove the build directory first.  Only for "
                          "exercising the refusal an incremental build triggers; "
                          "a gate run must not use it.")
-    ap.add_argument("--min-checks", type=int, default=156,
+    ap.add_argument("--min-checks", type=int, default=167,
                     help="fail if the behavioural run passes fewer checks than this")
     ap.add_argument("--no-run", action="store_true",
                     help="build only; do not run the behavioural checks")

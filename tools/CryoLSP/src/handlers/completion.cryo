@@ -46,6 +46,7 @@ import lsp::handlers::definition::{ Declared };
 import lsp::handlers::hover::{ Shown };
 import lsp::handlers::identity::{ Asked, Locator };
 import lsp::handlers::members::{ Member, Members };
+import lsp::handlers::names::{ Names, Place };
 import lsp::server::docs;
 import lsp::server::line_index::{ Columns };
 import lsp::server::session;
@@ -85,13 +86,6 @@ public function handle_completion(docs: mut &docs::Docs, projects: mut &session:
 }
 
 
-/// What a path written before the cursor names.
-type enum Place {
-    Nothing;
-    Module(ModulePath);
-    Type(DefId);
-}
-
 /// One `.name` (or the head) of a receiver written before a `.`, and the
 /// text of the calls and indexings written after it (`(4)[0]`).
 type struct Step {
@@ -125,6 +119,8 @@ type struct Completer {
     items:  Array<value::JsonValue>;
     /// The labels already offered.
     labels: HashMap<String, i64>;
+    /// Paths read, and items' details written, as the cursor's scope does.
+    names:  Names;
 
     static new(ctx: CompilationContext*, module_idx: i64) -> Completer {
         mut m: ModulePath = ModulePath::none();
@@ -132,7 +128,8 @@ type struct Completer {
         return Completer { ctx: ctx, module: m, scope: ScopeID::invalid(),
                            pos: docs::CompilerPos { line: 0, col: 0 },
                            items: Array::<value::JsonValue>::with_capacity(64),
-                           labels: HashMap::<String, i64>::new() };
+                           labels: HashMap::<String, i64>::new(),
+                           names: Names::at(ctx, m, 0, 0) };
     }
 
     /// Complete at byte `end` of `line`, the cursor's line in the buffer;
@@ -173,9 +170,8 @@ type struct Completer {
     /// Take the cursor's scope from where the analysis has it, `pos`.
     place_cursor(mut &this, pos: docs::CompilerPos) -> void {
         this.pos = pos;
-        if (this.ctx != null && this.module.is_valid() && pos.line != 0) {
-            this.scope = this.ctx.resolver.scope_at(this.module, pos.line, pos.col);
-        }
+        this.names = Names::at(this.ctx, this.module, pos.line, pos.col);
+        this.scope = this.names.scope;
     }
 
     // -- What was written --
@@ -210,26 +206,6 @@ type struct Completer {
         if (k != 0) { return false; }
         const word: str::Str = line.sub_bytes(s, e);
         return word.equals(&str::Str::from("import")) || word.equals(&str::Str::from("export"));
-    }
-
-    /// The segments of `text`, split at `::`.
-    static segments(text: str::Str) -> str::Str[] {
-        mut out: str::Str[] = [];
-        const b: u8* = text.as_ptr();
-        const n: u64 = text.length();
-        mut s: u64 = 0;
-        mut i: u64 = 0;
-        while (i < n) {
-            if (i + 1 < n && b[i] == ':' as u8 && b[i + 1] == ':' as u8) {
-                out.push(text.sub_bytes(s, i));
-                i = i + 2;
-                s = i;
-                continue;
-            }
-            i = i + 1;
-        }
-        out.push(text.sub_bytes(s, n));
-        return out;
     }
 
     // -- `a.b().` --
@@ -479,66 +455,7 @@ type struct Completer {
 
     /// What the path `written` (`A::B`) names in the cursor's scope.
     place_of_path(&this, written: str::Str) -> Place {
-        if (this.ctx == null || !this.scope.is_valid()) { return Place::Nothing; }
-        const segs: str::Str[] = Completer::segments(written);
-        mut place: Place = this.head_place(segs[0]);
-        for (mut i: i64 = 1; i < segs.length; i++) {
-            place = this.next_place(&place, segs[i]);
-        }
-        return place;
-    }
-
-    /// What a path's first segment names in the cursor's scope: the type
-    /// the scope binds it to, or the module it spells there.
-    head_place(&this, seg: str::Str) -> Place {
-        const name: SymbolStr = this.intern(seg);
-        const bound: SymbolID = this.ctx.resolver.type_binding(name, this.scope);
-        if (bound.is_valid()) {
-            mut s: Symbol = this.ctx.resolver.get_symbol(bound);
-            if (s.kind == SymbolKind::Import) {
-                if (s.def.is_valid() && this.ctx.defs.kind_of(s.def) == DefKind::Module) {
-                    return Place::Module(this.ctx.module_graph.module_of_def(s.def));
-                }
-                s = this.ctx.resolver.get_symbol(this.ctx.resolver.declaration_of(bound));
-            }
-            return this.place_of(&s);
-        }
-        const m: ModuleSpellingMatch = this.ctx.modules_written_as(
-            this.cstr(seg), this.module, ModulePath::none());
-        if (m.visible == 1) { return Place::Module(m.found); }
-        return Place::Nothing;
-    }
-
-    /// What segment `seg` names after `place`: a type the module exports,
-    /// or a module under it.
-    next_place(&this, place: &Place, seg: str::Str) -> Place {
-        match (place) {
-            Place::Module(m) => {
-                const found: SymbolID[] = this.ctx.resolver.exports_named(m, this.intern(seg));
-                for (mut i: i64 = 0; i < found.length; i++) {
-                    const s: Symbol = this.ctx.resolver.get_symbol(found[i]);
-                    const p: Place = this.place_of(&s);
-                    match (p) {
-                        Place::Nothing => { }
-                        _              => { return p; }
-                    }
-                }
-                const sub: ModuleSpellingMatch = this.ctx.modules_written_as(this.cstr(seg), this.module, m);
-                if (sub.visible == 1) { return Place::Module(sub.found); }
-                return Place::Nothing;
-            }
-            _ => { return Place::Nothing; }
-        }
-    }
-
-    place_of(&this, s: &Symbol) -> Place {
-        if (s.kind == SymbolKind::Type || s.kind == SymbolKind::TypeAlias) {
-            if (s.def.is_valid()) { return Place::Type(s.def); }
-        }
-        if (s.kind == SymbolKind::Namespace && s.def.is_valid()) {
-            return Place::Module(this.ctx.module_graph.module_of_def(s.def));
-        }
-        return Place::Nothing;
+        return this.names.place_of_path(written);
     }
 
     // -- `import A::B::` --
@@ -620,7 +537,7 @@ type struct Completer {
             if (target.equals(id)) { return; }
             s = this.ctx.resolver.get_symbol(target);
         }
-        mut shown: Shown = Shown::new(this.ctx);
+        mut shown: Shown = Shown::new(this.names);
         mut kind: i64 = CK_VARIABLE;
         match (s.kind) {
             SymbolKind::Variable  => {
@@ -655,7 +572,7 @@ type struct Completer {
     }
 
     member_item(mut &this, m: &Member) -> void {
-        mut shown: Shown = Shown::new(this.ctx);
+        mut shown: Shown = Shown::new(this.names);
         match (m) {
             Member::Field(o, i) => {
                 const fd: FieldDeclNode* = Members::field_decl(this.ctx, o, i);

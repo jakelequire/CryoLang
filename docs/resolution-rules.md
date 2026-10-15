@@ -197,6 +197,16 @@ yet is recorded with the change that builds it, not here.
      Whole-module reuse between saves stays on the roadmap, folded into the
      intermediate representation work with stable identities.  (Jake)
 
+346. **The editor's text prints names relative to the cursor's scope, by
+     identity, and leaves out defaulted type arguments.**  Hover, signature
+     help, completion details and inlay hints write each definition and
+     type in the shortest form that names the same identity from the
+     cursor, decided through the doors and compared by identity, never by
+     trimming text; a short name that would name something else there, or
+     nothing, keeps enough of its path.  A type argument equal to the
+     default its template declares is left out.  The expanded hover keeps
+     every path in full.  (Dispatch, delegated, at Jake's request)
+
 ### 2026-10-13
 
 299. **Before the merge, the scratch directories are deleted:** `.objcmp/`,
