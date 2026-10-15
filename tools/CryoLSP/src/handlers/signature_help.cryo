@@ -5,7 +5,9 @@
 ///! the innermost `(` the cursor is inside, the callee written before it
 ///! (`f`, `recv.m`, `T::m`, `M::f`), resolved through the same lookups
 ///! completion asks, and the commas before the cursor counting the active
-///! parameter.  A call whose `(` is on an earlier line is not read.
+///! parameter.  Every overload of the callee is offered, the first with
+///! room for the active argument highlighted.  A call whose `(` is on an
+///! earlier line is not read.
 namespace lsp::handlers::signature_help;
 
 import std::core::option;
@@ -151,14 +153,23 @@ type struct Signatures {
         return out;
     }
 
+    /// Every overload of the functions `syms` bind: each one's family, read
+    /// off its definition, once.
     static of_symbols(ctx: CompilationContext*, syms: SymbolID[]) -> Offered[] {
-        mut out: Offered[] = [];
+        mut entries: OverloadId[] = [];
         for (mut k: i64 = 0; k < syms.length; k++) {
             const s: Symbol = ctx.resolver.get_symbol(syms[k]);
             if (s.kind != SymbolKind::Function || !s.def.is_valid()) { continue; }
-            Signatures::add(&out, ctx.decl_index.declaration_of(s.def));
+            const family: OverloadId[] = ctx.decl_index.family_entries_of_def(s.def);
+            for (mut f: i64 = 0; f < family.length; f++) {
+                mut seen: boolean = false;
+                for (mut e: i64 = 0; e < entries.length; e++) {
+                    if (entries[e].equals(family[f])) { seen = true; break; }
+                }
+                if (!seen) { entries.push(family[f]); }
+            }
         }
-        return out;
+        return Signatures::of_entries(ctx, entries);
     }
 
     static add(out: mut &Offered[], decl: ASTNode*) -> void {

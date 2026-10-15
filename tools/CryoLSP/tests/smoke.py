@@ -57,8 +57,9 @@ asks for the whole file's hints and names, per position, the label of the
 hint that must sit there, or null for none.
 
 A `signatureHelp` check ("at", "contains", "excludes", "active", "param",
-or "expect": null) reads the active signature's label, the active
-parameter's index, and that parameter's label as its offsets cut it.
+"count", or "expect": null) reads the active signature's label, the active
+parameter's index, and that parameter's label as its offsets cut it;
+"count" is how many signatures, every overload, the answer must offer.
 
 A rename check compares the set of edits' starts with the markers', and
 every edit must replace exactly `old`'s width with `new_name`.  A refusal
@@ -643,6 +644,9 @@ def run_signature_check(srv, fx, chk, c, name):
     active = result.get("activeParameter", 0)
     bad = [s for s in chk.get("contains", []) if s not in label]
     bad += ["has %r" % s for s in chk.get("excludes", []) if s in label]
+    if "count" in chk and len(sigs) != chk["count"]:
+        bad.append("%d signature(s), want %d: %r" % (len(sigs), chk["count"],
+                                                      [s.get("label") for s in sigs]))
     if active != chk["active"]:
         bad.append("active parameter %r, want %r" % (active, chk["active"]))
     if "param" in chk:
