@@ -142,11 +142,10 @@ What is left:
      compiler architecture project.
 - **Parsing that continues past an error** (ruling 330), only if the last
   good analysis proves not to be enough.
-- **Completion after a partial module path** (ruling 339): `import Probe::`
-  where `Probe` names no module but prefixes `Probe::A` and `Probe::B`
-  offers nothing, until the module graph can list a path's children by
-  identity through a door.  Completion is not read for a receiver whose
-  head is a path (`T::make().`).
+- **Completion is not read for a receiver whose head is a path**
+  (`T::make().`).  After an import's path it lists only the modules the
+  last analysis loaded, so `import std::` offers the standard library's
+  modules the project reaches, not every one on disk.
 - **The import suggestion for a module already imported** (ruling 332)
   becomes not machine-applicable and suggests the qualified name.  It
   changes a diagnostic's text, which waits for its wording to be decided.

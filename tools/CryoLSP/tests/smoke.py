@@ -80,6 +80,9 @@ against the changed text and its markers, and the document is changed back.
 That is how a check asks about a buffer mid-typing.  With `"save": true` the
 edit, and the change back, are each followed by a save.
 
+A completion check may carry `"trigger": ":"`: it is then sent as the editor
+sends one the typed character triggered, not as one the user invoked.
+
 A position check may carry `"quiet_stderr": true`: it then also fails when the
 server writes to stderr while answering, which an analysis of a buffer that
 does not parse always does.  `expandHover` asks `cryo/expandHover`, the
@@ -95,7 +98,9 @@ is 0 only when M is 0 and something ran.
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -411,6 +416,14 @@ def decode_tokens(data, legend):
     return out
 
 
+def completion_context(trigger):
+    """A completion's context as an editor sends it: invoked, or triggered by
+    the character just typed."""
+    if trigger is None:
+        return {"triggerKind": 1}
+    return {"triggerKind": 2, "triggerCharacter": trigger}
+
+
 def completion_labels(result):
     items = result.get("items", []) if isinstance(result, dict) else (result or [])
     return [i.get("label") for i in items]
@@ -507,7 +520,7 @@ def run_check(srv, fx, chk, c):
     rel, pos = fx.at(chk["at"])
     params = {"textDocument": {"uri": fx.uri(rel)}, "position": pos}
     if method == "completion":
-        params["context"] = {"triggerKind": 1}
+        params["context"] = completion_context(chk.get("trigger"))
     if method == "references":
         params["context"] = {"includeDeclaration": chk.get("declaration", False)}
     wire = "cryo/expandHover" if method == "expandHover" else "textDocument/" + method
@@ -901,6 +914,59 @@ def run_during_analysis(server_path, c):
         srv.stop()
 
 
+def run_outside_project(server_path, c):
+    """A file under no cryoconfig, analysed as its own entry point, with an
+    import typed into it one character at a time as an editor sends it: a
+    change, then a completion for each character, `:` as a trigger.  The
+    file lives in a temporary directory, since every fixture is inside the
+    server's own project."""
+    label = "outside a project"
+    print(label)
+    failed_before = len(c.failed)
+    root = tempfile.mkdtemp(prefix="cryolsp-outside-")
+    path = os.path.join(root, "scratch.cryo")
+    body = "\nfunction main() -> i32 {\n    return 0;\n}\n"
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(body)
+    uri = uri_for(path)
+    srv = Server(server_path, root)
+    try:
+        initialize(srv, root, c, label)
+        srv.notify("textDocument/didOpen", {"textDocument": {
+            "uri": uri, "languageId": "cryo", "version": 1, "text": body}})
+        published = srv.wait_notification("textDocument/publishDiagnostics",
+                                           lambda p: same_uri(p.get("uri", ""), uri))
+        c.ok(published is not None and published.get("diagnostics") == [],
+             "%s: the file is analysed on open, with no diagnostics" % label, "got %r" % (published,))
+        answers = {}
+        typed = ""
+        version = 1
+        for ch in "import std::core::":
+            typed += ch
+            version += 1
+            srv.notify("textDocument/didChange", {
+                "textDocument": {"uri": uri, "version": version},
+                "contentChanges": [{"text": typed + body}]})
+            resp = srv.request("textDocument/completion", {
+                "textDocument": {"uri": uri}, "position": {"line": 0, "character": len(typed)},
+                "context": completion_context(ch if ch in ".:" else None)})
+            answers[typed] = completion_labels((resp or {}).get("result"))
+        c.ok(answers["import std:"] == [],
+             "%s: the first `:` of a `::` offers nothing" % label,
+             "got %r" % answers["import std:"][:12])
+        got = answers["import std::"]
+        c.ok("core" in got and "collections" in got and not [g for g in got if ":" in g],
+             "%s: `import std::` lists the modules under `std`" % label, "got %r" % got[:20])
+        got = answers["import std::core::"]
+        c.ok("option" in got and "core" not in got,
+             "%s: `import std::core::` lists the modules under `std::core`" % label, "got %r" % got[:20])
+        shutdown(srv, c, label)
+    finally:
+        srv.stop()
+        report_stderr(srv, c, failed_before)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     args = sys.argv[1:]
     only = None
@@ -922,6 +988,7 @@ def main():
         run_protocol(server_path, c)
         run_protocol_errors(server_path, c)
         run_during_analysis(server_path, c)
+        run_outside_project(server_path, c)
     for name in sorted(os.listdir(FIXTURES)):
         root = os.path.join(FIXTURES, name)
         if only is not None and name != only:

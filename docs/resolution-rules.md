@@ -103,6 +103,7 @@ or reads the store by identity.  Locked so far:
 | `trait-method` | `GenericRegistry::trait_item_slot` | `compiler/src/compiler/types/generic_registry.cryo` | member: a trait's declared method, by trait identity and leaf, to its position in the trait |
 | `assoc-type` | `TraitDeclNode::assoc_type_index` | `compiler/src/compiler/AST/declaration.cryo` | member: a trait's associated type, by the trait's declaration and leaf, to its position among the trait's associated types |
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
+| `module-by-path` | `ModuleGraph::module_path_over` | `compiler/src/compiler/module_graph.cryo` | an import's written path to itself as a path to list modules within, when the graph holds a module at it or under it, whether or not it names a module (`import std::`) |
 | `module-by-path` | `ModuleGraph::modules_in_view` | `compiler/src/compiler/module_graph.cryo` | a path written in a body to the modules it names, among those the writing file can see: its own, the ones it imports, the prelude, or a package root written whole |
 | `loader-path` | `ModuleLoader::resolve_import_path` | `compiler/src/compiler/module_loader.cryo` | a module path written in an `import`, an `export` or a `public module` to the file of the module it names: a vendored library, a file declaring the namespace, or a file at the path on disk |
 | `loader-path` | `ModuleLoader::binding_of` | `compiler/src/compiler/module_loader.cryo` | a body path's head to the import of the file that binds it |
@@ -173,6 +174,28 @@ yet is recorded with the change that builds it, not here.
 341. **The names inside an import's braces get their positions and the
      definitions they name before the editor's rename is built,** so a
      rename reaches every import of what it renames.  (Jake)
+
+342. **The suggestion for a module that is already imported reads
+     "`Probe::A` is already imported; write `A::Item`"** and is not applied
+     automatically.  (Jake)
+
+343. **The language server's `serverInfo.version` from the build stamp
+     stays on the roadmap;** it needs a matching change in the VS Code
+     extension.  (Jake)
+
+344. **Signature help reads the typed text only for its structure** - which
+     call the cursor is in, and which argument.  It resolves the callee
+     through the compiler's doors in the scope at the cursor, as completion
+     resolves a path, and takes the signature from the callee's identity;
+     it never matches the callee's text against names.  It shows every
+     overload and highlights the one that fits the argument count so far.
+     (Jake)
+
+345. **Ruling 329 is amended: the editor analyses the standard library
+     once per server process** and reuses it as a frozen base layer, and in
+     the editor's mode the passes the editor does not need are skipped.
+     Whole-module reuse between saves stays on the roadmap, folded into the
+     intermediate representation work with stable identities.  (Jake)
 
 ### 2026-10-13
 
