@@ -12,9 +12,11 @@ housekeeping (ruling 266: CI matches verify's gate list first thing after
 the merge).  The first project was the editor's rewrite, on a branch named
 `lsp-rewrite` (ruling 316: the editor's rewrite comes first, before the
 type-syntax update and the class removal); what it built and what it left
-are under "The language server".  Then the type-syntax update
-(the array syntax below), then the class removal, then trait objects; the
-other items are not ordered yet.
+are under "The language server".  Then the type-syntax update: array
+types are written `[T]` and `[T; N]`, and the postfix forms are refused,
+which is built; one dynamic array type (below) is what remains of it.
+Then the class removal, then trait objects; the other items are not
+ordered yet.
 
 ## Merge notes
 
@@ -255,35 +257,22 @@ and `i32::MAX` is refused (ruling 275: primitives keep `max_value()` and
 Open: whether a trait may declare a constant its implementations supply,
 and whether a constant may be used where a type argument is expected.
 
-## Array syntax
-
-`T[]` becomes `[T]` for a dynamic array, and `[T; N]` is the fixed-size
-array.
-
-The first phase changes nothing: it re-measures the corpus - every array
-type written in `compiler/`, `stdlib/`, `tools/`, `tests/` and `examples/`
-- so the conversion is planned from today's numbers, not old ones.  That
-measurement, the slices and the decisions they wait on are in
-`docs/type-syntax-plan.md`, which is folded back into this item and deleted
-when the work lands.
-
-The postfix forms are refused once the tree is migrated, with no transition
-period; a constant-expression length is written after the `;`
-(`[T; CHUNK * 2]`), as the repeat expression `[value; N]` writes it; an
-array of functions is `[(i32) -> i32]`.
-
 ## One dynamic array type
 
-`[T]` names the builtin dynamic array that `T[]` names today, and that is
-not `Array<T>`: the two mangle differently, refuse each other by value,
-only the builtin indexes with `[]`, and an array literal initialises only
-the builtin.  The builtin borrows its methods from `Array<T>`, and nested
-builtin arrays crash at run time where `Array<Array<T>>` does not.  The two
-are made one type in a change of its own, after the array syntax and
-before the class removal, so the class removal writes its thousands of
-array types against the type that remains.  Open: which of the two is the
-end state, and what that does to mangling and to `&[T]` as against
-`Slice<T>`.
+`[T]` names a builtin dynamic array, and that is not `Array<T>`: the two
+mangle differently, refuse each other by value, only the builtin indexes
+with `[]`, and an array literal initialises only the builtin.  The builtin
+borrows its methods from `Array<T>`, and nested builtin arrays (`[[T]]`)
+crash at run time where `Array<Array<T>>` does not; the drop pass and the
+type resolver carry comments that route around the nested shape.  The two
+are made one type in a change of its own, before the class removal, so
+the class removal writes its thousands of array types against the type
+that remains: the AST's child lists are `[ExpressionNode*]`,
+`[StatementNode*]` and `[TypeAnnotation*]` today, and become arrays of
+whatever the AST's enums are.  Open: which of the two is the end state,
+and what that does to mangling, and to `&[T]` - a reference to an owning,
+growable array - as against `Slice<T>`, the borrowed view, which a reader
+may expect `[T]` to spell.
 
 ## The class removal
 
@@ -322,7 +311,8 @@ v1.0 (ruling 286).
 - **Spelling:** `virtual &Shape` and `virtual Shape*`, a prefix as in
   `mut &this`; there is no `dyn` (ruling 285).  Until then `&Shape` and
   `Shape*` are refused where they are written (`E0313`; ruling 287), as
-  is a bare `p: Shape` (ruling 304).
+  is a bare `p: Shape` (ruling 304).  The prefix composes inside an
+  array's brackets with no parentheses: `[virtual &Shape]`.
 - **Object safety is per method** (ruling 288): a method that cannot go in
   the table - one with type parameters of its own, for instance - is unavailable on
   the object, and the rest of the trait still works.
