@@ -548,8 +548,9 @@ parser (a trace patch prints each postfix array's start, `[` and `]`) and
 checks every position against the text before writing.  `cryo check` on a
 lone file cannot resolve a project dependency and then parses nothing, so
 the language server, the runtime and one test project are built instead.
-Counted by the same trace: 2,411 dynamic array types rewritten in 161
-files, 5 more by hand where no trace reaches (the language server's
+Counted by the same trace: 2,395 dynamic array types rewritten in 159
+files (the run rewrote 2,411 in 161; the 16 in the two postfix-subject
+tests below were restored), 5 more by hand where no trace reaches (the language server's
 `positions` fixture, whose markers must stay on the element, and
 `build_stamp_version_format`), 5 in the docs' code blocks; 16 remain, all
 in the two tests whose subject is the postfix spelling
@@ -568,6 +569,20 @@ in a debug build.  A one-column shift in a hosted file left its object
 byte-identical.  So 3b moves no test or example object, and can move a
 runtime object only where a check site follows a rewritten fixed type on
 its line.
+
+**3b landed.**  Predicted moved set: none.  Of the nine fixed types in the
+runtime, the one place a column is embedded, none has anything after the
+type on its line.  Result: 358 fixed array types rewritten in 107 files by
+the codemod, 1 by hand (the `positions` fixture), 7 in `docs/cryo.md`'s
+code blocks; `make verify` moved 0 of 9785 / 1126; the runtime (14), the
+standard library (154), the compiler (247) and the language server (277)
+moved 0 against builds of the 3a tree.  Control: one added space before a
+check site in `runtime/backtrace` moved exactly `Backtrace.o`.  The two
+postfix-subject tests keep their fixed arrays as well.
+
+Left for slice 5: 142 comment lines still spell an array the postfix way
+(103 in `compiler/src`), and the prose of `docs/cryo.md` and the other
+specs.
 
 Order inside slice 3: `compiler/src`, `stdlib`, `runtime` (need the slice-1
 pin), then `tools/CryoLSP`, `tests`, `examples`.  `legacy/` is not touched.

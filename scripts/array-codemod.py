@@ -100,7 +100,7 @@ def collect(cryo, trace, dirs):
     with open(trace, "w", encoding="utf-8") as fh:
         for row in sorted(seen):
             rel = os.path.relpath(row[0], ROOT).replace("\\", "/")
-            if rel.startswith("..") or rel.startswith("legacy/"):
+            if rel.startswith("..") or rel.startswith("legacy/") or "/build/" in rel:
                 continue
             fh.write("\t".join([rel] + list(row[1:])) + "\n")
             kept += 1

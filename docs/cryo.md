@@ -339,7 +339,7 @@ Two distinct things share the word "array" in Cryo: the **raw array type** (a lo
 An array type is written in brackets: `[T]` is a dynamic array and `[T; N]` a fixed one of `N` elements.  The postfix spellings `T[]` and `T[N]` name the same two types.  The element between the brackets is a whole type, so `[&Node]` is an array of references, `&[Node*]` a reference to an array of pointers, `[(i32) -> i32]` an array of functions, and `[[u64; 2]; 3]` three rows of `[u64; 2]` - the length written nearest the element belongs to the inner array, as in the postfix `u64[2][3]`.  A `,` after the first type, `[T, U]`, is refused (E0104): a tuple is written `(T, U)`.
 
 ```cryo
-const buf:    int[16];     // raw fixed-size buffer of 16 ints
+const buf:    [int; 16];   // raw fixed-size buffer of 16 ints
 const dyn:    [int];       // raw dynamic array (FFI / unsized)
 mut   v:      Array<int>;  // growable, heap-backed; from collections::array
 ```
@@ -350,8 +350,8 @@ The `N` in `T[N]` is a **compile-time integer**: an integer literal, a named `co
 
 ```cryo
 const CAPACITY: i64 = 512;
-type struct Grid { cells: boolean[CAPACITY]; }
-const cells: boolean[CAPACITY] = [false; CAPACITY];
+type struct Grid { cells: [boolean; CAPACITY]; }
+const cells: [boolean; CAPACITY] = [false; CAPACITY];
 ```
 
 `sizeof`/`alignof` are **not** available in this position: an array's size is fixed before any layout is computed. `static_assert` runs after layouts exist and does accept them ([section 18.5](#185-compile-time-layout-assertions-static_assert)).
@@ -1145,7 +1145,7 @@ for (i in 0..5) {            // range literal; 0,1,2,3,4
 }
 // sum == 10
 
-const xs: i32[3] = [7, 8, 9];
+const xs: [i32; 3] = [7, 8, 9];
 for (x in xs) {              // fixed-size array
     sum = sum + x;
 }
@@ -2271,7 +2271,7 @@ reads (`v = a[i]`), writes (`a[i] = v`), and compound assignment (`a[i] += v`).
 Built-in array/slice/string/pointer indexing keeps its native path.
 
 ```cryo
-type struct Grid { cells: i32[9]; }
+type struct Grid { cells: [i32; 9]; }
 implement trait Index<u64, i32> for struct Grid {
     index(&this, i: u64) -> i32* { return &this.cells[i]; }
 }
@@ -2938,7 +2938,7 @@ type trait Allocate {
 `delete p` runs the `Drop` of `p`'s static pointee type - the type the pointer is declared with, not the class of the object it points at. A `Base*` holding a `Derived` runs `Base`'s `Drop`, if `Base` has one, and never `Derived`'s; a cleanup a subclass needs is not run through a pointer to its base. Then `delete p` hands `p` to the same implementation's `release` with the pointee type's alignment, instead of freeing it. `release` does nothing unless an implementation writes it, which is what an arena wants: its storage is reclaimed whole, never one object at a time. An allocator that does free single objects writes both methods.
 
 ```cryo
-mut g_pool: u8[4096] = [0; 4096];
+mut g_pool: [u8; 4096] = [0; 4096];
 mut g_used: u64 = 0;
 
 type class Node {
@@ -3386,7 +3386,7 @@ This is the recommended idiom for type-safe wrappers around primitive FFI types 
 ```cryo
 ![align(64)]
 type struct CacheLine {
-    payload: u8[64];
+    payload: [u8; 64];
 }
 ```
 
