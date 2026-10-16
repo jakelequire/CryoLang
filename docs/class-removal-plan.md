@@ -503,6 +503,9 @@ and the chance of casting to the wrong class all go.
   `compiler::ast::expression` without a module cycle.  Slice 0 measured
   that claim false: the node structs keep the current module split, and
   these fields become `Expr*` and `Pattern*` (section 6, slice 0).
+  Built: `PatternSub.pattern` is a `Pattern*` (slice 5), and
+  `TypeofAnnotation.operand` and `StaticAssertItem.cond` are
+  `ExpressionNode*`, each cast back to its type deleted.
 - **`TypeAnnotation`** is already an enum of pointers to annotation structs
   (`AST/_module.cryo:335`).  It is the precedent for this design, and it
   does not change except that its hand-written `clone` becomes `Clone`
