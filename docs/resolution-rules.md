@@ -253,6 +253,20 @@ yet is recorded with the change that builds it, not here.
      plain-copy type,** with an error saying so: the one value would
      otherwise be released `n` times.  (Jake)
 
+375. **`Array`'s `length` and `capacity` are `i64`,** the type the
+     built-in `[T]`'s `length` had and every array in the tree was written
+     against.  The change is confined to `array.cryo` and the code that
+     reads those two values.  (Jake)
+
+376. **Taking a `![caller_location]` function as a value is refused,** and
+     the refusal is made early enough that the editor and `cryo check`
+     report it, not only a build.  (Jake)
+
+377. **A refused fill literal keeps code E0453 and its wording.**  (Jake)
+
+378. **The attribute that reports the caller's location is named
+     `![caller_location]`.**  (Jake)
+
 ### 2026-10-14
 
 333. **One project's analysis covers every target of its cryoconfig, and
