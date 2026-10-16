@@ -1,0 +1,575 @@
+/// A walk over the syntax tree.
+///
+/// `Walk` has one hook per kind of node.  Each hook's default visits the
+/// node's children in source order, through the kind's `walk_children`, so a
+/// walker overrides only the kinds it acts on; an override that still wants
+/// the children below it calls that kind's `walk_children` itself, before or
+/// after its own work.
+///
+/// The children are the tree as written.  What a later pass hangs on a node
+/// beside it - an operator's `desugared_call`, a `?`'s `desugared`, the
+/// cleanups an unwinding call records - is not a child: a walker that must
+/// see it visits it from its own hook.
+///
+/// Every call is static: the defaults are instantiated for each walker, and
+/// `walk_children` for each walker it is called with.
+
+namespace compiler::ast::walk;
+
+import compiler::ast;
+import compiler::ast::{ node, expression, statement, declaration, pattern, NodeKind, PatternKind };
+import compiler::ast::declaration::{
+    ClassDeclNode, DeclarationNode, DestructureDeclNode, EnumDeclNode, EnumVariantNode,
+    ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
+    ImportDeclNode, IntrinsicConstDeclNode, IntrinsicDeclNode, MethodNode, ModuleDeclNode,
+    StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, IdentifierNode, IfExprNode,
+    LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
+    ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode, StructLiteralNode,
+    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
+    YieldExprNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::pattern::{
+    DirectiveNode, EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode
+};
+import compiler::ast::statement::{
+    AsmBlockStmtNode, BlockStmtNode, BreakStmtNode, ContinueStmtNode, DeclStmtNode,
+    DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode,
+    ReturnStmtNode, StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
+};
+
+type trait Walk {
+    /// Hand `n` to its kind's hook; nothing for `null`.
+    walk_node(mut &this, n: ASTNode*) -> void {
+        if (n == null) { return; }
+        match (n.kind) {
+            NodeKind::Program                   => { this.walk_program(n as ProgramNode*); }
+
+            NodeKind::Literal                   => { this.walk_literal(n as LiteralNode*); }
+            NodeKind::Identifier                => { this.walk_identifier(n as IdentifierNode*); }
+            NodeKind::BinaryExpression          => { this.walk_binary(n as BinaryExprNode*); }
+            NodeKind::UnaryExpression           => { this.walk_unary(n as UnaryExprNode*); }
+            NodeKind::TernaryExpression         => { this.walk_ternary(n as TernaryExprNode*); }
+            NodeKind::IfExpression              => { this.walk_if_expr(n as IfExprNode*); }
+            NodeKind::MatchExpression           => { this.walk_match_expr(n as MatchExprNode*); }
+            NodeKind::StaticMatchExpression     => { this.walk_static_match_expr(n as StaticMatchExprNode*); }
+            NodeKind::CallExpression            => { this.walk_call(n as CallExprNode*); }
+            NodeKind::NewExpression             => { this.walk_new(n as NewExprNode*); }
+            NodeKind::SizeofExpression          => { this.walk_sizeof(n as SizeofExprNode*); }
+            NodeKind::AlignofExpression         => { this.walk_alignof(n as AlignofExprNode*); }
+            NodeKind::CastExpression            => { this.walk_cast(n as CastExprNode*); }
+            NodeKind::StructLiteral             => { this.walk_struct_literal(n as StructLiteralNode*); }
+            NodeKind::ArrayLiteral              => { this.walk_array_literal(n as ArrayLiteralNode*); }
+            NodeKind::TupleLiteral              => { this.walk_tuple_literal(n as TupleLiteralNode*); }
+            NodeKind::LambdaExpression          => { this.walk_lambda(n as LambdaExprNode*); }
+            NodeKind::ArrayAccess               => { this.walk_array_access(n as ArrayAccessNode*); }
+            NodeKind::MemberAccess              => { this.walk_member_access(n as MemberAccessNode*); }
+            NodeKind::ScopeResolution           => { this.walk_scope_resolution(n as ScopeResolutionNode*); }
+            NodeKind::TypeofExpression          => { this.walk_typeof(n as TypeofExprNode*); }
+            NodeKind::DeleteExpression          => { this.walk_delete(n as DeleteExprNode*); }
+            NodeKind::AwaitExpression           => { this.walk_await(n as AwaitExprNode*); }
+            NodeKind::YieldExpression           => { this.walk_yield(n as YieldExprNode*); }
+            NodeKind::TryExpression             => { this.walk_try(n as TryExprNode*); }
+
+            NodeKind::BlockStatement            => { this.walk_block(n as BlockStmtNode*); }
+            NodeKind::UnsafeBlockStatement      => { this.walk_unsafe_block(n as UnsafeBlockStmtNode*); }
+            NodeKind::AsmBlockStatement         => { this.walk_asm_block(n as AsmBlockStmtNode*); }
+            NodeKind::ReturnStatement           => { this.walk_return(n as ReturnStmtNode*); }
+            NodeKind::IfStatement               => { this.walk_if(n as IfStmtNode*); }
+            NodeKind::WhileStatement            => { this.walk_while(n as WhileStmtNode*); }
+            NodeKind::DoWhileStatement          => { this.walk_do_while(n as DoWhileStmtNode*); }
+            NodeKind::ForStatement              => { this.walk_for(n as ForStmtNode*); }
+            NodeKind::MatchStatement            => { this.walk_match_stmt(n as MatchStmtNode*); }
+            NodeKind::StaticMatchStatement      => { this.walk_static_match_stmt(n as StaticMatchStmtNode*); }
+            NodeKind::BreakStatement            => { this.walk_break(n as BreakStmtNode*); }
+            NodeKind::ContinueStatement         => { this.walk_continue(n as ContinueStmtNode*); }
+            NodeKind::ExpressionStatement       => { this.walk_expr_stmt(n as ExprStmtNode*); }
+            NodeKind::DeclarationStatement      => { this.walk_decl_stmt(n as DeclStmtNode*); }
+            NodeKind::LoopStatement             => { this.walk_loop(n as LoopStmtNode*); }
+
+            NodeKind::VariableDeclaration       => { this.walk_var(n as VarDeclNode*); }
+            NodeKind::DestructureDeclaration    => { this.walk_destructure(n as DestructureDeclNode*); }
+            NodeKind::FunctionDeclaration       => { this.walk_function(n as FunctionDeclNode*); }
+            NodeKind::MethodDeclaration         => { this.walk_method(n as MethodNode*); }
+            NodeKind::IntrinsicDeclaration      => { this.walk_intrinsic(n as IntrinsicDeclNode*); }
+            NodeKind::IntrinsicConstDeclaration => { this.walk_intrinsic_const(n as IntrinsicConstDeclNode*); }
+            NodeKind::ImportDeclaration         => { this.walk_import(n as ImportDeclNode*); }
+            NodeKind::ModuleDeclaration         => { this.walk_module(n as ModuleDeclNode*); }
+            NodeKind::StructDeclaration         => { this.walk_struct(n as StructDeclNode*); }
+            NodeKind::UnionDeclaration          => { this.walk_union(n as UnionDeclNode*); }
+            NodeKind::ClassDeclaration          => { this.walk_class(n as ClassDeclNode*); }
+            NodeKind::TraitDeclaration          => { this.walk_trait(n as TraitDeclNode*); }
+            NodeKind::TypeAliasDeclaration      => { this.walk_type_alias(n as TypeAliasDeclNode*); }
+            NodeKind::EnumDeclaration           => { this.walk_enum(n as EnumDeclNode*); }
+            NodeKind::EnumVariant               => { this.walk_enum_variant(n as EnumVariantNode*); }
+            NodeKind::ImplementationBlock       => { this.walk_impl(n as ImplBlockNode*); }
+            NodeKind::ExternBlock               => { this.walk_extern_block(n as ExternBlockNode*); }
+            NodeKind::FieldDeclaration          => { this.walk_field(n as FieldDeclNode*); }
+            NodeKind::GenericParamDeclaration   => { this.walk_generic_param(n as GenericParamNode*); }
+
+            NodeKind::MatchArm                  => { this.walk_match_arm(n as MatchArmNode*); }
+            NodeKind::StaticMatchArm            => { this.walk_static_match_arm(n as StaticMatchArmNode*); }
+            NodeKind::Directive                 => { this.walk_directive(n as DirectiveNode*); }
+            NodeKind::Pattern                   => {
+                const p: PatternNode* = n as PatternNode*;
+                if (p.pattern_kind == PatternKind::Enum) {
+                    this.walk_enum_pattern(p as EnumPatternNode*);
+                } else {
+                    this.walk_pattern(p);
+                }
+            }
+
+            // Category and placeholder kinds that no node is built with; an
+            // enum pattern is a `Pattern` whose `pattern_kind` says so.
+            NodeKind::EnumPattern               => { }
+            NodeKind::Expression                => { }
+            NodeKind::Statement                 => { }
+            NodeKind::Declaration               => { }
+            NodeKind::AsyncExpression           => { }
+            NodeKind::Unknown                   => { }
+        }
+    }
+
+    walk_expr(mut &this, e: ExpressionNode*) -> void { this.walk_node(e as ASTNode*); }
+    walk_stmt(mut &this, s: StatementNode*) -> void { this.walk_node(s as ASTNode*); }
+    walk_decl(mut &this, d: DeclarationNode*) -> void { this.walk_node(d as ASTNode*); }
+
+    walk_program(mut &this, n: ProgramNode*) -> void { ProgramNode::walk_children(n, this); }
+
+    // Expressions
+    walk_literal(mut &this, n: LiteralNode*) -> void { }
+    walk_identifier(mut &this, n: IdentifierNode*) -> void { }
+    walk_binary(mut &this, n: BinaryExprNode*) -> void { BinaryExprNode::walk_children(n, this); }
+    walk_unary(mut &this, n: UnaryExprNode*) -> void { UnaryExprNode::walk_children(n, this); }
+    walk_ternary(mut &this, n: TernaryExprNode*) -> void { TernaryExprNode::walk_children(n, this); }
+    walk_if_expr(mut &this, n: IfExprNode*) -> void { IfExprNode::walk_children(n, this); }
+    walk_match_expr(mut &this, n: MatchExprNode*) -> void { MatchExprNode::walk_children(n, this); }
+    walk_static_match_expr(mut &this, n: StaticMatchExprNode*) -> void {
+        StaticMatchExprNode::walk_children(n, this);
+    }
+    walk_call(mut &this, n: CallExprNode*) -> void { CallExprNode::walk_children(n, this); }
+    walk_new(mut &this, n: NewExprNode*) -> void { NewExprNode::walk_children(n, this); }
+    walk_sizeof(mut &this, n: SizeofExprNode*) -> void { }
+    walk_alignof(mut &this, n: AlignofExprNode*) -> void { }
+    walk_cast(mut &this, n: CastExprNode*) -> void { CastExprNode::walk_children(n, this); }
+    walk_struct_literal(mut &this, n: StructLiteralNode*) -> void {
+        StructLiteralNode::walk_children(n, this);
+    }
+    walk_array_literal(mut &this, n: ArrayLiteralNode*) -> void {
+        ArrayLiteralNode::walk_children(n, this);
+    }
+    walk_tuple_literal(mut &this, n: TupleLiteralNode*) -> void {
+        TupleLiteralNode::walk_children(n, this);
+    }
+    walk_lambda(mut &this, n: LambdaExprNode*) -> void { LambdaExprNode::walk_children(n, this); }
+    walk_array_access(mut &this, n: ArrayAccessNode*) -> void {
+        ArrayAccessNode::walk_children(n, this);
+    }
+    walk_member_access(mut &this, n: MemberAccessNode*) -> void {
+        MemberAccessNode::walk_children(n, this);
+    }
+    walk_scope_resolution(mut &this, n: ScopeResolutionNode*) -> void { }
+    walk_typeof(mut &this, n: TypeofExprNode*) -> void { TypeofExprNode::walk_children(n, this); }
+    walk_delete(mut &this, n: DeleteExprNode*) -> void { DeleteExprNode::walk_children(n, this); }
+    walk_await(mut &this, n: AwaitExprNode*) -> void { AwaitExprNode::walk_children(n, this); }
+    walk_yield(mut &this, n: YieldExprNode*) -> void { YieldExprNode::walk_children(n, this); }
+    walk_try(mut &this, n: TryExprNode*) -> void { TryExprNode::walk_children(n, this); }
+
+    // Statements
+    walk_block(mut &this, n: BlockStmtNode*) -> void { BlockStmtNode::walk_children(n, this); }
+    walk_unsafe_block(mut &this, n: UnsafeBlockStmtNode*) -> void {
+        UnsafeBlockStmtNode::walk_children(n, this);
+    }
+    walk_asm_block(mut &this, n: AsmBlockStmtNode*) -> void {
+        AsmBlockStmtNode::walk_children(n, this);
+    }
+    walk_return(mut &this, n: ReturnStmtNode*) -> void { ReturnStmtNode::walk_children(n, this); }
+    walk_if(mut &this, n: IfStmtNode*) -> void { IfStmtNode::walk_children(n, this); }
+    walk_while(mut &this, n: WhileStmtNode*) -> void { WhileStmtNode::walk_children(n, this); }
+    walk_do_while(mut &this, n: DoWhileStmtNode*) -> void { DoWhileStmtNode::walk_children(n, this); }
+    walk_for(mut &this, n: ForStmtNode*) -> void { ForStmtNode::walk_children(n, this); }
+    walk_match_stmt(mut &this, n: MatchStmtNode*) -> void { MatchStmtNode::walk_children(n, this); }
+    walk_static_match_stmt(mut &this, n: StaticMatchStmtNode*) -> void {
+        StaticMatchStmtNode::walk_children(n, this);
+    }
+    walk_break(mut &this, n: BreakStmtNode*) -> void { }
+    walk_continue(mut &this, n: ContinueStmtNode*) -> void { }
+    walk_expr_stmt(mut &this, n: ExprStmtNode*) -> void { ExprStmtNode::walk_children(n, this); }
+    walk_decl_stmt(mut &this, n: DeclStmtNode*) -> void { DeclStmtNode::walk_children(n, this); }
+    walk_loop(mut &this, n: LoopStmtNode*) -> void { LoopStmtNode::walk_children(n, this); }
+
+    // Declarations
+    walk_var(mut &this, n: VarDeclNode*) -> void { VarDeclNode::walk_children(n, this); }
+    walk_destructure(mut &this, n: DestructureDeclNode*) -> void {
+        DestructureDeclNode::walk_children(n, this);
+    }
+    walk_function(mut &this, n: FunctionDeclNode*) -> void { FunctionDeclNode::walk_children(n, this); }
+    walk_method(mut &this, n: MethodNode*) -> void { MethodNode::walk_children(n, this); }
+    walk_intrinsic(mut &this, n: IntrinsicDeclNode*) -> void { IntrinsicDeclNode::walk_children(n, this); }
+    walk_intrinsic_const(mut &this, n: IntrinsicConstDeclNode*) -> void { }
+    walk_import(mut &this, n: ImportDeclNode*) -> void { }
+    walk_module(mut &this, n: ModuleDeclNode*) -> void { }
+    walk_struct(mut &this, n: StructDeclNode*) -> void { StructDeclNode::walk_children(n, this); }
+    walk_union(mut &this, n: UnionDeclNode*) -> void { UnionDeclNode::walk_children(n, this); }
+    walk_class(mut &this, n: ClassDeclNode*) -> void { ClassDeclNode::walk_children(n, this); }
+    walk_trait(mut &this, n: TraitDeclNode*) -> void { TraitDeclNode::walk_children(n, this); }
+    walk_type_alias(mut &this, n: TypeAliasDeclNode*) -> void { }
+    walk_enum(mut &this, n: EnumDeclNode*) -> void { EnumDeclNode::walk_children(n, this); }
+    walk_enum_variant(mut &this, n: EnumVariantNode*) -> void { }
+    walk_impl(mut &this, n: ImplBlockNode*) -> void { ImplBlockNode::walk_children(n, this); }
+    walk_extern_block(mut &this, n: ExternBlockNode*) -> void { ExternBlockNode::walk_children(n, this); }
+    walk_field(mut &this, n: FieldDeclNode*) -> void { FieldDeclNode::walk_children(n, this); }
+    walk_generic_param(mut &this, n: GenericParamNode*) -> void { }
+
+    // Arms, patterns and directives
+    walk_match_arm(mut &this, n: MatchArmNode*) -> void { MatchArmNode::walk_children(n, this); }
+    walk_static_match_arm(mut &this, n: StaticMatchArmNode*) -> void {
+        StaticMatchArmNode::walk_children(n, this);
+    }
+    walk_pattern(mut &this, n: PatternNode*) -> void { }
+    walk_enum_pattern(mut &this, n: EnumPatternNode*) -> void { EnumPatternNode::walk_children(n, this); }
+    walk_directive(mut &this, n: DirectiveNode*) -> void { }
+}
+
+
+// Each kind's children, in source order.
+
+implement class ProgramNode {
+    static walk_children<V>(n: ProgramNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.statements.length; i++) { v.walk_node(n.statements[i]); }
+    }
+}
+
+implement class BinaryExprNode {
+    static walk_children<V>(n: BinaryExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.left);
+        v.walk_expr(n.right);
+    }
+}
+
+implement class UnaryExprNode {
+    static walk_children<V>(n: UnaryExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
+    }
+}
+
+implement class TernaryExprNode {
+    static walk_children<V>(n: TernaryExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.condition);
+        v.walk_expr(n.true_expr);
+        v.walk_expr(n.false_expr);
+    }
+}
+
+implement class IfExprNode {
+    static walk_children<V>(n: IfExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.condition);
+        v.walk_expr(n.then_expr);
+        v.walk_expr(n.else_expr);
+    }
+}
+
+implement class MatchExprNode {
+    static walk_children<V>(n: MatchExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.subject);
+        for (mut i: i64 = 0; i < n.arms.length; i++) { v.walk_node(n.arms[i] as ASTNode*); }
+    }
+}
+
+implement class StaticMatchExprNode {
+    static walk_children<V>(n: StaticMatchExprNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.arms.length; i++) { v.walk_node(n.arms[i] as ASTNode*); }
+    }
+}
+
+implement class CallExprNode {
+    static walk_children<V>(n: CallExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.callee);
+        for (mut i: i64 = 0; i < n.arguments.length; i++) { v.walk_expr(n.arguments[i]); }
+    }
+}
+
+implement class NewExprNode {
+    static walk_children<V>(n: NewExprNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.arguments.length; i++) { v.walk_expr(n.arguments[i]); }
+        v.walk_expr(n.array_size);
+        v.walk_expr(n.struct_init as ExpressionNode*);
+    }
+}
+
+implement class CastExprNode {
+    static walk_children<V>(n: CastExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.expression);
+    }
+}
+
+implement class StructLiteralNode {
+    static walk_children<V>(n: StructLiteralNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.field_inits.length; i++) { v.walk_expr(n.field_inits[i].value); }
+    }
+}
+
+implement class ArrayLiteralNode {
+    static walk_children<V>(n: ArrayLiteralNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.elements.length; i++) { v.walk_expr(n.elements[i]); }
+        v.walk_expr(n.repeat_count_expr);
+    }
+}
+
+implement class TupleLiteralNode {
+    static walk_children<V>(n: TupleLiteralNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.elements.length; i++) { v.walk_expr(n.elements[i]); }
+    }
+}
+
+implement class LambdaExprNode {
+    static walk_children<V>(n: LambdaExprNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.parameters.length; i++) {
+            v.walk_decl(n.parameters[i] as DeclarationNode*);
+        }
+        v.walk_stmt(n.body);
+    }
+}
+
+implement class ArrayAccessNode {
+    static walk_children<V>(n: ArrayAccessNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.array);
+        v.walk_expr(n.index);
+    }
+}
+
+implement class MemberAccessNode {
+    static walk_children<V>(n: MemberAccessNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.object);
+    }
+}
+
+implement class TypeofExprNode {
+    static walk_children<V>(n: TypeofExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
+    }
+}
+
+implement class DeleteExprNode {
+    static walk_children<V>(n: DeleteExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
+    }
+}
+
+implement class AwaitExprNode {
+    static walk_children<V>(n: AwaitExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
+    }
+}
+
+implement class YieldExprNode {
+    static walk_children<V>(n: YieldExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
+    }
+}
+
+implement class TryExprNode {
+    static walk_children<V>(n: TryExprNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
+    }
+}
+
+implement class BlockStmtNode {
+    static walk_children<V>(n: BlockStmtNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.statements.length; i++) { v.walk_stmt(n.statements[i]); }
+    }
+}
+
+implement class UnsafeBlockStmtNode {
+    static walk_children<V>(n: UnsafeBlockStmtNode*, v: mut &V) -> void where V: Walk {
+        v.walk_stmt(n.block as StatementNode*);
+    }
+}
+
+implement class AsmBlockStmtNode {
+    static walk_children<V>(n: AsmBlockStmtNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.operands.length; i++) { v.walk_expr(n.operands[i].expr); }
+    }
+}
+
+implement class ReturnStmtNode {
+    static walk_children<V>(n: ReturnStmtNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.expression);
+    }
+}
+
+implement class IfStmtNode {
+    static walk_children<V>(n: IfStmtNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.condition);
+        v.walk_stmt(n.then_stmt);
+        v.walk_stmt(n.else_stmt);
+    }
+}
+
+implement class WhileStmtNode {
+    static walk_children<V>(n: WhileStmtNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.condition);
+        v.walk_stmt(n.body);
+    }
+}
+
+implement class DoWhileStmtNode {
+    static walk_children<V>(n: DoWhileStmtNode*, v: mut &V) -> void where V: Walk {
+        v.walk_stmt(n.body);
+        v.walk_expr(n.condition);
+    }
+}
+
+implement class ForStmtNode {
+    static walk_children<V>(n: ForStmtNode*, v: mut &V) -> void where V: Walk {
+        v.walk_node(n.init);
+        v.walk_expr(n.condition);
+        v.walk_expr(n.update);
+        v.walk_stmt(n.body);
+    }
+}
+
+implement class MatchStmtNode {
+    static walk_children<V>(n: MatchStmtNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.subject);
+        for (mut i: i64 = 0; i < n.arms.length; i++) { v.walk_node(n.arms[i] as ASTNode*); }
+    }
+}
+
+implement class StaticMatchStmtNode {
+    static walk_children<V>(n: StaticMatchStmtNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.arms.length; i++) { v.walk_node(n.arms[i] as ASTNode*); }
+    }
+}
+
+implement class ExprStmtNode {
+    static walk_children<V>(n: ExprStmtNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.expression);
+    }
+}
+
+implement class DeclStmtNode {
+    static walk_children<V>(n: DeclStmtNode*, v: mut &V) -> void where V: Walk {
+        v.walk_decl(n.declaration);
+    }
+}
+
+implement class LoopStmtNode {
+    static walk_children<V>(n: LoopStmtNode*, v: mut &V) -> void where V: Walk {
+        v.walk_stmt(n.body);
+    }
+}
+
+implement class VarDeclNode {
+    static walk_children<V>(n: VarDeclNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.initializer);
+    }
+}
+
+implement class DestructureDeclNode {
+    static walk_children<V>(n: DestructureDeclNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.initializer);
+    }
+}
+
+implement class FunctionDeclNode {
+    static walk_children<V>(n: FunctionDeclNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.parameters.length; i++) {
+            v.walk_decl(n.parameters[i] as DeclarationNode*);
+        }
+        v.walk_stmt(n.body as StatementNode*);
+    }
+}
+
+implement class MethodNode {
+    static walk_children<V>(n: MethodNode*, v: mut &V) -> void where V: Walk {
+        v.walk_decl(n.func as DeclarationNode*);
+    }
+}
+
+implement class IntrinsicDeclNode {
+    static walk_children<V>(n: IntrinsicDeclNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.parameters.length; i++) {
+            v.walk_decl(n.parameters[i] as DeclarationNode*);
+        }
+        v.walk_stmt(n.body as StatementNode*);
+    }
+}
+
+implement class StructDeclNode {
+    static walk_children<V>(n: StructDeclNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.fields.length; i++) { v.walk_decl(n.fields[i] as DeclarationNode*); }
+        for (mut i: i64 = 0; i < n.methods.length; i++) { v.walk_decl(n.methods[i] as DeclarationNode*); }
+    }
+}
+
+implement class UnionDeclNode {
+    static walk_children<V>(n: UnionDeclNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.fields.length; i++) { v.walk_decl(n.fields[i] as DeclarationNode*); }
+        for (mut i: i64 = 0; i < n.methods.length; i++) { v.walk_decl(n.methods[i] as DeclarationNode*); }
+    }
+}
+
+implement class ClassDeclNode {
+    static walk_children<V>(n: ClassDeclNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.fields.length; i++) { v.walk_decl(n.fields[i] as DeclarationNode*); }
+        for (mut i: i64 = 0; i < n.methods.length; i++) { v.walk_decl(n.methods[i] as DeclarationNode*); }
+    }
+}
+
+implement class TraitDeclNode {
+    static walk_children<V>(n: TraitDeclNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.methods.length; i++) { v.walk_decl(n.methods[i] as DeclarationNode*); }
+    }
+}
+
+implement class EnumDeclNode {
+    static walk_children<V>(n: EnumDeclNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.variants.length; i++) { v.walk_decl(n.variants[i] as DeclarationNode*); }
+    }
+}
+
+implement class ImplBlockNode {
+    static walk_children<V>(n: ImplBlockNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.methods.length; i++) { v.walk_decl(n.methods[i] as DeclarationNode*); }
+    }
+}
+
+implement class ExternBlockNode {
+    static walk_children<V>(n: ExternBlockNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.functions.length; i++) {
+            v.walk_decl(n.functions[i] as DeclarationNode*);
+        }
+        for (mut i: i64 = 0; i < n.globals.length; i++) { v.walk_decl(n.globals[i] as DeclarationNode*); }
+    }
+}
+
+implement class FieldDeclNode {
+    static walk_children<V>(n: FieldDeclNode*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.default_value);
+    }
+}
+
+implement class MatchArmNode {
+    static walk_children<V>(n: MatchArmNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.patterns.length; i++) { v.walk_node(n.patterns[i] as ASTNode*); }
+        v.walk_expr(n.guard);
+        v.walk_stmt(n.body);
+    }
+}
+
+implement class StaticMatchArmNode {
+    static walk_children<V>(n: StaticMatchArmNode*, v: mut &V) -> void where V: Walk {
+        v.walk_stmt(n.body);
+    }
+}
+
+implement class EnumPatternNode {
+    static walk_children<V>(n: EnumPatternNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.elements.length; i++) { v.walk_node(n.sub_at(i) as ASTNode*); }
+    }
+}

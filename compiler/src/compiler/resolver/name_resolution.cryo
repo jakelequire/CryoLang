@@ -28,7 +28,7 @@ import compiler::ast;
 import compiler::ast::{
     GenericAnnotation, ImportStyle, NamedAnnotation, NodeKind, PatternBinding, PatternKind, ProjectionAnnotation,
     TraitBound, TraitRef, TypeAnnotation, Visibility, declaration, expression, node,
-    pattern, statement, visitor
+    pattern, statement
 };
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
@@ -63,7 +63,8 @@ import compiler::ast::statement::{
     ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
     StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
 };
-import compiler::ast::visitor::{ ASTVisitor, BaseASTVisitor };
+import compiler::ast::walk;
+import compiler::ast::walk::{ Walk };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
@@ -86,8 +87,7 @@ type struct ParamProjection {
     proj:   ProjectionAnnotation*;
 }
 
-type class NameResolver : BaseASTVisitor {
-public:
+type struct NameResolver {
     resolver: Resolver*;
     ctx:      CompilationContext*;
     /// The method whose base-constructor initializer list is still unresolved,
@@ -131,21 +131,22 @@ public:
     /// first alternative declared.
     in_alternative: boolean;
 
-    NameResolver(resolver: Resolver*, ctx: CompilationContext*)
-        : BaseASTVisitor() {
-        this.param_projections = [];
-        this.in_alternative    = false;
-        this.resolver = resolver;
-        this.ctx      = ctx;
-        this.pending_base_ctor = null;
-        this.callee_ident      = null;
-        this.defining_type     = SymbolStr::empty();
-        this.naming_trait      = false;
-        this.this_sym          = resolver.intern_table.intern("this");
-        this.this_trait        = DefId::invalid();
-        this.this_owner        = ResBase::Def(DefId::invalid());
-        this.this_owner_decl   = null;
-        this.this_owner_sym    = SymbolID::invalid();
+    static new(resolver: Resolver*, ctx: CompilationContext*) -> NameResolver {
+        return NameResolver {
+            resolver:          resolver,
+            ctx:               ctx,
+            pending_base_ctor: null,
+            callee_ident:      null,
+            defining_type:     SymbolStr::empty(),
+            naming_trait:      false,
+            this_sym:          resolver.intern_table.intern("this"),
+            this_trait:        DefId::invalid(),
+            this_owner:        ResBase::Def(DefId::invalid()),
+            this_owner_decl:   null,
+            this_owner_sym:    SymbolID::invalid(),
+            param_projections: [],
+            in_alternative:    false,
+        };
     }
 
     /// The parameters `This` is written with in the body of `decl`: an
@@ -202,7 +203,7 @@ public:
     /// `type struct T`) is the ordinary case - the nearer rib wins - and is
     /// not this.  Declared one at a time so a duplicate in one list meets
     /// the first as an enclosing symbol.
-    declare_generics(generic_params: &[GenericParamNode*]) -> void {
+    declare_generics(mut &this, generic_params: &[GenericParamNode*]) -> void {
         if (generic_params.length == 0) { return; }
         for (mut i: i64 = 0; i < generic_params.length; i++) {
             const gp: GenericParamNode* = generic_params[i];
@@ -247,7 +248,7 @@ public:
     // Pass 1: Forward declaration collection (top-level only)
 
     /// Walk top-level statements and forward-declare all names.
-    forward_declare(program: ProgramNode*) -> void {
+    forward_declare(mut &this, program: ProgramNode*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] forward_declare() with %d statements", program.statements.length);
         for (mut i: i64 = 0; i < program.statements.length; i++) {
             const stmt: ASTNode* = program.statements[i];
@@ -368,7 +369,7 @@ public:
         return false;
     }
 
-    forward_declare_node(node: ASTNode*) -> void {
+    forward_declare_node(mut &this, node: ASTNode*) -> void {
         match (node.kind) {
             NodeKind::FunctionDeclaration => {
                 const fn_node: FunctionDeclNode* = node as FunctionDeclNode*;
@@ -627,36 +628,6 @@ public:
 
     // Pass 2: Full resolution walk
 
-    // -- ProgramNode --
-    override visit(node: ProgramNode*) -> void {
-        // The module's own names are already declared and exported, and the
-        // scope holding them is the one the caller restored.  Naming the module
-        // again here would CREATE a second scope of the same name and walk into
-        // it, leaving every symbol declared above unreachable from the walk.
-        for (mut i: i64 = 0; i < node.statements.length; i++) {
-            node.statements[i].accept(this);
-        }
-
-        // A `static_assert` condition lives in a side list, not the statement
-        // stream, so the loop above never reaches it.  Its condition is an
-        // ordinary expression that may name a constant or an enum variant, and
-        // the fold that reads it runs in TypeLowering - long after the only
-        // pass that can say which module a written qualifier denotes.  Without
-        // this walk the qualifier reaches that fold with no `Res` to read.
-        //
-        // The list is this module's own: the driver swaps `ast.root` per module
-        // before the walk, so a condition is resolved in the scope of the file
-        // that wrote it.
-        for (mut i: i64 = 0; i < node.static_asserts.length; i++) {
-            const sa: StaticAssertItem* = node.static_asserts[i];
-            if (sa == null || sa.cond == null) { continue; }
-            (sa.cond as ExpressionNode*).accept(this);
-        }
-
-        this.refuse_module_type_collisions();
-        this.refuse_import_redeclarations();
-    }
-
     /// A declaration in this module's scope and an explicit import - or a
     /// module alias - of the same name in the same namespace is a
     /// redeclaration (E0205): the scope can keep only one of the two, and
@@ -878,401 +849,6 @@ public:
             b.end_line, b.end_col);
     }
 
-    // -- Declarations --
-    override visit(node: FunctionDeclNode*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(FunctionDecl) name='%s' generics=%d",
-            this.resolver.intern_table.resolve(node.name), node.generic_params.length);
-        // Enter function scope
-        this.resolver.enter_scope(ScopeKind::Function, this.resolver.intern_table.resolve(node.name),
-            NameResolver::function_extent(node));
-
-        // Declare generic params
-        this.declare_generics(node.generic_params);
-
-        // Declare parameters and record spans for type write-back
-        for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const param: VarDeclNode* = node.parameters[i];
-            // Reject a duplicate parameter name (E0205). `Scope::insert` drops
-            // the duplicate silently, so `function f(x: i32, x: i32)` would
-            // otherwise compile with the second `x` shadowed and unreachable.
-            // Scan only prior parameters (rather than `current_scope_has`) so a
-            // value parameter sharing a generic param's name is not falsely
-            // flagged.
-            if (NameResolver::repeats_parameter(node, i)) {
-                this.ctx.emit_error_at(
-                    ErrorCode::E0205_REDEFINED_SYMBOL,
-                    fmt::format("the parameter `%s` is already declared in this function",
-                        this.resolver.intern_table.resolve(param.name)),
-                    param.span);
-            }
-            // The receiver binds as `this` whatever its written form: `&this`
-            // is a spelling no use can write, and every use of `this` in the
-            // body names this parameter.
-            const bound_as: SymbolStr = if (param.is_receiver()) { this.this_sym } else { param.name };
-            const param_sym: SymbolID = this.resolver.declare_parameter(bound_as, param.span);
-            this.resolver.record_resolution(param.span, param_sym);
-            param.set_sym_id(param_sym);
-            // After `declare_generics`, so a parameter spelled `T` is answered
-            // as the generic param it names rather than searched for as a type.
-            this.stamp_annotation(param.type_annotation);
-        }
-        this.stamp_annotation(node.return_type_annotation);
-        this.stamp_trait_bounds(&node.trait_bounds);
-
-        // The base-constructor initializer list, if this function is the
-        // constructor one was written on.  Resolved here, after the parameters
-        // are declared and before the body, because that is the scope the
-        // language evaluates it in.  Every other consumer - sema, codegen,
-        // drop insertion, the substituter, the cloner - already walks these
-        // arguments; name resolution was the only pass that did not, so a path
-        // written in one reached codegen with nothing recorded.
-        if (this.pending_base_ctor != null
-                && this.pending_base_ctor.func == node) {
-            const owner: MethodNode* = this.pending_base_ctor;
-            // Cleared for the descent: an argument containing a lambda or a
-            // nested constructor call must not re-enter this branch and resolve
-            // the same list a second time.
-            this.pending_base_ctor = null;
-            for (mut i: i64 = 0; i < owner.base_ctor_args.length; i++) {
-                owner.base_ctor_args[i].accept(this);
-            }
-            this.pending_base_ctor = owner;
-        }
-
-        // Visit body
-        if (node.has_body()) {
-            this.visit_block_contents(node.body);
-        }
-
-        this.resolver.exit_scope();
-    }
-
-    override visit(node: MethodNode*) -> void {
-        if (node.func != null) {
-            // A base-constructor initializer list is written outside the body
-            // but evaluated inside it: `: Base(kind, span)` reads the
-            // constructor's own parameters, so it has to be resolved with those
-            // in scope.  Handed to the function visitor rather than walked here
-            // because that is the one place the parameter scope is open, and
-            // opening a second one would put the same names in two scopes.
-            this.pending_base_ctor = node;
-            node.func.accept(this);
-            this.pending_base_ctor = null;
-        }
-    }
-
-    override visit(node: StructDeclNode*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(StructDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
-        // Enter type body scope
-        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
-
-        // Declare generic params
-        this.declare_generics(node.generic_params);
-        // The declaration's own `where` clause, read after its parameters are
-        // declared so a bound naming one is answered as that parameter.
-        this.stamp_trait_bounds(&node.where_bounds);
-
-        // Declare fields
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            const field: FieldDeclNode* = node.fields[i];
-            this.resolver.declare_field(field.name, field.span);
-        }
-
-        // Then walk them.  Declaring a field is not resolving what its type
-        // annotation NAMES, and the field visitor - which stamps that
-        // annotation - was reachable from nothing: every field's annotation
-        // reached the type layer with no `Res` on it.  Declaration stays a
-        // separate first pass so a field's default value can name a sibling
-        // declared after it.
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            node.fields[i].accept(this);
-        }
-
-        // Every method is a definition of the type before any body is
-        // walked.
-        this.define_body_methods(node.def, &node.methods);
-        const outer_owner: ResBase = this.this_owner;
-        const outer_owner_decl: ASTNode* = this.this_owner_decl;
-        const outer_owner_sym: SymbolID = this.this_owner_sym;
-        this.this_owner = ResBase::Def(node.def);
-        this.this_owner_decl = if (node.def.is_valid()) { node as ASTNode* } else { null };
-        this.this_owner_sym = SymbolID::invalid();
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
-        }
-        this.this_owner = outer_owner;
-        this.this_owner_decl = outer_owner_decl;
-        this.this_owner_sym = outer_owner_sym;
-
-        this.resolver.exit_scope();
-    }
-
-    override visit(node: UnionDeclNode*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(UnionDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
-        // Enter type body scope
-        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
-
-        // Declare generic params
-        this.declare_generics(node.generic_params);
-        this.stamp_trait_bounds(&node.where_bounds);
-
-        // Declare fields
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            const field: FieldDeclNode* = node.fields[i];
-            this.resolver.declare_field(field.name, field.span);
-        }
-
-        // Then walk them.  Declaring a field is not resolving what its type
-        // annotation NAMES, and the field visitor - which stamps that
-        // annotation - was reachable from nothing: every field's annotation
-        // reached the type layer with no `Res` on it.  Declaration stays a
-        // separate first pass so a field's default value can name a sibling
-        // declared after it.
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            node.fields[i].accept(this);
-        }
-
-        // Every method is a definition of the type before any body is
-        // walked.
-        this.define_body_methods(node.def, &node.methods);
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
-        }
-
-        this.resolver.exit_scope();
-    }
-
-    override visit(node: ClassDeclNode*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(ClassDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
-
-        // The base, in the scope ENCLOSING the class.  It has to be asked
-        // before `enter_scope`: the class body declares the class's own name
-        // and its generic parameters, either of which would shadow the base.
-        //
-        // The parser accepts a single identifier here, so this is always a
-        // one-segment question in the type namespace - and one this layer can
-        // finish, which is why anything other than a definition is reported
-        // here rather than passed on.  A base that names nothing leaves the
-        // class with no base at all, so letting it through silently drops
-        // every member the class was written to inherit.
-        if (node.has_base_class()) {
-            const r: Res = this.resolver.type_res_in_scope(
-                node.base_class, this.resolver.current_scope);
-            match (r) {
-                Res::Def(_) => { node.set_base_res(r); }
-                _           => {
-                    const written: string =
-                        this.resolver.intern_table.resolve(node.base_class);
-                    mut d: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0203_UNDEFINED_TYPE,
-                        fmt::format("cannot find type `%s` in this scope", written));
-                    d = d.at_with_label(node.base_span, "not found in this scope");
-                    d = d.with_note("a base class is resolved in the scope the class is written in, before the class body");
-                    this.ctx.emit_diagnostic(d);
-                    node.set_base_res(Res::Err);
-                }
-            }
-        }
-        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
-
-        // Declare generic params
-        this.declare_generics(node.generic_params);
-        this.stamp_trait_bounds(&node.where_bounds);
-
-        // Declare fields
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            const field: FieldDeclNode* = node.fields[i];
-            this.resolver.declare_field(field.name, field.span);
-        }
-
-        // Then walk them.  Declaring a field is not resolving what its type
-        // annotation NAMES, and the field visitor - which stamps that
-        // annotation - was reachable from nothing: every field's annotation
-        // reached the type layer with no `Res` on it.  Declaration stays a
-        // separate first pass so a field's default value can name a sibling
-        // declared after it.
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            node.fields[i].accept(this);
-        }
-
-        // Every method is a definition of the type before any body is
-        // walked.
-        this.define_body_methods(node.def, &node.methods);
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
-        }
-
-        this.resolver.exit_scope();
-    }
-
-    override visit(node: EnumDeclNode*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(EnumDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
-        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
-
-        // Declare generic params
-        this.declare_generics(node.generic_params);
-        this.stamp_trait_bounds(&node.where_bounds);
-        // The discriminant's type is a written name (`: i32`, `: u8`),
-        // answered like every other.
-        this.stamp_annotation(node.discriminant_annotation);
-
-        // Declare variants
-        for (mut i: i64 = 0; i < node.variants.length; i++) {
-            const variant: EnumVariantNode* = node.variants[i];
-            this.resolver.declare_enum_variant(variant.name, variant.span);
-            // A payload is written type syntax; a variant carrying one spells
-            // a type exactly as a field declaration does.
-            this.stamp_annotation_list(&variant.associated_types);
-        }
-
-        this.resolver.exit_scope();
-    }
-
-    override visit(node: TraitDeclNode*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(TraitDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
-        this.resolver.enter_scope(ScopeKind::Trait, this.resolver.intern_table.resolve(node.name), node.span);
-        const outer_trait: DefId = this.this_trait;
-        this.this_trait = match (this.bare_name_res(node.sym_id)) {
-            ResSlot::Answered(r) => { r.def_id() }
-            _                    => { DefId::invalid() }
-        };
-
-        // Declare generic params
-        this.declare_generics(node.generic_params);
-
-        // A supertrait (`type trait Step : Ord`) names a trait the way a
-        // bound does; its arguments may spell the trait's own parameters.
-        for (mut i: i64 = 0; i < node.base_traits.length; i++) {
-            const base: TraitRef* = &node.base_traits[i];
-            this.stamp_trait_ref_identity(base);
-            this.stamp_annotation_list(&base.type_args);
-        }
-
-        // An associated type's declared bound (`type Item: Copy;`) names a
-        // trait the way a where clause does, and is written in this file.
-        for (mut i: i64 = 0; i < node.assoc_types.length; i++) {
-            if (node.assoc_types[i] == null) { continue; }
-            for (mut j: i64 = 0; j < node.assoc_types[i].bounds.length; j++) {
-                const tref: TraitRef* = &node.assoc_types[i].bounds[j];
-                this.stamp_trait_ref_identity(tref);
-                this.stamp_annotation_list(&tref.type_args);
-            }
-        }
-
-        // Every signature is declared before any body is walked, so a default
-        // body may call a sibling method declared after it.
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            const method: FunctionDeclNode* = node.methods[i];
-            this.resolver.declare_method(method.name, method.span, true,
-                this.define_method(this.this_trait, method, method as ASTNode*));
-        }
-
-        // A default body is source written in THIS file, and is the only place
-        // the module that wrote it is still known: it is later instantiated
-        // against each implementing type, where the surrounding module is the
-        // implementor's, not the trait's.  Skipping it here leaves every path
-        // it spells to be re-derived from wherever the compiler is standing at
-        // instantiation time.  A method with no default has no body, and
-        // `visit(FunctionDeclNode*)` already walks one only when it exists.
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
-        }
-
-        this.this_trait = outer_trait;
-        this.resolver.exit_scope();
-    }
-
-    override visit(node: ImplBlockNode*) -> void {
-        this.resolver.enter_scope(ScopeKind::Impl,
-            this.resolver.intern_table.resolve(node.target_type), node.span);
-
-        // Declare generic params (e.g., implement enum Optional<T> { ... })
-        this.declare_generics(node.generic_params);
-
-        // Resolve the target type name
-        const target_id: SymbolID = this.resolver.lookup(
-            node.target_type, this.resolver.current_scope);
-        if (target_id.is_valid()) {
-            this.resolver.record_resolution(node.span, target_id);
-        }
-        // The type an impl head is FOR, stamped after `declare_generics` for
-        // the same reason the trait side is: a name spelled like an impl
-        // generic is that param, not a type to search for.
-        match (this.type_spelling_res(node.target_type, node.span)) {
-            ResSlot::Answered(r) => {
-                node.set_res(r);
-            }
-            _                    => { }
-        }
-        // `This::` in the body names what the head was just answered with.
-        const outer_owner: ResBase = this.this_owner;
-        const outer_owner_decl: ASTNode* = this.this_owner_decl;
-        const outer_owner_sym: SymbolID = this.this_owner_sym;
-        this.this_owner_decl = null;
-        this.this_owner_sym = target_id;
-        match (node.res) {
-            ResSlot::Answered(Res::Def(d)) => {
-                this.this_owner = ResBase::Def(d);
-                this.this_owner_decl = node as ASTNode*;
-            }
-            ResSlot::Answered(Res::PrimTy(p)) => {
-                this.this_owner = ResBase::PrimTy(p);
-                this.this_owner_decl = node as ASTNode*;
-            }
-            _ => { }
-        }
-
-        // The trait an impl head names. After `declare_generics`, for the same
-        // reason a parameter annotation is stamped there: a name spelled like
-        // an impl generic is that param, not a type to search for.
-        //
-        // Without this the head's identity is only ever recoverable as the
-        // leaf its spelling ends in, which is a search key - it answers only
-        // while that leaf is unique program-wide.
-        // The head's own name is a trait; what it is applied to is not.
-        const trait_head: TypeAnnotation* = TypeAnnotation::head_base(node.trait_annotation);
-        this.naming_trait = true;
-        this.stamp_annotation_tree(trait_head);
-        this.naming_trait = false;
-        this.stamp_annotation_tree(node.trait_annotation);
-        const outer_trait: DefId = this.this_trait;
-        this.this_trait = TypeAnnotation::trait_def(node.trait_annotation);
-        // What the head writes AFTER the target: a parameter of its own, or
-        // a declaration (`Array<T, GlobalAlloc>`), and only a stamp can say
-        // which.  Read after `declare_generics` for the reason the trait
-        // side is.
-        this.stamp_impl_target_args(node);
-
-        // `type Item = T;` in the body binds an associated type to written
-        // syntax, and the impl's own `where` clause spells types the same way
-        // a method's does.  Both are read after the generic params are
-        // declared, so a binding naming one is answered as that param.
-        this.stamp_annotation_list(&node.assoc_binding_annotations);
-        this.stamp_trait_bounds(&node.where_bounds);
-
-        // Declare and visit methods, each a definition of the type the head
-        // names - a trait implementation's too: the trait's own method is
-        // the trait's definition, the implementation's is the type's.
-        const method_owner: DefId = this.impl_owner_def(node);
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            const method: MethodNode* = node.methods[i];
-            if (method.func != null) {
-                const is_public: boolean =
-                    method.visibility == Visibility::Public;
-                this.resolver.declare_method(
-                    method.func.name, method.func.span, is_public,
-                    this.define_method(method_owner, method.func, method as ASTNode*));
-            }
-            method.accept(this);
-        }
-
-        this.this_trait = outer_trait;
-        this.this_owner = outer_owner;
-        this.this_owner_decl = outer_owner_decl;
-        this.this_owner_sym = outer_owner_sym;
-        this.resolver.exit_scope();
-    }
-
     /// Stamp what an impl head writes after its target.  A trait impl's list
     /// names the template's arguments and declares nothing, so a bare name in
     /// it that no scope binds - no leading `implement<S>`, no type `S` in
@@ -1341,131 +917,6 @@ public:
         diag = diag.with_note(fmt::format("write the parameters: `implement<%s> trait %s for %s<%s>`",
             head_params, trait_part, target, target_args));
         this.ctx.emit_diagnostic(diag);
-    }
-
-    override visit(node: VarDeclNode*) -> void {
-        this.stamp_annotation(node.type_annotation);
-        // Local variable declarations (globals handled in forward_declare)
-        if (!node.is_global) {
-            // Reject a same-scope redeclaration of a value binding (E0205).
-            // Without this check, `const x = 1; const x = 2;` in one block keeps
-            // only one of the two: Scope::insert drops the duplicate from the
-            // index with nothing but a debug log, so the second binding is
-            // silently accepted. Shadowing in a nested block is a distinct
-            // child scope and remains allowed.
-            if (this.resolver.current_scope_has(node.name)) {
-                this.ctx.emit_error_at(
-                    ErrorCode::E0205_REDEFINED_SYMBOL,
-                    fmt::format("the name `%s` is already declared in this scope",
-                        this.resolver.intern_table.resolve(node.name)),
-                    node.span);
-            }
-            const sym_id: SymbolID = this.resolver.declare_variable(node.name, node.span, node.is_mutable,
-                                                          false);
-            // Record the declaration span so downstream passes (TypeResolution,
-            // Sema) can map VarDeclNode.span -> SymbolID for type write-back.
-            this.resolver.record_resolution(node.span, sym_id);
-            node.set_sym_id(sym_id);
-        }
-
-        // Visit initializer expression
-        if (node.has_initializer()) {
-            node.initializer.accept(this);
-        }
-    }
-
-    override visit(node: DestructureDeclNode*) -> void {
-        this.stamp_annotation(node.type_annotation);
-        // Resolve the initializer first; its identifiers must bind to the
-        // outer scope, before the new field locals shadow anything.
-        if (node.has_initializer()) {
-            node.initializer.accept(this);
-        }
-        // Declare each binding's local in the current scope.
-        for (mut i: i64 = 0; i < node.bindings.length; i++) {
-            const b: DestructureBinding = node.bindings[i];
-            // Reject two bindings that introduce the same local name (E0205):
-            // `const {x, x} = ...` would otherwise drop the duplicate silently.
-            if (NameResolver::repeats_binding(node, i)) {
-                this.ctx.emit_error_at(
-                    ErrorCode::E0205_REDEFINED_SYMBOL,
-                    fmt::format("the name `%s` is bound more than once in this destructuring",
-                        this.resolver.intern_table.resolve(b.local_name)),
-                    b.name_span);
-            }
-            const sym_id: SymbolID = this.resolver.declare_variable(
-                b.local_name, b.name_span, b.is_mutable, false);
-            this.resolver.record_resolution(b.name_span, sym_id);
-            node.bindings[i].sym_id = sym_id;
-        }
-    }
-
-    override visit(node: TypeAliasDeclNode*) -> void {
-        // Already forward-declared.  The alias's own parameters are in
-        // scope for its target, as a struct's are for its fields; the target
-        // is the alias's definition, so the alias's own name is no
-        // suggestion for a name inside it.
-        this.resolver.enter_scope(ScopeKind::TypeBody,
-            this.resolver.intern_table.resolve(node.alias_name), node.span);
-        this.declare_generics(node.generic_params);
-        this.defining_type = node.alias_name;
-        this.stamp_annotation(node.target_annotation);
-        this.defining_type = SymbolStr::empty();
-        this.resolver.exit_scope();
-    }
-
-    override visit(node: ImportDeclNode*) -> void {
-        // Every module has declared and exported its own names by now, so the
-        // exports this import reads from exist whichever order the modules are
-        // walked in - including inside an import cycle, where no order can put
-        // the declarer first.
-        //
-        // Running after this module's own declarations rather than before them
-        // does not change which of the two wins: the scope tiers them, so a
-        // declaration owns the slot and shadows the import either way.
-        this.process_import(node);
-    }
-
-    override visit(node: ExternBlockNode*) -> void {
-        // Already forward-declared functions; visit bodies if any.
-        for (mut i: i64 = 0; i < node.functions.length; i++) {
-            node.functions[i].accept(this);
-        }
-    }
-
-    override visit(node: IntrinsicDeclNode*) -> void {
-        // Already forward-declared.  The signature's annotations are stamped
-        // here as a function's are: a primitive (`void*`, `u32*`) is a
-        // written name the name layer answers, not a token that needs no
-        // answer.
-        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
-            this.stamp_annotation(node.parameters[pi].type_annotation);
-        }
-        this.stamp_annotation(node.return_type_annotation);
-        if (node.has_body()) {
-            this.resolver.enter_scope(ScopeKind::Function, this.resolver.intern_table.resolve(node.name), node.span);
-            for (mut i: i64 = 0; i < node.parameters.length; i++) {
-                const param: VarDeclNode* = node.parameters[i];
-                const param_sym: SymbolID = this.resolver.declare_parameter(param.name, param.span);
-                this.resolver.record_resolution(param.span, param_sym);
-                param.set_sym_id(param_sym);
-            }
-            this.visit_block_contents(node.body);
-            this.resolver.exit_scope();
-        }
-    }
-
-    override visit(node: FieldDeclNode*) -> void {
-        this.stamp_annotation(node.type_annotation);
-        // Fields already declared by parent struct/class visitor.
-        // Visit default value expression if present.
-        if (node.has_default_value()) {
-            node.default_value.accept(this);
-        }
-    }
-
-    override visit(node: GenericParamNode*) -> void {
-        // Already declared by parent function/struct visitor.
     }
 
 
@@ -1894,117 +1345,6 @@ public:
     /// The code a spelling that names nothing is refused with.
     not_found_code(&this) -> ErrorCode {
         return if (this.naming_trait) { ErrorCode::E0242_UNDEFINED_TRAIT } else { ErrorCode::E0203_UNDEFINED_TYPE };
-    }
-
-    override visit(node: IdentifierNode*) -> void {
-        // A bare identifier in expression position names a VALUE, so it is
-        // asked in the value namespace alone: a type spelled the same is not
-        // an answer, and when a module holds both a type and a function under
-        // the leaf the function is what `Color(5)` names, whichever was
-        // declared first.
-        mut sym_id: SymbolID = this.resolver.lookup_value(
-            node.name, this.resolver.current_scope);
-        if (!sym_id.is_valid()) {
-            // A source-location pseudo-constant is declared nowhere, so no
-            // binding can answer it; the spelling is the answer, as a
-            // primitive's is on the type lane.  Asked only once every scope
-            // has declined, so a binding of the same spelling shadows it.
-            match (SourceLoc::of_spelling(this.resolver.intern_table.resolve(node.name))) {
-                Option::Some(k) => {
-                    node.set_res(Res::SourceLoc(k));
-                    this.stamp_annotation_list(&node.generic_args);
-                    return;
-                }
-                Option::None => { }
-            }
-            // A type is not a value.  Asking whether the name binds at all
-            // chooses the message only - the answer is a refusal either way.
-            if (this.resolver.lookup(node.name, this.resolver.current_scope).is_valid()) {
-                this.refuse_type_as_value(node);
-                this.stamp_annotation_list(&node.generic_args);
-                return;
-            }
-            // No rib binds the name, the prelude included, and nothing
-            // later in the pipeline can: this scope is the one the name was
-            // written in, and it is the only place the answer is knowable.
-            // Refused here, as the name that does not exist that it is - a
-            // function when a call names it, a value otherwise - and stamped
-            // `Err` so no later stage reports it again or guesses at it.
-            this.refuse_unbound_name(node);
-            this.stamp_annotation_list(&node.generic_args);
-            return;
-        }
-        if (sym_id.is_valid()) {
-            this.resolver.record_resolution(node.span, sym_id);
-            // Two imports of one leaf from different modules bind the name to
-            // neither: the scope keeps the first so a lookup lands somewhere,
-            // and the record of the second is what says the first was never
-            // the answer.  Refused here, where the name is used, because an
-            // import brings a name into scope and it is naming the item that
-            // needs it to name one.  A declaration of the leaf in this module
-            // shadows every import of it and clears the record, so this is
-            // reached only for the import-vs-import tie.
-            const bound: Symbol = this.resolver.get_symbol(sym_id);
-            if (bound.kind == SymbolKind::Import
-                    && this.resolver.is_ambiguous(node.name, Namespace::Value)) {
-                const mods: [ModulePath] = this.resolver.get_ambiguous_modules(node.name, Namespace::Value);
-                const leaf: string = this.resolver.intern_table.resolve(node.name);
-                const a: string = if (mods.length > 0) { this.resolver.intern_table.shown(mods[0].decl_name()) } else { "" };
-                const b: string = if (mods.length > 1) { this.resolver.intern_table.shown(mods[1].decl_name()) } else { "" };
-                mut d: Diagnostic = Diagnostic::error(
-                    ErrorCode::E0154_AMBIGUOUS_CALL,
-                    fmt::format("`%s` is ambiguous: it is imported from both `%s` and `%s`",
-                        leaf, a, b));
-                d = d.at_with_label(node.span, "ambiguous name");
-                d = d.with_note(fmt::format(
-                    "write the path out to say which one is meant, `%s::%s` or `%s::%s`",
-                    a, leaf, b, leaf));
-                this.ctx.emit_diagnostic(d);
-                node.set_res(Res::Err);
-                this.stamp_annotation_list(&node.generic_args);
-                return;
-            }
-        }
-        // Stamped from the lookup already performed, never a second one: the
-        // scope this walk stands in is the scope the name was written in, and
-        // that is the only place the answer is knowable.  An import is
-        // stamped with the declaration it binds in the value namespace, not
-        // with whichever declaration its module listed first.
-        match (this.bare_name_res(this.resolver.value_target(sym_id))) {
-            ResSlot::Answered(r) => { node.set_res(r); }
-            _                    => { }
-        }
-        this.stamp_annotation_list(&node.generic_args);
-    }
-
-    override visit(node: ScopeResolutionNode*) -> void {
-        if (!this.stamp_this_scope(node)) {
-            // Look up the scope name (e.g., "Foo" in "Foo::Bar")
-            const scope_sym: SymbolID = this.resolver.lookup(
-                node.scope_name, this.resolver.current_scope);
-            if (scope_sym.is_valid()) {
-                this.resolver.record_resolution(node.span, scope_sym);
-            }
-            // A segment that already binds in scope names a TYPE (or a value), and
-            // what its members are is sema's question, not this one.  Passing the
-            // SYMBOL through is what keeps the two refusals below from judging a
-            // type that merely shares its name with some module elsewhere in the
-            // program, and it is also the base a type-relative answer records - so
-            // the stamp is built from the lookup already performed rather than from
-            // a second one asking the same question.
-            this.stamp_module_scope(node, scope_sym);
-        }
-        // The scope segment's own arguments (`Pair<String, String>::new`) and
-        // the member's (`Layout::of<Entry<K, V>>`) are written types in their
-        // own right; what they name is settled here, where the writing scope
-        // is still the current one.
-        this.stamp_annotation_list(&node.scope_generic_args);
-        this.stamp_annotation_list(&node.generic_args);
-        // The trait of an impl-qualified path, `(Beta for P)::make`, is a
-        // written type name like the arguments beside it.
-        this.stamp_annotation_tree(node.impl_trait);
-        // Member resolution within the type's scope is deferred to
-        // TypeResolution (needs type info to find the TypeBody scope).
     }
 
     /// The declaration named by a module-rooted path - a scope segment
@@ -2536,7 +1876,7 @@ public:
                 // the fold that reads it runs in TypeResolution, so a written
                 // qualifier has to be stamped here or there is nothing for
                 // that fold to read but the spelling.
-                if (a.size_expr != null) { a.size_expr.accept(this); }
+                if (a.size_expr != null) { this.walk_node(a.size_expr); }
             }
             TypeAnnotation::Projection(pj) => {
                 this.stamp_annotation_tree(pj.base);
@@ -2582,7 +1922,7 @@ public:
             // here like any other: `x` in `const y: typeof(x)` is the local
             // the writer's scope binds.
             TypeAnnotation::Typeof(t) => {
-                if (t.operand != null) { (t.operand as ExpressionNode*).accept(this); }
+                if (t.operand != null) { this.walk_node((t.operand as ExpressionNode*)); }
             }
             _ => {}
         }
@@ -3005,406 +2345,8 @@ public:
         this.param_projections = [];
     }
 
-    override visit(node: CallExprNode*) -> void {
-        const callee_node: ASTNode* = node.callee as ASTNode*;
-        // A bare callee is visited as the callee it is, so one that binds to
-        // nothing is refused as a function rather than as a value.  Set for
-        // the callee's own visit only: an argument is not a callee.
-        const outer_callee: IdentifierNode* = this.callee_ident;
-        if (callee_node.kind == NodeKind::Identifier) {
-            this.callee_ident = node.callee as IdentifierNode*;
-        }
-        node.callee.accept(this);
-        this.callee_ident = outer_callee;
-
-        this.stamp_annotation_list(&node.generic_args);
-
-        // Visit arguments
-        for (mut i: i64 = 0; i < node.arguments.length; i++) {
-            node.arguments[i].accept(this);
-        }
-    }
-
-    override visit(node: MemberAccessNode*) -> void {
-        // Visit the object expression; member resolution deferred to TypeResolution
-        node.object.accept(this);
-        this.stamp_annotation_list(&node.generic_args);
-    }
-
-    override visit(node: BinaryExprNode*) -> void {
-        node.left.accept(this);
-        node.right.accept(this);
-    }
-
-    override visit(node: UnaryExprNode*) -> void {
-        node.operand.accept(this);
-    }
-
-    override visit(node: TernaryExprNode*) -> void {
-        node.condition.accept(this);
-        node.true_expr.accept(this);
-        node.false_expr.accept(this);
-    }
-
-    override visit(node: IfExprNode*) -> void {
-        node.condition.accept(this);
-        node.then_expr.accept(this);
-        if (node.else_expr != null) {
-            node.else_expr.accept(this);
-        }
-    }
-
-    override visit(node: MatchExprNode*) -> void {
-        node.subject.accept(this);
-        for (mut i: i64 = 0; i < node.arms.length; i++) {
-            node.arms[i].accept(this);
-        }
-    }
-
-    override visit(node: StaticMatchExprNode*) -> void {
-        // The scrutinee is a written type - a parameter, almost always - and
-        // is stamped like the arms' patterns: a later stage that reads its
-        // slot must find an answer there, not a name to search for.
-        this.stamp_annotation(node.scrutinee);
-        for (mut i: i64 = 0; i < node.arms.length; i++) {
-            node.arms[i].accept(this);
-        }
-    }
-
-    override visit(node: NewExprNode*) -> void {
-        // `new <path>` denotes one of two things and the parser decides
-        // neither: a TYPE to allocate, or a VARIANT of an enum.  One question
-        // separates them, and it is the question every path already asks.
-        //
-        // `TypeRelative` means the name layer walked to a type and a type owns
-        // the rest of the path - which for `new` is exactly `Enum::Variant`.
-        // Any other answer means the whole path names one definition, so it is
-        // the type being allocated.  There is no second lookup and no ordering
-        // to get wrong: the single answer carries which case this is.
-        // A `new` path is a TYPE path, optionally followed by one VARIANT
-        // segment, and the parser decides neither half.
-        //
-        // Classification first, from what the WHOLE path resolves to.
-        // `TypeRelative` means the name layer walked to a type and a type owns
-        // the tail - which for `new` is exactly `Enum::Variant`. When the whole
-        // path answers nothing, the same question is asked of the type path it
-        // contains, one segment shorter: that is what `Mod::Enum::Variant` is.
-        // Any other answer means the whole path names the type being allocated.
-        const written: string = this.resolver.intern_table.resolve(node.type_name);
-        mut do_split: boolean = false;
-        match (this.type_spelling_res(node.type_name, node.span)) {
-            ResSlot::Answered(r) => {
-                match (r) {
-                    Res::TypeRelative(_, _) => { do_split = true; }
-                    _                       => { }
-                }
-            }
-            _ => {
-                if (this.resolver.contains_separator(written)) {
-                    const parent_sym: SymbolStr = this.resolver.intern_table.intern(
-                        QualifiedName::parent_of(written));
-                    match (this.type_spelling_res(parent_sym, node.span)) {
-                        ResSlot::Answered(pr) => {
-                            match (pr) {
-                                Res::Def(_) => { do_split = true; }
-                                _           => { }
-                            }
-                        }
-                        _ => { }
-                    }
-                }
-            }
-        }
-        if (do_split) {
-            node.set_variant_name(this.resolver.intern_table.intern(
-                QualifiedName::leaf_of(written)));
-            node.type_name = this.resolver.intern_table.intern(
-                QualifiedName::parent_of(written));
-        }
-
-        // The node is stamped from the path it actually names - the type,
-        // after any variant segment has been taken off it.  Stamping the
-        // classification answer instead records the enum by a `Def` that
-        // carries no generic arguments, and `new Option<i64>::Some(41)` then
-        // resolves to `Option` rather than `Option<i64>`.
-        match (this.type_spelling_res(node.type_name, node.span)) {
-            ResSlot::Answered(r2) => { node.set_res(r2); }
-            _                     => { }
-        }
-
-        // Resolve type name.  After the split above, so a variant path records
-        // the ENUM rather than a leaf no scope binds.
-        const type_sym: SymbolID = this.resolver.lookup(
-            node.type_name, this.resolver.current_scope);
-        if (type_sym.is_valid()) {
-            this.resolver.record_resolution(node.span, type_sym);
-        }
-
-        this.stamp_annotation_list(&node.generic_args);
-
-        for (mut i: i64 = 0; i < node.arguments.length; i++) {
-            node.arguments[i].accept(this);
-        }
-
-        if (node.has_array_size()) {
-            node.array_size.accept(this);
-        }
-
-        // Struct-initializer form `new Foo { field: value }`: resolve the field
-        // initializer expressions so identifier references inside them are
-        // recorded in the resolution map (mirrors visit(StructLiteralNode)).
-        // Without this, a local used only as a `new`-init field value looks
-        // unreferenced (drives W0001 false positives and misses LSP hover/def).
-        if (node.has_struct_init()) {
-            node.struct_init.accept(this);
-        }
-    }
-
-    override visit(node: CastExprNode*) -> void {
-        node.expression.accept(this);
-        this.stamp_annotation(node.target_annotation);
-    }
-
-    override visit(node: StructLiteralNode*) -> void {
-        // Resolve struct type name
-        const type_sym: SymbolID = this.resolver.lookup(
-            node.struct_type, this.resolver.current_scope);
-        if (type_sym.is_valid()) {
-            this.resolver.record_resolution(node.span, type_sym);
-        }
-        // The literal names a TYPE, and its spelling may be qualified, so it
-        // is the annotation's question rather than the single-segment scope
-        // lookup a bare value name gets - `type_sym` above answers whether the
-        // leaf binds here, which is not the same thing.
-        match (this.type_spelling_res(node.struct_type, node.span)) {
-            ResSlot::Answered(r) => { node.set_res(r); }
-            _                    => {
-                if (this.refuse_unbound_type(node.struct_type, node.span)) {
-                    node.set_res(Res::Err);
-                }
-            }
-        }
-        this.stamp_annotation_list(&node.generic_args);
-
-        // Visit field initializer expressions
-        for (mut i: i64 = 0; i < node.field_inits.length; i++) {
-            const init_value: ExpressionNode* = node.field_inits[i].value as ExpressionNode*;
-            if (init_value != null) {
-                init_value.accept(this);
-            }
-        }
-    }
-
-    override visit(node: ArrayLiteralNode*) -> void {
-        for (mut i: i64 = 0; i < node.elements.length; i++) {
-            node.elements[i].accept(this);
-        }
-        if (node.repeat_count_expr != null) {
-            node.repeat_count_expr.accept(this);
-        }
-    }
-
-    override visit(node: TupleLiteralNode*) -> void {
-        for (mut i: i64 = 0; i < node.elements.length; i++) {
-            node.elements[i].accept(this);
-        }
-    }
-
-    override visit(node: ArrayAccessNode*) -> void {
-        node.array.accept(this);
-        node.index.accept(this);
-    }
-
-    override visit(node: LambdaExprNode*) -> void {
-        this.resolver.enter_scope(ScopeKind::Lambda, "<lambda>", node.span);
-
-        // Declare parameters
-        for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const param: VarDeclNode* = node.parameters[i];
-            param.set_sym_id(this.resolver.declare_parameter(param.name, param.span));
-            this.stamp_annotation(param.type_annotation);
-        }
-        this.stamp_annotation(node.return_type_ann);
-
-        // Visit body
-        if (node.body != null) {
-            node.body.accept(this);
-        }
-
-        this.resolver.exit_scope();
-    }
-
-    // Leaf expressions: no name resolution needed
-    override visit(node: LiteralNode*) -> void {}
-    override visit(node: SizeofExprNode*) -> void {
-        this.stamp_annotation(node.type_ann);
-    }
-    override visit(node: AlignofExprNode*) -> void {
-        this.stamp_annotation(node.type_ann);
-    }
-
 
     // -- Statements --
-
-    override visit(node: BlockStmtNode*) -> void {
-        this.resolver.enter_scope(ScopeKind::Block, "<block>", node.span);
-        this.visit_block_contents(node);
-        this.resolver.exit_scope();
-    }
-
-    override visit(node: ReturnStmtNode*) -> void {
-        if (node.has_expression()) {
-            node.expression.accept(this);
-        }
-    }
-
-    override visit(node: IfStmtNode*) -> void {
-        node.condition.accept(this);
-        node.then_stmt.accept(this);
-        if (node.has_else()) {
-            node.else_stmt.accept(this);
-        }
-    }
-
-    override visit(node: WhileStmtNode*) -> void {
-        node.condition.accept(this);
-        node.body.accept(this);
-    }
-
-    override visit(node: DoWhileStmtNode*) -> void {
-        node.body.accept(this);
-        node.condition.accept(this);
-    }
-
-    override visit(node: LoopStmtNode*) -> void {
-        if (node.body != null) { node.body.accept(this); }
-    }
-
-    override visit(node: TypeofExprNode*) -> void {
-        if (node.operand != null) { node.operand.accept(this); }
-    }
-
-    override visit(node: DeleteExprNode*) -> void {
-        if (node.operand != null) { node.operand.accept(this); }
-    }
-
-    override visit(node: AwaitExprNode*) -> void {
-        if (node.operand != null) { node.operand.accept(this); }
-    }
-
-    override visit(node: YieldExprNode*) -> void {
-        if (node.operand != null) { node.operand.accept(this); }
-    }
-
-    override visit(node: TryExprNode*) -> void {
-        // Name resolution runs long before sema lowers `?`, so only the
-        // source operand exists at this point.
-        if (node.operand != null) { node.operand.accept(this); }
-    }
-
-    override visit(node: ForStmtNode*) -> void {
-        // For loops create a scope for the loop variable
-        this.resolver.enter_scope(ScopeKind::Block, "<for>", node.span);
-
-        if (node.init != null) {
-            node.init.accept(this);
-        }
-        if (node.condition != null) {
-            node.condition.accept(this);
-        }
-        if (node.update != null) {
-            node.update.accept(this);
-        }
-        if (node.body != null) {
-            node.body.accept(this);
-        }
-
-        this.resolver.exit_scope();
-    }
-
-    override visit(node: MatchStmtNode*) -> void {
-        node.subject.accept(this);
-        for (mut i: i64 = 0; i < node.arms.length; i++) {
-            node.arms[i].accept(this);
-        }
-    }
-
-    override visit(node: MatchArmNode*) -> void {
-        // Each arm gets its own scope for pattern bindings
-        this.resolver.enter_scope(ScopeKind::Block, "<match-arm>", node.span);
-
-        // Visit patterns (may introduce bindings)
-        for (mut i: i64 = 0; i < node.patterns.length; i++) {
-            this.in_alternative = i > 0;
-            node.patterns[i].accept(this);
-        }
-        this.in_alternative = false;
-
-        // The guard is an expression of this arm's scope: it reads the
-        // pattern's bindings and anything the module can see, so it is
-        // resolved where the body is.  Left unvisited, every name in it stays
-        // unstamped - a module constant in `n if n > LIMIT` is then refused
-        // as not in scope, and a callee in it binds by spelling.
-        if (node.guard != null) {
-            node.guard.accept(this);
-        }
-
-        // Visit body
-        if (node.body != null) {
-            node.body.accept(this);
-        }
-
-        this.resolver.exit_scope();
-    }
-
-    override visit(node: StaticMatchStmtNode*) -> void {
-        this.stamp_annotation(node.scrutinee);
-        for (mut i: i64 = 0; i < node.arms.length; i++) {
-            node.arms[i].accept(this);
-        }
-    }
-
-    override visit(node: StaticMatchArmNode*) -> void {
-        // The pattern IS a type, written in this file, so it is stamped like
-        // any other written type.  It binds no name, which is why the arm
-        // scope below holds only the body.
-        this.stamp_annotation_list(&node.type_patterns);
-        this.resolver.enter_scope(ScopeKind::Block, "<static-match-arm>", node.span);
-        if (node.body != null) {
-            node.body.accept(this);
-        }
-        this.resolver.exit_scope();
-    }
-
-    override visit(node: PatternNode*) -> void {
-        // A bare identifier pattern is normally a fresh binding. But if the
-        // name resolves to an existing `const`, it is a *value* pattern -
-        // compare the subject against the constant - not a binding: a named
-        // constant in a pattern is a value. Without this, a match
-        // like `match (code) { ENOENT => ...; EAGAIN => ... }` silently treats
-        // every const arm as a catch-all binding, so only the first arm ever
-        // runs. Reclassify by moving the name into `value` and clearing
-        // `binding_name`; downstream passes (sema, codegen) treat an Identifier
-        // pattern with no `binding_name` as a constant-value pattern.
-        if (node.pattern_kind == PatternKind::Identifier) {
-            const sym: SymbolID = this.resolver.lookup(
-                node.binding_name, this.resolver.current_scope);
-            if (sym.is_valid()
-                    && this.resolver.get_symbol(sym).kind == SymbolKind::Constant) {
-                this.resolver.record_resolution(node.span, sym);
-                node.set_value(node.binding_name);
-                node.set_binding_name(SymbolStr::empty());
-                // The same answer an identifier naming this constant gets,
-                // recorded on the node for the stage that compares against it.
-                match (this.bare_name_res(sym)) {
-                    ResSlot::Answered(r) => { node.set_const_res(r); }
-                    _                    => { }
-                }
-            } else {
-                node.binding_sym = this.declare_pattern_binding(node.binding_name, node.span);
-            }
-        }
-    }
 
     /// The binding a pattern declares for `name`.  The alternatives of one arm
     /// (`A(v) | B(v)`) bind ONE value under each name - whichever alternative
@@ -3422,69 +2364,11 @@ public:
         return this.resolver.declare_variable(name, span, false, false);
     }
 
-    override visit(node: EnumPatternNode*) -> void {
-        // Resolve enum name
-        const enum_sym: SymbolID = this.resolver.lookup(
-            node.enum_name, this.resolver.current_scope);
-        if (enum_sym.is_valid()) {
-            this.resolver.record_resolution(node.span, enum_sym);
-        }
-        // The pattern names a TYPE, and its spelling may be qualified, so it is
-        // the annotation's question rather than the single-segment scope lookup
-        // a bare value name gets.  `enum_span` is the enum-path side of the
-        // pattern, which is what this stamp is about.
-        match (this.type_spelling_res(node.enum_name, node.enum_span)) {
-            ResSlot::Answered(r) => { node.set_res(r); }
-            _                    => { }
-        }
-
-        // Declare each binding variable.  A nested pattern (`Some(Some(n))`)
-        // binds in the same arm scope and is walked as a pattern of its own,
-        // so its identifier is declared - or reclassified as a constant - by
-        // the one rule above.
-        for (mut i: i64 = 0; i < node.elements.length; i++) {
-            mut pb: PatternBinding* = node.binding_at(i);
-            if (pb != null) {
-                pb.sym_id = this.declare_pattern_binding(pb.name, pb.span);
-                continue;
-            }
-            const sub: PatternNode* = node.sub_at(i);
-            if (sub != null) { sub.accept(this); }
-        }
-    }
-
-    override visit(node: ExprStmtNode*) -> void {
-        node.expression.accept(this);
-    }
-
-    override visit(node: DeclStmtNode*) -> void {
-        if (node.declaration != null) {
-            node.declaration.accept(this);
-        }
-    }
-
-    override visit(node: UnsafeBlockStmtNode*) -> void {
-        if (node.block != null) {
-            node.block.accept(this);
-        }
-    }
-
-    override visit(node: AsmBlockStmtNode*) -> void {
-        // Resolve the variable references inside each `{...}` operand so
-        // sema and codegen see bound identifiers.
-        for (mut i: i64 = 0; i < node.operands.length; i++) {
-            const op: AsmOperand = node.operands[i];
-            if (op.expr != null) {
-                op.expr.accept(this);
-            }
-        }
-    }
-
     /// Visit block contents without creating a new scope (caller manages scope).
-    visit_block_contents(block: BlockStmtNode*) -> void {
+    visit_block_contents(mut &this, block: BlockStmtNode*) -> void {
         if (block == null) { return; }
         for (mut i: i64 = 0; i < block.statements.length; i++) {
-            block.statements[i].accept(this);
+            this.walk_node(block.statements[i]);
         }
     }
 
@@ -3744,7 +2628,7 @@ public:
         return this.ctx.module_graph.find_module_index(sub_module);
     }
 
-    process_import(node: ImportDeclNode*) -> void {
+    process_import(mut &this, node: ImportDeclNode*) -> void {
         const module_path: string = this.resolver.intern_table.resolve(node.module_path);
         LOG_DEBUG(LogComponent::General, "[NameResolver] process_import() module='%s'", module_path);
 
@@ -4041,6 +2925,987 @@ public:
     }
 }
 
+implement trait Walk for struct NameResolver {
+    // -- ProgramNode --
+    walk_program(mut &this, node: ProgramNode*) -> void {
+        // The module's own names are already declared and exported, and the
+        // scope holding them is the one the caller restored.  Naming the module
+        // again here would CREATE a second scope of the same name and walk into
+        // it, leaving every symbol declared above unreachable from the walk.
+        for (mut i: i64 = 0; i < node.statements.length; i++) {
+            this.walk_node(node.statements[i]);
+        }
+
+        // A `static_assert` condition lives in a side list, not the statement
+        // stream, so the loop above never reaches it.  Its condition is an
+        // ordinary expression that may name a constant or an enum variant, and
+        // the fold that reads it runs in TypeLowering - long after the only
+        // pass that can say which module a written qualifier denotes.  Without
+        // this walk the qualifier reaches that fold with no `Res` to read.
+        //
+        // The list is this module's own: the driver swaps `ast.root` per module
+        // before the walk, so a condition is resolved in the scope of the file
+        // that wrote it.
+        for (mut i: i64 = 0; i < node.static_asserts.length; i++) {
+            const sa: StaticAssertItem* = node.static_asserts[i];
+            if (sa == null || sa.cond == null) { continue; }
+            this.walk_node((sa.cond as ExpressionNode*));
+        }
+
+        this.refuse_module_type_collisions();
+        this.refuse_import_redeclarations();
+    }
+
+    // -- Declarations --
+    walk_function(mut &this, node: FunctionDeclNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(FunctionDecl) name='%s' generics=%d",
+            this.resolver.intern_table.resolve(node.name), node.generic_params.length);
+        // Enter function scope
+        this.resolver.enter_scope(ScopeKind::Function, this.resolver.intern_table.resolve(node.name),
+            NameResolver::function_extent(node));
+
+        // Declare generic params
+        this.declare_generics(node.generic_params);
+
+        // Declare parameters and record spans for type write-back
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const param: VarDeclNode* = node.parameters[i];
+            // Reject a duplicate parameter name (E0205). `Scope::insert` drops
+            // the duplicate silently, so `function f(x: i32, x: i32)` would
+            // otherwise compile with the second `x` shadowed and unreachable.
+            // Scan only prior parameters (rather than `current_scope_has`) so a
+            // value parameter sharing a generic param's name is not falsely
+            // flagged.
+            if (NameResolver::repeats_parameter(node, i)) {
+                this.ctx.emit_error_at(
+                    ErrorCode::E0205_REDEFINED_SYMBOL,
+                    fmt::format("the parameter `%s` is already declared in this function",
+                        this.resolver.intern_table.resolve(param.name)),
+                    param.span);
+            }
+            // The receiver binds as `this` whatever its written form: `&this`
+            // is a spelling no use can write, and every use of `this` in the
+            // body names this parameter.
+            const bound_as: SymbolStr = if (param.is_receiver()) { this.this_sym } else { param.name };
+            const param_sym: SymbolID = this.resolver.declare_parameter(bound_as, param.span);
+            this.resolver.record_resolution(param.span, param_sym);
+            param.set_sym_id(param_sym);
+            // After `declare_generics`, so a parameter spelled `T` is answered
+            // as the generic param it names rather than searched for as a type.
+            this.stamp_annotation(param.type_annotation);
+        }
+        this.stamp_annotation(node.return_type_annotation);
+        this.stamp_trait_bounds(&node.trait_bounds);
+
+        // The base-constructor initializer list, if this function is the
+        // constructor one was written on.  Resolved here, after the parameters
+        // are declared and before the body, because that is the scope the
+        // language evaluates it in.  Every other consumer - sema, codegen,
+        // drop insertion, the substituter, the cloner - already walks these
+        // arguments; name resolution was the only pass that did not, so a path
+        // written in one reached codegen with nothing recorded.
+        if (this.pending_base_ctor != null
+                && this.pending_base_ctor.func == node) {
+            const owner: MethodNode* = this.pending_base_ctor;
+            // Cleared for the descent: an argument containing a lambda or a
+            // nested constructor call must not re-enter this branch and resolve
+            // the same list a second time.
+            this.pending_base_ctor = null;
+            for (mut i: i64 = 0; i < owner.base_ctor_args.length; i++) {
+                this.walk_node(owner.base_ctor_args[i]);
+            }
+            this.pending_base_ctor = owner;
+        }
+
+        // Visit body
+        if (node.has_body()) {
+            this.visit_block_contents(node.body);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    walk_method(mut &this, node: MethodNode*) -> void {
+        if (node.func != null) {
+            // A base-constructor initializer list is written outside the body
+            // but evaluated inside it: `: Base(kind, span)` reads the
+            // constructor's own parameters, so it has to be resolved with those
+            // in scope.  Handed to the function visitor rather than walked here
+            // because that is the one place the parameter scope is open, and
+            // opening a second one would put the same names in two scopes.
+            this.pending_base_ctor = node;
+            this.walk_node(node.func);
+            this.pending_base_ctor = null;
+        }
+    }
+
+    walk_struct(mut &this, node: StructDeclNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(StructDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
+        // Enter type body scope
+        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
+
+        // Declare generic params
+        this.declare_generics(node.generic_params);
+        // The declaration's own `where` clause, read after its parameters are
+        // declared so a bound naming one is answered as that parameter.
+        this.stamp_trait_bounds(&node.where_bounds);
+
+        // Declare fields
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            const field: FieldDeclNode* = node.fields[i];
+            this.resolver.declare_field(field.name, field.span);
+        }
+
+        // Then walk them.  Declaring a field is not resolving what its type
+        // annotation NAMES, and the field visitor - which stamps that
+        // annotation - was reachable from nothing: every field's annotation
+        // reached the type layer with no `Res` on it.  Declaration stays a
+        // separate first pass so a field's default value can name a sibling
+        // declared after it.
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            this.walk_node(node.fields[i]);
+        }
+
+        // Every method is a definition of the type before any body is
+        // walked.
+        this.define_body_methods(node.def, &node.methods);
+        const outer_owner: ResBase = this.this_owner;
+        const outer_owner_decl: ASTNode* = this.this_owner_decl;
+        const outer_owner_sym: SymbolID = this.this_owner_sym;
+        this.this_owner = ResBase::Def(node.def);
+        this.this_owner_decl = if (node.def.is_valid()) { node as ASTNode* } else { null };
+        this.this_owner_sym = SymbolID::invalid();
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            this.walk_node(node.methods[i]);
+        }
+        this.this_owner = outer_owner;
+        this.this_owner_decl = outer_owner_decl;
+        this.this_owner_sym = outer_owner_sym;
+
+        this.resolver.exit_scope();
+    }
+
+    walk_union(mut &this, node: UnionDeclNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(UnionDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
+        // Enter type body scope
+        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
+
+        // Declare generic params
+        this.declare_generics(node.generic_params);
+        this.stamp_trait_bounds(&node.where_bounds);
+
+        // Declare fields
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            const field: FieldDeclNode* = node.fields[i];
+            this.resolver.declare_field(field.name, field.span);
+        }
+
+        // Then walk them.  Declaring a field is not resolving what its type
+        // annotation NAMES, and the field visitor - which stamps that
+        // annotation - was reachable from nothing: every field's annotation
+        // reached the type layer with no `Res` on it.  Declaration stays a
+        // separate first pass so a field's default value can name a sibling
+        // declared after it.
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            this.walk_node(node.fields[i]);
+        }
+
+        // Every method is a definition of the type before any body is
+        // walked.
+        this.define_body_methods(node.def, &node.methods);
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            this.walk_node(node.methods[i]);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    walk_class(mut &this, node: ClassDeclNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(ClassDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
+
+        // The base, in the scope ENCLOSING the class.  It has to be asked
+        // before `enter_scope`: the class body declares the class's own name
+        // and its generic parameters, either of which would shadow the base.
+        //
+        // The parser accepts a single identifier here, so this is always a
+        // one-segment question in the type namespace - and one this layer can
+        // finish, which is why anything other than a definition is reported
+        // here rather than passed on.  A base that names nothing leaves the
+        // class with no base at all, so letting it through silently drops
+        // every member the class was written to inherit.
+        if (node.has_base_class()) {
+            const r: Res = this.resolver.type_res_in_scope(
+                node.base_class, this.resolver.current_scope);
+            match (r) {
+                Res::Def(_) => { node.set_base_res(r); }
+                _           => {
+                    const written: string =
+                        this.resolver.intern_table.resolve(node.base_class);
+                    mut d: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0203_UNDEFINED_TYPE,
+                        fmt::format("cannot find type `%s` in this scope", written));
+                    d = d.at_with_label(node.base_span, "not found in this scope");
+                    d = d.with_note("a base class is resolved in the scope the class is written in, before the class body");
+                    this.ctx.emit_diagnostic(d);
+                    node.set_base_res(Res::Err);
+                }
+            }
+        }
+        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
+
+        // Declare generic params
+        this.declare_generics(node.generic_params);
+        this.stamp_trait_bounds(&node.where_bounds);
+
+        // Declare fields
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            const field: FieldDeclNode* = node.fields[i];
+            this.resolver.declare_field(field.name, field.span);
+        }
+
+        // Then walk them.  Declaring a field is not resolving what its type
+        // annotation NAMES, and the field visitor - which stamps that
+        // annotation - was reachable from nothing: every field's annotation
+        // reached the type layer with no `Res` on it.  Declaration stays a
+        // separate first pass so a field's default value can name a sibling
+        // declared after it.
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            this.walk_node(node.fields[i]);
+        }
+
+        // Every method is a definition of the type before any body is
+        // walked.
+        this.define_body_methods(node.def, &node.methods);
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            this.walk_node(node.methods[i]);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    walk_enum(mut &this, node: EnumDeclNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(EnumDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
+        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
+
+        // Declare generic params
+        this.declare_generics(node.generic_params);
+        this.stamp_trait_bounds(&node.where_bounds);
+        // The discriminant's type is a written name (`: i32`, `: u8`),
+        // answered like every other.
+        this.stamp_annotation(node.discriminant_annotation);
+
+        // Declare variants
+        for (mut i: i64 = 0; i < node.variants.length; i++) {
+            const variant: EnumVariantNode* = node.variants[i];
+            this.resolver.declare_enum_variant(variant.name, variant.span);
+            // A payload is written type syntax; a variant carrying one spells
+            // a type exactly as a field declaration does.
+            this.stamp_annotation_list(&variant.associated_types);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    walk_trait(mut &this, node: TraitDeclNode*) -> void {
+        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(TraitDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
+        this.resolver.enter_scope(ScopeKind::Trait, this.resolver.intern_table.resolve(node.name), node.span);
+        const outer_trait: DefId = this.this_trait;
+        this.this_trait = match (this.bare_name_res(node.sym_id)) {
+            ResSlot::Answered(r) => { r.def_id() }
+            _                    => { DefId::invalid() }
+        };
+
+        // Declare generic params
+        this.declare_generics(node.generic_params);
+
+        // A supertrait (`type trait Step : Ord`) names a trait the way a
+        // bound does; its arguments may spell the trait's own parameters.
+        for (mut i: i64 = 0; i < node.base_traits.length; i++) {
+            const base: TraitRef* = &node.base_traits[i];
+            this.stamp_trait_ref_identity(base);
+            this.stamp_annotation_list(&base.type_args);
+        }
+
+        // An associated type's declared bound (`type Item: Copy;`) names a
+        // trait the way a where clause does, and is written in this file.
+        for (mut i: i64 = 0; i < node.assoc_types.length; i++) {
+            if (node.assoc_types[i] == null) { continue; }
+            for (mut j: i64 = 0; j < node.assoc_types[i].bounds.length; j++) {
+                const tref: TraitRef* = &node.assoc_types[i].bounds[j];
+                this.stamp_trait_ref_identity(tref);
+                this.stamp_annotation_list(&tref.type_args);
+            }
+        }
+
+        // Every signature is declared before any body is walked, so a default
+        // body may call a sibling method declared after it.
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            const method: FunctionDeclNode* = node.methods[i];
+            this.resolver.declare_method(method.name, method.span, true,
+                this.define_method(this.this_trait, method, method as ASTNode*));
+        }
+
+        // A default body is source written in THIS file, and is the only place
+        // the module that wrote it is still known: it is later instantiated
+        // against each implementing type, where the surrounding module is the
+        // implementor's, not the trait's.  Skipping it here leaves every path
+        // it spells to be re-derived from wherever the compiler is standing at
+        // instantiation time.  A method with no default has no body, and
+        // `visit(FunctionDeclNode*)` already walks one only when it exists.
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            this.walk_node(node.methods[i]);
+        }
+
+        this.this_trait = outer_trait;
+        this.resolver.exit_scope();
+    }
+
+    walk_impl(mut &this, node: ImplBlockNode*) -> void {
+        this.resolver.enter_scope(ScopeKind::Impl,
+            this.resolver.intern_table.resolve(node.target_type), node.span);
+
+        // Declare generic params (e.g., implement enum Optional<T> { ... })
+        this.declare_generics(node.generic_params);
+
+        // Resolve the target type name
+        const target_id: SymbolID = this.resolver.lookup(
+            node.target_type, this.resolver.current_scope);
+        if (target_id.is_valid()) {
+            this.resolver.record_resolution(node.span, target_id);
+        }
+        // The type an impl head is FOR, stamped after `declare_generics` for
+        // the same reason the trait side is: a name spelled like an impl
+        // generic is that param, not a type to search for.
+        match (this.type_spelling_res(node.target_type, node.span)) {
+            ResSlot::Answered(r) => {
+                node.set_res(r);
+            }
+            _                    => { }
+        }
+        // `This::` in the body names what the head was just answered with.
+        const outer_owner: ResBase = this.this_owner;
+        const outer_owner_decl: ASTNode* = this.this_owner_decl;
+        const outer_owner_sym: SymbolID = this.this_owner_sym;
+        this.this_owner_decl = null;
+        this.this_owner_sym = target_id;
+        match (node.res) {
+            ResSlot::Answered(Res::Def(d)) => {
+                this.this_owner = ResBase::Def(d);
+                this.this_owner_decl = node as ASTNode*;
+            }
+            ResSlot::Answered(Res::PrimTy(p)) => {
+                this.this_owner = ResBase::PrimTy(p);
+                this.this_owner_decl = node as ASTNode*;
+            }
+            _ => { }
+        }
+
+        // The trait an impl head names. After `declare_generics`, for the same
+        // reason a parameter annotation is stamped there: a name spelled like
+        // an impl generic is that param, not a type to search for.
+        //
+        // Without this the head's identity is only ever recoverable as the
+        // leaf its spelling ends in, which is a search key - it answers only
+        // while that leaf is unique program-wide.
+        // The head's own name is a trait; what it is applied to is not.
+        const trait_head: TypeAnnotation* = TypeAnnotation::head_base(node.trait_annotation);
+        this.naming_trait = true;
+        this.stamp_annotation_tree(trait_head);
+        this.naming_trait = false;
+        this.stamp_annotation_tree(node.trait_annotation);
+        const outer_trait: DefId = this.this_trait;
+        this.this_trait = TypeAnnotation::trait_def(node.trait_annotation);
+        // What the head writes AFTER the target: a parameter of its own, or
+        // a declaration (`Array<T, GlobalAlloc>`), and only a stamp can say
+        // which.  Read after `declare_generics` for the reason the trait
+        // side is.
+        this.stamp_impl_target_args(node);
+
+        // `type Item = T;` in the body binds an associated type to written
+        // syntax, and the impl's own `where` clause spells types the same way
+        // a method's does.  Both are read after the generic params are
+        // declared, so a binding naming one is answered as that param.
+        this.stamp_annotation_list(&node.assoc_binding_annotations);
+        this.stamp_trait_bounds(&node.where_bounds);
+
+        // Declare and visit methods, each a definition of the type the head
+        // names - a trait implementation's too: the trait's own method is
+        // the trait's definition, the implementation's is the type's.
+        const method_owner: DefId = this.impl_owner_def(node);
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            const method: MethodNode* = node.methods[i];
+            if (method.func != null) {
+                const is_public: boolean =
+                    method.visibility == Visibility::Public;
+                this.resolver.declare_method(
+                    method.func.name, method.func.span, is_public,
+                    this.define_method(method_owner, method.func, method as ASTNode*));
+            }
+            this.walk_node(method);
+        }
+
+        this.this_trait = outer_trait;
+        this.this_owner = outer_owner;
+        this.this_owner_decl = outer_owner_decl;
+        this.this_owner_sym = outer_owner_sym;
+        this.resolver.exit_scope();
+    }
+
+    walk_var(mut &this, node: VarDeclNode*) -> void {
+        this.stamp_annotation(node.type_annotation);
+        // Local variable declarations (globals handled in forward_declare)
+        if (!node.is_global) {
+            // Reject a same-scope redeclaration of a value binding (E0205).
+            // Without this check, `const x = 1; const x = 2;` in one block keeps
+            // only one of the two: Scope::insert drops the duplicate from the
+            // index with nothing but a debug log, so the second binding is
+            // silently accepted. Shadowing in a nested block is a distinct
+            // child scope and remains allowed.
+            if (this.resolver.current_scope_has(node.name)) {
+                this.ctx.emit_error_at(
+                    ErrorCode::E0205_REDEFINED_SYMBOL,
+                    fmt::format("the name `%s` is already declared in this scope",
+                        this.resolver.intern_table.resolve(node.name)),
+                    node.span);
+            }
+            const sym_id: SymbolID = this.resolver.declare_variable(node.name, node.span, node.is_mutable,
+                                                          false);
+            // Record the declaration span so downstream passes (TypeResolution,
+            // Sema) can map VarDeclNode.span -> SymbolID for type write-back.
+            this.resolver.record_resolution(node.span, sym_id);
+            node.set_sym_id(sym_id);
+        }
+
+        // Visit initializer expression
+        if (node.has_initializer()) {
+            this.walk_node(node.initializer);
+        }
+    }
+
+    walk_destructure(mut &this, node: DestructureDeclNode*) -> void {
+        this.stamp_annotation(node.type_annotation);
+        // Resolve the initializer first; its identifiers must bind to the
+        // outer scope, before the new field locals shadow anything.
+        if (node.has_initializer()) {
+            this.walk_node(node.initializer);
+        }
+        // Declare each binding's local in the current scope.
+        for (mut i: i64 = 0; i < node.bindings.length; i++) {
+            const b: DestructureBinding = node.bindings[i];
+            // Reject two bindings that introduce the same local name (E0205):
+            // `const {x, x} = ...` would otherwise drop the duplicate silently.
+            if (NameResolver::repeats_binding(node, i)) {
+                this.ctx.emit_error_at(
+                    ErrorCode::E0205_REDEFINED_SYMBOL,
+                    fmt::format("the name `%s` is bound more than once in this destructuring",
+                        this.resolver.intern_table.resolve(b.local_name)),
+                    b.name_span);
+            }
+            const sym_id: SymbolID = this.resolver.declare_variable(
+                b.local_name, b.name_span, b.is_mutable, false);
+            this.resolver.record_resolution(b.name_span, sym_id);
+            node.bindings[i].sym_id = sym_id;
+        }
+    }
+
+    walk_type_alias(mut &this, node: TypeAliasDeclNode*) -> void {
+        // Already forward-declared.  The alias's own parameters are in
+        // scope for its target, as a struct's are for its fields; the target
+        // is the alias's definition, so the alias's own name is no
+        // suggestion for a name inside it.
+        this.resolver.enter_scope(ScopeKind::TypeBody,
+            this.resolver.intern_table.resolve(node.alias_name), node.span);
+        this.declare_generics(node.generic_params);
+        this.defining_type = node.alias_name;
+        this.stamp_annotation(node.target_annotation);
+        this.defining_type = SymbolStr::empty();
+        this.resolver.exit_scope();
+    }
+
+    walk_import(mut &this, node: ImportDeclNode*) -> void {
+        // Every module has declared and exported its own names by now, so the
+        // exports this import reads from exist whichever order the modules are
+        // walked in - including inside an import cycle, where no order can put
+        // the declarer first.
+        //
+        // Running after this module's own declarations rather than before them
+        // does not change which of the two wins: the scope tiers them, so a
+        // declaration owns the slot and shadows the import either way.
+        this.process_import(node);
+    }
+
+    walk_extern_block(mut &this, node: ExternBlockNode*) -> void {
+        // Already forward-declared functions; visit bodies if any.
+        for (mut i: i64 = 0; i < node.functions.length; i++) {
+            this.walk_node(node.functions[i]);
+        }
+    }
+
+    walk_intrinsic(mut &this, node: IntrinsicDeclNode*) -> void {
+        // Already forward-declared.  The signature's annotations are stamped
+        // here as a function's are: a primitive (`void*`, `u32*`) is a
+        // written name the name layer answers, not a token that needs no
+        // answer.
+        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+            this.stamp_annotation(node.parameters[pi].type_annotation);
+        }
+        this.stamp_annotation(node.return_type_annotation);
+        if (node.has_body()) {
+            this.resolver.enter_scope(ScopeKind::Function, this.resolver.intern_table.resolve(node.name), node.span);
+            for (mut i: i64 = 0; i < node.parameters.length; i++) {
+                const param: VarDeclNode* = node.parameters[i];
+                const param_sym: SymbolID = this.resolver.declare_parameter(param.name, param.span);
+                this.resolver.record_resolution(param.span, param_sym);
+                param.set_sym_id(param_sym);
+            }
+            this.visit_block_contents(node.body);
+            this.resolver.exit_scope();
+        }
+    }
+
+    walk_field(mut &this, node: FieldDeclNode*) -> void {
+        // The field itself was declared with its owner.
+        this.stamp_annotation(node.type_annotation);
+        FieldDeclNode::walk_children(node, this);
+    }
+
+    walk_identifier(mut &this, node: IdentifierNode*) -> void {
+        // A bare identifier in expression position names a VALUE, so it is
+        // asked in the value namespace alone: a type spelled the same is not
+        // an answer, and when a module holds both a type and a function under
+        // the leaf the function is what `Color(5)` names, whichever was
+        // declared first.
+        mut sym_id: SymbolID = this.resolver.lookup_value(
+            node.name, this.resolver.current_scope);
+        if (!sym_id.is_valid()) {
+            // A source-location pseudo-constant is declared nowhere, so no
+            // binding can answer it; the spelling is the answer, as a
+            // primitive's is on the type lane.  Asked only once every scope
+            // has declined, so a binding of the same spelling shadows it.
+            match (SourceLoc::of_spelling(this.resolver.intern_table.resolve(node.name))) {
+                Option::Some(k) => {
+                    node.set_res(Res::SourceLoc(k));
+                    this.stamp_annotation_list(&node.generic_args);
+                    return;
+                }
+                Option::None => { }
+            }
+            // A type is not a value.  Asking whether the name binds at all
+            // chooses the message only - the answer is a refusal either way.
+            if (this.resolver.lookup(node.name, this.resolver.current_scope).is_valid()) {
+                this.refuse_type_as_value(node);
+                this.stamp_annotation_list(&node.generic_args);
+                return;
+            }
+            // No rib binds the name, the prelude included, and nothing
+            // later in the pipeline can: this scope is the one the name was
+            // written in, and it is the only place the answer is knowable.
+            // Refused here, as the name that does not exist that it is - a
+            // function when a call names it, a value otherwise - and stamped
+            // `Err` so no later stage reports it again or guesses at it.
+            this.refuse_unbound_name(node);
+            this.stamp_annotation_list(&node.generic_args);
+            return;
+        }
+        if (sym_id.is_valid()) {
+            this.resolver.record_resolution(node.span, sym_id);
+            // Two imports of one leaf from different modules bind the name to
+            // neither: the scope keeps the first so a lookup lands somewhere,
+            // and the record of the second is what says the first was never
+            // the answer.  Refused here, where the name is used, because an
+            // import brings a name into scope and it is naming the item that
+            // needs it to name one.  A declaration of the leaf in this module
+            // shadows every import of it and clears the record, so this is
+            // reached only for the import-vs-import tie.
+            const bound: Symbol = this.resolver.get_symbol(sym_id);
+            if (bound.kind == SymbolKind::Import
+                    && this.resolver.is_ambiguous(node.name, Namespace::Value)) {
+                const mods: [ModulePath] = this.resolver.get_ambiguous_modules(node.name, Namespace::Value);
+                const leaf: string = this.resolver.intern_table.resolve(node.name);
+                const a: string = if (mods.length > 0) { this.resolver.intern_table.shown(mods[0].decl_name()) } else { "" };
+                const b: string = if (mods.length > 1) { this.resolver.intern_table.shown(mods[1].decl_name()) } else { "" };
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0154_AMBIGUOUS_CALL,
+                    fmt::format("`%s` is ambiguous: it is imported from both `%s` and `%s`",
+                        leaf, a, b));
+                d = d.at_with_label(node.span, "ambiguous name");
+                d = d.with_note(fmt::format(
+                    "write the path out to say which one is meant, `%s::%s` or `%s::%s`",
+                    a, leaf, b, leaf));
+                this.ctx.emit_diagnostic(d);
+                node.set_res(Res::Err);
+                this.stamp_annotation_list(&node.generic_args);
+                return;
+            }
+        }
+        // Stamped from the lookup already performed, never a second one: the
+        // scope this walk stands in is the scope the name was written in, and
+        // that is the only place the answer is knowable.  An import is
+        // stamped with the declaration it binds in the value namespace, not
+        // with whichever declaration its module listed first.
+        match (this.bare_name_res(this.resolver.value_target(sym_id))) {
+            ResSlot::Answered(r) => { node.set_res(r); }
+            _                    => { }
+        }
+        this.stamp_annotation_list(&node.generic_args);
+    }
+
+    walk_scope_resolution(mut &this, node: ScopeResolutionNode*) -> void {
+        if (!this.stamp_this_scope(node)) {
+            // Look up the scope name (e.g., "Foo" in "Foo::Bar")
+            const scope_sym: SymbolID = this.resolver.lookup(
+                node.scope_name, this.resolver.current_scope);
+            if (scope_sym.is_valid()) {
+                this.resolver.record_resolution(node.span, scope_sym);
+            }
+            // A segment that already binds in scope names a TYPE (or a value), and
+            // what its members are is sema's question, not this one.  Passing the
+            // SYMBOL through is what keeps the two refusals below from judging a
+            // type that merely shares its name with some module elsewhere in the
+            // program, and it is also the base a type-relative answer records - so
+            // the stamp is built from the lookup already performed rather than from
+            // a second one asking the same question.
+            this.stamp_module_scope(node, scope_sym);
+        }
+        // The scope segment's own arguments (`Pair<String, String>::new`) and
+        // the member's (`Layout::of<Entry<K, V>>`) are written types in their
+        // own right; what they name is settled here, where the writing scope
+        // is still the current one.
+        this.stamp_annotation_list(&node.scope_generic_args);
+        this.stamp_annotation_list(&node.generic_args);
+        // The trait of an impl-qualified path, `(Beta for P)::make`, is a
+        // written type name like the arguments beside it.
+        this.stamp_annotation_tree(node.impl_trait);
+        // Member resolution within the type's scope is deferred to
+        // TypeResolution (needs type info to find the TypeBody scope).
+    }
+
+    walk_call(mut &this, node: CallExprNode*) -> void {
+        const callee_node: ASTNode* = node.callee as ASTNode*;
+        // A bare callee is visited as the callee it is, so one that binds to
+        // nothing is refused as a function rather than as a value.  Set for
+        // the callee's own visit only: an argument is not a callee.
+        const outer_callee: IdentifierNode* = this.callee_ident;
+        if (callee_node.kind == NodeKind::Identifier) {
+            this.callee_ident = node.callee as IdentifierNode*;
+        }
+        this.walk_node(node.callee);
+        this.callee_ident = outer_callee;
+
+        this.stamp_annotation_list(&node.generic_args);
+
+        // Visit arguments
+        for (mut i: i64 = 0; i < node.arguments.length; i++) {
+            this.walk_node(node.arguments[i]);
+        }
+    }
+
+    walk_member_access(mut &this, node: MemberAccessNode*) -> void {
+        // The member itself is resolved by the type check, which knows the
+        // object's type.
+        MemberAccessNode::walk_children(node, this);
+        this.stamp_annotation_list(&node.generic_args);
+    }
+
+    walk_static_match_expr(mut &this, node: StaticMatchExprNode*) -> void {
+        // The scrutinee is a written type - a parameter, almost always - and
+        // is stamped like the arms' patterns: a later stage that reads its
+        // slot must find an answer there, not a name to search for.
+        this.stamp_annotation(node.scrutinee);
+        for (mut i: i64 = 0; i < node.arms.length; i++) {
+            this.walk_node(node.arms[i]);
+        }
+    }
+
+    walk_new(mut &this, node: NewExprNode*) -> void {
+        // `new <path>` denotes one of two things and the parser decides
+        // neither: a TYPE to allocate, or a VARIANT of an enum.  One question
+        // separates them, and it is the question every path already asks.
+        //
+        // `TypeRelative` means the name layer walked to a type and a type owns
+        // the rest of the path - which for `new` is exactly `Enum::Variant`.
+        // Any other answer means the whole path names one definition, so it is
+        // the type being allocated.  There is no second lookup and no ordering
+        // to get wrong: the single answer carries which case this is.
+        // A `new` path is a TYPE path, optionally followed by one VARIANT
+        // segment, and the parser decides neither half.
+        //
+        // Classification first, from what the WHOLE path resolves to.
+        // `TypeRelative` means the name layer walked to a type and a type owns
+        // the tail - which for `new` is exactly `Enum::Variant`. When the whole
+        // path answers nothing, the same question is asked of the type path it
+        // contains, one segment shorter: that is what `Mod::Enum::Variant` is.
+        // Any other answer means the whole path names the type being allocated.
+        const written: string = this.resolver.intern_table.resolve(node.type_name);
+        mut do_split: boolean = false;
+        match (this.type_spelling_res(node.type_name, node.span)) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::TypeRelative(_, _) => { do_split = true; }
+                    _                       => { }
+                }
+            }
+            _ => {
+                if (this.resolver.contains_separator(written)) {
+                    const parent_sym: SymbolStr = this.resolver.intern_table.intern(
+                        QualifiedName::parent_of(written));
+                    match (this.type_spelling_res(parent_sym, node.span)) {
+                        ResSlot::Answered(pr) => {
+                            match (pr) {
+                                Res::Def(_) => { do_split = true; }
+                                _           => { }
+                            }
+                        }
+                        _ => { }
+                    }
+                }
+            }
+        }
+        if (do_split) {
+            node.set_variant_name(this.resolver.intern_table.intern(
+                QualifiedName::leaf_of(written)));
+            node.type_name = this.resolver.intern_table.intern(
+                QualifiedName::parent_of(written));
+        }
+
+        // The node is stamped from the path it actually names - the type,
+        // after any variant segment has been taken off it.  Stamping the
+        // classification answer instead records the enum by a `Def` that
+        // carries no generic arguments, and `new Option<i64>::Some(41)` then
+        // resolves to `Option` rather than `Option<i64>`.
+        match (this.type_spelling_res(node.type_name, node.span)) {
+            ResSlot::Answered(r2) => { node.set_res(r2); }
+            _                     => { }
+        }
+
+        // Resolve type name.  After the split above, so a variant path records
+        // the ENUM rather than a leaf no scope binds.
+        const type_sym: SymbolID = this.resolver.lookup(
+            node.type_name, this.resolver.current_scope);
+        if (type_sym.is_valid()) {
+            this.resolver.record_resolution(node.span, type_sym);
+        }
+
+        this.stamp_annotation_list(&node.generic_args);
+
+        for (mut i: i64 = 0; i < node.arguments.length; i++) {
+            this.walk_node(node.arguments[i]);
+        }
+
+        if (node.has_array_size()) {
+            this.walk_node(node.array_size);
+        }
+
+        // Struct-initializer form `new Foo { field: value }`: resolve the field
+        // initializer expressions so identifier references inside them are
+        // recorded in the resolution map (mirrors visit(StructLiteralNode)).
+        // Without this, a local used only as a `new`-init field value looks
+        // unreferenced (drives W0001 false positives and misses LSP hover/def).
+        if (node.has_struct_init()) {
+            this.walk_node(node.struct_init);
+        }
+    }
+
+    walk_cast(mut &this, node: CastExprNode*) -> void {
+        CastExprNode::walk_children(node, this);
+        this.stamp_annotation(node.target_annotation);
+    }
+
+    walk_struct_literal(mut &this, node: StructLiteralNode*) -> void {
+        // Resolve struct type name
+        const type_sym: SymbolID = this.resolver.lookup(
+            node.struct_type, this.resolver.current_scope);
+        if (type_sym.is_valid()) {
+            this.resolver.record_resolution(node.span, type_sym);
+        }
+        // The literal names a TYPE, and its spelling may be qualified, so it
+        // is the annotation's question rather than the single-segment scope
+        // lookup a bare value name gets - `type_sym` above answers whether the
+        // leaf binds here, which is not the same thing.
+        match (this.type_spelling_res(node.struct_type, node.span)) {
+            ResSlot::Answered(r) => { node.set_res(r); }
+            _                    => {
+                if (this.refuse_unbound_type(node.struct_type, node.span)) {
+                    node.set_res(Res::Err);
+                }
+            }
+        }
+        this.stamp_annotation_list(&node.generic_args);
+
+        // Visit field initializer expressions
+        for (mut i: i64 = 0; i < node.field_inits.length; i++) {
+            const init_value: ExpressionNode* = node.field_inits[i].value as ExpressionNode*;
+            if (init_value != null) {
+                this.walk_node(init_value);
+            }
+        }
+    }
+
+    walk_lambda(mut &this, node: LambdaExprNode*) -> void {
+        this.resolver.enter_scope(ScopeKind::Lambda, "<lambda>", node.span);
+
+        // Declare parameters
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const param: VarDeclNode* = node.parameters[i];
+            param.set_sym_id(this.resolver.declare_parameter(param.name, param.span));
+            this.stamp_annotation(param.type_annotation);
+        }
+        this.stamp_annotation(node.return_type_ann);
+
+        // Visit body
+        if (node.body != null) {
+            this.walk_node(node.body);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    // Leaf expressions: no name resolution needed
+    walk_sizeof(mut &this, node: SizeofExprNode*) -> void {
+        this.stamp_annotation(node.type_ann);
+    }
+
+    walk_alignof(mut &this, node: AlignofExprNode*) -> void {
+        this.stamp_annotation(node.type_ann);
+    }
+
+    walk_block(mut &this, node: BlockStmtNode*) -> void {
+        this.resolver.enter_scope(ScopeKind::Block, "<block>", node.span);
+        this.visit_block_contents(node);
+        this.resolver.exit_scope();
+    }
+
+
+    walk_for(mut &this, node: ForStmtNode*) -> void {
+        // For loops create a scope for the loop variable
+        this.resolver.enter_scope(ScopeKind::Block, "<for>", node.span);
+
+        if (node.init != null) {
+            this.walk_node(node.init);
+        }
+        if (node.condition != null) {
+            this.walk_node(node.condition);
+        }
+        if (node.update != null) {
+            this.walk_node(node.update);
+        }
+        if (node.body != null) {
+            this.walk_node(node.body);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    walk_match_arm(mut &this, node: MatchArmNode*) -> void {
+        // Each arm gets its own scope for pattern bindings
+        this.resolver.enter_scope(ScopeKind::Block, "<match-arm>", node.span);
+
+        // Visit patterns (may introduce bindings)
+        for (mut i: i64 = 0; i < node.patterns.length; i++) {
+            this.in_alternative = i > 0;
+            this.walk_node(node.patterns[i]);
+        }
+        this.in_alternative = false;
+
+        // The guard is an expression of this arm's scope: it reads the
+        // pattern's bindings and anything the module can see, so it is
+        // resolved where the body is.  Left unvisited, every name in it stays
+        // unstamped - a module constant in `n if n > LIMIT` is then refused
+        // as not in scope, and a callee in it binds by spelling.
+        if (node.guard != null) {
+            this.walk_node(node.guard);
+        }
+
+        // Visit body
+        if (node.body != null) {
+            this.walk_node(node.body);
+        }
+
+        this.resolver.exit_scope();
+    }
+
+    walk_static_match_stmt(mut &this, node: StaticMatchStmtNode*) -> void {
+        this.stamp_annotation(node.scrutinee);
+        for (mut i: i64 = 0; i < node.arms.length; i++) {
+            this.walk_node(node.arms[i]);
+        }
+    }
+
+    walk_static_match_arm(mut &this, node: StaticMatchArmNode*) -> void {
+        // The pattern IS a type, written in this file, so it is stamped like
+        // any other written type.  It binds no name, which is why the arm
+        // scope below holds only the body.
+        this.stamp_annotation_list(&node.type_patterns);
+        this.resolver.enter_scope(ScopeKind::Block, "<static-match-arm>", node.span);
+        if (node.body != null) {
+            this.walk_node(node.body);
+        }
+        this.resolver.exit_scope();
+    }
+
+    walk_pattern(mut &this, node: PatternNode*) -> void {
+        // A bare identifier pattern is normally a fresh binding. But if the
+        // name resolves to an existing `const`, it is a *value* pattern -
+        // compare the subject against the constant - not a binding: a named
+        // constant in a pattern is a value. Without this, a match
+        // like `match (code) { ENOENT => ...; EAGAIN => ... }` silently treats
+        // every const arm as a catch-all binding, so only the first arm ever
+        // runs. Reclassify by moving the name into `value` and clearing
+        // `binding_name`; downstream passes (sema, codegen) treat an Identifier
+        // pattern with no `binding_name` as a constant-value pattern.
+        if (node.pattern_kind == PatternKind::Identifier) {
+            const sym: SymbolID = this.resolver.lookup(
+                node.binding_name, this.resolver.current_scope);
+            if (sym.is_valid()
+                    && this.resolver.get_symbol(sym).kind == SymbolKind::Constant) {
+                this.resolver.record_resolution(node.span, sym);
+                node.set_value(node.binding_name);
+                node.set_binding_name(SymbolStr::empty());
+                // The same answer an identifier naming this constant gets,
+                // recorded on the node for the stage that compares against it.
+                match (this.bare_name_res(sym)) {
+                    ResSlot::Answered(r) => { node.set_const_res(r); }
+                    _                    => { }
+                }
+            } else {
+                node.binding_sym = this.declare_pattern_binding(node.binding_name, node.span);
+            }
+        }
+    }
+
+    walk_enum_pattern(mut &this, node: EnumPatternNode*) -> void {
+        // Resolve enum name
+        const enum_sym: SymbolID = this.resolver.lookup(
+            node.enum_name, this.resolver.current_scope);
+        if (enum_sym.is_valid()) {
+            this.resolver.record_resolution(node.span, enum_sym);
+        }
+        // The pattern names a TYPE, and its spelling may be qualified, so it is
+        // the annotation's question rather than the single-segment scope lookup
+        // a bare value name gets.  `enum_span` is the enum-path side of the
+        // pattern, which is what this stamp is about.
+        match (this.type_spelling_res(node.enum_name, node.enum_span)) {
+            ResSlot::Answered(r) => { node.set_res(r); }
+            _                    => { }
+        }
+
+        // Declare each binding variable.  A nested pattern (`Some(Some(n))`)
+        // binds in the same arm scope and is walked as a pattern of its own,
+        // so its identifier is declared - or reclassified as a constant - by
+        // the one rule above.
+        for (mut i: i64 = 0; i < node.elements.length; i++) {
+            mut pb: PatternBinding* = node.binding_at(i);
+            if (pb != null) {
+                pb.sym_id = this.declare_pattern_binding(pb.name, pb.span);
+                continue;
+            }
+            const sub: PatternNode* = node.sub_at(i);
+            if (sub != null) { this.walk_node(sub); }
+        }
+    }
+
+}
+
 
 // Entry points: static methods for cross-module resolution
 
@@ -4080,8 +3945,8 @@ type struct NameDeclarationPass {
             ctx.resolver.set_module(ctx.current_module());
         }
 
-        const visitor: NameResolver = NameResolver(ctx.resolver, ctx);
-        visitor.forward_declare(root);
+        mut resolver: NameResolver = NameResolver::new(ctx.resolver, ctx);
+        resolver.forward_declare(root);
         NameDeclarationPass::record_entry_fn(ctx);
         NameDeclarationPass::settle_c_refs(ctx);
 
@@ -4290,10 +4155,9 @@ type struct NameResolutionPass {
             ctx.resolver.restore_scope(ctx.current_module(), walk_scope);
         }
 
-        // Create and run the visitor
-        mut visitor: NameResolver = NameResolver(ctx.resolver, ctx);
-        root.accept(&visitor as ASTVisitor*);
-        visitor.check_param_projections();
+        mut resolver: NameResolver = NameResolver::new(ctx.resolver, ctx);
+        resolver.walk_node(root);
+        resolver.check_param_projections();
 
         LOG_DEBUG(LogComponent::General, "[NameResolution] Resolved %lld symbols in %lld scopes, %lld map entries",
             ctx.resolver.symbol_count(),

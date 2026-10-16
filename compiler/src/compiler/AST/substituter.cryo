@@ -18,7 +18,7 @@ import compiler::ast::{
     ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
     MemberPin, NamedAnnotation, node, NodeKind, pattern, PatternElement, PatternKind, PointerAnnotation,
     PrimitiveAnnotation, ProjectionAnnotation, statement, TupleAnnotation, TypeAnnotation,
-    visitor
+    walk
 };
 import compiler::types;
 import compiler::types::{ arena, substitution, TypeKind };
@@ -31,7 +31,7 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
-    ClassDeclNode, DestructureDeclNode, EnumDeclNode, EnumVariantNode, FieldDeclNode,
+    ClassDeclNode, DeclarationNode, DestructureDeclNode, EnumVariantNode, FieldDeclNode,
     FunctionDeclNode, ImplBlockNode, MethodNode, StructDeclNode, TraitDeclNode,
     TypeAliasDeclNode, UnionDeclNode, VarDeclNode
 };
@@ -47,9 +47,7 @@ import compiler::ast::pattern::{
     EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode
 };
 import compiler::ast::statement::{
-    AsmBlockStmtNode, AsmOperand, BlockStmtNode, DeclStmtNode, DoWhileStmtNode,
-    ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
-    StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
+    MatchStmtNode, StatementNode, StaticMatchStmtNode
 };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -59,11 +57,10 @@ import compiler::types::arena::{ TypeArena };
 import compiler::ast::node::{ ASTNode };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::resolver::{ TypeResolver };
-import compiler::ast::visitor::{ BaseASTVisitor };
+import compiler::ast::walk::{ Walk };
 
 
-type class ASTTypeSubstituter : BaseASTVisitor {
-public:
+type struct ASTTypeSubstituter {
     subst:             TypeSubstitution*;
     arena:             TypeArena*;
     intern_table:      InternTable*;
@@ -93,20 +90,21 @@ public:
     /// the implementation binds; null where a copy's types are not written.
     types:             TypeResolver*;
 
-    ASTTypeSubstituter(subst: TypeSubstitution*, arena: TypeArena*,
-                       intern_table: InternTable*,
-                       template: DefId, spec_name: SymbolStr,
-                       param_syms: [SymbolID],
-                       spec_typeref: TypeRef)
-        : BaseASTVisitor() {
-        this.subst             = subst;
-        this.arena             = arena;
-        this.intern_table      = intern_table;
-        this.template          = template;
-        this.spec_name         = spec_name;
-        this.param_syms        = param_syms;
-        this.spec_typeref      = spec_typeref;
-        this.types             = null;
+    static create(subst: TypeSubstitution*, arena: TypeArena*,
+                  intern_table: InternTable*,
+                  template: DefId, spec_name: SymbolStr,
+                  param_syms: [SymbolID],
+                  spec_typeref: TypeRef) -> ASTTypeSubstituter* {
+        return new ASTTypeSubstituter {
+            subst:        subst,
+            arena:        arena,
+            intern_table: intern_table,
+            template:     template,
+            spec_name:    spec_name,
+            param_syms:   param_syms,
+            spec_typeref: spec_typeref,
+            types:        null,
+        };
     }
 
     /// The name a rewritten annotation carries beside its argument's
@@ -259,7 +257,7 @@ public:
 
     /// Substitute type parameters in a type annotation.
     /// Returns a new annotation if changes were made, or the original if not.
-    substitute_annotation(ann: TypeAnnotation*) -> TypeAnnotation* {
+    substitute_annotation(&this, ann: TypeAnnotation*) -> TypeAnnotation* {
         if (ann == null) { return null; }
 
         match (*ann) {
@@ -335,7 +333,7 @@ public:
 
     // Annotation substitution helpers
 
-    substitute_named_annotation(ann: TypeAnnotation*, named: NamedAnnotation*) -> TypeAnnotation* {
+    substitute_named_annotation(&this, ann: TypeAnnotation*, named: NamedAnnotation*) -> TypeAnnotation* {
         // Associated-type projection on a generic param written as a FLAT
         // qualified name (`I::Item` - only `This::Item` is a Projection node).
         // The stamp says which parameter the path is rooted at; when it is one
@@ -440,7 +438,7 @@ public:
         return ann;
     }
 
-    substitute_function_annotation(ann: TypeAnnotation*, func: FunctionAnnotation*) -> TypeAnnotation* {
+    substitute_function_annotation(&this, ann: TypeAnnotation*, func: FunctionAnnotation*) -> TypeAnnotation* {
         // In-place: recurse into params and return type (cloned AST)
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             this.substitute_annotation(func.parameters[i]);
@@ -449,7 +447,7 @@ public:
         return ann;
     }
 
-    substitute_tuple_annotation(ann: TypeAnnotation*, tup: TupleAnnotation*) -> TypeAnnotation* {
+    substitute_tuple_annotation(&this, ann: TypeAnnotation*, tup: TupleAnnotation*) -> TypeAnnotation* {
         // In-place: recurse into elements (cloned AST)
         for (mut i: i64 = 0; i < tup.elements.length; i++) {
             this.substitute_annotation(tup.elements[i]);
@@ -457,7 +455,7 @@ public:
         return ann;
     }
 
-    substitute_generic_annotation(ann: TypeAnnotation*, gen: GenericAnnotation*) -> TypeAnnotation* {
+    substitute_generic_annotation(&this, ann: TypeAnnotation*, gen: GenericAnnotation*) -> TypeAnnotation* {
         // A Generic is a self-reference to the outer type ONLY when its
         // base names the template AND its args (BEFORE substitution)
         // are exactly the outer type's generic param names in declaration
@@ -519,7 +517,7 @@ public:
     }
 
     /// Whether the annotation is a name whose stamp is the template.
-    is_named_matching_base(ann: TypeAnnotation*) -> boolean {
+    is_named_matching_base(&this, ann: TypeAnnotation*) -> boolean {
         if (ann == null) { return false; }
         match (*ann) {
             TypeAnnotation::Named(named) => {
@@ -535,7 +533,7 @@ public:
     /// Substitute type parameters in generic arg annotations.
     /// Delegates to substitute_annotation() for each element, preserving
     /// the full structure (pointers, arrays, nested generics, etc.).
-    substitute_generic_type_args(args: &[TypeAnnotation*]) -> [TypeAnnotation*] {
+    substitute_generic_type_args(&this, args: &[TypeAnnotation*]) -> [TypeAnnotation*] {
         mut result: [TypeAnnotation*] = [];
         for (mut i: i64 = 0; i < args.length; i++) {
             result.push(this.substitute_annotation(args[i]));
@@ -544,45 +542,88 @@ public:
     }
 
 
-    // Declaration visitors: rename + substitute annotations
+    /// A `sizeof`/`alignof` operand's decided type as this copy sees it.
+    /// Without a substitution the annotation may now name a different type
+    /// than the one decided, so the answer is dropped: a stale size is a
+    /// wrong answer, and a missing one is an error codegen reports.
+    operand_in_copy(&this, t: TypeRef) -> TypeRef {
+        if (this.subst == null || !t.is_valid()) { return TypeRef::invalid(); }
+        return this.in_copy(t);
+    }
 
-    override visit(node: StructDeclNode*) -> void {
+    /// Rewrite a TypeAnnotation* in-place from Named to Primitive variant.
+    static rewrite_to_primitive(ann: TypeAnnotation*, name: SymbolStr, span: SourceSpan) -> void {
+        const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: name, span: span };
+        *ann = TypeAnnotation::Primitive(prim);
+    }
+
+    /// Rewrite a TypeAnnotation* in-place from Named to Pointer(Named(inner)).
+    /// `inner_pre_resolved` is the inner type's TypeRef when known (the
+    /// substituter has it from `subst.replacements[i]`'s pointee), and it is
+    /// what the inner Named answers with: a rewritten spelling carries no
+    /// stamp, so without it a type the reading module cannot reach by that
+    /// spelling (`Entry<K,V>` inside a `Layout::array<Entry<K,V>*>` clone)
+    /// resolves to nothing.
+    static rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr,
+                                inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
+        const inner_named: NamedAnnotation* = new NamedAnnotation {
+            name: inner_name,
+            span: span,
+            pre_resolved: inner_pre_resolved,
+            res: ResSlot::Pending,
+        };
+        const inner_ann: TypeAnnotation* = new TypeAnnotation::Named(inner_named);
+        const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner_ann, is_const: false, span: span };
+        *ann = TypeAnnotation::Pointer(ptr);
+    }
+
+    /// Rewrite a TypeAnnotation* in-place to the empty-tuple (unit) annotation.
+    /// Used when a generic param is substituted with `()`, which is not a Named
+    /// type and cannot survive as Named("()") through the resolver.
+    static rewrite_to_unit(ann: TypeAnnotation*, span: SourceSpan) -> void {
+        mut empty_elems: [TypeAnnotation*] = [];
+        const tup: TupleAnnotation* = new TupleAnnotation { elements: empty_elems, span: span };
+        *ann = TypeAnnotation::Tuple(tup);
+    }
+}
+
+/// The substitution is a walk over the copy: every expression's decided type
+/// and every written type is rewritten, and the kinds below also rewrite the
+/// stamps and pins that name the template's parameters.
+implement trait Walk for struct ASTTypeSubstituter {
+    // Declarations: substitute annotations
+
+    walk_struct(mut &this, node: StructDeclNode*) -> void {
         // Rename + generic_params clearing happen at clone time via
-        // ASTCloner::for_specialization; this visitor only walks annotations.
+        // ASTCloner::for_specialization; this walk only rewrites annotations.
         for (mut i: i64 = 0; i < node.fields.length; i++) {
-            this.visit(node.fields[i]);
+            this.walk_field(node.fields[i]);
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
+            this.walk_decl(node.methods[i] as DeclarationNode*);
         }
     }
 
-    override visit(node: UnionDeclNode*) -> void {
+    walk_union(mut &this, node: UnionDeclNode*) -> void {
         // Mirror StructDeclNode: walk field/method annotations for substitution.
         for (mut i: i64 = 0; i < node.fields.length; i++) {
-            this.visit(node.fields[i]);
+            this.walk_field(node.fields[i]);
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
+            this.walk_decl(node.methods[i] as DeclarationNode*);
         }
     }
 
-    override visit(node: ClassDeclNode*) -> void {
+    walk_class(mut &this, node: ClassDeclNode*) -> void {
         for (mut i: i64 = 0; i < node.fields.length; i++) {
-            this.visit(node.fields[i]);
+            this.walk_field(node.fields[i]);
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
+            this.walk_decl(node.methods[i] as DeclarationNode*);
         }
     }
 
-    override visit(node: EnumDeclNode*) -> void {
-        for (mut i: i64 = 0; i < node.variants.length; i++) {
-            node.variants[i].accept(this);
-        }
-    }
-
-    override visit(node: EnumVariantNode*) -> void {
+    walk_enum_variant(mut &this, node: EnumVariantNode*) -> void {
         // Substitute type annotations in associated types.
         // Now uses structured TypeAnnotation*; the same substitute_annotation()
         // used for fields, parameters, etc.
@@ -591,10 +632,10 @@ public:
         }
     }
 
-    override visit(node: FunctionDeclNode*) -> void {
+    walk_function(mut &this, node: FunctionDeclNode*) -> void {
         // Substitute parameter type annotations
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            this.visit(node.parameters[i]);
+            this.walk_var(node.parameters[i]);
         }
         // Substitute return type annotation
         if (node.return_type_annotation != null) {
@@ -613,20 +654,19 @@ public:
         // return type.
         if (node.has_body() && !node.is_self_returning_default
                 && !node.is_lazy_self_growing) {
-            node.body.accept(this);
+            this.walk_stmt(node.body as StatementNode*);
         }
     }
 
-    override visit(node: MethodNode*) -> void {
-        // Delegate to function
-        node.func.accept(this);
+    walk_method(mut &this, node: MethodNode*) -> void {
+        MethodNode::walk_children(node, this);
         // Substitute base_ctor_args expressions
         for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
-            node.base_ctor_args[i].accept(this);
+            this.walk_expr(node.base_ctor_args[i]);
         }
     }
 
-    override visit(node: DestructureDeclNode*) -> void {
+    walk_destructure(mut &this, node: DestructureDeclNode*) -> void {
         // The decided types - the destructured value's and each binding's -
         // as this copy sees them.
         if (this.subst != null) {
@@ -640,12 +680,10 @@ public:
         if (node.type_annotation != null) {
             node.type_annotation = this.substitute_annotation(node.type_annotation);
         }
-        if (node.initializer != null) {
-            node.initializer.accept(this);
-        }
+        DestructureDeclNode::walk_children(node, this);
     }
 
-    override visit(node: ImplBlockNode*) -> void {
+    walk_impl(mut &this, node: ImplBlockNode*) -> void {
         if (node.trait_annotation != null) {
             this.substitute_annotation(node.trait_annotation);
         }
@@ -656,27 +694,23 @@ public:
             }
             node.trait_arg_types = tats;
         }
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
-        }
+        ImplBlockNode::walk_children(node, this);
     }
 
-    override visit(node: TypeAliasDeclNode*) -> void {
+    walk_type_alias(mut &this, node: TypeAliasDeclNode*) -> void {
         if (node.target_annotation != null) {
             node.target_annotation = this.substitute_annotation(node.target_annotation);
         }
     }
 
-    override visit(node: TraitDeclNode*) -> void {
+    walk_trait(mut &this, node: TraitDeclNode*) -> void {
         node.generic_params = [];
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
-        }
+        TraitDeclNode::walk_children(node, this);
     }
 
-    override visit(node: CastExprNode*) -> void {
+    walk_cast(mut &this, node: CastExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        node.expression.accept(this);
+        CastExprNode::walk_children(node, this);
         if (node.target_annotation != null) {
             node.target_annotation = this.substitute_annotation(node.target_annotation);
         }
@@ -688,12 +722,9 @@ public:
 
     // Expression visitors: rewrite generic_args
 
-    override visit(node: CallExprNode*) -> void {
+    walk_call(mut &this, node: CallExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        node.callee.accept(this);
-        for (mut i: i64 = 0; i < node.arguments.length; i++) {
-            node.arguments[i].accept(this);
-        }
+        CallExprNode::walk_children(node, this);
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
@@ -742,14 +773,14 @@ public:
     /// types (`thread_trampoline<C,T>` -> `thread_trampoline<String,String>`)
     /// so the monomorphizer's discovery walk can resolve them and pin the
     /// specialized callee. Ordinary identifiers (no turbofish) are untouched.
-    override visit(node: IdentifierNode*) -> void {
+    walk_identifier(mut &this, node: IdentifierNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
     }
 
-    override visit(node: NewExprNode*) -> void {
+    walk_new(mut &this, node: NewExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
         const is_self: boolean = this.names_template(node.res)
             && (node.generic_args.length == 0
@@ -767,24 +798,20 @@ public:
             node.set_resolved_type(this.arena.get_pointer_to(this.spec_typeref));
         }
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
-            node.arguments[i].accept(this);
+            this.walk_expr(node.arguments[i]);
         }
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
-        if (node.array_size != null) {
-            node.array_size.accept(this);
-        }
-        if (node.struct_init != null) {
-            node.struct_init.accept(this);
-        }
+        this.walk_expr(node.array_size);
+        this.walk_expr(node.struct_init as ExpressionNode*);
         // A variant's ordinal is the same in every instantiation of the enum,
         // so the pin crosses the substitution; the mark records that the walk
         // over this clone did not produce it.
         node.carry_resolved_member();
     }
 
-    override visit(node: StructLiteralNode*) -> void {
+    walk_struct_literal(mut &this, node: StructLiteralNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
         // A self-reference denotes the enclosing specialization, and it is
         // recorded as the arena id that specialization already has - not by
@@ -812,17 +839,14 @@ public:
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
         for (mut i: i64 = 0; i < node.field_inits.length; i++) {
-            const val: ExpressionNode* = node.field_inits[i].value;
-            if (val != null) {
-                val.accept(this);
-            }
+            this.walk_expr(node.field_inits[i].value);
             // A field's position in its owner is the same in every
             // instantiation, so the pin crosses the substitution.
             node.field_inits[i].pin_carried = node.field_inits[i].pin.is_some();
         }
     }
 
-    override visit(node: ScopeResolutionNode*) -> void {
+    walk_scope_resolution(mut &this, node: ScopeResolutionNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
         // ScopeResolution carries TWO arg lists:
         //   * scope_generic_args: args on the scope (`Pair<T>::method`)
@@ -891,7 +915,7 @@ public:
         }
     }
 
-    override visit(node: SizeofExprNode*) -> void {
+    walk_sizeof(mut &this, node: SizeofExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
         // Substitute generic params inside the operand annotation
         // (e.g., `HashMapEntry<K, V>` -> `HashMapEntry<S, j>`).
@@ -901,7 +925,7 @@ public:
         }
     }
 
-    override visit(node: AlignofExprNode*) -> void {
+    walk_alignof(mut &this, node: AlignofExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
         if (node.type_ann != null) {
             this.substitute_annotation(node.type_ann);
@@ -909,239 +933,147 @@ public:
         }
     }
 
-    /// A `sizeof`/`alignof` operand's decided type as this copy sees it.
-    /// Without a substitution the annotation may now name a different type
-    /// than the one decided, so the answer is dropped: a stale size is a
-    /// wrong answer, and a missing one is an error codegen reports.
-    operand_in_copy(&this, t: TypeRef) -> TypeRef {
-        if (this.subst == null || !t.is_valid()) { return TypeRef::invalid(); }
-        return this.in_copy(t);
-    }
-
-
-    override visit(node: TypeofExprNode*) -> void {
+    walk_typeof(mut &this, node: TypeofExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        if (node.operand != null) { node.operand.accept(this); }
+        TypeofExprNode::walk_children(node, this);
     }
 
-    override visit(node: DeleteExprNode*) -> void {
+    walk_delete(mut &this, node: DeleteExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        if (node.operand != null) { node.operand.accept(this); }
+        DeleteExprNode::walk_children(node, this);
     }
 
-    override visit(node: AwaitExprNode*) -> void {
+    walk_await(mut &this, node: AwaitExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        if (node.operand != null) { node.operand.accept(this); }
+        AwaitExprNode::walk_children(node, this);
     }
 
-    override visit(node: YieldExprNode*) -> void {
+    walk_yield(mut &this, node: YieldExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        if (node.operand != null) { node.operand.accept(this); }
+        YieldExprNode::walk_children(node, this);
     }
 
-    override visit(node: TryExprNode*) -> void {
+    walk_try(mut &this, node: TryExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
         // Monomorphization runs before sema lowers `?`, so only `operand`
         // is populated here; recurse into `desugared` too if a post-sema
         // clone is ever substituted.
-        if (node.operand != null)   { node.operand.accept(this); }
-        if (node.desugared != null) { node.desugared.accept(this); }
+        TryExprNode::walk_children(node, this);
+        this.walk_expr(node.desugared);
     }
 
 
-    // Statement visitors: recurse into children
+    // Statements: only the arms of a `match` need more than their children
 
-    override visit(node: BlockStmtNode*) -> void {
-        for (mut i: i64 = 0; i < node.statements.length; i++) {
-            node.statements[i].accept(this);
-        }
-    }
-
-    override visit(node: UnsafeBlockStmtNode*) -> void {
-        node.block.accept(this);
-    }
-
-    override visit(node: AsmBlockStmtNode*) -> void {
-        for (mut i: i64 = 0; i < node.operands.length; i++) {
-            const op: AsmOperand = node.operands[i];
-            if (op.expr != null) {
-                op.expr.accept(this);
-            }
-        }
-    }
-
-    override visit(node: ReturnStmtNode*) -> void {
-        if (node.expression != null) {
-            node.expression.accept(this);
-        }
-    }
-
-    override visit(node: IfStmtNode*) -> void {
-        node.condition.accept(this);
-        node.then_stmt.accept(this);
-        if (node.else_stmt != null) {
-            node.else_stmt.accept(this);
-        }
-    }
-
-    override visit(node: WhileStmtNode*) -> void {
-        node.condition.accept(this);
-        node.body.accept(this);
-    }
-
-    override visit(node: DoWhileStmtNode*) -> void {
-        node.body.accept(this);
-        node.condition.accept(this);
-    }
-
-    override visit(node: LoopStmtNode*) -> void {
-        if (node.body != null) { node.body.accept(this); }
-    }
-
-    override visit(node: ForStmtNode*) -> void {
-        if (node.init != null) { node.init.accept(this); }
-        if (node.condition != null) { node.condition.accept(this); }
-        if (node.update != null) { node.update.accept(this); }
-        node.body.accept(this);
-    }
-
-    override visit(node: MatchStmtNode*) -> void {
-        node.subject.accept(this);
+    walk_match_stmt(mut &this, node: MatchStmtNode*) -> void {
+        this.walk_expr(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
-            this.visit(node.arms[i]);
+            this.walk_match_arm(node.arms[i]);
         }
     }
 
-    override visit(node: StaticMatchStmtNode*) -> void {
+    walk_static_match_stmt(mut &this, node: StaticMatchStmtNode*) -> void {
         node.scrutinee = this.substitute_annotation(node.scrutinee);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
-            this.visit(node.arms[i]);
+            this.walk_static_match_arm(node.arms[i]);
         }
     }
 
     /// Walk a static-match arm: rewrite the type pattern (T -> concrete) and
     /// the body. Dead arms are substituted harmlessly here; the monomorphizer
     /// prunes them before any type-checking sees them.
-    override visit(arm: StaticMatchArmNode*) -> void {
+    walk_static_match_arm(mut &this, arm: StaticMatchArmNode*) -> void {
         for (mut i: i64 = 0; i < arm.type_patterns.length; i++) {
             arm.type_patterns[i] = this.substitute_annotation(arm.type_patterns[i]);
         }
-        if (arm.body != null) {
-            arm.body.accept(this);
-        }
+        StaticMatchArmNode::walk_children(arm, this);
     }
 
-    /// Walk a match arm: visit patterns then walk the body.
-    override visit(arm: MatchArmNode*) -> void {
+    /// Walk a match arm: its enum patterns, then the body.  The guard is not
+    /// walked.
+    walk_match_arm(mut &this, arm: MatchArmNode*) -> void {
         for (mut j: i64 = 0; j < arm.patterns.length; j++) {
             const pat: PatternNode* = arm.patterns[j];
             if (pat.pattern_kind == PatternKind::Enum) {
-                this.visit(pat as EnumPatternNode*);
+                this.walk_enum_pattern(pat as EnumPatternNode*);
             }
             // Other pattern kinds have no type annotations to substitute
         }
-        if (arm.body != null) {
-            arm.body.accept(this);
-        }
+        this.walk_stmt(arm.body);
     }
 
-    override visit(node: ExprStmtNode*) -> void {
-        node.expression.accept(this);
-    }
+    // Expressions: the decided type, then the children
 
-    override visit(node: DeclStmtNode*) -> void {
-        node.declaration.accept(this);
-    }
-
-    // Remaining expression visitors: recurse into children
-
-    override visit(node: BinaryExprNode*) -> void {
+    walk_binary(mut &this, node: BinaryExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        node.left.accept(this);
-        node.right.accept(this);
+        BinaryExprNode::walk_children(node, this);
         // Rewrite the operator-overload call's stashed type-args (T -> concrete)
         // so a bounded-param `a + b` specializes to the right trait-method spec.
-        if (node.desugared_call != null) { node.desugared_call.accept(this); }
+        this.walk_expr(node.desugared_call);
     }
 
-    override visit(node: UnaryExprNode*) -> void {
+    walk_unary(mut &this, node: UnaryExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        node.operand.accept(this);
-        if (node.desugared_call != null) { node.desugared_call.accept(this); }
+        UnaryExprNode::walk_children(node, this);
+        this.walk_expr(node.desugared_call);
     }
 
-    override visit(node: TernaryExprNode*) -> void {
+    walk_ternary(mut &this, node: TernaryExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        node.condition.accept(this);
-        node.true_expr.accept(this);
-        node.false_expr.accept(this);
+        TernaryExprNode::walk_children(node, this);
     }
 
-    override visit(node: IfExprNode*) -> void {
+    walk_if_expr(mut &this, node: IfExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        node.condition.accept(this);
-        node.then_expr.accept(this);
-        if (node.else_expr != null) {
-            node.else_expr.accept(this);
-        }
+        IfExprNode::walk_children(node, this);
     }
 
-    override visit(node: MatchExprNode*) -> void {
+    walk_match_expr(mut &this, node: MatchExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        node.subject.accept(this);
+        this.walk_expr(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
-            this.visit(node.arms[i]);
+            this.walk_match_arm(node.arms[i]);
         }
     }
 
-    override visit(node: StaticMatchExprNode*) -> void {
+    walk_static_match_expr(mut &this, node: StaticMatchExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
         node.scrutinee = this.substitute_annotation(node.scrutinee);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
-            this.visit(node.arms[i]);
+            this.walk_static_match_arm(node.arms[i]);
         }
     }
 
-    override visit(node: ArrayLiteralNode*) -> void {
+    walk_array_literal(mut &this, node: ArrayLiteralNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        for (mut i: i64 = 0; i < node.elements.length; i++) {
-            node.elements[i].accept(this);
-        }
-        if (node.repeat_count_expr != null) {
-            node.repeat_count_expr.accept(this);
-        }
+        ArrayLiteralNode::walk_children(node, this);
     }
 
-    override visit(node: TupleLiteralNode*) -> void {
+    walk_tuple_literal(mut &this, node: TupleLiteralNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        for (mut i: i64 = 0; i < node.elements.length; i++) {
-            node.elements[i].accept(this);
-        }
+        TupleLiteralNode::walk_children(node, this);
     }
 
-    override visit(node: LambdaExprNode*) -> void {
+    walk_lambda(mut &this, node: LambdaExprNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            this.visit(node.parameters[i]);
+            this.walk_var(node.parameters[i]);
         }
-        if (node.body != null) {
-            node.body.accept(this);
-        }
+        this.walk_stmt(node.body);
     }
 
-    override visit(node: ArrayAccessNode*) -> void {
+    walk_array_access(mut &this, node: ArrayAccessNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        node.array.accept(this);
-        node.index.accept(this);
+        ArrayAccessNode::walk_children(node, this);
         // Rewrite the index-overload call's stashed type-args (T -> concrete)
         // so `a[i]` on a bounded param / generic container specializes to the
         // right `Index::index` spec.
-        if (node.desugared_call != null) { node.desugared_call.accept(this); }
+        this.walk_expr(node.desugared_call);
     }
 
-    override visit(node: MemberAccessNode*) -> void {
+    walk_member_access(mut &this, node: MemberAccessNode*) -> void {
         this.substitute_type(node as ExpressionNode*);
-        node.object.accept(this);
+        MemberAccessNode::walk_children(node, this);
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
@@ -1150,7 +1082,7 @@ public:
         node.carry_resolved_member();
     }
 
-    override visit(node: EnumPatternNode*) -> void {
+    walk_enum_pattern(mut &this, node: EnumPatternNode*) -> void {
         if (this.names_template(node.res)) {
             node.enum_name = this.spec_name;
         }
@@ -1160,15 +1092,13 @@ public:
         // Recurse into nested sub-patterns (`Some(Some(n))`, `Branch(Leaf(x),
         // r)`) so their enum_name is substituted too. Without this, a nested
         // pattern in a generic body kept the unsubstituted (template) name.
-        // Explicit kind dispatch (not accept()) to reliably reach this
-        // override for a nested EnumPatternNode.
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             match (node.elements[i]) {
                 PatternElement::Sub(sub) => {
                     if (sub.pattern != null) {
                         const child: PatternNode* = sub.pattern as PatternNode*;
                         if (child.pattern_kind == PatternKind::Enum) {
-                            this.visit(child as EnumPatternNode*);
+                            this.walk_enum_pattern(child as EnumPatternNode*);
                         }
                     }
                 }
@@ -1177,61 +1107,20 @@ public:
         }
     }
 
-    override visit(node: VarDeclNode*) -> void {
+    walk_var(mut &this, node: VarDeclNode*) -> void {
         if (this.subst != null && node.resolved_type.is_valid()) {
             node.resolved_type = this.in_copy(node.resolved_type);
         }
         if (node.type_annotation != null) {
             node.type_annotation = this.substitute_annotation(node.type_annotation);
         }
-        if (node.initializer != null) {
-            node.initializer.accept(this);
-        }
+        VarDeclNode::walk_children(node, this);
     }
 
-    override visit(node: FieldDeclNode*) -> void {
+    walk_field(mut &this, node: FieldDeclNode*) -> void {
         if (node.type_annotation != null) {
             node.type_annotation = this.substitute_annotation(node.type_annotation);
         }
-        if (node.default_value != null) {
-            node.default_value.accept(this);
-        }
+        FieldDeclNode::walk_children(node, this);
     }
-
-    /// Rewrite a TypeAnnotation* in-place from Named to Primitive variant.
-    static rewrite_to_primitive(ann: TypeAnnotation*, name: SymbolStr, span: SourceSpan) -> void {
-        const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: name, span: span };
-        *ann = TypeAnnotation::Primitive(prim);
-    }
-
-    /// Rewrite a TypeAnnotation* in-place from Named to Pointer(Named(inner)).
-    /// `inner_pre_resolved` is the inner type's TypeRef when known (the
-    /// substituter has it from `subst.replacements[i]`'s pointee), and it is
-    /// what the inner Named answers with: a rewritten spelling carries no
-    /// stamp, so without it a type the reading module cannot reach by that
-    /// spelling (`Entry<K,V>` inside a `Layout::array<Entry<K,V>*>` clone)
-    /// resolves to nothing.
-    static rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr,
-                                inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
-        const inner_named: NamedAnnotation* = new NamedAnnotation {
-            name: inner_name,
-            span: span,
-            pre_resolved: inner_pre_resolved,
-            res: ResSlot::Pending,
-        };
-        const inner_ann: TypeAnnotation* = new TypeAnnotation::Named(inner_named);
-        const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner_ann, is_const: false, span: span };
-        *ann = TypeAnnotation::Pointer(ptr);
-    }
-
-
-    /// Rewrite a TypeAnnotation* in-place to the empty-tuple (unit) annotation.
-    /// Used when a generic param is substituted with `()`, which is not a Named
-    /// type and cannot survive as Named("()") through the resolver.
-    static rewrite_to_unit(ann: TypeAnnotation*, span: SourceSpan) -> void {
-        mut empty_elems: [TypeAnnotation*] = [];
-        const tup: TupleAnnotation* = new TupleAnnotation { elements: empty_elems, span: span };
-        *ann = TypeAnnotation::Tuple(tup);
-    }
-
 }

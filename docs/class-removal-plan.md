@@ -953,6 +953,60 @@ every visitor.
   either way: the old visitor was missing a child, or the new default
   visits one it must not.
 
+**Built.**
+
+- `compiler::ast::walk` holds the trait: `walk_node` dispatches on
+  `NodeKind` with a cast (`walk_expr`, `walk_stmt` and `walk_decl` forward
+  to it), and there is one hook per node class, 65.  A hook's default is
+  its kind's `walk_children`, a generic static in an `implement class`
+  block in the same file, so the traversal of each kind is written once.
+  The children are the tree as written, in source order; what a later pass
+  hangs beside a node (`desugared_call`, `desugared`, `unwind_cleanup`,
+  `synth_drops`) is not a child, and a walker that needs it visits it
+  itself.  The six kinds no node is built with have empty arms, among them
+  `NodeKind::EnumPattern`: an enum pattern is a `Pattern` whose
+  `pattern_kind` is `Enum`, so the five comparisons against
+  `NodeKind::EnumPattern` in the tree never hold (logged as a bug).
+- The three visitors are structs implementing `Walk`, in one commit.  The
+  conversion is mechanical so that the traversal cannot move: each
+  `override visit(X)` became the hook for `X`; each `child.accept(this)`
+  became a dispatching `this.walk_node(child)`; each direct
+  `this.visit(child)` became a direct hook call; and then an override whose
+  body was exactly its kind's default recursion was deleted.  The renames
+  were made by `scripts/walk-codemod.py`, which also moves a type's hooks
+  out of its body into its `Walk` implementation; it is deleted in the next
+  commit.
+  - The substituter: 53 overrides -> 41 hooks, 22 of them continuing
+    through `walk_children`.  It keeps its own recursion where it skips a child
+    (a match arm's guard, a self-returning default's body) or visits one
+    that is not a child (`desugared_call`).
+  - The dumper: 68 -> 65 hooks.  Every hook prints its line and then its
+    children with the "last child" flag the tree drawing needs, which a
+    default walk does not carry, so none uses the default.  The three
+    category fallbacks went: `walk_node` never reaches a category.
+  - The name resolver: 59 -> 34 hooks; 25 were exactly the default.
+- **Traversal agreement.**  The probe: every dispatch that reaches a node
+  (an `accept` in the old compiler; an `accept` or a `walk_node` in the
+  new) writes the node's kind, line and column to a trace, and the two
+  compilers' traces are compared line by line over the corpus.
+  - Corpus: the compiler, the 14 examples, the 265 test projects, and
+    every unit-test and negative file built on its own: 826 inputs.
+  - Result: 826 identical, 0 differing, 62,496,968 events in the old
+    traces.  41 inputs traced nothing on either compiler; each stops
+    before any visitor runs (a lexer or parser refusal, a missing module).
+  - Controls: the old compiler against itself agrees (determinism); a
+    compiler with `DoWhileStmtNode::walk_children` visiting the condition
+    before the body differs from the old one at event 27,432 of
+    `lang/control_flow.cryo`, where the new compiler agrees.
+  - The dumper's output is the stronger check for it: `--ast` over the
+    same 468 files is byte-identical old against new (198 MB of dumps).
+- **Measured.**  verify `--require-identical`: 0 test and 0 example
+  objects moved.  Check time interleaved x3 against the slice-1 compiler,
+  over the same source: 7.95 s and 7.95 s (medians); peak 1552.2 and
+  1551.8 MiB; node count identical (1,941,481); arena use 187,338 bytes
+  lower, which the prediction did not include and which is not yet
+  attributed.  Clean build: 0 warnings.  Classes 103 -> 100.
+
 ### Slice 3: sema, codegen and the cloner onto direct `match`
 
 - Their `visit` overrides become methods called from the existing
