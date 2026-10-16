@@ -15,7 +15,7 @@ import std::json::value;
 import std::ffi::libc;
 
 import compiler::compilation_context::{ CompilationContext };
-import compiler::ast::{ NodeKind };
+import compiler::ast::{ NodeKind, TypeAnnotation };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::declaration::{
     DeclarationNode, EnumVariantNode, FieldDeclNode, FunctionDeclNode, IntrinsicDeclNode,
@@ -130,6 +130,10 @@ type struct Shown {
         return this.names.type_text(ty);
     }
 
+    type_text_written(&this, ty: TypeRef, ann: TypeAnnotation*) -> string {
+        return this.names.type_text_written(ty, ann);
+    }
+
     def(mut &this, d: DefId) -> void {
         if (this.ctx.defs.kind_of(d) == DefKind::Module) {
             this.text = "module " + this.path(d);
@@ -164,7 +168,8 @@ type struct Shown {
             NodeKind::VariableDeclaration => {
                 const v: VarDeclNode* = decl as VarDeclNode*;
                 const kw: string = if (v.is_mutable) { "mut " } else { "const " };
-                this.text = kw + this.path(d) + ": " + this.type_text(v.resolved_type);
+                this.text = kw + this.path(d) + ": "
+                    + this.names.type_text_written(v.resolved_type, v.type_annotation);
             }
             _ => { this.text = this.path(d); }
         }
@@ -181,15 +186,17 @@ type struct Shown {
         // `this`, `&this` or `mut &this`, and shown as written.
         const receiver: boolean = is_method && !is_static;
         return head + this.path(d) + "(" + this.params(&f.parameters, receiver) + ") -> "
-            + this.type_text(f.resolved_return_type);
+            + this.names.type_text_written(f.resolved_return_type, f.return_type_annotation);
     }
 
-    params(&this, ps: &VarDeclNode*[], receiver: boolean) -> string {
+    params(&this, ps: &[VarDeclNode*], receiver: boolean) -> string {
         mut out: string = "";
         for (mut i: i64 = 0; i < ps.length; i++) {
             if (i > 0) { out = out + ", "; }
             out = out + this.ctx.intern_table.resolve(ps[i].name);
-            if (i > 0 || !receiver) { out = out + ": " + this.type_text(ps[i].resolved_type); }
+            if (i > 0 || !receiver) {
+                out = out + ": " + this.names.type_text_written(ps[i].resolved_type, ps[i].type_annotation);
+            }
         }
         return out;
     }
@@ -203,6 +210,13 @@ type struct Shown {
         } else if (sym.kind != SymbolKind::Parameter) {
             kw = if (sym.is_mutable) { "mut " } else { "const " };
         }
+        // A binding declared with an annotation shows its type as written.
+        const at: ASTNode* = Declared::binding_node(this.ctx, s);
+        if (at != null && at.kind == NodeKind::VariableDeclaration) {
+            this.text = kw + name + ": "
+                + this.names.type_text_written(ty, (at as VarDeclNode*).type_annotation);
+            return;
+        }
         this.text = kw + name + ": " + this.type_text(ty);
     }
 
@@ -210,7 +224,7 @@ type struct Shown {
         const fd: FieldDeclNode* = Members::field_decl(this.ctx, owner, index);
         if (fd == null) { return; }
         this.text = "field " + this.path(owner) + "::" + this.ctx.intern_table.resolve(fd.name)
-            + ": " + this.type_text(fd.resolved_type);
+            + ": " + this.names.type_text_written(fd.resolved_type, fd.type_annotation);
         this.doc = fd.documentation;
     }
 
@@ -224,7 +238,7 @@ type struct Shown {
     /// The members of the type `d`, one line each, for the extended hover:
     /// a field's name and type, a variant's name, a method's signature.
     members(mut &this, d: DefId) -> void {
-        const all: Member[] = Members::of_type(this.ctx, d);
+        const all: [Member] = Members::of_type(this.ctx, d);
         mut out: String = String::from_str(str::Str::from(this.text));
         for (mut i: i64 = 0; i < all.length; i++) {
             mut line: Shown = Shown::new(this.names);

@@ -25,6 +25,8 @@ import compiler::ast::{
     ProjectionAnnotation, ReferenceAnnotation, statement, ThisTypeAnnotation,
     TupleAnnotation, TypeAnnotation, TypeofAnnotation
 };
+import compiler::ast::node_locator;
+import compiler::ast::node_locator::{ annotation_span };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::resolver::{ symbol_str, qualified_name };
@@ -79,7 +81,7 @@ public mut g_for_in_counter: u32 = 0;
 
 type class ExprParser : ParserBase {
 public:
-    ExprParser(tokens: Token[], source_file: string, ctx: CompilationContext*)
+    ExprParser(tokens: [Token], source_file: string, ctx: CompilationContext*)
         : ParserBase(tokens, source_file, ctx) {
     }
 
@@ -202,7 +204,7 @@ public:
                  prepend: boolean, span: SourceSpan) -> ExpressionNode* {
         if (callable.kind == NodeKind::CallExpression) {
             mut call: CallExprNode* = callable as CallExprNode*;
-            mut new_args: ExpressionNode*[] = [];
+            mut new_args: [ExpressionNode*] = [];
             if (prepend) {
                 new_args.push(value);
                 for (mut i: i64 = 0; i < call.arguments.length; i++) {
@@ -449,6 +451,7 @@ public:
         while (this.check(TokenType::KwAs)) {
             this.advance();
             mut target: TypeAnnotation* = null;
+            const target_tok: Token = this.current();
             // `as const T*` casts to a pointer-to-const; the const binds
             // to the first pointer suffix (threaded via
             // parse_type_suffixes_q).
@@ -462,9 +465,11 @@ public:
             // orphaned 8.  A parenthesized base - function `(T) -> R`, tuple
             // `(T, U)`, unit `()`, grouping `(T)` - is read by the paren
             // parser the annotation grammar uses; parse_base_type has no
-            // `(` branch.
+            // `(` branch.  A bracketed array type `[T; N]` likewise.
             if (this.check(TokenType::LParen)) {
                 target = this.parse_paren_type();
+            } else if (this.check(TokenType::LSquare)) {
+                target = this.parse_bracket_array_type();
             } else {
                 target = this.parse_base_type();
             }
@@ -475,11 +480,11 @@ public:
             }
             // `*` is a pointer suffix when followed by a token that cannot
             // start an expression (;  )  }  ]  ,  as  EOF); otherwise it is
-            // multiplication.  Other suffixes ([], ?) are unambiguous.
+            // multiplication.  `?` is unambiguous.
             if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
-                target = this.parse_type_suffixes_q(target, pending_const);
+                target = this.parse_type_suffixes_q(target, pending_const, target_tok);
             } else if (!this.check(TokenType::Star)) {
-                target = this.parse_type_suffixes_q(target, pending_const);
+                target = this.parse_type_suffixes_q(target, pending_const, target_tok);
             }
             const span: SourceSpan = ParserBase::merge_spans(expr.span, this.current_span());
             expr = new CastExprNode(expr, target, span);
@@ -585,7 +590,7 @@ public:
                 // E0154 ambiguity detector.
                 this.advance();
                 mut scope_name: SymbolStr = SymbolStr::empty();
-                mut carried_gen_args: TypeAnnotation*[] = [];
+                mut carried_gen_args: [TypeAnnotation*] = [];
                 if (expr.kind == NodeKind::ScopeResolution) {
                     const psr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
                     // An impl-qualified path names one member of one
@@ -643,7 +648,7 @@ public:
                 const qname: SymbolStr = this.ctx.intern_table.intern(
                     fmt::format("%s::%s", scope_s, member_s));
                 // Deep-clone the member generic args; `sr` owns its pointees.
-                mut sl_gen: TypeAnnotation*[] = [];
+                mut sl_gen: [TypeAnnotation*] = [];
                 for (mut gi: i64 = 0; gi < sr.generic_args.length; gi++) {
                     sl_gen.push(TypeAnnotation::clone_ptr(sr.generic_args[gi]));
                 }
@@ -1105,7 +1110,7 @@ public:
     fstr_parse_hole(src_text: string, base_line: int, base_col: int) -> ExpressionNode* {
         mut lx: Lexer = Lexer::new("<fstring>", src_text, this.ctx.diagnostics);
         lx.seed_location(base_line, base_col);
-        const hole_toks: Token[] = lx.lex();
+        const hole_toks: [Token] = lx.lex();
         return this.parse_expr_from_tokens(hole_toks);
     }
 
@@ -1265,7 +1270,7 @@ public:
     /// (`tramp::<i32>` passed, cast or assigned).  The cursor is on the `<`.
     parse_generic_head(expr: ExpressionNode*, name: SymbolStr, tok: Token) -> ExpressionNode* {
         mut head: ExpressionNode* = expr;
-        const gen_args: TypeAnnotation*[] = this.parse_generic_args();
+        const gen_args: [TypeAnnotation*] = this.parse_generic_args();
 
         if (this.check(TokenType::LParen)) {
             mut call: CallExprNode* = new CallExprNode(head, head.span);
@@ -1308,7 +1313,7 @@ public:
         // Check for scope resolution without generic args: Name::member
         if (this.check(TokenType::ColonColon)) {
             this.advance(); // consume '::'
-            const no_gen_args: TypeAnnotation*[] = [];
+            const no_gen_args: [TypeAnnotation*] = [];
             expr = this.parse_scope_member(name, no_gen_args, this.span_from_token(tok));
         }
 
@@ -1326,7 +1331,7 @@ public:
         // modules (member generic args carry through for `Module::Type<T> {}`).
         if (this.check(TokenType::LBrace) && !this.struct_lit_suppressed() && this.is_struct_literal_ahead()) {
             mut lit_name: SymbolStr = name;
-            mut lit_gen: TypeAnnotation*[] = [];
+            mut lit_gen: [TypeAnnotation*] = [];
             if (expr.kind == NodeKind::ScopeResolution) {
                 const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
                 const scope_s: string  = this.ctx.intern_table.resolve(sr.scope_name);
@@ -1375,7 +1380,7 @@ public:
     }
 
     /// Parse the body of a struct literal after the name and optional generic args.
-    parse_struct_literal_body(name: SymbolStr, gen_args: TypeAnnotation*[], start: Token) -> ExpressionNode* {
+    parse_struct_literal_body(name: SymbolStr, gen_args: [TypeAnnotation*], start: Token) -> ExpressionNode* {
         mut lit: StructLiteralNode* = new StructLiteralNode(name, this.span_from_token(start));
         if (gen_args.length > 0) {
             lit.set_generic_args(gen_args);
@@ -1594,7 +1599,7 @@ public:
         }
 
         mut scope_name: SymbolStr = SymbolStr::empty();
-        mut scope_args: TypeAnnotation*[] = [];
+        mut scope_args: [TypeAnnotation*] = [];
         match (*target_ann) {
             TypeAnnotation::Named(n)     => { scope_name = n.name; }
             TypeAnnotation::Primitive(p) => { scope_name = p.name; }
@@ -1637,7 +1642,7 @@ public:
     /// not extend Parser and pulling the helper down would require either
     /// duplicating it on ParserBase or threading a Parser* through.
     parse_lambda_expression(start: Token) -> ExpressionNode* {
-        mut params: VarDeclNode*[] = [];
+        mut params: [VarDeclNode*] = [];
         mut reported_untyped: boolean = false;
         while (!this.check(TokenType::RParen) && !this.is_at_end()) {
             const name_tok: Token = this.consume(TokenType::Identifier, "parameter name");
@@ -1680,7 +1685,7 @@ public:
     ///   () -> T { return value; }   (block body)
     ///   () -> T expr                (expression body)
     ///   (x: A) -> C { ... }         (block body with params)
-    parse_lambda_after_params(params: VarDeclNode*[], start: Token) -> ExpressionNode* {
+    parse_lambda_after_params(params: [VarDeclNode*], start: Token) -> ExpressionNode* {
         this.consume(TokenType::Arrow, "'->'");
 
         mut lambda: LambdaExprNode* = new LambdaExprNode(this.span_from_token(start));
@@ -1827,7 +1832,7 @@ public:
         // unconditionally here and never read afterwards, so a branch-local
         // binding leaves nothing conditionally moved past the if.
         if (this.check(TokenType::LAngle)) {
-            const scope_gen_args: TypeAnnotation*[] = this.parse_generic_args();
+            const scope_gen_args: [TypeAnnotation*] = this.parse_generic_args();
             node.set_generic_args(scope_gen_args);
         }
 
@@ -1862,7 +1867,7 @@ public:
             // (drop frees each node, like `ASTCloner::clone_type_annotations`),
             // so the struct literal must get its own cloned nodes - a shallow
             // pointer copy would let both arrays free the same nodes.
-            mut gen: TypeAnnotation*[] = [];
+            mut gen: [TypeAnnotation*] = [];
             for (mut gi: i64 = 0; gi < node.generic_args.length; gi++) { gen.push(TypeAnnotation::clone_ptr(node.generic_args[gi])); }
             const lit: StructLiteralNode* = this.parse_struct_literal_body(type_name, gen, start) as StructLiteralNode*;
             node.struct_init = lit;
@@ -2466,7 +2471,7 @@ public:
                 // array, and `TypeAnnotation*[]` owns its pointees, so the call
                 // node and the member-access node must each get their own cloned
                 // nodes - a shallow pointer copy double-frees the shared nodes.
-                mut ga_copy: TypeAnnotation*[] = [];
+                mut ga_copy: [TypeAnnotation*] = [];
                 for (mut gi: i64 = 0; gi < ma.generic_args.length; gi++) { ga_copy.push(TypeAnnotation::clone_ptr(ma.generic_args[gi])); }
                 call.set_generic_args(ga_copy);
             }
@@ -2565,7 +2570,7 @@ public:
         // Explicit type arguments on the member: `obj.method::<T, U>(...)`.
         if (this.at_turbofish()) {
             this.advance(); // consume '::'
-            const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
+            const member_gen_args: [TypeAnnotation*] = this.parse_generic_args();
             node.set_generic_args(member_gen_args);
         }
 
@@ -2580,7 +2585,7 @@ public:
     /// `scope_name`       - the left-hand identifier (e.g. "Foo" in Foo::bar)
     /// `scope_gen_args`   - generic args on the scope (e.g. <T> in Foo<T>::bar), empty if none
     /// `start_span`       - span of the left-hand side (for merged span)
-    parse_scope_member(scope_name: SymbolStr, scope_gen_args: TypeAnnotation*[], start_span: SourceSpan) -> ScopeResolutionNode* {
+    parse_scope_member(scope_name: SymbolStr, scope_gen_args: [TypeAnnotation*], start_span: SourceSpan) -> ScopeResolutionNode* {
         // Accept identifiers and any keyword as member names after '::'.
         // Keywords like `new`, `default`, `function`, `optional`, `type`
         // can all be used as static method / variant names.
@@ -2606,7 +2611,7 @@ public:
         // Generic args on the member itself: `Foo::bar::<U>`.
         if (this.at_turbofish()) {
             this.advance(); // consume '::'
-            const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
+            const member_gen_args: [TypeAnnotation*] = this.parse_generic_args();
             sr.set_generic_args(member_gen_args);
         }
 
@@ -2653,8 +2658,8 @@ public:
     /// Parse generic type arguments: <T1, T2*, Array<int>, ...>
     /// Returns structured TypeAnnotation nodes, preserving pointer, array,
     /// optional, and nested generic structure.
-    parse_generic_args() -> TypeAnnotation*[] {
-        mut args: TypeAnnotation*[] = [];
+    parse_generic_args() -> [TypeAnnotation*] {
+        mut args: [TypeAnnotation*] = [];
         this.advance(); // consume '<'
 
         while (!this.check(TokenType::RAngle) &&
@@ -2753,24 +2758,22 @@ public:
         // Parenthesized types: tuple `(T, U)`, 1-tuple `(T,)`, grouping `(T)`,
         // unit `()`, or function `(T, U) -> R`. Disambiguated by the trailing
         // comma (grouping vs 1-tuple) and a following `->` (function type).
-        // The suffixes after the `)` apply to the whole group:
-        // `(i32, i32)[]`, and `((i32) -> i32)[]` for an array of functions.
+        // The suffixes after the `)` apply to the whole group: `(&T)*`,
+        // `(&T)?`.
         if (this.check(TokenType::LParen)) {
+            const open: Token = this.current();
             const group: TypeAnnotation* = this.parse_paren_type();
             if (group == null) { return null; }
-            return this.parse_type_suffixes(group);
+            return this.parse_type_suffixes(group, open);
         }
 
-        // Bracket tuple types `[T, U]` are not supported; tuples use the
-        // parenthesized form `(T, U)`. A *leading* `[` in type
-        // position is unambiguously the bracket-tuple form (array suffixes
-        // `T[]`/`T[N]` are postfix, handled by parse_type_suffixes), so emit a
-        // targeted diagnostic instead of letting it fall through to
-        // a generic "expected type" error.
+        // Array types `[T]` and `[T; N]`.  The suffixes after the `]` apply
+        // to the whole array: `[T]*`, `[T]?`.
         if (this.check(TokenType::LSquare)) {
-            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                "bracket tuple types '[T, U]' are no longer supported; use '(T, U)'");
-            return null;
+            const open_sq: Token = this.current();
+            const arr: TypeAnnotation* = this.parse_bracket_array_type();
+            if (arr == null) { return null; }
+            return this.parse_type_suffixes(arr, open_sq);
         }
 
         // `implement Trait + Trait2` opaque type. `implement` is already a
@@ -2787,16 +2790,17 @@ public:
         // following `*` has no representation on a value type and is dropped,
         // matching C (top-level const on a by-value param is meaningless).
         if (this.check(TokenType::KwConst)) {
-            this.advance(); // consume `const`
+            const const_tok: Token = this.advance();
             const cbase: TypeAnnotation* = this.parse_base_type();
             if (cbase == null) { return null; }
-            return this.parse_type_suffixes_q(cbase, true);
+            return this.parse_type_suffixes_q(cbase, true, const_tok);
         }
 
         // Base type + optional suffixes
+        const base_tok: Token = this.current();
         const base: TypeAnnotation* = this.parse_base_type();
         if (base == null) { return null; }
-        return this.parse_type_suffixes(base);
+        return this.parse_type_suffixes(base, base_tok);
     }
 
     /// Parse `implement Trait + Trait2 + ...`. Each bound is a base type
@@ -2806,7 +2810,7 @@ public:
     parse_impl_trait_type() -> TypeAnnotation* {
         const start: Token = this.current();
         this.advance(); // consume `implement`
-        mut bounds: TypeAnnotation*[] = [];
+        mut bounds: [TypeAnnotation*] = [];
         while (true) {
             const bound: TypeAnnotation* = this.parse_base_type();
             if (bound == null) { break; }
@@ -2977,7 +2981,7 @@ public:
                     }
                 );
 
-                const type_args: TypeAnnotation*[] = this.parse_generic_args();
+                const type_args: [TypeAnnotation*] = this.parse_generic_args();
 
                 const gen_ann: GenericAnnotation* = new GenericAnnotation {
                     base: base_ann,
@@ -3018,17 +3022,28 @@ public:
         return false;
     }
 
-    /// Parse type suffixes: *, [], [N], ?
-    parse_type_suffixes(base: TypeAnnotation*) -> TypeAnnotation* {
-        return this.parse_type_suffixes_q(base, false);
+    /// Parse type suffixes: `*` and `?`.  `start` is the first token of the
+    /// type the suffixes apply to (a group's `(`, a `const`); each wrapper's
+    /// span runs from it through the suffix's last token.
+    parse_type_suffixes(base: TypeAnnotation*, start: Token) -> TypeAnnotation* {
+        return this.parse_type_suffixes_q(base, false, start);
     }
 
     /// As `parse_type_suffixes`, but `pending_const` marks the pointee of the
     /// nearest `*` suffix as const (`const T*`). The flag is consumed by the
     /// first pointer only; subsequent levels default to non-const.
-    parse_type_suffixes_q(base: TypeAnnotation*, pending_const: boolean) -> TypeAnnotation* {
+    ///
+    /// A `[` after a type is an array written postfix, `T[]` or `T[N]`,
+    /// which is refused: one E0104 for the whole suffix run, carrying the
+    /// run rewritten in brackets as its fix.  The run is still read into the
+    /// array it spells, so the declaration around it parses on with no
+    /// follow-on error.
+    parse_type_suffixes_q(base: TypeAnnotation*, pending_const: boolean, start: Token) -> TypeAnnotation* {
         mut result: TypeAnnotation* = base;
         mut ptr_const: boolean = pending_const;
+        // The suffix run rewritten in brackets, once a postfix `[` is read.
+        mut postfix_array: boolean = false;
+        mut rewritten: string = "";
 
         // Pointer/array/optional suffixes (`T*`, `T[]`, `T?`) are consumed
         // iteratively here, but each wraps `result` in a new node, so a long
@@ -3043,7 +3058,7 @@ public:
             if (suffix_len > 256) {
                 this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
                     "type nesting too deep (pointer/array suffix limit exceeded)");
-                return result;
+                break;
             }
             // Pointer suffix: T*
             if (this.check(TokenType::Star)) {
@@ -3051,68 +3066,28 @@ public:
                 const ptr_ann: PointerAnnotation* = new PointerAnnotation {
                     inner:    result,
                     is_const: ptr_const,
-                    span:     this.current_span(),
+                    span:     this.span_from(start),
                 };
                 ptr_const = false; // const binds to the innermost pointer only
                 result = new TypeAnnotation::Pointer(ptr_ann);
+                if (postfix_array) { rewritten = rewritten + "*"; }
             }
-            // Array suffix: T[] or T[N]
+            // Refused postfix array: T[] or T[N].  Each one wraps what is
+            // written so far, so `u64[2][3]` becomes `[[u64; 2]; 3]`.
             else if (this.check(TokenType::LSquare)) {
+                if (!postfix_array) {
+                    postfix_array = true;
+                    rewritten = this.postfix_element_text(base, result, start);
+                }
                 this.advance();
-                if (this.check(TokenType::RSquare)) {
-                    // Heap-backed dynamic array: T[]
-                    this.advance();
-                    const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
-                        element:   result,
-                        size:      ArrayAnnotation::heap_dynamic_size(),
-                        size_expr: null,
-                        span:      this.current_span(),
-                    };
-                    result = new TypeAnnotation::Array(arr_ann);
+                if (this.match_tok(TokenType::RSquare)) {
+                    result = this.dynamic_array_type(result, start);
+                    rewritten = "[" + rewritten + "]";
                 } else {
-                    // Fixed-size array: T[N], T[CONST_NAME], T[CONST * 2]
-                    //
-                    // A plain numeric literal is decoded here; anything else is
-                    // kept as an expression for the type resolver to constant-
-                    // fold once names are bound.  The expression MUST be
-                    // retained: discarding it leaves the size permanently
-                    // unknown, and an array whose size never resolves is
-                    // emitted as a descriptor with no storage behind it.
-                    const size_tok: Token = this.current();
-                    mut size: i64 = 0;
-                    mut size_expr: ExpressionNode* = null;
-                    if (size_tok.kind == TokenType::NumericConstant) {
-                        // Decode the full numeric lexeme: this honours the
-                        // `0x`/`0o`/`0b` base prefixes and `_` separators that
-                        // a hand-rolled decimal scan would silently drop (e.g.
-                        // `T[0xFF]` must be 255, not 0).
-                        // A size that needs more than 64 bits would saturate to
-                        // a meaningless value; reject it up front rather than
-                        // build a garbage array type.
-                        if (ParserBase::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
-                            this.report_error(ErrorCode::E0010_NUMBER_TOO_LARGE,
-                                fmt::format("array size `%s` does not fit in 64 bits",
-                                    size_tok.lexeme));
-                        }
-                        size = ParserBase::parse_numeric_lexeme_i64(size_tok.lexeme);
-                        this.advance();
-                    } else {
-                        // Named constant or computed size: T[BTREE_MAX_KEYS],
-                        // T[CHUNK * 2].  Marked fixed-pending until the type
-                        // resolver folds `size_expr` - distinct from a
-                        // heap-backed `T[]` so ownership analysis does not free
-                        // its (nonexistent) heap buffer.
-                        size      = ArrayAnnotation::fixed_pending_size();
-                        size_expr = this.parse_expression();
-                    }
-                    this.consume(TokenType::RSquare, "']'");
-                    const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
-                        element:   result,
-                        size:      size,
-                        size_expr: size_expr,
-                        span:      this.current_span(),
-                    };
-                    result = new TypeAnnotation::Array(arr_ann);
+                    const length_from: i64 = this.pos;
+                    result = this.finish_fixed_array_type(result, start);
+                    rewritten = "[" + rewritten + "; "
+                        + this.tokens_text(length_from, this.last_consumed_index()) + "]";
                 }
             }
             // Optional suffix: `T?` is sugar for `Option<T>`. Desugar here in
@@ -3122,30 +3097,151 @@ public:
             // with `Option<T>` for free. `Option` resolves via the prelude from
             // any module, exactly as a hand-written `Option<T>` does.
             else if (this.check(TokenType::Question)) {
-                this.advance();
+                const question: Token = this.advance();
                 const opt_base: TypeAnnotation* = new TypeAnnotation::Named(
                     new NamedAnnotation {
                         name:         this.ctx.intern("Option"),
-                        span:         this.current_span(),
+                        span:         this.span_from_token(question),
                         pre_resolved: TypeRef::invalid(),
                         res: ResSlot::Pending,
                     }
                 );
-                mut opt_args: TypeAnnotation*[] = [];
+                mut opt_args: [TypeAnnotation*] = [];
                 opt_args.push(result);
                 const opt_gen: GenericAnnotation* = new GenericAnnotation {
                     base: opt_base,
                     args: opt_args,
-                    span: this.current_span(),
+                    span: this.span_from(start),
                 };
                 result = new TypeAnnotation::Generic(opt_gen);
+                if (postfix_array) { rewritten = rewritten + "?"; }
             }
             else {
                 break;
             }
         }
 
+        if (postfix_array) {
+            const written: SourceSpan = this.span_from(start);
+            this.error_count += 1;
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0104_EXPECTED_TYPE,
+                fmt::format("array types are written `[T]`: write `%s`", rewritten));
+            diag = diag.at(written);
+            diag = diag.suggest(Suggestion::machine_applicable(written, rewritten,
+                fmt::format("write `%s`", rewritten)));
+            this.ctx.emit_diagnostic(diag);
+        }
         return result;
+    }
+
+    /// The written type a postfix array's brackets go around: the tokens
+    /// from `start` up to the first `[`.  A grouping's parentheses are left
+    /// out when the array is the first suffix after them, since brackets
+    /// group by themselves: `(&T)[]` is `[&T]`.  A group that is a tuple or
+    /// a function type keeps them; its annotation's span starts at the `(`.
+    postfix_element_text(base: TypeAnnotation*, result: TypeAnnotation*, start: Token) -> string {
+        const from: i64 = this.consumed_index_of(start);
+        const to: i64 = this.last_consumed_index() + 1;
+        if (result == base && start.kind == TokenType::LParen) {
+            const inner: SourceSpan = annotation_span(base);
+            if (inner.start_line != start.line as u32 || inner.start_col != start.column as u32) {
+                return this.tokens_text(from + 1, to - 1);
+            }
+        }
+        return this.tokens_text(from, to);
+    }
+
+    /// Parse an array type written in brackets: `[T]` (dynamic) or `[T; N]`
+    /// (fixed).  The element is a whole type, so `[&T]` is an array of
+    /// references and `[[u64; 2]; 3]` is three rows of `[u64; 2]`.
+    ///
+    /// `[T, U]` is the removed bracket tuple.  It is reported at its `[` and
+    /// read through its `]` as the tuple `(T, U)` it spells, so the
+    /// declaration around it parses on with no follow-on error.
+    parse_bracket_array_type() -> TypeAnnotation* {
+        const open: Token = this.advance(); // consume `[`
+        const element: TypeAnnotation* = this.parse_type_annotation();
+        if (element == null) { return null; }
+        if (this.check(TokenType::Comma)) {
+            this.report_invalid_at(ErrorCode::E0104_EXPECTED_TYPE,
+                "bracket tuple types '[T, U]' are no longer supported; use '(T, U)'",
+                this.span_from_token(open));
+            mut elements: [TypeAnnotation*] = [];
+            elements.push(element);
+            while (this.match_tok(TokenType::Comma)) {
+                if (this.check(TokenType::RSquare)) { break; }
+                const next: TypeAnnotation* = this.parse_type_annotation();
+                if (next == null) { return null; }
+                elements.push(next);
+            }
+            this.consume(TokenType::RSquare, "']'");
+            const tup_ann: TupleAnnotation* = new TupleAnnotation {
+                elements: elements,
+                span:     this.span_from(open),
+            };
+            return new TypeAnnotation::Tuple(tup_ann);
+        }
+        if (this.match_tok(TokenType::Semicolon)) {
+            return this.finish_fixed_array_type(element, open);
+        }
+        this.consume(TokenType::RSquare, "']'");
+        return this.dynamic_array_type(element, open);
+    }
+
+    /// The heap-backed dynamic array of `element`, its closing `]` consumed;
+    /// the span runs from `start`.
+    dynamic_array_type(element: TypeAnnotation*, start: Token) -> TypeAnnotation* {
+        const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
+            element:   element,
+            size:      ArrayAnnotation::heap_dynamic_size(),
+            size_expr: null,
+            span:      this.span_from(start),
+        };
+        return new TypeAnnotation::Array(arr_ann);
+    }
+
+    /// The fixed-size array of `element` whose length is at the current
+    /// token, through the closing `]`: `N`, `CONST_NAME` or `CONST * 2`.
+    ///
+    /// A plain numeric literal is decoded here; anything else is kept as an
+    /// expression for the type resolver to constant-fold once names are
+    /// bound.  The expression MUST be retained: discarding it leaves the size
+    /// permanently unknown, and an array whose size never resolves is emitted
+    /// as a descriptor with no storage behind it.
+    finish_fixed_array_type(element: TypeAnnotation*, start: Token) -> TypeAnnotation* {
+        const size_tok: Token = this.current();
+        mut size: i64 = 0;
+        mut size_expr: ExpressionNode* = null;
+        if (size_tok.kind == TokenType::NumericConstant) {
+            // Decode the full numeric lexeme: this honours the `0x`/`0o`/`0b`
+            // base prefixes and `_` separators that a hand-rolled decimal
+            // scan would silently drop (`0xFF` must be 255, not 0).  A size
+            // that needs more than 64 bits would saturate to a meaningless
+            // value; reject it up front rather than build a garbage array
+            // type.
+            if (ParserBase::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
+                this.report_error(ErrorCode::E0010_NUMBER_TOO_LARGE,
+                    fmt::format("array size `%s` does not fit in 64 bits",
+                        size_tok.lexeme));
+            }
+            size = ParserBase::parse_numeric_lexeme_i64(size_tok.lexeme);
+            this.advance();
+        } else {
+            // A named constant or computed size is fixed-pending until the
+            // type resolver folds `size_expr` - distinct from the dynamic
+            // array `[T]`.
+            size      = ArrayAnnotation::fixed_pending_size();
+            size_expr = this.parse_expression();
+        }
+        this.consume(TokenType::RSquare, "']'");
+        const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
+            element:   element,
+            size:      size,
+            size_expr: size_expr,
+            span:      this.span_from(start),
+        };
+        return new TypeAnnotation::Array(arr_ann);
     }
 
     /// Parse a reference type: `&T` or `&mut T`. The leading `&` is at
@@ -3195,7 +3291,7 @@ public:
     parse_paren_type() -> TypeAnnotation* {
         const start: Token = this.advance(); // consume '('
 
-        mut params: TypeAnnotation*[] = [];
+        mut params: [TypeAnnotation*] = [];
         mut trailing_comma: boolean = false;
         if (!this.check(TokenType::RParen)) {
             while (true) {
@@ -3250,12 +3346,6 @@ public:
         return new TypeAnnotation::Tuple(tup_ann);
     }
 
-    /// Parse the DEPRECATED bracket tuple type `[T, U, V]`. Retained only for
-    /// bootstrap compatibility (the pinned compiler builds the stdlib, which
-    /// still uses `[...]`); new code should use the parenthesized form
-    /// `(T, U)`. To be removed once the stdlib is migrated and re-pinned.
-    /// Empty `[]` is invalid (use `()` for unit). Lowers to the same
-    /// TupleAnnotation as `(...)`.
     // Type Helper Predicates
 
     /// Check if the current token is a primitive type keyword.

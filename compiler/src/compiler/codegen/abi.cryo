@@ -105,7 +105,7 @@ type struct ParamPlan {
     /// How the value crosses the boundary.
     cls:      ArgClass;
     /// The LLVM types this parameter expands to (0, 1, or 2 slots).
-    llvm_slots: LType[];
+    llvm_slots: [LType];
     /// Optional attribute to attach to the LLVM parameter slot.
     attr:       AbiAttr;
     /// For `Indirect` parameters / returns: the underlying pointee LLVM
@@ -117,7 +117,7 @@ type struct ParamPlan {
     /// rebuilt into an independent buffer so a clone can be stored in a
     /// second owner without double-freeing this plan's slots.
     clone(&this) -> ParamPlan {
-        mut slots_c: LType[] = [];
+        mut slots_c: [LType] = [];
         for (mut i: i64 = 0; i < this.llvm_slots.length; i++) {
             slots_c.push(this.llvm_slots[i]);
         }
@@ -139,7 +139,7 @@ type struct SignaturePlan {
     /// One plan per source-language parameter (excluding the variadic
     /// trailing `args...` bucket which lowers to LLVM's `...` marker
     /// outside this seam).
-    param_plans:  ParamPlan[];
+    param_plans:  [ParamPlan];
     /// The fully-lowered LLVM function type.  Built by `build_llvm_fn_type`
     /// from the slot list each plan contributes.
     llvm_fn_type: LType;
@@ -308,12 +308,12 @@ type struct AbiClassifier {
     /// source-language parameter list (excluding the variadic trailing
     /// bucket); `return_type` may be invalid for `void`/`unit` returns.
     classify_signature(mut &this,
-                       params: &TypeRef[],
+                       params: &[TypeRef],
                        return_type: TypeRef,
                        is_variadic: boolean) -> SignaturePlan {
         const return_plan: ParamPlan = this.classify_return(return_type);
 
-        mut param_plans: ParamPlan[] = [];
+        mut param_plans: [ParamPlan] = [];
         for (mut i: i64 = 0; i < params.length; i++) {
             param_plans.push(this.classify_param(params[i]));
         }
@@ -337,7 +337,7 @@ type struct AbiClassifier {
     /// for <=8, DirectPair for 9-16).  Retained as an alias for the
     /// extern-declare call site.
     classify_signature_extern_c(mut &this,
-                                params: TypeRef[],
+                                params: [TypeRef],
                                 return_type: TypeRef,
                                 is_variadic: boolean) -> SignaturePlan {
         return this.classify_signature(params, return_type, is_variadic);
@@ -382,7 +382,7 @@ type struct AbiClassifier {
         const arena: TypeArena* = tm.arena;
         const ty: Type* = arena.lookup(t);
         if (ty == null) {
-            mut slots_fb: LType[] = [];
+            mut slots_fb: [LType] = [];
             const lty_fb: LType = tm.map_type(t);
             if (lty_fb.is_valid()) { slots_fb.push(lty_fb); }
             return ParamPlan {
@@ -430,7 +430,7 @@ type struct AbiClassifier {
             if (sz > 16) {
                 // Phase 2: large aggregate -> byval.
                 const pointee: LType = tm.map_type(t);
-                mut slots_iv: LType[] = [];
+                mut slots_iv: [LType] = [];
                 slots_iv.push(LType::pointer_to(LType::i8()));
                 return ParamPlan {
                     cryo_type:  t,
@@ -450,7 +450,7 @@ type struct AbiClassifier {
                 const orig: LType = tm.map_type(t);
                 const slot: LType = this.eightbyte_slot_type(concrete, 0, sz);
                 if (slot.is_valid()) {
-                    mut slots_d: LType[] = [];
+                    mut slots_d: [LType] = [];
                     slots_d.push(slot);
                     return ParamPlan {
                         cryo_type:  t,
@@ -470,7 +470,7 @@ type struct AbiClassifier {
                 const lo_slot: LType = this.eightbyte_slot_type(concrete, 0, 8);
                 const hi_slot: LType = this.eightbyte_slot_type(concrete, 8, sz);
                 if (lo_slot.is_valid() && hi_slot.is_valid()) {
-                    mut slots_dp: LType[] = [];
+                    mut slots_dp: [LType] = [];
                     slots_dp.push(lo_slot);
                     slots_dp.push(hi_slot);
                     return ParamPlan {
@@ -486,7 +486,7 @@ type struct AbiClassifier {
 
         // Non-aggregate, or an aggregate whose eightbyte classification
         // bailed: plain `Direct` of the mapped LLVM type.
-        mut slots: LType[] = [];
+        mut slots: [LType] = [];
         const lty: LType = tm.map_type(t);
         if (lty.is_valid()) { slots.push(lty); }
         return ParamPlan {
@@ -525,7 +525,7 @@ type struct AbiClassifier {
             // Empty aggregate: same fall-through as the SysV path; the
             // caller's loop emits a plain Direct of the mapped LLVM
             // type, which on an empty struct is a no-op slot list.
-            mut slots: LType[] = [];
+            mut slots: [LType] = [];
             const lty: LType = tm.map_type(t);
             if (lty.is_valid()) { slots.push(lty); }
             return ParamPlan {
@@ -538,7 +538,7 @@ type struct AbiClassifier {
         }
         // 3, 5, 6, 7, or > 8: ByVal pointer.
         const pointee: LType = tm.map_type(t);
-        mut slots: LType[] = [];
+        mut slots: [LType] = [];
         slots.push(LType::pointer_to(LType::i8()));
         return ParamPlan {
             cryo_type:  t,
@@ -564,7 +564,7 @@ type struct AbiClassifier {
             return this.classify_small_aggregate_int(t, sz);
         }
         if (sz == 0) {
-            mut slots: LType[] = [];
+            mut slots: [LType] = [];
             const lty: LType = tm.map_type(t);
             if (lty.is_valid()) { slots.push(lty); }
             return ParamPlan {
@@ -577,7 +577,7 @@ type struct AbiClassifier {
         }
         // 3, 5, 6, 7, or > 8: SRet pointer.
         const pointee: LType = tm.map_type(t);
-        mut slots: LType[] = [];
+        mut slots: [LType] = [];
         slots.push(LType::pointer_to(LType::i8()));
         return ParamPlan {
             cryo_type:  t,
@@ -620,7 +620,7 @@ type struct AbiClassifier {
         // demoted `struct { struct { f64 } inner; f64 y; }` (and similar)
         // to INTEGER class, so the value crossed the C ABI in GP registers
         // while clang/gcc used XMM - silently corrupting extern-C interop.
-        const leaves: AbiLeaf[] = this.collect_abi_leaves(ty, 0, 0);
+        const leaves: [AbiLeaf] = this.collect_abi_leaves(ty, 0, 0);
 
         mut count: i64 = 0;
         mut all_floats: boolean = true;
@@ -668,11 +668,11 @@ type struct AbiClassifier {
     /// float buried inside a nested aggregate still contributes SSE class
     /// to its eightbyte - matching how clang/gcc classify SysV
     /// eightbytes.  Everything else (ints, pointers, enums, tuples,
-    /// optionals, dynamic-array fat pointers) becomes a single
+    /// optionals) becomes a single
     /// INTEGER-class leaf.  `depth` guards against pathological /
     /// recursive value types (which the front end can currently accept).
-    collect_abi_leaves(mut &this, ty: Type*, base: u64, depth: i32) -> AbiLeaf[] {
-        mut out: AbiLeaf[] = [];
+    collect_abi_leaves(mut &this, ty: Type*, base: u64, depth: i32) -> [AbiLeaf] {
+        mut out: [AbiLeaf] = [];
         if (ty == null || depth > 16) { return out; }
         const arena: TypeArena* = this.type_mapper.arena;
 
@@ -715,7 +715,7 @@ type struct AbiClassifier {
                 const st: StructType* = c as StructType*;
                 for (mut i: i64 = 0; i < st.fields.length; i++) {
                     const ft: Type* = arena.lookup(st.fields[i].field_type);
-                    const sub: AbiLeaf[] = this.collect_abi_leaves(
+                    const sub: [AbiLeaf] = this.collect_abi_leaves(
                         ft, base + st.fields[i].offset, depth + 1);
                     for (mut j: i64 = 0; j < sub.length; j++) { out.push(sub[j]); }
                 }
@@ -724,7 +724,7 @@ type struct AbiClassifier {
                 const ct: ClassType* = c as ClassType*;
                 for (mut i: i64 = 0; i < ct.fields.length; i++) {
                     const ft: Type* = arena.lookup(ct.fields[i].field_type);
-                    const sub: AbiLeaf[] = this.collect_abi_leaves(
+                    const sub: [AbiLeaf] = this.collect_abi_leaves(
                         ft, base + ct.fields[i].offset, depth + 1);
                     for (mut j: i64 = 0; j < sub.length; j++) { out.push(sub[j]); }
                 }
@@ -734,14 +734,14 @@ type struct AbiClassifier {
                 const elem: Type* = arena.lookup(at.element);
                 mut stride: u64 = 0;
                 if (elem != null) { stride = elem.size_bytes(); }
-                if (at.is_fixed() && elem != null && stride > 0) {
+                if (elem != null && stride > 0) {
                     for (mut k: i64 = 0; k < at.size; k++) {
-                        const sub: AbiLeaf[] = this.collect_abi_leaves(
+                        const sub: [AbiLeaf] = this.collect_abi_leaves(
                             elem, base + (k as u64) * stride, depth + 1);
                         for (mut j: i64 = 0; j < sub.length; j++) { out.push(sub[j]); }
                     }
                 } else {
-                    // Dynamic array (fat pointer) or unsized element => INTEGER.
+                    // An unsized element => INTEGER.
                     out.push(AbiLeaf { offset: base, is_float: false, is_f32: false });
                 }
             }
@@ -771,7 +771,7 @@ type struct AbiClassifier {
         const tm: TypeMapper* = this.type_mapper;
         const orig: LType = tm.map_type(t);
         const int_slot: LType = AbiClassifier::eightbyte_integer_type(size_bytes);
-        mut slots: LType[] = [];
+        mut slots: [LType] = [];
         slots.push(int_slot);
         return ParamPlan {
             cryo_type:  t,
@@ -796,7 +796,7 @@ type struct AbiClassifier {
     classify_return(mut &this, t: TypeRef) -> ParamPlan {
         const tm: TypeMapper* = this.type_mapper;
         if (!t.is_valid()) {
-            mut slots: LType[] = [];
+            mut slots: [LType] = [];
             slots.push(LType::void_type());
             return ParamPlan {
                 cryo_type:  t,
@@ -809,7 +809,7 @@ type struct AbiClassifier {
         const arena: TypeArena* = tm.arena;
         const ty: Type* = arena.lookup(t);
         if (ty == null || ty.kind == TypeKind::Void || ty.kind == TypeKind::Unit) {
-            mut slots: LType[] = [];
+            mut slots: [LType] = [];
             slots.push(LType::void_type());
             return ParamPlan {
                 cryo_type:  t,
@@ -862,7 +862,7 @@ type struct AbiClassifier {
             if (sz > 16) {
                 // Phase 1: large aggregate -> sret.
                 const pointee: LType = tm.map_type(t);
-                mut slots: LType[] = [];
+                mut slots: [LType] = [];
                 slots.push(LType::pointer_to(LType::i8()));
                 return ParamPlan {
                     cryo_type:  t,
@@ -877,7 +877,7 @@ type struct AbiClassifier {
                 const orig: LType = tm.map_type(t);
                 const slot: LType = this.eightbyte_slot_type(concrete, 0, sz);
                 if (slot.is_valid()) {
-                    mut slots_d: LType[] = [];
+                    mut slots_d: [LType] = [];
                     slots_d.push(slot);
                     return ParamPlan {
                         cryo_type:  t,
@@ -894,7 +894,7 @@ type struct AbiClassifier {
                 const lo_slot: LType = this.eightbyte_slot_type(concrete, 0, 8);
                 const hi_slot: LType = this.eightbyte_slot_type(concrete, 8, sz);
                 if (lo_slot.is_valid() && hi_slot.is_valid()) {
-                    mut slots_dp: LType[] = [];
+                    mut slots_dp: [LType] = [];
                     slots_dp.push(lo_slot);
                     slots_dp.push(hi_slot);
                     return ParamPlan {
@@ -909,7 +909,7 @@ type struct AbiClassifier {
         }
 
         const lty: LType = tm.map_type(t);
-        mut slots: LType[] = [];
+        mut slots: [LType] = [];
         slots.push(lty);
         return ParamPlan {
             cryo_type:  t,
@@ -1166,7 +1166,7 @@ type struct AbiClassifier {
     /// DirectPair params the ordinal no longer equals the LLVM slot index,
     /// and a `byval(%T)` attached at the wrong index lands on an incompatible
     /// (non-pointer) slot - an LLVM verifier failure.
-    static llvm_slot_index_of_param(param_plans: &ParamPlan[],
+    static llvm_slot_index_of_param(param_plans: &[ParamPlan],
                                       sret: boolean, param_idx: i64) -> u32 {
         mut idx: u32 = if (sret) { 1 } else { 0 } as u32;
         mut i: i64 = 0;
@@ -1184,7 +1184,7 @@ type struct AbiClassifier {
     /// `return_plan` / `param_plans` are borrowed: this only reads the plans to
     /// assemble the LLVM type, so the caller keeps ownership for the SignaturePlan.
     static build_llvm_fn_type(return_plan:  &ParamPlan,
-                                param_plans:  &ParamPlan[],
+                                param_plans:  &[ParamPlan],
                                 is_variadic:  boolean) -> LType {
         // Step 1: pick the LLVM return type.  `Indirect` returns become
         // `void` because the value is written through the hidden sret

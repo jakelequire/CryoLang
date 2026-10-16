@@ -145,8 +145,8 @@ mut g_current_reactor: Reactor* = null;
 /// and parked futures hold raw pointers to it, and the backend hands the OS
 /// interior addresses, so it must not move.
 type struct Reactor {
-    mtx:      u8[40];              // guards the table (pthread_mutex_t / SRWLOCK)
-    buckets:  Registration*[64];   // REG_BUCKETS chains, keyed by `fd & 63`
+    mtx:      [u8; 40];              // guards the table (pthread_mutex_t / SRWLOCK)
+    buckets:  [Registration*; 64];   // REG_BUCKETS chains, keyed by `fd & 63`
     poll_h:   i64;                 // epoll fd (Linux) / completion port (Windows)
     kick_h:   i64;                 // eventfd (Linux) / unused (Windows)
     aux_h:    i64;                 // unused (Linux) / AFD helper handle (Windows)
@@ -344,8 +344,8 @@ type struct Reactor {
     /// fire the wakers of every descriptor that became ready. The reactor thread
     /// calls this in a loop.
     poll_once(mut &this, timeout_ms: i32) -> void {
-        mut fds:   i32[64] = [0; 64];
-        mut ready: u32[64] = [0; 64];
+        mut fds:   [i32; 64] = [0; 64];
+        mut ready: [u32; 64] = [0; 64];
         const n: i32 = rt_wait(&this, &fds[0], &ready[0], RT_MAX_EVENTS, timeout_ms);
         for (mut i: i32 = 0; i < n; i = i + 1) {
             this.dispatch(fds[i], ready[i]);
@@ -616,7 +616,7 @@ private function rt_mtx_destroy(b: u8*) -> void { }
 /// Start the reactor thread on `rt`, returning its joinable id/handle.
 ![target(unix)]
 private function rt_thread_spawn(rt: Reactor*) -> u64 {
-    mut tbuf: u8[8] = [0; 8];
+    mut tbuf: [u8; 8] = [0; 8];
     const t: (u8*) -> u8* = reactor_tramp;
     if (libc::pthread_create(&tbuf[0], null, t as void*, rt as u8*) != 0) {
         panic("Reactor::start: reactor thread creation failed", FILE, LINE);
@@ -680,7 +680,7 @@ private function rt_backend_open(rt: Reactor*) -> boolean {
         libc::close(ep);
         return false;
     }
-    mut slot: u8[12] = [0; 12];
+    mut slot: [u8; 12] = [0; 12];
     epoll_event_pack(&slot[0], libc::EPOLLIN, ev as u32);
     if (libc::epoll_ctl(ep, libc::EpollOp::EPOLL_CTL_ADD, ev, &slot[0]) != 0) {
         libc::close(ev);
@@ -710,7 +710,7 @@ private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
     if ((reg.interest & INTEREST_WRITE) != 0) {
         events = events | libc::EPOLLOUT;
     }
-    mut slot: u8[12] = [0; 12];
+    mut slot: [u8; 12] = [0; 12];
     epoll_event_pack(&slot[0], events, reg.fd as u32);
     mut op: EpollOp = libc::EpollOp::EPOLL_CTL_MOD;
     if (!reg.backend_added) { op = libc::EpollOp::EPOLL_CTL_ADD; }
@@ -725,7 +725,7 @@ private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
 private function rt_disarm(rt: Reactor*, reg: Registration*) -> void {
     if (!reg.backend_added) { return; }
     // Pre-2.6.9 kernels reject a null event on DEL; pass a scratch one.
-    mut slot: u8[12] = [0; 12];
+    mut slot: [u8; 12] = [0; 12];
     libc::epoll_ctl(rt.poll_h as i32, libc::EpollOp::EPOLL_CTL_DEL, reg.fd, &slot[0]);
     reg.backend_added = false;
 }
@@ -747,7 +747,7 @@ private function rt_kick(rt: Reactor*) -> void {
 ![target(unix)]
 private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
                          max: i32, timeout_ms: i32) -> i32 {
-    mut buf: u8[768] = [0; 768];   // RT_MAX_EVENTS * sizeof(struct epoll_event)
+    mut buf: [u8; 768] = [0; 768];   // RT_MAX_EVENTS * sizeof(struct epoll_event)
     mut cap: i32 = max;
     if (cap > RT_MAX_EVENTS) { cap = RT_MAX_EVENTS; }
     const n: i32 = libc::epoll_wait(rt.poll_h as i32, &buf[0], cap, timeout_ms);
@@ -814,8 +814,8 @@ private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
 /// byte arrays would only be byte-aligned when it comes off the heap.
 ![target(windows)]
 type struct AfdOp {
-    ovl:  u64[4];   // OVERLAPPED (32 bytes), doubling as the IO_STATUS_BLOCK
-    info: u64[4];   // AFD_POLL_INFO (32 bytes) carrying exactly one handle
+    ovl:  [u64; 4];   // OVERLAPPED (32 bytes), doubling as the IO_STATUS_BLOCK
+    info: [u64; 4];   // AFD_POLL_INFO (32 bytes) carrying exactly one handle
     fd:   i32;      // descriptor this poll was armed for
 }
 
@@ -865,12 +865,12 @@ private function rt_backend_open(rt: Reactor*) -> boolean {
     const iocp: u8* = syscall::CreateIoCompletionPort(invalid, null, 0, 0);
     if (iocp == null) { return false; }
 
-    mut path: u16[64] = [0; 64];
+    mut path: [u16; 64] = [0; 64];
     const chars: u32 = afd_device_path(&path[0]);
 
     // UNICODE_STRING { u16 Length; u16 MaximumLength; u8* Buffer } — Length is
     // in BYTES, not characters.
-    mut uni_buf: u64[2] = [0; 2];
+    mut uni_buf: [u64; 2] = [0; 2];
     const uni: u8* = &uni_buf[0] as u8*;
     *(uni as u16*)         = (chars * 2) as u16;
     *((uni + 2) as u16*)   = (chars * 2) as u16;
@@ -879,12 +879,12 @@ private function rt_backend_open(rt: Reactor*) -> boolean {
     // OBJECT_ATTRIBUTES { u32 Length; u8* RootDirectory; u8* ObjectName;
     //                     u32 Attributes; u8* SecurityDescriptor;
     //                     u8* SecurityQualityOfService }
-    mut oa_buf: u64[6] = [0; 6];
+    mut oa_buf: [u64; 6] = [0; 6];
     const oa: u8* = &oa_buf[0] as u8*;
     *(oa as u32*)         = syscall::SIZEOF_OBJECT_ATTRIBUTES as u32;
     *((oa + 16) as u64*)  = uni as u64;
 
-    mut iosb_buf: u64[2] = [0; 2];
+    mut iosb_buf: [u64; 2] = [0; 2];
     const iosb: u8* = &iosb_buf[0] as u8*;
     mut afd:  u8*    = null;
     const st: u32 = syscall::NtCreateFile(&afd, syscall::SYNCHRONIZE, oa, iosb,
@@ -918,7 +918,7 @@ private function rt_backend_close(rt: Reactor*) -> void {
     }
     if (rt.poll_h >= 0) {
         const iocp: u8* = rt.poll_h as u8*;
-        mut entries: u8[1024] = [0; 1024];   // 32 * SIZEOF_OVERLAPPED_ENTRY
+        mut entries: [u8; 1024] = [0; 1024];   // 32 * SIZEOF_OVERLAPPED_ENTRY
         loop {
             mut removed: u32 = 0;
             if (syscall::GetQueuedCompletionStatusEx(iocp, &entries[0], 32,
@@ -1022,7 +1022,7 @@ private function rt_kick(rt: Reactor*) -> void {
 private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
                          max: i32, timeout_ms: i32) -> i32 {
     if (rt.poll_h < 0) { return 0; }
-    mut entries: u8[2048] = [0; 2048];   // RT_MAX_EVENTS * SIZEOF_OVERLAPPED_ENTRY
+    mut entries: [u8; 2048] = [0; 2048];   // RT_MAX_EVENTS * SIZEOF_OVERLAPPED_ENTRY
     mut cap: i32 = max;
     if (cap > RT_MAX_EVENTS) { cap = RT_MAX_EVENTS; }
     // A negative timeout means "wait indefinitely", which Win32 spells INFINITE.

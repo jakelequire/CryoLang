@@ -19,7 +19,7 @@ import compiler::codegen::visit::{
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index;
-import compiler::decl_index::{ GlobalEntry };
+import compiler::decl_index::{ DeclarationIndex, GlobalEntry, OverloadId };
 import compiler::module_graph;
 import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
@@ -46,7 +46,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDeclNode, FunctionDeclNode,
-    ImplBlockNode, StructDeclNode, UnionDeclNode, VarDeclNode
+    ImplBlockNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     CalleePin,
@@ -67,7 +67,7 @@ import compiler::ast::statement::{
 };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{
-    LBasicBlock, LContext, LTargetMachine, LType, LTypeKind, LValue
+    LBasicBlock, LContext, LLinkage, LTargetMachine, LType, LTypeKind, LValue
 };
 import compiler::codegen::ops::ir_flow_emitter::{ ForBlocks, IfBlocks, LoopBlocks };
 import compiler::codegen::util::{ CodegenUtil };
@@ -237,7 +237,7 @@ public:
         cdebug("[IRGen] Phase 2: done\n"); libc::fflush(null);
 
         cdebug("[IRGen] Phase 3: generate bodies (%lld stmts)...\n", program.statements.length); libc::fflush(null);
-        const stmts: &ASTNode*[] = &program.statements;
+        const stmts: &[ASTNode*] = &program.statements;
         for (mut i: i64 = 0; i < stmts.length; i++) {
             const stmt: ASTNode* = stmts[i];
             if (stmt == null) { continue; }
@@ -253,8 +253,38 @@ public:
         }
 
         cdebug("[IRGen] Phase 3: all bodies done\n"); libc::fflush(null);
+        this.emit_inline_copies();
         this.decl_visit.emit_global_initializers(this);
         return true;
+    }
+
+    /// Emit this module's copy of every `![inline]` body another module
+    /// defines and this one calls, `available_externally`: the optimizer
+    /// inlines it and discards it, and the defining module's definition
+    /// answers any call left.  A copy's own calls may queue more copies.
+    emit_inline_copies(mut &this) -> void {
+        const di: DeclarationIndex* = this.cg.ctx.decl_index;
+        mut k: i64 = 0;
+        while (k < this.cg.resolver.inline_copies.length) {
+            const id: OverloadId = this.cg.resolver.inline_copies[k];
+            k += 1;
+            match (di.inline_body(id)) {
+                Option::Some(body) => {
+                    const d: ASTNode* = di.entry_decl(id);
+                    if (d != null && d.kind == NodeKind::MethodDeclaration) {
+                        this.state.current_impl_target = body.owner;
+                        this.decl_visit.generate_method_body(this, d as MethodNode*, body.base);
+                        this.state.current_impl_target = TypeRef::invalid();
+                    } else if (d != null && d.kind == NodeKind::FunctionDeclaration) {
+                        this.decl_visit.generate_function_body(this, d as FunctionDeclNode*);
+                    }
+                    const fn_val: LValue = this.cg.functions.get(di.entry_symbol(id).spelling());
+                    fn_val.set_linkage(LLinkage::AvailableExternally);
+                    this.cg.abi.apply_inline_attribute(fn_val);
+                }
+                Option::None => { }
+            }
+        }
     }
 
 
@@ -350,9 +380,9 @@ public:
         const nops: i64 = node.operands.length;
 
         // Classify operands by direction.
-        mut out_idx: i64[] = [];    // Out and InOut, source order
-        mut in_idx: i64[] = [];     // pure In, source order
-        mut tied_idx: i64[] = [];   // InOut, source order
+        mut out_idx: [i64] = [];    // Out and InOut, source order
+        mut in_idx: [i64] = [];     // pure In, source order
+        mut tied_idx: [i64] = [];   // InOut, source order
         for (mut k: i64 = 0; k < nops; k++) {
             const op: AsmOperand* = node.operands[k];
             if (op.direction == AsmOpDir::In) {
@@ -370,7 +400,7 @@ public:
         }
 
         // Template number per source operand.
-        mut tmpl_num: i64[] = [];
+        mut tmpl_num: [i64] = [];
         for (mut k: i64 = 0; k < nops; k++) { tmpl_num.push(-1); }
         for (mut p: i64 = 0; p < out_idx.length; p++) { tmpl_num[out_idx[p]] = p; }
         for (mut p: i64 = 0; p < in_idx.length; p++) {
@@ -439,9 +469,9 @@ public:
         // inputs (current values).  Indirect memory operands (`*m`) pass a
         // pointer and require an `elementtype(T)` call-site attribute (LLVM
         // opaque pointers); record their arg index + pointee type here.
-        mut arg_vals: LValue[] = [];
-        mut mem_arg_idx: i64[] = [];
-        mut mem_arg_pointee: LType[] = [];
+        mut arg_vals: [LValue] = [];
+        mut mem_arg_idx: [i64] = [];
+        mut mem_arg_pointee: [LType] = [];
         for (mut p: i64 = 0; p < out_idx.length; p++) {
             const op: AsmOperand* = node.operands[out_idx[p]];
             if (op.constraint == AsmConstraintKind::Memory) {
@@ -482,7 +512,7 @@ public:
         }
 
         // Return type = the direct (register) outputs, in output order.
-        mut direct_out: i64[] = [];   // positions within out_idx that are direct
+        mut direct_out: [i64] = [];   // positions within out_idx that are direct
         for (mut p: i64 = 0; p < out_idx.length; p++) {
             const op: AsmOperand* = node.operands[out_idx[p]];
             if (op.constraint != AsmConstraintKind::Memory) { direct_out.push(p); }
@@ -671,7 +701,7 @@ public:
     /// `abort` trap so the failure unwinds and the frame's live locals drop.
     /// `sched` is the match node's `unwind_cleanup` (empty => plain call).
     /// Shared by the statement and expression match forms.
-    emit_no_match_raise(mut &this, span: SourceSpan, sched: ASTNode*[]*) -> void {
+    emit_no_match_raise(mut &this, span: SourceSpan, sched: [ASTNode*]*) -> void {
         this.cg.expr_ops.emit_check_raise(this, sched, span,
             "no matching pattern (non-exhaustive match)");
     }
@@ -707,7 +737,7 @@ public:
         // set traps cleanly instead of falling through into the next function
         // in the binary (which is what bug-in-the-wild triggered when a garbage
         // SocketAddr's IpAddr discriminant was neither V4 nor V6).
-        mut arm_bbs: LBasicBlock[] = [];
+        mut arm_bbs: [LBasicBlock] = [];
         for (mut i: i64 = 0; i < num_arms; i++) {
             const name: string = fmt::format("match.arm%lld", i);
             arm_bbs.push(LBasicBlock::append(current_fn, name));
@@ -792,7 +822,7 @@ public:
             if (this.cg.ctx.options.unwinds() && !this.cg.intrinsics.no_runtime) {
                 this.emit_no_match_raise(node.span, &node.unwind_cleanup);
             } else {
-                mut no_ops: LValue[] = [];
+                mut no_ops: [LValue] = [];
                 this.cg.intrinsics.emit_check_sink(MangledName::new("__cryo_panic_no_match"),
                                                    node.span, &no_ops);
             }
@@ -874,8 +904,8 @@ public:
         const ty: Type* = this.cg.arena_type(node.resolved_type);
         if (ty == null) { return; }
 
-        const empty_fields: FieldInfo[] = [];
-        mut fields_arr: &FieldInfo[] = &empty_fields;
+        const empty_fields: [FieldInfo] = [];
+        mut fields_arr: &[FieldInfo] = &empty_fields;
         if (ty.kind == TypeKind::Struct) {
             const st: StructType* = ty as StructType*;
             fields_arr = &st.fields;
@@ -1022,9 +1052,19 @@ public:
     /// Look up a named value (local, parameter, or global).
     codegen_identifier(mut &this, node: IdentifierNode*) -> void {
         // A source-location pseudo-constant expands to the location of the
-        // reference itself, which is the node's own span.
+        // reference itself, which is the node's own span - or, in the body
+        // of a `![caller_location]` function, to its caller's, which the
+        // call passed.
         match (node.res) {
             ResSlot::Answered(Res::SourceLoc(k)) => {
+                if (this.cg.decl.caller_file.is_valid()) {
+                    this.state.last_value = match (k) {
+                        SourceLoc::File => { this.cg.decl.caller_file }
+                        SourceLoc::Line => { this.cg.decl.caller_line }
+                    };
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
                 match (k) {
                     SourceLoc::File => {
                         mut filename: string = node.span.file;
@@ -1088,7 +1128,7 @@ public:
     /// Materialize a struct literal `{ field: value, ... }` into a stack alloca
     /// and store each field.  Writes the alloca's address to `this.state.last_value`
     /// with `this.state.last_is_lvalue=true`; rvalue users load through it.
-    codegen_struct_literal(mut &this, struct_type: TypeRef, field_names: SymbolStr[], field_pins: MemberPin[], field_values: LValue[], site_span: SourceSpan) -> void {
+    codegen_struct_literal(mut &this, struct_type: TypeRef, field_names: [SymbolStr], field_pins: [MemberPin], field_values: [LValue], site_span: SourceSpan) -> void {
         const ty: LType = this.cg.type_mapper.map_type(struct_type);
         if (!ty.is_valid()) {
             this.state.last_value = LValue::null();
@@ -1150,14 +1190,7 @@ public:
             }
         }
 
-        // Store each field value at its GEP index.  If a field expects a
-        // dynamic-array fat pointer (`{T*, i64, i64}`) but the value is a
-        // fixed LLVM array (`[N x T]`; happens when the source literal
-        // `[a, b, c]` resolved to a fixed ArrayType but the field is
-        // dynamic), convert by malloc'ing a buffer, memcpy'ing the literal
-        // contents, and packaging into a fat pointer.  Without this, the
-        // store writes only the first few bytes of the field, leaving the
-        // rest uninitialised, and downstream `provisions[k]` reads garbage.
+        // Store each field value at its GEP index.
         const t: Type* = this.cg.arena_type(struct_type);
         // Each initializer carries the coordinates of the field it names -
         // `(depth, index)`, a base class's field included - and the slot is
@@ -1237,7 +1270,6 @@ public:
             const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, slot, "field");
             mut val: LValue = field_values[i];
             if (val.is_valid()) {
-                val = this.cg.expr_ops.coerce_fixed_array_to_fat_ptr(val, pin_field.field_type);
                 // Widen/narrow integer literals to the field's declared
                 // width before storing.  `HashMap { len: 0, cap: 0, ... }`
                 // arrives with each `0` as `i32 0` (codegen_literal defaults
@@ -1292,7 +1324,7 @@ public:
 
     /// Materialize a tuple literal `(a, b, c)` into a stack alloca and store
     /// each element.  Same lvalue convention as `codegen_struct_literal`.
-    codegen_tuple_literal(mut &this, tuple_type: TypeRef, element_values: LValue[], site_span: SourceSpan) -> void {
+    codegen_tuple_literal(mut &this, tuple_type: TypeRef, element_values: [LValue], site_span: SourceSpan) -> void {
         const ty: LType = this.cg.type_mapper.map_type(tuple_type);
         if (!ty.is_valid()) {
             this.state.last_value = LValue::null();
@@ -1413,34 +1445,16 @@ public:
             this.state.last_is_lvalue = false;
         } else if (src_t != null && dst_is_ptr_like &&
                    src_t.kind == TypeKind::Array) {
-            // Array -> Pointer / String: extract the data-pointer
-            // field from the fat-pointer `{ptr, i64}` struct.
-            // Fixed arrays (`[N x T]`) don't have a fat pointer;
-            // their lvalue is already a pointer to the storage, so
-            // pointer-cast that directly.  For dynamic arrays we
-            // need an explicit extract to avoid the illegal
-            // `bitcast { ptr, i64 } to ptr` that the generic path
-            // emits.
-            const arr_t: ArrayType* = src_t as ArrayType*;
+            // A fixed array (`[N x T]`) to a pointer or a string: its
+            // lvalue is already a pointer to the storage, so pointer-cast
+            // that.
             const dst_lty: LType = this.cg.type_mapper.map_type(node.resolved_target);
-            if (arr_t.is_fixed()) {
-                const addr: LValue = this.dispatch.codegen_lvalue(this,node.expression);
-                if (addr.is_valid() && dst_lty.is_valid()) {
-                    this.state.last_value = this.cg.builder.build_pointer_cast(
-                        addr, dst_lty, "arrcast");
-                } else {
-                    this.state.last_value = addr;
-                }
+            const addr: LValue = this.dispatch.codegen_lvalue(this,node.expression);
+            if (addr.is_valid() && dst_lty.is_valid()) {
+                this.state.last_value = this.cg.builder.build_pointer_cast(
+                    addr, dst_lty, "arrcast");
             } else {
-                const val: LValue = this.dispatch.codegen_rvalue(this,node.expression);
-                const data_ptr: LValue = this.cg.builder.build_extract_value(
-                    val, 0, "arrdata");
-                if (data_ptr.is_valid() && dst_lty.is_valid()) {
-                    this.state.last_value = this.cg.builder.build_pointer_cast(
-                        data_ptr, dst_lty, "arrcast");
-                } else {
-                    this.state.last_value = data_ptr;
-                }
+                this.state.last_value = addr;
             }
             this.state.last_is_lvalue = false;
         } else {
@@ -1515,7 +1529,7 @@ public:
     /// `map_tuple` (anonymous LLVM struct of element types in order).
     override visit(mut &this, node: TupleLiteralNode*) -> void {
         const type_ref: TypeRef = node.resolved_type;
-        mut element_values: LValue[] = [];
+        mut element_values: [LValue] = [];
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             element_values.push(this.dispatch.codegen_rvalue(this,node.elements[i]));
         }
@@ -1527,9 +1541,9 @@ public:
         // literal to from the name layer's stamp, and codegen does not resolve
         // the spelling again.
         const type_ref: TypeRef = node.resolved_type;
-        mut field_names: SymbolStr[] = [];
-        mut field_pins: MemberPin[] = [];
-        mut field_values: LValue[] = [];
+        mut field_names: [SymbolStr] = [];
+        mut field_pins: [MemberPin] = [];
+        mut field_values: [LValue] = [];
         for (mut i: i64 = 0; i < node.field_inits.length; i++) {
             const init: FieldInit = node.field_inits[i];
             field_names.push(init.field_name);
@@ -1540,7 +1554,7 @@ public:
     }
 
     /// Array literal: delegate to ArrayLitEmitter, which handles all three
-    /// shapes (fixed `[a,b,c]`, dynamic `[a,b,c]: T[]`, fill `[v; N]`).
+    /// shapes (fixed `[a,b,c]`, dynamic `[a,b,c]: [T]`, fill `[v; N]`).
     /// Element recursion flows through `dispatch.codegen_rvalue`; result
     /// lands on `state.last_value`.
     override visit(mut &this, node: ArrayLiteralNode*) -> void {
@@ -1622,7 +1636,7 @@ public:
         const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, node.resolved_member);
         if (variant == null) { return false; }
 
-        mut no_args: LValue[] = [];
+        mut no_args: [LValue] = [];
         this.state.last_value = this.enum_variant.build(et, variant, real_ref, no_args);
         this.state.last_is_lvalue = false;
         return true;
@@ -1697,7 +1711,7 @@ public:
         const num_arms: i64 = node.arms.length;
 
         // Create basic blocks: one per arm + a no_match trap + merge.
-        mut arm_bbs: LBasicBlock[] = [];
+        mut arm_bbs: [LBasicBlock] = [];
         for (mut i: i64 = 0; i < num_arms; i++) {
             arm_bbs.push(LBasicBlock::append(current_fn, fmt::format("mexpr.arm%lld", i)));
         }
@@ -1815,7 +1829,7 @@ public:
             if (this.cg.ctx.options.unwinds() && !this.cg.intrinsics.no_runtime) {
                 this.emit_no_match_raise(node.span, &node.unwind_cleanup);
             } else {
-                mut no_ops_e: LValue[] = [];
+                mut no_ops_e: [LValue] = [];
                 this.cg.intrinsics.emit_check_sink(MangledName::new("__cryo_panic_no_match"),
                                                    node.span, &no_ops_e);
             }

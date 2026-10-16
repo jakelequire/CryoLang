@@ -334,22 +334,32 @@ Reading the value a reference refers to is explicit in arithmetic and comparison
 
 ### 2.4 Array Types
 
-Two distinct things share the word "array" in Cryo: the **raw array type** (a low-level fixed buffer) and the **growable `Array<T>`** in the standard library.
+Cryo has two array types: the **fixed array** `[T; N]`, which holds its `N` elements in place, and the **dynamic array** `[T]`, growable and heap-backed.  The dynamic array is the standard library's `Array<T>` with the default allocator: `[T]` is a spelling of that type, not a second one, so a `[T]` and an `Array<T>` are interchangeable everywhere.  An array with another allocator is written out, `Array<T, A>`; `[T]` never names one.
+
+An array type is written in brackets: `[T]` is a dynamic array and `[T; N]` a fixed one of `N` elements.  The element between the brackets is a whole type, so `[&Node]` is an array of references, `&[Node*]` a reference to an array of pointers, `[(i32) -> i32]` an array of functions, and `[[u64; 2]; 3]` three rows of `[u64; 2]` - the length written nearest the element belongs to the inner array.  A `,` after the first type, `[T, U]`, is refused (E0104): a tuple is written `(T, U)`.
+
+An array is never written after its element: a type followed by `[` is refused (E0104, "array types are written `[T]`: write `[i64]`"), and the diagnostic carries the bracketed spelling as a fix that an editor can apply.  The fix writes nested lengths outside-in, so `u64[2][3]` becomes `[[u64; 2]; 3]`, and drops parentheses the brackets make unnecessary, so `(&Node)[]` becomes `[&Node]`.  `new u8[n]` is not an array type but an allocation yielding a pointer ([section 15](#15-pointers-and-memory)), and keeps its spelling.
 
 ```cryo
-const buf:    int[16];     // raw fixed-size buffer of 16 ints
-const dyn:    int[];       // raw dynamic array (FFI / unsized)
-mut   v:      Array<int>;  // growable, heap-backed; from collections::array
+const buf: [int; 16];   // fixed: 16 ints held in place
+mut   v:   [int];       // dynamic: `Array<int>`, growable, heap-backed
+mut   w:   Array<int>;  // the same type as `v`, written out
 ```
 
-For everything except FFI and stack-allocated scratch buffers, prefer `Array<T>` from the standard library. The shorthand `T[]` desugars to `Array<T>` in expression position when the prelude is loaded.
+A fixed array does not convert to a dynamic one: `const d: [int] = buf;` is refused (E0200).  A dynamic array has `Array`'s methods, iterates with `for` as `Array` does, and is indexed through `Array`'s `Index` implementations: `xs[i]` is `*(xs.index(i))`, for an index of any integer type, in a generic body as anywhere else.  An index out of range panics, and the report names the `xs[i]` that wrote it (`![caller_location]`, [section 4.5](#45-intrinsic-functions)).
 
-The `N` in `T[N]` is a **compile-time integer**: an integer literal, a named `const` (declared in this module or another, written bare or qualified), an enum variant, a cast between integer types, or arithmetic, comparison, logical, and bitwise operators over those. The repeat expression `[value; N]` accepts exactly the same set and yields `T[N]`, so a field and the initializer that fills it can share one name for their length; a count that is *not* a compile-time integer is legal there and yields a dynamic `T[]` sized at run time. A size that is neither is E0239.
+Diagnostics and the editor spell an array the way the annotation that declared it wrote it: one written `[i32]` shows as `[i32]`, one written `Array<i32>` as `Array<i32>`.  The spelling is for display only.  A type no annotation wrote, an inferred one, shows as `[T]` when its allocator is the default and as `Array<T, A>` otherwise.
+
+An array literal written where an `Array<T>` with the default allocator is expected builds that array, in every form: `[a, b]`, `[]`, and `[value; n]` with `n` fixed or known only at run time.  The literal allocates the storage, so an `Array<T, A>` with another allocator is not initialised by one.
+
+An array's `length` and `capacity`, read as fields or through `length()` and `capacity()`, are `i64`.  `Array`'s methods take an index or an element count as a `u64`.
+
+The `N` in `[T; N]` is a **compile-time integer**: an integer literal, a named `const` (declared in this module or another, written bare or qualified), an enum variant, a cast between integer types, or arithmetic, comparison, logical, and bitwise operators over those. The repeat expression `[value; N]` accepts exactly the same set and yields `[T; N]`, so a field and the initializer that fills it can share one name for their length; a count that is *not* a compile-time integer is legal there and yields a dynamic `[T]` sized at run time. A size that is neither is E0239. `value` is evaluated once and the same bits are stored in every slot, so its type must be a plain-copy type (one that satisfies `Copy`); an element that releases what it owns would be released once per slot, and is refused (E0453).
 
 ```cryo
 const CAPACITY: i64 = 512;
-type struct Grid { cells: boolean[CAPACITY]; }
-const cells: boolean[CAPACITY] = [false; CAPACITY];
+type struct Grid { cells: [boolean; CAPACITY]; }
+const cells: [boolean; CAPACITY] = [false; CAPACITY];
 ```
 
 `sizeof`/`alignof` are **not** available in this position: an array's size is fixed before any layout is computed. `static_assert` runs after layouts exist and does accept them ([section 18.5](#185-compile-time-layout-assertions-static_assert)).
@@ -558,10 +568,8 @@ equivalent `t[0]`, `t[1]`) - and the index is checked against the tuple's arity
 at compile time. Chained access like `t.1.0` works (element 1, then element 0 of
 that).
 
-> **Note:** a pre-1.0 bracket spelling, `[T, U]`, was previously accepted in
-> type position. It has been removed - a leading `[` in a type is now an error.
-> Write `(T, U)`. (The array suffixes `T[]` / `T[N]` are unaffected: they are
-> postfix on an existing type, not a leading bracket.)
+> **Note:** a leading `[` in a type starts an array type, `[T]` or `[T; N]`,
+> so `[T, U]` is refused (E0104). Write `(T, U)`.
 
 ### 2.7 The Unit Type
 
@@ -619,7 +627,7 @@ variable, parameter, return type, struct field, and generic argument.
 const slot: int? = Option::Some(7);   // int?  is  Option<int>
 const back: Option<int> = slot;       // interchangeable both ways
 
-function first(xs: int[]) -> int? {   // optional return
+function first(xs: [int]) -> int? {   // optional return
     if (xs.length == 0) { return Option::None; }
     return Option::Some(xs[0]);
 }
@@ -644,7 +652,7 @@ to write it.
 ```cryo
 // The concrete iterator (`SliceIter<T>`) never appears in the signature.
 iter(&this) -> implement Iterator<T> where T: Copy {
-    return SliceIter::<T> { ptr: this.ptr, remaining: this.length };
+    return SliceIter::<T> { ptr: this.ptr, remaining: this.length as u64 };
 }
 
 // A caller binds the result without naming the concrete type either.
@@ -879,9 +887,24 @@ The compiler also expands two source-location pseudo-constants at the call site:
 | Constant | Expands to                               |
 | -------- | ---------------------------------------- |
 | `FILE`   | The current source file path (`string`). |
-| `LINE`   | The current line number (`i32`).         |
+| `LINE`   | The current line number (`u32`).         |
 
 These are used by `panic`, `assert`, and the testing framework to report failure locations without the caller passing them by hand.
+
+Inside a function marked `![caller_location]`, `FILE` and `LINE` are instead the location of the call to that function: every call passes its own location as two hidden trailing arguments, and a call made from inside another `![caller_location]` function passes on the location that one was given, so a chain of them reports the first call outside the chain.  The standard library's index bounds check is marked this way, so an out-of-range `xs[i]` reports the line of the `xs[i]`.  Such a function cannot be taken as a value (E0151), by its name, its path, or a static method's path: a call through the value would have no location to pass.  The type check refuses it, so `cryo check` and the editor report it.
+
+```cryo
+![caller_location]
+function expect_positive(n: i64) -> i64 {
+    if (n <= 0) { core::panic("expected a positive number", FILE, LINE); }
+    return n;
+}
+
+function main() -> i32 {
+    expect_positive(-1);   // panics reporting this line
+    return 0;
+}
+```
 
 ### 4.6 Overloading
 
@@ -1134,7 +1157,7 @@ The scrutinee may be:
 - An **`Iterator`** directly - a type that `implement trait Iterator<T>`, including the stdlib's `Range<T>` / `RangeInclusive<T>`, or a type parameter bounded by `Iterator`. A method that is merely spelled `next` does not make a type iterable: the loop refuses it (`E0306`, "does not implement `Iterator`").
 - A **range literal** `a..b` (half-open) or `a..=b` (inclusive). These are sugar for `Range::new(a, b)` / `RangeInclusive::new(a, b)`; see the precedence table in [section 5.7](#57-operator-precedence).
 - An **iterable** that exposes `iter()` returning an iterator - `Array<T>` and `Slice<T>` (their `iter()` is gated `where T: Copy`). The lowering inserts the `.iter()` call.
-- A **fixed-size array** `T[N]`. The lowering views it as a `Slice<T>` over its `N` elements.
+- A **fixed-size array** `[T; N]`. The lowering views it as a `Slice<T>` over its `N` elements.
 
 ```cryo
 mut sum: i32 = 0;
@@ -1143,7 +1166,7 @@ for (i in 0..5) {            // range literal; 0,1,2,3,4
 }
 // sum == 10
 
-const xs: i32[3] = [7, 8, 9];
+const xs: [i32; 3] = [7, 8, 9];
 for (x in xs) {              // fixed-size array
     sum = sum + x;
 }
@@ -2000,7 +2023,7 @@ function smallest<T>(xs: &Array<T>) -> Option<T>
     where T: Ord + Copy {
     if (xs.length() == 0) { return Option::None; }
     mut best: T = xs.get(0).unwrap();
-    for (mut i: u64 = 1; i < xs.length(); i++) {
+    for (mut i: u64 = 1; i < (xs.length() as u64); i++) {
         const next: T = xs.get(i).unwrap();
         if (next.compare(&best) == Ordering::Less) {
             best = next;
@@ -2266,10 +2289,18 @@ arithmetic, bitwise, and shift operator (`+= -= *= /= %= &= |= ^= <<= >>=`).
 **Indexing.** `Index<Idx, Output>::index` returns a **pointer** (`Output*`), so
 the desugar `a[i]` -> `*(a.index(i))` is a *place*: one implementation serves
 reads (`v = a[i]`), writes (`a[i] = v`), and compound assignment (`a[i] += v`).
-Built-in array/slice/string/pointer indexing keeps its native path.
+Fixed-array, string and pointer indexing keep their native path.  A type may
+implement `Index` once per index type; the call is answered by the
+implementation whose `Idx` is the index's own type.  `Array<T>` and `[T]` are
+indexed this way: the standard library implements `Index` for `Array<T>` once
+per integer type, marked `![inline]`, so `xs[i]` takes an index of any integer
+type, costs no call, and an index at or past the length (a negative one
+included) panics.  In a generic body, a container whose type
+carries the body's parameters (`xs: &Array<T>`) is indexed through its own
+implementation exactly as a concrete one is.
 
 ```cryo
-type struct Grid { cells: i32[9]; }
+type struct Grid { cells: [i32; 9]; }
 implement trait Index<u64, i32> for struct Grid {
     index(&this, i: u64) -> i32* { return &this.cells[i]; }
 }
@@ -2891,7 +2922,7 @@ const ptr: int* = &x;       // ptr holds the address of x
 const val: int  = *ptr;     // val is 42
 ```
 
-Pointer indexing is supported: `ptr[0]` is `*ptr`, and `ptr[n]` accesses the n-th element from the pointer's base.
+Pointer indexing is supported: `ptr[0]` is `*ptr`, and `ptr[n]` accesses the n-th element from the pointer's base.  This holds whatever the pointer points at: `p[i]` with `p: [T]*` is the `i`-th array from `p`, not an element of the array `p` points at; write `(*p)[i]` for that.
 
 ### 15.2 Heap Allocation
 
@@ -2936,7 +2967,7 @@ type trait Allocate {
 `delete p` runs the `Drop` of `p`'s static pointee type - the type the pointer is declared with, not the class of the object it points at. A `Base*` holding a `Derived` runs `Base`'s `Drop`, if `Base` has one, and never `Derived`'s; a cleanup a subclass needs is not run through a pointer to its base. Then `delete p` hands `p` to the same implementation's `release` with the pointee type's alignment, instead of freeing it. `release` does nothing unless an implementation writes it, which is what an arena wants: its storage is reclaimed whole, never one object at a time. An allocator that does free single objects writes both methods.
 
 ```cryo
-mut g_pool: u8[4096] = [0; 4096];
+mut g_pool: [u8; 4096] = [0; 4096];
 mut g_used: u64 = 0;
 
 type class Node {
@@ -3178,7 +3209,7 @@ use(a);                // error E0452: use of moved value 'a'
 
 Two move/ownership hazards that are unambiguous memory errors, called out as their own hard-error classes for clearer diagnostics, are:
 
-- **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.
+- **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.  A loop's condition, and a `for`'s update, run again at every back edge, so a value or field moved in them is refused, even when the body assigns it a new one, unless the body always leaves the loop with `break` or `return`.
 - **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine - those are caller-backed.)
 
 Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility (see [section 2](#2-type-system) and [section 15](#15-pointers-and-memory)). Move tracking enforces the moved-set above and nothing more: it does not prove that a reference or pointer outlives what it points to.
@@ -3270,8 +3301,9 @@ type struct AlignedData {
 
 | Directive                                                 | Target                             | Description                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | --------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `![inline]`                                               | function                           | Inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute (no effect at the default `-O0`).*                                                                                                                                                                                                                                                                                                                   |
-| `![noinline]`                                             | function                           | Anti-inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute.*                                                                                                                                                                                                                                                                                                                                               |
+| `![inline]`                                               | function, method                   | Every call is inlined, at every optimization level and across modules: a module calling the function compiles its own copy of the body, which is discarded once inlined, and the defining module keeps the one definition. A generic function's instances are inlined the same way.                                                                                                                                            |
+| `![noinline]`                                             | function, method                   | The function is never inlined.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `![caller_location]`                                      | function, method                   | `FILE` and `LINE` in the body are the location of the call ([section 4.5](#45-intrinsic-functions)). The function cannot be taken as a value.                                                                                                                                                                                                                                                                                            |
 | `![deprecated]` / `![deprecated("msg")]`                  | any decl                           | Marks a declaration as deprecated. *Parsed and validated; use-site warnings are not yet emitted.*                                                                                                                                                                                                                                                                                                                               |
 | `![symbol("name")]`                                       | extern fn / method / fn definition | Override the linker symbol: Cryo callers use the declared name while the symbol emitted / resolved at link time is `name`. On an extern decl or body-less method it renames the *imported* symbol; on a function *definition* it renames the *emitted* symbol. Used by the C++ binding generator to pin a decl to its Itanium-mangled symbol.                                                                                   |
 | `![no_mangle]`                                            | function / method                  | Emit the definition under its bare declared identifier instead of the mangled `C$…` symbol, so it can be linked from C (or serve as a runtime lang-item) without a wrapper. The preferred unmangling directive; `![symbol("name")]` is for the *rename* case.                                                                                                                                                                   |
@@ -3384,7 +3416,7 @@ This is the recommended idiom for type-safe wrappers around primitive FFI types 
 ```cryo
 ![align(64)]
 type struct CacheLine {
-    payload: u8[64];
+    payload: [u8; 64];
 }
 ```
 
@@ -3946,8 +3978,8 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::primitives`   | Methods on built-in types (`(-5 as i32).abs()`, `(2.0).sqrt()`, `x.clamp(lo, hi)`, `char::is_digit`, ...)             |
 | `core::varargs`      | `VaArgs`, the compiler-assigned type of a function's `args...` bucket                                                 |
 | `core::drop`, `core::marker`, `core::cmp`, `core::clone` | `Drop`, the marker traits (`Copy`, `Send`, `Sync`), `Eq` / `Ord` / `Ordering`, `Clone` |
-| `collections::array` | `Array<T>`, needed because `T[]` desugars to `Array<T>`                                                               |
-| `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: T[N]`)                   |
+| `collections::array` | `Array<T>`, the type `[T]` names                                                                                       |
+| `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: [T; N]`)                 |
 | `core::ops`          | `Range` / `RangeInclusive`, backing range literals (`a..b` desugars to `Range::new`)                                  |
 | `core::iter`         | `Iterator`, the trait the for-in sugar drives the scrutinee through                                                   |
 | `alloc::box`         | `Box<T>`                                                                                                              |

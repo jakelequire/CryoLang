@@ -1,0 +1,99 @@
+/// A field passed by value inside an `if` condition is moved out of its
+/// struct.  The condition runs whichever way the branch goes, so the move is
+/// unconditional: the callee releases the field, and the struct's release at
+/// every exit after it - an early return in the branch, the fall-through,
+/// an `else` - releases only the fields still in place.  Releasing the
+/// moved field again frees its buffer a second time.
+///
+/// The elements count their own releases.  Each check holds two elements in
+/// `a` and one in `b`, so every element released exactly once is 3; a field
+/// released twice counts 5, or corrupts the heap first.  `main` prints how
+/// many checks passed and exits 0 only when all did.
+namespace FieldMovedInIfCondition::Main;
+
+import std::core::drop::{ Drop };
+import std::ffi::libc;
+
+mut g_released: i64 = 0;
+
+type struct Counted { v: i64; }
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void {
+        g_released = g_released + 1;
+    }
+}
+
+type struct Holder {
+    a: [Counted];
+    b: [Counted];
+}
+
+function make() -> Holder {
+    mut a: [Counted] = [];
+    a.push(Counted { v: 1 });
+    a.push(Counted { v: 2 });
+    mut b: [Counted] = [];
+    b.push(Counted { v: 3 });
+    return Holder { a: a, b: b };
+}
+
+function take(xs: [Counted]) -> i64 {
+    return xs.length as i64;
+}
+
+function count(xs: &[Counted]) -> i64 {
+    return xs.length as i64;
+}
+
+function moved_then_early_return() -> i64 {
+    const h: Holder = make();
+    if (take(h.a) != 2) { return 1; }
+    return 0;
+}
+
+function moved_with_else() -> i64 {
+    const h: Holder = make();
+    mut r: i64 = 0;
+    if (take(h.a) == 2) { r = 0; } else { r = 1; }
+    if (count(&h.b) != 1) { r = 2; }
+    return r;
+}
+
+function both_fields_in_conditions() -> i64 {
+    const h: Holder = make();
+    if (take(h.a) != 2) { return 1; }
+    if (take(h.b) != 1) { return 2; }
+    return 0;
+}
+
+function moved_then_branch_returns() -> i64 {
+    const h: Holder = make();
+    if (take(h.a) == 2) { return 0; }
+    return 1;
+}
+
+function check(name: string, run: () -> i64) -> i64 {
+    g_released = 0;
+    const failed_at: i64 = run();
+    if (failed_at != 0) {
+        libc::printf("FAIL %s at comparison %d\n", name, failed_at);
+        return 0;
+    }
+    if (g_released != 3) {
+        libc::printf("FAIL %s: %d releases, want 3\n", name, g_released);
+        return 0;
+    }
+    return 1;
+}
+
+function main() -> i32 {
+    mut passed: i64 = 0;
+    passed += check("early return", moved_then_early_return);
+    passed += check("else", moved_with_else);
+    passed += check("both fields", both_fields_in_conditions);
+    passed += check("branch returns", moved_then_branch_returns);
+    libc::printf("field_moved_in_if_condition: %d of 4 passed\n", passed);
+    if (passed != 4) { return 1; }
+    return 0;
+}

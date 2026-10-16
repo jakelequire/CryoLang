@@ -131,13 +131,13 @@ type struct PatternResolver {
     /// alternative leaves unbound is read without ever being set, and a name
     /// typed differently is read as a type its value may not have.
     check_alternatives_agree(mut &this, arm: MatchArmNode*) -> void {
-        mut first: AltBinding[] = [];
+        mut first: [AltBinding] = [];
         if (arm.patterns[0] == null) { return; }
         PatternResolver::collect_alt_bindings(arm.patterns[0], &first);
         for (mut i: i64 = 1; i < arm.patterns.length; i++) {
             const alt: PatternNode* = arm.patterns[i];
             if (alt == null) { continue; }
-            mut here: AltBinding[] = [];
+            mut here: [AltBinding] = [];
             PatternResolver::collect_alt_bindings(alt, &here);
             for (mut k: i64 = 0; k < here.length; k++) {
                 const b: AltBinding = here[k];
@@ -193,7 +193,7 @@ type struct PatternResolver {
     }
 
     /// The names `pat` binds, at any depth, in the order written.
-    static collect_alt_bindings(pat: PatternNode*, out: mut &AltBinding[]) -> void {
+    static collect_alt_bindings(pat: PatternNode*, out: mut &[AltBinding]) -> void {
         if (pat == null) { return; }
         if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
             out.push(AltBinding {
@@ -217,7 +217,7 @@ type struct PatternResolver {
         }
     }
 
-    static alt_binding_position(list: &AltBinding[], sym: SymbolID) -> i64 {
+    static alt_binding_position(list: &[AltBinding], sym: SymbolID) -> i64 {
         for (mut i: i64 = 0; i < list.length; i++) {
             if (list[i].sym.equals(sym)) { return i; }
         }
@@ -244,8 +244,8 @@ type struct PatternResolver {
     /// Resolve the positional payload types of `enum_pat`'s variant against a value
     /// of `value_type`, applying the value-instantiation's generic substitution.
     resolve_variant_payload_types(mut &this, value_type: TypeRef,
-                                  enum_pat: EnumPatternNode*) -> TypeRef[] {
-        mut payload_types: TypeRef[] = [];
+                                  enum_pat: EnumPatternNode*) -> [TypeRef] {
+        mut payload_types: [TypeRef] = [];
         mut enum_ty: Type* = this.types.unwrap_to_enum(value_type);
         const peeled_inst: InstantiatedType* = this.types.peel_to_instantiation(value_type);
 
@@ -324,11 +324,11 @@ type struct PatternResolver {
         const view_base: TypeRef = this.types.view_generic_base(value_type);
         if (view_base.is_valid() && gr != null) {
             const tmpl: TemplateEntry* = gr.template_of_type(view_base);
-            const view_args: TypeRef[] = this.types.view_type_args_copy(value_type);
+            const view_args: [TypeRef] = this.types.view_type_args_copy(value_type);
             if (tmpl != null && tmpl.param_types.length == view_args.length) {
                 mut subst: TypeSubstitution = TypeSubstitution::from_params(
                     tmpl.param_types, view_args);
-                mut substituted: TypeRef[] = [];
+                mut substituted: [TypeRef] = [];
                 for (mut k: i64 = 0; k < payload_types.length; k++) {
                     substituted.push(subst.apply(payload_types[k], this.arena));
                 }
@@ -419,7 +419,7 @@ type struct PatternResolver {
             fmt::format("enum `%s` has no variant named `%s`", enum_name, variant_name));
         diag = diag.at_with_label(enum_pat.variant_span, "not a variant of this enum");
 
-        mut cands: string[] = [];
+        mut cands: [string] = [];
         for (mut i: i64 = 0; i < et.variants.length; i++) {
             cands.push(et.variants[i].display_name(this.intern));
         }
@@ -433,7 +433,7 @@ type struct PatternResolver {
     /// recursing into nested sub-patterns; each element binds against its payload.
     bind_enum_pattern(mut &this, enum_pat: EnumPatternNode*, value_type: TypeRef,
                       caller_backed: boolean) -> void {
-        const payload_types: TypeRef[] = this.resolve_variant_payload_types(value_type, enum_pat);
+        const payload_types: [TypeRef] = this.resolve_variant_payload_types(value_type, enum_pat);
         for (mut j: i64 = 0; j < enum_pat.elements.length; j++) {
             mut elem_ty: TypeRef = this.arena.get_void();
             if (j < payload_types.length && payload_types[j].is_valid()) {
@@ -491,7 +491,7 @@ type struct PatternResolver {
     /// Do the alternative patterns `pats` exhaustively cover `value_type`?  Recurses
     /// into nested enum sub-patterns; conservative for non-enum slots and multi-
     /// position narrowing.  `depth` guards pathologically deep recursive types.
-    patterns_cover(mut &this, pats: &PatternNode*[], value_type: TypeRef, depth: i32) -> boolean {
+    patterns_cover(mut &this, pats: &[PatternNode*], value_type: TypeRef, depth: i32) -> boolean {
         if (depth > 16) { return false; }
         for (mut i: i64 = 0; i < pats.length; i++) {
             const p: PatternNode* = pats[i];
@@ -514,7 +514,7 @@ type struct PatternResolver {
         const et: EnumType* = enum_ty as EnumType*;
         if (et.variants.length == 0) { return false; }
         for (mut vi: i64 = 0; vi < et.variants.length; vi++) {
-            mut v_arms: EnumPatternNode*[] = [];
+            mut v_arms: [EnumPatternNode*] = [];
             for (mut i: i64 = 0; i < pats.length; i++) {
                 const p: PatternNode* = pats[i];
                 if (p != null && p.pattern_kind == PatternKind::Enum) {
@@ -530,16 +530,16 @@ type struct PatternResolver {
 
     /// Is a variant fully covered by the enum-pattern arms `v_arms` (all the same
     /// variant) against a value of `parent_value_type`?
-    variant_covered(mut &this, v_arms: &EnumPatternNode*[],
+    variant_covered(mut &this, v_arms: &[EnumPatternNode*],
                     parent_value_type: TypeRef, depth: i32) -> boolean {
         for (mut i: i64 = 0; i < v_arms.length; i++) {
             if (this.arm_payload_irrefutable(v_arms[i])) { return true; }
         }
         // All arms narrow the payload; only single-position narrowing is analysed.
-        const payload_types: TypeRef[] =
+        const payload_types: [TypeRef] =
             this.resolve_variant_payload_types(parent_value_type, v_arms[0]);
         if (payload_types.length != 1) { return false; }
-        mut sub_alts: PatternNode*[] = [];
+        mut sub_alts: [PatternNode*] = [];
         for (mut i: i64 = 0; i < v_arms.length; i++) {
             const ep: EnumPatternNode* = v_arms[i];
             if (ep.elements.length < 1) { continue; }
@@ -551,9 +551,9 @@ type struct PatternResolver {
 
     /// Whether `arms` exhaustively cover `subject`'s value universe (used by
     /// expression-match to decide whether a `_` arm is required).
-    match_is_exhaustive(mut &this, subject: ExpressionNode*, arms: &MatchArmNode*[]) -> boolean {
+    match_is_exhaustive(mut &this, subject: ExpressionNode*, arms: &[MatchArmNode*]) -> boolean {
         if (subject == null) { return false; }
-        mut top_pats: PatternNode*[] = [];
+        mut top_pats: [PatternNode*] = [];
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
             if (arm == null || arm.guard != null) { continue; }
@@ -567,7 +567,7 @@ type struct PatternResolver {
 
     /// A match may have at most one unconditional wildcard arm; a second is dead
     /// code (E0114).  Guarded `_ if (..)` arms are conditional and not counted.
-    check_duplicate_default_arm(mut &this, arms: &MatchArmNode*[]) -> void {
+    check_duplicate_default_arm(mut &this, arms: &[MatchArmNode*]) -> void {
         mut seen_default: boolean = false;
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
@@ -599,7 +599,7 @@ type struct PatternResolver {
     /// pattern or range a `char` one, an integer pattern or range an integer or
     /// `char` one, `true` / `false` a `boolean` one.  A pattern let past here
     /// has nothing to compare against and would never match.
-    check_literal_patterns(mut &this, arms: &MatchArmNode*[], subject_type: TypeRef) -> void {
+    check_literal_patterns(mut &this, arms: &[MatchArmNode*], subject_type: TypeRef) -> void {
         mut subject: Type* = null;
         if (subject_type.is_valid()) { subject = this.arena.lookup(subject_type); }
         for (mut i: i64 = 0; i < arms.length; i++) {
@@ -664,7 +664,7 @@ type struct PatternResolver {
     /// irrefutable catch-all).  Emits E0405 with a missing-variants list + a
     /// has-placeholders quickfix.  No-op for non-enum subjects.
     check_match_exhaustive(mut &this, subject: ExpressionNode*, subject_type: TypeRef,
-                           arms: &MatchArmNode*[], match_span: SourceSpan) -> void {
+                           arms: &[MatchArmNode*], match_span: SourceSpan) -> void {
         if (!subject_type.is_valid()) { return; }
         const enum_ty: Type* = this.types.unwrap_to_enum(subject_type);
         if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return; }
@@ -672,7 +672,7 @@ type struct PatternResolver {
         if (et.variants.length == 0) { return; }
 
         // Gather unguarded top-level patterns; an unguarded `_`/binding catches all.
-        mut top_pats: PatternNode*[] = [];
+        mut top_pats: [PatternNode*] = [];
         mut has_wildcard: boolean = false;
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
@@ -689,9 +689,9 @@ type struct PatternResolver {
         }
         if (has_wildcard) { return; }
 
-        mut missing_names: string[] = [];
+        mut missing_names: [string] = [];
         for (mut i: i64 = 0; i < et.variants.length; i++) {
-            mut v_arms: EnumPatternNode*[] = [];
+            mut v_arms: [EnumPatternNode*] = [];
             for (mut k: i64 = 0; k < top_pats.length; k++) {
                 const p: PatternNode* = top_pats[k];
                 if (p != null && p.pattern_kind == PatternKind::Enum) {

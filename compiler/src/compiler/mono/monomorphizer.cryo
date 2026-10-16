@@ -228,7 +228,7 @@ type struct Monomorphizer {
         this.generic_registry.finalize_disambiguation(this.intern_table);
 
         // Import all unmonomorphized instantiations from the generic registry
-        const unprocessed: TypeRef[] = this.generic_registry.collect_unmonomorphized();
+        const unprocessed: [TypeRef] = this.generic_registry.collect_unmonomorphized();
 
         // Nothing new to process; skip the worklist entirely.
         if (unprocessed.length == 0) {
@@ -281,46 +281,6 @@ type struct Monomorphizer {
 
             if (!success) {
                 this.state.error_count += 1;
-            }
-        }
-
-        // Second pass: discover Array<T> for standalone T[] usages.  The nested
-        // discovery above only catches arrays that appear as fields of other
-        // monomorphized types.  Standalone T[] creates ArrayType without
-        // InstantiatedType.  Scan the arena once for dynamic ArrayTypes with
-        // concrete elements and enqueue any missing Array<T> instantiations.
-        const array_entry: TemplateEntry* =
-            this.generic_registry.template_of(this.generic_registry.wellknown(LangItem::Array));
-        if (array_entry != null) {
-            const array_base: TypeRef = array_entry.base_type;
-            const type_count: i64 = this.arena.type_count();
-            for (mut ti: i64 = 0; ti < type_count; ti++) {
-                const at: Type* = this.arena.types[ti];
-                if (at == null || at.kind != TypeKind::Array) { continue; }
-                const arr: ArrayType* = at as ArrayType*;
-                if (!arr.is_dynamic() || !arr.element.is_valid()) { continue; }
-                const elem_t: Type* = this.arena.lookup(arr.element);
-                if (elem_t == null) { continue; }
-                if (elem_t.kind == TypeKind::GenericParam) { continue; }
-                mut arr_args: TypeRef[] = [];
-                arr_args.push(arr.element);
-                mut arr_ctx: ResolutionContext = ResolutionContext::new("");
-                arr_args = this.type_resolver.expand_default_type_args(array_entry, arr_args, &arr_ctx);
-                const inst_ref: TypeRef = this.generic_registry.instantiate(array_base, arr_args);
-                this.state.enqueue_from_type_ref(inst_ref);
-            }
-            // Process any newly enqueued Array<T> instantiations.
-            while (this.state.pending_cursor < this.state.pending.length) {
-                const req: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
-                this.state.pending_cursor += 1;
-                const rkey: TypeKey = this.make_key(req);
-                if (this.is_cached(rkey)) {
-                    this.propagate_cached_resolution(rkey, req);
-                    this.generic_registry.mark_monomorphized(req.base_type, req.type_args);
-                    continue;
-                }
-                const rsuccess: boolean = this.specialize_request(req, rkey);
-                if (!rsuccess) { this.state.error_count += 1; }
             }
         }
 
@@ -397,7 +357,7 @@ type struct Monomorphizer {
     }
 
     // `request` is BORROWED, not taken by value: it carries an owning
-    // `type_args: TypeRef[]`; a by-value parameter would bitwise-copy the struct
+    // `type_args: [TypeRef]`; a by-value parameter would bitwise-copy the struct
     // (aliasing the caller's buffer) and the copy's drop would double-free.
     specialize_with_entry(mut &this, request: &MonomorphRequest, key: TypeKey,
                           entry: TemplateEntry*) -> boolean {
@@ -412,7 +372,7 @@ type struct Monomorphizer {
 
         // Build display names for type args.  Use the qualified name for
         // user-defined types so cross-module resolution works.
-        mut type_arg_displays: string[] = [];
+        mut type_arg_displays: [string] = [];
         for (mut i: i64 = 0; i < request.type_args.length; i++) {
             const arg_t: Type* = this.arena.lookup(request.type_args[i]);
             if (arg_t != null) {
@@ -479,7 +439,7 @@ type struct Monomorphizer {
         // substitution.  Removing them here means resolve_specialized_ast never
         // sees an uncompilable body and DI never indexes a junk signature.
         this.trait_spec.filter_bounds_violating_methods(result.specialized_ast, &subst);
-        const kept_impl_asts: ASTNode*[] = this.trait_spec.filter_bounds_violating_impls(
+        const kept_impl_asts: [ASTNode*] = this.trait_spec.filter_bounds_violating_impls(
             result.impl_asts, &request.type_args);
 
         // Determine the concrete aggregate kind for this template.  Function
@@ -681,7 +641,7 @@ type struct Monomorphizer {
         // unpinned.  `kept_impl_asts` is MOVED into the
         // entry, so capture the impl-node pointers into a walk list first (they alias
         // the same nodes the entry now owns).
-        mut walk_impls: ASTNode*[] = [];
+        mut walk_impls: [ASTNode*] = [];
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
             walk_impls.push(kept_impl_asts[ri]);
         }
@@ -855,12 +815,12 @@ type struct Monomorphizer {
     /// arguments in hand.  A bound whose argument is still abstract is
     /// deferred to the concrete instantiation.
     refuse_unsatisfied_type_bounds(mut &this, entry: TemplateEntry*, subst: TypeSubstitution*,
-                                   type_arg_displays: &string[]) -> boolean {
+                                   type_arg_displays: &[string]) -> boolean {
         if (entry == null || entry.ast_node == null) { return true; }
         // The four aggregates carry a `where` clause; a function template's
         // bounds are checked at its call, and nothing else has one.
-        const none: TraitBound[] = [];
-        mut bounds: &TraitBound[] = &none;
+        const none: [TraitBound] = [];
+        mut bounds: &[TraitBound] = &none;
         match (entry.node_kind) {
             NodeKind::StructDeclaration => { bounds = &(entry.ast_node as declaration::StructDeclNode*).where_bounds; }
             NodeKind::UnionDeclaration  => { bounds = &(entry.ast_node as declaration::UnionDeclNode*).where_bounds; }
@@ -1028,7 +988,7 @@ type struct Monomorphizer {
         return this.make_key_for(request.base_type, request.type_args);
     }
 
-    make_key_for(&this, base: TypeRef, type_args: &TypeRef[]) -> TypeKey {
+    make_key_for(&this, base: TypeRef, type_args: &[TypeRef]) -> TypeKey {
         return this.arena.create_instantiation(base, type_args).table_key();
     }
 

@@ -88,7 +88,7 @@ type struct TypeArena {
     /// set by `CompilationContext`, which owns it.
     defs: DefTable*;
     // -- Ownership --
-    types:   Type*[];           // All types (indexed by allocation order)
+    types:   [Type*];           // All types (indexed by allocation order)
     // True for the duration of a symbolic generic-body walk (sema sets it around
     // `symbolic_check_body`). While set, `create_instantiation` tags every new
     // InstantiatedType `is_symbolic`, so concrete instantiations that exist only
@@ -146,14 +146,20 @@ type struct TypeArena {
     //     definition, kept under it by the declaration index (file header).
     //   * GenericParam - keyed by NAME ONLY, dropping `index`.  That is a correctness fix, not an oversight: see
     //     `create_generic_param`.  Re-including them here would regress it.
-    intern_entries: InternEntry[];
-    intern_ops:     TypeRef[];          // flat operand pool, sliced by InternEntry
+    intern_entries: [InternEntry];
+    intern_ops:     [TypeRef];          // flat operand pool, sliced by InternEntry
     intern_cache:   HashMap<u64, i64>;  // structural hash (probed) -> intern_entries index
 
     // -- Generic parameter cache (key: the declaration's SymbolID -> TypeRef) --
     generic_param_cache:   HashMap<SymbolKey, TypeRef>;
     // The one `This` placeholder (`this_placeholder`).
     this_param:            TypeRef;
+
+    // `Array`'s template and its default allocator, set once the templates
+    // are registered and invalid in a build with no `Array`: `[T]` is the
+    // instantiation of the one over `T` and the other.
+    dynamic_array_base:    TypeRef;
+    dynamic_array_alloc:   TypeRef;
 
 private:
     /// The allocator of this arena's handles, and its only one: every
@@ -200,6 +206,8 @@ public:
             intern_cache:        HashMap::<u64, i64>::new(),
             generic_param_cache: HashMap::<SymbolKey, TypeRef>::new(),
             this_param:          TypeRef::invalid(),
+            dynamic_array_base:  TypeRef::invalid(),
+            dynamic_array_alloc: TypeRef::invalid(),
         };
 
         arena.init_primitives();
@@ -299,7 +307,7 @@ public:
     /// `entry_matches` decides identity, so a poor hash costs probes, never
     /// correctness.  The operand COUNT is mixed in so that `(a)` and `(a, a)`
     /// cannot land on the same key by accident.
-    structural_hash(&this, kind: TypeKind, aux0: u64, aux1: u64, ops: &TypeRef[]) -> u64 {
+    structural_hash(&this, kind: TypeKind, aux0: u64, aux1: u64, ops: &[TypeRef]) -> u64 {
         mut h: u64 = 2166136261;
         h = this.hash_mix(h, kind as u64);
         h = this.hash_mix(h, aux0);
@@ -320,7 +328,7 @@ public:
     /// `computed_align`, filled in later by TypeLowering, can never split one
     /// semantic type into two.
     entry_matches(&this, idx: i64, kind: TypeKind, aux0: u64, aux1: u64,
-                  ops: &TypeRef[]) -> boolean {
+                  ops: &[TypeRef]) -> boolean {
         if (idx < 0 || idx >= this.intern_entries.length) { return false; }
         if (this.intern_entries[idx].kind != kind) { return false; }
         if (this.intern_entries[idx].aux0 != aux0) { return false; }
@@ -336,7 +344,7 @@ public:
     /// The interned type for this canonical key, or invalid when absent.
     ///
     /// Linear probing over the hash keyspace.
-    intern_find(&this, kind: TypeKind, aux0: u64, aux1: u64, ops: &TypeRef[]) -> TypeRef {
+    intern_find(&this, kind: TypeKind, aux0: u64, aux1: u64, ops: &[TypeRef]) -> TypeRef {
         mut k: u64 = this.structural_hash(kind, aux0, aux1, ops);
         // Terminates: the map holds finitely many keys, so probing distinct
         // successive keys reaches an absent one in at most `count + 1` steps.
@@ -356,7 +364,7 @@ public:
     /// Used by `verify_canonical_identity`; see there for why.
     intern_find_entry_key(&this, idx: i64) -> TypeRef {
         if (idx < 0 || idx >= this.intern_entries.length) { return TypeRef::invalid(); }
-        mut ops: TypeRef[] = [];
+        mut ops: [TypeRef] = [];
         const s: i64 = this.intern_entries[idx].ops_start;
         for (mut i: i64 = 0; i < this.intern_entries[idx].ops_len; i++) {
             ops.push(this.intern_ops[s + i]);
@@ -396,7 +404,7 @@ public:
     /// Must follow a failed `intern_find` with the SAME key, so the probe
     /// lands on the first free slot of that key's chain.
     intern_record(mut &this, kind: TypeKind, aux0: u64, aux1: u64,
-                  ops: &TypeRef[], ty: TypeRef) -> void {
+                  ops: &[TypeRef], ty: TypeRef) -> void {
         mut k: u64 = this.structural_hash(kind, aux0, aux1, ops);
         while (true) {
             const slot: Option<i64> = this.intern_cache.get(&k);
@@ -433,7 +441,7 @@ public:
     /// `const T*` from `T*`. The two are separate interned types (so the
     /// checker can forbid dropping const) but mangle and lower identically.
     get_pointer_to_q(mut &this, pointee: TypeRef, const_pointee: boolean) -> TypeRef {
-        mut ops: TypeRef[] = [pointee];
+        mut ops: [TypeRef] = [pointee];
         mut aux: u64 = 0;
         if (const_pointee) { aux = 1; }
 
@@ -447,7 +455,7 @@ public:
 
     /// Get or create a reference type to the given referent.
     get_reference_to(mut &this, referent: TypeRef, mutability: RefMutability) -> TypeRef {
-        mut ops: TypeRef[] = [referent];
+        mut ops: [TypeRef] = [referent];
         mut aux: u64 = 0;
         if (mutability.is_mutable()) { aux = 1; }
 
@@ -464,7 +472,7 @@ public:
     /// (dynamic) and `0` (fixed zero-length) stay distinct without the old
     /// `+1` offset - and without its 32-bit element-id / 31-bit size ceiling.
     get_array_of(mut &this, element: TypeRef, size: i64) -> TypeRef {
-        mut ops: TypeRef[] = [element];
+        mut ops: [TypeRef] = [element];
         const aux: u64 = size as u64;
 
         const hit: TypeRef = this.intern_find(TypeKind::Array, aux, 0, &ops);
@@ -477,7 +485,7 @@ public:
 
     /// Get or create an optional type wrapping the given type.
     get_optional_of(mut &this, wrapped: TypeRef) -> TypeRef {
-        mut ops: TypeRef[] = [wrapped];
+        mut ops: [TypeRef] = [wrapped];
 
         const hit: TypeRef = this.intern_find(TypeKind::Optional, 0, 0, &ops);
         if (hit.is_valid()) { return hit; }
@@ -492,10 +500,10 @@ public:
     // cache key, so callers keep ownership (and can reuse the array for a
     // MethodInfo or drop it).  On the cache-miss path the array is copied into
     // the owning FunctionType (TypeRef is Copy, so this is a cheap shallow copy).
-    get_function(mut &this, ret: TypeRef, params: &TypeRef[], is_variadic: boolean) -> TypeRef {
+    get_function(mut &this, ret: TypeRef, params: &[TypeRef], is_variadic: boolean) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] get_function() ret=%lu params=%lld", ret.key(), params.length);
         // ops[0] = return type, ops[1..] = parameters.
-        mut ops: TypeRef[] = [ret];
+        mut ops: [TypeRef] = [ret];
         for (mut i: i64 = 0; i < params.length; i++) {
             ops.push(params[i]);
         }
@@ -505,7 +513,7 @@ public:
         const hit: TypeRef = this.intern_find(TypeKind::Function, aux, 0, &ops);
         if (hit.is_valid()) { return hit; }
 
-        mut params_owned: TypeRef[] = [];
+        mut params_owned: [TypeRef] = [];
         for (mut i: i64 = 0; i < params.length; i++) {
             params_owned.push(params[i]);
         }
@@ -515,11 +523,11 @@ public:
     }
 
     /// Get or create a tuple type.
-    get_tuple(mut &this, elements: TypeRef[]) -> TypeRef {
+    get_tuple(mut &this, elements: [TypeRef]) -> TypeRef {
         // `elements` is MOVED into the TupleType below, so snapshot the operand
         // ids into an independent buffer first - `ops` must stay readable for
         // `intern_record` after the move.
-        mut ops: TypeRef[] = [];
+        mut ops: [TypeRef] = [];
         for (mut i: i64 = 0; i < elements.length; i++) {
             ops.push(elements[i]);
         }
@@ -640,7 +648,7 @@ public:
     /// asked the `assoc-type` door for; a projection no trait answers is
     /// refused where it is written and never reaches here.
     create_assoc_projection(mut &this, base: TypeRef, member: SymbolStr, owning_trait: TypeRef, slot: i64) -> TypeRef {
-        mut ops: TypeRef[] = [base];
+        mut ops: [TypeRef] = [base];
         const aux0: u64 = slot as u64;
         const aux1: u64 = owning_trait.key();
 
@@ -669,9 +677,9 @@ public:
     // `args` is borrowed (read for the cache key); on the cache-miss path it
     // is copied into the owning InstantiatedType (TypeRef is Copy).  Callers
     // keep ownership and can reuse the array for demand tracking.
-    create_instantiation(mut &this, base: TypeRef, args: &TypeRef[]) -> TypeRef {
+    create_instantiation(mut &this, base: TypeRef, args: &[TypeRef]) -> TypeRef {
         // ops[0] = generic base, ops[1..] = type arguments.
-        mut ops: TypeRef[] = [base];
+        mut ops: [TypeRef] = [base];
         for (mut i: i64 = 0; i < args.length; i++) {
             ops.push(args[i]);
         }
@@ -679,7 +687,7 @@ public:
         const hit: TypeRef = this.intern_find(TypeKind::InstantiatedType, 0, 0, &ops);
         if (hit.is_valid()) { return hit; }
 
-        mut args_owned: TypeRef[] = [];
+        mut args_owned: [TypeRef] = [];
         for (mut i: i64 = 0; i < args.length; i++) {
             args_owned.push(args[i]);
         }
@@ -726,14 +734,50 @@ public:
         return pt.pointee;
     }
 
-    /// The element of a dynamic array `T[]`, or invalid for anything else -
-    /// a fixed-size array included, whose annotation carries its size.
-    dynamic_array_element_of(&this, ty: TypeRef) -> TypeRef {
-        const t: Type* = this.lookup(ty);
-        if (t == null || t.kind != TypeKind::Array) { return TypeRef::invalid(); }
-        const at: ArrayType* = t as ArrayType*;
-        if (!at.is_dynamic()) { return TypeRef::invalid(); }
-        return at.element;
+    /// Record what `[T]` is made of: `Array`'s template and its default
+    /// allocator.
+    set_dynamic_array_shape(mut &this, base: TypeRef, alloc: TypeRef) -> void {
+        this.dynamic_array_base = base;
+        this.dynamic_array_alloc = alloc;
+    }
+
+    /// `[element]`: `Array<element>` with the default allocator.  Invalid in
+    /// a build with no `Array`.
+    dynamic_array_of(mut &this, element: TypeRef) -> TypeRef {
+        if (!element.is_valid() || !this.dynamic_array_base.is_valid()) { return TypeRef::invalid(); }
+        const args: [TypeRef] = [element, this.dynamic_array_alloc];
+        return this.create_instantiation(this.dynamic_array_base, &args);
+    }
+
+    /// The element of `ty` when `ty` is `Array<T>` with the default
+    /// allocator, before monomorphization or after; invalid for any other
+    /// type, an `Array` with another allocator among them.
+    default_array_element(&this, ty: TypeRef) -> TypeRef {
+        return this.default_array_element_of(this.lookup(ty));
+    }
+
+    /// `default_array_element` of the type `t`.
+    default_array_element_of(&this, t: Type*) -> TypeRef {
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const it: InstantiatedType* = t as InstantiatedType*;
+            return this.default_array_element_in(it.generic_base, &it.type_args);
+        }
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            return this.default_array_element_in(st.generic_base, &st.type_args);
+        }
+        return TypeRef::invalid();
+    }
+
+    /// The element of the instance of `base` over `args` when that instance
+    /// is `Array<T>` with the default allocator.
+    default_array_element_in(&this, base: TypeRef, args: &[TypeRef]) -> TypeRef {
+        if (!this.dynamic_array_base.is_valid() || !base.equals(this.dynamic_array_base)) {
+            return TypeRef::invalid();
+        }
+        if (args.length != 2 || !args[1].equals(this.dynamic_array_alloc)) { return TypeRef::invalid(); }
+        return args[0];
     }
 
     /// The kind of the type `ty` names, `Error` for a handle naming none.
@@ -786,8 +830,8 @@ public:
     /// a garbage "pointer" out of any `V(u32, String)`-shaped payload
     /// (packed offset 4 vs constructed offset 8).
     variant_payload_layout(&this, variant: EnumVariantInfo*,
-                           out_size: u64*, out_align: u64*) -> u64[] {
-        mut offsets: u64[] = [];
+                           out_size: u64*, out_align: u64*) -> [u64] {
+        mut offsets: [u64] = [];
         mut running: u64 = 0;
         mut max_align: u64 = 1;
         for (mut i: i64 = 0; i < variant.payload_types.length; i++) {
@@ -884,7 +928,7 @@ public:
     /// `Type*` virtual dispatch) can call this directly.
     /// Every generic parameter `ty` names, in the places
     /// `contains_generic_param` looks, appended to `out`.
-    generic_params_in(&this, ty: TypeRef, out: mut &TypeRef[]) -> void {
+    generic_params_in(&this, ty: TypeRef, out: mut &[TypeRef]) -> void {
         if (!ty.is_valid()) { return; }
         const t: Type* = this.lookup(ty);
         if (t == null) { return; }
@@ -997,7 +1041,7 @@ public:
         if (!ty.is_valid() || !owner.is_valid()) { return false; }
         const t: Type* = this.lookup(ty);
         if (t == null) { return false; }
-        // Peel transparent wrappers so `&Option<T*>` / `Option<T*>[]` match.
+        // Peel transparent wrappers so `&Option<T*>` / `[Option<T*>]` match.
         if (t.kind == TypeKind::Pointer) {
             return this.is_self_growing_instantiation((t as PointerType*).pointee, owner);
         }
@@ -1133,10 +1177,7 @@ public:
             }
             TypeKind::Array => {
                 const a: ArrayType* = ty as ArrayType*;
-                const elem_name: string = this.resolve_display_name(a.element);
-                if (a.is_dynamic()) { return elem_name + "[]"; }
-                const size_str: string = fmt::format("%ld", a.size);
-                return elem_name + "[" + size_str + "]";
+                return a.spelled(this.resolve_display_name(a.element));
             }
             TypeKind::Optional => {
                 const o: OptionalType* = ty as OptionalType*;
@@ -1166,6 +1207,8 @@ public:
                 return result + ")";
             }
             TypeKind::InstantiatedType => {
+                const array_elem: TypeRef = this.default_array_element_of(ty);
+                if (array_elem.is_valid()) { return "[" + this.resolve_display_name(array_elem) + "]"; }
                 const inst: InstantiatedType* = ty as InstantiatedType*;
                 mut result: string = this.resolve_display_name(inst.generic_base) + "<";
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) {
@@ -1193,6 +1236,8 @@ public:
             }
             TypeKind::Struct | TypeKind::Class | TypeKind::Enum | TypeKind::Trait
             | TypeKind::TypeAlias | TypeKind::FunctionTemplate => {
+                const array_elem: TypeRef = this.default_array_element_of(ty);
+                if (array_elem.is_valid()) { return "[" + this.resolve_display_name(array_elem) + "]"; }
                 const custom: DeclName = this.custom_display_of(ty);
                 if (custom.is_valid()) { return this.intern_table.shown(custom); }
                 return this.intern_table.shown(this.declared_name(ty));
@@ -1276,9 +1321,7 @@ public:
             }
             TypeKind::Array => {
                 const a: ArrayType* = ty as ArrayType*;
-                const elem: string = this.resolve_display_name_short(a.element);
-                if (a.is_dynamic()) { return elem + "[]"; }
-                return elem + "[" + fmt::format("%ld", a.size) + "]";
+                return a.spelled(this.resolve_display_name_short(a.element));
             }
             TypeKind::Optional => {
                 const o: OptionalType* = ty as OptionalType*;
@@ -1308,6 +1351,8 @@ public:
                 return result + ")";
             }
             TypeKind::InstantiatedType => {
+                const array_elem: TypeRef = this.default_array_element_of(ty);
+                if (array_elem.is_valid()) { return "[" + this.resolve_display_name_short(array_elem) + "]"; }
                 const inst: InstantiatedType* = ty as InstantiatedType*;
                 mut result: string = this.resolve_display_name_short(inst.generic_base) + "<";
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) {
@@ -1334,6 +1379,9 @@ public:
             }
             _ => { }
         }
+
+        const array_elem: TypeRef = this.default_array_element_of(ty);
+        if (array_elem.is_valid()) { return "[" + this.resolve_display_name_short(array_elem) + "]"; }
 
         // Leaf user-defined types: strip qualified prefixes.
         // `QualifiedName::shorten_paths` walks the display string and
@@ -1544,10 +1592,7 @@ public:
             const r: ReferenceType* = ty as ReferenceType*;
             return r.mutability.to_string();
         }
-        if (ty.kind == TypeKind::Array) {
-            const a: ArrayType* = ty as ArrayType*;
-            return if (a.is_dynamic()) { "dynamic" } else { "fixed" };
-        }
+        if (ty.kind == TypeKind::Array) { return "fixed"; }
         if (ty.kind == TypeKind::Function) {
             const f: FunctionType* = ty as FunctionType*;
             return if (f.is_variadic) { "variadic" } else { "" };
@@ -1716,7 +1761,7 @@ public:
     }
 
     /// The `i`-th type argument of `ty` as an instantiation, or invalid.
-    /// Indexed rather than returned as an array: handing out a `TypeRef[]` by
+    /// Indexed rather than returned as an array: handing out a `[TypeRef]` by
     /// value would alias the type's owned buffer and free it twice.
     inst_type_arg_at(&this, ty: TypeRef, i: i64) -> TypeRef {
         if (i < 0) { return TypeRef::invalid(); }

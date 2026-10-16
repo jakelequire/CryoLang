@@ -424,10 +424,17 @@ PatElem            ::= "_" | "mut"? Ident | Literal
 
 (*  Types & Literals =========================================== *)
 
-Type               ::= BaseType "*"+                       (* pointer *)
+(* `&` takes everything to its right, and `*` and `?` bind to the type
+   before them, so `(&T)*` needs its parentheses and `&T*` is `&(T*)`.  An
+   array is written only in brackets: a type followed by `[` is refused
+   (E0104), with the bracketed spelling as its fix.                          *)
+Type               ::= Type "*"                            (* pointer *)
                      | "&" "mut"? Type                     (* reference *)
                      | "mut" "&" Type                      (* mut-ref alt form *)
-                     | BaseType ("[" NumLit? "]")+         (* array *)
+                     | "[" Type "]"                        (* dynamic array *)
+                     | "[" Type ";" Expr "]"               (* fixed array; the length is a
+                                                              compile-time integer *)
+                     | "(" Type ")"                        (* grouping *)
                      | "(" Type ("," Type)* ","? ")"       (* tuple - needs >=2 elements
                                                               OR a trailing comma; `(T)`
                                                               is grouping, not a 1-tuple *)

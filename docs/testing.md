@@ -151,7 +151,7 @@ type struct Case { input: i32; want: i32; }
 
 ![test]
 function doubling_table() -> Result<(), TestError> {
-    const cases: Case[] = [
+    const cases: [Case] = [
         Case { input: 1, want: 2 },
         Case { input: 2, want: 4 },
         Case { input: 3, want: 6 },

@@ -57,7 +57,7 @@ import compiler::sema::symbolic_checker::{ SymbolicChecker };
 import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::checker::{ TypeChecker, TypeCheckResult };
-import compiler::types::compound::{ FunctionType, PointerType, ReferenceType, TupleType };
+import compiler::types::compound::{ ArrayType, FunctionType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ GenericParamType, InstantiatedType };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
@@ -241,7 +241,7 @@ type struct MemberResolver {
                 ErrorCode::E0204_UNDEFINED_FIELD,
                 fmt::format("no field or method `%s` on type `%s`", member_name, type_name));
             d = d.at_with_label(m_span, "unknown field or method");
-            const cands: string[] = this.diag.collect_struct_or_class_member_names(obj_type);
+            const cands: [string] = this.diag.collect_struct_or_class_member_names(obj_type);
             d = d.did_you_mean(member_name, cands, "field or method", m_span);
             this.ctx.emit_diagnostic(d);
         }
@@ -398,7 +398,7 @@ type struct MemberResolver {
         mut owner: TypeRef = this.types.method_owner_ref(ty);
         mut depth: i32 = 0;
         while (owner.is_valid() && depth < 16) {
-            const entries: OverloadId[] = this.ctx.decl_index.lookup_family_entries(
+            const entries: [OverloadId] = this.ctx.decl_index.lookup_family_entries(
                 FamilyOwner::Type(owner), member.member);
             if (entries.length > 0) { return this.shared_entry_return(&entries); }
             const t: Type* = this.arena.lookup(owner);
@@ -413,7 +413,7 @@ type struct MemberResolver {
 
     /// The return type every entry of `entries` declares, canonicalized;
     /// invalid when they differ or none carries a signature.
-    shared_entry_return(&this, entries: &OverloadId[]) -> TypeRef {
+    shared_entry_return(&this, entries: &[OverloadId]) -> TypeRef {
         mut ret: TypeRef = TypeRef::invalid();
         for (mut k: i64 = 0; k < entries.length; k++) {
             const sig: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[k]));
@@ -576,7 +576,7 @@ type struct MemberResolver {
     /// the generic owner itself - in declaration order, which is their order
     /// in every specialization.  False when `recv` names no such template (a
     /// type parameter, a projection): it has no field list to read.
-    template_field_names(&this, recv: TypeRef, out: mut &SymbolStr[]) -> boolean {
+    template_field_names(&this, recv: TypeRef, out: mut &[SymbolStr]) -> boolean {
         mut t: Type* = this.arena.lookup(recv);
         if (t == null) { return false; }
         mut tmpl_ref: TypeRef = recv;
@@ -692,11 +692,19 @@ type struct MemberResolver {
             // A type parameter a bound gives `Index` is indexed through that
             // bound where it is written: the desugar's call is answered by
             // the bound and records it, and every copy of the body carries
-            // that record.  Any other unresolved base waits for its copies.
+            // that record.  A user aggregate carrying the parameters
+            // (`&Array<T>`) is indexed through its own implementation, here
+            // as for a concrete base: the copies specialize the call the
+            // desugar holds and build no desugar of their own.
             const bounded: ExpressionNode* = this.try_bounded_index(visitor, access, array_type);
             if (bounded != null) {
                 access.desugared_call = bounded;
                 return bounded.resolved_type;
+            }
+            const owned: ExpressionNode* = this.try_index_overload(visitor, access, array_type);
+            if (owned != null) {
+                access.desugared_call = owned;
+                return owned.resolved_type;
             }
             return TypeRef::invalid();
         }
@@ -706,9 +714,8 @@ type struct MemberResolver {
         // param bounded by `Index`) that implements `Index<Idx, Output>` rewrites
         // `a[i]` into `*(a.index(i))` - the deref of the returned `Output*` is a
         // place, so the one desugar serves read / write / compound assignment.
-        // Arrays, slices, strings, pointers, pointer-to-array, and references
-        // all succeed above and never reach here, so the hot indexing path stays
-        // byte-identical.
+        // Fixed arrays, strings, pointers and references to them all succeed
+        // above and never reach here.
         const de: ExpressionNode* = this.try_index_overload(visitor, access, array_type);
         if (de != null) {
             access.desugared_call = de;

@@ -1,0 +1,64 @@
+// E0452: a loop tests its condition again at the back edge, and runs a
+// `for`'s update there, so a value moved in either is moved again on the
+// next iteration - the same buffer released twice.  The first test always
+// runs; each refusal is at the move the back edge repeats.  A whole local
+// and a field moved out of one are refused alike.
+![config(testing)]
+![config(negative, E0452)]
+namespace CryoTests::Negative::E0452MoveInLoopCondition;
+
+type struct Holder { a: [i64]; b: [i64]; }
+
+function take(xs: [i64]) -> i64 { return xs.length as i64; }
+
+function whole_in_while() -> i64 {
+    const v: [i64] = [1, 2];
+    mut n: i64 = 0;
+    while (take(v) == 2 && n < 2) { n += 1; }   //~ ERROR[E0452] value 'v' moved inside a loop is used again on the next iteration
+    return n;
+}
+
+function field_in_while() -> i64 {
+    const h: Holder = Holder { a: [1, 2], b: [3] };
+    mut n: i64 = 0;
+    while (take(h.a) == 2 && n < 2) { n += 1; }   //~ ERROR[E0452] value 'h.a' moved inside a loop is used again on the next iteration
+    return n;
+}
+
+function whole_in_for_condition() -> i64 {
+    const v: [i64] = [1, 2];
+    mut n: i64 = 0;
+    for (mut i: i64 = 0; take(v) == 2 && i < 2; i++) { n += 1; }   //~ ERROR[E0452] value 'v' moved inside a loop is used again on the next iteration
+    return n;
+}
+
+function whole_in_for_update() -> i64 {
+    const v: [i64] = [1, 2];
+    mut n: i64 = 0;
+    for (mut i: i64 = 0; i < 2; n += take(v)) { i += 1; }   //~ ERROR[E0452] value 'v' moved inside a loop is used again on the next iteration
+    return n;
+}
+
+function whole_in_do_while() -> i64 {
+    const v: [i64] = [1, 2];
+    mut n: i64 = 0;
+    do { n += 1; } while (take(v) == 2 && n < 2);   //~ ERROR[E0452] value 'v' moved inside a loop is used again on the next iteration
+    return n;
+}
+
+// A new value assigned in the body does not make it legal: the test that
+// ends the loop moves the new value too, and the scope releases it again.
+function reassigned_in_body() -> i64 {
+    mut v: [i64] = [1, 2];
+    mut n: i64 = 0;
+    while (take(v) == 2 && n < 2) {   //~ ERROR[E0452] value 'v' moved inside a loop is used again on the next iteration
+        n += 1;
+        v = [3, 4];
+    }
+    return n;
+}
+
+function main() -> int {
+    return (whole_in_while() + field_in_while() + whole_in_for_condition()
+        + whole_in_for_update() + whole_in_do_while() + reassigned_in_body()) as int;
+}

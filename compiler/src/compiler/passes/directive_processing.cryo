@@ -105,7 +105,7 @@ type struct DirectiveRecord {
 /// "what's the `repr` of struct Foo?", etc.
 type class DirectiveRegistry {
 public:
-    records: DirectiveRecord[];
+    records: [DirectiveRecord];
 
     static new() -> DirectiveRegistry* {
         mut r: DirectiveRegistry* = new DirectiveRegistry();
@@ -211,7 +211,7 @@ type struct DirectiveProcessingPasses {
     /// side-effects; they're still registered so user tooling can read them.
     static is_known_builtin(name: Keyword) -> boolean {
         return match (name.as_string()) {
-            "inline" | "noinline" | "entry" | "test" | "ignore"
+            "inline" | "noinline" | "caller_location" | "entry" | "test" | "ignore"
             | "should_panic" | "config" | "deprecated" | "align"
             | "repr" | "link" | "symbol" | "target" | "allow" | "warn" | "deny"
             | "derive"
@@ -292,7 +292,9 @@ type struct DirectiveProcessingPasses {
             // `![inline]` / `![noinline]`: zero args; function- or method-target.
             // Both apply to anything that lowers to an LLVM function body, so a
             // method (whose body is a function too) is a valid target.
-            "inline" | "noinline" => {
+            // `![caller_location]`: the same shape - it changes how the
+            // function's body and its calls are emitted.
+            "inline" | "noinline" | "caller_location" => {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
@@ -845,8 +847,8 @@ type struct DirectiveProcessingPasses {
                 // distance.  The full directive list is short and stable
                 // enough to embed inline here; updating it tracks
                 // `is_known_builtin` above.
-                mut cands: string[] = [
-                    "inline", "noinline", "entry", "test", "ignore",
+                mut cands: [string] = [
+                    "inline", "noinline", "caller_location", "entry", "test", "ignore",
                     "should_panic", "config", "deprecated", "align",
                     "repr", "link", "symbol", "no_mangle", "weak", "naked", "section",
                     "target", "allow", "warn", "deny",
@@ -1088,6 +1090,10 @@ type struct DirectiveProcessingPasses {
                 fn.is_inline   = false;
                 return;
             }
+            if (name.eq("caller_location")) {
+                fn.is_caller_located = true;
+                return;
+            }
             if (name.eq("implicit")) {
                 // Converter registration (for single-param `![implicit]`
                 // functions / static methods) happens in a dedicated walk after
@@ -1274,6 +1280,10 @@ type struct DirectiveProcessingPasses {
                     m.func.is_noinline = true;
                     m.func.is_inline   = false;
                 }
+                return;
+            }
+            if (name.eq("caller_location")) {
+                if (m.func != null) { m.func.is_caller_located = true; }
                 return;
             }
             // `![symbol("sym")]` on a method: pin the LLVM symbol of the wrapped
@@ -1490,12 +1500,12 @@ type struct DirectiveProcessingPasses {
             // top-level loop above only sees the container; per-method
             // directives like `![sink]` live on each MethodNode
             // and must be validated + applied here.  Methods on traits
-            // are FunctionDeclNode*[] (no MethodNode wrapper) and don't
+            // are [FunctionDeclNode*] (no MethodNode wrapper) and don't
             // currently carry directives; if that changes, fold them in.
             // Borrow the decl's method array - aliasing it into an owning local
             // would free the decl node's buffer when the local drops.
-            const empty_methods: MethodNode*[] = [];
-            mut method_list: &MethodNode*[] = &empty_methods;
+            const empty_methods: [MethodNode*] = [];
+            mut method_list: &[MethodNode*] = &empty_methods;
             if (decl.kind == NodeKind::StructDeclaration) {
                 const sn: StructDeclNode* = decl as StructDeclNode*;
                 method_list = &sn.methods;
@@ -1540,8 +1550,8 @@ type struct DirectiveProcessingPasses {
 
             // Descend into the fields of structs, classes and unions: a field's
             // own directives are validated and recorded as a declaration's are.
-            const empty_fields: FieldDeclNode*[] = [];
-            mut field_list: &FieldDeclNode*[] = &empty_fields;
+            const empty_fields: [FieldDeclNode*] = [];
+            mut field_list: &[FieldDeclNode*] = &empty_fields;
             if (decl.kind == NodeKind::StructDeclaration) {
                 field_list = &(decl as StructDeclNode*).fields;
             } else if (decl.kind == NodeKind::UnionDeclaration) {
@@ -1669,7 +1679,7 @@ type struct DirectiveProcessingPasses {
     /// Register each `![implicit]` static method of `methods` as a
     /// converter.  Instance methods are skipped: a converter needs no
     /// receiver.
-    static register_converter_methods(ctx: CompilationContext*, methods: &MethodNode*[]) -> void {
+    static register_converter_methods(ctx: CompilationContext*, methods: &[MethodNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null) { continue; }

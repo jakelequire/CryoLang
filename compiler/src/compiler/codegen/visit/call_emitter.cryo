@@ -134,6 +134,25 @@ type struct CallEmitter {
     /// `&mut` borrow sees the caller's storage.  Otherwise (rvalue: a
     /// literal, a global like a string constant, a computed value) we spill
     /// it to a fresh stack slot and return that slot's address.
+    /// Append the location a `![caller_location]` callee reports as its
+    /// caller's: `span`, the call's own, or - inside such a function
+    /// itself - the location its own caller passed, so a chain of them
+    /// reports the first call outside the chain.
+    push_caller_location(mut &this, args: [Pair<LValue, TypeRef>]*, span: SourceSpan) -> void {
+        const arena: TypeArena* = this.cg.get_arena();
+        if (this.cg.decl.caller_file.is_valid()) {
+            (*args).push(Pair::<LValue, TypeRef>::new(this.cg.decl.caller_file, arena.get_string()));
+            (*args).push(Pair::<LValue, TypeRef>::new(this.cg.decl.caller_line, arena.get_u32()));
+            return;
+        }
+        mut file: string = span.file;
+        if (file == null || file.length() == 0) { file = "<unknown>"; }
+        (*args).push(Pair::<LValue, TypeRef>::new(
+            this.cg.builder.build_global_string_ptr(file, "FILE.str"), arena.get_string()));
+        (*args).push(Pair::<LValue, TypeRef>::new(
+            LType::const_int(LType::i32(), span.start_line as u64, false), arena.get_u32()));
+    }
+
     /// Stack slot for a value spilled so its address can be taken.
     entry_spill_slot(&this, ty: LType, name: string) -> LValue {
         return this.cg.flow.temp_slot(ty, name);
@@ -184,7 +203,7 @@ type struct CallEmitter {
         if (!plan.sret_slot && plan.return_plan.llvm_slots.length > 0) {
             ret_ty = plan.return_plan.llvm_slots[0];
         }
-        mut call_args: Pair<LValue, TypeRef>[] = [];
+        mut call_args: [Pair<LValue, TypeRef>] = [];
         for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
             const av: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ai]);
             call_args.push(Pair::<LValue, TypeRef>::new(av, node.arguments[ai].resolved_type));
@@ -355,7 +374,7 @@ type struct CallEmitter {
                             }
                             const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
                             if (ctor_ty.is_valid() && LType::kind_of(ctor_ty.raw) == LTypeKind::Function) {
-                                mut ctor_args: Pair<LValue, TypeRef>[] = [];
+                                mut ctor_args: [Pair<LValue, TypeRef>] = [];
                                 ctor_args.push(Pair::<LValue, TypeRef>::new(obj_alloca, node.resolved_type));
                                 for (mut ci: i64 = 0; ci < node.arguments.length; ci++) {
                                     const carg: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ci]);
@@ -464,7 +483,7 @@ type struct CallEmitter {
                     const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, sr.resolved_member);
                     if (variant != null) {
                         // Codegen the arguments first.
-                        mut vargs: LValue[] = [];
+                        mut vargs: [LValue] = [];
                         for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
                             vargs.push(this.dispatch.codegen_rvalue(visitor,node.arguments[ai]));
                         }
@@ -583,7 +602,7 @@ type struct CallEmitter {
                         const fn_node: FunctionDeclNode* = rm.func;
                         // Extract the resolved method's declared param
                         // types (skipping self) in exact declaration order.
-                        mut rm_params: TypeRef[] = [];
+                        mut rm_params: [TypeRef] = [];
                         for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
                             const pp: VarDeclNode* = fn_node.parameters[pi];
                             if (pp == null) { continue; }
@@ -700,7 +719,7 @@ type struct CallEmitter {
         // callee then owns them). Opened before the receiver so a consumed
         // receiver temp joins this frame.
         if (this.cg.ctx.options.unwinds()) { this.cg.expr_ops.open_arg_temp_frame(); }
-        mut args: Pair<LValue, TypeRef>[] = [];
+        mut args: [Pair<LValue, TypeRef>] = [];
         if (node.callee.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
             // For pointer/reference receivers (e.g. `runner: Runner*`),
@@ -794,7 +813,8 @@ type struct CallEmitter {
         if (node.resolved_callee.is_some()
                 && (node.callee.kind == NodeKind::Identifier
                     || node.callee.kind == NodeKind::ScopeResolution)) {
-            const pinned_ft: TypeRef = this.cg.resolver.pinned_signature(node.resolved_callee);
+            const pinned_ft: TypeRef = this.cg.resolver.call_signature(
+                this.cg.resolver.pinned_entry(node.resolved_callee));
             const pinned_t: Type* = if (pinned_ft.is_valid()) { this.cg.arena_type(pinned_ft) } else { null };
             if (pinned_t != null && pinned_t.kind == TypeKind::Function) {
                 const pinned_lty: LType = this.cg.resolver.build_function_ltype(pinned_t as FunctionType*);
@@ -814,7 +834,11 @@ type struct CallEmitter {
         // function pointer.  We keep `fn_ty` from the statically resolved
         // function; it describes the correct signature for `LLVMBuildCall2`
         // and matches whatever override got installed in the slot at
-        // runtime (since all overrides share the base's signature).
+        // runtime (since all overrides share the base's signature).  The
+        // statically resolved function stays the one whose parameters say
+        // how the arguments pass (`declared`): the pointer loaded from the
+        // slot carries none.
+        const declared: LValue = callee_val;
         if (vtable_dispatch && args.length > 0 && args[0].first.is_valid() && vtable_obj_ref.is_valid()) {
             const class_lty: LType = this.cg.type_mapper.map_type(vtable_obj_ref);
             if (class_lty.is_valid()) {
@@ -882,6 +906,12 @@ type struct CallEmitter {
         // Live anonymous arg temps in an enclosing in-progress call also force an
         // invoke: if this call unwinds, its pad must drop them (the callee that
         // would own them never runs on the unwind path).
+        // A `![caller_location]` callee takes its caller's `FILE` and `LINE`
+        // after its own arguments: this call's location, or, inside another
+        // such function, the location that one was given.
+        if (this.cg.resolver.caller_located(this.cg.resolver.pinned_entry(node.resolved_callee))) {
+            this.push_caller_location(&args, node.span);
+        }
         const needs_invoke: boolean = this.cg.ctx.options.unwinds()
             && (node.unwind_cleanup.length > 0
                 || this.cg.expr_ops.has_live_arg_temps());
@@ -893,7 +923,7 @@ type struct CallEmitter {
                 this.cg.expr_ops.invoke_active = true;
                 this.cg.expr_ops.invoke_normal = cont_bb;
                 this.cg.expr_ops.invoke_lpad   = lpad_bb;
-                result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+                result = this.cg.expr_ops.codegen_call_via(callee_val, declared, fn_ty, args, call_name);
                 // Clear defensively in case an upstream error path returned
                 // before any callee call armed and consumed the flag.
                 this.cg.expr_ops.invoke_active = false;
@@ -901,10 +931,10 @@ type struct CallEmitter {
                 // `build_call_maybe_invoke` left the builder at `cont_bb`; the
                 // return coercion and any `unreachable` below emit there.
             } else {
-                result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+                result = this.cg.expr_ops.codegen_call_via(callee_val, declared, fn_ty, args, call_name);
             }
         } else {
-            result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+            result = this.cg.expr_ops.codegen_call_via(callee_val, declared, fn_ty, args, call_name);
         }
 
         result = this.reshape_call_result(node, result);
@@ -1107,7 +1137,7 @@ type struct CallEmitter {
         // `args` is scoped to this call: it is built and moved into
         // `try_emit` unconditionally, so nothing is left conditionally
         // moved past the if.
-        mut args: LValue[] = [];
+        mut args: [LValue] = [];
         for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
             args.push(this.dispatch.codegen_rvalue(visitor, node.arguments[ai]));
         }
@@ -1368,11 +1398,8 @@ type struct CallEmitter {
         }
         if (t.kind == TypeKind::Array) {
             const at: ArrayType* = t as ArrayType*;
-            // Dynamic arrays own their heap buffer via the Array<T> Drop impl
-            // (caught upstream by method resolution); only bare fixed-size
-            // arrays reach here.  Drop each element in place.
-            if (at.is_fixed() &&
-                OwnershipQuery::needs_drop(arena, this.cg.ctx.generic_registry,
+            // A fixed array owns its elements in place: drop each.
+            if (OwnershipQuery::needs_drop(arena, this.cg.ctx.generic_registry,
                                            this.cg.get_intern(), at.element)) {
                 this.emit_fixed_array_drops(visitor, receiver, at);
             }
@@ -1464,7 +1491,7 @@ type struct CallEmitter {
     /// yields a pointer into the receiver, so a leaf drop nulls that storage
     /// and any later re-drop is a no-op.
     emit_field_drops(mut &this, visitor: ASTVisitor*, receiver: ExpressionNode*,
-                     fields: &FieldInfo[]) -> void {
+                     fields: &[FieldInfo]) -> void {
         const arena: TypeArena* = this.cg.get_arena();
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
         const intern: InternTable* = this.cg.get_intern();
@@ -1555,7 +1582,7 @@ type struct CallEmitter {
             // running sum this replaced dropped e.g. `V(u32, String)`'s
             // String from packed offset 4 while construction wrote it at
             // aligned offset 8 - freeing a garbage pointer.
-            const offsets: u64[] = arena.variant_payload_layout(v, null, null);
+            const offsets: [u64] = arena.variant_payload_layout(v, null, null);
             for (mut pos: i64 = 0; pos < v.payload_types.length; pos++) {
                 const pt: TypeRef = v.payload_types[pos];
                 if (OwnershipQuery::needs_drop(arena, registry, intern, pt)) {

@@ -1,20 +1,54 @@
 # Roadmap
 
-What comes after `naming-impl` is merged into `main`.  Each item says what
-it is and what is still open about it.  Nothing here is built yet; the
-rulings that constrain an item are in the appendix of
-`docs/resolution-rules.md`, and the language as it stands is
-`docs/cryo.md`.  Known bugs are not here: they are in the local bug log,
-`.bug-report/` (see `CLAUDE.md`).
+The work planned since `naming-impl` was merged into `main`.  Each item
+says what it is, and what of it is built and still open.  The rulings
+that constrain an item are in the appendix of `docs/resolution-rules.md`,
+and the language as it stands is `docs/cryo.md`.  Known bugs are not here:
+they are in the local bug log, `.bug-report/` (see `CLAUDE.md`).
 
-**Order.**  CI is aligned with `make verify`'s gate list first, as
-housekeeping (ruling 266: CI matches verify's gate list first thing after
-the merge).  The first project was the editor's rewrite, on a branch named
-`lsp-rewrite` (ruling 316: the editor's rewrite comes first, before the
-type-syntax update and the class removal); what it built and what it left
-are under "The language server".  Then the type-syntax update
-(the array syntax below), then the class removal, then trait objects; the
-other items are not ordered yet.
+## Order to v1.0
+
+CI runs `make verify`'s gate list (ruling 266), and the editor's rewrite
+came first (ruling 316); what it built and what it left are under "The
+language server".  From there, in order, to the v1.0 freeze:
+
+1. **Array type syntax.**  Array types are written `[T]` and `[T; N]`, and
+   the postfix forms are refused.  Built, on `type-syntax-impl`.
+2. **One dynamic array type.**  `[T]` becomes `Array<T>`, which also
+   removes the crash of nested builtin arrays (below).
+3. **The class removal, and borrowed trait objects** (`virtual &T`,
+   rulings 285, 288, 289) right after it or folded into it, built on the
+   class vtable machinery (ruling 360).  Owning boxes, upcasting and
+   generic implementations coerced to an object come after v1.0.
+4. **Associated constants on concrete types** (`i32::MAX`,
+   `Config::DEFAULT_PORT`), with the decision whether `max_value()` stays.
+   Trait constants used as values come after v1.0; trait constants as
+   array lengths are not in v1.0.
+5. **An internal compiler logger** in place of `LOG_DEBUG` and `cdebug`.
+6. **The standard library's visibility pass.**  Everything in it is public
+   today, so internals such as `Array`'s grower are public API.  The pass
+   decides what stays public, and which standard-library APIs want trait
+   objects.
+7. **Bug fixing and bug hunting** before the freeze.
+
+The rule of thumb: a breaking change goes in before the freeze; an
+additive feature, or an internal rewrite such as the HIR and MIR pipeline
+or compile-time execution, comes after it.  The other items here are not
+ordered yet.
+
+## The language, used by its own compiler
+
+An ongoing principle rather than an item (ruling 368): the compiler and
+the standard library use Cryo's own language features wherever one fits -
+`Eq`, `Index`, `Drop`, `Allocate` and the other traits - instead of an
+ad-hoc method that does the same job, so that the compiler exercises the
+whole language in live code and its defects surface there first.  A type
+with an `equal` method that does not implement `Eq` is the shape to
+remove.
+
+Open: a survey of the compiler and the standard library for ad-hoc
+`equal`, compare, hash and to-string style methods that should be trait
+implementations, each one a candidate for its trait.  Not started.
 
 ## Merge notes
 
@@ -186,27 +220,21 @@ What is left:
 
 ## CI
 
-Continuous integration comes back after the merge (ruling 163: CI is out
-of scope until after the merge into `main`).  Today it fires only on
-`main` and on a manual dispatch, so on a branch the gates are what a
-person or an agent runs.
-
-The first change after the merge makes CI run the gate list `make verify`
-runs (ruling 266: CI is aligned with verify's gate list first thing after
-the merge), so green on `main` means what green meant on the branch.  Until
-then the difference is recorded in the merge notes.
+CI runs the gate list `make verify` runs (ruling 266), so green on `main`
+means what green meant on the branch; the rows it runs that verify does
+not are in the merge notes.  It fires only on `main` and on a manual
+dispatch, so on a branch the gates are what a person or an agent runs.
 
 Open: which gates run on every push and which only before a release; and
 whether branch pushes trigger anything at all.
 
 ## The test runner reports what it ran
 
-Right after the merge, `cryo test` always prints a count for each of its
-three suites - zero included - and `--list` lists all three, not the unit
-suite alone (ruling 272: the runner prints each suite's count and lists
-every suite, retiring the census and roster scripts).  `test-census.py`
-then reduces to nothing, and `roster-check.py` to a diff of `--list`
-against the golden.
+Not built: `cryo test` is to print a count for each of its three suites -
+zero included - and `--list` to list all three, not the unit suite alone
+(ruling 272: the runner prints each suite's count and lists every suite,
+retiring the census and roster scripts).  `test-census.py` then reduces to
+nothing, and `roster-check.py` to a diff of `--list` against the golden.
 
 A project's `test.json` gains `stdout_file`, which compares the program's
 whole output against a file (ruling 271: a `stdout_file` field compares a
@@ -247,27 +275,64 @@ normalised before the comparison.
 
 ## Associated constants
 
-A type declares named constants reached by a path, so `i32::MAX` is a
-value.  Until then a primitive's bounds are `min_value()` and `max_value()`,
-and `i32::MAX` is refused (ruling 275: primitives keep `max_value()` and
-`min_value()` for now).
+A concrete type declares named constants reached by a path, so `i32::MAX`
+and `Config::DEFAULT_PORT` are values; this comes before v1.0.  Until then
+a primitive's bounds are `min_value()` and `max_value()`, and `i32::MAX` is
+refused (ruling 275: primitives keep `max_value()` and `min_value()` for
+now).  Whether `max_value()` stays once `i32::MAX` exists is decided with
+it.  A constant a trait declares and its implementations supply, used as a
+value, comes after v1.0; one used as an array length is not in v1.0.
 
-Open: whether a trait may declare a constant its implementations supply,
-and whether a constant may be used where a type argument is expected.
+Open: whether a constant may be used where a type argument is expected.
 
-## Array syntax
+## An internal compiler logger
 
-`T[]` becomes `[T]` for a dynamic array, and `[T; N]` is the fixed-size
-array.
+The compiler traces through two mechanisms.  `LOG_DEBUG` takes a component
+and returns at once without printing, so its call sites trace nothing.
+`cdebug` prints to stderr, all of it or none, behind `--debug` (or
+`debug = true` in cryoconfig).  One logger replaces both, before v1.0.
 
-The first phase changes nothing: it re-measures the corpus - every array
-type written in `compiler/`, `stdlib/`, `tools/`, `tests/` and `examples/`
-- so the conversion is planned from today's numbers, not old ones.
+Open: how a component is selected (flag, environment variable or both),
+and whether a trace line names its source position.
 
-Open: whether `T[]` stays accepted for a transition period or is refused
-at once; how a fixed-size array's length is written when it is a constant
-expression; and what the conversion does with arrays of function types,
-which today need parentheses (`((i32) -> i32)[]`).
+## The standard library's visibility pass
+
+Everything in the standard library is public today, so its internals -
+`Array`'s grower among them - are public API, and would be frozen with
+v1.0.  The pass goes through the library deciding what stays public, and
+decides at the same time which of its APIs want borrowed trait objects.
+
+Open: whether the pass is gated (a public item with no documentation, or
+nothing outside the library using it, reported) or done by review alone.
+
+## One dynamic array type
+
+Done: `[T]` is `Array<T>` with the default allocator (ruling 363), indexed
+through the library's `Index` implementations (364), with `length` and
+`capacity` of type `i64` (375).  The symbol rename was proved by comparing
+compiled output with old names mapped to new (367); the one difference in
+compiled code, the calling convention of a `[T]` passed by value, was made
+alike first.  What stays open:
+
+- **A fixed array converted to a dynamic one.**  `const d: [i32] = buf;`
+  with `buf: [i32; 3]` is refused (E0200).  The built-in `[T]` accepted it
+  and miscompiled it; whether the conversion is built (allocate and copy,
+  moving an owning element) is undecided.
+- **`xs[i] = v` does not release the displaced element**, as `cryo.md`
+  states for a run-time index.
+- **Operators on a generic container in a generic body** (`a + b` with
+  `a: Vec<T>`) have the gap indexing had: only a bare bounded parameter is
+  desugared there.
+- **Every method of an instantiated generic is emitted**, `Array`'s
+  eleven `index` and `element_at` among them, used or not: about 1% of a
+  stripped binary.  Emitting only the used ones needs reachability over
+  every reference to a specialization's methods, codegen's own synthesized
+  calls among them, where a missed one is a link failure (373: accepted).
+- **The written spelling reaches declaration mismatches only.**  An
+  argument mismatch shows the parameter as `[T]` even where the parameter
+  was written `Array<T>`: the check holds the types, not the annotations.
+- **The demangler prints `[T]` as the instance it is**,
+  `std::collections::array::Array<i64, std::alloc::allocator::GlobalAlloc>`.
 
 ## The class removal
 
@@ -300,13 +365,17 @@ a flag day across the whole compiler, and what replaces `ASTNode`'s
 ## Trait objects
 
 A pointer or reference to a trait, dispatched through a table of the
-implementation's methods.  Built after the class removal, possibly after
-v1.0 (ruling 286).
+implementation's methods.  Borrowed trait objects come before v1.0, right
+after the class removal or folded into it, built on the class vtable
+machinery (ruling 360, which brings forward ruling 286's "possibly after
+v1.0"); owning boxes, upcasting and generic implementations coerced to an
+object come after v1.0.
 
 - **Spelling:** `virtual &Shape` and `virtual Shape*`, a prefix as in
   `mut &this`; there is no `dyn` (ruling 285).  Until then `&Shape` and
   `Shape*` are refused where they are written (`E0313`; ruling 287), as
-  is a bare `p: Shape` (ruling 304).
+  is a bare `p: Shape` (ruling 304).  The prefix composes inside an
+  array's brackets with no parentheses: `[virtual &Shape]`.
 - **Object safety is per method** (ruling 288): a method that cannot go in
   the table - one with type parameters of its own, for instance - is unavailable on
   the object, and the rest of the trait still works.

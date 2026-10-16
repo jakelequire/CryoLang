@@ -17,7 +17,8 @@ import compiler::{
 import compiler::passes::{
     pass_id, pass_registry, specialization
 };
-import compiler::codegen::{ llvm, llvm_types, passes, test_main_codegen, type_map };
+import compiler::codegen::{ inline_bodies, llvm, llvm_types, passes, test_main_codegen, type_map };
+import compiler::codegen::inline_bodies::{ InlineBodies };
 import compiler::resolver::{
     intern_table, symbol_str, mangled_name
 };
@@ -648,7 +649,7 @@ type struct CompilerInstance {
     /// cleanly at TypeLowering.
     compile_for_lsp_project(&this, config_path_text: string,
                             focus_path_text: string,
-                            overlays: SourceOverride[]) -> ProjectBuild {
+                            overlays: [SourceOverride]) -> ProjectBuild {
         const focus_path: string = focus_path_text;
         mangled_name::set_lsp_safe(true);
         if (config_path_text.length() == 0) {
@@ -877,13 +878,13 @@ type struct CompilerInstance {
     /// then be missing inputs exactly like an unresolvable dependency name,
     /// and the caller declines to serve those modules from cache.
     mark_implicit_closure(&this, ctx: CompilationContext*, m: LangModule, n: u32,
-                          out: boolean[]*, out_short: boolean*) -> void {
+                          out: [boolean]*, out_short: boolean*) -> void {
         if (ctx == null || out == null) { return; }
         const idx: i64 = ctx.module_graph.find_module_index(
             ctx.module_graph.lang_module(m, ctx.intern_table));
         if (idx < 0 || idx >= n as i64) { return; }
         mut short_walk: boolean = false;
-        const clos: boolean[] =
+        const clos: [boolean] =
             ctx.module_graph.compute_import_closure(idx as u32, n, &short_walk);
         for (mut i: u32 = 0; i < n; i++) {
             if (clos[i as i64]) { (*out)[i as i64] = true; }
@@ -961,7 +962,7 @@ type struct CompilerInstance {
     /// returned so the language server can walk it after the compile; it is
     /// null when the build failed before one was made.
     compile_project_to_context(&this, mut config: ProjectConfig, mode: CompileMode,
-                               overlays: SourceOverride[]) -> ProjectBuild {
+                               overlays: [SourceOverride]) -> ProjectBuild {
         // The tallies count one compilation's defects; a process that
         // compiles again (each target of a build, every analysis of the
         // language server) must not report the last one's.
@@ -978,7 +979,7 @@ type struct CompilerInstance {
         // cryoconfig stdlib_root -> legacy fallbacks.
         mut stdlib_root: string = "";
         if (!config.no_std) {
-            mut tried: string[] = [];
+            mut tried: [string] = [];
             stdlib_root = CompilerInstance::resolve_stdlib_root(
                 this.config.stdlib_path_override,
                 config.stdlib_root,
@@ -1115,7 +1116,7 @@ type struct CompilerInstance {
         // resolved view of each [dependencies] entry's source roots.
         // The loader appends each to project_root and pre-scans them so
         // imports targeting the dep's namespaces resolve.
-        mut effective_roots: string[] = [];
+        mut effective_roots: [string] = [];
         for (mut ip: i64 = 0; ip < config.source_paths.length; ip++) {
             effective_roots.push(config.source_paths[ip]);
         }
@@ -1165,7 +1166,7 @@ type struct CompilerInstance {
         // The language server's open buffers: discovery reads them, so a
         // freshly typed `import std::collections::str` reaches its module
         // before the file is saved.
-        mut overlays: SourceOverride[] = [];
+        mut overlays: [SourceOverride] = [];
         for (mut oi: i64 = 0; oi < ctx.options.source_overrides.length; oi++) {
             overlays.push(ctx.options.source_overrides[oi]);
         }
@@ -1222,7 +1223,7 @@ type struct CompilerInstance {
         // the `cryoconfig.lock` vendor section.  A normal build pins/updates it;
         // `--locked` instead FAILS when a binding drifts from the lock (e.g. a
         // system header or libclang upgrade silently changed the bound API).
-        const used_locks: LockedVendor[] = loader.collect_vendor_locks();
+        const used_locks: [LockedVendor] = loader.collect_vendor_locks();
         if (used_locks.length > 0) {
             if (!CompilerInstance::sync_vendor_lock(lock_path, &used_locks, this.config.locked)) {
                 // Only `--locked` returns false (a drift/missing-entry gate
@@ -1385,7 +1386,7 @@ type struct CompilerInstance {
         // closure below scans only re-exporters instead of the whole graph per
         // visible namespace; on a program that writes no `export` this list is
         // empty and the closure costs nothing.
-        mut reexporters: u32[] = [];
+        mut reexporters: [u32] = [];
         for (mut rxi: u32 = 0; rxi < ctx.module_graph.module_count(); rxi++) {
             if (ctx.module_graph.modules[rxi].reexports.length > 0) {
                 reexporters.push(rxi);
@@ -1397,7 +1398,7 @@ type struct CompilerInstance {
             // items, which are deliberately not dependencies (they would create
             // false cycles in `compute_order`); with only `dependencies`, a
             // module would not reach what its brace items name.
-            mut imi_visible: ModulePath[] = [];
+            mut imi_visible: [ModulePath] = [];
             for (mut di: i64 = 0; di < imi_info.dependencies.length; di++) {
                 imi_visible.push(imi_info.dependencies[di]);
             }
@@ -1489,7 +1490,7 @@ type struct CompilerInstance {
             // no diagnostic at all: the cycle listing went to the debug
             // channel, and the E0501 below was buffered but never flushed.
             mut cyc: string = "";
-            const unplaced: &u32[] = &ctx.module_graph.topo_unplaced;
+            const unplaced: &[u32] = &ctx.module_graph.topo_unplaced;
             for (mut ui: i64 = 0; ui < unplaced.length; ui++) {
                 const uinfo: ModuleInfo* =
                     &ctx.module_graph.modules[unplaced[ui]];
@@ -1511,7 +1512,7 @@ type struct CompilerInstance {
             return CompilationResult::failed(ctx.diagnostics.error_count, 0);
         }
 
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         tm_discovery_end = Instant::now().as_nanos();
 
@@ -1540,8 +1541,8 @@ type struct CompilerInstance {
         const do_incremental: boolean =
             this.config.incremental && ctx.options.mode.codegen_enabled()
             && this.config.output_path_override.length() == 0;
-        mut mod_entries: build_manifest::ModuleEntry[] = [];
-        mut manifest_artifacts: string[] = [];
+        mut mod_entries: [build_manifest::ModuleEntry] = [];
+        mut manifest_artifacts: [string] = [];
         mut manifest_stdlib_archive: string = "";
         mut build_fp_hex: string = "";
 
@@ -1551,9 +1552,9 @@ type struct CompilerInstance {
         //   pm_key_names[m]: namespace of module m (parallel to pm_key_hex)
         //   pm_key_hex[m]  : current cache key of module m
         //   pm_active      : the per-module cache is in effect this build
-        mut pm_cached:    boolean[] = [];
-        mut pm_key_names: string[]  = [];
-        mut pm_key_hex:   string[]  = [];
+        mut pm_cached:    [boolean] = [];
+        mut pm_key_names: [string]  = [];
+        mut pm_key_hex:   [string]  = [];
         mut pm_active:    boolean    = false;
         if (do_incremental) {
             for (mut i: u32 = 0; i < n; i++) {
@@ -1619,7 +1620,7 @@ type struct CompilerInstance {
         }
 
         // -- Per-target arena: ACTIVATE ----------------------------------
-        // From here through linking, every `T[]`/`HashMap`/`Box`/`String`
+        // From here through linking, every `[T]`/`HashMap`/`Box`/`String`
         // allocation (the frontend/mono/sema/codegen container heap, ~1 GB)
         // bumps the per-target arena instead of libc, to be bulk-reclaimed at
         // the next target's reset rather than leaking with this target's
@@ -1761,7 +1762,7 @@ type struct CompilerInstance {
             pm_active = true;
 
             // Per-module source hashes (indexed by module index).
-            mut pm_src_h: u128[] = [];
+            mut pm_src_h: [u128] = [];
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                 pm_src_h.push(compiler::build_manifest::Manifest::module_source_hash(
@@ -1776,7 +1777,7 @@ type struct CompilerInstance {
             // Spec ownership.  A spec whose owner can't be attributed to a
             // module would let a stale .o win, so disable the cache (full
             // rebuild) rather than risk a miscompile.
-            mut pm_owns_spec: boolean[] = [];
+            mut pm_owns_spec: [boolean] = [];
             for (mut m: u32 = 0; m < n; m++) { pm_owns_spec.push(false); }
             if (ctx.monomorphizer != null) {
                 const sc: i64 = ctx.monomorphizer.spec_count();
@@ -1825,7 +1826,7 @@ type struct CompilerInstance {
             // Per-module key (indexed by module index, parallel arrays).
             // `pm_closure_ok` clears for any module whose import closure came
             // back short; such a module is never served from cache.
-            mut pm_closure_ok: boolean[] = [];
+            mut pm_closure_ok: [boolean] = [];
             for (mut m: u32 = 0; m < n; m++) { pm_cached.push(false); pm_closure_ok.push(true); }
 
             // Modules the compiler imports on a module's behalf - the prelude,
@@ -1844,7 +1845,7 @@ type struct CompilerInstance {
             // settled until AutoImport runs, so widening the key is the change
             // that cannot be wrong in the dangerous direction.  Owner modules
             // already fold the global digest and so are covered.
-            mut pm_implicit: boolean[] = [];
+            mut pm_implicit: [boolean] = [];
             for (mut i: u32 = 0; i < n; i++) { pm_implicit.push(false); }
             mut pm_implicit_short: boolean = false;
             if (ctx.options.mode.auto_imports_enabled() && !config.no_std) {
@@ -1854,6 +1855,17 @@ type struct CompilerInstance {
                     this.mark_implicit_closure(ctx, LangModule::Interp, n,
                                                &pm_implicit, &pm_implicit_short);
                 }
+            }
+            // A module calling an `![inline]` function embeds a copy of its
+            // body, so every leaf key folds the source of each module that
+            // writes or holds one (a placed specialization), imported or
+            // not.  Folded in with the implicit set.
+            mut pm_inline: [boolean] = [];
+            for (mut m: u32 = 0; m < n; m++) {
+                const islot: void** = (ast_buf as void**) + m;
+                const writes: boolean = InlineBodies::writes_inline_body(*islot as ProgramNode*);
+                pm_inline.push(writes);
+                if (writes) { pm_implicit[m as i64] = true; }
             }
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
@@ -1866,7 +1878,7 @@ type struct CompilerInstance {
                 } else {
                     k.fold("leaf");
                     mut clos_incomplete: boolean = false;
-                    const clos: boolean[] =
+                    const clos: [boolean] =
                         ctx.module_graph.compute_import_closure(m, n, &clos_incomplete);
                     for (mut i: u32 = 0; i < n; i++) {
                         // The implicit set is unioned in rather than folded
@@ -1902,6 +1914,17 @@ type struct CompilerInstance {
                         compiler::build_manifest::Manifest::path_module(ctx.intern_table.shown(mi.path().decl_name())));
                     if (metadata::exists(Path::from(objp))) {
                         pm_cached[m as i64] = true;
+                    }
+                }
+                // A rebuilt module copies `![inline]` bodies from the modules
+                // holding them, which must then be analysed in this build too.
+                mut any_rebuilt: boolean = false;
+                for (mut m: u32 = 0; m < n; m++) {
+                    if (!pm_cached[m as i64]) { any_rebuilt = true; }
+                }
+                if (any_rebuilt) {
+                    for (mut m: u32 = 0; m < n; m++) {
+                        if (pm_inline[m as i64]) { pm_cached[m as i64] = false; }
                     }
                 }
             }
@@ -2148,19 +2171,28 @@ type struct CompilerInstance {
             // artifact isn't relinked, or the module failed).  Registering AFTER
             // the whole loop, in topo order, keeps the linker's input order
             // identical regardless of the order objects finish emitting.
-            mut cg_obj: string[] = [];
+            mut cg_obj: [string] = [];
             mut cg_failed: boolean = false;
             for (mut r: u32 = 0; r < n; r++) { cg_obj.push(""); }
 
             // Multi-process collection: parallel arrays of (bitcode, object)
             // paths + topo position, one per module emitted out-of-process.
-            mut mp_bc:  string[] = [];
-            mut mp_obj: string[] = [];
-            mut mp_pos: u32[] = [];
+            mut mp_bc:  [string] = [];
+            mut mp_obj: [string] = [];
+            mut mp_pos: [u32] = [];
 
             // In-process serial fallback batch (used when `!multiproc`).
-            mut cg_jobs: EmitJob[] = [];
-            mut cg_pos:  u32[] = [];
+            mut cg_jobs: [EmitJob] = [];
+            mut cg_pos:  [u32] = [];
+
+            // Every analysed `![inline]` body, for the modules calling one to
+            // copy.  A cached module was not analysed and offers none; the
+            // cache never reuses a module holding one while it rebuilds any.
+            for (mut r: u32 = 0; r < n; r++) {
+                if (pm_active && pm_cached[r as i64]) { continue; }
+                const rslot: void** = (ast_buf as void**) + r;
+                InlineBodies::record(ctx, *rslot as ProgramNode*);
+            }
 
             for (mut i: u32 = 0; i < n; i++) {
                 // An error reported while generating an earlier module fails
@@ -2509,7 +2541,7 @@ type struct CompilerInstance {
                         }
                     }
                 }
-                mut lib_objs: string[] = [];
+                mut lib_objs: [string] = [];
                 for (mut oi: i64 = 0; oi < ctx.artifacts.object_files.length; oi++) {
                     const o: string = ctx.artifacts.object_files[oi];
                     if (o.length() == 0) { continue; }
@@ -2706,7 +2738,7 @@ type struct CompilerInstance {
     /// consumers).
     run_frontend(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                  ast_buf: void*) -> boolean {
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         cdebug("[Compiler] Frontend: %u module(s)\n", n);
         pipeline.set_passes([PassID::Lexing, PassID::Parsing,
@@ -2751,7 +2783,7 @@ type struct CompilerInstance {
     /// DefaultExpansion consults the registry.
     run_module_resolution(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                           ast_buf: void*) -> boolean {
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
 
         pipeline.set_passes([PassID::AutoImport, PassID::ImportResolution,
@@ -2825,7 +2857,7 @@ type struct CompilerInstance {
     /// node).
     collect_type_declarations(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                               ast_buf: void*) -> boolean {
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         // The phase's own errors, so the walk stops after it has reported
         // every module's rather than at the first module that had one.
@@ -2863,7 +2895,7 @@ type struct CompilerInstance {
     /// import graph places a consumer before its declarer in `order[]`.
     register_templates(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                        ast_buf: void*) -> boolean {
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         // The phase's own errors, so the walk stops after it has reported
         // every module's rather than at the first module that had one.
@@ -2903,7 +2935,7 @@ type struct CompilerInstance {
     /// `!resolved_type.is_valid()`, so a later re-walk would skip them.
     expand_defaults_and_signatures(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                                    ast_buf: void*) -> boolean {
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         // The phase's own errors, so the walk stops after it has reported
         // every module's rather than at the first module that had one.
@@ -2942,7 +2974,7 @@ type struct CompilerInstance {
     /// TypeResolution + StructFieldTypeSync over every module.
     resolve_types(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                   ast_buf: void*) -> boolean {
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         // The phase's own errors, so the walk stops after it has reported
         // every module's rather than at the first module that had one.
@@ -3030,7 +3062,7 @@ type struct CompilerInstance {
     /// processed, silently dropping the layout onto every instantiation.
     process_directives(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                        ast_buf: void*) -> boolean {
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         // The phase's own errors, so the walk stops after it has reported
         // every module's rather than at the first module that had one.
@@ -3071,7 +3103,7 @@ type struct CompilerInstance {
     /// mono, resolves generic call return types.
     typecheck_bodies(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                      ast_buf: void*) -> boolean {
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         // The phase's own errors, so the walk stops after it has reported
         // every module's rather than at the first module that had one.
@@ -3112,7 +3144,7 @@ type struct CompilerInstance {
     /// mono specializes.
     monomorphize(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                  ast_buf: void*) -> boolean {
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         // The phase's own errors, so the walk stops after it has reported
         // every module's rather than at the first module that had one.
@@ -3163,7 +3195,7 @@ type struct CompilerInstance {
     /// registration can fall back to the arena.
     route_specializations(&this, ctx: CompilationContext*,
                           ast_buf: void*) -> boolean {
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         for (mut i: u32 = 0; i < n; i++) {
             CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
@@ -3241,7 +3273,7 @@ type struct CompilerInstance {
     static resolve_stdlib_root(cli_override_text: string,
                                  cryoconfig_override_text: string,
                                  project_root_text: string,
-                                 tried_out: string[]*) -> string {
+                                 tried_out: [string]*) -> string {
         const cli_override: string = cli_override_text;
         const cryoconfig_override: string = cryoconfig_override_text;
         const project_root: string = project_root_text;
@@ -3399,7 +3431,7 @@ type struct CompilerInstance {
     ///     content hash drifted.  Returns true when every binding matches.
     /// The packages section is preserved because `read` loads it and `write`
     /// emits it back untouched.
-    static sync_vendor_lock(lock_path_text: string, used: &LockedVendor[], locked: boolean) -> boolean {
+    static sync_vendor_lock(lock_path_text: string, used: &[LockedVendor], locked: boolean) -> boolean {
         const lock_path: string = lock_path_text;
         mut lock: Lockfile = Lockfile::read(lock_path_text);
         mut changed: boolean = false;
@@ -3543,7 +3575,7 @@ type struct CompilerInstance {
     /// (the serial path: `CRYO_CODEGEN_MODE=serial` / a 1-thread or tiny build).
     /// Emits each live module, then disposes the modules/contexts/target
     /// machines (`dispose_emit_jobs`).
-    static emit_jobs_serial(jobs: EmitJob[]*) -> void {
+    static emit_jobs_serial(jobs: [EmitJob]*) -> void {
         const cnt: i64 = (*jobs).length as i64;
         for (mut j: i64 = 0; j < cnt; j++) {
             codegen_emit_job(&(*jobs)[j]);
@@ -3554,7 +3586,7 @@ type struct CompilerInstance {
     /// Dispose every job's target machine, module, and context.  Runs on the
     /// MAIN thread after all emits complete (LLVM disposal must not interleave
     /// with concurrent emit).
-    static dispose_emit_jobs(jobs: EmitJob[]*) -> void {
+    static dispose_emit_jobs(jobs: [EmitJob]*) -> void {
         const cnt: i64 = (*jobs).length as i64;
         for (mut j: i64 = 0; j < cnt; j++) {
             if ((*jobs)[j].tm != null) {
@@ -3608,7 +3640,7 @@ type struct CompilerInstance {
     /// path that is already reporting an error.
     static codegen_module_name(ctx: CompilationContext*, pos: u32) -> string {
         if (ctx == null) { return "<unknown>"; }
-        const order: &u32[] = &ctx.module_graph.topo_order;
+        const order: &[u32] = &ctx.module_graph.topo_order;
         if (pos as i64 >= order.length) { return "<unknown>"; }
         const mi: u32 = order[pos as i64];
         if (mi as i64 >= ctx.module_graph.modules.length) { return "<unknown>"; }
@@ -3618,7 +3650,7 @@ type struct CompilerInstance {
 
     /// `nthreads <= 1` (or a single job) runs the batch inline via
     /// `emit_jobs_serial`, keeping a serial build byte-identical.
-    static emit_jobs_threaded(jobs: EmitJob[]*, nthreads: u32) -> void {
+    static emit_jobs_threaded(jobs: [EmitJob]*, nthreads: u32) -> void {
         const cnt: i64 = (*jobs).length as i64;
         if (cnt <= 0) { return; }
         if (nthreads <= 1 || cnt <= 1) {
@@ -3634,7 +3666,7 @@ type struct CompilerInstance {
         // worker held a pointer into it could realloc and dangle. Fill first,
         // then spawn.
         const base: EmitJob* = (*jobs).as_ptr();
-        mut wcs: EmitWorkerCtx[] = [];
+        mut wcs: [EmitWorkerCtx] = [];
         for (mut w: u32 = 0; w < nw; w++) {
             wcs.push(EmitWorkerCtx { jobs: base, count: cnt, start: w, stride: nw });
         }

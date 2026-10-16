@@ -126,6 +126,7 @@ import compiler::types::checker::{ TypeChecker, TypeCheckResult, TypeCompatibili
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ AssocProjectionType, GenericParamType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::ownership::{ OwnershipQuery };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::resolver::{ ResolutionContext };
@@ -400,7 +401,7 @@ public:
                     const ib: ImplBlockNode* = stmt as ImplBlockNode*;
                     // The head's owner, off the stamp; the written target is
                     // what a refusal names.
-                    mut owner_params: GenericParamNode*[] = this.impl_owner_params(ib);
+                    mut owner_params: [GenericParamNode*] = this.impl_owner_params(ib);
                     this.declare_async_methods(ib.methods, owner_params,
                         this.ctx.decl_index.impl_owner(ib, "sema/async declare"), ib.target_type, ib);
                 }
@@ -420,8 +421,8 @@ public:
     /// `impl_node` is the enclosing impl block when the owner is one (null
     /// otherwise); a trait impl uses it to bind the trait's implicit
     /// `<Method>Fut` associated type to the future each method lowers to.
-    declare_async_methods(mut &this, methods: &MethodNode*[],
-                          owner_params: &GenericParamNode*[],
+    declare_async_methods(mut &this, methods: &[MethodNode*],
+                          owner_params: &[GenericParamNode*],
                           owner_ty: TypeRef, written: SymbolStr,
                           impl_node: ImplBlockNode*) -> void {
         if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, written); return; }
@@ -459,7 +460,7 @@ public:
     /// undeclared reaches `lower` with no pending record, and that fallback
     /// declares it as a FREE function — where the body's `this` would silently
     /// resolve to the generated future instead of the receiver.
-    reject_undeclarable_async(mut &this, methods: &MethodNode*[], written: SymbolStr) -> void {
+    reject_undeclarable_async(mut &this, methods: &[MethodNode*], written: SymbolStr) -> void {
         const owner: string = if (written.is_valid()) { this.intern.resolve(written) } else { "?" };
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
@@ -475,11 +476,11 @@ public:
     /// The owner type as a method body sees `this`: the type itself, or the
     /// template instantiated over its own parameters for a generic owner
     /// (`Box<T>`), which is what the symbolic walk binds `this` to.
-    async_owner_instance(mut &this, base: TypeRef, params: &GenericParamNode*[]) -> TypeRef {
+    async_owner_instance(mut &this, base: TypeRef, params: &[GenericParamNode*]) -> TypeRef {
         if (!base.is_valid() || params.length == 0) { return base; }
         const t: Type* = this.arena.lookup(base);
         if (t == null || t.kind == TypeKind::InstantiatedType) { return base; }
-        mut refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(params, this.arena);
+        mut refs: [TypeRef] = TypeResolutionPasses::create_generic_param_types(params, this.arena);
         const inst: TypeRef = this.arena.create_instantiation(base, &refs);
         mem::drop(refs);
         return inst;
@@ -495,7 +496,7 @@ public:
     /// symbolically, and a body walked concretely while an abstract projection
     /// (`S::ReadFut::Output`) is still in it fails every check against that
     /// projection instead of deferring until monomorphization resolves it.
-    impl_owner_params(mut &this, ib: ImplBlockNode*) -> GenericParamNode*[] {
+    impl_owner_params(mut &this, ib: ImplBlockNode*) -> [GenericParamNode*] {
         if (ib.generic_params.length > 0) {
             return this.clone_generic_params(ib.generic_params);
         }
@@ -524,8 +525,8 @@ public:
         return [];
     }
 
-    clone_generic_params(&this, params: &GenericParamNode*[]) -> GenericParamNode*[] {
-        mut out: GenericParamNode*[] = [];
+    clone_generic_params(&this, params: &[GenericParamNode*]) -> [GenericParamNode*] {
+        mut out: [GenericParamNode*] = [];
         for (mut i: i64 = 0; i < params.length; i++) { out.push(params[i]); }
         return out;
     }
@@ -710,7 +711,7 @@ public:
     }
 
     /// Type-check all method bodies in a type or impl block.
-    visit_methods(mut &this, methods: &MethodNode*[], owner_type: TypeRef) -> void {
+    visit_methods(mut &this, methods: &[MethodNode*], owner_type: TypeRef) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null || method.func.body == null) { continue; }
@@ -831,14 +832,14 @@ public:
         const saved_symbolic: boolean = this.state.in_symbolic_check;
         const saved_cur_func: FunctionDeclNode* = this.state.symbolic_current_func;
         this.state.symbolic_current_func = func;
-        mut saved_method_nodes: GenericParamNode*[] = [];
+        mut saved_method_nodes: [GenericParamNode*] = [];
         swap(&this.state.symbolic_method_param_nodes, &saved_method_nodes);
         this.state.current_owner_type = owner_type;
         this.state.in_symbolic_check  = true;
         const ar: TypeArena* = this.arena;
         const saved_no_demand: boolean = if (ar != null) { ar.symbolic_no_demand_active } else { false };
         if (ar != null) { ar.set_symbolic_no_demand(true); }
-        mut method_nodes: GenericParamNode*[] = [];
+        mut method_nodes: [GenericParamNode*] = [];
         for (mut gp: i64 = 0; gp < func.generic_params.length; gp++) {
             const pnode: GenericParamNode* = func.generic_params[gp];
             if (pnode != null) { method_nodes.push(pnode); }
@@ -895,12 +896,12 @@ public:
     /// Walk every method body of a GENERIC owner symbolically.  A method on a
     /// generic owner reaches sema only here, so this is also where an `async` one
     /// is lowered, off the types the walk leaves on its body.
-    symbolic_check_owner_methods(mut &this, methods: &MethodNode*[], owner_type: TypeRef,
-                                 owner_params: &GenericParamNode*[]) -> void {
+    symbolic_check_owner_methods(mut &this, methods: &[MethodNode*], owner_type: TypeRef,
+                                 owner_params: &[GenericParamNode*]) -> void {
         const saved_owner_generic: boolean = this.state.symbolic_owner_is_generic;
-        mut saved_owner_nodes: GenericParamNode*[] = [];
+        mut saved_owner_nodes: [GenericParamNode*] = [];
         swap(&this.state.symbolic_owner_param_nodes, &saved_owner_nodes);
-        mut onodes: GenericParamNode*[] = [];
+        mut onodes: [GenericParamNode*] = [];
         for (mut i: i64 = 0; i < owner_params.length; i++) {
             const p: GenericParamNode* = owner_params[i];
             if (p != null) { onodes.push(p); }
@@ -1014,8 +1015,8 @@ public:
                 if (!this.checker.can_assign(expr_type, declared)) {
                     const value_span: SourceSpan = if (node.expression != null) { node.expression.span } else { node.span };
                     const ann_span: SourceSpan = annotation_span(this.state.return_type_ann);
-                    this.diag.emit_type_mismatch_with_value(
-                        ErrorCode::E0200_TYPE_MISMATCH, value_span, declared, expr_type,
+                    this.diag.emit_declared_mismatch(
+                        ErrorCode::E0200_TYPE_MISMATCH, value_span, declared, this.state.return_type_ann, expr_type,
                         "the function's declared return type doesn't match the value returned here",
                         ann_span, node.expression);
                 }
@@ -1288,7 +1289,7 @@ public:
                 const arr_t: Type* = this.arena.lookup(init_type);
                 if (arr_t != null && arr_t.kind == TypeKind::Array) {
                     const at: ArrayType* = arr_t as ArrayType*;
-                    if (at.is_fixed()) {
+                    {
                         const orig_init: ExpressionNode* = var_node.initializer;
                         const sp: SourceSpan = orig_init.span;
                         const zero_lit: LiteralNode* = new LiteralNode("0", LiteralKind::Integer, sp);
@@ -1314,7 +1315,7 @@ public:
                             res: ResSlot::Pending,
                         };
                         const elt_ann: TypeAnnotation* = new TypeAnnotation::Named(elt_named);
-                        mut gen_args: TypeAnnotation*[] = [];
+                        mut gen_args: [TypeAnnotation*] = [];
                         gen_args.push(elt_ann);
                         sr.set_scope_generic_args(gen_args);
                         mut call: CallExprNode* = new CallExprNode(sr as ExpressionNode*, sp);
@@ -1411,8 +1412,9 @@ public:
                         const var_name: string = this.intern.resolve(var_node.name);
                         const value_span: SourceSpan = if (var_node.initializer != null) { var_node.initializer.span } else { var_node.span };
                         const ann_span: SourceSpan = annotation_span(var_node.type_annotation);
-                        this.diag.emit_type_mismatch_with_value(
-                            ErrorCode::E0200_TYPE_MISMATCH, value_span, var_node.resolved_type, init_type,
+                        this.diag.emit_declared_mismatch(
+                            ErrorCode::E0200_TYPE_MISMATCH, value_span, var_node.resolved_type,
+                            var_node.type_annotation, init_type,
                             fmt::format("`%s` was declared with this type; the initializer must match", var_name),
                             ann_span, var_node.initializer);
                     }
@@ -1471,9 +1473,10 @@ public:
                 if (!this.checker.can_assign(init_type, node.resolved_type)) {
                     const value_span: SourceSpan = if (node.initializer != null) { node.initializer.span } else { node.span };
                     const ann_span: SourceSpan = annotation_span(node.type_annotation);
-                    this.diag.emit_type_mismatch_with_value(
-                        ErrorCode::E0200_TYPE_MISMATCH, value_span, node.resolved_type, init_type,
-                        "destructure pattern's declared type must match the initializer", ann_span, node.initializer);
+                    this.diag.emit_declared_mismatch(
+                        ErrorCode::E0200_TYPE_MISMATCH, value_span, node.resolved_type, node.type_annotation,
+                        init_type, "destructure pattern's declared type must match the initializer",
+                        ann_span, node.initializer);
                 }
             }
         }
@@ -1485,8 +1488,8 @@ public:
         const ty: Type* = this.arena.lookup(node.resolved_type);
         if (ty == null) { this.register_destructure_locals_void(node); return; }
 
-        const empty_fields: FieldInfo[] = [];
-        mut fields_ptr: &FieldInfo[] = &empty_fields;
+        const empty_fields: [FieldInfo] = [];
+        mut fields_ptr: &[FieldInfo] = &empty_fields;
         mut got_fields: boolean = false;
         if (ty.kind == TypeKind::Struct) { fields_ptr = &(ty as StructType*).fields; got_fields = true; }
         else if (ty.kind == TypeKind::Class) { fields_ptr = &(ty as ClassType*).fields; got_fields = true; }
@@ -1498,9 +1501,9 @@ public:
             return;
         }
 
-        mut names: SymbolStr[] = [];
+        mut names: [SymbolStr] = [];
         for (mut k: i64 = 0; k < fields_ptr.length; k++) { names.push(fields_ptr[k].decl_name().spelling()); }
-        const positions: i64[] = this.check_destructure_shape(node, &names,
+        const positions: [i64] = this.check_destructure_shape(node, &names,
             this.arena.format_display(ty));
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             mut b: DestructureBinding = node.bindings[i];
@@ -1520,9 +1523,9 @@ public:
     /// of the type it destructures (`ty_name` in the messages): a field bound
     /// twice, a field the type does not have, a field left out.  Each
     /// binding's field position in `names`, or -1 for one reported here.
-    check_destructure_shape(mut &this, node: DestructureDeclNode*, names: &SymbolStr[],
-                            ty_name: string) -> i64[] {
-        mut positions: i64[] = [];
+    check_destructure_shape(mut &this, node: DestructureDeclNode*, names: &[SymbolStr],
+                            ty_name: string) -> [i64] {
+        mut positions: [i64] = [];
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             const b: DestructureBinding = node.bindings[i];
             mut dup: boolean = false;
@@ -1552,7 +1555,7 @@ public:
                 mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0350_STRUCT_FIELD_NOT_FOUND,
                     fmt::format("no field `%s` on type `%s`", field_name, ty_name));
                 diag = diag.at_with_label(b.span, "unknown field");
-                mut cands: string[] = [];
+                mut cands: [string] = [];
                 for (mut k: i64 = 0; k < names.length; k++) { cands.push(this.intern.resolve(names[k])); }
                 diag = diag.did_you_mean(field_name, cands, "field", b.span);
                 this.ctx.emit_diagnostic(diag);
@@ -1593,8 +1596,8 @@ public:
     /// projection) is not checked.  Each binding's type is recorded on the
     /// template, which every copy substitutes.
     register_destructure_locals_abstract(mut &this, node: DestructureDeclNode*) -> void {
-        mut names: SymbolStr[] = [];
-        mut positions: i64[] = [];
+        mut names: [SymbolStr] = [];
+        mut positions: [i64] = [];
         if (node.has_resolved_type() && this.member.template_field_names(node.resolved_type, &names)) {
             positions = this.check_destructure_shape(node, &names,
                 this.arena.resolve_display_name(node.resolved_type));
@@ -1660,7 +1663,9 @@ public:
         const n: ASTNode* = expr as ASTNode*;
         const result: TypeRef = match (n.kind) {
             NodeKind::Literal           => { this.literals.resolve_literal(expr as LiteralNode*) }
-            NodeKind::Identifier        => { this.resolve_identifier(expr as IdentifierNode*) }
+            NodeKind::Identifier        => {
+                this.calls.located_value_checked(expr, this.resolve_identifier(expr as IdentifierNode*))
+            }
             NodeKind::BinaryExpression  => { this.resolve_binary(expr as BinaryExprNode*) }
             NodeKind::UnaryExpression   => { this.resolve_unary(expr as UnaryExprNode*) }
             NodeKind::CallExpression    => { this.calls.resolve_call(this, expr as CallExprNode*) }
@@ -1672,7 +1677,9 @@ public:
             NodeKind::MatchExpression   => { this.resolve_match_expr(expr as MatchExprNode*) }
             NodeKind::StaticMatchExpression => { this.resolve_static_match_expr(expr as StaticMatchExprNode*) }
             NodeKind::StructLiteral     => { this.resolve_struct_literal(expr as StructLiteralNode*) }
-            NodeKind::ScopeResolution   => { this.resolve_scope_resolution(expr as ScopeResolutionNode*) }
+            NodeKind::ScopeResolution   => {
+                this.calls.located_value_checked(expr, this.resolve_scope_resolution(expr as ScopeResolutionNode*))
+            }
             NodeKind::NewExpression     => { this.resolve_new_expr(expr as NewExprNode*) }
             NodeKind::ArrayLiteral      => { this.resolve_array_literal(expr as ArrayLiteralNode*) }
             NodeKind::TupleLiteral      => { this.resolve_tuple_literal(expr as TupleLiteralNode*) }
@@ -1868,7 +1875,7 @@ public:
             // node, from which monomorphization pins the instance.
             const tm: TemplateEntry* = this.ctx.generic_registry.template_of(def_id);
             if (tm != null && tm.node_kind == NodeKind::FunctionDeclaration) {
-                mut args: TypeRef[] = [];
+                mut args: [TypeRef] = [];
                 const inst_ty: TypeRef = this.calls.generic_value_type(tm, &tm.param_types, func_ty, &ident.generic_args,
                     name_str, fmt::format("%s::<...>", name_str), ident.span, &args);
                 if (inst_ty.is_valid()) { ident.set_value_instance(tm.base_type, args); }
@@ -1881,7 +1888,7 @@ public:
             }
             // An overloaded function as a value is the overload the expected
             // function type selects, pinned by its entry.
-            const family: OverloadId[] = this.calls.family_entries(def_id);
+            const family: [OverloadId] = this.calls.family_entries(def_id);
             const picked: TypeRef = this.calls.value_overload_signature(&family, name_str,
                 ident.span, ident as ExpressionNode*, &refused);
             if (refused) { return TypeRef::invalid(); }
@@ -1971,7 +1978,7 @@ public:
         if (lt == null || lt.kind != TypeKind::String) { return; }
         const string_ty: TypeRef = this.arena.get_string();
         const di: DeclarationIndex* = this.ctx.decl_index;
-        const entries: OverloadId[] = di.lookup_family_entries(
+        const entries: [OverloadId] = di.lookup_family_entries(
             FamilyOwner::Type(string_ty), this.intern.intern("append"));        for (mut i: i64 = 0; i < entries.length; i++) {
             const sig: Type* = this.arena.lookup(di.entry_signature(entries[i]));
             if (sig == null || sig.kind != TypeKind::Function) { continue; }
@@ -2276,7 +2283,7 @@ public:
         // The trait is spelled by its path: a bound of the program's own may
         // share its name.
         const trait_path: string = map.lang.path();
-        const bounds: DefId[] = this.binding.param_bound_traits(param);
+        const bounds: [DefId] = this.binding.param_bound_traits(param);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0229_INVALID_BINARY_OP,
             fmt::format("the `%s` operator cannot be applied to `%s`: its bounds do not give it `%s`",
                 op_text, shown, trait_path));
@@ -3117,11 +3124,11 @@ public:
         // arm's type in the param's place: `declare` mutates
         // `state.bindings`, so it must not run while the entry iterator is
         // live.
-        mut params: TypeRef[] = [scrut_ref];
-        mut args: TypeRef[] = [arm_ref];
+        mut params: [TypeRef] = [scrut_ref];
+        mut args: [TypeRef] = [arm_ref];
         const narrowing: TypeSubstitution = TypeSubstitution::from_params(&params, &args);
-        mut rebound: LocalBinding[] = [];
-        mut rebound_types: TypeRef[] = [];
+        mut rebound: [LocalBinding] = [];
+        mut rebound_types: [TypeRef] = [];
         mut bit: HashMapIter<SymbolKey, LocalBinding> = this.state.bindings.iter();
         loop {
             match (bit.next()) {
@@ -3499,8 +3506,8 @@ public:
                 }
             }
         }
-        mut infer_fields: TypeRef[] = [];
-        mut infer_values: TypeRef[] = [];
+        mut infer_fields: [TypeRef] = [];
+        mut infer_values: [TypeRef] = [];
 
         const saved_expected: TypeRef = this.state.expected_type;
         for (mut i: i64 = 0; i < lit.field_inits.length; i++) {
@@ -3582,13 +3589,13 @@ public:
         }
 
         if (struct_t != null && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
-            const empty_fields: FieldInfo[] = [];
-            mut fields_ptr: &FieldInfo[] = &empty_fields;
+            const empty_fields: [FieldInfo] = [];
+            mut fields_ptr: &[FieldInfo] = &empty_fields;
             mut is_complete: boolean = false;
             if (struct_t.kind == TypeKind::Struct) { const st: StructType* = struct_t as StructType*; fields_ptr = &st.fields; is_complete = st.is_complete; }
             else { const ct: ClassType* = struct_t as ClassType*; fields_ptr = &ct.fields; is_complete = ct.is_complete; }
             if (is_complete && fields_ptr.length > 0) {
-                mut missing_names: SymbolStr[] = [];
+                mut missing_names: [SymbolStr] = [];
                 for (mut k: i64 = 0; k < fields_ptr.length; k++) {
                     const decl_name: SymbolStr = fields_ptr[k].decl_name().spelling();
                     mut covered: boolean = false;
@@ -3753,7 +3760,7 @@ public:
         if (sig == null || sig.kind != TypeKind::Function) { return TypeRef::invalid(); }
         const ft: FunctionType* = sig as FunctionType*;
         if (node.func.generic_params.length > 0) { return TypeRef::invalid(); }
-        mut params: TypeRef[] = [recv.resolved_type];
+        mut params: [TypeRef] = [recv.resolved_type];
         for (mut i: i64 = 0; i < ft.param_types.length; i++) { params.push(ft.param_types[i]); }
         const value_ft: TypeRef = this.arena.get_function(ft.return_type, &params, ft.is_variadic);
         if (this.types.contains_generic_param(value_ft)) { return TypeRef::invalid(); }
@@ -3883,7 +3890,7 @@ public:
         if (this.calls.owner_declares_member(scope_ty, scope.member_name)) { return; }
         const enum_name: string = this.intern.resolve(scope.scope_name);
         const member:    string = this.intern.resolve(scope.member_name);
-        mut cands: string[] = [];
+        mut cands: [string] = [];
         for (mut i: i64 = 0; i < et.variants.length; i++) { cands.push(et.variants[i].display_name(this.intern)); }
         const best: string = find_best_candidate(member, cands);
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0640_INVALID_ENUM_VARIANT_ACCESS,
@@ -3919,7 +3926,7 @@ public:
                 } else {
                     const enum_name: string = this.intern.resolve(new_expr.type_name);
                     const member: string = this.intern.resolve(new_expr.variant_name);
-                    mut cands: string[] = [];
+                    mut cands: [string] = [];
                     for (mut i: i64 = 0; i < et.variants.length; i++) { cands.push(et.variants[i].display_name(this.intern)); }
                     const best: string = find_best_candidate(member, cands);
                     mut d: Diagnostic = Diagnostic::error(ErrorCode::E0640_INVALID_ENUM_VARIANT_ACCESS,
@@ -3939,22 +3946,19 @@ public:
                 _                    => { DefId::invalid() }
             };
             if (def.is_valid()) {
-                const ctors: TypeRef[] = this.calls.family_signatures_of(def);
+                const ctors: [TypeRef] = this.calls.family_signatures_of(def);
                 this.calls.check_constructor_args(this, def, &ctors, &new_expr.arguments, new_expr.span);
             }
         }
         return this.arena.get_pointer_to(base);
     }
 
-    expected_is_dynamic_array(&this) -> boolean {
-        if (!this.state.expected_type.is_valid()) { return false; }
-        mut exp_t: Type* = this.arena.lookup(this.state.expected_type);
-        if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = exp_t as InstantiatedType*;
-            if (inst.has_resolved_type()) { exp_t = this.arena.lookup(inst.resolved_type); }
-        }
-        if (exp_t == null || exp_t.kind != TypeKind::Array) { return false; }
-        return !(exp_t as ArrayType*).is_fixed();
+    /// The element of the owning dynamic array an array literal written
+    /// here builds: the expected type's, when it is `[T]` (`Array<T>` with
+    /// the default allocator), whose storage the literal allocates; invalid
+    /// for any other expected type.
+    expected_dynamic_element(&this) -> TypeRef {
+        return this.arena.default_array_element(this.state.expected_type);
     }
 
     /// The element count of a `[value; N]` repeat expression, or -1 when `N`
@@ -3962,7 +3966,7 @@ public:
     /// array sized at run time.
     ///
     /// Folded through the same environment an array size in a type is folded
-    /// through, so `T[N]` and `[v; N]` cannot disagree about `N` - a field and
+    /// through, so `[T; N]` and `[v; N]` cannot disagree about `N` - a field and
     /// its initializer sharing one name for their length is the whole point of
     /// naming it.  No arena: a repeat count is fixed before TypeLowering, the
     /// same position an array annotation's size is fixed at.
@@ -3976,8 +3980,9 @@ public:
     }
 
     resolve_array_literal(mut &this, arr: ArrayLiteralNode*) -> TypeRef {
-        mut elem_expected: TypeRef = TypeRef::invalid();
-        if (this.state.expected_type.is_valid()) {
+        const dynamic_elem: TypeRef = this.expected_dynamic_element();
+        mut elem_expected: TypeRef = dynamic_elem;
+        if (!elem_expected.is_valid() && this.state.expected_type.is_valid()) {
             mut exp_t: Type* = this.arena.lookup(this.state.expected_type);
             if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = exp_t as InstantiatedType*;
@@ -4007,7 +4012,7 @@ public:
                 // no instruction between them - the literal IS an array of
                 // the expected element type.  `null` is typed `void*` and is
                 // valid in any pointer context, so `[null; 8]` written into a
-                // `T*[8]` must be a `T*[8]`; typing it `void*[8]` makes the
+                // `[T*; 8]` must be a `[T*; 8]`; typing it `[void*; 8]` makes the
                 // enclosing assignment fail on a difference that does not
                 // exist at runtime.
                 //
@@ -4025,6 +4030,18 @@ public:
             }
         }
         if (arr.repeat_count_expr != null) { this.resolve_expr(arr.repeat_count_expr); }
+        // `[value; n]` evaluates `value` once and stores it in every slot,
+        // so every slot would release the one value: the element must be a
+        // plain-copy type.  An element still written in a generic body's
+        // parameters is checked in each copy of the body.
+        if ((arr.repeat_count > 0 || arr.repeat_count_expr != null) && elem_type.is_valid()
+                && !this.symbolic.symbolic_type_unresolved(elem_type)
+                && !OwnershipQuery::is_copy(this.arena, this.ctx.generic_registry, this.intern, elem_type)) {
+            this.ctx.emit_error_at(ErrorCode::E0453_DOUBLE_FREE,
+                fmt::format("`[value; n]` stores one value in every slot, so its element must be a plain-copy type; `%s` is not, and the one value would be released once per slot",
+                    this.arena.resolve_display_name_short(elem_type)),
+                arr.span);
+        }
         if (!elem_type.is_valid() && this.state.expected_type.is_valid()
             && arr.elements.length == 0 && arr.repeat_count == 0 && arr.repeat_count_expr == null) {
             mut exp_t: Type* = this.arena.lookup(this.state.expected_type);
@@ -4033,6 +4050,7 @@ public:
                 if (inst.has_resolved_type()) { exp_t = this.arena.lookup(inst.resolved_type); }
             }
             if (exp_t != null && exp_t.kind == TypeKind::Array) { return this.state.expected_type; }
+            if (dynamic_elem.is_valid()) { return this.state.expected_type; }
         }
         if (elem_type.is_valid()) {
             mut size: i64 = arr.elements.length;
@@ -4040,24 +4058,19 @@ public:
                 size = arr.repeat_count;
             } else if (arr.repeat_count_expr != null) {
                 size = -1;
-                if (!this.expected_is_dynamic_array()) {
+                if (!dynamic_elem.is_valid()) {
                     const fill_count: i64 = this.const_repeat_count(arr);
                     if (fill_count >= 0) { size = fill_count; }
                 }
             }
-            if (this.state.expected_type.is_valid() && arr.repeat_count == 0 && arr.repeat_count_expr == null) {
-                mut exp_t: Type* = this.arena.lookup(this.state.expected_type);
-                if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
-                    const inst: InstantiatedType* = exp_t as InstantiatedType*;
-                    if (inst.has_resolved_type()) { exp_t = this.arena.lookup(inst.resolved_type); }
-                }
-                if (exp_t != null && exp_t.kind == TypeKind::Array) {
-                    const exp_arr: ArrayType* = exp_t as ArrayType*;
-                    if (!exp_arr.is_fixed() && this.checker.can_assign(elem_type, exp_arr.element)) {
-                        return this.state.expected_type;
-                    }
-                }
+            // A literal written where an `Array<T>` is expected is that
+            // array, its elements in storage the literal allocates, in
+            // every form: listed, or filled to a count fixed or run-time.
+            if (dynamic_elem.is_valid() && this.checker.can_assign(elem_type, dynamic_elem)) {
+                return this.state.expected_type;
             }
+            // A fill to a run-time count is an `Array<T>`.
+            if (size < 0) { return this.ctx.type_resolver.dynamic_array_type(elem_type); }
             return this.arena.get_array_of(elem_type, size);
         }
         return TypeRef::invalid();
@@ -4100,7 +4113,7 @@ public:
             }
         }
         const saved_expected: TypeRef = this.state.expected_type;
-        mut elem_types: TypeRef[] = [];
+        mut elem_types: [TypeRef] = [];
         for (mut i: i64 = 0; i < tup.elements.length; i++) {
             if (exp_tup != null) {
                 this.state.expected_type = exp_tup.elements[i];

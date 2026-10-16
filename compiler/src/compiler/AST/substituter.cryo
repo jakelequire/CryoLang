@@ -81,7 +81,7 @@ public:
     /// rewritten only when that symbol is one of these: a trait default's
     /// own `<U>` copied under an `implement<U>` keeps its `U` while the
     /// impl's is rewritten, which no comparison of spellings can do.
-    param_syms:        SymbolID[];
+    param_syms:        [SymbolID];
     /// The arena id the specialization will occupy, or invalid when the caller
     /// has none.  Attached as `pre_resolved` to every annotation rewritten to
     /// `spec_name`, so a synthesized mangled name never has to be re-derived
@@ -96,7 +96,7 @@ public:
     ASTTypeSubstituter(subst: TypeSubstitution*, arena: TypeArena*,
                        intern_table: InternTable*,
                        template: DefId, spec_name: SymbolStr,
-                       param_syms: SymbolID[],
+                       param_syms: [SymbolID],
                        spec_typeref: TypeRef)
         : BaseASTVisitor() {
         this.subst             = subst;
@@ -410,16 +410,6 @@ public:
                 }
                 _ => {}
             }
-            // A dynamic array's element carries its TypeRef, as a pointee
-            // does; without it an element that is not a type in scope at the
-            // specialization resolves to nothing and mangling fails.
-            const element: TypeRef = this.arena.dynamic_array_element_of(arg);
-            if (element.is_valid()) {
-                ASTTypeSubstituter::rewrite_to_array(
-                    ann, this.arena.display_label(element),
-                    element, named.span);
-                return ann;
-            }
             // Anything else stays Named, answered by the argument itself:
             // the substitution holds the TypeRef the user gave, and the
             // resolver takes `pre_resolved` before it reads the name.
@@ -510,7 +500,7 @@ public:
     /// self-reference; the trailing defaulted positions still resolve
     /// to whatever the current spec used. Empty `args` is also a self-
     /// reference (a bare unparameterized name).
-    args_are_outer_param_refs(&this, args: &TypeAnnotation*[]) -> boolean {
+    args_are_outer_param_refs(&this, args: &[TypeAnnotation*]) -> boolean {
         if (args.length > this.param_syms.length) { return false; }
         for (mut i: i64 = 0; i < args.length; i++) {
             const a: TypeAnnotation* = args[i];
@@ -545,8 +535,8 @@ public:
     /// Substitute type parameters in generic arg annotations.
     /// Delegates to substitute_annotation() for each element, preserving
     /// the full structure (pointers, arrays, nested generics, etc.).
-    substitute_generic_type_args(args: &TypeAnnotation*[]) -> TypeAnnotation*[] {
-        mut result: TypeAnnotation*[] = [];
+    substitute_generic_type_args(args: &[TypeAnnotation*]) -> [TypeAnnotation*] {
+        mut result: [TypeAnnotation*] = [];
         for (mut i: i64 = 0; i < args.length; i++) {
             result.push(this.substitute_annotation(args[i]));
         }
@@ -660,7 +650,7 @@ public:
             this.substitute_annotation(node.trait_annotation);
         }
         if (node.trait_arg_types.length > 0 && this.subst != null) {
-            mut tats: TypeRef[] = [];
+            mut tats: [TypeRef] = [];
             for (mut i: i64 = 0; i < node.trait_arg_types.length; i++) {
                 tats.push(this.reduced(this.subst.apply(node.trait_arg_types[i], this.arena)));
             }
@@ -719,7 +709,7 @@ public:
         // instantiation from sema's bindings without re-inferring.  A no-op on
         // an already-concrete element (subst's domain is the template params).
         if (node.resolved_type_args.length > 0 && this.subst != null) {
-            mut sub_rta: TypeRef[] = [];
+            mut sub_rta: [TypeRef] = [];
             for (mut i: i64 = 0; i < node.resolved_type_args.length; i++) {
                 sub_rta.push(this.subst.apply(node.resolved_type_args[i], this.arena));
             }
@@ -732,14 +722,14 @@ public:
             node.template_recv = this.reduced(this.subst.apply(node.template_recv, this.arena));
         }
         if (node.bound_params.length > 0 && this.subst != null) {
-            mut bps: TypeRef[] = [];
+            mut bps: [TypeRef] = [];
             for (mut i: i64 = 0; i < node.bound_params.length; i++) {
                 bps.push(this.reduced(this.subst.apply(node.bound_params[i], this.arena)));
             }
             node.bound_params = bps;
         }
         if (node.bound_trait_args.length > 0 && this.subst != null) {
-            mut btas: TypeRef[] = [];
+            mut btas: [TypeRef] = [];
             for (mut i: i64 = 0; i < node.bound_trait_args.length; i++) {
                 btas.push(this.reduced(this.subst.apply(node.bound_trait_args[i], this.arena)));
             }
@@ -1234,34 +1224,12 @@ public:
         *ann = TypeAnnotation::Pointer(ptr);
     }
 
-    /// Rewrite a TypeAnnotation* in-place from Named to Array(Named(inner), -1).
-    /// `inner_pre_resolved` is the element type's TypeRef when known (the
-    /// substituter has it from `subst.replacements[i]`'s array element). Mirrors
-    /// `rewrite_to_pointer`: without it, the inner Named is resolved by bare name
-    /// in a fresh empty ResolutionContext, which fails for any element that isn't a
-    /// bare-name-resolvable type - e.g. a pointer element (`i32*[]`, the inner
-    /// display `i32*` names no type) or a user-defined type out of scope at the
-    /// spec site - yielding an `Array<invalid>` that later ICEs the mangler.
-    static rewrite_to_array(ann: TypeAnnotation*, inner_name: SymbolStr,
-                              inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
-        const inner_named: NamedAnnotation* = new NamedAnnotation {
-            name: inner_name,
-            span: span,
-            pre_resolved: inner_pre_resolved,
-            res: ResSlot::Pending,
-        };
-        const inner_ann: TypeAnnotation* = new TypeAnnotation::Named(inner_named);
-        const arr: ArrayAnnotation* = new ArrayAnnotation {
-            element: inner_ann, size: ArrayAnnotation::heap_dynamic_size(),
-            size_expr: null, span: span };
-        *ann = TypeAnnotation::Array(arr);
-    }
 
     /// Rewrite a TypeAnnotation* in-place to the empty-tuple (unit) annotation.
     /// Used when a generic param is substituted with `()`, which is not a Named
     /// type and cannot survive as Named("()") through the resolver.
     static rewrite_to_unit(ann: TypeAnnotation*, span: SourceSpan) -> void {
-        mut empty_elems: TypeAnnotation*[] = [];
+        mut empty_elems: [TypeAnnotation*] = [];
         const tup: TupleAnnotation* = new TupleAnnotation { elements: empty_elems, span: span };
         *ann = TypeAnnotation::Tuple(tup);
     }

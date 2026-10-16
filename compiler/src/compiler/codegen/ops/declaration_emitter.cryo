@@ -107,8 +107,8 @@ type struct DebugInfoState {
 /// computed when the program starts (`emit_global_initializers`).  Read by
 /// position only.
 type struct StartedGlobals {
-    nodes: VarDeclNode*[];
-    slots: LValue[];
+    nodes: [VarDeclNode*];
+    slots: [LValue];
 }
 
 type struct DeclarationEmitter {
@@ -129,9 +129,17 @@ type struct DeclarationEmitter {
     ctx:         CompilationContext*;
     started:     StartedGlobals;
 
+    /// While a `![caller_location]` function's body is emitted, the two
+    /// trailing parameters its callers pass their `FILE` and `LINE` in;
+    /// null for any other body.
+    caller_file: LValue;
+    caller_line: LValue;
+
     static null() -> DeclarationEmitter {
         return DeclarationEmitter {
             started:     StartedGlobals { nodes: [], slots: [] },
+            caller_file: LValue::null(),
+            caller_line: LValue::null(),
             llvm_module: null,
             builder:     null,
             type_mapper: null,
@@ -220,7 +228,7 @@ type struct DeclarationEmitter {
     /// named LLVM struct types.  This must run before function declarations
     /// so that parameter and return types can reference these types.
     declare_types(mut &this, program: ProgramNode*) -> void {
-        const stmts: &ASTNode*[] = &program.statements;
+        const stmts: &[ASTNode*] = &program.statements;
         for (mut i: i64 = 0; i < stmts.length; i++) {
             const stmt: ASTNode* = stmts[i];
             if (stmt == null) { continue; }
@@ -314,7 +322,7 @@ type struct DeclarationEmitter {
     /// (regardless of source order, e.g. `clock_gettime(CLOCK_REALTIME, ...)`
     /// where the const is declared later in the file) can resolve it.
     declare_functions(mut &this, program: ProgramNode*) -> void {
-        const stmts: &ASTNode*[] = &program.statements;
+        const stmts: &[ASTNode*] = &program.statements;
         for (mut i: i64 = 0; i < stmts.length; i++) {
             const stmt: ASTNode* = stmts[i];
             if (stmt == null) { continue; }
@@ -495,7 +503,7 @@ type struct DeclarationEmitter {
         // Indirect parameter.  Empty when the main-widening branch
         // builds `fn_type` open-coded (main can't have aggregate
         // parameters in source, so byval never applies there).
-        mut plan_param_plans: ParamPlan[] = [];
+        mut plan_param_plans: [ParamPlan] = [];
         // Under `no_runtime` there is no C runtime calling `main`, so we do
         // NOT widen its signature to argc/argv/envp (nor emit the
         // set_args/set_env prologue below): a freestanding entry is a
@@ -524,12 +532,16 @@ type struct DeclarationEmitter {
             fn_type = LType::function_type(ret_ty, buf, 3, false);
             libc::free(buf);
         } else {
-            mut params: TypeRef[] = [];
+            mut params: [TypeRef] = [];
             for (mut i: u32 = 0; i < param_count; i++) {
                 const param: VarDeclNode* = node.parameters[i];
                 if (param != null && param.resolved_type.is_valid()) {
                     params.push(param.resolved_type);
                 }
+            }
+            if (node.is_caller_located) {
+                const extra: [TypeRef] = SymbolResolver::caller_location_params(this.get_arena());
+                for (mut ci: i64 = 0; ci < extra.length; ci++) { params.push(extra[ci]); }
             }
             const plan: SignaturePlan = this.abi.classify_signature(
                 params, node.resolved_return_type, node.is_variadic);
@@ -719,11 +731,11 @@ type struct DeclarationEmitter {
     /// existing slot at vtable-emission time.  The returned list is in
     /// root -> leaf declaration order, so every subclass's vtable extends
     /// the base's layout with its own additions.
-    collect_vtable_slots(mut &this, cls: ClassType*) -> VTableSlot[] {
+    collect_vtable_slots(mut &this, cls: ClassType*) -> [VTableSlot] {
         const arena: TypeArena* = this.get_arena();
 
         // Build chain = [cls, ..., root].
-        mut chain: ClassType*[] = [];
+        mut chain: [ClassType*] = [];
         mut walk: ClassType* = cls;
         mut depth: i32 = 0;
         while (walk != null && depth < 16) {
@@ -735,7 +747,7 @@ type struct DeclarationEmitter {
             depth += 1;
         }
 
-        mut slots: VTableSlot[] = [];
+        mut slots: [VTableSlot] = [];
         for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
             const link: ClassType* = chain[ci];
             for (mut mi: i64 = 0; mi < link.methods.length; mi++) {
@@ -760,7 +772,7 @@ type struct DeclarationEmitter {
                     // Own an independent copy of the param-type ids; moving
                     // `m.param_types` out of the slice-element copy `m` would
                     // alias the array and double-free. TypeRef is Copy.
-                    mut pt_copy: TypeRef[] = [];
+                    mut pt_copy: [TypeRef] = [];
                     for (mut pk: i64 = 0; pk < m.param_types.length; pk++) {
                         pt_copy.push(m.param_types[pk]);
                     }
@@ -778,7 +790,7 @@ type struct DeclarationEmitter {
     /// goes through the method's own registered entry so the correct LLVM
     /// function is installed in the slot, not the last-registered one
     /// under `Type::method`.
-    find_vtable_slot_impl(mut &this, cls: ClassType*, slot_name: SymbolStr, slot_params: &TypeRef[]) -> LValue {
+    find_vtable_slot_impl(mut &this, cls: ClassType*, slot_name: SymbolStr, slot_params: &[TypeRef]) -> LValue {
         const arena: TypeArena* = this.get_arena();
         mut walk: ClassType* = cls;
         mut depth: i32 = 0;
@@ -846,8 +858,8 @@ type struct DeclarationEmitter {
     /// base-class pointer would fall back to a static call to the base accept
     /// (which targets vtable slot 0, the no-op base `visit(BaseNode*)`;
     /// silently dropping every visitor traversal).
-    vtable_slot_index(mut &this, cls: ClassType*, method_name: SymbolStr, param_types: TypeRef[]) -> i32 {
-        const slots: VTableSlot[] = this.collect_vtable_slots(cls);
+    vtable_slot_index(mut &this, cls: ClassType*, method_name: SymbolStr, param_types: [TypeRef]) -> i32 {
+        const slots: [VTableSlot] = this.collect_vtable_slots(cls);
         for (mut i: i32 = 0; i < slots.length as i32; i++) {
             if (slots[i].name.equals(method_name) &&
                 CodegenUtil::param_types_equal(
@@ -865,10 +877,10 @@ type struct DeclarationEmitter {
     codegen_vtable_for_class(mut &this, cls: ClassType*) -> void {
         const intern: InternTable* = this.get_intern();
 
-        const slots: VTableSlot[] = this.collect_vtable_slots(cls);
+        const slots: [VTableSlot] = this.collect_vtable_slots(cls);
         if (slots.length == 0) { return; }
 
-        mut impls: LValue[] = [];
+        mut impls: [LValue] = [];
         for (mut i: i64 = 0; i < slots.length; i++) {
             const impl: LValue = this.find_vtable_slot_impl(cls, slots[i].name, slots[i].param_types);
             if (!impl.is_valid()) {
@@ -1032,12 +1044,12 @@ type struct DeclarationEmitter {
         // keeps them out of the seam.  We build each plan in
         // final form to avoid re-assigning across move-checker
         // boundaries.
-        mut user_plans: ParamPlan[] = [];
+        mut user_plans: [ParamPlan] = [];
         mut total_user_slots: u32 = 0;
         for (mut i: u32 = 0; i < fixed_user_count; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) {
-                mut empty_slots: LType[] = [];
+                mut empty_slots: [LType] = [];
                 user_plans.push(ParamPlan {
                     cryo_type:  TypeRef::invalid(),
                     cls:      ArgClass::Direct,
@@ -1053,7 +1065,7 @@ type struct DeclarationEmitter {
                 param.is_value_receiver()
                 && target_mapped.is_valid() && param.type_annotation == null;
             if (is_amp_this) {
-                mut s_amp: LType[] = [];
+                mut s_amp: [LType] = [];
                 s_amp.push(this_ty);
                 total_user_slots += 1;
                 user_plans.push(ParamPlan {
@@ -1087,6 +1099,14 @@ type struct DeclarationEmitter {
                 user_plans.push(pplan_n);
             }
         }
+        if (func.is_caller_located) {
+            const extra: [TypeRef] = SymbolResolver::caller_location_params(this.get_arena());
+            for (mut ci: i64 = 0; ci < extra.length; ci++) {
+                const pplan_c: ParamPlan = this.abi.classify_param(extra[ci]);
+                total_user_slots += pplan_c.llvm_slots.length as u32;
+                user_plans.push(pplan_c);
+            }
+        }
 
         const total_params: u32 = total_user_slots + sret_inc;
 
@@ -1097,7 +1117,7 @@ type struct DeclarationEmitter {
         // parameter slot.  `LType::null()` for slots that are NOT
         // byval.  Walked after `add_function` to attach the
         // `byval(%T)` attribute to the right LLVM indices.
-        mut byval_pointees: LType[] = [];
+        mut byval_pointees: [LType] = [];
         for (mut bi: u32 = 0; bi < total_params; bi++) {
             byval_pointees.push(LType::null());
         }
@@ -1109,7 +1129,7 @@ type struct DeclarationEmitter {
         }
 
         mut params_valid: boolean = true;
-        for (mut i: u32 = 0; i < fixed_user_count; i++) {
+        for (mut i: u32 = 0; i < user_plans.length as u32; i++) {
             const pplan: &ParamPlan = &user_plans[i as i64];
             if (pplan.cls == ArgClass::Indirect
                     && pplan.attr == AbiAttr::ByVal
@@ -1219,7 +1239,7 @@ type struct DeclarationEmitter {
             TypeRef::invalid()
         };
         const param_count: u32 = CodegenUtil::fixed_param_count_intrinsic(node);
-        mut params: TypeRef[] = [];
+        mut params: [TypeRef] = [];
         for (mut i: u32 = 0; i < param_count; i++) {
             const param: VarDeclNode* = node.parameters[i];
             if (param != null && param.resolved_type.is_valid()) {
@@ -1260,7 +1280,7 @@ type struct DeclarationEmitter {
             // C ABI: large aggregate returns get sret, large aggregate
             // params get byval, small aggregate returns are coerced
             // into a register-sized integer (Phase 3).
-            mut params: TypeRef[] = [];
+            mut params: [TypeRef] = [];
             for (mut pi: u32 = 0; pi < param_count; pi++) {
                 const param_pi: VarDeclNode* = func.parameters[pi];
                 if (param_pi != null && param_pi.resolved_type.is_valid()) {
@@ -1468,7 +1488,7 @@ type struct DeclarationEmitter {
             init = this.try_const_struct(
                 this.type_mapper, gty, init_expr as StructLiteralNode*, ty);
         }
-        // Array-literal const initializer, e.g. `const GAINS: f32[2] = [0.9,
+        // Array-literal const initializer, e.g. `const GAINS: [f32; 2] = [0.9,
         // 1.0]`.  Without this an array-typed global has no branch at all and
         // lands on the zeroinitializer below, so EVERY element reads 0 - a
         // literal one included, which is what makes the failure look like a
@@ -1593,6 +1613,17 @@ type struct DeclarationEmitter {
     /// location. No-op unless `-g`. The subroutine type carries no
     /// parameter list (sufficient for function-level file:line backtraces;
     /// per-argument types and per-statement line granularity are follow-ups).
+    /// Enter the body of `func`, defined as `fn_val`: a `![caller_location]`
+    /// body reads `FILE` and `LINE` from its last two parameters.
+    open_caller_site(mut &this, fn_val: LValue, func: FunctionDeclNode*) -> void {
+        this.caller_file = LValue::null();
+        this.caller_line = LValue::null();
+        if (!func.is_caller_located) { return; }
+        const n: u32 = llvm::LLVMCountParams(fn_val.raw);
+        this.caller_file = fn_val.get_param(n - 2);
+        this.caller_line = fn_val.get_param(n - 1);
+    }
+
     emit_debug_subprogram(mut &this, fn_val: LValue, node: FunctionDeclNode*) -> void {
         const ctx_ptr: CompilationContext* = this.ctx;
         if (!this.debug_info.is_on()) { return; }
@@ -1714,6 +1745,7 @@ type struct DeclarationEmitter {
         // inlinable calls in a function that carries debug info). No-op
         // unless `-g`.
         this.emit_debug_subprogram(fn_val, node);
+        this.open_caller_site(fn_val, node);
 
         // Create allocas for each parameter and store the incoming value.
         this.values.push_scope();
@@ -1854,7 +1886,7 @@ type struct DeclarationEmitter {
         const argc: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 0) };
         const argv: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 1) };
 
-        mut args: Pair<LValue, TypeRef>[] = [];
+        mut args: [Pair<LValue, TypeRef>] = [];
         args.push(Pair::<LValue, TypeRef>::new(argc, TypeRef::invalid()));
         args.push(Pair::<LValue, TypeRef>::new(argv, TypeRef::invalid()));
         mut result: LValue = LValue::null();
@@ -1880,7 +1912,7 @@ type struct DeclarationEmitter {
 
         const envp: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 2) };
 
-        mut args: Pair<LValue, TypeRef>[] = [];
+        mut args: [Pair<LValue, TypeRef>] = [];
         args.push(Pair::<LValue, TypeRef>::new(envp, TypeRef::invalid()));
         mut result: LValue = LValue::null();
         result = this.expr_ops.codegen_call(set_env_fn, set_env_ty, args, "");
@@ -2082,6 +2114,7 @@ type struct DeclarationEmitter {
 
         const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
         this.builder.position_at_end(entry_bb);
+        this.open_caller_site(fn_val, func);
 
         this.values.push_scope();
 
@@ -2530,7 +2563,7 @@ type struct DeclarationEmitter {
     /// disagree about which expressions are constant, and the disagreement
     /// would surface as a zeroed aggregate rather than as an error.
     ///
-    /// A nested aggregate recurses, so `f32[2][2]` and an array inside a struct
+    /// A nested aggregate recurses, so `[[f32; 2]; 2]` and an array inside a struct
     /// are built rather than declined.  A struct element declines: building one
     /// needs its layout to map field order onto element order, which is reached
     /// from the declaration and not from the llvm type in hand here.

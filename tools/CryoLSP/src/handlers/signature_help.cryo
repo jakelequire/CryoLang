@@ -46,8 +46,8 @@ type struct OpenCall {
     /// string and character literals; `paren` -1 when there is none.
     static before(line: str::Str, end: u64) -> OpenCall {
         const b: u8* = line.as_ptr();
-        mut parens: i64[] = [];
-        mut commas: i64[] = [];
+        mut parens: [i64] = [];
+        mut commas: [i64] = [];
         mut i: u64 = 0;
         while (i < end) {
             const c: u8 = b[i];
@@ -99,7 +99,7 @@ public function handle_signature_help(docs: mut &docs::Docs, projects: mut &sess
             if (call.paren < 0) { return value::JsonValue::Null; }
             mut c: Completer = Completer::new(asked.ctx, asked.module_idx);
             c.place_cursor(docs.scope_pos(asked.uri, asked.line, asked.character));
-            const offered: Offered[] = Signatures::of_callee(&c, line, call.paren as u64);
+            const offered: [Offered] = Signatures::of_callee(&c, line, call.paren as u64);
             if (offered.length == 0) { return value::JsonValue::Null; }
             return Signatures::reply(c.names, &offered, call.active);
         }
@@ -110,7 +110,7 @@ public function handle_signature_help(docs: mut &docs::Docs, projects: mut &sess
 
 type struct Signatures {
     /// The functions the callee written before byte `paren` can call.
-    static of_callee(c: &Completer, line: str::Str, paren: u64) -> Offered[] {
+    static of_callee(c: &Completer, line: str::Str, paren: u64) -> [Offered] {
         const b: u8* = line.as_ptr();
         mut e: u64 = paren;
         while (e > 0 && (b[e - 1] == ' ' as u8 || b[e - 1] == '\t' as u8)) { e = e - 1; }
@@ -141,13 +141,13 @@ type struct Signatures {
         const bound: SymbolID = c.ctx.resolver.value_target(
             c.ctx.resolver.lookup_value(c.intern(leaf), c.scope));
         if (!bound.is_valid()) { return []; }
-        mut one: SymbolID[] = [];
+        mut one: [SymbolID] = [];
         one.push(bound);
         return Signatures::of_symbols(c.ctx, one);
     }
 
-    static of_entries(ctx: CompilationContext*, entries: OverloadId[]) -> Offered[] {
-        mut out: Offered[] = [];
+    static of_entries(ctx: CompilationContext*, entries: [OverloadId]) -> [Offered] {
+        mut out: [Offered] = [];
         for (mut k: i64 = 0; k < entries.length; k++) {
             Signatures::add(&out, ctx.decl_index.entry_decl(entries[k]));
         }
@@ -156,12 +156,12 @@ type struct Signatures {
 
     /// Every overload of the functions `syms` bind: each one's family, read
     /// off its definition, once.
-    static of_symbols(ctx: CompilationContext*, syms: SymbolID[]) -> Offered[] {
-        mut entries: OverloadId[] = [];
+    static of_symbols(ctx: CompilationContext*, syms: [SymbolID]) -> [Offered] {
+        mut entries: [OverloadId] = [];
         for (mut k: i64 = 0; k < syms.length; k++) {
             const s: Symbol = ctx.resolver.get_symbol(syms[k]);
             if (s.kind != SymbolKind::Function || !s.def.is_valid()) { continue; }
-            const family: OverloadId[] = ctx.decl_index.family_entries_of_def(s.def);
+            const family: [OverloadId] = ctx.decl_index.family_entries_of_def(s.def);
             for (mut f: i64 = 0; f < family.length; f++) {
                 mut seen: boolean = false;
                 for (mut e: i64 = 0; e < entries.length; e++) {
@@ -173,7 +173,7 @@ type struct Signatures {
         return Signatures::of_entries(ctx, entries);
     }
 
-    static add(out: mut &Offered[], decl: ASTNode*) -> void {
+    static add(out: mut &[Offered], decl: ASTNode*) -> void {
         if (decl == null) { return; }
         if (decl.kind == NodeKind::FunctionDeclaration) {
             out.push(Offered { func: decl as FunctionDeclNode*, receiver: false });
@@ -187,7 +187,7 @@ type struct Signatures {
     /// The `SignatureHelp` for `offered`, `active` the argument the cursor
     /// is in; the first signature with that many parameters is active.
     /// Types are written as `names` writes them.
-    static reply(names: Names, offered: &Offered[], active: i64) -> value::JsonValue {
+    static reply(names: Names, offered: &[Offered], active: i64) -> value::JsonValue {
         const ctx: CompilationContext* = names.ctx;
         const shown: Shown = Shown::new(names);
         mut sigs: Array<value::JsonValue> = Array::<value::JsonValue>::new();
@@ -204,7 +204,7 @@ type struct Signatures {
                 const from: u64 = label.length();
                 label.push(str::Str::from(ctx.intern_table.resolve(p.name)));
                 label.push(str::Str::from(": "));
-                label.push(str::Str::from(shown.type_text(p.resolved_type)));
+                label.push(str::Str::from(shown.type_text_written(p.resolved_type, p.type_annotation)));
                 mut range: Array<value::JsonValue> = Array::<value::JsonValue>::new();
                 range.push(value::JsonValue::int_value(from as i64));
                 range.push(value::JsonValue::int_value(label.length() as i64));
@@ -213,7 +213,7 @@ type struct Signatures {
                 ps.push(value::JsonValue::Object(pobj));
             }
             label.push(str::Str::from(") -> "));
-            label.push(str::Str::from(shown.type_text(f.resolved_return_type)));
+            label.push(str::Str::from(shown.type_text_written(f.resolved_return_type, f.return_type_annotation)));
             if (chosen < 0 && f.parameters.length - first > active) { chosen = k; }
             mut sig: value::JsonObject = value::JsonObject::new();
             sig.put("label", value::JsonValue::from(label.as_str()));

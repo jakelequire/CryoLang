@@ -48,7 +48,7 @@ import std::core::mem;
 /// compete for one slot and the first writer wins -- so the tier travels
 /// WITH the entry.
 ///
-/// It is a field rather than a parallel `boolean[]` deliberately: a parallel
+/// It is a field rather than a parallel `[boolean]` deliberately: a parallel
 /// array holds its invariant only as long as every push site remembers to
 /// update both, and an insert path that forgets desyncs it silently, every
 /// index-based read after it returning a NEIGHBOUR's tier.
@@ -90,7 +90,7 @@ public:
     parent_id:       ScopeID;
     owner_name:      string;
     span:            SourceSpan;
-    child_scope_ids: ScopeID[];
+    child_scope_ids: [ScopeID];
 
     static new(id: ScopeID, kind: ScopeKind, parent: ScopeID,
                owner: string, span: SourceSpan) -> Scope {
@@ -130,29 +130,29 @@ public:
 
 private:
     // One entry per name bound directly in this scope, in insertion order.
-    symbols:         ScopeEntry[];
+    symbols:         [ScopeEntry];
 
     // Fast lookup index: SymbolStr.id -> index in symbols[]
     symbol_index:    HashMap<u32, i64>;
 
     // Overloaded names: flat array of (name_key, SymbolID) pairs, and
     // beside each whether that binding is in the type namespace.
-    overloads:       Pair<u32, SymbolID>[];
-    overload_in_type_ns: boolean[];
+    overloads:       [Pair<u32, SymbolID>];
+    overload_in_type_ns: [boolean];
 
     // Every binding added under a name the scope already bound: `.first`
     // the binding the name held, `.second` the one added.  The scope keeps
     // one of the two (or both, as overloads); the name layer reads these to
     // refuse a declaration beside an import of its name.
-    meetings:        Pair<SymbolID, SymbolID>[];
+    meetings:        [Pair<SymbolID, SymbolID>];
 
     // Ambiguous imports: the names imported from two different modules,
     // which a bare use must refuse.  A tie is within one namespace: a type
     // and a function of one leaf never tie.
-    ambig_name_ids:   u32[];      // SymbolStr.id of ambiguous names
-    ambig_module_a:   ModulePath[];   // the first import's module
-    ambig_module_b:   ModulePath[];   // the conflicting import's module
-    ambig_ns:         Namespace[];
+    ambig_name_ids:   [u32];      // SymbolStr.id of ambiguous names
+    ambig_module_a:   [ModulePath];   // the first import's module
+    ambig_module_b:   [ModulePath];   // the conflicting import's module
+    ambig_ns:         [Namespace];
 
     /// The binding this scope alone holds under `name`, or invalid.
     find(&this, name: SymbolStr) -> SymbolID {
@@ -270,10 +270,10 @@ private:
     /// Drop every ambiguity record for `name`: a declaration took the
     /// name's slot, and both imports the record was between are shadowed.
     clear_ambiguity(mut &this, name: SymbolStr) -> void {
-        mut keep_names: u32[] = [];
-        mut keep_a:     ModulePath[] = [];
-        mut keep_b:     ModulePath[] = [];
-        mut keep_ns:    Namespace[] = [];
+        mut keep_names: [u32] = [];
+        mut keep_a:     [ModulePath] = [];
+        mut keep_b:     [ModulePath] = [];
+        mut keep_ns:    [Namespace] = [];
         for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
             if (this.ambig_name_ids[i] == name.id) { continue; }
             keep_names.push(this.ambig_name_ids[i]);
@@ -299,7 +299,7 @@ private:
 
     /// The two conflicting modules for an ambiguous name, or none when it is
     /// not ambiguous.
-    get_ambiguous_modules(&this, name: SymbolStr, ns: Namespace) -> ModulePath[] {
+    get_ambiguous_modules(&this, name: SymbolStr, ns: Namespace) -> [ModulePath] {
         for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
             if (this.ambig_name_ids[i] == name.id && this.ambig_ns[i] == ns) {
                 return [this.ambig_module_a[i], this.ambig_module_b[i]];
@@ -316,8 +316,8 @@ private:
 
     /// Every binding the scope holds under `name`: the primary one, then
     /// the overloads.
-    get_overloads(&this, name: SymbolStr) -> SymbolID[] {
-        mut result: SymbolID[] = [];
+    get_overloads(&this, name: SymbolStr) -> [SymbolID] {
+        mut result: [SymbolID] = [];
         const opt: Option<i64> = this.symbol_index.get(&name.id);
         if (opt.is_some()) {
             result.push(this.symbols[opt.unwrap()].sym);
@@ -342,11 +342,11 @@ type struct Resolver {
     intern_table:       InternTable*;
 
     // Symbol arena
-    symbols:            Symbol[];
+    symbols:            [Symbol];
     symbol_ids:         SymbolIds;
 
     // Scope tree
-    scopes:             Scope[];
+    scopes:             [Scope];
     next_scope_id:      u64;
     global_scope:       ScopeID;
     current_scope:      ScopeID;
@@ -359,12 +359,12 @@ type struct Resolver {
     referenced_records: u64;
     referenced_symbols: i64;
 
-    // Cross-module exports: Pair<SymbolID, ModulePath>[] avoids T[][] codegen
-    // paths.  SymbolID[][] and HashMap<K, SymbolID[]>
-    // mishandle T[] as a generic type argument (inner array descriptor
-    // corrupted on store/load).  Pair<A,B>[] sidesteps generic-over-array
+    // Cross-module exports: [Pair<SymbolID, ModulePath>] avoids [[T]] codegen
+    // paths.  [[SymbolID]] and HashMap<K, [SymbolID]>
+    // mishandle [T] as a generic type argument (inner array descriptor
+    // corrupted on store/load).  [Pair<A,B>] sidesteps generic-over-array
     // codegen entirely.
-    exports:              Pair<SymbolID, ModulePath>[];  // .first = exported symbol, .second = the module exporting it
+    exports:              [Pair<SymbolID, ModulePath>];  // .first = exported symbol, .second = the module exporting it
 
 
     // Current context
@@ -384,7 +384,7 @@ type struct Resolver {
     /// list instead of a per-module duplication of every prelude export, and so
     /// it shadows correctly: it is consulted only after every real scope has
     /// been asked, which is what makes an inner declaration win.
-    prelude_modules:    ModulePath[];
+    prelude_modules:    [ModulePath];
 
     // Index: interned module name id -> the id of that module's scope.  A
     // lookup would otherwise linear-scan every scope with a per-scope strcmp
@@ -406,7 +406,7 @@ type struct Resolver {
     /// the parameter's symbol, `.second` the trait's definition.  `S::Item`
     /// is `Item` of whichever of these traits declares it; a trait the
     /// parameter is not bounded by does not answer it, however it is spelled.
-    param_bounds:  Pair<SymbolID, DefId>[];
+    param_bounds:  [Pair<SymbolID, DefId>];
 
     /// The declaration each import binding names, by the binding's key.  An
     /// import of a leaf binds every declaration the module offers under it,
@@ -462,8 +462,8 @@ type struct Resolver {
 
     /// The traits the type parameter `param` is bounded by, in the order its
     /// `where` clauses name them.
-    bounds_of_param(&this, param: SymbolID) -> DefId[] {
-        mut out: DefId[] = [];
+    bounds_of_param(&this, param: SymbolID) -> [DefId] {
+        mut out: [DefId] = [];
         if (!param.is_valid()) { return out; }
         for (mut i: i64 = 0; i < this.param_bounds.length; i++) {
             if (this.param_bounds[i].first.equals(param)) { out.push(this.param_bounds[i].second); }
@@ -630,8 +630,8 @@ type struct Resolver {
     /// `.second` the declaration.  Read off the scope's own record of a name
     /// bound twice (`Scope::meetings`); the name layer refuses a pair in one
     /// namespace (E0205).
-    import_meetings_in(&this, scope: u64) -> Pair<SymbolID, SymbolID>[] {
-        mut out: Pair<SymbolID, SymbolID>[] = [];
+    import_meetings_in(&this, scope: u64) -> [Pair<SymbolID, SymbolID>] {
+        mut out: [Pair<SymbolID, SymbolID>] = [];
         if (scope == 0) { return out; }
         const s: Scope* = this.get_scope(ScopeID { id: scope });
         for (mut i: i64 = 0; i < s.meetings.length; i++) {
@@ -690,7 +690,7 @@ type struct Resolver {
             // Every binding the scope holds under the name answers both
             // questions: whether an explicit entry already brought it in,
             // and whether one of them already names `target`.
-            const all: SymbolID[] = this.scopes[this.current_scope.id - 1].get_overloads(name);
+            const all: [SymbolID] = this.scopes[this.current_scope.id - 1].get_overloads(name);
             if (explicit && check_repeat) {
                 const first: SymbolID = this.binding_beside(&all, target, true);
                 if (first.is_valid()) { return first; }
@@ -730,7 +730,7 @@ type struct Resolver {
 
     /// Among one name's `bindings`, the import binding whose target is
     /// `target`, or an invalid id.
-    binding_to(&this, bindings: &SymbolID[], target: SymbolID) -> SymbolID {
+    binding_to(&this, bindings: &[SymbolID], target: SymbolID) -> SymbolID {
         for (mut i: i64 = 0; i < bindings.length; i++) {
             const t: Option<SymbolID> = this.import_targets.get(&bindings[i].table_key());
             if (t.is_some() && t.unwrap().equals(target)) { return bindings[i]; }
@@ -750,7 +750,7 @@ type struct Resolver {
     /// Among one name's `bindings`, an import binding whose target is in the
     /// namespace `target` is in - one an explicit entry made, when
     /// `explicit_only` - or an invalid id.
-    binding_beside(&this, bindings: &SymbolID[], target: SymbolID, explicit_only: boolean) -> SymbolID {
+    binding_beside(&this, bindings: &[SymbolID], target: SymbolID, explicit_only: boolean) -> SymbolID {
         const ns: Namespace = this.namespace_of(target);
         for (mut i: i64 = 0; i < bindings.length; i++) {
             if (explicit_only && !this.explicit_imports.get(&bindings[i].table_key()).is_some()) { continue; }
@@ -770,7 +770,7 @@ type struct Resolver {
     /// module happened to list first.
     import_target(&this, s: &Symbol, ns: Namespace) -> SymbolID {
         if (s.kind != SymbolKind::Import || !s.scope_id.is_valid()) { return SymbolID::invalid(); }
-        const all: SymbolID[] = this.scopes[s.scope_id.id - 1].get_overloads(s.name);
+        const all: [SymbolID] = this.scopes[s.scope_id.id - 1].get_overloads(s.name);
         for (mut i: i64 = 0; i < all.length; i++) {
             const t: Option<SymbolID> = this.import_targets.get(&all[i].table_key());
             if (!t.is_some()) { continue; }
@@ -899,7 +899,7 @@ type struct Resolver {
 
     /// The two modules whose imports tie for an ambiguous name:
     /// [module_a, module_b].
-    get_ambiguous_modules(&this, name: SymbolStr, ns: Namespace) -> ModulePath[] {
+    get_ambiguous_modules(&this, name: SymbolStr, ns: Namespace) -> [ModulePath] {
         return this.ambiguous_modules_from(this.current_scope, name, ns);
     }
 
@@ -907,10 +907,10 @@ type struct Resolver {
     /// EXPLICIT scope - the one a name was written in - rather than from the
     /// cursor, which a pass called from elsewhere may have left standing in
     /// another module.  Empty when no rib on the chain records a tie.
-    ambiguous_modules_from(&this, start: ScopeID, name: SymbolStr, ns: Namespace) -> ModulePath[] {
+    ambiguous_modules_from(&this, start: ScopeID, name: SymbolStr, ns: Namespace) -> [ModulePath] {
         mut scope_id: ScopeID = start;
         while (scope_id.is_valid()) {
-            const mods: ModulePath[] = this.scopes[scope_id.id - 1].get_ambiguous_modules(name, ns);
+            const mods: [ModulePath] = this.scopes[scope_id.id - 1].get_ambiguous_modules(name, ns);
             if (mods.length >= 2) {
                 return mods;
             }
@@ -970,7 +970,7 @@ type struct Resolver {
         if (!found.is_valid()) { return found; }
         const first: Symbol = this.get_symbol(found);
         if (first.kind == SymbolKind::Import || ns.accepts(first.kind)) { return found; }
-        const all: SymbolID[] = scope.get_overloads(name);
+        const all: [SymbolID] = scope.get_overloads(name);
         for (mut i: i64 = 0; i < all.length; i++) {
             const s: Symbol = this.get_symbol(all[i]);
             if (s.kind != SymbolKind::Import && ns.accepts(s.kind)) { return all[i]; }
@@ -1000,7 +1000,7 @@ type struct Resolver {
         mut scope_id: ScopeID = start;
         while (scope_id.is_valid()) {
             const scope: Scope* = this.get_scope(scope_id);
-            const all: SymbolID[] = scope.get_overloads(name);
+            const all: [SymbolID] = scope.get_overloads(name);
             for (mut i: i64 = 0; i < all.length; i++) {
                 const sym: Symbol = this.get_symbol(all[i]);
                 if (sym.kind == SymbolKind::Import) {
@@ -1046,7 +1046,7 @@ type struct Resolver {
     lookup_prelude(&this, name: SymbolStr, ns: Option<Namespace>) -> SymbolID {
         mut found: SymbolID = SymbolID::invalid();
         for (mut i: i64 = 0; i < this.prelude_modules.length; i++) {
-            const all: SymbolID[] = this.exports_named(this.prelude_modules[i], name);
+            const all: [SymbolID] = this.exports_named(this.prelude_modules[i], name);
             if (all.length == 0) { continue; }
             mut hit: SymbolID = SymbolID::invalid();
             if (ns.is_some()) {
@@ -1065,7 +1065,7 @@ type struct Resolver {
     /// Record the namespaces reachable without an import.  Derived from the
     /// prelude module's own `public module` list, so it is empty when no
     /// prelude was loaded rather than defaulting to a transcribed set.
-    set_prelude_modules(mut &this, mods: ModulePath[]) -> void {
+    set_prelude_modules(mut &this, mods: [ModulePath]) -> void {
         this.prelude_modules = mods;
     }
 
@@ -1117,8 +1117,8 @@ type struct Resolver {
     }
 
     /// Get all exported symbols from a module.
-    get_exports(&this, m: ModulePath) -> SymbolID[] {
-        mut result: SymbolID[] = [];
+    get_exports(&this, m: ModulePath) -> [SymbolID] {
+        mut result: [SymbolID] = [];
         for (mut i: i64 = 0; i < this.exports.length; i++) {
             if (this.exports[i].second.equals(m)) {
                 result.push(this.exports[i].first);
@@ -1140,7 +1140,7 @@ type struct Resolver {
     /// namespace `ns`, or an invalid id: `M::f` in an expression names the
     /// function `f`, never a type `M` also declares as `f`.
     export_in(&this, m: ModulePath, name: SymbolStr, ns: Namespace) -> SymbolID {
-        const all: SymbolID[] = this.exports_named(m, name);
+        const all: [SymbolID] = this.exports_named(m, name);
         for (mut i: i64 = 0; i < all.length; i++) {
             if (ns.accepts(this.get_symbol(all[i]).kind)) { return all[i]; }
         }
@@ -1155,8 +1155,8 @@ type struct Resolver {
     /// Every public declaration module `m` exports under `name`, in
     /// declaration order: a type and a function may share a leaf, and a
     /// reader that wants one of them chooses by kind.
-    exports_named(&this, m: ModulePath, name: SymbolStr) -> SymbolID[] {
-        mut out: SymbolID[] = [];
+    exports_named(&this, m: ModulePath, name: SymbolStr) -> [SymbolID] {
+        mut out: [SymbolID] = [];
         for (mut i: i64 = 0; i < this.exports.length; i++) {
             if (this.exports[i].second.equals(m)) {
                 const sym: Symbol = this.get_symbol(this.exports[i].first);
@@ -1178,12 +1178,12 @@ type struct Resolver {
     ///
     /// Read off the module's own scope: the export list holds only what is
     /// public, so a private declaration is exactly what it does not carry.
-    private_declarations(&this, m: ModulePath, name: SymbolStr) -> SymbolID[] {
-        mut out: SymbolID[] = [];
+    private_declarations(&this, m: ModulePath, name: SymbolStr) -> [SymbolID] {
+        mut out: [SymbolID] = [];
         const sid: u64 = this.find_module_scope(m);
         if (sid == 0) { return out; }
         const scope: Scope* = this.get_scope(ScopeID { id: sid });
-        const all: SymbolID[] = scope.get_overloads(name);
+        const all: [SymbolID] = scope.get_overloads(name);
         for (mut i: i64 = 0; i < all.length; i++) {
             const sym: Symbol = this.get_symbol(all[i]);
             if (sym.kind == SymbolKind::Import) { continue; }
@@ -1209,7 +1209,7 @@ type struct Resolver {
 
     /// Borrow a scope by its ScopeID.  Indexes by id-1 (IDs start at 1).
     /// Returns a pointer into `this.scopes` rather than a copy: `Scope`
-    /// owns a HashMap + Pair[], so a by-value return would alias their heap
+    /// owns a HashMap + [Pair], so a by-value return would alias their heap
     /// and (under drop glue) double-free at the caller's scope exit.
     get_scope(&this, id: ScopeID) -> Scope* {
         return &this.scopes[id.id - 1];
@@ -1255,8 +1255,8 @@ type struct Resolver {
     /// global scope: locals, parameters, the module's own declarations and
     /// its imports.  A name bound in two scopes appears once per scope; the
     /// first is the one a bare use binds.
-    visible_bindings(&this, s: ScopeID) -> SymbolID[] {
-        mut out: SymbolID[] = [];
+    visible_bindings(&this, s: ScopeID) -> [SymbolID] {
+        mut out: [SymbolID] = [];
         mut scope_id: ScopeID = s;
         while (scope_id.is_valid()) {
             const scope: Scope* = this.get_scope(scope_id);

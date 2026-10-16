@@ -104,11 +104,11 @@ type struct MonoCallSpecializer {
     /// is walked once, when it is made, often before the instantiations it
     /// names are.  Each is bound once the instantiation is registered
     /// (`bind_queued_calls`).
-    queued_binds:     CallExprNode*[];
+    queued_binds:     [CallExprNode*];
     /// A generic owner's methods taken as values (`Wrap::get`) whose owner
     /// instance was not minted when the value was walked; each is bound to
     /// that instance's method once it is (`bind_queued_calls`).
-    queued_path_values: ScopeResolutionNode*[];
+    queued_path_values: [ScopeResolutionNode*];
     /// The function whose body the walk is in, for the report of a call
     /// left unbound.
     current_fn:       FunctionDeclNode*;
@@ -117,7 +117,7 @@ type struct MonoCallSpecializer {
     /// through (a local of function type, a variant, a function-typed field,
     /// a release); one bound by nothing is reported once monomorphization
     /// has bound everything it will (`report_unbound_calls`).
-    unpinned_calls:   UnpinnedCall[];
+    unpinned_calls:   [UnpinnedCall];
 
     static null() -> MonoCallSpecializer {
         return MonoCallSpecializer {
@@ -210,7 +210,7 @@ type struct MonoCallSpecializer {
         }
     }
 
-    walk_methods(mut &this, methods: &MethodNode*[], res_ctx: ResolutionContext*) -> void {
+    walk_methods(mut &this, methods: &[MethodNode*], res_ctx: ResolutionContext*) -> void {
         for (mut k: i64 = 0; k < methods.length; k++) {
             const m: MethodNode* = methods[k];
             if (m == null || m.func == null) { continue; }
@@ -283,7 +283,7 @@ type struct MonoCallSpecializer {
         }
     }
 
-    walk_spec_methods(mut &this, methods: &MethodNode*[], res_ctx: ResolutionContext*,
+    walk_spec_methods(mut &this, methods: &[MethodNode*], res_ctx: ResolutionContext*,
                       subst: TypeSubstitution*) -> void {
         for (mut k: i64 = 0; k < methods.length; k++) {
             const m: MethodNode* = methods[k];
@@ -693,7 +693,7 @@ type struct MonoCallSpecializer {
             // (Candidate to HARDEN to an ICE; left as a soft return for now.)
             return;
         }
-        mut bindings: TypeRef[] = [];
+        mut bindings: [TypeRef] = [];
         mut all_bound: boolean = true;
         for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
             const b: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
@@ -748,11 +748,11 @@ type struct MonoCallSpecializer {
     /// The instance of the function template `entry` a value names: the
     /// template applied to `args`, concretized by the active
     /// specialization, and queued.  Invalid when an argument stays abstract.
-    value_instance(mut &this, entry: TemplateEntry*, args: &TypeRef[], subst: TypeSubstitution*) -> TypeRef {
+    value_instance(mut &this, entry: TemplateEntry*, args: &[TypeRef], subst: TypeSubstitution*) -> TypeRef {
         if (entry == null || this.generic_registry == null) { return TypeRef::invalid(); }
         if (entry.node_kind != NodeKind::FunctionDeclaration) { return TypeRef::invalid(); }
         if (args.length != entry.param_types.length) { return TypeRef::invalid(); }
-        mut seeded: TypeRef[] = [];
+        mut seeded: [TypeRef] = [];
         for (mut i: i64 = 0; i < args.length; i++) {
             const tr: TypeRef = this.concretize_stashed_arg(args[i], subst);
             if (!tr.is_valid() || this.arena.contains_generic_param(tr)) { return TypeRef::invalid(); }
@@ -789,11 +789,11 @@ type struct MonoCallSpecializer {
         if (this.generic_registry == null) { return false; }
         const owner_ast: ASTNode* = this.generic_registry.lookup_inherent_owner(recv_type);
         if (MethodNode::is_method_of(m, owner_ast)) { *out_owner = owner_ast; return true; }
-        const inherent: ImplBlockNode*[] = this.generic_registry.inherent_impl_blocks(recv_type);
+        const inherent: [ImplBlockNode*] = this.generic_registry.inherent_impl_blocks(recv_type);
         for (mut bi: i64 = 0; bi < inherent.length; bi++) {
             if (MethodNode::is_method_of(m, inherent[bi] as ASTNode*)) { *out_impl = inherent[bi]; return true; }
         }
-        const traits: ImplBlockNode*[] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
+        const traits: [ImplBlockNode*] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
         for (mut bi: i64 = 0; bi < traits.length; bi++) {
             if (MethodNode::is_method_of(m, traits[bi] as ASTNode*)) { *out_impl = traits[bi]; return true; }
         }
@@ -983,7 +983,7 @@ type struct MonoCallSpecializer {
     /// arguments that are still a generic body's parameters.
     method_instance_entry(mut &this, orig_method: MethodNode*,
                           impl_node: ImplBlockNode*, inherent_owner_ast: ASTNode*,
-                          recv_type: TypeRef, stashed: &TypeRef[], subst: TypeSubstitution*) -> OverloadId {
+                          recv_type: TypeRef, stashed: &[TypeRef], subst: TypeSubstitution*) -> OverloadId {
         if (impl_node == null && inherent_owner_ast == null) { return OverloadId::invalid(); }
         const orig_func: FunctionDeclNode* = orig_method.func;
         if (orig_func == null) { return OverloadId::invalid(); }
@@ -993,7 +993,7 @@ type struct MonoCallSpecializer {
         // outside sema's visibility and is left unspecialized.
         const n_method_params: i64 = orig_func.generic_params.length;
         if (n_method_params == 0 || stashed.length != n_method_params) { return OverloadId::invalid(); }
-        mut bindings: TypeRef[] = [];
+        mut bindings: [TypeRef] = [];
         for (mut i: i64 = 0; i < n_method_params; i++) {
             const sv: TypeRef = this.concretize_stashed_arg(stashed[i], subst);
             if (!sv.is_valid()) { return OverloadId::invalid(); }
@@ -1074,7 +1074,7 @@ type struct MonoCallSpecializer {
             // Two specs of one method whose signature doesn't mention the
             // method param (`name<T>() -> string`) would otherwise mangle
             // identically and collapse onto the first emitted spec.
-            mut spec_args_owned: TypeRef[] = [];
+            mut spec_args_owned: [TypeRef] = [];
             for (mut ai: i64 = 0; ai < bindings.length; ai++) {
                 spec_args_owned.push(bindings[ai]);
             }
@@ -1137,7 +1137,7 @@ type struct MonoCallSpecializer {
         // and returning its answer.  The entry is the one registration just
         // wrote for this spec (its `$MG` disambiguator included), and the
         // definition is emitted under the same entry's symbol.
-        mut inst_args: TypeRef[] = [];
+        mut inst_args: [TypeRef] = [];
         for (mut ai: i64 = 0; ai < bindings.length; ai++) { inst_args.push(bindings[ai]); }
         this.state.add_method_instance(recv_type, def_slot, inst_args, spec_method.func.overload_entry);
 
@@ -1207,7 +1207,7 @@ type struct MonoCallSpecializer {
             }
         }
         if (this.generic_registry == null) { return null; }
-        const traits: ImplBlockNode*[] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
+        const traits: [ImplBlockNode*] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
         for (mut i: i64 = 0; i < traits.length; i++) {
             const m: MethodNode* = MonoCallSpecializer::deferred_in(traits[i], d);
             if (m != null) { *out_impl = traits[i]; return m; }
@@ -1241,7 +1241,7 @@ type struct MonoCallSpecializer {
     trait_item_on(&this, call: CallExprNode*, ma: MemberAccessNode*, recv_type: TypeRef,
                   out_impl: ImplBlockNode**) -> MethodNode* {
         if (this.generic_registry == null) { return null; }
-        const heads: ImplBlockNode*[] = this.trait_heads_on(ma.resolved_trait, recv_type);
+        const heads: [ImplBlockNode*] = this.trait_heads_on(ma.resolved_trait, recv_type);
         mut head: ImplBlockNode* = null;
         if (heads.length == 1) {
             head = heads[0];
@@ -1264,8 +1264,8 @@ type struct MonoCallSpecializer {
     /// generic type's specialization, the blocks placed under it, where the
     /// instances its calls ask for are added and emitted; for any other
     /// receiver, the registry's heads selected for it.
-    trait_heads_on(&this, trait_def: DefId, recv_type: TypeRef) -> ImplBlockNode*[] {
-        mut heads: ImplBlockNode*[] = [];
+    trait_heads_on(&this, trait_def: DefId, recv_type: TypeRef) -> [ImplBlockNode*] {
+        mut heads: [ImplBlockNode*] = [];
         mut specialized: boolean = false;
         for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
             const entry: SpecializationEntry* = &this.state.spec_entries[i];
@@ -1441,7 +1441,7 @@ type struct MonoCallSpecializer {
         const d: DefId = call.template_method;
         const slot: i64 = this.generic_registry.trait_item_position(d);
         if (slot < 0) { return this.recorded_method_on(d, owner); }
-        const heads: ImplBlockNode*[] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
+        const heads: [ImplBlockNode*] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
         if (heads.length == 1) { return this.generic_registry.trait_item_method(heads[0], slot); }
         // Several implementations of one generic trait (`TryFrom<&JsonValue>`
         // beside `TryFrom<i64>` for `u64`): the one the bound directing the
@@ -1478,7 +1478,7 @@ type struct MonoCallSpecializer {
     recorded_method_on(&this, d: DefId, owner: TypeRef) -> MethodNode* {
         const slot: i64 = this.generic_registry.trait_item_position(d);
         if (slot >= 0) {
-            const heads: ImplBlockNode*[] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
+            const heads: [ImplBlockNode*] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
             if (heads.length != 1) { return null; }
             return this.generic_registry.trait_item_method(heads[0], slot);
         }
@@ -1491,7 +1491,7 @@ type struct MonoCallSpecializer {
     named_method_on(&this, d: DefId, owner: TypeRef) -> MethodNode* {
         const slot: i64 = this.generic_registry.trait_item_position(d);
         if (slot >= 0) {
-            const heads: ImplBlockNode*[] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
+            const heads: [ImplBlockNode*] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
             if (heads.length == 0) { return null; }
             return this.generic_registry.trait_item_method(heads[0], slot);
         }
@@ -1529,7 +1529,7 @@ type struct MonoCallSpecializer {
                 if (this.callee_is_value(call.callee)) {
                     const vt: Type* = this.arena.lookup(call.callee.resolved_type);
                     if (vt != null && vt.kind == TypeKind::Function) {
-                        mut vparams: TypeRef[] = [];
+                        mut vparams: [TypeRef] = [];
                         const vfn: FunctionType* = vt as FunctionType*;
                         for (mut i: i64 = 0; i < vfn.param_types.length; i++) { vparams.push(vfn.param_types[i]); }
                         call.bind_arguments(this.arena, &vparams);
@@ -1541,7 +1541,7 @@ type struct MonoCallSpecializer {
         }
         if (!e.is_valid()) { return; }
         const m: MethodNode* = this.decl_index.entry_method(e);
-        mut params: TypeRef[] = [];
+        mut params: [TypeRef] = [];
         if (m != null && m.func != null) {
             const on_receiver: boolean = (call.callee as ASTNode*).kind == NodeKind::MemberAccess;
             for (mut i: i64 = 0; i < m.func.parameters.length; i++) {
@@ -1594,7 +1594,7 @@ type struct MonoCallSpecializer {
     /// Any other is bound only as written.  A call whose receiver is still
     /// not minted stays queued.
     bind_queued_calls(mut &this) -> void {
-        mut still: CallExprNode*[] = [];
+        mut still: [CallExprNode*] = [];
         for (mut i: i64 = 0; i < this.queued_binds.length; i++) {
             const call: CallExprNode* = this.queued_binds[i];
             if (call.resolved_callee.is_some()) { continue; }
@@ -1627,7 +1627,7 @@ type struct MonoCallSpecializer {
             }
         }
         this.queued_binds = still;
-        mut values: ScopeResolutionNode*[] = [];
+        mut values: [ScopeResolutionNode*] = [];
         for (mut i: i64 = 0; i < this.queued_path_values.length; i++) { values.push(this.queued_path_values[i]); }
         this.queued_path_values = [];
         for (mut i: i64 = 0; i < values.length; i++) {
@@ -1757,8 +1757,8 @@ type struct MonoCallSpecializer {
             this.pin_spec_entry(call, made.func.overload_entry);
             return true;
         }
-        mut empty_params: GenericParamNode*[] = [];
-        mut empty_args: TypeRef[] = [];
+        mut empty_params: [GenericParamNode*] = [];
+        mut empty_args: [TypeRef] = [];
         mut copy_subst: TypeSubstitution* = null;
         const spec_method: MethodNode* = this.specialize_method(
             orig, &empty_params, &empty_args, recv_type, impl_node, &copy_subst);
@@ -1835,7 +1835,7 @@ type struct MonoCallSpecializer {
         if (func.generic_params.length == 0) {
             // The owner's type args come from sema's stash (declaration order).
             if (call.resolved_type_args.length != entry.param_types.length) { return false; }
-            mut binds: TypeRef[] = [];
+            mut binds: [TypeRef] = [];
             for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
                 const b: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
                 if (!b.is_valid() || this.arena.contains_generic_param(b)) { return false; }
@@ -1874,7 +1874,7 @@ type struct MonoCallSpecializer {
         if (registry == null) { return false; }
 
         // Owner binds: scope turbofish, else template defaults.
-        mut owner_binds: TypeRef[] = this.compute_owner_default_binds(scope, entry, subst);
+        mut owner_binds: [TypeRef] = this.compute_owner_default_binds(scope, entry, subst);
         if (owner_binds.length != entry.param_types.length) { return false; }
 
         // Materialize the owner instantiation.
@@ -1905,12 +1905,12 @@ type struct MonoCallSpecializer {
     /// turbofish (`Wrap<u8>::make`) if present, else all-default (`Wrap` ->
     /// `Wrap<i32>`).  Mirrors sema's `compute_generic_static_owner_binds`.
     compute_owner_default_binds(mut &this, scope: ScopeResolutionNode*,
-                                entry: TemplateEntry*, subst: TypeSubstitution*) -> TypeRef[] {
+                                entry: TemplateEntry*, subst: TypeSubstitution*) -> [TypeRef] {
         const want: i64 = entry.param_types.length;
         if (want == 0) { return []; }
         if (this.type_resolver == null) { return []; }
         mut rc: ResolutionContext = ResolutionContext::new("");
-        mut binds: TypeRef[] = [];
+        mut binds: [TypeRef] = [];
         for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
             mut tr: TypeRef = this.type_resolver.resolve(scope.scope_generic_args[i], &rc);
             if (subst != null) { tr = subst.apply(tr, this.arena); }
@@ -1983,8 +1983,8 @@ type struct MonoCallSpecializer {
         const tmpl: TemplateEntry* =
             this.generic_registry.template_of_type(owner_base);
         if (tmpl == null || tmpl.ast_node == null) { return; }
-        const empty_params: GenericParamNode*[] = [];
-        mut owner_params: &GenericParamNode*[] = &empty_params;
+        const empty_params: [GenericParamNode*] = [];
+        mut owner_params: &[GenericParamNode*] = &empty_params;
         if (tmpl.ast_node.kind == NodeKind::StructDeclaration) {
             owner_params = &(tmpl.ast_node as StructDeclNode*).generic_params;
         } else if (tmpl.ast_node.kind == NodeKind::UnionDeclaration) {
@@ -2020,8 +2020,8 @@ type struct MonoCallSpecializer {
         const tmpl: TemplateEntry* =
             this.generic_registry.template_of_type(recv_type);
         if (tmpl == null || tmpl.ast_node == null) { return recv_type; }
-        const empty_gp: GenericParamNode*[] = [];
-        mut params: &GenericParamNode*[] = &empty_gp;
+        const empty_gp: [GenericParamNode*] = [];
+        mut params: &[GenericParamNode*] = &empty_gp;
         if (tmpl.ast_node.kind == NodeKind::StructDeclaration) {
             params = &(tmpl.ast_node as StructDeclNode*).generic_params;
         } else if (tmpl.ast_node.kind == NodeKind::ClassDeclaration) {
@@ -2030,7 +2030,7 @@ type struct MonoCallSpecializer {
             return recv_type;
         }
         if (params.length == 0) { return recv_type; }
-        mut default_args: TypeRef[] = [];
+        mut default_args: [TypeRef] = [];
         mut rc: ResolutionContext = ResolutionContext::new("");
         for (mut i: i64 = 0; i < params.length; i++) {
             const gp: GenericParamNode* = params[i];
@@ -2058,20 +2058,20 @@ type struct MonoCallSpecializer {
     /// method's parameters, the owner's, and the ones its impl names - which
     /// is the one the copy's body is walked with.
     specialize_method(mut &this, original: MethodNode*,
-                      params: &GenericParamNode*[], args: &TypeRef[],
+                      params: &[GenericParamNode*], args: &[TypeRef],
                       owner_type: TypeRef, owner_impl: ImplBlockNode*,
                       out_subst: TypeSubstitution**) -> MethodNode* {
         if (original == null || original.func == null) { return null; }
         if (params.length != args.length) { return null; }
-        mut param_names: SymbolStr[] = [];
-        mut param_syms: SymbolID[] = [];
+        mut param_names: [SymbolStr] = [];
+        mut param_syms: [SymbolID] = [];
         for (mut i: i64 = 0; i < params.length; i++) {
             if (params[i] == null) { return null; }
             param_names.push(params[i].name);
             param_syms.push(params[i].sym_id);
         }
 
-        mut param_ids: TypeRef[] = [];
+        mut param_ids: [TypeRef] = [];
         for (mut i: i64 = 0; i < param_names.length; i++) {
             const gp_ref: TypeRef = this.arena.create_generic_param(param_syms[i], param_names[i], i as u64);
             param_ids.push(gp_ref);
@@ -2148,7 +2148,7 @@ type struct MonoCallSpecializer {
         // handed INDEPENDENT copies rather than the buffers this frame still
         // owns (a by-value pass would shallow-copy them and both would free
         // them -> the double-free heap-corruption wall).
-        mut ps_owned: SymbolID[] = [];
+        mut ps_owned: [SymbolID] = [];
         for (mut i: i64 = 0; i < param_syms.length; i++) {
             ps_owned.push(param_syms[i]);
         }
@@ -2362,7 +2362,7 @@ type struct MonoCallSpecializer {
         // a stale object (see MonoState::record_spec_owner_file).
         this.state.record_spec_owner_file(owning_file);
         if (this.receiver_unmaterialized(recv_type)) { return; }
-        mut spec_methods: MethodNode*[] = [];
+        mut spec_methods: [MethodNode*] = [];
         spec_methods.push(spec_method);
         this.decl_index.register_methods(
             recv_type, spec_methods, this.intern_table, this.arena, "mono/spec impl method");
@@ -2383,7 +2383,7 @@ type struct MonoCallSpecializer {
         // (see MonoState::record_spec_owner_file): an owner not flagged is
         // served from its cached object, which predates the spec.
         this.state.record_spec_owner_file(this.intern_table.intern(owner_ast.span.file));
-        mut spec_methods: MethodNode*[] = [];
+        mut spec_methods: [MethodNode*] = [];
         spec_methods.push(spec_method);
         this.decl_index.register_methods(
             recv_type, spec_methods, this.intern_table, this.arena, "mono/spec inherent method");
@@ -2432,7 +2432,7 @@ type struct MonoCallSpecializer {
     check_function_bounds_at_call(mut &this, call: CallExprNode*,
                                   tmpl_func: FunctionDeclNode*,
                                   entry: TemplateEntry*,
-                                  bindings: &TypeRef[]) -> boolean {
+                                  bindings: &[TypeRef]) -> boolean {
         if (tmpl_func == null || entry == null) { return true; }
         if (tmpl_func.trait_bounds.length == 0) { return true; }
         for (mut bi: i64 = 0; bi < tmpl_func.trait_bounds.length; bi++) {

@@ -65,6 +65,11 @@ A rename check compares the set of edits' starts with the markers', and
 every edit must replace exactly `old`'s width with `new_name`.  A refusal
 check passes only on an error reply whose message holds `refused`.
 
+A `codeAction` check ("at", "code", "old", "new_text") waits for a
+diagnostic of `code` underlining `old` at `at`, asks for the actions on it, and
+passes when one quickfix replaces exactly `old`'s width there with
+`new_text`.
+
 A semantic-tokens check names, per position, the token that must start
 there: its type, then any modifiers it must carry (it may carry more), or
 null for no token.  A marker reference may add `+N` columns
@@ -454,6 +459,10 @@ def run_check(srv, fx, chk, c):
             c.ok(True, name)
         return
 
+    if method == "codeAction":
+        run_code_action_check(srv, fx, chk, c, name)
+        return
+
     if method == "semanticTokens":
         resp = srv.request("textDocument/semanticTokens/full",
                            {"textDocument": {"uri": fx.uri(chk["file"])}})
@@ -625,6 +634,46 @@ def run_rename_check(srv, fx, chk, c, name):
         want.append(position_key(fx.uri(mrel), mpos))
     c.ok(sorted(got) == sorted(want) and not bad, name,
          "want %r, got %r; edits not replacing %r: %r" % (sorted(want), sorted(got), chk["old"], bad))
+
+
+def run_code_action_check(srv, fx, chk, c, name):
+    rel, pos = fx.at(chk["at"])
+    uri = fx.uri(rel)
+
+    # The diagnostic underlines `old` exactly, so one published for an
+    # earlier check's text at the same position is not taken for this one.
+    def starting_there(params):
+        return [d for d in params.get("diagnostics", [])
+                if d.get("code") == chk["code"] and d["range"]["start"] == pos
+                and d["range"]["end"] == {"line": pos["line"],
+                                          "character": pos["character"] + len(chk["old"])}]
+    params = srv.wait_notification(
+        "textDocument/publishDiagnostics",
+        lambda p: same_uri(p.get("uri", ""), uri) and starting_there(p),
+        timeout=COLD_TIMEOUT)
+    if params is None:
+        c.ok(False, name, "no %s published at %s" % (chk["code"], chk["at"]))
+        return
+    diag = starting_there(params)[0]
+    resp = srv.request("textDocument/codeAction", {
+        "textDocument": {"uri": uri}, "range": diag["range"],
+        "context": {"diagnostics": [diag]}})
+    if resp is None or "error" in resp:
+        c.ok(False, name, "no answer: %r" % resp)
+        return
+    fixes = []
+    for action in resp.get("result") or []:
+        if action.get("kind") != "quickfix":
+            continue
+        for euri, edits in ((action.get("edit") or {}).get("changes") or {}).items():
+            for e in edits:
+                r = e["range"]
+                fixes.append((same_uri(euri, uri), r["start"] == pos,
+                              r["end"]["line"] == pos["line"],
+                              r["end"]["character"] - pos["character"], e["newText"]))
+    want = (True, True, True, len(chk["old"]), chk["new_text"])
+    c.ok(want in fixes, name, "want a quickfix replacing %r with %r, got %r"
+         % (chk["old"], chk["new_text"], fixes))
 
 
 def run_signature_check(srv, fx, chk, c, name):

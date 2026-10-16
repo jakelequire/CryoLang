@@ -134,6 +134,139 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-15
+
+347. **Fixed-size arrays change syntax with dynamic ones:** `T[N]` is
+     written `[T; N]`, so the language has one array syntax.  (Jake)
+
+348. **The postfix array forms are refused once the tree is migrated,**
+     with no period in which both are accepted.  (Jake)
+
+349. **Diagnostics, the language server, the demangler and generated
+     bindings print array types in the circumfix form,** `[T]` and
+     `[T; N]`.  (Jake)
+
+350. **`[T]` means exactly the type `T[]` names today,** so the change is
+     pure syntax, provable with no compiled output changed.  Unifying the
+     builtin dynamic array with `Array<T>` is a separate step, done before
+     the class removal.  (Jake)
+
+351. **`new u8[n]` keeps its spelling:** it is an allocation expression
+     yielding a pointer, not an array type.  (Jake)
+
+352. **A postfix array type is refused with "array types are written
+     `[T]`: write `[i32]`"** (filled in with the type actually written) and
+     an automatic fix, under a code of the existing parser error family
+     rather than a new one.  (Jake approved the wording; the code choice was
+     delegated)
+
+353. **`[i32, i32]` keeps its message asking for `(T, U)`** once `[` starts
+     an array type.  (Jake)
+
+354. **The rulings stay as written records:** an old spelling inside a past
+     ruling is not respelled.  (Jake)
+
+355. **The pins are refreshed after a change to what the compiler accepts or
+     what it compiles a program to.**  A change only to text the compiler
+     prints needs no repin.  (Jake)
+
+356. **The refused postfix array type is E0104** ("expected type"), worded
+     as 352 states, with the type actually written filled in, and carries
+     its bracketed spelling as an automatic fix.  (Jake)
+
+357. **Code comments that spell an array type postfix are respelled** in
+     the brackets once the postfix form is refused.  (Jake)
+
+358. **A struct field passed by value inside an `if` condition is not
+     released twice:** the defect is fixed on the branch that changes the
+     array syntax, where it was found.  (Jake)
+
+359. **The demangler's output is pinned by a test.**  (Jake)
+
+360. **Trait objects come before v1.0, borrowed only:** `virtual &T`
+     (285, 288, 289), right after or folded into the class removal, built
+     on the class vtable machinery.  Owning boxes, upcasting and generic
+     implementations coerced to an object come after v1.0.  (Jake)
+
+361. **The refused postfix fixed array keeps the wording of 352 exactly:**
+     `u8[4]` reads "array types are written `[T]`: write `[u8; 4]`".
+     (Jake)
+
+362. **A value moved in a loop's condition, or in any expression the loop
+     evaluates again at its back edge, is refused** with the existing
+     loop-carried report ("moved inside a loop is used again on the next
+     iteration").  (Jake)
+
+363. **`[T]` means exactly `Array<T>` with the default allocator.**  An
+     array with another allocator is written `Array<T, A>`; `[T]` never
+     names one.  (Jake)
+
+364. **`Array<T>` is indexed through `Index` implementations in the
+     standard library,** not by extending the compiler's built-in
+     indexing: `xs[i]` on an `Array<T>` is `*(xs.index(i))`.  (Jake)
+
+365. **The `length` field of an array stays readable for now;** whether it
+     stays public is decided in the standard library's visibility pass.
+     (Jake)
+
+366. **`&[T]` stays a reference to the owning array,** and a borrowed view
+     stays `Slice<T>`.  (Jake)
+
+367. **The change that renames the dynamic array's symbols is proved by a
+     one-off comparison** of the compiled output with old symbol names
+     mapped to new ones; the comparison script is deleted in the next
+     commit.  (Jake)
+
+368. **The compiler and the standard library use Cryo's own language
+     features wherever one fits** - `Eq`, `Index`, `Drop`, `Allocate` and
+     the other traits - rather than an ad-hoc method of the same purpose,
+     so that the compiler exercises the whole language in live code.
+     (Jake)
+
+369. **Editor and diagnostic text spells a type the way the user wrote
+     it:** an annotation written `[i32]` displays as `[i32]`, one written
+     `Array<i32>` as `Array<i32>`.  The spelling is remembered per
+     annotation, for display only; it never takes part in identity, keys
+     or resolution.  A type with no written spelling displays as `[T]`
+     when its allocator is the default and as `Array<T, A>` otherwise.
+     (Jake)
+
+370. **A function marked `![inline]` is copied into every module that
+     calls it,** so the call can be inlined there; `Array`'s `index` and
+     the like are marked `![inline]`.  (Jake)
+
+371. **`p[i]` on a pointer to an array is pointer arithmetic,** as on any
+     other pointer; indexing does not look through a pointer to an
+     array.  (Jake)
+
+372. **An attribute makes a function report its caller's source location
+     in a panic,** and the standard library's index bounds check carries
+     it, so an out-of-range index reports the `xs[i]` that wrote it.  The
+     attribute's name is proposed with the change and confirmed by Jake.
+     (Jake)
+
+373. **Emitting only the methods of an instantiated generic that are
+     used** is scouted: built if the work is moderate, recorded as an
+     accepted cost otherwise.  (Jake)
+
+374. **A fill literal `[v; n]` is refused unless its element type is a
+     plain-copy type,** with an error saying so: the one value would
+     otherwise be released `n` times.  (Jake)
+
+375. **`Array`'s `length` and `capacity` are `i64`,** the type the
+     built-in `[T]`'s `length` had and every array in the tree was written
+     against.  The change is confined to `array.cryo` and the code that
+     reads those two values.  (Jake)
+
+376. **Taking a `![caller_location]` function as a value is refused,** and
+     the refusal is made early enough that the editor and `cryo check`
+     report it, not only a build.  (Jake)
+
+377. **A refused fill literal keeps code E0453 and its wording.**  (Jake)
+
+378. **The attribute that reports the caller's location is named
+     `![caller_location]`.**  (Jake)
+
 ### 2026-10-14
 
 333. **One project's analysis covers every target of its cryoconfig, and

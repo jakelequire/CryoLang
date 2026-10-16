@@ -183,7 +183,7 @@ type struct TypeChecker {
             return TypeCompatibility::ExplicitCast;
         }
 
-        // Array coercion: T[N] -> T[] (sized array assignable to dynamic array)
+        // A fixed array is another fixed array of its element and length.
         if (from_type.kind == TypeKind::Array && to_type.kind == TypeKind::Array) {
             const from_arr: ArrayType* = from_type as ArrayType*;
             const to_arr: ArrayType* = to_type as ArrayType*;
@@ -191,22 +191,22 @@ type struct TypeChecker {
             // through the arena's structural hash-cons table, so one semantic
             // element type has exactly one id.  This deliberately does
             // NOT fall back to comparing element `kind`: two unrelated structs
-            // are both `TypeKind::Struct`, which made `Foo[]` read as
-            // `Compatible` with `Bar[]`, and `i32[]` -> `u8[]` `Compatible`
+            // are both `TypeKind::Struct`, which made `[Foo]` read as
+            // `Compatible` with `[Bar]`, and `[i32]` -> `[u8]` `Compatible`
             // (stronger than the `ImplicitConvert` the widening branch below
             // returns for that same pair).  See the `&T` -> `T*` branch, which
             // recurses for exactly this reason.
             if (from_arr.element.equals(to_arr.element)) {
-                if (to_arr.is_dynamic() || from_arr.size == to_arr.size) {
+                if (from_arr.size == to_arr.size) {
                     return TypeCompatibility::Compatible;
                 }
             }
             // Element types that merely share a kind are NOT interchangeable.
             // An array is one contiguous buffer, so there is no element-wise
-            // conversion to emit: admitting `i64[] -> u8[]` would reinterpret
+            // conversion to emit: admitting `[i64] -> [u8]` would reinterpret
             // the backing memory at a different stride.  Literals reach their
             // element type through `resolve_array_literal`'s expected-type
-            // propagation instead, which is why `char[] c = [0; N]` needs no
+            // propagation instead, which is why `[char] c = [0; N]` needs no
             // coercion here.
         }
 
@@ -977,19 +977,10 @@ type struct TypeChecker {
             return TypeCheckResult::fail("Array index must be an integer");
         }
 
-        // Pointer indexing.  A raw pointer `T*` indexes as C pointer arithmetic
-        // (`*(ptr + i)` -> T).  A pointer-to-array `T[]*`, however, auto-derefs
-        // and indexes the pointed-to array (-> its element type), mirroring the
-        // reference case below: pointer arithmetic over a fat-array header is
-        // never meaningful (the pointee is a single `{data, len}` struct), so the
-        // convenient reading is the only useful one, and `arr[i]` now matches the
-        // `(*arr)[i]` people had to write before.
+        // Pointer indexing is pointer arithmetic (`*(ptr + i)` -> T), whatever
+        // the pointer points at, an array among them.
         if (base_type.kind == TypeKind::Pointer) {
             const ptr_type: PointerType* = base_type as PointerType*;
-            const pointee_t: Type* = this.arena.lookup(ptr_type.pointee);
-            if (pointee_t != null && pointee_t.kind == TypeKind::Array) {
-                return this.check_index_access(ptr_type.pointee, index);
-            }
             return TypeCheckResult::ok(ptr_type.pointee);
         }
 
@@ -999,9 +990,9 @@ type struct TypeChecker {
         }
 
         // Reference indexing: auto-deref `&T` and index the referent, so
-        // `foo[i]` works on a `&T[]` the same way `foo.length` already does
+        // `foo[i]` works on a `&[T]` the same way `foo.length` already does
         // (member access auto-derefs references too).  Raw pointers `T*` index
-        // as C pointer arithmetic above; only pointer-TO-ARRAY auto-derefs there.
+        // as pointer arithmetic above.
         if (base_type.kind == TypeKind::Reference) {
             const rt: ReferenceType* = base_type as ReferenceType*;
             return this.check_index_access(rt.referent, index);

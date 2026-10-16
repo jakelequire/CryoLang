@@ -94,8 +94,8 @@ type struct Step {
 
     /// The brackets opening each call (`(`) and indexing (`[`) in `ops`,
     /// in order.
-    op_list(&this) -> u8[] {
-        mut out: u8[] = [];
+    op_list(&this) -> [u8] {
+        mut out: [u8] = [];
         const b: u8* = this.ops.as_ptr();
         mut depth: i64 = 0;
         for (mut i: u64 = 0; i < this.ops.length(); i++) {
@@ -216,7 +216,7 @@ type struct Completer {
         if (!ty.is_valid()) { return; }
         const d: DefId = this.type_def(ty);
         if (!d.is_valid()) { return; }
-        const all: Member[] = Members::of_type(this.ctx, d);
+        const all: [Member] = Members::of_type(this.ctx, d);
         for (mut i: i64 = 0; i < all.length; i++) {
             if (Members::is_instance(&all[i])) { this.member_item(&all[i]); }
         }
@@ -226,7 +226,7 @@ type struct Completer {
     /// invalid when it is not read.
     receiver_before(&this, line: str::Str, dot: u64) -> TypeRef {
         if (this.ctx == null || !this.scope.is_valid()) { return TypeRef::invalid(); }
-        mut steps: Step[] = [];
+        mut steps: [Step] = [];
         const b: u8* = line.as_ptr();
         mut q: u64 = dot;
         loop {
@@ -276,7 +276,7 @@ type struct Completer {
 
     /// The type of a receiver's head: `this`, or a name the scope binds.
     head_type(&this, s: &Step) -> TypeRef {
-        const ops: u8[] = s.op_list();
+        const ops: [u8] = s.op_list();
         mut ty: TypeRef = TypeRef::invalid();
         mut from: i64 = 0;
         if (s.name.equals(&str::Str::from("this"))) {
@@ -342,7 +342,7 @@ type struct Completer {
     /// The type of `.name` on a value of type `ty`, then its calls and
     /// indexings.
     step_type(&this, ty: TypeRef, s: &Step) -> TypeRef {
-        const ops: u8[] = s.op_list();
+        const ops: [u8] = s.op_list();
         if (ops.length > 0 && ops[0] == '(' as u8) {
             return this.apply_ops(this.method_return(ty, this.intern(s.name)), &ops, 1);
         }
@@ -366,19 +366,19 @@ type struct Completer {
     /// The return type the methods named `leaf` of type `ty` declare, through
     /// its base classes; invalid when none or when they disagree.
     method_return(&this, ty: TypeRef, leaf: SymbolStr) -> TypeRef {
-        const entries: OverloadId[] = this.method_entries(ty, leaf);
+        const entries: [OverloadId] = this.method_entries(ty, leaf);
         if (entries.length == 0) { return TypeRef::invalid(); }
         return this.shared_return(&entries);
     }
 
     /// The methods named `leaf` of type `ty`, from the first of it and its
     /// base classes that declares any.
-    method_entries(&this, ty: TypeRef, leaf: SymbolStr) -> OverloadId[] {
+    method_entries(&this, ty: TypeRef, leaf: SymbolStr) -> [OverloadId] {
         mut types_: TypeUtils = TypeUtils { arena: this.ctx.type_arena, intern: this.ctx.intern_table,
                                             ctx: this.ctx, checker: null };
         mut owner: TypeRef = types_.method_owner_ref(this.carrier(ty));
         for (mut depth: i64 = 0; depth < 16 && owner.is_valid(); depth++) {
-            const entries: OverloadId[] = this.ctx.decl_index.lookup_family_entries(
+            const entries: [OverloadId] = this.ctx.decl_index.lookup_family_entries(
                 FamilyOwner::Type(owner), leaf);
             if (entries.length > 0) { return entries; }
             const t: type_base::Type* = this.ctx.type_arena.lookup(owner);
@@ -390,7 +390,7 @@ type struct Completer {
         return [];
     }
 
-    shared_return(&this, entries: &OverloadId[]) -> TypeRef {
+    shared_return(&this, entries: &[OverloadId]) -> TypeRef {
         mut ret: TypeRef = TypeRef::invalid();
         for (mut k: i64 = 0; k < entries.length; k++) {
             const sig: type_base::Type* = this.ctx.type_arena.lookup(
@@ -405,11 +405,17 @@ type struct Completer {
 
     /// `ty` after the calls and indexings in `ops` from position `from`: an
     /// index takes an array's element; a call on a value is not followed.
-    apply_ops(&this, ty: TypeRef, ops: &u8[], from: i64) -> TypeRef {
+    apply_ops(&this, ty: TypeRef, ops: &[u8], from: i64) -> TypeRef {
         mut cur: TypeRef = ty;
         for (mut i: i64 = from; i < ops.length && cur.is_valid(); i++) {
             if (ops[i] != '[' as u8) { return TypeRef::invalid(); }
-            const t: type_base::Type* = this.ctx.type_arena.lookup(this.carrier(cur));
+            const c: TypeRef = this.carrier(cur);
+            const dynamic_elem: TypeRef = this.ctx.type_arena.default_array_element(c);
+            if (dynamic_elem.is_valid()) {
+                cur = dynamic_elem;
+                continue;
+            }
+            const t: type_base::Type* = this.ctx.type_arena.lookup(c);
             if (t == null || t.kind != types::TypeKind::Array) { return TypeRef::invalid(); }
             cur = (t as compound::ArrayType*).element;
         }
@@ -421,8 +427,7 @@ type struct Completer {
         return loc.carrier(ty);
     }
 
-    /// The type definition a value of type `ty` is an instance of; a
-    /// built-in array's is the library type that carries its methods.
+    /// The type definition a value of type `ty` is an instance of.
     type_def(&this, ty: TypeRef) -> DefId {
         const c: TypeRef = this.carrier(ty);
         const d: DefId = this.ctx.decl_index.def_of(c, this.ctx.type_arena);
@@ -439,12 +444,12 @@ type struct Completer {
         const place: Place = this.place_of_path(line.sub_bytes(start, end));
         match (place) {
             Place::Module(m) => {
-                const syms: SymbolID[] = Members::exports_of(this.ctx, m);
+                const syms: [SymbolID] = Members::exports_of(this.ctx, m);
                 for (mut i: i64 = 0; i < syms.length; i++) { this.symbol_item(syms[i]); }
                 this.modules_under(m);
             }
             Place::Type(d) => {
-                const all: Member[] = Members::of_type(this.ctx, d);
+                const all: [Member] = Members::of_type(this.ctx, d);
                 for (mut i: i64 = 0; i < all.length; i++) {
                     if (!Members::is_instance(&all[i])) { this.member_item(&all[i]); }
                 }
@@ -470,7 +475,7 @@ type struct Completer {
 
     modules_under(mut &this, m: ModulePath) -> void {
         if (this.ctx == null) { return; }
-        const subs: string[] = Members::submodules_of(this.ctx, m);
+        const subs: [string] = Members::submodules_of(this.ctx, m);
         for (mut i: i64 = 0; i < subs.length; i++) { this.push(subs[i], "", CK_MODULE); }
     }
 
@@ -481,7 +486,7 @@ type struct Completer {
     /// the modules the file imports.
     bare(mut &this) -> void {
         if (this.ctx == null || !this.scope.is_valid()) { return; }
-        const seen: SymbolID[] = this.ctx.resolver.visible_bindings(this.scope);
+        const seen: [SymbolID] = this.ctx.resolver.visible_bindings(this.scope);
         for (mut i: i64 = 0; i < seen.length; i++) {
             // A type body binds its fields, methods and variants, which a
             // bare name never reaches: they are written through `this` or
@@ -493,9 +498,9 @@ type struct Completer {
             if (this.declared_after_cursor(seen[i])) { continue; }
             this.symbol_item(seen[i]);
         }
-        const prelude: &ModulePath[] = &this.ctx.resolver.prelude_modules;
+        const prelude: &[ModulePath] = &this.ctx.resolver.prelude_modules;
         for (mut p: i64 = 0; p < prelude.length; p++) {
-            const syms: SymbolID[] = Members::exports_of(this.ctx, prelude[p]);
+            const syms: [SymbolID] = Members::exports_of(this.ctx, prelude[p]);
             for (mut i: i64 = 0; i < syms.length; i++) { this.symbol_item(syms[i]); }
         }
         const n: u32 = this.ctx.module_graph.module_count();
@@ -597,7 +602,7 @@ type struct Completer {
 
     /// The keywords a statement or an expression can start with.
     keywords(mut &this) -> void {
-        const words: string[] = [
+        const words: [string] = [
             "function", "return", "if", "else", "while", "for", "loop", "match", "break",
             "continue", "type", "struct", "union", "enum", "trait", "implement", "import",
             "namespace", "const", "mut", "move", "asm", "this", "true", "false", "null"

@@ -29,7 +29,7 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index;
 import compiler::decl_index::{ GlobalEntry };
 import compiler::ast;
-import compiler::ast::{ MemberPin };
+import compiler::ast::{ MemberPin, TypeAnnotation };
 import compiler::ast::node;
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::expression;
@@ -162,8 +162,7 @@ type struct TypeUtils {
 
     /// The registered type `ty` reads its methods off, or invalid: `ty`
     /// itself when the index registered it; an instantiation's resolved
-    /// type once it has one, else its template; a dynamic array's
-    /// registration, keyed by its element.  The ref-keyed twin of
+    /// type once it has one, else its template.  The ref-keyed twin of
     /// `lookup_type_sym`, which answers the same owner's NAME for display
     /// and for the composed keys.
     method_owner_ref(&this, ty: TypeRef) -> TypeRef {
@@ -174,9 +173,6 @@ type struct TypeUtils {
             const inst: InstantiatedType* = t as InstantiatedType*;
             if (inst.has_resolved_type()) { return inst.resolved_type; }
             if (this.ctx.decl_index.lookup_type_name(inst.generic_base).is_valid()) { return inst.generic_base; }
-        }
-        if (t != null && t.kind == TypeKind::Array && (t as ArrayType*).is_dynamic()) {
-            return this.ctx.decl_index.lookup_array_type((t as ArrayType*).element);
         }
         return TypeRef::invalid();
     }
@@ -259,17 +255,6 @@ type struct TypeUtils {
             }
             const base: SymbolStr = this.ctx.decl_index.lookup_type_name(inst.generic_base);
             if (base.is_valid()) { return base; }
-        }
-        // A dynamic array shares the `Array_<T>` method/layout registry, but its
-        // TypeRef is not canonical (many TypeRefs describe the same `T[]`), so the
-        // TypeRef-keyed `direct` lookup above misses. Resolve its name by ELEMENT
-        // type, the canonical key - the same mapping codegen dispatches through.
-        // Without this a `T[]` receiver has no name, so method resolution can't
-        // find `pop`/`push`/etc. on it and (for a value use like
-        // `const x = arr.pop()`) silently falls through unresolved instead of
-        // resolving to the real return type (`pop -> Option<T>`) or erroring.
-        if (t != null && t.kind == TypeKind::Array && (t as ArrayType*).is_dynamic()) {
-            return this.ctx.decl_index.lookup_array_type_name((t as ArrayType*).element);
         }
         return SymbolStr::empty();
     }
@@ -530,8 +515,8 @@ type struct TypeUtils {
     /// Copy `ty`'s instantiation type arguments into a fresh owned array.
     /// Element-wise by construction - never hand back a borrow of the type's own
     /// buffer, which would be freed twice.
-    view_type_args_copy(&this, ty: TypeRef) -> TypeRef[] {
-        mut out: TypeRef[] = [];
+    view_type_args_copy(&this, ty: TypeRef) -> [TypeRef] {
+        mut out: [TypeRef] = [];
         const n: i64 = this.view_type_arg_count(ty);
         for (mut i: i64 = 0; i < n; i++) { out.push(this.view_type_arg_at(ty, i)); }
         return out;
@@ -809,5 +794,54 @@ type struct TypeUtils {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return "?"; }
         return this.arena.format_display(t);
+    }
+
+    /// `ty` for a message, as the annotation `ann` that declared it writes
+    /// it: an array written `Array<T>` shows as that instantiation, one
+    /// written `[T]` as `[T]`.  The written spelling is for display only;
+    /// with no annotation, or a part of `ty` the annotation does not spell,
+    /// the type's own display.
+    written_display_name(&this, ty: TypeRef, ann: TypeAnnotation*) -> string {
+        if (ann == null || !ty.is_valid()) { return this.type_display_name(ty); }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return "?"; }
+        match (*ann) {
+            TypeAnnotation::Pointer(p) => {
+                if (t.kind == TypeKind::Pointer) {
+                    return this.written_display_name((t as PointerType*).pointee, p.inner) + "*";
+                }
+            }
+            TypeAnnotation::Reference(r) => {
+                if (t.kind == TypeKind::Reference) {
+                    const rt: ReferenceType* = t as ReferenceType*;
+                    const inner: string = this.written_display_name(rt.referent, r.inner);
+                    if (rt.is_mutable()) { return "mut &" + inner; }
+                    return "&" + inner;
+                }
+            }
+            TypeAnnotation::Array(a) => {
+                const elem: TypeRef = this.arena.default_array_element(ty);
+                if (elem.is_valid()) { return "[" + this.written_display_name(elem, a.element) + "]"; }
+                if (t.kind == TypeKind::Array) {
+                    const at: ArrayType* = t as ArrayType*;
+                    return at.spelled(this.written_display_name(at.element, a.element));
+                }
+            }
+            TypeAnnotation::Generic(g) => {
+                const base: TypeRef = this.arena.inst_generic_base(ty);
+                const n: i64 = this.arena.inst_type_arg_count(ty);
+                if (base.is_valid() && n > 0) {
+                    mut out: string = this.type_display_name(base) + "<";
+                    for (mut i: i64 = 0; i < n; i++) {
+                        if (i > 0) { out += ", "; }
+                        const arg_ann: TypeAnnotation* = if (i < g.args.length) { g.args[i] } else { null };
+                        out += this.written_display_name(this.arena.inst_type_arg_at(ty, i), arg_ann);
+                    }
+                    return out + ">";
+                }
+            }
+            _ => { }
+        }
+        return this.type_display_name(ty);
     }
 }

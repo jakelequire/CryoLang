@@ -108,8 +108,8 @@ type struct MoveChecker {
     /// in this list are Live by default. The full span is retained
     /// (not just the line) so the renderer can underline the move
     /// site in a combined multi-span snippet.
-    moved_keys:  u64[];
-    moved_spans: SourceSpan[];
+    moved_keys:  [u64];
+    moved_spans: [SourceSpan];
     /// Bindings that have been `poll`ed, i.e. futures whose storage must now
     /// hold still.  A poll runs the state machine's own body, which may take
     /// the address of one of its fields and keep it in another field across the
@@ -126,8 +126,8 @@ type struct MoveChecker {
     /// polls and moves the same future in mutually exclusive branches.  That is
     /// the safe direction, and it keeps this out of `merge_branches`, where the
     /// meet-over-paths reasoning is subtle enough already.
-    polled_keys:  u64[];
-    polled_spans: SourceSpan[];
+    polled_keys:  [u64];
+    polled_spans: [SourceSpan];
     /// Parallel to `moved_keys`: whether the move was *storage-
     /// duplicating* (a `let`/`var` initializer, an assignment RHS, or an
     /// aggregate-literal field - all of which bitwise-copy the value into
@@ -138,7 +138,7 @@ type struct MoveChecker {
     /// double-free across a loop back-edge, so loop-carried detection
     /// keys on this flag - that is what keeps autoref'd arguments (e.g.
     /// `topo_contains(order, i)`) from being flagged.
-    moved_real:  boolean[];
+    moved_real:  [boolean];
 
     /// Loop-carried-move detection state.  A loop body is walked twice:
     /// a silent discovery pass (`suppress_emit`) that records, via
@@ -149,8 +149,8 @@ type struct MoveChecker {
     /// loop is reported as a use-after-move on the next iteration.
     suppress_emit:      boolean;
     capture_decls:      boolean;
-    captured_decl_keys: u64[];
-    carried_keys:       u64[];
+    captured_decl_keys: [u64];
+    carried_keys:       [u64];
 
     /// Names bound by an enum/match pattern in an enclosing arm (e.g. `pair`
     /// in `Some(pair) => ...`).  These are by-value payload bindings the
@@ -163,7 +163,7 @@ type struct MoveChecker {
     /// whole-payload only.  Pushed around each arm body's walk, truncated
     /// after the join.
     /// Keyed by the binding the pattern declares, as every set in this pass is.
-    pat_binding_keys: u64[];
+    pat_binding_keys: [u64];
 
     /// Partial-move set: parallel arrays recording a non-Copy *droppable*
     /// FIELD moved out of a non-`Drop` owned local (a partial move, the
@@ -179,8 +179,8 @@ type struct MoveChecker {
     /// drop_insertion's `pm_binding`/`pm_field`; the two passes MUST classify
     /// the identical set (a divergence is a double-free or a leak).  Reset in
     /// `enter_function`.
-    pm_binding: u64[];
-    pm_field:   u32[];
+    pm_binding: [u64];
+    pm_field:   [u32];
 
     /// Depth of enclosing `unsafe` blocks.
     ///
@@ -229,6 +229,12 @@ type struct MoveChecker {
     /// mirrored in drop_insertion.
     branch_depth: i64;
 
+    /// True while a loop's repeated expressions - its condition and a `for`'s
+    /// update - are walked again at the back edge.  A value or field moved
+    /// there is moved again on every iteration, so it is reported as
+    /// loop-carried rather than tracked.
+    loop_repeat: boolean;
+
     /// The receiver of the function being walked when that function is a
     /// `Drop` implementation's `drop`, invalid otherwise.  Its fields are
     /// released by field glue when the destructor returns, so moving one out
@@ -262,6 +268,7 @@ type struct MoveChecker {
             pm_binding:         [],
             pm_field:           [],
             branch_depth:       0,
+            loop_repeat:        false,
             unsafe_depth:        0,
             arg_binding_unknown: false,
             drop_receiver:       SymbolID::invalid(),
@@ -285,6 +292,7 @@ type struct MoveChecker {
         this.pm_binding         = [];
         this.pm_field           = [];
         this.branch_depth       = 0;
+        this.loop_repeat        = false;
         this.unsafe_depth       = 0;
         this.arg_binding_unknown = false;
         this.drop_receiver       = SymbolID::invalid();
@@ -574,9 +582,9 @@ type struct MoveChecker {
     /// pattern.
     unmark_moved(mut &this, sym: SymbolID) -> void {
         if (!sym.is_valid()) { return; }
-        mut keep_keys:  u64[]        = [];
-        mut keep_spans: SourceSpan[] = [];
-        mut keep_real:  boolean[]    = [];
+        mut keep_keys:  [u64]        = [];
+        mut keep_spans: [SourceSpan] = [];
+        mut keep_real:  [boolean]    = [];
         for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
             if (this.moved_keys[i] == sym.key()) { continue; }
             keep_keys.push(this.moved_keys[i]);
@@ -614,11 +622,11 @@ type struct MoveChecker {
     /// it, so a length rewind cannot put a pre-branch move back, and a
     /// one-branch revival would otherwise erase a move on every path
     /// (an accepted use-after-move -> double free).
-    restore_full(mut &this, keys: &u64[], spans: &SourceSpan[],
-                 real: &boolean[]) -> void {
-        mut nk: u64[]        = [];
-        mut ns: SourceSpan[] = [];
-        mut nr: boolean[]    = [];
+    restore_full(mut &this, keys: &[u64], spans: &[SourceSpan],
+                 real: &[boolean]) -> void {
+        mut nk: [u64]        = [];
+        mut ns: [SourceSpan] = [];
+        mut nr: [boolean]    = [];
         for (mut i: i64 = 0; i < keys.length; i++) {
             nk.push(keys[i]);
             ns.push(spans[i]);
@@ -682,6 +690,43 @@ type struct MoveChecker {
         }
     }
 
+    /// True when every path through a loop body leaves the loop (`break` or
+    /// `return`) before the back edge, so the loop's condition and update
+    /// are never evaluated again.  A `continue` reaches the back edge.  A
+    /// loop nested in the body is not looked into: its `break` leaves only
+    /// itself.
+    leaves_loop(&this, stmt: StatementNode*) -> boolean {
+        if (stmt == null) { return false; }
+        match (stmt.kind) {
+            NodeKind::ReturnStatement => { return true; }
+            NodeKind::BreakStatement  => { return true; }
+            NodeKind::BlockStatement => {
+                // The first statement that always diverges decides.
+                const b: BlockStmtNode* = stmt as BlockStmtNode*;
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    if (this.leaves_loop(b.statements[i])) { return true; }
+                    if (this.always_diverges(b.statements[i])) { return false; }
+                }
+                return false;
+            }
+            NodeKind::IfStatement => {
+                const it: IfStmtNode* = stmt as IfStmtNode*;
+                if (it.else_stmt == null) { return false; }
+                return this.leaves_loop(it.then_stmt) && this.leaves_loop(it.else_stmt);
+            }
+            NodeKind::MatchStatement => {
+                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+                if (m.arms.length == 0) { return false; }
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    const arm: MatchArmNode* = m.arms[i];
+                    if (arm == null || !this.leaves_loop(arm.body)) { return false; }
+                }
+                return true;
+            }
+            _ => { return false; }
+        }
+    }
+
     /// Walk a set of mutually-exclusive branches (the two arms of an `if`,
     /// or the arms of a `match`) and merge their move-sets at the join.
     ///
@@ -696,7 +741,7 @@ type struct MoveChecker {
     /// A null body (e.g. a missing `else`) is the implicit live no-move
     /// branch: it is skipped, contributing nothing to the union, which
     /// leaves a one-sided move correctly *possibly*-moved.
-    merge_branches(mut &this, bodies: StatementNode*[]) -> void {
+    merge_branches(mut &this, bodies: [StatementNode*]) -> void {
         // Inside a conditional: a field-move-out here is NOT an unconditional
         // partial move, so partial_move_allowed rejects it (stays E0453).
         this.branch_depth += 1;
@@ -708,9 +753,9 @@ type struct MoveChecker {
         // would erase a pre-branch move on EVERY path (an accepted
         // use-after-move -> double free). We snapshot the whole set and
         // restore it in full between branches (see `restore_full`).
-        mut pre_keys:  u64[]        = [];
-        mut pre_spans: SourceSpan[] = [];
-        mut pre_real:  boolean[]    = [];
+        mut pre_keys:  [u64]        = [];
+        mut pre_spans: [SourceSpan] = [];
+        mut pre_real:  [boolean]    = [];
         for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
             pre_keys.push(this.moved_keys[i]);
             pre_spans.push(this.moved_spans[i]);
@@ -735,9 +780,9 @@ type struct MoveChecker {
         // checkpoint): a pre-branch move a branch did NOT revive is still in
         // its end-set and must survive, while one that ALL branches revived
         // appears in no end-set and is correctly dropped.
-        mut u_keys:  u64[]        = [];
-        mut u_spans: SourceSpan[] = [];
-        mut u_real:  boolean[]    = [];
+        mut u_keys:  [u64]        = [];
+        mut u_spans: [SourceSpan] = [];
+        mut u_real:  [boolean]    = [];
         for (mut i: i64 = 0; i < bodies.length; i++) {
             const body: StatementNode* = bodies[i];
             if (body == null) {
@@ -842,9 +887,14 @@ type struct MoveChecker {
     /// aborting the pipeline before codegen so the double-freeing binary
     /// is never emitted.
     emit_loop_carried(mut &this, name: SymbolStr, use_span: SourceSpan) -> void {
+        this.emit_loop_carried_text(this.intern.resolve(name), use_span);
+    }
+
+    /// As `emit_loop_carried`, for a value named by written text: a field
+    /// path such as `h.items`.
+    emit_loop_carried_text(mut &this, name: string, use_span: SourceSpan) -> void {
         const headline: string = fmt::format(
-            "value '%s' moved inside a loop is used again on the next iteration",
-            this.intern.resolve(name));
+            "value '%s' moved inside a loop is used again on the next iteration", name);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0452_USE_AFTER_MOVE, headline);
         diag = diag.at_with_label(use_span,
@@ -893,7 +943,7 @@ type struct MoveChecker {
         }
     }
 
-    walk_methods(mut &this, methods: &MethodNode*[]) -> void {
+    walk_methods(mut &this, methods: &[MethodNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null) { continue; }
@@ -965,7 +1015,7 @@ type struct MoveChecker {
                 // fall-through that moves nothing - it just leaves a then-only
                 // move *possibly* (not definitely) moved, which the union
                 // models correctly. See merge_branches.
-                mut if_branches: StatementNode*[] = [it.then_stmt, it.else_stmt];
+                mut if_branches: [StatementNode*] = [it.then_stmt, it.else_stmt];
                 this.merge_branches(if_branches);
             }
             NodeKind::MatchStatement => {
@@ -986,7 +1036,7 @@ type struct MoveChecker {
                 // This is what lets `check_field_move_out` catch a field moved
                 // out of a `Some(pair) => ...` binding.
                 const pat_snap: i64 = this.pat_binding_keys.length;
-                mut arm_bodies: StatementNode*[] = [];
+                mut arm_bodies: [StatementNode*] = [];
                 for (mut ai: i64 = 0; ai < m.arms.length; ai++) {
                     const arm: MatchArmNode* = m.arms[ai];
                     if (arm != null) {
@@ -1011,25 +1061,29 @@ type struct MoveChecker {
                     this.walk_stmt(sm.arms[0].body);
                 }
             }
+            // The first test of a condition runs whatever the loop does, so
+            // its moves stay in effect after the loop; the loop body walk
+            // re-walks it, and a `for`'s update, at the back edge.
             NodeKind::WhileStatement => {
                 const w: WhileStmtNode* = stmt as WhileStmtNode*;
                 if (w.condition != null) { this.walk_expr_read(w.condition); }
-                this.walk_loop_body(w.body);
+                this.walk_loop_body(w.body, null, w.condition);
             }
             NodeKind::ForStatement => {
                 const f: ForStmtNode* = stmt as ForStmtNode*;
                 if (f.condition != null) { this.walk_expr_read(f.condition); }
-                if (f.update != null)    { this.walk_expr_read(f.update); }
-                this.walk_loop_body(f.body);
+                this.walk_loop_body(f.body, f.update, f.condition);
             }
             NodeKind::DoWhileStatement => {
+                // The condition is tested after the body, so it runs at
+                // least once and is part of every iteration's back edge.
                 const d: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
-                this.walk_loop_body(d.body);
+                this.walk_loop_body(d.body, null, d.condition);
                 if (d.condition != null) { this.walk_expr_read(d.condition); }
             }
             NodeKind::LoopStatement => {
                 const lp: LoopStmtNode* = stmt as LoopStmtNode*;
-                this.walk_loop_body(lp.body);
+                this.walk_loop_body(lp.body, null, null);
             }
             _ => {}
         }
@@ -1051,8 +1105,14 @@ type struct MoveChecker {
     /// site. Branch handling stays conservative (snapshot/restore), so
     /// only UNCONDITIONAL loop-carried moves are flagged - zero false
     /// positives, at the cost of missing moves guarded by an inner `if`.
-    walk_loop_body(mut &this, body: StatementNode*) -> void {
+    ///
+    /// The back edge re-evaluates `update`, then `condition` (either may be
+    /// null), so both walks walk them after the body, unless the body always
+    /// leaves the loop; any move made there is refused (`walk_back_edge`).
+    walk_loop_body(mut &this, body: StatementNode*, update: ExpressionNode*,
+                   condition: ExpressionNode*) -> void {
         if (body == null) { return; }
+        const loops_back: boolean = !this.leaves_loop(body);
         // A loop body is conditional (0+ iterations): a field-move-out inside
         // it is not an unconditional partial move, so it stays E0453.
         this.branch_depth += 1;
@@ -1069,6 +1129,7 @@ type struct MoveChecker {
         this.suppress_emit = true;
         this.capture_decls = true;
         this.walk_stmt(body);
+        if (loops_back) { this.walk_back_edge(update, condition); }
         this.suppress_emit = prev_suppress;
         this.capture_decls = prev_capture;
 
@@ -1095,12 +1156,24 @@ type struct MoveChecker {
             this.moved_real.push(true);
         }
         this.walk_stmt(body);
+        if (loops_back) { this.walk_back_edge(update, condition); }
 
         // A loop may run zero times; body-internal moves don't propagate
         // to the following code.
         this.truncate_carried(carry_snap);
         this.restore_moves(snap);
         this.branch_depth -= 1;
+    }
+
+    /// Walk what the back edge evaluates: a `for`'s update, then the
+    /// condition.  Either may be null.  Every value or field moved there is
+    /// refused as loop-carried (`handle_ident`, `check_field_move_out`).
+    walk_back_edge(mut &this, update: ExpressionNode*, condition: ExpressionNode*) -> void {
+        const prev: boolean = this.loop_repeat;
+        this.loop_repeat = true;
+        if (update != null)    { this.walk_expr_read(update); }
+        if (condition != null) { this.walk_expr_read(condition); }
+        this.loop_repeat = prev;
     }
 
     walk_var_decl(mut &this, vd: VarDeclNode*) -> void {
@@ -1204,7 +1277,7 @@ type struct MoveChecker {
         if (real) { this.check_array_move_out(expr); }
         // ...and for a whole owning-array field read by value THROUGH a
         // pointer/reference (`x = node.fields`): `check_field_move_out` only
-        // covers owned-value places, but an owning `T[]` field aliases its
+        // covers owned-value places, but an owning `[T]` field aliases its
         // buffer regardless of how the struct is reached, so it double-frees.
         if (real) { this.check_array_field_move_out(expr); }
         if (expr.kind == NodeKind::Identifier) {
@@ -1495,7 +1568,7 @@ type struct MoveChecker {
             this.walk_expr_read(m.subject);
         }
         const pat_snap: i64 = this.pat_binding_keys.length;
-        mut arm_bodies: StatementNode*[] = [];
+        mut arm_bodies: [StatementNode*] = [];
         for (mut i: i64 = 0; i < m.arms.length; i++) {
             const arm: MatchArmNode* = m.arms[i];
             if (arm != null) {
@@ -1631,6 +1704,12 @@ type struct MoveChecker {
         // Unconditional only: drop-skip without per-field flags is sound only
         // for a definitely-moved field.
         if (this.branch_depth != 0) { return false; }
+        return this.partial_move_shape(ma);
+    }
+
+    /// The owner shape `partial_move_allowed` accepts, whatever the branch
+    /// depth: a bare owned local of a non-`Drop` struct or class.
+    partial_move_shape(&this, ma: MemberAccessNode*) -> boolean {
         if (ma.object == null || ma.object.kind != NodeKind::Identifier) {
             return false;
         }
@@ -1746,6 +1825,16 @@ type struct MoveChecker {
         // the owner's scope exit (per-field glue makes that sound).  Every
         // other shape - `Drop` owner, in-branch (conditional) move, pattern
         // binding, non-droppable non-Copy field - keeps the hard E0453.
+        // A loop's condition or update moves the field again on every
+        // iteration: the same double free as a carried whole value.
+        if (this.loop_repeat && this.type_needs_drop(field_ty) && this.partial_move_shape(ma)) {
+            if (!this.suppress_emit) {
+                const owner: string = this.intern.resolve((ma.object as IdentifierNode*).name);
+                this.emit_loop_carried_text(
+                    fmt::format("%s.%s", owner, this.intern.resolve(ma.member)), ma.span);
+            }
+            return;
+        }
         if (this.type_needs_drop(field_ty) && this.partial_move_allowed(ma)) {
             const owner_id: u64 = (ma.object as IdentifierNode*).res.local_sym().key();
             const field_id: u32 = ma.member.id;
@@ -1927,7 +2016,7 @@ type struct MoveChecker {
         // are bitwise-independent of the array and safe to duplicate.
         const elem_ty: TypeRef = expr.resolved_type;
         if (!elem_ty.is_valid() || !this.type_needs_drop(elem_ty)) { return; }
-        // The indexed operand must be an owning array value (`T[]`/`Array<T>`),
+        // The indexed operand must be an owning array value (`[T]`/`Array<T>`),
         // not a raw-pointer deref the caller is responsible for.
         const arr_ty: TypeRef = aa.array.resolved_type;
         if (!arr_ty.is_valid() || this.is_ptr_or_ref(arr_ty)) { return; }
@@ -1947,7 +2036,7 @@ type struct MoveChecker {
         this.fatal += 1;
     }
 
-    /// Reject a value-copy of a whole owning array (`T[]`) out of a struct
+    /// Reject a value-copy of a whole owning array (`[T]`) out of a struct
     /// FIELD reached through a pointer/reference (`x = node.fields`,
     /// `f(node.fields)`).  `check_field_move_out` already catches the
     /// owned-value-place form; this covers the through-pointer form, which it
@@ -1973,7 +2062,7 @@ type struct MoveChecker {
         diag = diag.at_with_label(ma.span,
             "copying this array field out aliases the buffer the source still owns (double free)");
         diag = diag.help(
-            "borrow it (`const x: &T[] = &place.field;`) or clone it when an owned copy is required");
+            "borrow it (`const x: &[T] = &place.field;`) or clone it when an owned copy is required");
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1996,6 +2085,14 @@ type struct MoveChecker {
             this.intern.resolve(name), ty.key(), _is_copy as i32,
             _is_moved as i32, in_move_context as i32);
         if (_is_copy) { return; }
+
+        // A move in a loop's condition or update is made again at every back
+        // edge.  Refused even when the body gave the value a new one: the
+        // value the last test moved is still the one the scope releases.
+        if (this.loop_repeat && in_move_context && real) {
+            if (!this.suppress_emit) { this.emit_loop_carried(name, ident.span); }
+            return;
+        }
 
         // A whole by-value move of an aggregate that already has a field moved
         // out of it is a partial-move violation: the value has a hole and

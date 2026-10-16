@@ -2,7 +2,7 @@
 ///
 /// Lowering for the three array-literal shapes:
 ///   1. element-form fixed `[a, b, c]`          -> alloca `[N x T]`, store per slot
-///   2. element-form dynamic `[a, b, c]: T[]`   -> malloc + fat pointer `{T*, i64, i64}`
+///   2. element-form dynamic `[a, b, c]: [T]`   -> malloc + `Array<T>` {ptr, length, capacity}
 ///   3. fill-form    `[value; N]`               -> alloca + fill loop (fixed or dynamic)
 ///
 /// The fill-loop emitters (`emit_fill_loop_indexed` / `emit_fill_loop_raw`)
@@ -36,6 +36,9 @@ import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LBasicBlock, LIntPredicate, LType, LTypeKind, LValue };
 import compiler::types::compound::{ ArrayType };
 import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::arena;
+import compiler::types::arena::{ TypeArena };
 import compiler::resolver::res::{ DefId };
 
 
@@ -86,10 +89,10 @@ type struct ArrayLitEmitter {
         // Fill form `[value; N]`: single element repeated N times.  Needs
         // its own codegen path: allocate the backing storage, run a fill
         // loop writing the value at every slot, and (for dynamic arrays)
-        // wire up the fat-pointer struct.  The element-form path below
-        // would write only slot 0 and GEP as if the alloca's outer type
-        // were a flat array, which is wrong for both fixed `[N x T]`
-        // alloca shapes and dynamic `{T*, i64}` fat pointers.
+        // fill in the `Array<T>`.  The element-form path below would write
+        // only slot 0 and GEP as if the alloca's outer type were a flat
+        // array, which is wrong for both fixed `[N x T]` alloca shapes and
+        // an `Array<T>`.
         const is_fill: boolean = (node.repeat_count > 0 || node.repeat_count_expr != null)
                                  && node.elements.length == 1;
         if (is_fill) {
@@ -97,17 +100,9 @@ type struct ArrayLitEmitter {
             return;
         }
 
-        const arr_t_raw: Type* = this.cg.arena_type(node.resolved_type);
-        mut is_dynamic: boolean = false;
-        mut arr_type_ptr: ArrayType* = null;
-        if (arr_t_raw != null && arr_t_raw.kind == TypeKind::Array) {
-            arr_type_ptr = arr_t_raw as ArrayType*;
-            if (!arr_type_ptr.is_fixed()) {
-                is_dynamic = true;
-            }
-        }
-        if (is_dynamic) {
-            this.emit_dynamic(visitor, node, arr_type_ptr);
+        const dynamic_elem: TypeRef = this.dynamic_element(node.resolved_type);
+        if (dynamic_elem.is_valid()) {
+            this.emit_dynamic(visitor, node, dynamic_elem);
             return;
         }
 
@@ -146,17 +141,24 @@ type struct ArrayLitEmitter {
     }
 
 
-    // Element-form dynamic (`[a, b, c]: T[]`)
+    /// The element of `ty` when it is `[T]`, `Array<T>` with the default
+    /// allocator, else invalid.  It is laid out pointer, length, capacity
+    /// first; the allocator is empty and has nothing to store.
+    dynamic_element(&this, ty: TypeRef) -> TypeRef {
+        const a: TypeArena* = this.cg.ctx.type_arena;
+        return a.default_array_element(ty);
+    }
 
-    /// Emit element-form `[a, b, c]` where the expected type is a dynamic
-    /// array `T[]` (fat pointer `{T*, i64, i64}`).  Malloc a buffer for N
-    /// elements, store each element into it, then stash (data, len, cap)
-    /// into the fat pointer alloca.  Without this path, we'd alloca
-    /// `[N x T]` and hand back a fixed-size array to a caller expecting
-    /// `{ptr, i64}`, failing LLVM verification.
+
+    // Element-form dynamic (`[a, b, c]: [T]`)
+
+    /// Emit element-form `[a, b, c]` where the expected type is an owning
+    /// dynamic array of `element` (`Array<T>`: pointer, length, capacity,
+    /// allocator).  Allocate a buffer for N elements, store each element
+    /// into it, then stash (data, len, cap) into the array's alloca.
     emit_dynamic(mut &this, visitor: ASTVisitor*, node: ArrayLiteralNode*,
-                  arr_type: ArrayType*) -> void {
-        const elem_ty: LType = this.cg.type_mapper.map_type(arr_type.element);
+                  element: TypeRef) -> void {
+        const elem_ty: LType = this.cg.type_mapper.map_type(element);
         if (!elem_ty.is_valid()) {
             this.state.last_value     = LValue::null();
             this.state.last_is_lvalue = false;
@@ -189,7 +191,7 @@ type struct ArrayLitEmitter {
             // into heap corruption at the next allocation. `codegen_sizeof`
             // tries `size_bytes()` first and falls back to `LLVMSizeOf`,
             // which is always data-layout-correct.
-            const elem_size_val: LValue = this.cg.expr_ops.codegen_sizeof(arr_type.element);
+            const elem_size_val: LValue = this.cg.expr_ops.codegen_sizeof(element);
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 
@@ -243,13 +245,17 @@ type struct ArrayLitEmitter {
     /// constant (fixed array) or a runtime expression (dynamic array).
     emit_fill(mut &this, visitor: ASTVisitor*, node: ArrayLiteralNode*) -> void {
         const arr_t_raw: Type* = this.cg.arena_type(node.resolved_type);
-        if (arr_t_raw == null || arr_t_raw.kind != TypeKind::Array) {
+        mut fixed: ArrayType* = null;
+        if (arr_t_raw != null && arr_t_raw.kind == TypeKind::Array) {
+            fixed = arr_t_raw as ArrayType*;
+        }
+        const element: TypeRef = if (fixed != null) { fixed.element } else { this.dynamic_element(node.resolved_type) };
+        if (!element.is_valid()) {
             this.state.last_value     = LValue::null();
             this.state.last_is_lvalue = false;
             return;
         }
-        const arr_type: ArrayType* = arr_t_raw as ArrayType*;
-        const elem_ty: LType = this.cg.type_mapper.map_type(arr_type.element);
+        const elem_ty: LType = this.cg.type_mapper.map_type(element);
         if (!elem_ty.is_valid()) {
             this.state.last_value     = LValue::null();
             this.state.last_is_lvalue = false;
@@ -292,7 +298,7 @@ type struct ArrayLitEmitter {
         }
 
         // Compute the fill value.  Coerce the RHS integer width to match
-        // the element type; common case: `[0; N]` for `i8[]` where 0 is
+        // the element type; common case: `[0; N]` for `[i8]` where 0 is
         // an i32 literal and slots want i8.
         mut fill_val: LValue = this.dispatch.codegen_rvalue(visitor, node.elements[0]);
         if (fill_val.is_valid()) {
@@ -310,26 +316,26 @@ type struct ArrayLitEmitter {
             }
         }
 
-        if (arr_type.is_fixed()) {
+        if (fixed != null) {
             // Fixed `[value; N]` where N is a compile-time constant.
             // Alloca `[N x T]` and fill loop.  `gep_element_type` is T;
             // GEP needs `[N x T]` + indices `[0, i]` to land on slot i.
-            const arr_lty: LType = LType::array_of(elem_ty, arr_type.size as u32);
+            const arr_lty: LType = LType::array_of(elem_ty, fixed.size as u32);
             const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", arr_lty);
             this.emit_fill_loop_indexed(current_fn, arr_lty, alloca,
                                          elem_ty, fill_val, count_val);
             this.state.last_value     = alloca;
             this.state.last_is_lvalue = true;
         } else {
-            // Dynamic `{T*, i64}` fat pointer.  Alloca the struct, malloc
-            // a buffer of `count * sizeof(T)` bytes, fill it, then store
-            // the (data_ptr, count) into the fat pointer.
+            // Dynamic `Array<T>`.  Alloca the struct, malloc a buffer of
+            // `count * sizeof(T)` bytes, fill it, then store the
+            // (data_ptr, count) into the struct.
             const fat_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
             const fat: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", fat_ty);
 
             // Stride from LLVM's data layout; see emit_dynamic above for
             // why size_bytes() can be 0 here.
-            const elem_size_val: LValue = this.cg.expr_ops.codegen_sizeof(arr_type.element);
+            const elem_size_val: LValue = this.cg.expr_ops.codegen_sizeof(element);
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 

@@ -233,6 +233,9 @@ type struct SpecializationPasses {
 
         LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registered %lld templates", registry.template_count());
 
+        // The module declaring `Array` makes `[T]` a type from here on.
+        ctx.type_resolver.note_dynamic_array_shape();
+
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
 
@@ -629,29 +632,6 @@ type struct SpecializationPasses {
             if (arena.get_qualified_name(entry.specialized_type).is_valid()) {
                 ctx.decl_index.register_type_reverse_only(
                     ctx.decl_index.registered_def(entry.specialized_type), entry.instantiated_type);
-
-                // For Array specializations, register a mapping from
-                // element TypeRef -> concrete Array_<T> struct name.
-                // Sema sets expression types to ArrayType (T[]), not
-                // InstantiatedType, so codegen needs this to find methods.
-                // The element type is always type_args[0]; subsequent args
-                // (e.g. the allocator in stdlib-next's `Array<T, A = GlobalAlloc>`)
-                // are part of the Array spec but not part of the element key.
-                // `inst_*` reads the instantiation identity whether this id holds a
-                // pre-mono wrapper or the post-mono concrete (single-id identity).
-                // A bare `kind == InstantiatedType` test would be false for every
-                // monomorphized spec, so this mapping would never be registered and
-                // codegen could not find methods on a dynamic `T[]` receiver.
-                if (arena.inst_type_arg_count(entry.instantiated_type) >= 1) {
-                    const inst_base: TypeRef =
-                        arena.inst_generic_base(entry.instantiated_type);
-                    const base_def: DefId = ctx.decl_index.registered_def(inst_base);
-                    if (base_def.is_valid() && base_def.equals(ctx.generic_registry.wellknown(LangItem::Array))) {
-                        ctx.decl_index.register_array_element_type(
-                            arena.inst_type_arg_at(entry.instantiated_type, 0),
-                            entry.specialized_type);
-                    }
-                }
             }
         }
         // Each cloned impl block is rewritten to target the specialization
@@ -720,7 +700,7 @@ type struct SpecializationPasses {
         }
     }
 
-    static mark_methods(methods: &MethodNode*[]) -> void {
+    static mark_methods(methods: &[MethodNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m != null && m.func != null) { m.func.is_specialization = true; }
@@ -787,7 +767,7 @@ type struct SpecializationPasses {
     /// the index's answer for it; a function's is a placeholder.  An
     /// unstamped declaration is a missed stamp, recorded, and registers
     /// nothing: no second key is derived for it from the name and the file.
-    static register_generic_template(name: SymbolStr, generic_params: &GenericParamNode*[],
+    static register_generic_template(name: SymbolStr, generic_params: &[GenericParamNode*],
                                        ast_node: ASTNode*, node_kind: NodeKind,
                                        def: DefId,
                                        registry: GenericRegistry*, arena: TypeArena*,
@@ -803,11 +783,11 @@ type struct SpecializationPasses {
             node_kind.to_string(), ctx.resolve_str(name));
 
         // Use the shared utility for arena TypeRef creation (single source of truth)
-        const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
+        const refs: [TypeRef] = TypeResolutionPasses::create_generic_param_types(
             generic_params, arena);
-        mut param_names: SymbolStr[] = [];
-        mut param_syms: SymbolID[] = [];
-        mut param_types: TypeRef[] = [];
+        mut param_names: [SymbolStr] = [];
+        mut param_syms: [SymbolID] = [];
+        mut param_types: [TypeRef] = [];
         for (mut i: i64 = 0; i < generic_params.length; i++) {
             const gp: GenericParamNode* = generic_params[i];
             param_names.push(gp.name);
@@ -852,7 +832,7 @@ type struct SpecializationPasses {
     /// which keeps apart two types' static methods of one bare name: the
     /// method's definition has the owner it is declared on as its parent,
     /// whichever file the methods were written in.
-    static register_static_method_templates(methods: &MethodNode*[],
+    static register_static_method_templates(methods: &[MethodNode*],
                                               registry: GenericRegistry*,
                                               arena: TypeArena*,
                                               ctx: CompilationContext*) -> void {
@@ -870,11 +850,11 @@ type struct SpecializationPasses {
 
             const qualified_sym: SymbolStr = ctx.defs.path_of(m.func.def).spelling();
 
-            const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
+            const refs: [TypeRef] = TypeResolutionPasses::create_generic_param_types(
                 m.func.generic_params, arena);
-            mut param_names: SymbolStr[] = [];
-            mut param_syms: SymbolID[] = [];
-            mut param_types: TypeRef[] = [];
+            mut param_names: [SymbolStr] = [];
+            mut param_syms: [SymbolID] = [];
+            mut param_types: [TypeRef] = [];
             for (mut j: i64 = 0; j < m.func.generic_params.length; j++) {
                 const gp: GenericParamNode* = m.func.generic_params[j];
                 param_names.push(gp.name);
