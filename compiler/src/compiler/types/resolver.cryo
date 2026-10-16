@@ -346,6 +346,11 @@ type struct TypeResolver {
                 if (!elem.is_valid()) {
                     return TypeRef::invalid();
                 }
+                // `[T]` is `Array<T>` with the default allocator.
+                if (a.size == ArrayAnnotation::heap_dynamic_size()) {
+                    if (ctx.symbolic_no_demand) { return this.arena.dynamic_array_of(elem); }
+                    return this.dynamic_array_type(elem);
+                }
                 return this.arena.get_array_of(elem, this.array_size_of(a));
             }
             TypeAnnotation::Function(f) => {
@@ -1559,46 +1564,30 @@ type struct TypeResolver {
         return this.arena.create_instantiation(ty, &filled);
     }
 
-    /// The type a dynamic `element[]` is laid out as and whose methods it
-    /// has: `Array<element>` with the template's defaults filled
-    /// (`Array<string, GlobalAlloc>`).  Before monomorphization it is the
-    /// instantiation, whose template's methods a call selects; after, the
-    /// same id holds the specialization.  Arena-only, like the default
-    /// canonicalization above: monomorphization demands `Array<element>`
-    /// for every concrete dynamic array it finds.  Invalid when the build
-    /// has no `Array`.
-    dynamic_array_type(&this, element: TypeRef) -> TypeRef {
-        if (!element.is_valid()) { return TypeRef::invalid(); }
+    /// Give the arena what `[T]` is made of - `Array`'s template and the
+    /// allocator its second parameter defaults to - once the templates are
+    /// registered.  A build with no `Array`, or an `Array` whose allocator
+    /// has no default, records nothing, and `[T]` names no type there.
+    note_dynamic_array_shape(&this) -> void {
+        if (this.arena.dynamic_array_base.is_valid()) { return; }
         const entry: TemplateEntry* = this.generic_registry.template_of(
             this.generic_registry.wellknown(LangItem::Array));
-        if (entry == null) { return TypeRef::invalid(); }
+        if (entry == null || entry.param_count != 2) { return; }
+        const params: [GenericParamNode*] = entry.get_generic_params();
+        if (params.length != 2 || params[1] == null || !params[1].has_default_annotation()) { return; }
         mut ctx: ResolutionContext = ResolutionContext::new("");
-        mut args: [TypeRef] = [element];
-        args = this.expand_default_type_args(entry, args, &ctx);
-        if (args.length != entry.param_count) { return TypeRef::invalid(); }
-        return this.arena.create_instantiation(entry.base_type, &args);
+        const alloc: TypeRef = this.resolve(params[1].default_annotation, &ctx);
+        if (!alloc.is_valid()) { return; }
+        this.arena.set_dynamic_array_shape(entry.base_type, alloc);
     }
 
-    /// The element of `ty` when `ty` is the type `dynamic_array_type` builds
-    /// for it - `Array<element>` with every other argument the template's
-    /// default - before monomorphization or after; invalid for any other
-    /// type, an `Array` with another allocator among them.
-    dynamic_array_element(&this, ty: TypeRef) -> TypeRef {
-        if (!ty.is_valid()) { return TypeRef::invalid(); }
-        const entry: TemplateEntry* = this.generic_registry.template_of(
-            this.generic_registry.wellknown(LangItem::Array));
-        if (entry == null) { return TypeRef::invalid(); }
-        if (!this.arena.inst_generic_base(ty).equals(entry.base_type)) { return TypeRef::invalid(); }
-        const count: i64 = this.arena.inst_type_arg_count(ty);
-        if (count != entry.param_count || count < 1) { return TypeRef::invalid(); }
-        const element: TypeRef = this.arena.inst_type_arg_at(ty, 0);
-        const canonical: TypeRef = this.dynamic_array_type(element);
-        for (mut i: i64 = 1; i < count; i++) {
-            if (!this.arena.inst_type_arg_at(ty, i).equals(this.arena.inst_type_arg_at(canonical, i))) {
-                return TypeRef::invalid();
-            }
-        }
-        return element;
+    /// `[element]`: `Array<element>` with the default allocator, demanded
+    /// for monomorphization as a written `Array<element>` is.  Invalid in a
+    /// build with no `Array`.
+    dynamic_array_type(&this, element: TypeRef) -> TypeRef {
+        if (!element.is_valid() || !this.arena.dynamic_array_base.is_valid()) { return TypeRef::invalid(); }
+        const args: [TypeRef] = [element, this.arena.dynamic_array_alloc];
+        return this.generic_registry.instantiate(this.arena.dynamic_array_base, &args);
     }
 
 

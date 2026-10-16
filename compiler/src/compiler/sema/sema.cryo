@@ -1015,8 +1015,8 @@ public:
                 if (!this.checker.can_assign(expr_type, declared)) {
                     const value_span: SourceSpan = if (node.expression != null) { node.expression.span } else { node.span };
                     const ann_span: SourceSpan = annotation_span(this.state.return_type_ann);
-                    this.diag.emit_type_mismatch_with_value(
-                        ErrorCode::E0200_TYPE_MISMATCH, value_span, declared, expr_type,
+                    this.diag.emit_declared_mismatch(
+                        ErrorCode::E0200_TYPE_MISMATCH, value_span, declared, this.state.return_type_ann, expr_type,
                         "the function's declared return type doesn't match the value returned here",
                         ann_span, node.expression);
                 }
@@ -1412,8 +1412,9 @@ public:
                         const var_name: string = this.intern.resolve(var_node.name);
                         const value_span: SourceSpan = if (var_node.initializer != null) { var_node.initializer.span } else { var_node.span };
                         const ann_span: SourceSpan = annotation_span(var_node.type_annotation);
-                        this.diag.emit_type_mismatch_with_value(
-                            ErrorCode::E0200_TYPE_MISMATCH, value_span, var_node.resolved_type, init_type,
+                        this.diag.emit_declared_mismatch(
+                            ErrorCode::E0200_TYPE_MISMATCH, value_span, var_node.resolved_type,
+                            var_node.type_annotation, init_type,
                             fmt::format("`%s` was declared with this type; the initializer must match", var_name),
                             ann_span, var_node.initializer);
                     }
@@ -1472,9 +1473,10 @@ public:
                 if (!this.checker.can_assign(init_type, node.resolved_type)) {
                     const value_span: SourceSpan = if (node.initializer != null) { node.initializer.span } else { node.span };
                     const ann_span: SourceSpan = annotation_span(node.type_annotation);
-                    this.diag.emit_type_mismatch_with_value(
-                        ErrorCode::E0200_TYPE_MISMATCH, value_span, node.resolved_type, init_type,
-                        "destructure pattern's declared type must match the initializer", ann_span, node.initializer);
+                    this.diag.emit_declared_mismatch(
+                        ErrorCode::E0200_TYPE_MISMATCH, value_span, node.resolved_type, node.type_annotation,
+                        init_type, "destructure pattern's declared type must match the initializer",
+                        ann_span, node.initializer);
                 }
             }
         }
@@ -3948,21 +3950,11 @@ public:
     }
 
     /// The element of the owning dynamic array an array literal written
-    /// here builds: the expected type's, when it is `[T]` or `Array<T>` with
-    /// the default allocator, whose storage the literal allocates; invalid
+    /// here builds: the expected type's, when it is `[T]` (`Array<T>` with
+    /// the default allocator), whose storage the literal allocates; invalid
     /// for any other expected type.
     expected_dynamic_element(&this) -> TypeRef {
-        if (!this.state.expected_type.is_valid()) { return TypeRef::invalid(); }
-        const owned: TypeRef = this.ctx.type_resolver.dynamic_array_element(this.state.expected_type);
-        if (owned.is_valid()) { return owned; }
-        mut exp_t: Type* = this.arena.lookup(this.state.expected_type);
-        if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = exp_t as InstantiatedType*;
-            if (inst.has_resolved_type()) { exp_t = this.arena.lookup(inst.resolved_type); }
-        }
-        if (exp_t == null || exp_t.kind != TypeKind::Array) { return TypeRef::invalid(); }
-        if ((exp_t as ArrayType*).is_fixed()) { return TypeRef::invalid(); }
-        return (exp_t as ArrayType*).element;
+        return this.arena.default_array_element(this.state.expected_type);
     }
 
     /// The element count of a `[value; N]` repeat expression, or -1 when `N`
@@ -4070,23 +4062,11 @@ public:
             // A literal written where an `Array<T>` is expected is that
             // array, its elements in storage the literal allocates, in
             // every form: listed, or filled to a count fixed or run-time.
-            if (this.ctx.type_resolver.dynamic_array_element(this.state.expected_type).is_valid()
-                    && this.checker.can_assign(elem_type, dynamic_elem)) {
+            if (dynamic_elem.is_valid() && this.checker.can_assign(elem_type, dynamic_elem)) {
                 return this.state.expected_type;
             }
-            if (this.state.expected_type.is_valid() && arr.repeat_count == 0 && arr.repeat_count_expr == null) {
-                mut exp_t: Type* = this.arena.lookup(this.state.expected_type);
-                if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
-                    const inst: InstantiatedType* = exp_t as InstantiatedType*;
-                    if (inst.has_resolved_type()) { exp_t = this.arena.lookup(inst.resolved_type); }
-                }
-                if (exp_t != null && exp_t.kind == TypeKind::Array) {
-                    const exp_arr: ArrayType* = exp_t as ArrayType*;
-                    if (!exp_arr.is_fixed() && this.checker.can_assign(elem_type, exp_arr.element)) {
-                        return this.state.expected_type;
-                    }
-                }
-            }
+            // A fill to a run-time count is an `Array<T>`.
+            if (size < 0) { return this.ctx.type_resolver.dynamic_array_type(elem_type); }
             return this.arena.get_array_of(elem_type, size);
         }
         return TypeRef::invalid();

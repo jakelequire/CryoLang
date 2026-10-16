@@ -29,7 +29,7 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index;
 import compiler::decl_index::{ GlobalEntry };
 import compiler::ast;
-import compiler::ast::{ MemberPin };
+import compiler::ast::{ MemberPin, TypeAnnotation };
 import compiler::ast::node;
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::expression;
@@ -809,5 +809,54 @@ type struct TypeUtils {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return "?"; }
         return this.arena.format_display(t);
+    }
+
+    /// `ty` for a message, as the annotation `ann` that declared it writes
+    /// it: an array written `Array<T>` shows as that instantiation, one
+    /// written `[T]` as `[T]`.  The written spelling is for display only;
+    /// with no annotation, or a part of `ty` the annotation does not spell,
+    /// the type's own display.
+    written_display_name(&this, ty: TypeRef, ann: TypeAnnotation*) -> string {
+        if (ann == null || !ty.is_valid()) { return this.type_display_name(ty); }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return "?"; }
+        match (*ann) {
+            TypeAnnotation::Pointer(p) => {
+                if (t.kind == TypeKind::Pointer) {
+                    return this.written_display_name((t as PointerType*).pointee, p.inner) + "*";
+                }
+            }
+            TypeAnnotation::Reference(r) => {
+                if (t.kind == TypeKind::Reference) {
+                    const rt: ReferenceType* = t as ReferenceType*;
+                    const inner: string = this.written_display_name(rt.referent, r.inner);
+                    if (rt.is_mutable()) { return "mut &" + inner; }
+                    return "&" + inner;
+                }
+            }
+            TypeAnnotation::Array(a) => {
+                const elem: TypeRef = this.arena.default_array_element(ty);
+                if (elem.is_valid()) { return "[" + this.written_display_name(elem, a.element) + "]"; }
+                if (t.kind == TypeKind::Array) {
+                    const at: ArrayType* = t as ArrayType*;
+                    return at.spelled(this.written_display_name(at.element, a.element));
+                }
+            }
+            TypeAnnotation::Generic(g) => {
+                const base: TypeRef = this.arena.inst_generic_base(ty);
+                const n: i64 = this.arena.inst_type_arg_count(ty);
+                if (base.is_valid() && n > 0) {
+                    mut out: string = this.type_display_name(base) + "<";
+                    for (mut i: i64 = 0; i < n; i++) {
+                        if (i > 0) { out += ", "; }
+                        const arg_ann: TypeAnnotation* = if (i < g.args.length) { g.args[i] } else { null };
+                        out += this.written_display_name(this.arena.inst_type_arg_at(ty, i), arg_ann);
+                    }
+                    return out + ">";
+                }
+            }
+            _ => { }
+        }
+        return this.type_display_name(ty);
     }
 }

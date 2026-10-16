@@ -334,19 +334,21 @@ Reading the value a reference refers to is explicit in arithmetic and comparison
 
 ### 2.4 Array Types
 
-Two distinct things share the word "array" in Cryo: the **raw array type** (a low-level fixed buffer) and the **growable `Array<T>`** in the standard library.
+Cryo has two array types: the **fixed array** `[T; N]`, which holds its `N` elements in place, and the **dynamic array** `[T]`, growable and heap-backed.  The dynamic array is the standard library's `Array<T>` with the default allocator: `[T]` is a spelling of that type, not a second one, so a `[T]` and an `Array<T>` are interchangeable everywhere.  An array with another allocator is written out, `Array<T, A>`; `[T]` never names one.
 
 An array type is written in brackets: `[T]` is a dynamic array and `[T; N]` a fixed one of `N` elements.  The element between the brackets is a whole type, so `[&Node]` is an array of references, `&[Node*]` a reference to an array of pointers, `[(i32) -> i32]` an array of functions, and `[[u64; 2]; 3]` three rows of `[u64; 2]` - the length written nearest the element belongs to the inner array.  A `,` after the first type, `[T, U]`, is refused (E0104): a tuple is written `(T, U)`.
 
 An array is never written after its element: a type followed by `[` is refused (E0104, "array types are written `[T]`: write `[i64]`"), and the diagnostic carries the bracketed spelling as a fix that an editor can apply.  The fix writes nested lengths outside-in, so `u64[2][3]` becomes `[[u64; 2]; 3]`, and drops parentheses the brackets make unnecessary, so `(&Node)[]` becomes `[&Node]`.  `new u8[n]` is not an array type but an allocation yielding a pointer ([section 15](#15-pointers-and-memory)), and keeps its spelling.
 
 ```cryo
-const buf:    [int; 16];   // raw fixed-size buffer of 16 ints
-const dyn:    [int];       // raw dynamic array (FFI / unsized)
-mut   v:      Array<int>;  // growable, heap-backed; from collections::array
+const buf: [int; 16];   // fixed: 16 ints held in place
+mut   v:   [int];       // dynamic: `Array<int>`, growable, heap-backed
+mut   w:   Array<int>;  // the same type as `v`, written out
 ```
 
-For everything except FFI and stack-allocated scratch buffers, prefer `Array<T>` from the standard library. The shorthand `[T]` desugars to `Array<T>` in expression position when the prelude is loaded.
+A fixed array does not convert to a dynamic one: `const d: [int] = buf;` is refused (E0200).  A dynamic array has `Array`'s methods, iterates with `for` as `Array` does, and is indexed through `Array`'s `Index` implementations: `xs[i]` is `*(xs.index(i))`, for an index of any integer type, in a generic body as anywhere else.  An index out of range panics, and the report names the `xs[i]` that wrote it (`![caller_location]`, [section 4.5](#45-intrinsic-functions)).
+
+Diagnostics and the editor spell an array the way the annotation that declared it wrote it: one written `[i32]` shows as `[i32]`, one written `Array<i32>` as `Array<i32>`.  The spelling is for display only.  A type no annotation wrote, an inferred one, shows as `[T]` when its allocator is the default and as `Array<T, A>` otherwise.
 
 An array literal written where an `Array<T>` with the default allocator is expected builds that array, in every form: `[a, b]`, `[]`, and `[value; n]` with `n` fixed or known only at run time.  The literal allocates the storage, so an `Array<T, A>` with another allocator is not initialised by one.
 

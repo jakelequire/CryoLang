@@ -95,7 +95,7 @@ Type-position prefixes (a single leading letter, never preceded by `$`):
 |--------|----------------------------------------|
 | `P`    | Pointer - `P` + pointee                |
 | `R`    | Reference - `R` + referent             |
-| `A`    | Array - `A` [`$L` len `$G`] + element  |
+| `A`    | Fixed array - `A$L` len `$G` + element |
 | `N`    | Named type - `N$L` Path [args] `$G`    |
 | `F`    | Function type - `F$L` params `$G` ret  |
 
@@ -222,7 +222,6 @@ with `s` (`i16`). Additional rules:
 |----------------------|-----------------------------------------|----------------------------------|
 | Pointer `T*`         | `P` + `T`                               | `int*` -> `Pi`                    |
 | Reference `&T`       | `R` + `T`                               | `&Vec2` -> `RN$L4Vec2$G`          |
-| Array, dynamic `[T]` | `A` + element                           | `[int]` -> `Ai`                   |
 | Array, fixed `[T; N]`| `A$L` N `$G` + element                  | `[int; 8]` -> `A$L8$Gi`           |
 | Named type           | `N$L` Path `$G`                         | `Math::Vec2` -> `N$L4Math.4Vec2$G`|
 | Generic instance     | `N$L` Path `$L` args `$G$G`             | `Pair<int>` -> `N$L4Pair$Li$G$G`  |
@@ -232,7 +231,10 @@ with `s` (`i16`). Additional rules:
 
 Notes:
 
-- A dynamic array's `A` encodes only the element type.  A fixed array's length
+- A dynamic array `[T]` is the generic instance `Array<T>` with the default
+  allocator and is encoded as that instance:
+  `[int]` -> `N$L3std.11collections.5array.5Array$Li_N$L3std.5alloc.9allocator.11GlobalAlloc$G$G$G`.
+- A fixed array's length
   is part of the mangling, so `[int; 4]` and `[int; 8]` are distinct symbols.
   The length is written before the element, so a nested fixed array writes its
   outer length first: `[[u64; 2]; 3]` -> `A$L3$GA$L2$Gm`.

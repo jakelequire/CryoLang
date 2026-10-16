@@ -2864,12 +2864,6 @@ type struct CallResolver {
                     return;
                 }
                 base_ref = inst.resolved_type;
-            } else if (base_t.kind == TypeKind::Array && (base_t as ArrayType*).is_dynamic()) {
-                // A dynamic `[T]` has the methods of `Array<T>`, as the
-                // selection sees it, and those are the parameters its
-                // arguments meet.
-                base_ref = this.ctx.type_resolver.dynamic_array_type((base_t as ArrayType*).element);
-                if (!base_ref.is_valid()) { return; }
             } else {
                 break;
             }
@@ -3655,18 +3649,6 @@ type struct CallResolver {
                 }
                 base_ref = inst.resolved_type;
                 base_t = this.arena.lookup(base_ref);
-            } else if (base_t.kind == TypeKind::Array
-                    && (base_t as ArrayType*).is_dynamic()) {
-                // A dynamic `[T]` has no method set of its own: it is laid
-                // out as, and dispatches through, `Array<T>` - before
-                // monomorphization the instantiation, selected through its
-                // template like any other, after it the specialization.  A
-                // fixed `[T; N]` owns nothing and has no methods.
-                const arr_owner: TypeRef = this.ctx.type_resolver.dynamic_array_type(
-                    (base_t as ArrayType*).element);
-                if (!arr_owner.is_valid()) { break; }
-                base_ref = arr_owner;
-                base_t = this.arena.lookup(arr_owner);
             } else {
                 break;
             }
@@ -3924,14 +3906,8 @@ type struct CallResolver {
         // whether or not the type has a destructor to bind: code generation
         // releases one without by its glue, and knows the call by this.
         call.named_method = d;
-        mut subject: TypeRef = recv;
-        const rt: Type* = this.arena.lookup(recv);
-        if (rt != null && rt.kind == TypeKind::Array && (rt as ArrayType*).is_dynamic()) {
-            subject = this.ctx.decl_index.lookup_array_type((rt as ArrayType*).element);
-            if (!subject.is_valid()) { return Selection::none(); }
-        }
         const block: ImplBlockNode* = this.trait_checker().select_impl(
-            this.ctx.defs.parent_of(d), subject, 0);
+            this.ctx.defs.parent_of(d), recv, 0);
         const chosen: MethodNode* = this.ctx.generic_registry.trait_item_method(
             block, this.ctx.generic_registry.trait_item_position(d));
         if (chosen == null) { return Selection::none(); }
@@ -5010,7 +4986,6 @@ type struct CallResolver {
         this.binding.stash_method_call_bindings(obj_type, member, call, selected.chosen);
 
         mut lookup_ref: TypeRef = obj_type;
-        mut shown_ref: TypeRef = TypeRef::invalid();
         mut base_t: Type* = this.arena.lookup(obj_type);
         mut unwrap_depth: i32 = 0;
         while (base_t != null && unwrap_depth < 5) {
@@ -5024,16 +4999,6 @@ type struct CallResolver {
                 const inst: InstantiatedType* = base_t as InstantiatedType*;
                 if (!inst.has_resolved_type()) { break; }
                 lookup_ref = inst.resolved_type;
-                base_t = this.arena.lookup(lookup_ref);
-            } else if (base_t.kind == TypeKind::Array && (base_t as ArrayType*).is_dynamic()) {
-                // The type a dynamic array's methods belong to, as the
-                // selection above saw it; the written `[T]` is what a
-                // diagnostic shows.
-                shown_ref = lookup_ref;
-                const arr_owner: TypeRef = this.ctx.type_resolver.dynamic_array_type(
-                    (base_t as ArrayType*).element);
-                if (!arr_owner.is_valid()) { break; }
-                lookup_ref = arr_owner;
                 base_t = this.arena.lookup(lookup_ref);
             } else {
                 break;
@@ -5146,7 +5111,7 @@ type struct CallResolver {
         // Counted once here so the tally is over OUTCOMES, not diagnostics.
 
         const method_name: string = this.intern.resolve(member.member);
-        const recv_t: Type* = this.arena.lookup(if (shown_ref.is_valid()) { shown_ref } else { lookup_ref });
+        const recv_t: Type* = this.arena.lookup(lookup_ref);
         const type_display: string = if (recv_t != null) { this.arena.format_display(recv_t) } else { this.intern.resolve(type_sym) };
         const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
 

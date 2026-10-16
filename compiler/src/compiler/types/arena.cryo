@@ -155,6 +155,12 @@ type struct TypeArena {
     // The one `This` placeholder (`this_placeholder`).
     this_param:            TypeRef;
 
+    // `Array`'s template and its default allocator, set once the templates
+    // are registered and invalid in a build with no `Array`: `[T]` is the
+    // instantiation of the one over `T` and the other.
+    dynamic_array_base:    TypeRef;
+    dynamic_array_alloc:   TypeRef;
+
 private:
     /// The allocator of this arena's handles, and its only one: every
     /// handle is made by `alloc_type`, so the handle at position `i` names
@@ -200,6 +206,8 @@ public:
             intern_cache:        HashMap::<u64, i64>::new(),
             generic_param_cache: HashMap::<SymbolKey, TypeRef>::new(),
             this_param:          TypeRef::invalid(),
+            dynamic_array_base:  TypeRef::invalid(),
+            dynamic_array_alloc: TypeRef::invalid(),
         };
 
         arena.init_primitives();
@@ -736,6 +744,52 @@ public:
         return at.element;
     }
 
+    /// Record what `[T]` is made of: `Array`'s template and its default
+    /// allocator.
+    set_dynamic_array_shape(mut &this, base: TypeRef, alloc: TypeRef) -> void {
+        this.dynamic_array_base = base;
+        this.dynamic_array_alloc = alloc;
+    }
+
+    /// `[element]`: `Array<element>` with the default allocator.  Invalid in
+    /// a build with no `Array`.
+    dynamic_array_of(mut &this, element: TypeRef) -> TypeRef {
+        if (!element.is_valid() || !this.dynamic_array_base.is_valid()) { return TypeRef::invalid(); }
+        const args: [TypeRef] = [element, this.dynamic_array_alloc];
+        return this.create_instantiation(this.dynamic_array_base, &args);
+    }
+
+    /// The element of `ty` when `ty` is `Array<T>` with the default
+    /// allocator, before monomorphization or after; invalid for any other
+    /// type, an `Array` with another allocator among them.
+    default_array_element(&this, ty: TypeRef) -> TypeRef {
+        return this.default_array_element_of(this.lookup(ty));
+    }
+
+    /// `default_array_element` of the type `t`.
+    default_array_element_of(&this, t: Type*) -> TypeRef {
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const it: InstantiatedType* = t as InstantiatedType*;
+            return this.default_array_element_in(it.generic_base, &it.type_args);
+        }
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            return this.default_array_element_in(st.generic_base, &st.type_args);
+        }
+        return TypeRef::invalid();
+    }
+
+    /// The element of the instance of `base` over `args` when that instance
+    /// is `Array<T>` with the default allocator.
+    default_array_element_in(&this, base: TypeRef, args: &[TypeRef]) -> TypeRef {
+        if (!this.dynamic_array_base.is_valid() || !base.equals(this.dynamic_array_base)) {
+            return TypeRef::invalid();
+        }
+        if (args.length != 2 || !args[1].equals(this.dynamic_array_alloc)) { return TypeRef::invalid(); }
+        return args[0];
+    }
+
     /// The kind of the type `ty` names, `Error` for a handle naming none.
     kind_of(&this, ty: TypeRef) -> TypeKind {
         const t: Type* = this.lookup(ty);
@@ -1163,6 +1217,8 @@ public:
                 return result + ")";
             }
             TypeKind::InstantiatedType => {
+                const array_elem: TypeRef = this.default_array_element_of(ty);
+                if (array_elem.is_valid()) { return "[" + this.resolve_display_name(array_elem) + "]"; }
                 const inst: InstantiatedType* = ty as InstantiatedType*;
                 mut result: string = this.resolve_display_name(inst.generic_base) + "<";
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) {
@@ -1190,6 +1246,8 @@ public:
             }
             TypeKind::Struct | TypeKind::Class | TypeKind::Enum | TypeKind::Trait
             | TypeKind::TypeAlias | TypeKind::FunctionTemplate => {
+                const array_elem: TypeRef = this.default_array_element_of(ty);
+                if (array_elem.is_valid()) { return "[" + this.resolve_display_name(array_elem) + "]"; }
                 const custom: DeclName = this.custom_display_of(ty);
                 if (custom.is_valid()) { return this.intern_table.shown(custom); }
                 return this.intern_table.shown(this.declared_name(ty));
@@ -1303,6 +1361,8 @@ public:
                 return result + ")";
             }
             TypeKind::InstantiatedType => {
+                const array_elem: TypeRef = this.default_array_element_of(ty);
+                if (array_elem.is_valid()) { return "[" + this.resolve_display_name_short(array_elem) + "]"; }
                 const inst: InstantiatedType* = ty as InstantiatedType*;
                 mut result: string = this.resolve_display_name_short(inst.generic_base) + "<";
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) {
@@ -1329,6 +1389,9 @@ public:
             }
             _ => { }
         }
+
+        const array_elem: TypeRef = this.default_array_element_of(ty);
+        if (array_elem.is_valid()) { return "[" + this.resolve_display_name_short(array_elem) + "]"; }
 
         // Leaf user-defined types: strip qualified prefixes.
         // `QualifiedName::shorten_paths` walks the display string and

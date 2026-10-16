@@ -93,19 +93,12 @@ Built:
   every form (listed, empty, fill fixed or run-time): sema types it as the
   expected `Array<T>`, and the literal emitter stores pointer, length and
   capacity as it does for the builtin (the allocator field is empty).
-  `TypeResolver::dynamic_array_element` is the one test of "is this
-  `Array<T>` with the default allocator".
-
 Not done additively, on purpose:
 
-- **`for` over a builtin `[T]`.**  It fails because the element-keyed
-  bridge is empty when sema lowers the loop.  The type switch deletes the
-  bridge and `for` over `Array<T>` already works, so `for` over `[T]`
-  arrives with the switch; fixing it first would be a second lookup path
-  deleted one commit later.
-- **`[T; N]` converted to `Array<T>`.**  Needed by the switch (the builtin
-  has it implicitly); it is built with the switch, where the conversion's
-  target is the only dynamic array.
+- **`for` over a builtin `[T]`.**  It failed because the element-keyed
+  bridge was empty when sema lowered the loop; it works since the switch.
+- **`[T; N]` converted to `Array<T>`.**  Refused since the switch
+  (section 3.2); whether to build it is open.
 
 ### 3.2 The type switch
 
@@ -133,16 +126,26 @@ Done ahead of the switch:
 - **A pointer to an array, indexed** is pointer arithmetic; the one site
   in the tree reads `(*sched)[i]` and the look-through is deleted.
 
-What must keep working, each with a measurement before and after:
-- **Fixed to dynamic conversion**, implicit today.
-- **Display**: hover and diagnostics print `[T]` for `Array<T>` with the
-  default allocator, or `Array<T>` everywhere - decided in this unit and
-  reported.
-- **Symbols**: every dynamic array in a signature changes from `A<elem>`
-  to the `Array` path.  Proof (367): compile both trees, rewrite old names
-  to new in the old IR, compare object for object; a control object whose
-  code changed must differ.
-- selfhost x2, then `wsl --shutdown`, then a repin.
+Built.  `[T]` resolves to `Array<T>` with the default allocator, the
+instance demanded as a written `Array<T>` is (`TypeResolver::
+dynamic_array_type`), out of the shape the template registration records
+in the arena (`TypeArena::default_array_element` is the one test).  The
+method bridge in sema is deleted; the remaining builtin paths go in the
+cleanup.  Measured before and after on probes:
+
+- **Fixed to dynamic conversion** was accepted and miscompiled: the
+  fixed array's bytes were read as the dynamic one's pointer, length and
+  capacity (`[10, 20, 30]` gave a length of 30, and indexing it crashed).
+  It is refused now (E0200), as `Array<T>` refused it.
+- **Generic bodies** over `&[T]` were an internal error (E0900, no
+  resolved function); they compile and index through `Index`.
+- **Calling convention**: a `[T]` passed or returned by value was split
+  into three registers; `Array<T>` follows the aggregate rules.  Made
+  alike before the switch, so the switch itself moved names only.
+- **Display** (369): `[T]` for an inferred type, the written spelling
+  where an annotation declared it (declaration mismatches in the
+  compiler, hover and signature help in the editor).
+- **Symbols**: proved by `scripts/array-rename-proof.py` (367).
 
 ### 3.3 Bug 0045
 

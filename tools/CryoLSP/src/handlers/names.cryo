@@ -29,6 +29,8 @@ import compiler::types::type_base::{ Type };
 import compiler::types::compound::{ ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic_registry::{ TemplateEntry };
 import compiler::types::resolver::{ ResolutionContext };
+import compiler::ast::{ GenericAnnotation, TypeAnnotation };
+import compiler::sema::type_utils::{ TypeUtils };
 
 
 /// What a path written before the cursor names.
@@ -214,6 +216,50 @@ type struct Names {
 
     // -- A type as the cursor's scope writes it --
 
+    /// `type_text` of a type an annotation `ann` declared, with an array
+    /// spelled as the annotation spells it: `Array<T>` written so, `[T]`
+    /// written so.  Without an annotation, `type_text`.
+    type_text_written(&this, ty: TypeRef, ann: TypeAnnotation*) -> string {
+        if (ann == null || !ty.is_valid()) { return this.type_text(ty); }
+        if (!this.relative()) {
+            mut types_: TypeUtils = TypeUtils { arena: this.ctx.type_arena, intern: this.ctx.intern_table,
+                                                ctx: this.ctx, checker: null };
+            return types_.written_display_name(ty, ann);
+        }
+        const t: Type* = this.ctx.type_arena.lookup(ty);
+        if (t == null) { return "?"; }
+        match (*ann) {
+            TypeAnnotation::Pointer(p) => {
+                if (t.kind == TypeKind::Pointer) {
+                    return this.type_text_written((t as PointerType*).pointee, p.inner) + "*";
+                }
+            }
+            TypeAnnotation::Reference(r) => {
+                if (t.kind == TypeKind::Reference) {
+                    const rt: ReferenceType* = t as ReferenceType*;
+                    const inner: string = this.type_text_written(rt.referent, r.inner);
+                    if (rt.is_mutable()) { return "mut &" + inner; }
+                    return "&" + inner;
+                }
+            }
+            TypeAnnotation::Array(a) => {
+                const elem: TypeRef = this.ctx.type_arena.default_array_element(ty);
+                if (elem.is_valid()) { return "[" + this.type_text_written(elem, a.element) + "]"; }
+                if (t.kind == TypeKind::Array) {
+                    const at: ArrayType* = t as ArrayType*;
+                    return at.spelled(this.type_text_written(at.element, a.element));
+                }
+            }
+            TypeAnnotation::Generic(g) => {
+                const d: DefId = this.ctx.decl_index.def_of(ty, this.ctx.type_arena);
+                const base: TypeRef = this.ctx.type_arena.inst_generic_base(ty);
+                if (d.is_valid() && base.is_valid()) { return this.instance_text(ty, base, d, g); }
+            }
+            _ => { }
+        }
+        return this.type_text(ty);
+    }
+
     type_text(&this, ty: TypeRef) -> string {
         if (!ty.is_valid()) { return "?"; }
         if (!this.relative()) { return this.ctx.type_arena.resolve_display_name(ty); }
@@ -256,19 +302,13 @@ type struct Names {
             }
             _ => { }
         }
+        const array_elem: TypeRef = this.ctx.type_arena.default_array_element(ty);
+        if (array_elem.is_valid()) { return "[" + this.type_text(array_elem) + "]"; }
         const d: DefId = this.ctx.decl_index.def_of(ty, this.ctx.type_arena);
         const base: TypeRef = this.ctx.type_arena.inst_generic_base(ty);
         if (base.is_valid()) {
             if (!d.is_valid()) { return this.ctx.type_arena.resolve_display_name(ty); }
-            const keep: i64 = this.args_shown(ty, base);
-            mut out: string = this.def_path(d);
-            if (keep == 0) { return out; }
-            out = out + "<";
-            for (mut i: i64 = 0; i < keep; i++) {
-                if (i > 0) { out = out + ", "; }
-                out = out + this.type_text(this.ctx.type_arena.inst_type_arg_at(ty, i));
-            }
-            return out + ">";
+            return this.instance_text(ty, base, d, null);
         }
         if (d.is_valid() && (t.kind == TypeKind::Struct || t.kind == TypeKind::Class
                 || t.kind == TypeKind::Enum || t.kind == TypeKind::Trait
@@ -276,6 +316,26 @@ type struct Names {
             return this.def_path(d);
         }
         return this.ctx.type_arena.resolve_display_name(ty);
+    }
+
+    /// Instantiation `ty` of the template `d` (whose type is `base`), its
+    /// arguments as `written`, a generic annotation, spells them when it is
+    /// given.
+    instance_text(&this, ty: TypeRef, base: TypeRef, d: DefId, written: GenericAnnotation*) -> string {
+        const keep: i64 = this.args_shown(ty, base);
+        mut out: string = this.def_path(d);
+        if (keep == 0) { return out; }
+        out = out + "<";
+        for (mut i: i64 = 0; i < keep; i++) {
+            if (i > 0) { out = out + ", "; }
+            const arg: TypeRef = this.ctx.type_arena.inst_type_arg_at(ty, i);
+            if (written != null && i < written.args.length) {
+                out = out + this.type_text_written(arg, written.args[i]);
+            } else {
+                out = out + this.type_text(arg);
+            }
+        }
+        return out + ">";
     }
 
     /// How many of instantiation `ty`'s arguments to show: all of them, less
