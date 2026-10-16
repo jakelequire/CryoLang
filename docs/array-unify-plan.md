@@ -162,8 +162,26 @@ spec drops the dynamic `A` row; the roadmap item goes.
 - Binary and unary operators on a generic container (`a + b` with
   `a: Vec<T>`) in a generic body have the gap indexing had: only a bare
   bounded parameter is desugared there.
+- The nested-array crash (`[[i32]]` with a row pushed) was the
+  pointer-to-array look-through: `Array<T>`'s own `this.ptr[i]`, with `T`
+  an array, indexed the first row instead of stepping over rows.  Gone
+  with the look-through; `nested_dynamic_array` pins it.
 
-## 5. Open questions (for Jake)
+## 5. Emitting every method of an instantiated generic: accepted
+
+Every `Array<T>` instantiation emits all its methods, the eleven `index`
+and `element_at` among them, used or not.  Measured: the stripped
+Windows compiler grew 8,128,512 -> 8,227,328 bytes (+1.2%) when they were
+added, the Linux one 6,966,096 -> 7,060,304; the 1.8 MB growth of the
+unstripped binary is almost all symbol names.  Build time did not move
+measurably.  Linking with `--gc-sections` frees 0.24 MB unstripped and
+20 KB stripped and keeps all 1,500 `index` definitions (the PE linker
+keeps them).  Emitting only used methods needs reachability over every
+reference to a specialization's methods, codegen's own synthesized
+calls (drop glue, language-item calls) among them, where a missed one is
+a link failure: much work for about 1% of the binary.
+
+## 6. Open questions (for Jake)
 
 1. **The type of an array's `length`.**  A) `Array<T>`'s `length` and
    `capacity` become `i64`, as every `[T]` in the tree was written
