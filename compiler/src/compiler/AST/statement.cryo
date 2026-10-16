@@ -139,8 +139,7 @@ type enum AsmConstraintKind {
 /// One operand of an `asm` block: a Cryo expression bound into the
 /// assembly with a direction and a constraint class.  See
 /// `visit(AsmBlockStmtNode*)` in codegen/ir_generator.cryo for lowering.
-type class AsmOperand {
-public:
+type struct AsmOperand {
     direction: AsmOpDir;
     /// The Cryo operand.  Inputs are read as rvalues; outputs / in-outs
     /// must be assignable lvalues (the call result is stored back).
@@ -148,13 +147,18 @@ public:
     constraint: AsmConstraintKind;
     /// Register name when `constraint == Pinned` (e.g. "rax"); else "".
     pinned_reg: string;
+}
 
-    AsmOperand(direction: AsmOpDir, expr: ExpressionNode*,
-               constraint: AsmConstraintKind, pinned_reg: string) {
-        this.direction = direction;
-        this.expr = expr;
-        this.constraint = constraint;
-        this.pinned_reg = pinned_reg;
+/// A copy that shares the operand's expression; the AST cloner replaces
+/// `expr` with its own copy of the expression.
+implement trait Clone for struct AsmOperand {
+    clone(&this) -> AsmOperand {
+        return AsmOperand {
+            direction:  this.direction,
+            expr:       this.expr,
+            constraint: this.constraint,
+            pinned_reg: this.pinned_reg,
+        };
     }
 }
 
@@ -162,26 +166,31 @@ public:
 /// reference to an operand (by index into `AsmBlockStmtNode.operands`).
 /// Codegen concatenates the pieces, substituting `$N` for operand refs
 /// (N assigned in outputs-first constraint order).
-type class AsmPiece {
-public:
+type struct AsmPiece {
     is_operand: boolean;
     /// Raw assembly text when `!is_operand`.
     text: string;
     /// Index into `operands` when `is_operand`.
     operand_index: i64;
+}
 
-    AsmPiece(is_operand: boolean, text: string, operand_index: i64) {
-        this.is_operand = is_operand;
-        this.text = text;
-        this.operand_index = operand_index;
+implement struct AsmPiece {
+    static raw(text: string) -> AsmPiece {
+        return AsmPiece { is_operand: false, text: text, operand_index: 0 };
     }
 
-    static raw(text: string) -> AsmPiece* {
-        return new AsmPiece(false, text, 0);
+    static operand(index: i64) -> AsmPiece {
+        return AsmPiece { is_operand: true, text: "", operand_index: index };
     }
+}
 
-    static operand(index: i64) -> AsmPiece* {
-        return new AsmPiece(true, "", index);
+implement trait Clone for struct AsmPiece {
+    clone(&this) -> AsmPiece {
+        return AsmPiece {
+            is_operand:    this.is_operand,
+            text:          this.text,
+            operand_index: this.operand_index,
+        };
     }
 }
 
@@ -196,8 +205,8 @@ public:
     /// Target architecture from `![arch(...)]` (e.g. "x86_64").
     arch: string;
     dialect: AsmDialect;
-    operands: [AsmOperand*];
-    pieces: [AsmPiece*];
+    operands: [AsmOperand];
+    pieces: [AsmPiece];
     /// Clobber tokens from `![clobber(...)]` (register names, "flags", "memory").
     clobbers: [string];
     /// True when written at module scope (naked / global asm, no operands).
@@ -217,12 +226,12 @@ public:
         this.attached_directives = [];
     }
 
-    add_operand(op: AsmOperand*) -> i64 {
+    add_operand(op: AsmOperand) -> i64 {
         this.operands.push(op);
         return this.operands.length - 1;
     }
 
-    add_piece(p: AsmPiece*) -> void {
+    add_piece(p: AsmPiece) -> void {
         this.pieces.push(p);
     }
 

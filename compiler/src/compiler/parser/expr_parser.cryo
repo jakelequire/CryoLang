@@ -1,8 +1,8 @@
 ///! ExprParser
 ///!
-///! Expression and type annotation parsing layer.  Extends ParserBase with
-///! Pratt-style precedence-climbing for binary operators, prefix/postfix
-///! unary handling, and recursive type annotation parsing.
+///! `Parser`'s expression and type annotation parsing: Pratt-style
+///! precedence-climbing for binary operators, prefix/postfix unary
+///! handling, and recursive type annotation parsing.
 
 namespace compiler::parser::expr_parser;
 
@@ -34,8 +34,8 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, Res, ResSlot };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
-import compiler::parser::parser_base;
-import compiler::parser::parser_base::{ ParserBase };
+import compiler::parser::cursor;
+import compiler::parser::cursor::{ Parser };
 import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import compiler::diag::diagnostic;
@@ -79,12 +79,7 @@ mut g_coalesce_counter: u32 = 0;
 public mut g_for_in_counter: u32 = 0;
 
 
-type class ExprParser : ParserBase {
-public:
-    ExprParser(tokens: [Token], source_file: string, ctx: CompilationContext*)
-        : ParserBase(tokens, source_file, ctx) {
-    }
-
+implement struct Parser {
 
     // Expression Parsing: Entry Points
 
@@ -119,7 +114,7 @@ public:
                     "expected expression after assignment operator");
                 return left;
             }
-            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
+            const span: SourceSpan = Parser::merge_spans(left.span, right.span);
             return new BinaryExprNode(op, left, right, span);
         }
 
@@ -158,7 +153,7 @@ public:
                     fmt::format("expected expression after '%s'", op.lexeme));
                 return left;
             }
-            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
+            const span: SourceSpan = Parser::merge_spans(left.span, right.span);
             if (op.kind == TokenType::PipeGreater) {
                 // x |> f : f is `right`, piped value is `left`, prepend.
                 left = this.desugar_pipe(right, left, true, span);
@@ -188,7 +183,7 @@ public:
                     "expected expression after '??'");
                 return left;
             }
-            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
+            const span: SourceSpan = Parser::merge_spans(left.span, right.span);
             left = this.desugar_null_coalesce(left, right, span,
                                               this.span_from_token(op_tok));
         }
@@ -330,7 +325,7 @@ public:
                     "expected expression after ':'");
                 return expr;
             }
-            const span: SourceSpan = ParserBase::merge_spans(expr.span, false_expr.span);
+            const span: SourceSpan = Parser::merge_spans(expr.span, false_expr.span);
             return new TernaryExprNode(expr, true_expr, false_expr, span);
         }
 
@@ -391,7 +386,7 @@ public:
                     fmt::format("expected expression after '%s'", op.lexeme));
                 return left;
             }
-            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
+            const span: SourceSpan = Parser::merge_spans(left.span, right.span);
             if (op.kind == TokenType::Spaceship) {
                 // `a <=> b` => `a.compare(&b)`.  Three-way comparison is
                 // sugar for the `Ord` trait method, so sema and codegen
@@ -486,7 +481,7 @@ public:
             } else if (!this.check(TokenType::Star)) {
                 target = this.parse_type_suffixes_q(target, pending_const, target_tok);
             }
-            const span: SourceSpan = ParserBase::merge_spans(expr.span, this.current_span());
+            const span: SourceSpan = Parser::merge_spans(expr.span, this.current_span());
             expr = new CastExprNode(expr, target, span);
         }
 
@@ -518,7 +513,7 @@ public:
                     fmt::format("expected expression after unary '%s'", op.lexeme));
                 return null;
             }
-            const span: SourceSpan = ParserBase::merge_spans(
+            const span: SourceSpan = Parser::merge_spans(
                 this.span_from_token(op), operand.span);
             return new UnaryExprNode(op, operand, span);
         }
@@ -663,7 +658,7 @@ public:
                 // in parse_unary) leave is_postfix=false and yield the
                 // updated value.
                 const op: Token        = this.advance();
-                const span: SourceSpan = ParserBase::merge_spans(expr.span, this.span_from_token(op));
+                const span: SourceSpan = Parser::merge_spans(expr.span, this.span_from_token(op));
                 mut un: UnaryExprNode* = new UnaryExprNode(op, expr, span);
                 un.is_postfix = true;
                 expr = un;
@@ -676,7 +671,7 @@ public:
                 // so the loop continues.  Sema lowers this to the
                 // equivalent `match` once the operand's type is known.
                 const op: Token        = this.advance();
-                const span: SourceSpan = ParserBase::merge_spans(expr.span, this.span_from_token(op));
+                const span: SourceSpan = Parser::merge_spans(expr.span, this.span_from_token(op));
                 expr = new TryExprNode(expr, span);
             } else {
                 break;
@@ -1098,8 +1093,8 @@ public:
     /// Sub-lex and parse a hole's source text as a standalone expression.
     /// Reuses the full expression grammar (so `f"{a + b.c()}"` parses
     /// correctly) by lexing the hole into its own token stream and handing
-    /// it to a fresh sub-parser via `parse_expr_from_tokens` (overridden on
-    /// the concrete `Parser`).  A separate parser is used so the hole's
+    /// it to a fresh sub-parser via `parse_expr_from_tokens`.  A separate
+    /// parser is used so the hole's
     /// tokens never displace this parser's own (owned) token stream.
     /// `base_line`/`base_col` are the hole's real position in the enclosing
     /// file, so the sub-lexed tokens carry true coordinates (the sub-parser
@@ -1637,10 +1632,8 @@ public:
 
     /// Parse a lambda starting from the parameter list (after '(' was consumed).
     /// Lambdas accept a stripped-down parameter form: `name` or `name: Type`,
-    /// without `mut`, default values, or variadics. Kept inline (rather than
-    /// delegating to Parser::parse_parameter_list) because ExprParser does
-    /// not extend Parser and pulling the helper down would require either
-    /// duplicating it on ParserBase or threading a Parser* through.
+    /// without `mut`, default values, or variadics, all of which
+    /// `parse_parameter_list` accepts.
     parse_lambda_expression(start: Token) -> ExpressionNode* {
         mut params: [VarDeclNode*] = [];
         mut reported_untyped: boolean = false;
@@ -1713,11 +1706,6 @@ public:
         // call.  Until the form is properly desugared to `{ return expr; }`,
         // reject it with a clear diagnostic pointing at the braced form.
         if (this.check(TokenType::LBrace)) {
-            // Route through the virtual `parse_inner_block` hook so Parser's
-            // full-statement override (if/while/for/loop/match/switch/break/
-            // continue) takes effect.  Parser is the only concrete parser -
-            // ExprParser exists as its base, never standalone - so this always
-            // dispatches there.
             const block: BlockStmtNode* = this.parse_inner_block();
             lambda.set_body(block);
         } else {
@@ -2097,7 +2085,7 @@ public:
 
     /// Parse match arm patterns and the '=>' arrow.
     /// Returns a MatchArmNode with patterns set but body NOT set.
-    /// Shared between expression match (ExprParser) and statement match (Parser).
+    /// Shared between expression match and statement match.
     parse_match_arm_patterns() -> MatchArmNode* {
         const start: Token = this.current();
         mut arm: MatchArmNode* = new MatchArmNode(this.span_from_token(start));
@@ -2136,9 +2124,8 @@ public:
         const start: Token = this.current();
         mut arm: MatchArmNode* = this.parse_match_arm_patterns();
 
-        // Body is either a block or a single expression.
-        // Block bodies are parsed via parse_inner_block(), which Parser
-        // overrides to support full statements (for, if, while, etc.).
+        // Body is either a block, which may hold any statement, or a single
+        // expression.
         if (this.check(TokenType::LBrace)) {
             mut block: BlockStmtNode* = this.parse_inner_block();
             this.promote_value_block_tail(block);
@@ -2360,7 +2347,7 @@ public:
         pat.set_enum_name(this.ctx.intern(enum_path));
         pat.set_variant_name(this.intern_lexeme(variant_tok));
         pat.set_segment_spans(
-            ParserBase::merge_spans(this.span_from_token(first_tok),
+            Parser::merge_spans(this.span_from_token(first_tok),
                                     this.span_from_token(path_end_tok)),
             this.span_from_token(variant_tok));
 
@@ -2410,8 +2397,8 @@ public:
                     if (this.match_tok(TokenType::Minus)) { sign = -1; }
                     const num_tok: Token = this.advance();
                     const ns: SourceSpan = this.span_from_token(num_tok);
-                    if (ParserBase::is_float_lexeme(num_tok.lexeme)) {
-                        const fv: f64 = ParserBase::parse_numeric_lexeme_f64(
+                    if (Parser::is_float_lexeme(num_tok.lexeme)) {
+                        const fv: f64 = Parser::parse_numeric_lexeme_f64(
                             num_tok.lexeme);
                         const signed_fv: f64 = if (sign < 0) { 0.0 - fv } else { fv };
                         const pf: PatternLiteralFloat* = new PatternLiteralFloat {
@@ -2419,7 +2406,7 @@ public:
                         };
                         pat.add_element(PatternElement::LiteralFloat(pf));
                     } else {
-                        const iv: i64 = ParserBase::parse_numeric_lexeme_i64(
+                        const iv: i64 = Parser::parse_numeric_lexeme_i64(
                             num_tok.lexeme);
                         const pi: PatternLiteralInt* = new PatternLiteralInt {
                             value: sign * iv, span: ns,
@@ -2490,7 +2477,7 @@ public:
         }
 
         const end: Token = this.consume(TokenType::RParen, "')'");
-        call.span = ParserBase::merge_spans(callee.span, this.span_from_token(end));
+        call.span = Parser::merge_spans(callee.span, this.span_from_token(end));
         return call;
     }
 
@@ -2510,7 +2497,7 @@ public:
         this.advance(); // consume '['
         const index: ExpressionNode* = this.parse_expression();
         const end: Token = this.consume(TokenType::RSquare, "']'");
-        const span: SourceSpan = ParserBase::merge_spans(array.span, this.span_from_token(end));
+        const span: SourceSpan = Parser::merge_spans(array.span, this.span_from_token(end));
         return new ArrayAccessNode(array, index, span);
     }
 
@@ -2545,7 +2532,7 @@ public:
         }
 
         if (member_tok.kind == TokenType::NumericConstant) {
-            const dot_pos: i64 = ExprParser::lexeme_first_dot(member_tok.lexeme);
+            const dot_pos: i64 = Parser::lexeme_first_dot(member_tok.lexeme);
             if (dot_pos >= 0) {
                 const lex_len: i64 = member_tok.lexeme.length() as i64;
                 const first_str: string = member_tok.lexeme.substr(0, dot_pos as i64);
@@ -2553,7 +2540,7 @@ public:
                 const first_sym: SymbolStr = this.ctx.intern(first_str);
                 const rest_sym: SymbolStr = this.ctx.intern(rest_str);
                 const tok_span: SourceSpan = this.span_from_token(member_tok);
-                const inner_span: SourceSpan = ParserBase::merge_spans(
+                const inner_span: SourceSpan = Parser::merge_spans(
                     object.span, tok_span);
                 const inner: MemberAccessNode* = new MemberAccessNode(
                     object, first_sym, tok_span, inner_span);
@@ -2564,7 +2551,7 @@ public:
 
         const member: SymbolStr = this.intern_lexeme(member_tok);
         const member_span: SourceSpan = this.span_from_token(member_tok);
-        const span: SourceSpan = ParserBase::merge_spans(object.span, member_span);
+        const span: SourceSpan = Parser::merge_spans(object.span, member_span);
         mut node: MemberAccessNode* = new MemberAccessNode(object, member, member_span, span);
 
         // Explicit type arguments on the member: `obj.method::<T, U>(...)`.
@@ -2597,7 +2584,7 @@ public:
         };
         const member_name: SymbolStr = this.intern_lexeme(member_tok);
         const member_span: SourceSpan = this.span_from_token(member_tok);
-        const span: SourceSpan = ParserBase::merge_spans(start_span, member_span);
+        const span: SourceSpan = Parser::merge_spans(start_span, member_span);
         mut sr: ScopeResolutionNode* = new ScopeResolutionNode(scope_name, member_name, span);
         // Record the scope/member token spans separately so LSP hover can
         // resolve each side of `Scope::member` independently.
@@ -3220,12 +3207,12 @@ public:
             // that needs more than 64 bits would saturate to a meaningless
             // value; reject it up front rather than build a garbage array
             // type.
-            if (ParserBase::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
+            if (Parser::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
                 this.report_error(ErrorCode::E0010_NUMBER_TOO_LARGE,
                     fmt::format("array size `%s` does not fit in 64 bits",
                         size_tok.lexeme));
             }
-            size = ParserBase::parse_numeric_lexeme_i64(size_tok.lexeme);
+            size = Parser::parse_numeric_lexeme_i64(size_tok.lexeme);
             this.advance();
         } else {
             // A named constant or computed size is fixed-pending until the

@@ -1,9 +1,12 @@
 ///! Parser
 ///!
-///! Top-level parser class extending ExprParser with statement and declaration
-///! parsing.  This is the main entry point for the parsing pass.
+///! `Parser`'s statement and declaration parsing, and its entry point for
+///! the parsing pass.  `Parser` is declared in `cursor` and re-exported
+///! here, so an importer of this module names a parser with every method.
 
 namespace compiler::parser::parser;
+
+export compiler::parser::cursor::{ Parser };
 
 import compiler::lex;
 import compiler::lex::{ Token, TokenType };
@@ -23,7 +26,7 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, ResSlot };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
-import compiler::parser::{ parser_base, expr_parser };
+import compiler::parser::{ cursor, expr_parser };
 import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import compiler::types::type_ref;
@@ -59,7 +62,6 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Applicability, Suggestion };
 import compiler::parser::expr_parser::{ g_for_in_counter };
-import compiler::parser::parser_base::{ ParserBase };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import utils::keyword::{ Keyword };
@@ -75,34 +77,22 @@ type struct MethodModifiers {
     span:      SourceSpan;
 }
 
-type class Parser : ExprParser {
-public:
-    /// Module-scope `static_assert(...)` items collected during the top-level
-    /// parse and attached to the ProgramNode before it is returned. Kept off
-    /// the statement stream so they need no NodeKind / visitor handling.
-    static_assert_items: [StaticAssertItem*];
-
-    Parser(tokens: [Token], source_file: string, ctx: CompilationContext*)
-        : ExprParser(tokens, source_file, ctx) {
-        this.static_assert_items = [];
-    }
-
+implement struct Parser {
     /// Parse a standalone expression from `toks` on a fresh sub-`Parser`,
     /// sharing this parser's source file and compilation context (intern
     /// table, diagnostics).  Used by f-string hole desugaring.  A separate
     /// parser is used so the hole's token stream never displaces this
     /// parser's own (owned) tokens.
-    override parse_expr_from_tokens(toks: [Token]) -> ExpressionNode* {
-        mut sub: Parser = Parser(toks, this.source_file, this.ctx);
+    parse_expr_from_tokens(toks: [Token]) -> ExpressionNode* {
+        mut sub: Parser = Parser::new(toks, this.source_file, this.ctx);
         return sub.parse_expression();
     }
 
-    /// Override ExprParser's limited block parser with full statement support.
-    /// This allows match expression arms and lambda bodies to contain any
-    /// statement (for, if, while, etc.), not just const/return/expressions.
-    /// Unlike parse_block_statement(), semicolons are optional before '}'
-    /// (the last expression in the block is the arm's return value).
-    override parse_inner_block() -> BlockStmtNode* {
+    /// The braced body of a match arm or a lambda, which may hold any
+    /// statement (for, if, while, etc.).  Unlike parse_block_statement(),
+    /// semicolons are optional before '}' (the last expression in the block
+    /// is the arm's return value).
+    parse_inner_block() -> BlockStmtNode* {
         // BRACE_DEPTH_LIMIT: nested blocks (`{{{...}}}`, and the block bodies
         // of nested `if`/`match`/`while`/`for`) recurse through here with no
         // expression-level bracketing for the unary/expr/type guards to catch,
@@ -169,7 +159,7 @@ public:
     }
 
     /// Create a parser from the compilation context's token stream.
-    /// The parser OWNS its `tokens` buffer (ParserBase.tokens), so it must
+    /// The parser OWNS its `tokens` buffer, so it must
     /// receive an independent copy rather than aliasing the ctx-owned lexer
     /// output (`ctx.artifacts.tokens.tokens`): otherwise both the parser and
     /// the context would free the same buffer.  Token is Copy, so this is a
@@ -180,7 +170,7 @@ public:
         for (mut i: i64 = 0; i < src_len; i++) {
             toks_copy.push(ctx.artifacts.tokens.tokens[i]);
         }
-        return Parser(
+        return Parser::new(
             toks_copy,
             ctx.artifacts.tokens.source_file,
             ctx
@@ -1764,7 +1754,7 @@ public:
             const val_tok: Token = this.current();
             if (val_tok.kind == TokenType::NumericConstant) {
                 this.advance();
-                const v: i64 = ParserBase::parse_numeric_lexeme_i64(val_tok.lexeme);
+                const v: i64 = Parser::parse_numeric_lexeme_i64(val_tok.lexeme);
                 variant.set_explicit_value(sign * v);
             } else {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
@@ -3006,14 +2996,14 @@ public:
         // String literal: "foo"
         if (start.kind == TokenType::StringLiteral) {
             const tok: Token = this.advance();
-            const content: string = ParserBase::unquote_string_lexeme(tok.lexeme);
+            const content: string = Parser::unquote_string_lexeme(tok.lexeme);
             return DirectiveArg::string_lit(content, this.span_from_token(tok));
         }
 
         // Integer literal: 16, 0xFF, 0b101, ...
         if (start.kind == TokenType::NumericConstant) {
             const tok: Token = this.advance();
-            const v: i64 = ParserBase::parse_numeric_lexeme_i64(tok.lexeme);
+            const v: i64 = Parser::parse_numeric_lexeme_i64(tok.lexeme);
             return DirectiveArg::int_lit(v, tok.lexeme, this.span_from_token(tok));
         }
 
@@ -3088,12 +3078,12 @@ public:
             TokenType::StringLiteral => {
                 this.advance();
                 kv.value_kind = DirectiveArgKind::StringLit;
-                kv.str_value  = ParserBase::unquote_string_lexeme(v_tok.lexeme);
+                kv.str_value  = Parser::unquote_string_lexeme(v_tok.lexeme);
             }
             TokenType::NumericConstant => {
                 this.advance();
                 kv.value_kind = DirectiveArgKind::IntLit;
-                kv.int_value  = ParserBase::parse_numeric_lexeme_i64(v_tok.lexeme);
+                kv.int_value  = Parser::parse_numeric_lexeme_i64(v_tok.lexeme);
                 kv.str_value  = v_tok.lexeme;
             }
             TokenType::Identifier => {
@@ -3557,9 +3547,8 @@ public:
     }
 
     /// Parse a static match statement: `static match (Type) { type-arms }`.
-    /// Used when arms yield no value. Reuses parse_static_match_arm (inherited
-    /// from ExprParser); arm blocks parse full statements via the Parser
-    /// override of parse_inner_block.
+    /// Used when arms yield no value. Reuses parse_static_match_arm, whose
+    /// arm blocks parse full statements through parse_inner_block.
     parse_static_match_statement() -> StaticMatchStmtNode* {
         const start: Token = this.advance(); // consume 'static'
         this.advance();                      // consume 'match'
@@ -3593,7 +3582,7 @@ public:
     /// Parse a match arm for statement context: pattern => { body }.
     /// Uses shared parse_match_arm_patterns() for pattern + '=>', then
     /// handles the body as a full block (declarations, statements, expressions).
-    /// See also: ExprParser::parse_expr_match_arm() for expression context.
+    /// See also: parse_expr_match_arm() for expression context.
     parse_match_arm() -> MatchArmNode* {
         const start: Token = this.current();
         mut arm: MatchArmNode* = this.parse_match_arm_patterns();
@@ -3785,7 +3774,7 @@ public:
                     if (this.check(TokenType::StringLiteral)) {
                         const s: Token = this.advance();
                         ck = AsmConstraintKind::Pinned;
-                        pin = ParserBase::unquote_string_lexeme(s.lexeme);
+                        pin = Parser::unquote_string_lexeme(s.lexeme);
                     } else if (this.check(TokenType::Identifier)) {
                         const c: Token = this.advance();
                         if (c.lexeme == "m") { ck = AsmConstraintKind::Memory; }
@@ -3815,16 +3804,18 @@ public:
                     }
                 }
                 if (idx >= 0) {
-                    mut existing: AsmOperand* = node.operands[idx];
-                    if (existing.direction != dir) { existing.direction = AsmOpDir::InOut; }
-                    if (existing.constraint == AsmConstraintKind::Reg
+                    if (node.operands[idx].direction != dir) {
+                        node.operands[idx].direction = AsmOpDir::InOut;
+                    }
+                    if (node.operands[idx].constraint == AsmConstraintKind::Reg
                             && ck != AsmConstraintKind::Reg) {
-                        existing.constraint = ck;
-                        existing.pinned_reg = pin;
+                        node.operands[idx].constraint = ck;
+                        node.operands[idx].pinned_reg = pin;
                     }
                 } else {
-                    const op: AsmOperand* = new AsmOperand(dir, expr, ck, pin);
-                    idx = node.add_operand(op);
+                    idx = node.add_operand(AsmOperand {
+                        direction: dir, expr: expr, constraint: ck, pinned_reg: pin,
+                    });
                     names.push(opname);
                 }
                 node.add_piece(AsmPiece::operand(idx));

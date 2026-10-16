@@ -891,6 +891,46 @@ deterministic compiler; a slice that moves them says by how much.
   classes, and no measurable change in check time.
 - **Wrong if:** any test or example object moves.
 
+**Built.**
+
+- `Parser` is one struct, declared in `parser/cursor.cryo` (the file
+  `parser_base.cryo` was, renamed for what it holds) with the state, the
+  cursor, spans, errors and recovery.  `expr_parser.cryo` and `parser.cryo`
+  each hold an `implement struct Parser` block.  The struct is declared in
+  the lowest of the three modules because a module's methods are found
+  only once the module is compiled, and module discovery follows imports:
+  a probe with the struct in the top module and the blocks below it,
+  imported by nothing, refused a call into a lower block (E0358).
+  `parser.cryo` re-exports `Parser` (`export`), so an importer of
+  `compiler::parser::parser` names the struct and compiles every block.
+- The two virtual hooks are plain methods in `parser.cryo`; the base
+  versions returning `null` are gone.  The constructor chain is one
+  `static new(...)` returning a struct literal.
+- `DirectiveRegistry` is a struct held by pointer as before.  It owns
+  `records`, which its `delete` does not release; neither did the class's.
+  `delete` runs no field drop glue for a struct or a class (a probe: an
+  `[E]` field's elements are dropped at scope exit and not by `delete`).
+  That is a defect in `delete`, logged; giving the registry a `Drop` would
+  work around it in one type.
+- `AsmOperand` and `AsmPiece` are value structs held in `[AsmOperand]` and
+  `[AsmPiece]`, each implementing `Clone`; the cloner calls `.clone()` and
+  then replaces the operand's expression with its own copy.  Every null
+  check on an element went with the pointers (the parser never stored a
+  null).
+- **Measured.**  verify `--require-identical`: 0 test and 0 example
+  objects moved.  Classes 109 -> 103: the prediction said 5, but its own
+  list is 6.  Vtables in the compiler binary 287 -> 284 symbol lines: the
+  three parser tables; the prediction said 4, but the registry and the asm
+  types had no virtual methods and so no table.  Check time, interleaved
+  x3 over the same source: 8.34 s base, 8.35 s new (medians); peak
+  1528.9 / 1525.5 MiB; node count identical (1,936,462); the arena
+  1,270 bytes larger, the asm operands and pieces now stored inline in
+  arena-routed arrays rather than as separately allocated objects.  The
+  binary is 30,892 bytes larger: `Array<AsmOperand>` and `Array<AsmPiece>`
+  each emit 94 functions where the pointer arrays emitted 90, `clone`
+  among them now that the element meets `Clone`, and each method copies a
+  32- or 24-byte element where it copied a pointer.
+
 ### Slice 2: the walker trait over today's classes, and the visitors that use it
 
 `Walk` is introduced with hooks typed over today's node classes

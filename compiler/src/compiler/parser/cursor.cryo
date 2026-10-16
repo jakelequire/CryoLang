@@ -1,15 +1,17 @@
-///! ParserBase
+///! Cursor
 ///!
-///! Base class providing the token cursor, source span construction, error
-///! reporting, and recovery infrastructure shared by all parser layers.
+///! The `Parser` struct: its state, the token cursor, source span
+///! construction, error reporting and recovery.  Expression and type
+///! parsing is in `expr_parser`, statements and declarations in `parser`.
 
-namespace compiler::parser::parser_base;
+namespace compiler::parser::cursor;
 
 import compiler::lex;
 import compiler::lex::{ Token, TokenType };
 import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
-import compiler::ast::{ statement, expression };
+import compiler::ast::node;
+import compiler::ast::node::{ StaticAssertItem };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::resolver::symbol_str;
@@ -22,31 +24,13 @@ import std::collections::str;
 import std::collections::str::{ Str };
 import std::fmt::float;
 import std::fmt;
-import compiler::ast::expression::{ ExpressionNode };
-import compiler::ast::statement::{ BlockStmtNode };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Suggestion };
 
 
-type class ParserBase {
-public:
-    /// Parse a brace-delimited block containing statements and expressions.
-    /// Base implementation returns null; overridden by ExprParser (limited)
-    /// and Parser (full statement support including for/if/while).
-    virtual parse_inner_block() -> BlockStmtNode* {
-        return null;
-    }
-
-    /// Parse a standalone expression from a separate token stream, on a
-    /// fresh parser instance.  Used by f-string desugaring to parse each
-    /// `{...}` hole without disturbing this parser's own token stream (which
-    /// is owned - reassigning it would drop the live tokens).  Overridden by
-    /// `Parser` to spin up a real sub-`Parser`; the base returns null.
-    virtual parse_expr_from_tokens(toks: [Token]) -> ExpressionNode* {
-        return null;
-    }
-
+/// The recursive-descent parser over one file's tokens.
+type struct Parser {
     tokens:        [Token];
     pos:           i64;
     source_file:   string;
@@ -140,32 +124,40 @@ public:
     // tripped a calling-convention mismatch).
     fstr_span: SourceSpan;
 
+    /// Module-scope `static_assert(...)` items collected during the top-level
+    /// parse and attached to the ProgramNode before it is returned. Kept off
+    /// the statement stream so they need no NodeKind / visitor handling.
+    static_assert_items: [StaticAssertItem*];
+}
 
-    ParserBase(tokens: [Token], source_file: string, ctx: CompilationContext*) {
-        this.tokens       = tokens;
-        this.pos          = 0;
-        this.source_file  = source_file;
-        this.ctx          = ctx;
-        this.panic_mode   = false;
-        this.error_count  = 0;
-        this.scope_depth  = 0;
-        this.brace_depth  = 0;
-        this.paren_depth  = 0;
-        this.bracket_depth = 0;
-        this.no_struct_lit_depth = -1;
-        this.unary_depth  = 0;
-        this.expr_depth   = 0;
-        this.type_depth   = 0;
-
-        this.pending_bare_variadic  = false;
-        this.pending_named_variadic = false;
-        this.pending_right_angle    = false;
-
-        this.pending_doc_comments = [];
-        this.last_doc_end_line    = -1;
-        this.current_type_name    = "";
-        this.used_fstring         = false;
-        this.fstr_span            = SourceSpan::none();
+implement struct Parser {
+    /// A parser at the start of `tokens`, which it owns.
+    static new(tokens: [Token], source_file: string, ctx: CompilationContext*) -> Parser {
+        return Parser {
+            tokens:                 tokens,
+            pos:                    0,
+            source_file:            source_file,
+            ctx:                    ctx,
+            panic_mode:             false,
+            error_count:            0,
+            scope_depth:            0,
+            brace_depth:            0,
+            paren_depth:            0,
+            bracket_depth:          0,
+            no_struct_lit_depth:    -1,
+            unary_depth:            0,
+            expr_depth:             0,
+            type_depth:             0,
+            pending_bare_variadic:  false,
+            pending_named_variadic: false,
+            pending_right_angle:    false,
+            pending_doc_comments:   [],
+            last_doc_end_line:      -1,
+            current_type_name:      "",
+            used_fstring:           false,
+            fstr_span:              SourceSpan::none(),
+            static_assert_items:    [],
+        };
     }
 
 
@@ -303,7 +295,7 @@ public:
     error_expected_with_insert(kind: TokenType, expected: string) -> void {
         const tok: Token = this.current();
         const message: string = fmt::format("expected %s, found '%s'", expected, tok.lexeme);
-        const literal: string = ParserBase::literal_for_token(kind);
+        const literal: string = Parser::literal_for_token(kind);
         if (literal == "") {
             // No safe auto-insertion; fall back to the plain error.
             this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, message);
@@ -402,7 +394,7 @@ public:
     /// those; this walks back past them.  -1 before the first token.
     last_consumed_index() -> i64 {
         mut idx: i64 = this.pos - 1;
-        while (idx >= 0 && idx < this.tokens.length && ParserBase::is_comment(this.tokens[idx].kind)) {
+        while (idx >= 0 && idx < this.tokens.length && Parser::is_comment(this.tokens[idx].kind)) {
             idx -= 1;
         }
         return idx;
@@ -431,7 +423,7 @@ public:
         mut prev_end: int = 0;
         for (mut i: i64 = from; i < to && i < this.tokens.length; i++) {
             const tok: Token = this.tokens[i];
-            if (ParserBase::is_comment(tok.kind)) { continue; }
+            if (Parser::is_comment(tok.kind)) { continue; }
             if (have_prev && (tok.line != prev_line || tok.column > prev_end)) {
                 text = text + " ";
             }
@@ -681,7 +673,7 @@ public:
 
     /// Check if the current token could start a declaration.
     is_declaration_start() -> boolean {
-        return ParserBase::opens_declaration(this.current().kind);
+        return Parser::opens_declaration(this.current().kind);
     }
 
     /// Refuse a binding named by a keyword that opens a declaration
@@ -691,7 +683,7 @@ public:
     /// its slot held.  Keywords are not identifiers there.  A
     /// keyword that opens nothing (`default`, `string`) stays a legal name.
     refuse_declaration_keyword_name(tok: Token, what: string) -> void {
-        if (!ParserBase::opens_declaration(tok.kind)) { return; }
+        if (!Parser::opens_declaration(tok.kind)) { return; }
         this.report_invalid_at(ErrorCode::E0100_EXPECTED_TOKEN,
             fmt::format("expected %s, found `%s`, which is a reserved word", what, tok.lexeme),
             this.span_from_token(tok));
@@ -799,7 +791,7 @@ public:
     /// `count_newlines_in_str` counts how many to derive the end line.
     push_doc(mut &this, tok: Token) -> void {
         const start_line: int = tok.line;
-        const end_line:   int = start_line + ParserBase::count_newlines_in_str(tok.lexeme);
+        const end_line:   int = start_line + Parser::count_newlines_in_str(tok.lexeme);
         if (this.last_doc_end_line >= 0 && start_line > this.last_doc_end_line + 1) {
             this.pending_doc_comments = [];
         }
