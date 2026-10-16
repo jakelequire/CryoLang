@@ -206,6 +206,16 @@ yet is recorded with the change that builds it, not here.
      pointee type:** its `Drop`, if it has one, then the values its fields
      own; then the storage is returned.  (Dispatch, delegated)
 
+397. **A struct's or union's own methods, static and instance, are written
+     inline in its body.**  An `implement` block is for implementing a trait
+     on a type, for an enum's methods (an enum body holds only variants),
+     and for the cases the language requires one.  A type whose methods
+     are split across several files (the parser's `Parser`) keeps
+     `implement struct` blocks in the other files, rather than growing one
+     huge file; the methods in its own file are inline.  A bound only some
+     methods need is a `where` on those methods, which works inline on a
+     generic struct.  (Jake)
+
 ### 2026-10-15
 
 347. **Fixed-size arrays change syntax with dynamic ones:** `T[N]` is

@@ -4,7 +4,7 @@
 /// binary operators, plus all unary operators (negate, not, bitnot,
 /// address-of, dereference, pre/post inc/dec).  Short-circuit `&&` / `||`
 /// get their own path (`short_circuit`) so the RHS is only evaluated
-/// when needed and `last_value` lands as the phi result.
+/// when needed and the phi is the result.
 ///
 /// Operand expressions are evaluated through `dispatch.codegen_rvalue`
 /// (or `codegen_lvalue` for the address-of / mutation cases); the
@@ -15,7 +15,7 @@ namespace compiler::codegen::visit::binary_unary_emitter;
 import compiler::codegen;
 import compiler::codegen::{ context, llvm, llvm_types, util };
 import compiler::codegen::state::visitor_state;
-import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::codegen::state::visitor_state::{ Emitted, VisitorState };
 import compiler::codegen::visit::expr_dispatch;
 import compiler::codegen::visit::expr_dispatch::{ ExprDispatch };
 import compiler::diag;
@@ -73,7 +73,8 @@ type struct BinaryUnaryEmitter {
 
     // Binary expressions
 
-    emit_binary(mut &this, visitor: IRGeneratorVisitor*, node: BinaryExprNode*) -> void {
+    emit_binary(mut &this, visitor: IRGeneratorVisitor*, node: BinaryExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const op: TokenType = node.op.kind;
 
         // Operator overloading: sema rewrote `a + b` / `a == b` / etc. into a
@@ -90,14 +91,14 @@ type struct BinaryUnaryEmitter {
                 if (addr.is_valid() && val.is_valid()) {
                     this.cg.builder.build_store(val, addr);
                 }
-                this.state.last_value = val;
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = val;
+                out.is_lvalue = false;
+                return out;
             }
             const val: LValue = this.dispatch.codegen_rvalue(visitor, node.desugared_call);
-            this.state.last_value = val;
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = val;
+            out.is_lvalue = false;
+            return out;
         }
 
         // Assignment
@@ -116,9 +117,9 @@ type struct BinaryUnaryEmitter {
                     diag = diag.also_at(node.right.span, "right-hand side did not produce a valid rvalue");
                 }
                 this.cg.diag.emit(diag);
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
             // Narrow-store fix: the LHS may be an i8 slot (string char,
             // pointer-to-i8 element, array-of-i8 element) while the RHS
@@ -153,9 +154,9 @@ type struct BinaryUnaryEmitter {
                 store_val = this.cg.builder.build_trunc(val, LType::i8(), "chartrunc");
             }
             this.cg.builder.build_store(store_val, addr);
-            this.state.last_value = val;
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = val;
+            out.is_lvalue = false;
+            return out;
         }
 
         // Compound assignment.  Each compound op (`+=`, `-=`, `*=`, `/=`,
@@ -177,18 +178,18 @@ type struct BinaryUnaryEmitter {
                 diag = diag.at(node.span);
                 diag = diag.also_at(node.left.span, "this expression must be assignable");
                 this.cg.diag.emit(diag);
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
             const lhs_ty: LType = this.cg.type_mapper.map_type(node.left.resolved_type);
             if (!lhs_ty.is_valid()) {
                 this.cg.diag.emit_error_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
                     "codegen: compound assignment: failed to map left-hand side type",
                     node.left.span);
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
             const lhs_loaded: LValue = this.cg.builder.build_load(lhs_ty, addr, "compoundlhs");
             const rhs: LValue = this.dispatch.codegen_rvalue(visitor, node.right);
@@ -216,15 +217,14 @@ type struct BinaryUnaryEmitter {
                 }
             }
             this.cg.builder.build_store(store_val, addr);
-            this.state.last_value = store_val;
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = store_val;
+            out.is_lvalue = false;
+            return out;
         }
 
         // Logical short-circuit
         if (op == TokenType::AmpAmp || op == TokenType::PipePipe) {
-            this.short_circuit(visitor, node);
-            return;
+            return this.short_circuit(visitor, node);
         }
 
         // Regular binary
@@ -233,26 +233,27 @@ type struct BinaryUnaryEmitter {
         mut result: LValue = LValue::null();
         result = this.cg.expr_ops.codegen_binary(lhs, rhs, op, node.left.resolved_type, node.right.resolved_type,
             node.append_entry, visitor, &node.unwind_cleanup, node.span);
-        this.state.last_value = result;
-        this.state.last_is_lvalue = false;
+        out.value = result;
+        out.is_lvalue = false;
+        return out;
     }
 
     // Unary expressions
 
-    emit_unary(mut &this, visitor: IRGeneratorVisitor*, node: UnaryExprNode*) -> void {
+    emit_unary(mut &this, visitor: IRGeneratorVisitor*, node: UnaryExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const op: TokenType = node.op.kind;
         // Operator overloading: sema rewrote a unary operator on a user type into
         // a trait-method call and hung it on `desugared_call` - `-x` -> `x.neg()`
         // (`!`/`~` likewise), and `*b` -> `*(b.deref())`.  Delegate with a plain
         // generate_expression and do NOT force an rvalue: `x.neg()` is a call
         // (already an rvalue, so this is byte-identical to the load-if-lvalue
-        // path), while `*(b.deref())` leaves `last_is_lvalue = true` (the deref is
-        // a place), so the enclosing codegen_rvalue / codegen_lvalue caller decides
+        // path), while `*(b.deref())` gives a place, so the enclosing
+        // codegen_rvalue / codegen_lvalue caller decides
         // load-vs-address.  This single delegation covers reads (`v = *b`), writes
         // (`*b = x`), and compound assignment (`*b += x`).
         if (node.desugared_call != null) {
-            this.dispatch.generate_expression(visitor, node.desugared_call);
-            return;
+            return this.dispatch.generate_expression(visitor, node.desugared_call);
         }
         if (op == TokenType::Star) {
             const op_t: Type* = this.cg.arena_type(node.operand.resolved_type);
@@ -277,40 +278,40 @@ type struct BinaryUnaryEmitter {
                 deref_addr = this.dispatch.codegen_lvalue(visitor, node.operand);
             }
             if (!deref_addr.is_valid()) {
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
             // The dereferenced expression is always an lvalue: it
             // names a memory location that callers can either read
             // (via codegen_rvalue -> emit a load) or write (via the
-            // assignment path -> use as a store destination).  The
-            // previous code set `last_is_lvalue = is_ptr_like`, which
-            // dropped the load step for value-typed operands and
-            // stored the *address bits* in place of the dereferenced
-            // value, observable as `const x: Option<T> = *this`
+            // assignment path -> use as a store destination).  Giving a
+            // place only for a pointer-like operand would drop the load
+            // step for value-typed operands and store the *address
+            // bits* in place of the dereferenced value, observable as
+            // `const x: Option<T> = *this`
             // emitting `store ptr %this, ptr %x` instead of the
             // 32-byte value copy, garbaging the enum discriminant.
-            this.state.last_value = deref_addr;
-            this.state.last_is_lvalue = true;
-            return;
+            out.value = deref_addr;
+            out.is_lvalue = true;
+            return out;
         }
         if (op == TokenType::Amp) {
-            // codegen_lvalue runs generate_expression and returns last_value;
-            // it doesn't enforce lvalue-ness.  When the operand is an rvalue
-            // (literal, call result, arithmetic), `last_value` IS the value
-            // itself, not an address.  Returning it here makes `&literal`
-            // lower to `inttoptr (i32 N to ptr)` once arg coercion converts
-            // the i32 to ptr; every callee that dereferences then crashes.
-            // Materialize an rvalue into a stack temp and pass that addr.
-            const v: LValue = this.dispatch.codegen_lvalue(visitor, node.operand);
+            // The operand as it was emitted: when it is an rvalue (literal,
+            // call result, arithmetic) its value is the value itself, not an
+            // address.  Returning it here makes `&literal` lower to
+            // `inttoptr (i32 N to ptr)` once arg coercion converts the i32 to
+            // ptr; every callee that dereferences then crashes.  Materialize
+            // an rvalue into a stack temp and pass that addr.
+            const operand_e: Emitted = this.dispatch.generate_expression(visitor, node.operand);
+            const v: LValue = operand_e.value;
             if (!v.is_valid()) {
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
             mut addr: LValue = v;
-            if (!this.state.last_is_lvalue) {
+            if (!operand_e.is_lvalue) {
                 const ty: LType = this.cg.type_mapper.map_type(node.operand.resolved_type);
                 if (ty.is_valid()) {
                     // The slot is hoisted to the entry block while the store
@@ -325,17 +326,17 @@ type struct BinaryUnaryEmitter {
                     this.cg.builder.build_store(v, addr);
                 }
             }
-            this.state.last_value = addr;
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = addr;
+            out.is_lvalue = false;
+            return out;
         }
         if (op == TokenType::PlusPlus || op == TokenType::MinusMinus) {
             const addr: LValue = this.dispatch.codegen_lvalue(visitor, node.operand);
             const ty: LType = this.cg.type_mapper.map_type(node.operand.resolved_type);
             if (!addr.is_valid() || !ty.is_valid()) {
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
             const old: LValue = this.cg.builder.build_load(ty, addr, "incdec.old");
             // Pointer ++/-- must lower to a GEP over the pointee, not an
@@ -363,9 +364,9 @@ type struct BinaryUnaryEmitter {
             mut updated: LValue = LValue::null();
             if (is_ptr) {
                 if (!pointee_lty.is_valid()) {
-                    this.state.last_value = LValue::null();
-                    this.state.last_is_lvalue = false;
-                    return;
+                    out.value = LValue::null();
+                    out.is_lvalue = false;
+                    return out;
                 }
                 const step: i64 = if (op == TokenType::PlusPlus) { 1 } else { -1 };
                 const idx_val: LValue = LType::const_int(LType::i64(), step as u64, true);
@@ -389,21 +390,23 @@ type struct BinaryUnaryEmitter {
             // branch (and the matching is_postfix discriminator on
             // UnaryExprNode), every form returned the old value, so
             // `const x: int = ++b;` bound x to b's pre-increment value.
-            this.state.last_value = if (node.is_postfix) { old } else { updated };
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = if (node.is_postfix) { old } else { updated };
+            out.is_lvalue = false;
+            return out;
         }
         const operand: LValue = this.dispatch.codegen_rvalue(visitor,node.operand);
         mut result: LValue = LValue::null();
         result = this.cg.expr_ops.codegen_unary(operand, op, node.operand.resolved_type);
-        this.state.last_value = result;
-        this.state.last_is_lvalue = false;
+        out.value = result;
+        out.is_lvalue = false;
+        return out;
     }
 
     // Short-circuit && / ||
 
     /// Short-circuit evaluation for && and ||.
-    short_circuit(mut &this, visitor: IRGeneratorVisitor*, node: BinaryExprNode*) -> void {
+    short_circuit(mut &this, visitor: IRGeneratorVisitor*, node: BinaryExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const is_and: boolean = node.op.kind == TokenType::AmpAmp;
 
         const lhs: LValue = this.dispatch.codegen_rvalue(visitor,node.left);
@@ -440,9 +443,9 @@ type struct BinaryUnaryEmitter {
         // IR instead of bailing.
         if (!lhs.is_valid() || !rhs.is_valid()) {
             this.cg.builder.position_at_end(merge_bb);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Merge with phi.
@@ -464,7 +467,8 @@ type struct BinaryUnaryEmitter {
         libc::free(vals_buf);
         libc::free(blocks_buf);
 
-        this.state.last_value = phi;
-        this.state.last_is_lvalue = false;
+        out.value = phi;
+        out.is_lvalue = false;
+        return out;
     }
 }

@@ -21,7 +21,7 @@ import compiler::codegen;
 import compiler::codegen::{ context, llvm, llvm_types, type_map, util };
 import compiler::codegen::util::{ CodegenUtil };
 import compiler::codegen::state::visitor_state;
-import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::codegen::state::visitor_state::{ Emitted, VisitorState };
 import compiler::codegen::visit::{ expr_dispatch, enum_variant_emitter };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
@@ -141,15 +141,15 @@ type struct NewDeleteEmitter {
 
     // new T(args) / new T { fields }
 
-    emit_new(mut &this, visitor: IRGeneratorVisitor*, node: NewExprNode*) -> void {
+    emit_new(mut &this, visitor: IRGeneratorVisitor*, node: NewExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         // Array allocation `new T[n]` is handled up front: it allocates raw
         // memory and the element may be a primitive (`new int[100]`) whose
         // name is a keyword not in the decl index, so the type_name lookup
         // below would fail.  emit_new_array reads the element type from the
         // sema-resolved `T*` result type instead.
         if (node.has_array_size()) {
-            this.emit_new_array(visitor, node);
-            return;
+            return this.emit_new_array(visitor, node);
         }
 
         const intern: InternTable* = this.cg.get_intern();
@@ -178,9 +178,9 @@ type struct NewDeleteEmitter {
                 fmt::format("codegen: 'new': target type '%s' not found",
                     intern.resolve(node.type_name)),
                 node.span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Heap-allocated enum variant: the one sema pinned inside the enum
@@ -192,18 +192,18 @@ type struct NewDeleteEmitter {
                 this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
                     "codegen: `new T::V(...)` carries no variant pin: no sema walk answered it",
                     node.span);
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
             mut vargs: [LValue] = [];
             for (mut i: i64 = 0; i < node.arguments.length; i++) {
                 vargs.push(this.dispatch.codegen_rvalue(visitor,node.arguments[i]));
             }
             const variant_val: LValue = this.enum_variant.build(et, variant, type_ref, vargs);
-            this.state.last_value = this.cg.expr_ops.heap_box_enum_variant(et, type_ref, variant_val, node.span);
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = this.cg.expr_ops.heap_box_enum_variant(et, type_ref, variant_val, node.span);
+            out.is_lvalue = false;
+            return out;
         }
 
         const mapped: LType = this.cg.type_mapper.map_type(type_ref);
@@ -238,9 +238,9 @@ type struct NewDeleteEmitter {
         if (alloc_block != null) {
             alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, node.span);
             if (!alloc_fn.is_valid()) {
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
         }
         mut align: u64 = 16;
@@ -251,9 +251,9 @@ type struct NewDeleteEmitter {
         const raw_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
             alloc_fn, size_val, align, "newtmp", node.span, "'new' expression");
         if (!raw_ptr.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Bitcast to the target struct pointer type.
@@ -373,8 +373,9 @@ type struct NewDeleteEmitter {
             }
         }
 
-        this.state.last_value = obj_ptr;
-        this.state.last_is_lvalue = false;
+        out.value = obj_ptr;
+        out.is_lvalue = false;
+        return out;
     }
 
     // new T[n]  - raw array allocation
@@ -386,15 +387,16 @@ type struct NewDeleteEmitter {
     /// The element type is read from the sema-resolved `T*` result type so
     /// primitive elements (whose name is a keyword, not a decl-index entry)
     /// resolve the same way user types do.
-    emit_new_array(mut &this, visitor: IRGeneratorVisitor*, node: NewExprNode*) -> void {
+    emit_new_array(mut &this, visitor: IRGeneratorVisitor*, node: NewExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const result_t: Type* = this.cg.arena_type(node.resolved_type);
         if (result_t == null || result_t.kind != TypeKind::Pointer) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
                 "codegen: 'new T[n]': could not resolve element type",
                 node.span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
         const elem_ref: TypeRef = (result_t as PointerType*).pointee;
         const elem_t: Type* = this.cg.arena_type(elem_ref);
@@ -419,9 +421,9 @@ type struct NewDeleteEmitter {
         // Element count expression -> i64.
         mut count_val: LValue = this.dispatch.codegen_rvalue(visitor, node.array_size);
         if (!count_val.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
         count_val = this.widen_to_i64(count_val);
 
@@ -442,17 +444,17 @@ type struct NewDeleteEmitter {
         if (alloc_block != null) {
             alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, node.span);
             if (!alloc_fn.is_valid()) {
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
         }
         const raw_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
             alloc_fn, total, 16, "new.arr", node.span, "'new T[n]'");
         if (!raw_ptr.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         mut elem_ptr: LValue = raw_ptr;
@@ -460,8 +462,9 @@ type struct NewDeleteEmitter {
             elem_ptr = this.cg.builder.build_pointer_cast(
                 raw_ptr, LType::pointer_to(elem_llvm), "new.arr.cast");
         }
-        this.state.last_value = elem_ptr;
-        this.state.last_is_lvalue = false;
+        out.value = elem_ptr;
+        out.is_lvalue = false;
+        return out;
     }
 
     /// Widen an integer value to i64 for use as a malloc byte count.  Array
@@ -478,7 +481,8 @@ type struct NewDeleteEmitter {
 
     // delete ptr
 
-    emit_delete(mut &this, visitor: IRGeneratorVisitor*, node: DeleteExprNode*) -> void {
+    emit_delete(mut &this, visitor: IRGeneratorVisitor*, node: DeleteExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         // `delete ptr` is the manual-memory dual of an end-of-scope drop:
         //   1. Release the pointee as a scope exit releases a value of its
         //      type: its destructor, if it has one, then its owned fields.
@@ -515,9 +519,9 @@ type struct NewDeleteEmitter {
             if (alloc_block != null) {
                 release_fn = this.allocator_method(alloc_block, LangItem::AllocateRelease, node.span);
                 if (!release_fn.is_valid()) {
-                    this.state.last_value = LValue::null();
-                    this.state.last_is_lvalue = false;
-                    return;
+                    out.value = LValue::null();
+                    out.is_lvalue = false;
+                    return out;
                 }
             }
         }
@@ -537,9 +541,9 @@ type struct NewDeleteEmitter {
         // drive both the synthesized `.drop()` and the `free` off it.
         const ptr: LValue = this.dispatch.codegen_rvalue(visitor, node.operand);
         if (!ptr.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         if (should_drop) {
@@ -612,7 +616,8 @@ type struct NewDeleteEmitter {
         } else {
             this.cg.expr_ops.emit_raw_dealloc(ptr, del_align, node.span);
         }
-        this.state.last_value = LValue::null();
-        this.state.last_is_lvalue = false;
+        out.value = LValue::null();
+        out.is_lvalue = false;
+        return out;
     }
 }

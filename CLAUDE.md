@@ -447,6 +447,14 @@ error / missing check / cosmetic / infrastructure) and where it came from.
 ## Conventions
 
 - Bare integer literals: `1`, not `1u32` — including in synthesized code.
+- A struct's or union's own methods, static and instance, go inline in its
+  body: `type struct Foo { bar: int; static new() -> Foo { … } }`, not a
+  separate `implement struct Foo { … }`.  `implement` blocks are for
+  implementing a trait, for an enum's methods (an enum body holds only
+  variants), and where the language requires one.  A type whose methods are
+  split across files (`Parser`) uses `implement struct` blocks in the other
+  files; the ones in its own file are inline.  A bound only some methods
+  need is a `where` on those methods, which works inline on a generic struct.
 - No parallel/mirrored module structures; extend the module that exists.
 - Commit messages are plain, with no trailers. That includes `Co-Authored-By:`,
   which some agent harnesses append automatically - turn it off at the source

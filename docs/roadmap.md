@@ -50,6 +50,27 @@ Open: a survey of the compiler and the standard library for ad-hoc
 `equal`, compare, hash and to-string style methods that should be trait
 implementations, each one a candidate for its trait.  Not started.
 
+### Inherent `implement struct` blocks to inline methods
+
+Ruling 397 puts a struct's own methods inline in its body.  Existing
+inherent blocks are converted as their files are next touched, not in one
+sweep.  Counted (`grep -E '^\s*implement(<[^>]*>)? (struct|union) '`):
+
+- compiler: 9.  Three are `Parser`'s: the blocks in `expr_parser.cryo`
+  and `parser.cryo` are the split-type exception and stay; the one in
+  `cursor.cryo`, the struct's own file, goes inline.  The others are
+  `AsmPiece`, `InlineBodies`, `DirectiveRegistry`, and `StampSlot`,
+  `BuildStamp`, `VersionReport` in `utils/build_stamp.cryo`.
+- standard library: 4.  Three are `BufStream<S>` extended from the
+  HTTP/1.1, HTTP/2 and WebSocket modules, the split-type exception; one is
+  `Array<T, A>`'s second block in its own file, to fold inline (its bound
+  becomes a `where` on the methods that need it, or stays on the type).
+- tests: 108, converted with the tests they belong to.
+
+Not counted: the 50 `implement class` blocks holding `walk_children` in
+`AST/walk.cryo`, which are class-removal bridge pieces and move inline
+into each node struct as its category converts.
+
 ## Merge notes
 
 `naming-impl` is merged into `main`, and CI runs verify's gate list.  These

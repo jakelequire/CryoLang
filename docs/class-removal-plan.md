@@ -391,6 +391,12 @@ type struct BinaryExpr {
     desugar_by_bound: boolean;
     append_entry:     OverloadId;
     unwind_cleanup:   [Node];
+
+    /// Visit the operands in source order.
+    static walk_children<V>(n: BinaryExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.left);
+        v.walk_expr(n.right);
+    }
 }
 
 implement trait Allocate for struct BinaryExpr {
@@ -399,16 +405,11 @@ implement trait Allocate for struct BinaryExpr {
     }
 }
 
-implement struct BinaryExpr {
-    /// Visit the operands in source order, then the operator's desugaring.
-    static walk_children<V>(n: BinaryExpr*, v: mut &V) -> void where V: Walk {
-        v.walk_expr(n.left);
-        v.walk_expr(n.right);
-        if (n.desugared_call != null) { v.walk_expr(n.desugared_call); }
-    }
-}
+// In `Expr`'s own body, beside its header fields (ruling 397: a struct's
+// own methods are inline):
+type struct Expr {
+    // ... the header fields of section 2.1 ...
 
-implement struct Expr {
     /// A binary expression at `span`, untyped.
     static binary(op: Token, left: Expr*, right: Expr*, span: SourceSpan) -> Expr* {
         const n: BinaryExpr* = new BinaryExpr {
@@ -1064,15 +1065,32 @@ every visitor.
 - **Measured.**  verify `--require-identical`: 0 objects moved.  Check
   time x3 against 3a: 7.92 s and 7.95 s; peak 1529.0 and 1528.9 MiB;
   nodes identical.  Clean build 0 warnings.
-- **Still to do (3b part 2):** codegen's `state.last_value` /
-  `last_is_lvalue`.  Measured: 290 writes, almost all a value write
-  paired with an `is_lvalue` write, against 18 reads, most in
-  `ExprDispatch::codegen_rvalue`/`codegen_lvalue`, a few in
-  `ir_generator`, `place_emitter`, `call_emitter` and
-  `binary_unary_emitter` that read the lvalue flag the previous dispatch
-  left.  The conversion makes the emitters return a value-and-place pair
-  and threads it through every function on the path from a `visit_*` to
-  its write.
+**Built (3b, return values), part 2.**
+
+- Codegen's `state.last_value` / `last_is_lvalue` are gone (290 writes,
+  18 reads).  Every emitter returns an `Emitted` (`value`, `is_lvalue`):
+  the 47 `visit_*` methods, `dispatch_node`, `ExprDispatch`'s
+  `generate_*`, and the 22 helper emitters that wrote the channel.  The
+  three that answered "handled" with a `boolean` and left the value on the
+  channel (`emit_pinned_intrinsic`, `try_emit_enum_variant`,
+  `try_codegen_tuple_index`) return `Option<Emitted>`.
+- A statement's value is its trailing expression statement's: a block
+  gives its last statement's, an expression statement its expression's,
+  loaded; every other statement gives none.  This is the contract a
+  block-bodied match arm and a static match already stated; the channel
+  also carried a stale value through any statement that wrote nothing,
+  and no compiled object depended on that.
+- The readers that asked whether the previous dispatch left a place (a
+  receiver, an array, an `&` operand) read the `Emitted` their own call
+  returned.
+- A one-off codemod (`scripts/emit-codemod.py`) rewrote the producers
+  (accumulator, `return;`, the call-then-return folds); the reads it could
+  not prove were converted by hand.  It is in the commit that ran it and
+  deleted in the next.
+- **Measured.**  verify `--require-identical`: 0 objects moved.  Check
+  time x3 against the pin built from part 1: 7.91 s and 7.96 s; peak
+  1529.5 and 1529.0 MiB; nodes and arena identical.  Clean build 0
+  warnings.
 
 ### Slice 4: the types
 
@@ -1409,5 +1427,5 @@ final audit greps for each name listed and expects none.
 
 | piece | where | written in | deleted when |
 |---|---|---|---|
-| `implement class XNode { static walk_children ... }`, one per node class with children | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | each moves to `implement struct` on its kind's payload struct as that category converts (slices 5-6); none left when the last category does |
+| `implement class XNode { static walk_children ... }`, one per node class with children | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | each moves inline into its kind's payload struct body (ruling 397) as that category converts (slices 5-6); none left when the last category does |
 | `Walk::walk_node`'s `match (n.kind)` plus a cast per arm | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | becomes `walk_expr`/`walk_stmt`/... matching on `ExprKind` etc. as each category converts; deleted with `NodeKind` |

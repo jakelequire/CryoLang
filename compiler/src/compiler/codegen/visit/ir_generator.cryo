@@ -1,7 +1,7 @@
 /// IR Generator
 ///
-/// The main AST visitor that produces LLVM IR.  Extends `BaseASTVisitor`
-/// and uses standard `accept(visitor)` double-dispatch throughout.
+/// The main AST visitor that produces LLVM IR.  `dispatch_node` hands each
+/// node to the `visit_*` method for its kind, which returns what it emitted.
 /// Delegates to the expression, statement, and declaration codegen
 /// modules for the actual IR construction.
 
@@ -10,7 +10,7 @@ namespace compiler::codegen::visit::ir_generator;
 import compiler::codegen;
 import compiler::codegen::{ context, llvm, llvm_types, type_map, util };
 import compiler::codegen::state::visitor_state;
-import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::codegen::state::visitor_state::{ Emitted, VisitorState };
 import compiler::codegen::ops::{ ir_flow_emitter };
 import compiler::codegen::visit::{
     expr_dispatch, pattern_emitter, lambda_emitter, array_lit_emitter, enum_variant_emitter,
@@ -105,7 +105,6 @@ type struct IRGeneratorVisitor {
     cg: CodegenContext*;
 
     /// Per-visitor mutable state shared across visit() methods:
-    ///   last_value / last_is_lvalue - most-recent-expression return channel
     ///   current_impl_target          - Self target during impl-block traversal
     ///   lambda_counter               - anonymous lambda name counter
     /// Held by value here; sub-emitters reference it via `state: VisitorState*`
@@ -154,8 +153,7 @@ type struct IRGeneratorVisitor {
 
     /// Place / lvalue lowering: member access (`obj.field`), array
     /// access (`arr[i]`), tuple index (`t.0`).  Each path GEPs the
-    /// container, leaves the slot address on `state.last_value` with
-    /// `last_is_lvalue=true`.
+    /// container and gives the slot's address as a place.
     places: PlaceEmitter;
 
     /// Declaration visit dispatch (function / impl / struct / class).
@@ -198,62 +196,62 @@ type struct IRGeneratorVisitor {
         this.decl_visit.wire(this.cg, &this.state, &this.dispatch);
     }
 
-    /// Hand `n` to the emitter for its kind.  An expression's value is left
-    /// on `state.last_value`.  The kinds with no emitter of their own are
-    /// emitted through their owners (a method through its implement block,
-    /// a match arm through its match) or emit nothing.
-    dispatch_node(mut &this, n: ASTNode*) -> void {
-        if (n == null) { return; }
+    /// Hand `n` to the emitter for its kind and return what it emitted.  The
+    /// kinds with no emitter of their own are emitted through their owners
+    /// (a method through its implement block, a match arm through its match)
+    /// or emit nothing.
+    dispatch_node(mut &this, n: ASTNode*) -> Emitted {
+        if (n == null) { return Emitted::none(); }
         match (n.kind) {
-            NodeKind::Literal                => { this.visit_literal(n as LiteralNode*); }
-            NodeKind::Identifier             => { this.visit_identifier(n as IdentifierNode*); }
-            NodeKind::BinaryExpression       => { this.visit_binary(n as BinaryExprNode*); }
-            NodeKind::UnaryExpression        => { this.visit_unary(n as UnaryExprNode*); }
-            NodeKind::TernaryExpression      => { this.visit_ternary(n as TernaryExprNode*); }
-            NodeKind::IfExpression           => { this.visit_if_expr(n as IfExprNode*); }
-            NodeKind::MatchExpression        => { this.visit_match_expr(n as MatchExprNode*); }
-            NodeKind::StaticMatchExpression  => { this.visit_static_match_expr(n as StaticMatchExprNode*); }
-            NodeKind::CallExpression         => { this.visit_call(n as CallExprNode*); }
-            NodeKind::NewExpression          => { this.visit_new(n as NewExprNode*); }
-            NodeKind::SizeofExpression       => { this.visit_sizeof(n as SizeofExprNode*); }
-            NodeKind::AlignofExpression      => { this.visit_alignof(n as AlignofExprNode*); }
-            NodeKind::CastExpression         => { this.visit_cast(n as CastExprNode*); }
-            NodeKind::StructLiteral          => { this.visit_struct_literal(n as StructLiteralNode*); }
-            NodeKind::ArrayLiteral           => { this.visit_array_literal(n as ArrayLiteralNode*); }
-            NodeKind::TupleLiteral           => { this.visit_tuple_literal(n as TupleLiteralNode*); }
-            NodeKind::LambdaExpression       => { this.visit_lambda(n as LambdaExprNode*); }
-            NodeKind::ArrayAccess            => { this.visit_array_access(n as ArrayAccessNode*); }
-            NodeKind::MemberAccess           => { this.visit_member_access(n as MemberAccessNode*); }
-            NodeKind::ScopeResolution        => { this.visit_scope_resolution(n as ScopeResolutionNode*); }
-            NodeKind::TypeofExpression       => { this.visit_typeof(n as TypeofExprNode*); }
-            NodeKind::DeleteExpression       => { this.visit_delete(n as DeleteExprNode*); }
-            NodeKind::AwaitExpression        => { this.visit_await(n as AwaitExprNode*); }
-            NodeKind::YieldExpression        => { this.visit_yield(n as YieldExprNode*); }
-            NodeKind::TryExpression          => { this.visit_try(n as TryExprNode*); }
+            NodeKind::Literal                => { return this.visit_literal(n as LiteralNode*); }
+            NodeKind::Identifier             => { return this.visit_identifier(n as IdentifierNode*); }
+            NodeKind::BinaryExpression       => { return this.visit_binary(n as BinaryExprNode*); }
+            NodeKind::UnaryExpression        => { return this.visit_unary(n as UnaryExprNode*); }
+            NodeKind::TernaryExpression      => { return this.visit_ternary(n as TernaryExprNode*); }
+            NodeKind::IfExpression           => { return this.visit_if_expr(n as IfExprNode*); }
+            NodeKind::MatchExpression        => { return this.visit_match_expr(n as MatchExprNode*); }
+            NodeKind::StaticMatchExpression  => { return this.visit_static_match_expr(n as StaticMatchExprNode*); }
+            NodeKind::CallExpression         => { return this.visit_call(n as CallExprNode*); }
+            NodeKind::NewExpression          => { return this.visit_new(n as NewExprNode*); }
+            NodeKind::SizeofExpression       => { return this.visit_sizeof(n as SizeofExprNode*); }
+            NodeKind::AlignofExpression      => { return this.visit_alignof(n as AlignofExprNode*); }
+            NodeKind::CastExpression         => { return this.visit_cast(n as CastExprNode*); }
+            NodeKind::StructLiteral          => { return this.visit_struct_literal(n as StructLiteralNode*); }
+            NodeKind::ArrayLiteral           => { return this.visit_array_literal(n as ArrayLiteralNode*); }
+            NodeKind::TupleLiteral           => { return this.visit_tuple_literal(n as TupleLiteralNode*); }
+            NodeKind::LambdaExpression       => { return this.visit_lambda(n as LambdaExprNode*); }
+            NodeKind::ArrayAccess            => { return this.visit_array_access(n as ArrayAccessNode*); }
+            NodeKind::MemberAccess           => { return this.visit_member_access(n as MemberAccessNode*); }
+            NodeKind::ScopeResolution        => { return this.visit_scope_resolution(n as ScopeResolutionNode*); }
+            NodeKind::TypeofExpression       => { return this.visit_typeof(n as TypeofExprNode*); }
+            NodeKind::DeleteExpression       => { return this.visit_delete(n as DeleteExprNode*); }
+            NodeKind::AwaitExpression        => { return this.visit_await(n as AwaitExprNode*); }
+            NodeKind::YieldExpression        => { return this.visit_yield(n as YieldExprNode*); }
+            NodeKind::TryExpression          => { return this.visit_try(n as TryExprNode*); }
 
-            NodeKind::BlockStatement         => { this.visit_block(n as BlockStmtNode*); }
-            NodeKind::UnsafeBlockStatement   => { this.visit_unsafe_block(n as UnsafeBlockStmtNode*); }
-            NodeKind::AsmBlockStatement      => { this.visit_asm_block(n as AsmBlockStmtNode*); }
-            NodeKind::ReturnStatement        => { this.visit_return(n as ReturnStmtNode*); }
-            NodeKind::IfStatement            => { this.visit_if(n as IfStmtNode*); }
-            NodeKind::WhileStatement         => { this.visit_while(n as WhileStmtNode*); }
-            NodeKind::DoWhileStatement       => { this.visit_do_while(n as DoWhileStmtNode*); }
-            NodeKind::ForStatement           => { this.visit_for(n as ForStmtNode*); }
-            NodeKind::MatchStatement         => { this.visit_match_stmt(n as MatchStmtNode*); }
-            NodeKind::StaticMatchStatement   => { this.visit_static_match_stmt(n as StaticMatchStmtNode*); }
-            NodeKind::BreakStatement         => { this.visit_break(n as BreakStmtNode*); }
-            NodeKind::ContinueStatement      => { this.visit_continue(n as ContinueStmtNode*); }
-            NodeKind::ExpressionStatement    => { this.visit_expr_stmt(n as ExprStmtNode*); }
-            NodeKind::DeclarationStatement   => { this.visit_decl_stmt(n as DeclStmtNode*); }
-            NodeKind::LoopStatement          => { this.visit_loop(n as LoopStmtNode*); }
+            NodeKind::BlockStatement         => { return this.visit_block(n as BlockStmtNode*); }
+            NodeKind::UnsafeBlockStatement   => { return this.visit_unsafe_block(n as UnsafeBlockStmtNode*); }
+            NodeKind::AsmBlockStatement      => { return this.visit_asm_block(n as AsmBlockStmtNode*); }
+            NodeKind::ReturnStatement        => { return this.visit_return(n as ReturnStmtNode*); }
+            NodeKind::IfStatement            => { return this.visit_if(n as IfStmtNode*); }
+            NodeKind::WhileStatement         => { return this.visit_while(n as WhileStmtNode*); }
+            NodeKind::DoWhileStatement       => { return this.visit_do_while(n as DoWhileStmtNode*); }
+            NodeKind::ForStatement           => { return this.visit_for(n as ForStmtNode*); }
+            NodeKind::MatchStatement         => { return this.visit_match_stmt(n as MatchStmtNode*); }
+            NodeKind::StaticMatchStatement   => { return this.visit_static_match_stmt(n as StaticMatchStmtNode*); }
+            NodeKind::BreakStatement         => { return this.visit_break(n as BreakStmtNode*); }
+            NodeKind::ContinueStatement      => { return this.visit_continue(n as ContinueStmtNode*); }
+            NodeKind::ExpressionStatement    => { return this.visit_expr_stmt(n as ExprStmtNode*); }
+            NodeKind::DeclarationStatement   => { return this.visit_decl_stmt(n as DeclStmtNode*); }
+            NodeKind::LoopStatement          => { return this.visit_loop(n as LoopStmtNode*); }
 
-            NodeKind::VariableDeclaration    => { this.visit_var(n as VarDeclNode*); }
-            NodeKind::DestructureDeclaration => { this.visit_destructure(n as DestructureDeclNode*); }
-            NodeKind::FunctionDeclaration    => { this.visit_function(n as FunctionDeclNode*); }
-            NodeKind::StructDeclaration      => { this.visit_struct(n as StructDeclNode*); }
-            NodeKind::UnionDeclaration       => { this.visit_union(n as UnionDeclNode*); }
-            NodeKind::ClassDeclaration       => { this.visit_class(n as ClassDeclNode*); }
-            NodeKind::ImplementationBlock    => { this.visit_impl(n as ImplBlockNode*); }
+            NodeKind::VariableDeclaration    => { return this.visit_var(n as VarDeclNode*); }
+            NodeKind::DestructureDeclaration => { return this.visit_destructure(n as DestructureDeclNode*); }
+            NodeKind::FunctionDeclaration    => { return this.visit_function(n as FunctionDeclNode*); }
+            NodeKind::StructDeclaration      => { return this.visit_struct(n as StructDeclNode*); }
+            NodeKind::UnionDeclaration       => { return this.visit_union(n as UnionDeclNode*); }
+            NodeKind::ClassDeclaration       => { return this.visit_class(n as ClassDeclNode*); }
+            NodeKind::ImplementationBlock    => { return this.visit_impl(n as ImplBlockNode*); }
 
             NodeKind::Program | NodeKind::MethodDeclaration | NodeKind::IntrinsicDeclaration
             | NodeKind::IntrinsicConstDeclaration | NodeKind::ImportDeclaration
@@ -261,10 +259,12 @@ type struct IRGeneratorVisitor {
             | NodeKind::TypeAliasDeclaration | NodeKind::EnumDeclaration
             | NodeKind::EnumVariant | NodeKind::ExternBlock | NodeKind::FieldDeclaration
             | NodeKind::GenericParamDeclaration | NodeKind::MatchArm | NodeKind::StaticMatchArm
-            | NodeKind::Pattern | NodeKind::EnumPattern | NodeKind::Directive => { }
+            | NodeKind::Pattern | NodeKind::EnumPattern | NodeKind::Directive => {
+                return Emitted::none();
+            }
 
             NodeKind::Expression | NodeKind::Statement | NodeKind::Declaration
-            | NodeKind::AsyncExpression | NodeKind::Unknown => { }
+            | NodeKind::AsyncExpression | NodeKind::Unknown => { return Emitted::none(); }
         }
     }
 
@@ -310,11 +310,10 @@ type struct IRGeneratorVisitor {
         for (mut i: i64 = 0; i < stmts.length; i++) {
             const stmt: ASTNode* = stmts[i];
             if (stmt == null) { continue; }
-            // Top-level dispatch via accept(); the visit() overrides for
-            // FunctionDeclNode / ImplBlockNode / StructDeclNode /
-            // ClassDeclNode handle their own emission.  Any node kind
-            // without an override (TypeAlias, Enum, Trait, Namespace,
-            // Import, etc.) falls through to BaseASTVisitor's no-op.
+            // Top-level dispatch: the visit methods for FunctionDeclNode /
+            // ImplBlockNode / StructDeclNode / ClassDeclNode handle their own
+            // emission.  A kind with none (TypeAlias, Enum, Trait, Namespace,
+            // Import, etc.) emits nothing.
             // Top-level VarDeclNode is guarded by `is_global` inside its
             // visit() override so globals (emitted in Phase 2) are
             // re-skipped here.
@@ -364,24 +363,34 @@ type struct IRGeneratorVisitor {
     // `generate_impl_block`, `generate_method_body`,
     // `emit_base_ctor_call`).
 
-    visit_function(mut &this, node: FunctionDeclNode*) -> void {
+    visit_function(mut &this, node: FunctionDeclNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         this.decl_visit.emit_function_decl(this, node);
+        return out;
     }
 
-    visit_impl(mut &this, node: ImplBlockNode*) -> void {
+    visit_impl(mut &this, node: ImplBlockNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         this.decl_visit.emit_impl_block_visit(this, node);
+        return out;
     }
 
-    visit_struct(mut &this, node: StructDeclNode*) -> void {
+    visit_struct(mut &this, node: StructDeclNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         this.decl_visit.emit_struct_decl(this, node);
+        return out;
     }
 
-    visit_union(mut &this, node: UnionDeclNode*) -> void {
+    visit_union(mut &this, node: UnionDeclNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         this.decl_visit.emit_union_decl(this, node);
+        return out;
     }
 
-    visit_class(mut &this, node: ClassDeclNode*) -> void {
+    visit_class(mut &this, node: ClassDeclNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         this.decl_visit.emit_class_decl(this, node);
+        return out;
     }
 
 
@@ -392,26 +401,31 @@ type struct IRGeneratorVisitor {
 
     // Statement visit overrides
 
-    visit_block(mut &this, node: BlockStmtNode*) -> void {
-        this.dispatch.generate_block(this,node);
+    visit_block(mut &this, node: BlockStmtNode*) -> Emitted {
+        return this.dispatch.generate_block(this,node);
     }
 
-    visit_break(mut &this, node: BreakStmtNode*) -> void {
+    visit_break(mut &this, node: BreakStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         this.cg.flow.codegen_break();
+        return out;
     }
 
-    visit_continue(mut &this, node: ContinueStmtNode*) -> void {
+    visit_continue(mut &this, node: ContinueStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         this.cg.flow.codegen_continue();
+        return out;
     }
 
-    visit_expr_stmt(mut &this, node: ExprStmtNode*) -> void {
-        if (node.expression != null) {
-            this.dispatch.codegen_rvalue(this,node.expression);
-        }
+    /// An expression statement's value is its expression's, loaded: the
+    /// value a block-bodied match arm yields.
+    visit_expr_stmt(mut &this, node: ExprStmtNode*) -> Emitted {
+        if (node.expression == null) { return Emitted::none(); }
+        return Emitted::rvalue(this.dispatch.codegen_rvalue(this,node.expression));
     }
 
-    visit_unsafe_block(mut &this, node: UnsafeBlockStmtNode*) -> void {
-        this.dispatch.generate_block(this,node.block);
+    visit_unsafe_block(mut &this, node: UnsafeBlockStmtNode*) -> Emitted {
+        return this.dispatch.generate_block(this,node.block);
     }
 
     /// Comma-join two constraint fragments (skipping the leading comma when
@@ -428,7 +442,8 @@ type struct IRGeneratorVisitor {
     /// lowering rules in the plan: operands are numbered outputs-first, the
     /// constraint string is [outputs, inputs, tied-inouts, clobbers], and
     /// direct (register) outputs are stored back after the call.
-    visit_asm_block(mut &this, node: AsmBlockStmtNode*) -> void {
+    visit_asm_block(mut &this, node: AsmBlockStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         // Arch gating: an `![arch(X, ...)]` block is only emitted when the
         // compile target's arch matches X, so per-arch blocks can sit side
         // by side (the others are skipped here).  `arch == ""` only happens
@@ -437,9 +452,9 @@ type struct IRGeneratorVisitor {
         if (node.arch != "") {
             const _triple: string = this.cg.ctx.options.target_triple;
             if (!_triple.contains(node.arch)) {
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
         }
 
@@ -492,9 +507,9 @@ type struct IRGeneratorVisitor {
         // Module-level (naked / global) asm: no operands, emit as module asm.
         if (node.is_module_level) {
             this.cg.llvm_module.append_inline_asm(tmpl);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Build the constraint string: outputs, pure inputs, tied inouts,
@@ -646,14 +661,16 @@ type struct IRGeneratorVisitor {
             }
         }
 
-        this.state.last_value = LValue::null();
-        this.state.last_is_lvalue = false;
+        out.value = LValue::null();
+        out.is_lvalue = false;
+        return out;
     }
 
 
     // Statement visitors
 
-    visit_return(mut &this, node: ReturnStmtNode*) -> void {
+    visit_return(mut &this, node: ReturnStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         // Drops attached to the return run *after* the expression value
         // is materialised; the expression may borrow a local that's
         // about to be dropped.  See ReturnStmtNode.synth_drops and the
@@ -672,9 +689,11 @@ type struct IRGeneratorVisitor {
             }
             this.cg.expr_ops.codegen_return(LValue::null(), false, TypeRef::invalid());
         }
+        return out;
     }
 
-    visit_if(mut &this, node: IfStmtNode*) -> void {
+    visit_if(mut &this, node: IfStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
         const current_fn: LValue = this.get_current_function();
         const blocks: IfBlocks = this.cg.flow.codegen_if(cond, current_fn,
@@ -690,9 +709,11 @@ type struct IRGeneratorVisitor {
             this.cg.flow.branch_if_not_terminated(blocks.merge_bb);
         }
         this.cg.builder.position_at_end(blocks.merge_bb);
+        return out;
     }
 
-    visit_while(mut &this, node: WhileStmtNode*) -> void {
+    visit_while(mut &this, node: WhileStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const current_fn: LValue = this.get_current_function();
         const blocks: LoopBlocks = this.cg.flow.codegen_while_header(current_fn);
         this.cg.builder.position_at_end(blocks.cond_bb);
@@ -705,9 +726,11 @@ type struct IRGeneratorVisitor {
         this.cg.flow.branch_if_not_terminated(blocks.cond_bb);
         this.cg.loops.pop();
         this.cg.builder.position_at_end(blocks.merge_bb);
+        return out;
     }
 
-    visit_for(mut &this, node: ForStmtNode*) -> void {
+    visit_for(mut &this, node: ForStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const current_fn: LValue = this.get_current_function();
         this.cg.values.push_scope();
         if (node.init != null) {
@@ -735,9 +758,11 @@ type struct IRGeneratorVisitor {
         this.cg.loops.pop();
         this.cg.values.pop_scope();
         this.cg.builder.position_at_end(blocks.merge_bb);
+        return out;
     }
 
-    visit_loop(mut &this, node: LoopStmtNode*) -> void {
+    visit_loop(mut &this, node: LoopStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const current_fn: LValue = this.get_current_function();
         const blocks: LoopBlocks = this.cg.flow.codegen_loop_header(current_fn);
         this.cg.builder.position_at_end(blocks.body_bb);
@@ -747,6 +772,7 @@ type struct IRGeneratorVisitor {
         this.cg.flow.branch_if_not_terminated(blocks.body_bb);
         this.cg.loops.pop();
         this.cg.builder.position_at_end(blocks.merge_bb);
+        return out;
     }
 
     /// Storage address of a match subject when it is an addressable owning
@@ -775,15 +801,16 @@ type struct IRGeneratorVisitor {
             "no matching pattern (non-exhaustive match)");
     }
 
-    visit_match_stmt(mut &this, node: MatchStmtNode*) -> void {
-        if (node.subject == null || node.arms.length == 0) { return; }
+    visit_match_stmt(mut &this, node: MatchStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
+        if (node.subject == null || node.arms.length == 0) { return out; }
 
         const current_fn: LValue = this.get_current_function();
-        if (!current_fn.is_valid()) { return; }
+        if (!current_fn.is_valid()) { return out; }
 
         // Evaluate the subject expression.
         const subject: LValue = this.dispatch.codegen_rvalue(this,node.subject);
-        if (!subject.is_valid()) { return; }
+        if (!subject.is_valid()) { return out; }
 
         // Resolve the enum type (if subject is an enum), normalize to ptr, and
         // pre-extract the tag value for pattern comparison.
@@ -905,6 +932,7 @@ type struct IRGeneratorVisitor {
         if (!any_arm_falls_through && !merge_bb.has_terminator()) {
             this.cg.builder.build_unreachable();
         }
+        return out;
     }
 
     /// Emit a pattern-guard test block. The comparison chain branches here
@@ -939,19 +967,20 @@ type struct IRGeneratorVisitor {
     // `this.patterns` (see `pattern_emitter.cryo`); the match visit()
     // overrides at lines 715 and 3996 delegate through that field.
 
-    visit_decl_stmt(mut &this, node: DeclStmtNode*) -> void {
+    visit_decl_stmt(mut &this, node: DeclStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         if (node.declaration != null) {
-            // Double-dispatch via accept(); runtime type picks the
-            // right `override visit(VarDeclNode*)` or
-            // `override visit(DestructureDeclNode*)`.  Other declaration
-            // kinds inside a stmt-level decl are silently ignored
-            // (BaseASTVisitor's no-op default).
+            // The declaration's kind picks `visit_var` or
+            // `visit_destructure`; other declaration kinds inside a
+            // stmt-level decl emit nothing.
             this.dispatch_node(node.declaration);
         }
+        return out;
     }
 
-    visit_var(mut &this, node: VarDeclNode*) -> void {
-        if (node.is_global) { return; }
+    visit_var(mut &this, node: VarDeclNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
+        if (node.is_global) { return out; }
         mut init_val: LValue = LValue::null();
         const has_init: boolean = node.initializer != null;
         if (has_init) {
@@ -959,19 +988,21 @@ type struct IRGeneratorVisitor {
         }
         this.cg.expr_ops.codegen_local_var(node.name, node.sym_id, node.resolved_type,
                           init_val, has_init, node.span, node.is_drop_flag);
+        return out;
     }
 
     /// Lower a struct destructure declaration into N field reads + N allocas.
     /// Picks `extractvalue` (for SSA struct values) vs `struct_gep + load`
     /// (for stored structs) per source, same dispatch as codegen_member_access.
-    visit_destructure(mut &this, node: DestructureDeclNode*) -> void {
-        if (node.initializer == null) { return; }
-        if (!node.resolved_type.is_valid()) { return; }
+    visit_destructure(mut &this, node: DestructureDeclNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
+        if (node.initializer == null) { return out; }
+        if (!node.resolved_type.is_valid()) { return out; }
 
         // Pull the struct fields off the resolved type so we can map binding
         // names -> field indices.
         const ty: Type* = this.cg.arena_type(node.resolved_type);
-        if (ty == null) { return; }
+        if (ty == null) { return out; }
 
         const empty_fields: [FieldInfo] = [];
         mut fields_arr: &[FieldInfo] = &empty_fields;
@@ -982,22 +1013,20 @@ type struct IRGeneratorVisitor {
             const ct: ClassType* = ty as ClassType*;
             fields_arr = &ct.fields;
         } else {
-            return;  // sema already errored on non-struct destructure
+            return out;  // sema already errored on non-struct destructure
         }
 
         const struct_lty: LType = this.cg.type_mapper.map_type(node.resolved_type);
-        if (!struct_lty.is_valid()) { return; }
+        if (!struct_lty.is_valid()) { return out; }
 
-        // Codegen the initializer once.  `last_value`/`last_is_lvalue` after
-        // generate_expression mirror the conventions used by member-access:
-        // an alloca pointer (lvalue) or an SSA struct value (rvalue).  The
-        // LLVMTypeOf check below is the same defensive recheck that
-        // codegen_member_access does; under opaque pointers an alloca
-        // address is `ptr` (kind 12), so a kind-10 (struct) means the
-        // value is already in SSA form, regardless of last_is_lvalue.
-        this.dispatch.generate_expression(this,node.initializer);
-        const src_val: LValue = this.state.last_value;
-        if (!src_val.is_valid()) { return; }
+        // Codegen the initializer once.  What it emits mirrors the
+        // conventions used by member-access: an alloca pointer (a place) or
+        // an SSA struct value.  The LLVMTypeOf check below is the same
+        // defensive recheck that codegen_member_access does; under opaque
+        // pointers an alloca address is `ptr` (kind 12), so a kind-10
+        // (struct) means the value is already in SSA form, place or not.
+        const src_val: LValue = this.dispatch.generate_expression(this,node.initializer).value;
+        if (!src_val.is_valid()) { return out; }
 
         const src_llvm_ty: void* = llvm::LLVMTypeOf(src_val.raw);
         const src_is_struct_value: boolean = src_llvm_ty != null
@@ -1030,6 +1059,7 @@ type struct IRGeneratorVisitor {
             this.cg.expr_ops.codegen_local_var(b.local_name, b.sym_id, b.resolved_type,
                               field_val, true, b.span, false);
         }
+        return out;
     }
 
 
@@ -1040,12 +1070,13 @@ type struct IRGeneratorVisitor {
     // `this.dispatch.codegen_rvalue(this, expr)` etc.
 
     /// Generate a constant value from a literal node.
-    codegen_literal(mut &this, node: LiteralNode*) -> void {
+    codegen_literal(mut &this, node: LiteralNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         mut ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
 
         const kind: LiteralKind = node.literal_kind;
 
-        this.state.last_is_lvalue = false;
+        out.is_lvalue = false;
 
         if (kind == LiteralKind::Integer) {
             if (!ty.is_valid()) { ty = LType::i32(); }
@@ -1080,10 +1111,10 @@ type struct IRGeneratorVisitor {
                 // literal's digit string instead.
                 mut radix: u8 = 10;
                 const digits: string = CodegenUtil::int_literal_clean(node.value, &radix);
-                this.state.last_value = LType::const_int_of_string(ty, digits, radix);
+                out.value = LType::const_int_of_string(ty, digits, radix);
             } else {
                 const val: u64 = node.value.parse_int::<u64>();
-                this.state.last_value = LType::const_int(ty, val, sign_extend);
+                out.value = LType::const_int(ty, val, sign_extend);
             }
         } else if (kind == LiteralKind::Float) {
             if (!ty.is_valid()) { ty = LType::f64(); }
@@ -1092,34 +1123,36 @@ type struct IRGeneratorVisitor {
             // otherwise silently parse to `1.0`.
             const fdigits: string = CodegenUtil::float_literal_clean(node.value);
             const val: f64 = float::parse_f64(fdigits).unwrap_or(0.0);
-            this.state.last_value = LType::const_real(ty, val);
+            out.value = LType::const_real(ty, val);
         } else if (kind == LiteralKind::String) {
-            this.state.last_value = this.cg.str_cache.get_or_create(node.value, node.byte_length, &this.cg.llvm_module);
+            out.value = this.cg.str_cache.get_or_create(node.value, node.byte_length, &this.cg.llvm_module);
         } else if (kind == LiteralKind::Char) {
             // Char is stored as i32.  The lexer hands us the raw lexeme between
             // the surrounding quotes; for `'\n'` that's the two-char string
             // "\\n" (backslash + n), not the resolved 0x0A.
             // `Lexer::char_literal_value` resolves the escapes so `'\n' == 10`,
             // `'\0' == 0`, `'\u{42}' == 66`.
-            this.state.last_value = LType::const_int(LType::i32(),
+            out.value = LType::const_int(LType::i32(),
                                                Lexer::char_literal_value(node.value) as u64, false);
         } else if (kind == LiteralKind::Boolean) {
             const bval: u64 = if (node.value == "true") { 1 } else { 0 };
-            this.state.last_value = LType::const_int(LType::i1(), bval, false);
+            out.value = LType::const_int(LType::i1(), bval, false);
         } else if (kind == LiteralKind::Null) {
             // Null literal must always be a pointer type.  If resolved_type
             // mapped to void or an invalid type, fall back to i8* (void*).
             if (!ty.is_valid() || LType::kind_of(ty.raw) != LTypeKind::Pointer) {
                 ty = LType::pointer_to(LType::i8());
             }
-            this.state.last_value = LType::const_pointer_null(ty);
+            out.value = LType::const_pointer_null(ty);
         } else {
-            this.state.last_value = LValue::null();
+            out.value = LValue::null();
         }
+        return out;
     }
 
     /// Look up a named value (local, parameter, or global).
-    codegen_identifier(mut &this, node: IdentifierNode*) -> void {
+    codegen_identifier(mut &this, node: IdentifierNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         // A source-location pseudo-constant expands to the location of the
         // reference itself, which is the node's own span - or, in the body
         // of a `![caller_location]` function, to its caller's, which the
@@ -1127,12 +1160,12 @@ type struct IRGeneratorVisitor {
         match (node.res) {
             ResSlot::Answered(Res::SourceLoc(k)) => {
                 if (this.cg.decl.caller_file.is_valid()) {
-                    this.state.last_value = match (k) {
+                    out.value = match (k) {
                         SourceLoc::File => { this.cg.decl.caller_file }
                         SourceLoc::Line => { this.cg.decl.caller_line }
                     };
-                    this.state.last_is_lvalue = false;
-                    return;
+                    out.is_lvalue = false;
+                    return out;
                 }
                 match (k) {
                     SourceLoc::File => {
@@ -1140,15 +1173,15 @@ type struct IRGeneratorVisitor {
                         if (filename == null || filename.length() == 0) {
                             filename = "<unknown>";
                         }
-                        this.state.last_value = this.cg.builder.build_global_string_ptr(filename, "FILE.str");
+                        out.value = this.cg.builder.build_global_string_ptr(filename, "FILE.str");
                     }
                     SourceLoc::Line => {
                         const line: u64 = node.span.start_line as u64;
-                        this.state.last_value = LType::const_int(LType::i32(), line, false);
+                        out.value = LType::const_int(LType::i32(), line, false);
                     }
                 }
-                this.state.last_is_lvalue = false;
-                return;
+                out.is_lvalue = false;
+                return out;
             }
             _ => { }
         }
@@ -1156,9 +1189,9 @@ type struct IRGeneratorVisitor {
         // Try local/parameter first.
         const local: LValue = this.cg.values.get(node.res.local_sym());
         if (local.is_valid()) {
-            this.state.last_value = local;
-            this.state.last_is_lvalue = true;
-            return;
+            out.value = local;
+            out.is_lvalue = true;
+            return out;
         }
         // Neither a local nor a parameter: the stamp names the definition
         // canonically.  A global is that name's namespace and leaf - two
@@ -1174,35 +1207,37 @@ type struct IRGeneratorVisitor {
         if (def_id.is_valid()) {
             const global: LValue = this.cg.resolver.resolve_global_of_def(def_id);
             if (global.is_valid()) {
-                this.state.last_value    = global;
-                this.state.last_is_lvalue = true;
-                return;
+                out.value    = global;
+                out.is_lvalue = true;
+                return out;
             }
         }
 
         if (node.resolved_callee.is_some()) {
             const func: LValue = this.cg.resolver.resolve_pinned(node.resolved_callee);
             if (func.is_valid()) {
-                this.state.last_value    = func;
-                this.state.last_is_lvalue = false;
-                return;
+                out.value    = func;
+                out.is_lvalue = false;
+                return out;
             }
         }
 
-        this.state.last_value    = LValue::null();
-        this.state.last_is_lvalue = false;
+        out.value    = LValue::null();
+        out.is_lvalue = false;
+        return out;
     }
 
 
     /// Materialize a struct literal `{ field: value, ... }` into a stack alloca
-    /// and store each field.  Writes the alloca's address to `this.state.last_value`
-    /// with `this.state.last_is_lvalue=true`; rvalue users load through it.
-    codegen_struct_literal(mut &this, struct_type: TypeRef, field_names: [SymbolStr], field_pins: [MemberPin], field_values: [LValue], site_span: SourceSpan) -> void {
+    /// and store each field.  Gives the alloca's address as a place; rvalue
+    /// users load through it.
+    codegen_struct_literal(mut &this, struct_type: TypeRef, field_names: [SymbolStr], field_pins: [MemberPin], field_values: [LValue], site_span: SourceSpan) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const ty: LType = this.cg.type_mapper.map_type(struct_type);
         if (!ty.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Get the current function for entry block alloca.
@@ -1211,18 +1246,18 @@ type struct IRGeneratorVisitor {
             this.cg.diag.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
                 "codegen: struct literal: builder has no insert block",
                 site_span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
         const current_fn: LValue = current_bb.get_parent();
         if (!current_fn.is_valid()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
                 "codegen: struct literal: insert block has no parent function",
                 site_span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "structlit", ty);
@@ -1253,9 +1288,9 @@ type struct IRGeneratorVisitor {
                         }
                     }
                 }
-                this.state.last_value = alloca;
-                this.state.last_is_lvalue = true;
-                return;
+                out.value = alloca;
+                out.is_lvalue = true;
+                return out;
             }
         }
 
@@ -1386,19 +1421,21 @@ type struct IRGeneratorVisitor {
             this.cg.builder.build_store(val, gep);
         }
 
-        this.state.last_value = alloca;
-        this.state.last_is_lvalue = true;
+        out.value = alloca;
+        out.is_lvalue = true;
+        return out;
     }
 
 
     /// Materialize a tuple literal `(a, b, c)` into a stack alloca and store
     /// each element.  Same lvalue convention as `codegen_struct_literal`.
-    codegen_tuple_literal(mut &this, tuple_type: TypeRef, element_values: [LValue], site_span: SourceSpan) -> void {
+    codegen_tuple_literal(mut &this, tuple_type: TypeRef, element_values: [LValue], site_span: SourceSpan) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const ty: LType = this.cg.type_mapper.map_type(tuple_type);
         if (!ty.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         const current_bb: LBasicBlock = this.cg.builder.get_insert_block();
@@ -1406,18 +1443,18 @@ type struct IRGeneratorVisitor {
             this.cg.diag.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
                 "codegen: tuple literal: builder has no insert block",
                 site_span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
         const current_fn: LValue = current_bb.get_parent();
         if (!current_fn.is_valid()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
                 "codegen: tuple literal: insert block has no parent function",
                 site_span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "tuplit", ty);
@@ -1430,66 +1467,65 @@ type struct IRGeneratorVisitor {
             }
         }
 
-        this.state.last_value = alloca;
-        this.state.last_is_lvalue = true;
+        out.value = alloca;
+        out.is_lvalue = true;
+        return out;
     }
 
 
-    visit_literal(mut &this, node: LiteralNode*) -> void {
-        this.codegen_literal(node);
+    visit_literal(mut &this, node: LiteralNode*) -> Emitted {
+        return this.codegen_literal(node);
     }
 
-    visit_identifier(mut &this, node: IdentifierNode*) -> void {
-        this.codegen_identifier(node);
+    visit_identifier(mut &this, node: IdentifierNode*) -> Emitted {
+        return this.codegen_identifier(node);
     }
 
-    visit_member_access(mut &this, node: MemberAccessNode*) -> void {
-        const obj: LValue = this.dispatch.codegen_lvalue(this,node.object);
-        // Mirror codegen_array_access: capture last_is_lvalue from
-        // generating the receiver expression. `f().field` leaves
-        // last_is_lvalue=false so the autoderef inside member-access
-        // codegen knows not to over-load the call's pointer rvalue.
-        const obj_is_lvalue: boolean = this.state.last_is_lvalue;
-        this.places.codegen_member_access(obj, node.object.resolved_type,
+    visit_member_access(mut &this, node: MemberAccessNode*) -> Emitted {
+        // The receiver as it was emitted, place or value: `f().field` gives
+        // a value, so the autoderef inside member-access codegen knows not
+        // to over-load the call's pointer rvalue.
+        const obj_e: Emitted = this.dispatch.generate_expression(this, node.object);
+        const obj: LValue = obj_e.value;
+        const obj_is_lvalue: boolean = obj_e.is_lvalue;
+        return this.places.codegen_member_access(obj, node.object.resolved_type,
                                           obj_is_lvalue, node.member,
                                           node.resolved_member, node.pin_carried,
                                           node.span);
     }
 
-    visit_array_access(mut &this, node: ArrayAccessNode*) -> void {
+    visit_array_access(mut &this, node: ArrayAccessNode*) -> Emitted {
         // Index operator overloading: sema rewrote `a[i]` on a user type (or a
         // generic param bounded by `Index`) into `*(a.index(i))` and hung it on
         // `desugared_call`.  Delegate to that expression with a plain
-        // generate_expression - do NOT force an rvalue.  The `*` emitter leaves
-        // `last_is_lvalue = true` (the deref is a place), so the enclosing
+        // generate_expression - do NOT force an rvalue.  The `*` emitter gives
+        // a place (the deref), so the enclosing
         // codegen_rvalue / codegen_lvalue caller decides load-vs-address.  This
         // single delegation covers reads (`v = a[i]`), writes (`a[i] = x`), and
         // compound assignment (`a[i] += x`), calling `index` exactly once.
         if (node.desugared_call != null) {
-            this.dispatch.generate_expression(this, node.desugared_call);
-            return;
+            return this.dispatch.generate_expression(this, node.desugared_call);
         }
         // Tuple bracket indexing is a struct GEP. Sema validated the
         // index at compile time, so we can read the literal value
         // here and skip codegen_array_access entirely (which is sized
         // around dynamic-index arrays/strings/pointers).
-        if (this.places.try_codegen_tuple_index(this, node)) {
-            return;
+        match (this.places.try_codegen_tuple_index(this, node)) {
+            Option::Some(e) => { return e; }
+            Option::None    => { }
         }
-        const arr: LValue = this.dispatch.codegen_lvalue(this,node.array);
-        // codegen_lvalue is misnamed; it doesn't enforce lvalue-ness,
-        // it just returns whatever generate_expression produced.  For
-        // `f()[i]` the call leaves last_is_lvalue=false, telling the
-        // array-access codegen to skip the lvalue load it would do
-        // for a stored pointer.
-        const arr_is_lvalue: boolean = this.state.last_is_lvalue;
+        // The array as it was emitted, a place or a value: `f()[i]` gives a
+        // value, telling the array access to skip the load it does for a
+        // stored pointer.
+        const arr_e: Emitted = this.dispatch.generate_expression(this, node.array);
         const idx: LValue = this.dispatch.codegen_rvalue(this,node.index);
-        this.places.codegen_array_access(arr, node.array.resolved_type,
-                                         arr_is_lvalue, idx,
+        return this.places.codegen_array_access(arr_e.value, node.array.resolved_type,
+                                         arr_e.is_lvalue, idx,
                                          node.span, this, &node.unwind_cleanup);
     }
 
-    visit_cast(mut &this, node: CastExprNode*) -> void {
+    visit_cast(mut &this, node: CastExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const src_t: Type* = this.cg.arena_type(node.expression.resolved_type);
         const dst_t: Type* = this.cg.arena_type(node.resolved_target);
         const dst_is_ptr_like: boolean = dst_t != null &&
@@ -1506,12 +1542,12 @@ type struct IRGeneratorVisitor {
             const addr: LValue = this.dispatch.codegen_lvalue(this,node.expression);
             const dst_lty: LType = this.cg.type_mapper.map_type(node.resolved_target);
             if (addr.is_valid() && dst_lty.is_valid()) {
-                this.state.last_value = this.cg.builder.build_pointer_cast(
+                out.value = this.cg.builder.build_pointer_cast(
                     addr, dst_lty, "upcast");
             } else {
-                this.state.last_value = addr;
+                out.value = addr;
             }
-            this.state.last_is_lvalue = false;
+            out.is_lvalue = false;
         } else if (src_t != null && dst_is_ptr_like &&
                    src_t.kind == TypeKind::Array) {
             // A fixed array (`[N x T]`) to a pointer or a string: its
@@ -1520,18 +1556,19 @@ type struct IRGeneratorVisitor {
             const dst_lty: LType = this.cg.type_mapper.map_type(node.resolved_target);
             const addr: LValue = this.dispatch.codegen_lvalue(this,node.expression);
             if (addr.is_valid() && dst_lty.is_valid()) {
-                this.state.last_value = this.cg.builder.build_pointer_cast(
+                out.value = this.cg.builder.build_pointer_cast(
                     addr, dst_lty, "arrcast");
             } else {
-                this.state.last_value = addr;
+                out.value = addr;
             }
-            this.state.last_is_lvalue = false;
+            out.is_lvalue = false;
         } else {
             const val: LValue = this.dispatch.codegen_rvalue(this,node.expression);
-            this.state.last_value = this.cg.expr_ops.codegen_cast(val, node.expression.resolved_type,
+            out.value = this.cg.expr_ops.codegen_cast(val, node.expression.resolved_type,
                                                    node.resolved_target);
-            this.state.last_is_lvalue = false;
+            out.is_lvalue = false;
         }
+        return out;
     }
 
     /// The operand of a `sizeof`/`alignof` is decided by sema (a body's) or
@@ -1548,22 +1585,26 @@ type struct IRGeneratorVisitor {
         return operand;
     }
 
-    visit_sizeof(mut &this, node: SizeofExprNode*) -> void {
-        this.state.last_value = this.cg.expr_ops.codegen_sizeof(
+    visit_sizeof(mut &this, node: SizeofExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
+        out.value = this.cg.expr_ops.codegen_sizeof(
             this.layout_operand("sizeof", node.operand_type, node.span));
-        this.state.last_is_lvalue = false;
+        out.is_lvalue = false;
+        return out;
     }
 
-    visit_alignof(mut &this, node: AlignofExprNode*) -> void {
-        this.state.last_value = this.cg.expr_ops.codegen_alignof(
+    visit_alignof(mut &this, node: AlignofExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
+        out.value = this.cg.expr_ops.codegen_alignof(
             this.layout_operand("alignof", node.operand_type, node.span));
-        this.state.last_is_lvalue = false;
+        out.is_lvalue = false;
+        return out;
     }
 
-    visit_if_expr(mut &this, node: IfExprNode*) -> void {
+    visit_if_expr(mut &this, node: IfExprNode*) -> Emitted {
         // IfExpr has the same field layout as TernaryExpr; delegate
         // to keep a single codegen path for both shapes.
-        this.visit_ternary(node as TernaryExprNode*);
+        return this.visit_ternary(node as TernaryExprNode*);
     }
 
 
@@ -1573,39 +1614,39 @@ type struct IRGeneratorVisitor {
     /// assignment, compound assignment, short-circuit `&&` / `||` (via
     /// `bin_un.short_circuit`), and all arithmetic / bitwise / shift /
     /// comparison ops.
-    visit_binary(mut &this, node: BinaryExprNode*) -> void {
-        this.bin_un.emit_binary(this, node);
+    visit_binary(mut &this, node: BinaryExprNode*) -> Emitted {
+        return this.bin_un.emit_binary(this, node);
     }
 
     /// Unary expression: delegate to BinaryUnaryEmitter.  Handles
     /// negate / not / bitnot / address-of / dereference / pre & post
     /// inc & dec.
-    visit_unary(mut &this, node: UnaryExprNode*) -> void {
-        this.bin_un.emit_unary(this, node);
+    visit_unary(mut &this, node: UnaryExprNode*) -> Emitted {
+        return this.bin_un.emit_unary(this, node);
     }
 
     /// Call expression: delegate to CallEmitter.  Handles all call shapes
     /// - identifier / method / scope-resolution / ctor / intrinsic /
     /// vtable-dispatched - plus the post-call `unreachable` emission for
     /// divergent (non-returning) callees.
-    visit_call(mut &this, node: CallExprNode*) -> void {
-        this.calls.emit(this, node);
+    visit_call(mut &this, node: CallExprNode*) -> Emitted {
+        return this.calls.emit(this, node);
     }
 
 
     /// Tuple literal: Sema tags `resolved_type` with the arena's
     /// TupleType (deduped by element types), so the layout follows
     /// `map_tuple` (anonymous LLVM struct of element types in order).
-    visit_tuple_literal(mut &this, node: TupleLiteralNode*) -> void {
+    visit_tuple_literal(mut &this, node: TupleLiteralNode*) -> Emitted {
         const type_ref: TypeRef = node.resolved_type;
         mut element_values: [LValue] = [];
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             element_values.push(this.dispatch.codegen_rvalue(this,node.elements[i]));
         }
-        this.codegen_tuple_literal(type_ref, element_values, node.span);
+        return this.codegen_tuple_literal(type_ref, element_values, node.span);
     }
 
-    visit_struct_literal(mut &this, node: StructLiteralNode*) -> void {
+    visit_struct_literal(mut &this, node: StructLiteralNode*) -> Emitted {
         // Use the sema-tagged `resolved_type`: it is the type sema resolved the
         // literal to from the name layer's stamp, and codegen does not resolve
         // the spelling again.
@@ -1619,22 +1660,21 @@ type struct IRGeneratorVisitor {
             field_pins.push(init.pin);
             field_values.push(this.dispatch.codegen_rvalue(this,init.value));
         }
-        this.codegen_struct_literal(type_ref, field_names, field_pins, field_values, node.span);
+        return this.codegen_struct_literal(type_ref, field_names, field_pins, field_values, node.span);
     }
 
     /// Array literal: delegate to ArrayLitEmitter, which handles all three
     /// shapes (fixed `[a,b,c]`, dynamic `[a,b,c]: [T]`, fill `[v; N]`).
-    /// Element recursion flows through `dispatch.codegen_rvalue`; result
-    /// lands on `state.last_value`.
-    visit_array_literal(mut &this, node: ArrayLiteralNode*) -> void {
-        this.array_lit.emit(this, node);
+    /// Element recursion flows through `dispatch.codegen_rvalue`.
+    visit_array_literal(mut &this, node: ArrayLiteralNode*) -> Emitted {
+        return this.array_lit.emit(this, node);
     }
 
     /// Lambda expression: delegate to LambdaEmitter (anonymous-function
     /// name minting, parameter / return type resolution, body emission via
-    /// `accept(this)` recursion).  Result lands on `state.last_value`.
-    visit_lambda(mut &this, node: LambdaExprNode*) -> void {
-        this.lambda.emit(this, node);
+    /// the visitor's dispatch).
+    visit_lambda(mut &this, node: LambdaExprNode*) -> Emitted {
+        return this.lambda.emit(this, node);
     }
 
     /// A qualified path in VALUE position: a function taken as a value, an
@@ -1643,14 +1683,15 @@ type struct IRGeneratorVisitor {
     /// looked up by the spelling.  A path sema pinned nothing for and that
     /// names no variant or global yields no value, which is the front end's
     /// miss reported as the front end's (sema already diagnosed it).
-    visit_scope_resolution(mut &this, node: ScopeResolutionNode*) -> void {
+    visit_scope_resolution(mut &this, node: ScopeResolutionNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         // 1. A function: sema's pin, routed as a call's pin is.
         if (node.resolved_callee.is_some()) {
             const fn_val: LValue = this.cg.resolver.resolve_pinned(node.resolved_callee);
             if (fn_val.is_valid()) {
-                this.state.last_value    = fn_val;
-                this.state.last_is_lvalue = false;
-                return;
+                out.value    = fn_val;
+                out.is_lvalue = false;
+                return out;
             }
         }
 
@@ -1658,7 +1699,10 @@ type struct IRGeneratorVisitor {
         // `resolved_type`: it names the enum this path denotes, through any
         // chain of instantiations, and a member it has no variant for is not
         // an enum reference at all.
-        if (this.try_emit_enum_variant(node)) { return; }
+        match (this.try_emit_enum_variant(node)) {
+            Option::Some(e) => { return e; }
+            Option::None    => { }
+        }
 
         // 3. A global: the registration slot sema pinned, read back from
         // the index by the slot.  Sema found it under the module the
@@ -1669,16 +1713,17 @@ type struct IRGeneratorVisitor {
             MemberPin::Global(slot) => {
                 const global: LValue = this.cg.resolver.resolve_global_at(slot);
                 if (global.is_valid()) {
-                    this.state.last_value    = global;
-                    this.state.last_is_lvalue = true;
-                    return;
+                    out.value    = global;
+                    out.is_lvalue = true;
+                    return out;
                 }
             }
             _ => { }
         }
 
-        this.state.last_value    = LValue::null();
-        this.state.last_is_lvalue = false;
+        out.value    = LValue::null();
+        out.is_lvalue = false;
+        return out;
     }
 
     /// Emit `Enum::Variant` as its discriminant, or false when this path does
@@ -1687,7 +1732,7 @@ type struct IRGeneratorVisitor {
     /// The enum comes from sema's `resolved_type`, through any chain of
     /// instantiations, so a generic enum is answered by the type it was
     /// instantiated to rather than by its declaration.
-    try_emit_enum_variant(mut &this, node: ScopeResolutionNode*) -> boolean {
+    try_emit_enum_variant(mut &this, node: ScopeResolutionNode*) -> Option<Emitted> {
         mut real_ref: TypeRef = node.resolved_type;
         mut real_t: Type* = this.cg.arena_type(real_ref);
         mut sr_depth: i32 = 0;
@@ -1699,16 +1744,14 @@ type struct IRGeneratorVisitor {
             } else { break; }
             sr_depth += 1;
         }
-        if (real_t == null || real_t.kind != TypeKind::Enum) { return false; }
+        if (real_t == null || real_t.kind != TypeKind::Enum) { return Option::None; }
 
         const et: EnumType* = real_t as EnumType*;
         const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, node.resolved_member);
-        if (variant == null) { return false; }
+        if (variant == null) { return Option::None; }
 
         mut no_args: [LValue] = [];
-        this.state.last_value = this.enum_variant.build(et, variant, real_ref, no_args);
-        this.state.last_is_lvalue = false;
-        return true;
+        return Option::Some(Emitted::rvalue(this.enum_variant.build(et, variant, real_ref, no_args)));
     }
 
     /// Match expression: produces a value via phi node.
@@ -1716,55 +1759,57 @@ type struct IRGeneratorVisitor {
     /// to a value and the merge block collects them with a phi.
     /// Static match used as an expression. The monomorphizer reduced it to a
     /// single live arm, so there is no discriminant, no per-arm basic blocks,
-    /// no phi, and no no-match trap: just emit the one arm's block. Its
-    /// trailing expression statement leaves the produced value in
-    /// `state.last_value` (the same contract a match-expression arm body
-    /// relies on), which we coerce to the node's resolved type for width
-    /// consistency at the use site.
-    visit_static_match_expr(mut &this, node: StaticMatchExprNode*) -> void {
+    /// no phi, and no no-match trap: just emit the one arm's block. The
+    /// block's value is its trailing expression statement's (the same
+    /// contract a match-expression arm body relies on), which we coerce to
+    /// the node's resolved type for width consistency at the use site.
+    visit_static_match_expr(mut &this, node: StaticMatchExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         if (node.arms.length == 0 || node.arms[0] == null ||
             node.arms[0].body == null) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
-        this.dispatch.generate_statement(this, node.arms[0].body);
-        mut v: LValue = this.state.last_value;
+        mut v: LValue = this.dispatch.generate_statement(this, node.arms[0].body).value;
         const result_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         if (v.is_valid() && result_ty.is_valid()) {
             v = IRGeneratorVisitor::coerce_to_phi_type(this.cg, v, result_ty, node.resolved_type);
         }
-        this.state.last_value = v;
-        this.state.last_is_lvalue = false;
+        out.value = v;
+        out.is_lvalue = false;
+        return out;
     }
 
     /// Static match used as a statement (void arms, e.g. an `Atomic<T>::store`
     /// body). Emit the single live arm's block for effect; ignore any value.
-    visit_static_match_stmt(mut &this, node: StaticMatchStmtNode*) -> void {
+    visit_static_match_stmt(mut &this, node: StaticMatchStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         if (node.arms.length == 0 || node.arms[0] == null ||
-            node.arms[0].body == null) { return; }
-        this.dispatch.generate_statement(this, node.arms[0].body);
+            node.arms[0].body == null) { return out; }
+        return this.dispatch.generate_statement(this, node.arms[0].body);
     }
 
-    visit_match_expr(mut &this, node: MatchExprNode*) -> void {
+    visit_match_expr(mut &this, node: MatchExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         if (node.subject == null || node.arms.length == 0) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         const current_fn: LValue = this.get_current_function();
         if (!current_fn.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         const subject: LValue = this.dispatch.codegen_rvalue(this,node.subject);
         if (!subject.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         const subject_addr: LValue = this.match_subject_addr(node.subject);
@@ -1844,8 +1889,7 @@ type struct IRGeneratorVisitor {
             // a block with a trailing expression or a single expression statement.
             mut arm_val: LValue = LValue::null();
             if (arm.body != null) {
-                this.dispatch.generate_statement(this,arm.body);
-                arm_val = this.state.last_value;
+                arm_val = this.dispatch.generate_statement(this,arm.body).value;
             }
 
             const arm_end: LBasicBlock = this.cg.builder.get_insert_block();
@@ -1909,17 +1953,19 @@ type struct IRGeneratorVisitor {
         if (phi_count > 0 && result_ty.is_valid()) {
             const phi: LValue = this.cg.builder.build_phi(result_ty, "mexpr.val");
             phi.add_incoming(phi_vals, phi_blks, phi_count);
-            this.state.last_value = phi;
+            out.value = phi;
         } else {
-            this.state.last_value = LValue::null();
+            out.value = LValue::null();
         }
-        this.state.last_is_lvalue = false;
+        out.is_lvalue = false;
 
         libc::free(phi_vals);
         libc::free(phi_blks);
+        return out;
     }
 
-    visit_ternary(mut &this, node: TernaryExprNode*) -> void {
+    visit_ternary(mut &this, node: TernaryExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
         const current_fn: LValue = this.get_current_function();
         const then_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.then");
@@ -1985,55 +2031,56 @@ type struct IRGeneratorVisitor {
         if (n > 0 && ty.is_valid()) {
             const phi: LValue = this.cg.builder.build_phi(ty, "ternary");
             phi.add_incoming(vals, blks, n);
-            this.state.last_value = phi;
+            out.value = phi;
         } else {
             // Both arms diverged; `merge_bb` is unreachable and there is no
             // value to produce.
-            this.state.last_value = LValue::null();
+            out.value = LValue::null();
         }
         libc::free(vals);
         libc::free(blks);
-        this.state.last_is_lvalue = false;
+        out.is_lvalue = false;
+        return out;
     }
 
     /// Try operator `expr?`: sema lowered it to an equivalent `match`
     /// stored on `desugared`, so codegen just emits that.  `desugared` is
     /// non-null for any `TryExprNode` that passed semantic analysis; a null
     /// here means sema rejected the operand, and a diagnostic already fired.
-    visit_try(mut &this, node: TryExprNode*) -> void {
+    visit_try(mut &this, node: TryExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         if (node.desugared != null) {
-            this.dispatch_node(node.desugared);
-            return;
+            return this.dispatch_node(node.desugared);
         }
         this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: `?` operator was not lowered by semantic analysis",
             node.span);
-        this.state.last_value     = LValue::null();
-        this.state.last_is_lvalue = false;
+        out.value     = LValue::null();
+        out.is_lvalue = false;
+        return out;
     }
 
     /// New expression (heap allocation): delegate to NewDeleteEmitter.
-    visit_new(mut &this, node: NewExprNode*) -> void {
-        this.new_delete.emit_new(this, node);
+    visit_new(mut &this, node: NewExprNode*) -> Emitted {
+        return this.new_delete.emit_new(this, node);
     }
 
     /// Delete expression (heap free): delegate to NewDeleteEmitter.
     /// Runs the pointee's drop method (if any) then frees the allocation.
-    visit_delete(mut &this, node: DeleteExprNode*) -> void {
-        this.new_delete.emit_delete(this, node);
+    visit_delete(mut &this, node: DeleteExprNode*) -> Emitted {
+        return this.new_delete.emit_delete(this, node);
     }
 
 
     // Unsupported AST node kinds
     //
     // The parser builds these nodes for syntactic completeness, but no
-    // codegen lowering exists yet.  Without these overrides the default
-    // no-op in BaseASTVisitor leaves `last_value` stale from the previous
-    // expression, which the caller would silently consume; a real
-    // miscompile vector.  Emit a clear diagnostic instead and clear
-    // `last_value` so downstream code fails loudly rather than wrongly.
+    // codegen lowering exists for them by the time codegen runs.  Emit a
+    // clear diagnostic and give no value, so downstream code fails loudly
+    // rather than wrongly.
 
-    visit_await(mut &this, node: AwaitExprNode*) -> void {
+    visit_await(mut &this, node: AwaitExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         // The async lowering (`sema/async_lower.cryo`) rewrites every `await` in
         // an `async function` into an explicit poll state machine, so a surviving
         // `AwaitExprNode` here was never lowered. Two causes: an `await` outside
@@ -2048,27 +2095,33 @@ type struct IRGeneratorVisitor {
         this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: this `await` was never lowered; it is either outside an `async function` (a lambda body is its own function) or inside a `switch`, which the async lowering does not walk - lift it out of that form, or bind it to a `const` before it",
             node.span);
-        this.state.last_value     = LValue::null();
-        this.state.last_is_lvalue = false;
+        out.value     = LValue::null();
+        out.is_lvalue = false;
+        return out;
     }
 
-    visit_yield(mut &this, node: YieldExprNode*) -> void {
+    visit_yield(mut &this, node: YieldExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: 'yield' expressions are not implemented",
             node.span);
-        this.state.last_value     = LValue::null();
-        this.state.last_is_lvalue = false;
+        out.value     = LValue::null();
+        out.is_lvalue = false;
+        return out;
     }
 
-    visit_typeof(mut &this, node: TypeofExprNode*) -> void {
+    visit_typeof(mut &this, node: TypeofExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: 'typeof' expressions are not implemented",
             node.span);
-        this.state.last_value     = LValue::null();
-        this.state.last_is_lvalue = false;
+        out.value     = LValue::null();
+        out.is_lvalue = false;
+        return out;
     }
 
-    visit_do_while(mut &this, node: DoWhileStmtNode*) -> void {
+    visit_do_while(mut &this, node: DoWhileStmtNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const current_fn: LValue = this.get_current_function();
         const blocks: LoopBlocks = this.cg.flow.codegen_do_while_header(current_fn);
         // Body first (runs at least once).
@@ -2083,6 +2136,7 @@ type struct IRGeneratorVisitor {
         this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
         this.cg.loops.pop();
         this.cg.builder.position_at_end(blocks.merge_bb);
+        return out;
     }
 
     /// Coerce `val` to match `expected` for use as a phi-node operand.  LLVM

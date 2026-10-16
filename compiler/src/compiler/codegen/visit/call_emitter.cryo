@@ -13,7 +13,7 @@
 /// expressions (`dispatch`), look up symbols (`cg.resolver`), and
 /// construct enum variant values (`enum_variant`).  The visitor passes
 /// itself as `IRGeneratorVisitor*` so element-expression evaluation can recurse
-/// via `accept(visitor)` through `dispatch.codegen_rvalue`.
+/// through `dispatch.codegen_rvalue`.
 
 namespace compiler::codegen::visit::call_emitter;
 
@@ -21,7 +21,7 @@ import compiler::codegen;
 import compiler::codegen::{ abi, context, llvm, llvm_types, type_map, util };
 import compiler::codegen::util::{ CodegenUtil };
 import compiler::codegen::state::visitor_state;
-import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::codegen::state::visitor_state::{ Emitted, VisitorState };
 import compiler::codegen::visit::{ expr_dispatch, enum_variant_emitter };
 import compiler::intrinsic_kind;
 import compiler::intrinsic_kind::{ IntrinsicKind };
@@ -197,7 +197,8 @@ type struct CallEmitter {
     /// the call site's sret/byval attributes can be read off it, and both
     /// come from `plan`, classified from the value's Cryo function type.
     call_through_value(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*,
-                       fn_ptr: LValue, plan: SignaturePlan) -> void {
+                       fn_ptr: LValue, plan: SignaturePlan) -> Emitted {
+        mut out: Emitted = Emitted::none();
         // The seam returns `void` when sret applies, else the Direct
         // return slot's type; a void call gets no result name.
         mut ret_ty: LType = LType::void_type();
@@ -212,9 +213,10 @@ type struct CallEmitter {
         const void_ty: LType = LType::void_type();
         const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
         const fn_type: LType = plan.llvm_fn_type;
-        this.state.last_value = this.reshape_call_result(node,
+        out.value = this.reshape_call_result(node,
             this.cg.expr_ops.codegen_call_with_plan(fn_ptr, fn_type, plan, call_args, call_name));
-        this.state.last_is_lvalue = false;
+        out.is_lvalue = false;
+        return out;
     }
 
     /// A call's result at its source type.  When the callee returns a
@@ -259,11 +261,11 @@ type struct CallEmitter {
 
     // Main emit
 
-    /// Lower `node.callee(args)` into LLVM IR.  Mirrors the visitor's
-    /// `override visit(CallExprNode*)`; the visitor passes itself as
-    /// `visitor: IRGeneratorVisitor*` so argument expressions can recurse via
-    /// `accept(visitor)` through `dispatch.codegen_rvalue`.
-    emit(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> void {
+    /// Lower `node.callee(args)` into LLVM IR.  The visitor's `visit_call`
+    /// delegates here, passing itself as `visitor: IRGeneratorVisitor*` so
+    /// argument expressions can recurse through `dispatch.codegen_rvalue`.
+    emit(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         mut callee_val: LValue = LValue::null();
 
         // Break pointer chains into locals (see the codegen helper note).
@@ -287,7 +289,10 @@ type struct CallEmitter {
             // entry, and the module carries an extern declaration for it
             // (from declare_function) that nothing defines, so a real call
             // would fail the link with `undefined reference`.
-            if (this.emit_pinned_intrinsic(visitor, node)) { return; }
+            match (this.emit_pinned_intrinsic(visitor, node)) {
+                Option::Some(e) => { return e; }
+                Option::None    => { }
+            }
 
             // Trust sema: `resolved_callee` is the mangled LLVM symbol
             // chosen by overload resolution (or, for unique-name
@@ -387,9 +392,9 @@ type struct CallEmitter {
                             // Load the constructed value as the expression result.
                             const loaded: LValue = this.cg.builder.build_load(
                                 mapped, obj_alloca, "ctor.val");
-                            this.state.last_value = loaded;
-                            this.state.last_is_lvalue = false;
-                            return;
+                            out.value = loaded;
+                            out.is_lvalue = false;
+                            return out;
                         }
                     }
                 }
@@ -420,15 +425,14 @@ type struct CallEmitter {
                         const plan: SignaturePlan = this.cg.abi.classify_signature(
                             ft.param_types, ft.return_type, false);
                         if (!plan.llvm_fn_type.is_valid()) {
-                            this.state.last_value = LValue::null();
-                            this.state.last_is_lvalue = false;
-                            return;
+                            out.value = LValue::null();
+                            out.is_lvalue = false;
+                            return out;
                         }
                         // Load the function pointer from the alloca.
                         const fn_ptr_llvm: LType = LType::pointer_to(LType::i8());
                         const fn_ptr: LValue = this.cg.builder.build_load(fn_ptr_llvm, local, "fn.ptr.load");
-                        this.call_through_value(visitor, node, fn_ptr, plan);
-                        return;
+                        return this.call_through_value(visitor, node, fn_ptr, plan);
                     }
                 }
             }
@@ -444,7 +448,10 @@ type struct CallEmitter {
             // is lowered inline BEFORE the pin is resolved as a callee: the
             // declaration table would declare the pinned symbol as an extern
             // and the link would look for a `ptr_diff` nothing defines.
-            if (this.emit_pinned_intrinsic(visitor, node)) { return; }
+            match (this.emit_pinned_intrinsic(visitor, node)) {
+                Option::Some(e) => { return e; }
+                Option::None    => { }
+            }
 
             // Sema's pin is the whole answer for a static call: written by
             // sema's static-method / module-function / C-import paths, or by
@@ -489,9 +496,9 @@ type struct CallEmitter {
                             vargs.push(this.dispatch.codegen_rvalue(visitor,node.arguments[ai]));
                         }
                         const result: LValue = this.enum_variant.build(et, variant, real_ref, vargs);
-                        this.state.last_value = result;
-                        this.state.last_is_lvalue = false;
-                        return;
+                        out.value = result;
+                        out.is_lvalue = false;
+                        return out;
                     }
                 }
             }
@@ -530,21 +537,20 @@ type struct CallEmitter {
                 const plan: SignaturePlan = this.cg.abi.classify_signature(
                     ft.param_types, ft.return_type, false);
                 if (!plan.llvm_fn_type.is_valid()) {
-                    this.state.last_value = LValue::null();
-                    this.state.last_is_lvalue = false;
-                    return;
+                    out.value = LValue::null();
+                    out.is_lvalue = false;
+                    return out;
                 }
                 // Load the fn-pointer value from the field (rvalue).  No
                 // implicit `this`: the field holds a plain function, not a
                 // bound method.
                 const fn_ptr: LValue = this.dispatch.codegen_rvalue(visitor,ma);
                 if (!fn_ptr.is_valid()) {
-                    this.state.last_value = LValue::null();
-                    this.state.last_is_lvalue = false;
-                    return;
+                    out.value = LValue::null();
+                    out.is_lvalue = false;
+                    return out;
                 }
-                this.call_through_value(visitor, node, fn_ptr, plan);
-                return;
+                return this.call_through_value(visitor, node, fn_ptr, plan);
             }
 
             // Get the object's type, unwrapping pointer/reference.
@@ -640,18 +646,17 @@ type struct CallEmitter {
                 const plan: SignaturePlan = this.cg.abi.classify_signature(
                     ft.param_types, ft.return_type, false);
                 if (!plan.llvm_fn_type.is_valid()) {
-                    this.state.last_value = LValue::null();
-                    this.state.last_is_lvalue = false;
-                    return;
+                    out.value = LValue::null();
+                    out.is_lvalue = false;
+                    return out;
                 }
                 const fn_ptr: LValue = this.dispatch.codegen_rvalue(visitor,node.callee);
                 if (!fn_ptr.is_valid()) {
-                    this.state.last_value = LValue::null();
-                    this.state.last_is_lvalue = false;
-                    return;
+                    out.value = LValue::null();
+                    out.is_lvalue = false;
+                    return out;
                 }
-                this.call_through_value(visitor, node, fn_ptr, plan);
-                return;
+                return this.call_through_value(visitor, node, fn_ptr, plan);
             }
             callee_val = this.dispatch.codegen_rvalue(visitor,node.callee);
         }
@@ -673,9 +678,9 @@ type struct CallEmitter {
                                this.cg.ctx.generic_registry,
                                this.cg.get_intern(),
                                dma.object.resolved_type)) {
-                    this.state.last_value = LValue::null();
-                    this.state.last_is_lvalue = false;
-                    return;
+                    out.value = LValue::null();
+                    out.is_lvalue = false;
+                    return out;
                 }
                 // Drop glue: the release of a non-Copy aggregate with no
                 // destructor is expanded into in-place releases of its
@@ -689,9 +694,9 @@ type struct CallEmitter {
                                dma.object.resolved_type)) {
                     if (this.emit_drop_glue(visitor, dma.object,
                                             dma.object.resolved_type)) {
-                        this.state.last_value = LValue::null();
-                        this.state.last_is_lvalue = false;
-                        return;
+                        out.value = LValue::null();
+                        out.is_lvalue = false;
+                        return out;
                     }
                 }
             }
@@ -703,9 +708,9 @@ type struct CallEmitter {
                 "internal: code generation found nothing to call for this call; monomorphization reports an unbound call before code generation, so this should never happen");
             diag = diag.at(node.span);
             this.cg.diag.emit(diag);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // `Pair<LValue, TypeRef>` per arg; the type drives sext-vs-zext
@@ -733,14 +738,15 @@ type struct CallEmitter {
                                 || recv_t.kind == TypeKind::Reference)) {
                 obj = this.dispatch.codegen_rvalue(visitor,ma.object);
             } else {
-                obj = this.dispatch.codegen_lvalue(visitor,ma.object);
+                const obj_e: Emitted = this.dispatch.generate_expression(visitor, ma.object);
+                obj = obj_e.value;
                 // A value-typed receiver that is an rvalue - a literal
                 // (`"x".method()`), a call result, or a method-chain result
-                // (`a.f().g()`) - has no backing storage, so `codegen_lvalue`
-                // hands back the VALUE rather than an address.  Using that as
+                // (`a.f().g()`) - has no backing storage, so emitting it
+                // gives the VALUE rather than an address.  Using that as
                 // `&this` is one indirection short and crashes the callee.
                 // Spill it to a fresh slot so `this` points at real memory.
-                if (obj.is_valid() && !this.state.last_is_lvalue) {
+                if (obj.is_valid() && !obj_e.is_lvalue) {
                     const recv_ty: LType = LType { raw: llvm::LLVMTypeOf(obj.raw) };
                     const recv_slot: LValue = this.entry_spill_slot(recv_ty, "recvtmp");
                     this.cg.builder.build_store(obj, recv_slot);
@@ -826,9 +832,9 @@ type struct CallEmitter {
             this.cg.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
                 "codegen: call expression: failed to retrieve function type from callee",
                 node.span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Virtual dispatch: replace the direct callee with a vtable-loaded
@@ -991,8 +997,9 @@ type struct CallEmitter {
             this.cg.builder.build_unreachable();
         }
 
-        this.state.last_value = result;
-        this.state.last_is_lvalue = false;
+        out.value = result;
+        out.is_lvalue = false;
+        return out;
     }
 
     /// Register an already-materialized owning temp `slot` for drop on the unwind
@@ -1124,16 +1131,15 @@ type struct CallEmitter {
     /// call is a function call, or names an intrinsic the dispatcher
     /// declines (an arity it does not take), which then goes through the
     /// pin as a call.
-    emit_pinned_intrinsic(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> boolean {
+    emit_pinned_intrinsic(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> Option<Emitted> {
         const kind: IntrinsicKind = this.pinned_intrinsic_kind(node);
-        if (kind == IntrinsicKind::Call) { return false; }
+        if (kind == IntrinsicKind::Call) { return Option::None; }
         // `try_catch(body, data)` - the catch_unwind primitive.  Needs an
         // `invoke` + a catch-all landing pad + a phi (control flow the
         // generic `try_emit` inline path cannot build), so it is special-
         // lowered here rather than by the inline dispatcher.
         if (kind == IntrinsicKind::TryCatch) {
-            this.emit_catch_unwind(visitor, node);
-            return true;
+            return Option::Some(this.emit_catch_unwind(visitor, node));
         }
         // `args` is scoped to this call: it is built and moved into
         // `try_emit` unconditionally, so nothing is left conditionally
@@ -1154,26 +1160,22 @@ type struct CallEmitter {
             && (node.unwind_cleanup.length > 0
                 || this.cg.expr_ops.has_live_arg_temps())
             && args.length >= 3) {
-            this.emit_panic_unwind(visitor, node, args[0], args[1], args[2]);
-            return true;
+            return Option::Some(this.emit_panic_unwind(visitor, node, args[0], args[1], args[2]));
         }
         return match (this.cg.intrinsics.try_emit(kind, args)) {
-            Option::Some(v) => {
-                this.state.last_value = v;
-                this.state.last_is_lvalue = false;
-                true
-            }
-            Option::None => { false }
+            Option::Some(v) => { Option::Some(Emitted::rvalue(v)) }
+            Option::None    => { Option::None }
         };
     }
 
     emit_panic_unwind(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*,
-                      msg: LValue, file: LValue, line: LValue) -> void {
+                      msg: LValue, file: LValue, line: LValue) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const cur_fn: LValue = this.get_current_function();
         if (!cur_fn.is_valid()) {
             // No enclosing function to hang a landing pad on; diverge plainly.
             this.cg.intrinsics.emit_panic_call(msg, file, line);
-            return;
+            return out;
         }
         const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "panic.cont");
         const lpad_bb: LBasicBlock = LBasicBlock::append(cur_fn, "panic.lpad");
@@ -1202,8 +1204,9 @@ type struct CallEmitter {
         // Cleanup pad: drop the frame's live locals, then resume the unwind.
         this.emit_cleanup_landingpad(visitor, node, cur_fn, lpad_bb);
 
-        this.state.last_value = LValue::null();
-        this.state.last_is_lvalue = false;
+        out.value = LValue::null();
+        out.is_lvalue = false;
+        return out;
     }
 
     /// Lower the `try_catch(body, data)` catch_unwind primitive.  `body` is an
@@ -1231,31 +1234,32 @@ type struct CallEmitter {
     /// `__cryo_panic_taken_*` symbols.  The default path never reaches here (the
     /// stdlib `catch_unwind` is generic and uninstantiated unless a program
     /// calls it), so this leaves the default IR byte-identical.
-    emit_catch_unwind(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> void {
+    emit_catch_unwind(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         if (node.arguments.length != 2) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
                 "codegen: try_catch expects exactly two arguments (body, data)",
                 node.span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         if (!this.cg.ctx.options.unwinds()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
                 "`catch_unwind` requires the unwinding panic strategy; rebuild with `--panic=unwind` (or set `panic = \"unwind\"` in cryoconfig). Under the default `--panic=abort` a panic terminates the process, so there is nothing to catch.",
                 node.span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         const body_ptr: LValue = this.dispatch.codegen_rvalue(visitor, node.arguments[0]);
         const data_ptr: LValue = this.dispatch.codegen_rvalue(visitor, node.arguments[1]);
         if (!body_ptr.is_valid() || !data_ptr.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Trampoline LLVM type: `void (ptr)`.
@@ -1275,9 +1279,9 @@ type struct CallEmitter {
         const cur_fn: LValue = this.get_current_function();
         if (!cur_fn.is_valid()) {
             libc::free(arg_buf);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "cu.cont");
@@ -1324,8 +1328,9 @@ type struct CallEmitter {
         libc::free(vals_buf);
         libc::free(blks_buf);
 
-        this.state.last_value = phi;
-        this.state.last_is_lvalue = false;
+        out.value = phi;
+        out.is_lvalue = false;
+        return out;
     }
 
     /// The callee's Cryo `FunctionType` when an argument MIGHT need the Win64

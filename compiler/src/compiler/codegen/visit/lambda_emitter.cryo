@@ -3,23 +3,21 @@
 /// Lambda-expression lowering: mint a unique anonymous function symbol,
 /// resolve its parameter and return types, materialise the function in
 /// the current LLVM module, bind parameters to allocas, recurse the body
-/// through the visitor (so each statement dispatches to the right
-/// `override visit(...)`), and surface the resulting function-pointer
-/// LValue back through the visitor's `state` return channel.
+/// through the visitor's dispatch, and return the resulting
+/// function-pointer value.
 ///
 /// Holds `cg: CodegenContext*` (heavy machinery - type mapper, function
 /// registry, IR-flow allocas, builder) and `state: VisitorState*` (for
 /// the per-module `lambda_counter`).  The visitor passes itself as
-/// `IRGeneratorVisitor*` so body statements can recurse via `accept(visitor)`
-/// without importing the concrete `IRGeneratorVisitor` type (which
-/// would form a module-graph cycle).
+/// `IRGeneratorVisitor*` so body statements can recurse through its
+/// dispatch.
 
 namespace compiler::codegen::visit::lambda_emitter;
 
 import compiler::codegen;
 import compiler::codegen::{ context, llvm, llvm_types, util };
 import compiler::codegen::state::visitor_state;
-import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::codegen::state::visitor_state::{ Emitted, VisitorState };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::diag;
@@ -94,16 +92,16 @@ type struct LambdaEmitter {
     /// so this module doesn't have to import the concrete visitor type
     /// (cycle-avoidance - `ir_generator.cryo` already imports this module
     /// to hold a `LambdaEmitter` field).
-    emit(mut &this, visitor: IRGeneratorVisitor*, node: LambdaExprNode*) -> void {
+    emit(mut &this, visitor: IRGeneratorVisitor*, node: LambdaExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         if (node == null) {
-            this.state.last_value     = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value     = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         if (node.is_capturing()) {
-            this.emit_capturing(visitor, node);
-            return;
+            return this.emit_capturing(visitor, node);
         }
 
         const ctx_ptr: CompilationContext* = this.cg.ctx;
@@ -175,9 +173,9 @@ type struct LambdaEmitter {
 
         if (!params_valid) {
             libc::free(param_buf);
-            this.state.last_value     = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value     = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Build LLVM function
@@ -185,9 +183,9 @@ type struct LambdaEmitter {
         libc::free(param_buf);
         const fn_val: LValue  = this.cg.llvm_module.add_function(MangledName::new(lam_name), fn_type);
         if (!fn_val.is_valid()) {
-            this.state.last_value     = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value     = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Register so that cross-module references can find it.
@@ -222,9 +220,7 @@ type struct LambdaEmitter {
             this.cg.values.set(param.sym_id, alloca);
         }
 
-        // Generate the body.  Inline the small generate_block / accept loop
-        // here so this module doesn't have to call back through the visitor
-        // for the helpers (which aren't on ASTVisitor).
+        // Generate the body: the small generate_block loop, inline.
         if (node.body != null) {
             if (node.body.kind == NodeKind::BlockStatement) {
                 const blk: BlockStmtNode* = node.body as BlockStmtNode*;
@@ -275,8 +271,9 @@ type struct LambdaEmitter {
         }
 
         // The value of a lambda expression is the function pointer itself.
-        this.state.last_value     = fn_val;
-        this.state.last_is_lvalue = false;
+        out.value     = fn_val;
+        out.is_lvalue = false;
+        return out;
     }
 
     /// Capturing-lambda codegen: materialise a value of the closure struct
@@ -291,14 +288,15 @@ type struct LambdaEmitter {
     /// lives on the synthesised `<closure_struct>::__call__` method,
     /// emitted by ordinary method codegen when the StructDecl Sema
     /// injected reaches Phase 7's codegen sweep.
-    emit_capturing(mut &this, visitor: IRGeneratorVisitor*, node: LambdaExprNode*) -> void {
+    emit_capturing(mut &this, visitor: IRGeneratorVisitor*, node: LambdaExprNode*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const closure_ty: TypeRef = node.resolved_type;
         if (!closure_ty.is_valid()) {
             // Sema should have set this; if not, fall back to a null value
             // and let downstream verification catch the bug.
-            this.state.last_value     = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value     = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         const arena: TypeArena* = this.cg.ctx.type_arena;
@@ -328,8 +326,8 @@ type struct LambdaEmitter {
         }
 
         // Dispatch through the visitor so the existing StructLiteral
-        // codegen path runs (alloca, GEP-store per field, set
-        // state.last_value to the alloca address with last_is_lvalue=true).
-        visitor.dispatch_node(lit);
+        // codegen path runs (alloca, GEP-store per field), giving the
+        // alloca's address as a place.
+        return visitor.dispatch_node(lit);
     }
 }
