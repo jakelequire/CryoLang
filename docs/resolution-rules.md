@@ -149,6 +149,63 @@ yet is recorded with the change that builds it, not here.
      declaration-site text follows the written spelling (ruling 369).
      (Dispatch, delegated)
 
+382. **An AST node is a header struct of the fields every kind shares plus
+     a `kind` enum of pointers to per-kind structs** (`Expr { span, ...,
+     kind: ExprKind }`), not a bare enum value as the handle: identity stays
+     the address, an absent child stays `null`, and the header is a field.
+     (Jake)
+
+383. **Each node struct carries its own small `Allocate` implementation**
+     over the AST arena, about 75 of them, rather than factories that
+     allocate from the arena directly.  (Jake)
+
+384. **Borrowed trait objects are built inside the class removal:** after
+     the compiler is free of classes and before the class feature is
+     deleted, reusing the class vtable emission rather than deleting and
+     rewriting it.  (Jake)
+
+385. **Declarations and expressions convert kind by kind under a temporary
+     bridge variant; patterns and statements convert all at once.**  The
+     bridge is temporary in fact: each category ends with its bridge
+     deleted, every bridge piece is tracked until it is, and the final
+     audit finds none left.  (Jake)
+
+386. **Tests of the class feature are deleted with it; tests that use a
+     class incidentally are ported to structs.**  (Jake)
+
+387. **Constructors and destructors written in a struct body are removed
+     along with classes;** a struct is built by a `static` factory and
+     released by `Drop`.  Their use is measured before they go.  (Jake)
+
+388. **The removed class syntax is refused with one new error code,** with
+     a help line per form saying what to write instead.  (Jake)
+
+389. **The visitors' side channels become return values in a commit of
+     their own,** after the dispatch change and apart from it.  (Jake)
+
+390. **`TypeKind` is derived from the type's data as a follow-up** to the
+     type conversion, not in it.  (Jake)
+
+391. **The trait-object error codes and the vtable symbol's spelling are
+     chosen by the implementation** and reported.  (Jake)
+
+392. **The language server's yield hook becomes a `virtual YieldHook*`**
+     once trait objects exist, as the compiler's own use of them.  (Jake)
+
+393. **A supertrait's methods are callable directly on a subtrait
+     object;** the subtrait's table holds the supertrait's slots.  (Jake)
+
+394. **`protected` is removed** with classes.  (Jake)
+
+395. **`![caller_location]` on a variadic function or method is refused
+     (E0151)** where the directive is written.  The hidden location
+     follows the written arguments, and a variadic call's written
+     arguments have no fixed end.  (Dispatch, delegated)
+
+396. **`delete p` releases `*p` as a scope exit releases a value of the
+     pointee type:** its `Drop`, if it has one, then the values its fields
+     own; then the storage is returned.  (Dispatch, delegated)
+
 ### 2026-10-15
 
 347. **Fixed-size arrays change syntax with dynamic ones:** `T[N]` is

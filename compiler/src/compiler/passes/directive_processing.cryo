@@ -1088,7 +1088,7 @@ type struct DirectiveProcessingPasses {
                 return;
             }
             if (name.eq("caller_location")) {
-                fn.is_caller_located = true;
+                DirectiveProcessingPasses::apply_caller_location(ctx, dir, fn);
                 return;
             }
             if (name.eq("implicit")) {
@@ -1280,7 +1280,9 @@ type struct DirectiveProcessingPasses {
                 return;
             }
             if (name.eq("caller_location")) {
-                if (m.func != null) { m.func.is_caller_located = true; }
+                if (m.func != null) {
+                    DirectiveProcessingPasses::apply_caller_location(ctx, dir, m.func);
+                }
                 return;
             }
             // `![symbol("sym")]` on a method: pin the LLVM symbol of the wrapped
@@ -1358,6 +1360,25 @@ type struct DirectiveProcessingPasses {
         diag = diag.suggest(Suggestion::machine_applicable(
             dir.span, "",
             fmt::format("remove the misplaced `![%s]` directive", name.as_string())));
+        ctx.emit_diagnostic(diag);
+    }
+
+    /// Mark `fn` as taking its caller's location, or refuse the directive
+    /// when `fn` is variadic: the hidden `(file, line)` pair follows the
+    /// written arguments, and a variadic call's written arguments have no
+    /// fixed end for the pair to follow.
+    static apply_caller_location(ctx: CompilationContext*, dir: DirectiveNode*,
+                                 fn: FunctionDeclNode*) -> void {
+        if (!fn.is_variadic) {
+            fn.is_caller_located = true;
+            return;
+        }
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0151_DIRECTIVE_MISPLACED,
+            "`![caller_location]` cannot be applied to a variadic function: its caller's location would be passed among the variadic arguments");
+        diag = diag.at(dir.span);
+        diag = diag.suggest(Suggestion::machine_applicable(
+            dir.span, "",
+            "remove the `![caller_location]` directive"));
         ctx.emit_diagnostic(diag);
     }
 

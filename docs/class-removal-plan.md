@@ -13,9 +13,9 @@ and measured only; nothing in it was built except two throwaway probes
 (section 2.6).  The decisions it needs are in section 9; nothing in a slice
 that depends on one starts before it is answered.
 
-**Status.**  The 13 decisions in section 9 are pending Jake.  Slices 0 and
-1, which depend on none of them, are built; their results are recorded
-under each slice in section 6.
+**Status.**  The 13 decisions in section 9 are answered.  Slices 0 and 1
+are built; their results are recorded under each slice in section 6.
+Every temporary bridge piece is listed in section 10 until it is deleted.
 
 **Prerequisite:** the array unification is finished (it has landed).  The
 node shapes below hold their children in `[T]` (`Array<T>`); the pin of
@@ -1183,7 +1183,32 @@ group finds an identity defect, as the naming migration's groups did.
 
 ---
 
-## 9. Decisions needed
+## 9. Decisions
+
+**Answered by Jake** (rulings 382-394 in `docs/resolution-rules.md`):
+
+| # | answer |
+|---|---|
+| 1 | A: a header struct with a `kind` enum of per-kind struct pointers (382) |
+| 2 | A: one small `Allocate` implementation per node struct (383) |
+| 3 | B: folded in, after the compiler is class-free and before the class feature is deleted, reusing the class vtable code (384) |
+| 4 | A for declarations and expressions, B for patterns and statements; the bridge is deleted at the end of each category and tracked in section 10 until it is (385) |
+| 5 | A: class-feature tests deleted, incidental users ported to structs (386) |
+| 6 | A: removed with classes, after measuring their use (387) |
+| 7 | A: one new code, a help line per form; the code and wording are proposed in a report first (388) |
+| 8 | A: a separate commit after the dispatch change (389) |
+| 9 | B, as a follow-up after slice 4 (390) |
+| 10 | the implementing agent's call, reported (391) |
+| 11 | A: the yield hook becomes `virtual YieldHook*` (392) |
+| 12 | A: supertrait methods callable directly on the object (393) |
+| 13 | A: `protected` removed (394) |
+
+The two bugs the plan found on the way are fixed first, since the arena and
+the conversion lean on `delete` and drop: `![caller_location]` on a variadic
+function is refused (395), and `delete` releases the fields the pointee
+owns (396).
+
+The options as they were put:
 
 1. **Node shape.**
    - A) A header struct owning a `kind` enum of payload pointers
@@ -1269,3 +1294,15 @@ group finds an identity defect, as the naming migration's groups did.
     - B) Kept as a reserved word.
 
     Lean A.
+
+---
+
+## 10. Bridge pieces still standing
+
+Every piece of code that exists only to carry the tree from one shape to the
+next is listed here when it is written and struck when it is deleted.  The
+final audit greps for each name listed and expects none.
+
+| piece | where | written in | deleted when |
+|---|---|---|---|
+| (none yet) | | | |

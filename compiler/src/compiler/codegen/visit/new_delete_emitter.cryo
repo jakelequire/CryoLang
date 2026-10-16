@@ -7,10 +7,9 @@
 /// pointer as `this`.
 ///
 /// `delete ptr` is the manual-memory dual of an end-of-scope drop:
-/// if the pointee has a Drop impl, synthesise a `ptr.drop()` method
-/// call (routed through the visitor's normal method-dispatch path so
-/// inherent/trait/virtual drops all reach the right symbol), then hand
-/// the pointer to the `Allocate`'s `release`, or free it.
+/// release the pointee as a scope exit releases a value of its type
+/// (its `Drop`, then the fields it owns), then hand the pointer to the
+/// `Allocate`'s `release`, or free it.
 ///
 /// Holds the same back-pointer bundle as CallEmitter (cg, state,
 /// dispatch, enum_variant) - both modules construct heap objects and
@@ -42,8 +41,10 @@ import std::collections::pair::{ Pair };
 import std::fmt;
 import compiler::ast::expression::{
     CallExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
-    MemberAccessNode, NewExprNode, StructLiteralNode
+    MemberAccessNode, NewExprNode, StructLiteralNode, UnaryExprNode
 };
+import compiler::lex;
+import compiler::lex::{ Token, TokenType };
 import compiler::ast::statement::{ ExprStmtNode };
 import compiler::ast::declaration;
 import compiler::ast::declaration::{ ImplBlockNode, MethodNode };
@@ -478,14 +479,15 @@ type struct NewDeleteEmitter {
 
     emit_delete(mut &this, visitor: ASTVisitor*, node: DeleteExprNode*) -> void {
         // `delete ptr` is the manual-memory dual of an end-of-scope drop:
-        //   1. Run the pointee's drop method, if it has one.
+        //   1. Release the pointee as a scope exit releases a value of its
+        //      type: its destructor, if it has one, then its owned fields.
         //   2. Free the allocation.
         // The operand is evaluated exactly once (see below): the pointer
-        // is spilled to a temp slot, the drop is synthesized as a
-        // `.drop()` on a synthetic local reading that slot - bound to the
-        // pointee's `Drop` implementation by identity, and emitted through
-        // the normal method-dispatch path, so virtual class destructors
-        // reach the right symbol - and the same spilled pointer is freed.  This
+        // is spilled to a temp slot, the release is synthesized as
+        // `(*recv).drop()` on a synthetic local reading that slot - bound to
+        // the pointee's `Drop` implementation by identity, or left for the
+        // type's glue when it has none - and the same spilled pointer is
+        // freed.  This
         // makes side-effecting operands (`delete arr.pop()`) safe: the
         // side effects fire once and the destructor and `free` see the
         // identical pointer.
@@ -522,8 +524,8 @@ type struct NewDeleteEmitter {
         mut should_drop: boolean = false;
         if (pointee.is_valid() && arena_ptr != null && registry_ptr != null
                 && intern_ptr != null) {
-            should_drop = OwnershipQuery::type_implements_drop(arena_ptr, registry_ptr,
-                                                               intern_ptr, pointee);
+            should_drop = OwnershipQuery::needs_drop(arena_ptr, registry_ptr,
+                                                     intern_ptr, pointee);
         }
 
         // Evaluate the operand exactly once.  A side-effecting operand
@@ -541,11 +543,11 @@ type struct NewDeleteEmitter {
 
         if (should_drop) {
             // Bind the already-evaluated pointer to a synthetic local so
-            // the drop dispatch (which re-codegens its receiver node) reads
-            // the spilled value instead of re-evaluating `node.operand`.
-            // The slot mirrors a real `T*` local - it holds the pointer
-            // value - so the receiver auto-deref in method dispatch behaves
-            // identically to a direct `node.operand.drop()`.
+            // the release (which re-codegens its receiver node) reads the
+            // spilled value instead of re-evaluating `node.operand`.  The
+            // release is `(*recv).drop()`, the one a scope exit gives a value
+            // of the pointee's type: its destructor, if it has one, then the
+            // release of the fields it owns.
             const slot_ty: LType = LType::pointer_to(LType::i8());
             // Hoisted to the entry block: `delete` in a loop body would
             // otherwise leave one spill slot behind per iteration.  The slot
@@ -561,12 +563,18 @@ type struct NewDeleteEmitter {
             mut recv: IdentifierNode* = new IdentifierNode(recv_sym, node.span);
             recv.set_res(Res::Local(recv_bind));
             recv.set_resolved_type(node.operand.resolved_type);
+            const deref_tok: Token = Token::new(TokenType::Star, "*",
+                node.span.start_line as int, node.span.start_col as int);
+            mut target: UnaryExprNode* = new UnaryExprNode(
+                deref_tok, recv as ExpressionNode*, node.span);
+            target.is_synthetic = true;
+            target.set_resolved_type(pointee);
             mut member: MemberAccessNode* = new MemberAccessNode(
-                recv as ExpressionNode*, drop_sym, node.span, node.span);
+                target as ExpressionNode*, drop_sym, node.span, node.span);
             member.set_resolved_type(TypeRef::invalid());
             mut call: CallExprNode* = new CallExprNode(
                 member as ExpressionNode*, node.span);
-            this.cg.bind_pointee_destructor_call(call, pointee);
+            this.cg.bind_destructor_call(call);
             mut stmt: ExprStmtNode* = new ExprStmtNode(
                 call as ExpressionNode*, node.span);
             stmt.accept(visitor);
