@@ -648,6 +648,16 @@ type struct ExprOps {
     /// type isn't known (low-level callers wiring up malloc/free/abort
     /// with already-matched widths); invalid slots fall back to `zext`.
     codegen_call(mut &this, callee: LValue, callee_type: LType, args: [Pair<LValue, TypeRef>], name: string) -> LValue {
+        return this.codegen_call_via(callee, callee, callee_type, args, name);
+    }
+
+    /// `codegen_call` of `callee`, a function or a pointer to one, passing
+    /// arguments and the result the way the function `declared` declares
+    /// them: its `sret` and `byval` parameters.  A pointer carries no
+    /// parameter attributes, so a call through one loaded from a vtable
+    /// names the method it stands for here.
+    codegen_call_via(mut &this, callee: LValue, declared: LValue, callee_type: LType,
+                     args: [Pair<LValue, TypeRef>], name: string) -> LValue {
         // Phase 1 - sret marshalling.  If the callee was declared with
         // `sret(%T)` on parameter slot 0, the LLVM-level signature is
         // `void f(ptr sret(%T), ...source params...)`.  Allocate a result
@@ -656,7 +666,7 @@ type struct ExprOps {
         // struct value back to upstream callers by loading from the
         // slot.  This keeps `codegen_call`'s contract intact: callers
         // still get a struct value back from a struct-returning call.
-        const sret_pointee: LType = this.abi.sret_pointee_of(callee);
+        const sret_pointee: LType = this.abi.sret_pointee_of(declared);
         if (sret_pointee.is_valid()) {
             const cur_bb: LBasicBlock = this.builder.get_insert_block();
             mut fn_for_alloca: LValue = LValue::null();
@@ -666,7 +676,7 @@ type struct ExprOps {
             if (!fn_for_alloca.is_valid()) {
                 // No enclosing function - extremely unusual; fall back
                 // to the legacy path rather than crashing on alloca.
-                return this.codegen_call_direct(callee, callee_type, args, name);
+                return this.codegen_call_direct_via(callee, declared, callee_type, args, name);
             }
             const slot: LValue = this.flow.create_entry_alloca(
                 fn_for_alloca, "sret.tmp", sret_pointee);
@@ -682,8 +692,8 @@ type struct ExprOps {
                 marshalled.push(Pair::<LValue, TypeRef>::new(args[ai].first, args[ai].second));
             }
 
-            const call_val: LValue = this.codegen_call_direct(
-                callee, callee_type, marshalled, "");
+            const call_val: LValue = this.codegen_call_direct_via(
+                callee, declared, callee_type, marshalled, "");
             if (call_val.is_valid()) {
                 this.abi.apply_sret_call_attribute(call_val, sret_pointee);
             }
@@ -695,7 +705,7 @@ type struct ExprOps {
             return loaded;
         }
 
-        return this.codegen_call_direct(callee, callee_type, args, name);
+        return this.codegen_call_direct_via(callee, declared, callee_type, args, name);
     }
 
     /// Variant of `codegen_call` for callees whose ABI cannot be
@@ -1228,6 +1238,13 @@ type struct ExprOps {
     /// of `codegen_call` so the sret-marshalling wrapper can call
     /// through to the same coercion logic.
     codegen_call_direct(mut &this, callee: LValue, callee_type: LType, args: [Pair<LValue, TypeRef>], name: string) -> LValue {
+        return this.codegen_call_direct_via(callee, callee, callee_type, args, name);
+    }
+
+    /// `codegen_call_direct` of `callee` with the `byval` parameters of
+    /// the function `declared` (see `codegen_call_via`).
+    codegen_call_direct_via(mut &this, callee: LValue, declared: LValue, callee_type: LType,
+                            args: [Pair<LValue, TypeRef>], name: string) -> LValue {
         mut out_value: LValue = LValue::null();
         const n: u32 = args.length as u32;
 
@@ -1258,7 +1275,7 @@ type struct ExprOps {
         // taking a 9-16 byte aggregate by value), not just extern-C.
         if (param_types_buf != null && expected_count > n) {
             const r: LValue = this.codegen_call_direct_dp_expand(
-                callee, callee_type, args, param_types_buf, expected_count, name);
+                callee, declared, callee_type, args, param_types_buf, expected_count, name);
             libc::free(param_types_buf);
             return r;
         }
@@ -1285,7 +1302,7 @@ type struct ExprOps {
         // attributes onto the matching call-site slots.  In this 1:1 path
         // each source arg fills exactly one LLVM slot, so the LLVM slot
         // index equals the source ordinal and `n` slots were emitted.
-        this.apply_byval_call_attributes(callee, out_value, n);
+        this.apply_byval_call_attributes(declared, out_value, n);
 
         return out_value;
     }
@@ -1326,7 +1343,7 @@ type struct ExprOps {
     /// LLVM type in every case.  Reached via the early dispatch in
     /// `codegen_call_direct` (when `expected_count > n`); ordinary
     /// Cryo-internal calls hit this, not just extern-C.
-    codegen_call_direct_dp_expand(mut &this, callee: LValue, callee_type: LType,
+    codegen_call_direct_dp_expand(mut &this, callee: LValue, declared: LValue, callee_type: LType,
                                   args: [Pair<LValue, TypeRef>],
                                   param_types_buf: void*, expected_count: u32,
                                   name: string) -> LValue {
@@ -1497,7 +1514,7 @@ type struct ExprOps {
         // call mixing a DirectPair arg with a byval arg silently dropped
         // the byval attribute (ABI break: the backend treated the
         // pointer as aliasing rather than a by-value copy).
-        this.apply_byval_call_attributes(callee, out, expected_count);
+        this.apply_byval_call_attributes(declared, out, expected_count);
 
         return out;
     }
