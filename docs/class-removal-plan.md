@@ -1070,7 +1070,7 @@ every visitor.
 - Codegen's `state.last_value` / `last_is_lvalue` are gone (290 writes,
   18 reads).  Every emitter returns an `Emitted` (`value`, `is_lvalue`):
   the 47 `visit_*` methods, `dispatch_node`, `ExprDispatch`'s
-  `generate_*`, and the 22 helper emitters that wrote the channel.  The
+  `generate_*`, and the 21 helper emitters that wrote the channel.  The
   three that answered "handled" with a `boolean` and left the value on the
   channel (`emit_pinned_intrinsic`, `try_emit_enum_variant`,
   `try_codegen_tuple_index`) return `Option<Emitted>`.
@@ -1085,8 +1085,8 @@ every visitor.
   returned.
 - A one-off codemod (`scripts/emit-codemod.py`) rewrote the producers
   (accumulator, `return;`, the call-then-return folds); the reads it could
-  not prove were converted by hand.  It is in the commit that ran it and
-  deleted in the next.
+  not prove were converted by hand.  It is in the commit that ran it
+  (`783aac22`) and deleted in the next.
 - **Measured.**  verify `--require-identical`: 0 objects moved.  Check
   time x3 against the pin built from part 1: 7.91 s and 7.96 s; peak
   1529.5 and 1529.0 MiB; nodes and arena identical.  Clean build 0
