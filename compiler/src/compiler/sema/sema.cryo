@@ -8,11 +8,10 @@
 /// codegen's `IRGeneratorVisitor`.
 ///
 /// `resolve_expr` is the authoritative `match (kind)` expression dispatch; each
-/// arm delegates to a collaborator (or to a resolver kept here).  The expression
-/// `visit(...)` overrides are thin seam delegates that stash
-/// `state.last_expr_type` so collaborators can recurse via
-/// `dispatch.resolve_expr(visitor, child)` without importing this concrete type.
-/// Statement / declaration `visit(...)` overrides carry the real walk logic.
+/// arm delegates to a collaborator (or to a resolver kept here), and returns
+/// the expression's type.  A collaborator holding the `SemaVisitor*` recurses
+/// through `resolve_expr` and `dispatch_node`.  The statement and declaration
+/// `visit_*` methods carry the walk logic.
 ///
 /// This file also keeps the methods that inherently drive the walk or the
 /// per-function frame (enter_function, visit_methods, the symbolic-walk drivers),
@@ -54,7 +53,7 @@ import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResSlot, SourceLoc };
 import compiler::decl_index::{ DeclarationIndex, OverloadId };
 import compiler::sema::{
     state, helpers, scope_manager, type_utils, literal_resolver, diagnostics,
-    dispatch, symbolic_checker, method_binding, pattern_resolver,
+    symbolic_checker, method_binding, pattern_resolver,
     lambda_synth, async_lower, member_resolver, call_resolver
 };
 import std::core::{ option, mem };
@@ -107,7 +106,6 @@ import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
 import compiler::sema::async_lower::{ AsyncLower, AsyncOwner };
 import compiler::sema::call_resolver::{ CallResolver };
 import compiler::sema::diagnostics::{ Diagnostics };
-import compiler::sema::dispatch::{ SemaDispatch };
 import compiler::sema::helpers::{
     is_constant_numeric_expr, is_narrow_float_type, is_numeric_literal_expr,
     is_wide_int_type, is_zero_int_literal, sema_i32_max_mag, try_fold_const_i64
@@ -235,7 +233,6 @@ type struct SemaVisitor {
     types:    TypeUtils;
     literals: LiteralResolver;
     diag:     Diagnostics;
-    dispatch: SemaDispatch;
     symbolic: SymbolicChecker;
     binding:  MethodBinding;
     patterns: PatternResolver;
@@ -261,7 +258,6 @@ type struct SemaVisitor {
             types:       TypeUtils::null(),
             literals:    LiteralResolver::null(),
             diag:        Diagnostics::null(),
-            dispatch:    SemaDispatch::null(),
             symbolic:    SymbolicChecker::null(),
             binding:     MethodBinding::null(),
             patterns:    PatternResolver::null(),
@@ -280,19 +276,18 @@ type struct SemaVisitor {
         this.types.wire(this.arena, this.intern, this.ctx, &this.checker);
         this.literals.wire(this.arena, this.ctx, &this.state);
         this.diag.wire(this.arena, this.intern, this.ctx, &this.state, &this.types);
-        this.dispatch.wire(this.ctx, &this.state);
         this.symbolic.wire(this.arena, this.ctx, &this.state, &this.types);
         this.binding.wire(this.arena, this.intern, this.ctx, &this.state, &this.types, &this.symbolic);
         this.patterns.wire(this.arena, this.intern, this.ctx, &this.state, &this.types,
                            &this.symbolic, &this.scopes);
         this.lambda.wire(this.arena, this.intern, this.ctx, &this.state, &this.symbolic,
-                         &this.scopes, &this.dispatch);
+                         &this.scopes);
         this.async_lower.wire(this.arena, this.intern, this.ctx, &this.patterns, &this.literals, &this.member);
         this.member.wire(this.arena, this.intern, this.ctx, &this.checker, &this.state, &this.types,
-                         &this.symbolic, &this.binding, &this.diag, &this.dispatch);
+                         &this.symbolic, &this.binding, &this.diag);
         this.calls.wire(this.arena, this.intern, this.ctx, &this.checker, &this.state, &this.types,
                         &this.literals, &this.diag, &this.binding, &this.symbolic, &this.member,
-                        &this.lambda, &this.scopes, &this.dispatch);
+                        &this.lambda, &this.scopes);
     }
 
     /// A wired visitor for a pass that synthesizes calls after sema has run
@@ -1615,8 +1610,8 @@ type struct SemaVisitor {
 
     // -- Dispatch by kind --
 
-    /// Hand `n` to the check for its kind.  An expression's type is left on
-    /// `state.last_expr_type`.  The kinds with no check of their own are
+    /// Hand `n` to the check for its kind; an expression's type is what
+    /// `resolve_expr` returns.  The kinds with no check of their own are
     /// reached through their owners (a method through its implement block, a
     /// match arm through its match) or need none.
     dispatch_node(mut &this, n: ASTNode*) -> void {
@@ -1633,7 +1628,7 @@ type struct SemaVisitor {
             | NodeKind::ArrayAccess | NodeKind::MemberAccess | NodeKind::ScopeResolution
             | NodeKind::TypeofExpression | NodeKind::DeleteExpression | NodeKind::AwaitExpression
             | NodeKind::YieldExpression | NodeKind::TryExpression => {
-                this.state.last_expr_type = this.resolve_expr(n as ExpressionNode*);
+                this.resolve_expr(n as ExpressionNode*);
             }
 
             NodeKind::BlockStatement         => { this.visit_block(n as BlockStmtNode*); }

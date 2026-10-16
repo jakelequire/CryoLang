@@ -1049,6 +1049,30 @@ every visitor.
   15,848,181; peak 1544.3 -> 1530.0 MiB.  Clean build 0 warnings.
   Classes 100 -> 95.
 
+**Built (3b, return values), part 1.**
+
+- The type check's expression channel is gone.  `SemaDispatch` had become
+  a pass-through (reset the channel, dispatch, read it back), so it is
+  deleted with its module; a collaborator calls
+  `visitor.resolve_expr(e)` or `visitor.dispatch_node(s)` on the
+  `SemaVisitor*` it is handed, and `SemaState.last_expr_type` is gone.
+- The cloner's `result` field is gone.  Every `visit_*` set it exactly
+  once, as its last statement (checked by the codemod, which refused
+  otherwise), so each returns its copy; `dispatch_node` returns it, and
+  `keep_generated` is a static over the copy.
+- **Measured.**  verify `--require-identical`: 0 objects moved.  Check
+  time x3 against 3a: 7.92 s and 7.95 s; peak 1529.0 and 1528.9 MiB;
+  nodes identical.  Clean build 0 warnings.
+- **Still to do (3b part 2):** codegen's `state.last_value` /
+  `last_is_lvalue`.  Measured: 290 writes, almost all a value write
+  paired with an `is_lvalue` write, against 18 reads, most in
+  `ExprDispatch::codegen_rvalue`/`codegen_lvalue`, a few in
+  `ir_generator`, `place_emitter`, `call_emitter` and
+  `binary_unary_emitter` that read the lvalue flag the previous dispatch
+  left.  The conversion makes the emitters return a value-and-place pair
+  and threads it through every function on the path from a `visit_*` to
+  its write.
+
 ### Slice 4: the types
 
 `Type` + 25 classes become `Type` + `TypeData` (section 2.5), one

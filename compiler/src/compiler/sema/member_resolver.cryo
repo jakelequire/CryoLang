@@ -26,7 +26,7 @@ import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::{
-    state, type_utils, symbolic_checker, method_binding, diagnostics, dispatch, helpers
+    state, type_utils, symbolic_checker, method_binding, diagnostics, helpers
 };
 import std::fmt;
 import compiler::types::generic_registry;
@@ -50,7 +50,6 @@ import compiler::decl_index::{ OverloadId };
 import compiler::module_graph;
 import compiler::module_graph::{ ModulePath };
 import compiler::sema::diagnostics::{ Diagnostics };
-import compiler::sema::dispatch::{ SemaDispatch };
 import compiler::sema::helpers::{ parse_tuple_index, sema_const_int_index };
 import compiler::sema::method_binding::{ MethodBinding };
 import compiler::sema::state::{ SemaState };
@@ -98,19 +97,18 @@ type struct MemberResolver {
     symbolic: SymbolicChecker*;
     binding:  MethodBinding*;
     diag:     Diagnostics*;
-    dispatch: SemaDispatch*;
 
     static null() -> MemberResolver {
         return MemberResolver {
             arena: null, intern: null, ctx: null, checker: null, state: null,
-            types: null, symbolic: null, binding: null, diag: null, dispatch: null,
+            types: null, symbolic: null, binding: null, diag: null,
         };
     }
 
     wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*,
                     checker: TypeChecker*, state: SemaState*, types: TypeUtils*,
                     symbolic: SymbolicChecker*, binding: MethodBinding*,
-                    diag: Diagnostics*, dispatch: SemaDispatch*) -> void {
+                    diag: Diagnostics*) -> void {
         this.arena    = arena;
         this.intern   = intern;
         this.ctx      = ctx;
@@ -120,14 +118,13 @@ type struct MemberResolver {
         this.symbolic = symbolic;
         this.binding  = binding;
         this.diag     = diag;
-        this.dispatch = dispatch;
     }
 
 
     // -- Member access (`obj.field` / `obj.0` / `obj.method`) --
 
     resolve_member_access(mut &this, visitor: SemaVisitor*, member: MemberAccessNode*) -> TypeRef {
-        const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
+        const obj_type: TypeRef = visitor.resolve_expr(member.object);
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
 
         // Symbolic walk: a `void`/abstract receiver is unresolved, not
@@ -316,7 +313,7 @@ type struct MemberResolver {
             mut star: UnaryExprNode* = new UnaryExprNode(star_tok, call as ExpressionNode*, member.span);
             star.is_synthetic = true;
             const star_expr: ExpressionNode* = star as ExpressionNode*;
-            const target_ty: TypeRef = this.dispatch.resolve_expr(visitor, star_expr);
+            const target_ty: TypeRef = visitor.resolve_expr(star_expr);
             if (!target_ty.is_valid()) { return TypeRef::invalid(); }
             // Re-attempt the field / method lookup on `Target`.
             const r: TypeRef = this.member_type_on(member, target_ty);
@@ -638,8 +635,8 @@ type struct MemberResolver {
         if (access.desugared_call != null) {
             return access.desugared_call.resolved_type;
         }
-        const array_type: TypeRef = this.dispatch.resolve_expr(visitor, access.array);
-        const index_type: TypeRef = this.dispatch.resolve_expr(visitor, access.index);
+        const array_type: TypeRef = visitor.resolve_expr(access.array);
+        const index_type: TypeRef = visitor.resolve_expr(access.index);
         if (!array_type.is_valid()) { return TypeRef::invalid(); }
         // Symbolic walk: the built-in rules - a pointer's pointee, an array's
         // element, a tuple's position - answer whatever the parameters are
@@ -800,7 +797,7 @@ type struct MemberResolver {
         mut deref: UnaryExprNode* = new UnaryExprNode(star_tok, call as ExpressionNode*, access.span);
         deref.is_synthetic = true;
         const de: ExpressionNode* = deref as ExpressionNode*;
-        const rty: TypeRef = this.dispatch.resolve_expr(visitor, de);
+        const rty: TypeRef = visitor.resolve_expr(de);
         if (!rty.is_valid()) { return null; }
         return de;
     }

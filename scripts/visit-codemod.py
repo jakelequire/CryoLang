@@ -153,7 +153,59 @@ def unimport(paths):
         print("%s: %d import lists" % (path, n))
 
 
-if sys.argv[1] == "unimport":
+def seam(paths):
+    """`this.dispatch.resolve_expr(visitor, e)` -> `visitor.resolve_expr(e)` and
+    `this.dispatch.dispatch_stmt(visitor, s)` -> `visitor.dispatch_node(s)`."""
+    for path in paths:
+        lines = read(path)
+        out, n = [], 0
+        for line in lines:
+            line, k1 = re.subn(r"this\.dispatch\.resolve_expr\(visitor, ", "visitor.resolve_expr(", line)
+            line, k2 = re.subn(r"this\.dispatch\.dispatch_stmt\(visitor, ", "visitor.dispatch_node(", line)
+            n += k1 + k2
+            out.append(line)
+        write(path, out)
+        print("%s: %d calls" % (path, n))
+
+
+def returns(path):
+    """Each `visit_*` method that ends by setting `this.result` returns the
+    copy instead: `-> void {` -> `-> ASTNode* {`, `this.result = x;` ->
+    `return x;`.  Refuses a method that sets it other than once, last."""
+    lines = read(path)
+    out, n = [], 0
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r"    visit_\w+\(mut &this, .*\) -> void \{\s*$", line):
+            j = i + 1
+            while lines[j].rstrip("\r\n") != "    }":
+                j += 1
+            body = lines[i + 1:j]
+            sets = [k for k, l in enumerate(body) if re.search(r"this\.result\s*=", l)]
+            last = max(k for k, l in enumerate(body) if l.strip())
+            if sets != [last]:
+                raise SystemExit("%s:%d: result is not set once, last" % (path, i + 1))
+            out.append(line.replace("-> void {", "-> ASTNode* {"))
+            for k, l in enumerate(body):
+                if k == last:
+                    l = re.sub(r"this\.result\s*=\s*", "return ", l)
+                out.append(l)
+            out.append(lines[j])
+            i = j + 1
+            n += 1
+            continue
+        out.append(line)
+        i += 1
+    write(path, out)
+    print("%s: %d methods return their copy" % (path, n))
+
+
+if sys.argv[1] == "returns":
+    returns(sys.argv[2])
+elif sys.argv[1] == "seam":
+    seam(sys.argv[2:])
+elif sys.argv[1] == "unimport":
     unimport(sys.argv[2:])
 elif sys.argv[1] == "type":
     convert_type(sys.argv[2], sys.argv[3])
