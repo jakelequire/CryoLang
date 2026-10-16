@@ -44,7 +44,7 @@ the array-syntax change):
   The outer push is `Array<[i32]>::push` taking the row as a builtin by
   value; why it faults is not established.
 
-## 2. Decided (rulings 363-368)
+## 2. Decided (rulings 363-378)
 
 - `[T]` is exactly `Array<T>` with the default allocator;
   `Array<T, A>` is written out for another allocator (363).
@@ -67,8 +67,11 @@ the array-syntax change):
   bounds check (372).
 - Emitting only the used methods of an instantiated generic is scouted
   (373).
-- A fill literal is refused unless its element is plain-copy (374).
-  Built.
+- A fill literal is refused unless its element is plain-copy (374), as
+  E0453 (377).  Built.
+- `Array`'s `length` and `capacity` are `i64` (375).
+- A `![caller_location]` function taken as a value is refused before
+  code generation (376); the attribute keeps its name (378).
 
 ## 3. Units
 
@@ -112,13 +115,11 @@ Not done additively, on purpose:
 dynamic arrays) and the codegen paths for the builtin are deleted.
 `TypeKind::Array` keeps only the fixed array.
 
-Blocked on the type of `length` (open question 1): the builtin's
-`.length` is an implicit `i64` field, `Array<T>`'s `length` field is a
-`u64`.  With `[T]` resolved to `Array<T>` (the resolver's annotation case
-and a run-time fill literal's type, nothing else), building the compiler
-reports 2,348 W0005 implicit `i64`/`u64` widenings and 177 E0200, every
-one "expected `i64`, found `u64`", and ~40 E0358 where an overload no
-longer fits (`push` of a `u64` onto an `[i64]`); nothing else.
+The type of `length` (375): the builtin's `.length` was an implicit
+`i64` field and `Array<T>`'s a `u64`, so `[T]` resolved to `Array<T>`
+reported 2,348 W0005 implicit `i64`/`u64` widenings, 177 E0200 and ~40
+E0358 in the compiler.  `Array`'s `length` and `capacity` (fields and
+methods) are `i64` now; its index and count parameters stay `u64`.
 
 Done ahead of the switch:
 
@@ -180,11 +181,3 @@ keeps them).  Emitting only used methods needs reachability over every
 reference to a specialization's methods, codegen's own synthesized
 calls (drop glue, language-item calls) among them, where a missed one is
 a link failure: much work for about 1% of the binary.
-
-## 6. Open questions (for Jake)
-
-1. **The type of an array's `length`.**  A) `Array<T>`'s `length` and
-   `capacity` become `i64`, as every `[T]` in the tree was written
-   against, and the library adapts inside `array.cryo`.  B) they stay
-   `u64` and the ~2,400 sites in the tree that compare or pass `.length`
-   as an `i64` are rewritten.  Lean A.

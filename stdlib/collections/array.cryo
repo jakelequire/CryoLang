@@ -50,15 +50,15 @@ import std::ffi::libc;
 /// First-allocation capacity. Small enough that near-empty arrays
 /// don't waste memory; large enough to amortize the first few
 /// pushes.
-const INITIAL_CAPACITY: u64 = 4;
+const INITIAL_CAPACITY: i64 = 4;
 
 
 type struct Array<T, A = GlobalAlloc> where A: Allocator {
     // Layout: { ptr, length, capacity, alloc }.  ABI-compatible with
     // the legacy `[T]` fat pointer the self-hosted compiler emits.
     ptr:      T*;
-    length:   u64;
-    capacity: u64;
+    length:   i64;
+    capacity: i64;
     alloc:    A;
 
     /// Empty array backed by `GlobalAlloc`.
@@ -111,15 +111,15 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
         if (capacity == 0) {
             return Result::Ok(array);
         }
-        array.resize_storage(capacity)?;
+        array.resize_storage(capacity as i64)?;
         return Result::Ok(array);
     }
 
-    length(&this) -> u64 {
+    length(&this) -> i64 {
         return this.length;
     }
 
-    capacity(&this) -> u64 {
+    capacity(&this) -> i64 {
         return this.capacity;
     }
 
@@ -133,7 +133,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// `T` carries no `Drop` obligation. For owning `T`, borrow in place
     /// with `get_ref` (or move an element out with `swap_remove`/`pop`).
     get(&this, index: u64) -> Option<T> where T: Copy {
-        if (index >= this.length) {
+        if (index >= this.length as u64) {
             return Option::None;
         }
         return Option::Some(this.ptr[index]);
@@ -144,7 +144,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// owning). The pointer is invalidated by any reallocating method
     /// (`push`, `reserve`, `shrink_to_fit`).
     get_ref(&this, index: u64) -> Option<T*> {
-        if (index >= this.length) {
+        if (index >= this.length as u64) {
             return Option::None;
         }
         return Option::Some(mem::offset(this.ptr, index as i64));
@@ -159,7 +159,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// Borrow the initialized prefix. Slice is invalidated by any
     /// reallocating method.
     as_slice(&this) -> Slice<T> {
-        return Slice::from_raw(this.ptr, this.length);
+        return Slice::from_raw(this.ptr, this.length as u64);
     }
 
     /// Iterate over the elements in order, yielding each by value
@@ -169,7 +169,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// iterator is invalidated by any reallocating method on the array
     /// (`push`, `reserve`, `shrink_to_fit`).
     iter(&this) -> implement Iterator<T> where T: Copy {
-        return SliceIter::<T> { ptr: this.ptr, remaining: this.length };
+        return SliceIter::<T> { ptr: this.ptr, remaining: this.length as u64 };
     }
 
     /// Iterate by shared borrow, yielding `T*` for each element in
@@ -215,7 +215,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// old element's resources would otherwise leak. Panics on
     /// out-of-range.
     set(mut &this, index: u64, value: T) -> void {
-        if (index >= this.length) {
+        if (index >= this.length as u64) {
             core::panic("Array::set: index out of range", FILE, LINE);
         }
         mut prev: T* = this.get_ref(index).unwrap();
@@ -226,12 +226,12 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// Remove at `index` by swapping in the last element. O(1) but
     /// doesn't preserve order. Panics on out-of-range.
     swap_remove(mut &this, index: u64) -> T {
-        if (index >= this.length) {
+        if (index >= this.length as u64) {
             core::panic("Array::swap_remove: index out of range", FILE, LINE);
         }
         const removed: T = this.ptr[index];
-        const last: u64 = this.length - 1;
-        if (index != last) {
+        const last: i64 = this.length - 1;
+        if (index != last as u64) {
             this.ptr[index] = this.ptr[last];
         }
         this.length = last;
@@ -249,16 +249,16 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// Last element by shared borrow, or `None` if empty.
     last(&this) -> Option<T*> {
         if (this.length == 0) { return Option::None; }
-        return Option::Some(mem::offset(this.ptr, (this.length - 1) as i64));
+        return Option::Some(mem::offset(this.ptr, this.length - 1));
     }
 
     /// Index of the first element equal to `value`, or `None`. Linear
     /// scan; `T: Eq`.
     index_of(&this, value: &T) -> Option<u64> where T: Eq {
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < this.length) {
             if (this.ptr[i].equals(value)) {
-                return Option::Some(i);
+                return Option::Some(i as u64);
             }
             i = i + 1;
         }
@@ -278,8 +278,8 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// inlined here so the method stays self-contained - see note below).
     reverse(mut &this) -> void {
         if (this.length < 2) { return; }
-        mut lo: u64 = 0;
-        mut hi: u64 = this.length - 1;
+        mut lo: i64 = 0;
+        mut hi: i64 = this.length - 1;
         while (lo < hi) {
             // Inlined move-swap. `mem::swap` is deliberately NOT called:
             // the monomorphizer does not queue a cross-module generic
@@ -288,8 +288,8 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
             // undefined symbol for `Array<T>` instantiations that never
             // call `sort`. `mem::offset` is already emitted for every
             // `Array<T>` (used by `get_ref`), so it stays a call.
-            const a: T* = mem::offset(this.ptr, lo as i64);
-            const b: T* = mem::offset(this.ptr, hi as i64);
+            const a: T* = mem::offset(this.ptr, lo);
+            const b: T* = mem::offset(this.ptr, hi);
             // A permutation of two slots the array keeps owning: each value
             // read out is balanced by the store that immediately replaces it,
             // so the block covers all three statements.
@@ -308,7 +308,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// allocation failure; use the `Result`-returning forms for recovery
     /// via `try_push` if you need fallibility on the common (append) path.
     insert(mut &this, index: u64, value: T) -> void {
-        if (index > this.length) {
+        if (index > this.length as u64) {
             core::panic("Array::insert: index out of range", FILE, LINE);
         }
         if (this.length == this.capacity) {
@@ -319,7 +319,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
                 }
             }
         }
-        const tail: u64 = this.length - index;
+        const tail: u64 = (this.length as u64) - index;
         if (tail > 0) {
             // Shift [index, length) right by one slot. memmove handles the
             // overlap; this relocates owning elements without aliasing.
@@ -337,11 +337,11 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// left by one to preserve order (O(n)). Panics if out of range. For
     /// O(1) removal when order doesn't matter, use `swap_remove`.
     remove(mut &this, index: u64) -> T {
-        if (index >= this.length) {
+        if (index >= this.length as u64) {
             core::panic("Array::remove: index out of range", FILE, LINE);
         }
         const removed: T = this.ptr[index];
-        const tail: u64 = this.length - index - 1;
+        const tail: u64 = (this.length as u64) - index - 1;
         if (tail > 0) {
             // Shift [index+1, length) left by one over the vacated slot.
             libc::memmove(
@@ -357,13 +357,13 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// Shorten to at most `new_length`, releasing the truncated elements
     /// in place. A no-op if `new_length >= length`. Keeps capacity.
     truncate(mut &this, new_length: u64) -> void {
-        if (new_length >= this.length) { return; }
-        mut i: u64 = new_length;
+        if (new_length >= this.length as u64) { return; }
+        mut i: i64 = new_length as i64;
         while (i < this.length) {
             ptr::drop_in_place::<T>(&this.ptr[i]);
             i++;
         }
-        this.length = new_length;
+        this.length = new_length as i64;
     }
 
     /// Release every initialized element (the `[0, length)` prefix) in
@@ -373,7 +373,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// contents.  Follow with `shrink_to_fit` to release the capacity, or
     /// `drop` when the array itself goes away.
     clear(mut &this) -> void {
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < this.length) {
             ptr::drop_in_place::<T>(&this.ptr[i]);
             i++;
@@ -394,7 +394,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// intact (every initialised slot still gets dropped exactly once).
     sort(mut &this) -> void where T: Ord {
         if (this.length < 2) { return; }
-        sort_range::<T>(this.ptr, 0, this.length);
+        sort_range::<T>(this.ptr, 0, this.length as u64);
     }
 
     /// Sort in place using a user-supplied "less-than" predicate.
@@ -411,7 +411,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// closure-arg path.
     sort_by(mut &this, less: (&T, &T) -> boolean) -> void {
         if (this.length < 2) { return; }
-        sort_range_by::<T>(this.ptr, 0, this.length, less);
+        sort_range_by::<T>(this.ptr, 0, this.length as u64, less);
     }
 
     /// Append every element of `source` to the end of this array.
@@ -440,11 +440,11 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
         if (add == 0) { return Result::Ok(()); }
         this.reserve_grow(add)?;
         libc::memcpy(
-            mem::offset(this.ptr, this.length as i64) as void*,
+            mem::offset(this.ptr, this.length) as void*,
             source.as_ptr() as void*,
             add * sizeof(T)
         );
-        this.length = this.length + add;
+        this.length = this.length + add as i64;
         return Result::Ok(());
     }
 
@@ -472,17 +472,17 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// either resized or left exactly as it was - never partially grown.
     try_resize(mut &this, new_length: u64, value: T) -> Result<(), AllocError>
     where T: Copy {
-        if (new_length <= this.length) {
+        if (new_length <= this.length as u64) {
             this.truncate(new_length);
             return Result::Ok(());
         }
-        this.reserve_grow(new_length - this.length)?;
-        mut i: u64 = this.length;
-        while (i < new_length) {
+        this.reserve_grow(new_length - (this.length as u64))?;
+        mut i: i64 = this.length;
+        while (i < new_length as i64) {
             this.ptr[i] = value;
             i++;
         }
-        this.length = new_length;
+        this.length = new_length as i64;
         return Result::Ok(());
     }
 
@@ -491,47 +491,48 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     }
 
     reserve_exact(mut &this, additional: u64) -> Result<(), AllocError> {
-        const required: u64 = this.length + additional;
-        // A wrapped `length + additional` (sum < length) means the requested
-        // capacity can't be represented in u64. Reject it rather than
-        // under-sizing: `try_append` would otherwise see `required <=
-        // capacity`, skip the realloc, and memcpy `additional` elements past
-        // the end of the buffer. Mirrors RawBuffer::reserve_exact.
+        const required: i64 = this.length + (additional as i64);
+        // A `length + additional` that does not fit in an `i64` (an
+        // `additional` past its range, or a sum that wrapped) reads below
+        // `length`.  Reject it rather than under-sizing: `try_append` would
+        // otherwise see `required <= capacity`, skip the realloc, and memcpy
+        // `additional` elements past the end of the buffer.
         if (required < this.length) {
             return Result::Err(AllocError::new(
-                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
+                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length as u64)));
         }
         if (required <= this.capacity) {
             return Result::Ok(());
         }
-        return this.resize_storage( required);
+        return this.resize_storage(required);
     }
 
     /// Internal: ensure at least `additional` more slots fit, doubling
-    /// past `INITIAL_CAPACITY`.  Inline of what `RawBuffer::reserve`
-    /// did before Array dropped its RawBuffer dependency.
+    /// past `INITIAL_CAPACITY`.
     reserve_grow(mut &this, additional: u64) -> Result<(), AllocError> {
-        const required: u64 = this.length + additional;
-        // See reserve_exact: reject a wrapped `length + additional` rather than
-        // under-allocating and overrunning the buffer in the caller's memcpy.
+        const required: i64 = this.length + (additional as i64);
+        // See reserve_exact: reject a `length + additional` that does not fit
+        // rather than under-allocating and overrunning the caller's memcpy.
         if (required < this.length) {
             return Result::Err(AllocError::new(
-                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
+                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length as u64)));
         }
         if (required <= this.capacity) {
             return Result::Ok(());
         }
-        return this.resize_storage(next_capacity(this.capacity, required, INITIAL_CAPACITY));
+        const grown: u64 = next_capacity(
+            this.capacity as u64, required as u64, INITIAL_CAPACITY as u64);
+        return this.resize_storage(grown as i64);
     }
 
     shrink_to_fit(mut &this) -> void {
-        const target: u64 = this.length;
+        const target: i64 = this.length;
         if (target >= this.capacity) { return; }
         if (target == 0) {
             if (this.ptr != null) {
                 this.alloc.deallocate(
                     NonNull::new(this.ptr as u8*),
-                    Layout::array::<T>(this.capacity)
+                    Layout::array::<T>(this.capacity as u64)
                 );
             }
             this.ptr = null;
@@ -552,12 +553,13 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     // `resize_array<T, A>(...)` would link as the unspecialized
     // GenericParam-named symbol from `try_with_capacity_in`'s callers.
 
-    resize_storage(mut &this, new_capacity: u64) -> Result<(), AllocError> {
+    resize_storage(mut &this, new_capacity: i64) -> Result<(), AllocError> {
         if (new_capacity == this.capacity) {
             return Result::Ok(());
         }
         mut new_layout: Layout = Layout { size: 0, alignment: 0 };
-        match (Layout::try_array::<T>(new_capacity)) {
+        // A negative capacity reads as one too large to allocate.
+        match (Layout::try_array::<T>(new_capacity as u64)) {
             Option::Some(l) => { new_layout = l; }
             Option::None    => {
                 return Result::Err(AllocError::new(
@@ -570,7 +572,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
             this.capacity = new_capacity;
             return Result::Ok(());
         }
-        const old_layout: Layout = Layout::array::<T>(this.capacity);
+        const old_layout: Layout = Layout::array::<T>(this.capacity as u64);
         const raw: NonNull<u8> = this.alloc.reallocate(
             NonNull::new(this.ptr as u8*),
             old_layout,
@@ -598,7 +600,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
 implement<T, A> trait Drop for struct Array<T, A>
 where T: Drop, A: Allocator {
     drop(mut &this) -> void {
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < this.length) {
             ptr::drop_in_place::<T>(&this.ptr[i]);
             i++;
@@ -606,7 +608,7 @@ where T: Drop, A: Allocator {
         if (this.ptr != null) {
             this.alloc.deallocate(
                 NonNull::new(this.ptr as u8*),
-                Layout::array::<T>(this.capacity)
+                Layout::array::<T>(this.capacity as u64)
             );
         }
         this.ptr = null;
@@ -803,8 +805,8 @@ function sort_order_pair_by<T>(ptr: T*, i: u64, j: u64,
 implement<T> trait Clone for struct Array<T, GlobalAlloc>
 where T: Clone {
     clone(&this) -> Array<T> {
-        mut out: Array<T> = Array::<T>::with_capacity(this.length);
-        mut i: u64 = 0;
+        mut out: Array<T> = Array::<T>::with_capacity(this.length as u64);
+        mut i: i64 = 0;
         while (i < this.length) {
             out.push(this.ptr[i].clone());
             i++;
@@ -833,7 +835,7 @@ implement<T, A> trait Eq for struct Array<T, A>
 where T: Eq, A: Allocator {
     equals(&this, other: &Array<T, A>) -> boolean {
         if (this.length != other.length) { return false; }
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < this.length) {
             if (!this.ptr[i].equals(&other.ptr[i])) { return false; }
             i = i + 1;
@@ -849,7 +851,7 @@ where T: Hash, A: Allocator {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
         this.length.hash(hasher);
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < this.length) {
             this.ptr[i].hash(hasher);
             i = i + 1;
@@ -867,8 +869,8 @@ where T: Hash, A: Allocator {
 /// never name it.
 private type struct RefIter<T> {
     ptr:    T*;
-    index:  u64;
-    length: u64;
+    index:  i64;
+    length: i64;
 
     /// Adapt this by-reference iterator into a by-value one that yields
     /// each pointee `T` by bitwise copy: `arr.iter_ref().copied()`. Sound
@@ -898,7 +900,7 @@ implement<T> trait Iterator<T*> for struct RefIter<T> {
         if (this.index >= this.length) {
             return Option::None;
         }
-        const elem: T* = mem::offset(this.ptr, this.index as i64);
+        const elem: T* = mem::offset(this.ptr, this.index);
         this.index = this.index + 1;
         return Option::Some(elem);
     }
@@ -967,7 +969,7 @@ implement<T, A> struct Array<T, A> where A: Allocator {
     ![inline]
     ![caller_location]
     private element_at(&this, index: u64) -> T* {
-        if (index >= this.length) {
+        if (index >= this.length as u64) {
             core::panic("Array: index out of range", FILE, LINE);
         }
         return &this.ptr[index];
