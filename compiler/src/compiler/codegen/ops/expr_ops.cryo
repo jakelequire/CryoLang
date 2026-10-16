@@ -74,7 +74,7 @@ import compiler::resolver::res::{ DefId };
 import compiler::decl_index::{ OverloadId };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
-import compiler::types::type_base::{ FloatType, IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ EnumType };
 import compiler::resolver::mangled_name::{ MangledName };
@@ -220,9 +220,9 @@ type struct ExprOps {
         if (t == null) { return 0; }
         mut pointee: TypeRef = TypeRef::invalid();
         if (t.kind == TypeKind::Pointer) {
-            pointee = (t as PointerType*).pointee;
+            pointee = t.as_pointer().pointee;
         } else if (t.kind == TypeKind::Reference) {
-            pointee = (t as ReferenceType*).referent;
+            pointee = t.as_reference().referent;
         }
         if (!pointee.is_valid()) { return 0; }
         const pmapped: LType = this.type_mapper.map_type(pointee);
@@ -236,8 +236,8 @@ type struct ExprOps {
         const t: Type* = this.arena_type(ty);
         if (t == null) { return false; }
         if (t.kind != TypeKind::Int) { return false; }
-        const it: IntType* = t as IntType*;
-        return it.int_kind.is_signed();
+        const it: IntegerKind = t.int_kind();
+        return it.is_signed();
     }
 
     intern_str(&this, text: string) -> SymbolStr {
@@ -336,9 +336,9 @@ type struct ExprOps {
         // width (handled in the int<->int block below; the default tag is
         // i32).  ADT enums are structs and fall through to the other paths.
         const from_enum: boolean = from_kind == TypeKind::Enum &&
-                                   (src_type as EnumType*).is_simple_enum();
+                                   src_type.as_enum().is_simple_enum();
         const to_enum: boolean = to_kind == TypeKind::Enum &&
-                                 (dst_type as EnumType*).is_simple_enum();
+                                 dst_type.as_enum().is_simple_enum();
         const from_int: boolean = from_kind == TypeKind::Int || from_kind == TypeKind::Char || from_enum;
         const from_float: boolean = from_kind == TypeKind::Float;
         const to_int: boolean = to_kind == TypeKind::Int || to_kind == TypeKind::Char || to_enum;
@@ -367,9 +367,9 @@ type struct ExprOps {
             mut from_bits: u32 = 0;
             mut signed_src: boolean = false;
             if (from_kind == TypeKind::Int) {
-                const from_it: IntType* = src_type as IntType*;
-                from_bits = from_it.int_kind.bit_width() as u32;
-                signed_src = from_it.int_kind.is_signed();
+                const from_it: IntegerKind = src_type.int_kind();
+                from_bits = from_it.bit_width() as u32;
+                signed_src = from_it.is_signed();
             } else if (from_kind == TypeKind::Char) {
                 from_bits = 32;
                 signed_src = false;
@@ -378,28 +378,28 @@ type struct ExprOps {
                 // (`type enum E : u8` -> 8/unsigned); default tag is i32.
                 from_bits = 32;
                 signed_src = true;
-                const fet: EnumType* = src_type as EnumType*;
+                const fet: EnumType* = src_type.as_enum();
                 if (fet.discriminant_type.is_valid()) {
                     const fdt: Type* = this.arena_type(fet.discriminant_type);
                     if (fdt != null && fdt.kind == TypeKind::Int) {
-                        from_bits = (fdt as IntType*).int_kind.bit_width() as u32;
-                        signed_src = (fdt as IntType*).int_kind.is_signed();
+                        from_bits = fdt.int_kind().bit_width() as u32;
+                        signed_src = fdt.int_kind().is_signed();
                     }
                 }
             }
             mut to_bits: u32 = 0;
             if (to_kind == TypeKind::Int) {
-                const to_it: IntType* = dst_type as IntType*;
-                to_bits = to_it.int_kind.bit_width() as u32;
+                const to_it: IntegerKind = dst_type.int_kind();
+                to_bits = to_it.bit_width() as u32;
             } else if (to_kind == TypeKind::Char) {
                 to_bits = 32;
             } else if (to_enum) {
                 to_bits = 32;
-                const tet: EnumType* = dst_type as EnumType*;
+                const tet: EnumType* = dst_type.as_enum();
                 if (tet.discriminant_type.is_valid()) {
                     const tdt: Type* = this.arena_type(tet.discriminant_type);
                     if (tdt != null && tdt.kind == TypeKind::Int) {
-                        to_bits = (tdt as IntType*).int_kind.bit_width() as u32;
+                        to_bits = tdt.int_kind().bit_width() as u32;
                     }
                 }
             }
@@ -417,10 +417,10 @@ type struct ExprOps {
                 return val;  // Same width, no-op.
             }
         } else if (from_float && to_float) {
-            const from_ft: FloatType* = src_type as FloatType*;
-            const to_ft: FloatType* = dst_type as FloatType*;
-            const from_fk: FloatKind = from_ft.float_kind;
-            const to_fk: FloatKind = to_ft.float_kind;
+            const from_ft: FloatKind = src_type.float_kind();
+            const to_ft: FloatKind = dst_type.float_kind();
+            const from_fk: FloatKind = from_ft;
+            const to_fk: FloatKind = to_ft;
             const from_bits: u64 = from_fk.bit_width();
             const to_bits: u64 = to_fk.bit_width();
             if (from_bits > to_bits) {
@@ -431,16 +431,16 @@ type struct ExprOps {
                 return val;
             }
         } else if (from_int && to_float) {
-            const from_it2: IntType* = src_type as IntType*;
-            const from_ik2: IntegerKind = from_it2.int_kind;
+            const from_it2: IntegerKind = src_type.int_kind();
+            const from_ik2: IntegerKind = from_it2;
             if (from_ik2.is_signed()) {
                 return this.builder.build_si_to_fp(val, dest_ty, "sitofptmp");
             } else {
                 return this.builder.build_ui_to_fp(val, dest_ty, "uitofptmp");
             }
         } else if (from_float && to_int) {
-            const to_it2: IntType* = dst_type as IntType*;
-            const to_ik2: IntegerKind = to_it2.int_kind;
+            const to_it2: IntegerKind = dst_type.int_kind();
+            const to_ik2: IntegerKind = to_it2;
             if (to_ik2.is_signed()) {
                 return this.builder.build_fp_to_si(val, dest_ty, "fptositmp");
             } else {
@@ -622,8 +622,8 @@ type struct ExprOps {
             mut signed_target: boolean = false;
             const ty_t: Type* = this.arena_type(ty);
             if (ty_t != null && ty_t.kind == TypeKind::Int) {
-                const ti: IntType* = ty_t as IntType*;
-                signed_target = ti.int_kind.is_signed();
+                const ti: IntegerKind = ty_t.int_kind();
+                signed_target = ti.is_signed();
             }
             if (signed_target) {
                 return this.builder.build_sext(init_val, llvm_ty, "init.widen");
@@ -1017,8 +1017,8 @@ type struct ExprOps {
                 if (arg_ty_ref.is_valid()) {
                     const at_t: Type* = this.arena_type(arg_ty_ref);
                     if (at_t != null && at_t.kind == TypeKind::Int) {
-                        const it: IntType* = at_t as IntType*;
-                        src_signed = it.int_kind.is_signed();
+                        const it: IntegerKind = at_t.int_kind();
+                        src_signed = it.is_signed();
                     }
                 }
                 if (src_signed) {
@@ -1539,7 +1539,7 @@ type struct ExprOps {
         mut t: Type* = this.arena_type(result_type);
         mut bd: i32 = 0;
         while (t != null && t.kind == TypeKind::InstantiatedType && bd < 5) {
-            const binst: InstantiatedType* = t as InstantiatedType*;
+            const binst: InstantiatedType* = t.as_instantiated();
             if (binst.has_resolved_type()) {
                 t = this.arena_type(binst.resolved_type);
             } else { break; }
@@ -1701,10 +1701,10 @@ type struct ExprOps {
             (op_kind == TokenType::Plus || op_kind == TokenType::Minus)) {
             mut elem_ty: TypeRef = TypeRef::invalid();
             if (t_kind == TypeKind::Pointer) {
-                const ptr_t: PointerType* = t as PointerType*;
+                const ptr_t: PointerType* = t.as_pointer();
                 elem_ty = ptr_t.pointee;
             } else {
-                const ref_t: ReferenceType* = t as ReferenceType*;
+                const ref_t: ReferenceType* = t.as_reference();
                 elem_ty = ref_t.referent;
             }
             const pointee_lty: LType = this.type_mapper.map_type(elem_ty);
@@ -1731,8 +1731,8 @@ type struct ExprOps {
         mut is_float: boolean = t_kind == TypeKind::Float;
         mut is_signed: boolean = false;
         if (t_kind == TypeKind::Int) {
-            const int_t: IntType* = t as IntType*;
-            const ik: IntegerKind = int_t.int_kind;
+            const int_t: IntegerKind = t.int_kind();
+            const ik: IntegerKind = int_t;
             is_signed = ik.is_signed();
         }
 
@@ -1747,15 +1747,15 @@ type struct ExprOps {
         mut rt: Type* = this.arena_type(rhs_type);
         mut rbd: i32 = 0;
         while (rt != null && rt.kind == TypeKind::InstantiatedType && rbd < 5) {
-            const rinst: InstantiatedType* = rt as InstantiatedType*;
+            const rinst: InstantiatedType* = rt.as_instantiated();
             if (rinst.has_resolved_type()) {
                 rt = this.arena_type(rinst.resolved_type);
             } else { break; }
             rbd += 1;
         }
         if (rt != null && rt.kind == TypeKind::Int) {
-            const rint: IntType* = rt as IntType*;
-            rhs_is_signed = rint.int_kind.is_signed();
+            const rint: IntegerKind = rt.int_kind();
+            rhs_is_signed = rint.is_signed();
         }
 
         // Normalize integer operand widths.

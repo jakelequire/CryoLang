@@ -814,12 +814,12 @@ type struct AsyncLower {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return null; }
         if (t.kind == TypeKind::GenericParam) {
-            const gp: GenericParamNode* = this.param_bound_by(params, t as GenericParamType*);
+            const gp: GenericParamNode* = this.param_bound_by(params, t.as_generic_param());
             if (gp == null) { return null; }
             return this.named_ann(gp, span);
         }
         if (t.kind == TypeKind::Pointer) {
-            const p: PointerType* = t as PointerType*;
+            const p: PointerType* = t.as_pointer();
             mut inner: TypeAnnotation* = this.type_ann_for(p.pointee, params, span);
             if (inner == null) { return null; }
             return new TypeAnnotation::Pointer(new PointerAnnotation {
@@ -827,7 +827,7 @@ type struct AsyncLower {
             });
         }
         if (t.kind == TypeKind::Reference) {
-            const r: ReferenceType* = t as ReferenceType*;
+            const r: ReferenceType* = t.as_reference();
             mut inner: TypeAnnotation* = this.type_ann_for(r.referent, params, span);
             if (inner == null) { return null; }
             return new TypeAnnotation::Reference(new ReferenceAnnotation {
@@ -835,7 +835,7 @@ type struct AsyncLower {
             });
         }
         if (t.kind == TypeKind::Array) {
-            const a: ArrayType* = t as ArrayType*;
+            const a: ArrayType* = t.as_array();
             mut elem: TypeAnnotation* = this.type_ann_for(a.element, params, span);
             if (elem == null) { return null; }
             return new TypeAnnotation::Array(new ArrayAnnotation {
@@ -849,7 +849,7 @@ type struct AsyncLower {
         // Without this the frame field for such an `await` cannot be spelled at
         // all and the whole lowering is refused.
         if (t.kind == TypeKind::AssocProjection) {
-            const proj: AssocProjectionType* = t as AssocProjectionType*;
+            const proj: AssocProjectionType* = t.as_assoc_projection();
             mut base: TypeAnnotation* = this.type_ann_for(proj.base, params, span);
             if (base == null) { return null; }
             const owner_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
@@ -865,7 +865,7 @@ type struct AsyncLower {
             });
         }
         if (t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+            const inst: InstantiatedType* = t.as_instantiated();
             const base_q: SymbolStr = this.arena.get_qualified_name(inst.generic_base).spelling();
             if (!base_q.is_valid()) { return null; }
             mut args: [TypeAnnotation*] = [];
@@ -955,7 +955,7 @@ type struct AsyncLower {
             this.ctx.decl_index.def_of(ty, this.ctx.type_arena));
         const t: Type* = if (decl_ty.is_valid()) { this.arena.lookup(decl_ty) } else { null };
         if (t != null && t.kind == TypeKind::Enum) {
-            const vi: i64 = (t as EnumType*).variant_index(leaf);
+            const vi: i64 = t.as_enum().variant_index(leaf);
             if (vi >= 0) { return MemberPin::Variant(vi); }
         }
         this.ctx.emit_error_at(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
@@ -2702,7 +2702,7 @@ type struct AsyncLower {
             t = if (base.is_valid()) { this.arena.lookup(base) } else { null };
         }
         if (t == null || t.kind != TypeKind::Struct) { return TypeRef::invalid(); }
-        const st: StructType* = t as StructType*;
+        const st: StructType* = t.as_struct();
         // The receiver slot the lowering recorded when it minted the frame.
         const f: FieldInfo* = st.async_recv_field();
         if (f == null) { return TypeRef::invalid(); }
@@ -2748,7 +2748,7 @@ type struct AsyncLower {
         // awaited projection naming exactly this method's future is one.
         const t: Type* = this.arena.lookup(e.resolved_type);
         if (t == null || t.kind != TypeKind::AssocProjection) { return false; }
-        const ap: AssocProjectionType* = t as AssocProjectionType*;
+        const ap: AssocProjectionType* = t.as_assoc_projection();
 
         // The trait's declaration settles the receiver form, which the abstract
         // future cannot.  The projection names its trait: the desugar that
@@ -4359,7 +4359,7 @@ type struct AsyncLower {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return true; }
         if (t.kind != TypeKind::InstantiatedType) { return false; }
-        return !(t as InstantiatedType*).has_resolved_type();
+        return !t.as_instantiated().has_resolved_type();
     }
 
     last_use_consumes(&this, blk: BlockStmtNode*, key: SymbolID, lty: TypeRef) -> boolean {
@@ -4896,7 +4896,7 @@ type struct AsyncLower {
         if (!d.equals(poll_def)) { return false; }
         const t: Type* = this.arena.lookup(this.ctx.decl_index.type_of_def(d));
         if (t == null || t.kind != TypeKind::Enum) { return false; }
-        const want: i64 = (t as EnumType*).variant_index(this.intern.intern(leaf));
+        const want: i64 = t.as_enum().variant_index(this.intern.intern(leaf));
         return match (scope.resolved_member) {
             MemberPin::Variant(vi) => { want >= 0 && vi == want }
             _                      => { false }
@@ -7500,7 +7500,7 @@ type struct AsyncLower {
         // StructType.methods so overload resolution sees `poll` on the receiver.
         const struct_t: Type* = this.arena.lookup(struct_ref);
         if (struct_t != null && struct_t.kind == TypeKind::Struct) {
-            const st: StructType* = struct_t as StructType*;
+            const st: StructType* = struct_t.as_struct();
             mut poll_param_types: [TypeRef] = [ctx_ptr_ty];
             const poll_fn_ty: TypeRef = this.arena.get_function(poll_out, poll_param_types, false);
             const minfo: MethodInfo = MethodInfo {
@@ -7610,7 +7610,7 @@ type struct AsyncLower {
             node.resolved_return_type, this.method_param_types(node), node.is_variadic);
         // A union is a StructType with `is_union`, so Struct covers it too.
         if (t.kind == TypeKind::Struct) {
-            mut st: StructType* = t as StructType*;
+            mut st: StructType* = t.as_struct();
             for (mut i: i64 = 0; i < st.methods.length; i++) {
                 if (st.methods[i].ast_node != (m as void*)) { continue; }
                 st.methods[i].function_type = fn_ty;
@@ -7619,7 +7619,7 @@ type struct AsyncLower {
             return;
         }
         if (t.kind == TypeKind::Class) {
-            mut ct: ClassType* = t as ClassType*;
+            mut ct: ClassType* = t.as_class();
             for (mut i: i64 = 0; i < ct.methods.length; i++) {
                 if (ct.methods[i].ast_node != (m as void*)) { continue; }
                 ct.methods[i].function_type = fn_ty;
@@ -7856,7 +7856,7 @@ type struct AsyncLower {
         // ---- 2. Arena StructType + FieldInfo (mirrors the decl fields) ----
         const struct_t: Type* = this.arena.lookup(struct_ref);
         if (struct_t != null && struct_t.kind == TypeKind::Struct) {
-            const st: StructType* = struct_t as StructType*;
+            const st: StructType* = struct_t.as_struct();
             mut infos: [FieldInfo] = [];
             infos.push(FieldInfo::new(state_sym, u32_ty, true, false, false));
             for (mut i: i64 = 0; i < node.parameters.length; i++) {

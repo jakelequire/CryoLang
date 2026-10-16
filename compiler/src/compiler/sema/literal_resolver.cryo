@@ -15,7 +15,7 @@ namespace compiler::sema::literal_resolver;
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::type_base;
-import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::arena;
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound;
@@ -40,7 +40,7 @@ import std::fmt;
 import compiler::diag::diagnostic;
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::types;
-import compiler::types::{ TypeKind };
+import compiler::types::{ IntegerKind, TypeKind };
 import utils::keyword::{ Keyword };
 
 type struct LiteralResolver {
@@ -121,13 +121,13 @@ type struct LiteralResolver {
         if (suffixed.is_valid()) {
             const st: Type* = this.arena.lookup(suffixed);
             if (st != null && st.kind == TypeKind::Int) {
-                const sit: IntType* = st as IntType*;
-                const smax: u64 = sema_int_unsigned_bound(sit.int_kind.bit_width());
+                const sit: IntegerKind = st.int_kind();
+                const smax: u64 = sema_int_unsigned_bound(sit.bit_width());
                 if (smax != 0 && int_literal_exceeds(lit.value, smax)) {
                     this.ctx.emit_error_at(
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
                         fmt::format("integer literal `%s` is out of range for type `%s`",
-                            lit.value, sit.int_kind.to_string()),
+                            lit.value, sit.to_string()),
                         lit.span);
                 }
             }
@@ -137,20 +137,20 @@ type struct LiteralResolver {
         if (this.state.expected_type.is_valid()) {
             const exp: Type* = this.arena.lookup(this.state.expected_type);
             if (exp != null && exp.kind == TypeKind::Int) {
-                const it: IntType* = exp as IntType*;
+                const it: IntegerKind = exp.int_kind();
                 // Bound the literal by what fits in the target's bit width (its
                 // unsigned max).  Catches genuine overflow (`u8 = 99999999`) while
                 // admitting two's-complement bit-pattern initializers up to the
                 // width.  128-bit bounds exceed u64, so they are left unchecked
                 // (sema_int_unsigned_bound returns 0 there).
-                const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
+                const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
                 if (max_mag != 0 && int_literal_exceeds(lit.value, max_mag)) {
                     this.ctx.emit_error_at(
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
                         fmt::format("integer literal `%s` is out of range for type `%s`",
-                            lit.value, it.int_kind.to_string()),
+                            lit.value, it.to_string()),
                         lit.span);
-                } else if (max_mag != 0 && it.int_kind.is_signed()) {
+                } else if (max_mag != 0 && it.is_signed()) {
                     // The literal fits the width's bit pattern but, for a signed
                     // type, exceeds the representable signed range: a bare
                     // `i8 = 200` stores the two's-complement pattern (-56).  This
@@ -166,7 +166,7 @@ type struct LiteralResolver {
                         mut diag: Diagnostic = Diagnostic::warning(
                             ErrorCode::W0012_SIGNED_LITERAL_OUT_OF_RANGE,
                             fmt::format("integer literal `%s` is outside the range of signed type `%s`; it is stored as its two's-complement bit pattern (wraps to a negative value)",
-                                lit.value, it.int_kind.to_string()));
+                                lit.value, it.to_string()));
                         diag = diag.at(lit.span);
                         this.ctx.emit_diagnostic(diag);
                     }
@@ -279,8 +279,8 @@ type struct LiteralResolver {
         if (lit.literal_kind != LiteralKind::Integer) { return false; }
         const t: Type* = this.arena.lookup(target);
         if (t == null || t.kind != TypeKind::Int) { return false; }
-        const it: IntType* = t as IntType*;
-        const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
+        const it: IntegerKind = t.int_kind();
+        const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
         if (max_mag == 0) { return false; }
         return !int_literal_exceeds(lit.value, max_mag);
     }
@@ -294,7 +294,7 @@ type struct LiteralResolver {
     const_expr_fits_target(&this, expr: ExpressionNode*, target: TypeRef) -> boolean {
         const t: Type* = this.arena.lookup(target);
         if (t == null || t.kind != TypeKind::Int) { return false; }
-        return LiteralResolver::const_expr_fits_int(expr, t as IntType*);
+        return LiteralResolver::const_expr_fits_int(expr, t.int_kind());
     }
 
     /// Refuse an expression made only of literals (`200 + 100`, `-200`)
@@ -311,32 +311,32 @@ type struct LiteralResolver {
         if (!is_constant_numeric_expr(expr)) { return false; }
         const t: Type* = this.arena.lookup(target);
         if (t == null || t.kind != TypeKind::Int) { return false; }
-        const it: IntType* = t as IntType*;
-        const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
+        const it: IntegerKind = t.int_kind();
+        const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
         if (max_mag == 0) { return false; }
         mut v: i64 = 0;
         if (!try_fold_const_i64(expr, &v)) { return false; }
         const held: boolean = if (v >= 0) {
             (v as u64) <= max_mag
         } else {
-            it.int_kind.is_signed() && v >= -((max_mag / 2) as i64) - 1
+            it.is_signed() && v >= -((max_mag / 2) as i64) - 1
         };
         if (held) { return false; }
         this.ctx.emit_error_at(
             ErrorCode::E0010_NUMBER_TOO_LARGE,
             fmt::format("this value is %lld, which `%s` does not hold: it narrows the value and would silently truncate; add an explicit `as` cast",
-                v, it.int_kind.to_string()),
+                v, it.to_string()),
             expr.span);
         return true;
     }
 
-    static const_expr_fits_int(expr: ExpressionNode*, it: IntType*) -> boolean {
+    static const_expr_fits_int(expr: ExpressionNode*, it: IntegerKind) -> boolean {
         if (expr == null) { return false; }
         mut v: i64 = 0;
         if (!try_fold_const_i64(expr, &v)) { return false; }
-        const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
+        const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
         if (max_mag == 0) { return false; }
-        if (it.int_kind.is_signed()) {
+        if (it.is_signed()) {
             const hi: i64 = (max_mag / 2) as i64;
             if (v > hi || v < -hi - 1) { return false; }
         } else {
@@ -360,6 +360,6 @@ type struct LiteralResolver {
     is_signed_int_type(&this, ty: TypeRef) -> boolean {
         const t: Type* = this.arena.lookup(ty);
         if (t == null || t.kind != TypeKind::Int) { return false; }
-        return (t as IntType*).int_kind.is_signed();
+        return t.int_kind().is_signed();
     }
 }

@@ -166,10 +166,10 @@ type struct MethodBinding {
         mut depth: i32 = 0;
         while (rt != null && depth < 5) {
             if (rt.kind == TypeKind::Reference) {
-                recv = (rt as ReferenceType*).referent;
+                recv = rt.as_reference().referent;
                 rt = this.arena.lookup(recv);
             } else if (rt.kind == TypeKind::Pointer) {
-                recv = (rt as PointerType*).pointee;
+                recv = rt.as_pointer().pointee;
                 rt = this.arena.lookup(recv);
             } else {
                 break;
@@ -316,9 +316,9 @@ type struct MethodBinding {
         mut depth: i32 = 0;
         while (t != null && depth < 5) {
             if (t.kind == TypeKind::Pointer) {
-                walk = (t as PointerType*).pointee;
+                walk = t.as_pointer().pointee;
             } else if (t.kind == TypeKind::Reference) {
-                walk = (t as ReferenceType*).referent;
+                walk = t.as_reference().referent;
             } else {
                 break;
             }
@@ -328,11 +328,11 @@ type struct MethodBinding {
         if (t == null) { return TypeRef::invalid(); }
         if (t.kind == TypeKind::AssocProjection) {
             return this.lookup_method_through_projection_bounds(
-                t as AssocProjectionType*, walk, method_name, dir);
+                t.as_assoc_projection(), walk, method_name, dir);
         }
         if (t.kind == TypeKind::GenericParam) {
             return this.lookup_method_through_param_bounds(
-                t as GenericParamType*, walk, method_name, dir);
+                t.as_generic_param(), walk, method_name, dir);
         }
         // A generic owner instantiated at a still-abstract argument (`H<S>` built
         // inside a generic function) is "unresolved" only in its ARGUMENTS: the
@@ -363,7 +363,7 @@ type struct MethodBinding {
         if (param == null) { return TypeRef::invalid(); }
         // `This` in a trait's default method is bounded by that trait alone,
         // which no where-clause writes.
-        if (this.arena.is_this_placeholder(param as Type*)) {
+        if (this.arena.is_this_placeholder(param)) {
             if (!this.state.symbolic_trait.is_valid()) { return TypeRef::invalid(); }
             mut none: [TraitBound] = [];
             return this.scan_param_bounds(&none, param, method_name, recv, this.state.symbolic_trait, true, dir);
@@ -406,7 +406,7 @@ type struct MethodBinding {
         if (pt == null || pt.kind != TypeKind::GenericParam) { return out; }
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_def);
         if (tdecl == null || tdecl.generic_params.length == 0) { return out; }
-        const tr: TraitRef* = this.param_bound_naming(pt as GenericParamType*, trait_def);
+        const tr: TraitRef* = this.param_bound_naming(pt.as_generic_param(), trait_def);
         if (tr == null) { return out; }
         const leaf: SymbolStr = tr.path[tr.path.length - 1];
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
@@ -476,17 +476,17 @@ type struct MethodBinding {
         mut depth: i32 = 0;
         while (t != null && depth < 5) {
             if (t.kind == TypeKind::Pointer) {
-                t = this.arena.lookup((t as PointerType*).pointee);
+                t = this.arena.lookup(t.as_pointer().pointee);
             } else if (t.kind == TypeKind::Reference) {
-                t = this.arena.lookup((t as ReferenceType*).referent);
+                t = this.arena.lookup(t.as_reference().referent);
             } else {
                 break;
             }
             depth += 1;
         }
         if (t == null || t.kind != TypeKind::GenericParam) { return null; }
-        const param: GenericParamType* = t as GenericParamType*;
-        if (this.arena.is_this_placeholder(param as Type*)) { return null; }
+        const param: GenericParamType* = t.as_generic_param();
+        if (this.arena.is_this_placeholder(param)) { return null; }
         return param;
     }
 
@@ -774,7 +774,7 @@ type struct MethodBinding {
                     if (!tref.is_valid()) { continue; }
                     const t: Type* = this.arena.lookup(tref);
                     if (t == null || t.kind != TypeKind::Trait) { continue; }
-                    const tt: TraitType* = t as TraitType*;
+                    const tt: TraitType* = t.as_trait();
                     const slot: i64 = this.ctx.generic_registry.trait_item_slot(chain[k], method_name);
                     for (mut mi: i64 = 0; mi < tt.required_methods.length; mi++) {
                         const m: MethodInfo* = &tt.required_methods[mi];
@@ -915,38 +915,38 @@ type struct MethodBinding {
         if (t == null) { return ty; }
         match (t.kind) {
             TypeKind::AssocProjection => {
-                const proj: AssocProjectionType* = t as AssocProjectionType*;
+                const proj: AssocProjectionType* = t.as_assoc_projection();
                 if (proj.slot == slot && proj.owning_trait.equals(trait_ty)) { return repl; }
                 const base: TypeRef = this.subst_assoc_slot(proj.base, trait_ty, slot, repl);
                 if (base.equals(proj.base)) { return ty; }
                 return this.arena.create_assoc_projection(base, proj.member, proj.owning_trait, proj.slot);
             }
             TypeKind::Pointer => {
-                const p: PointerType* = t as PointerType*;
+                const p: PointerType* = t.as_pointer();
                 const inner: TypeRef = this.subst_assoc_slot(p.pointee, trait_ty, slot, repl);
                 if (inner.equals(p.pointee)) { return ty; }
                 return this.arena.get_pointer_to(inner);
             }
             TypeKind::Reference => {
-                const r: ReferenceType* = t as ReferenceType*;
+                const r: ReferenceType* = t.as_reference();
                 const inner: TypeRef = this.subst_assoc_slot(r.referent, trait_ty, slot, repl);
                 if (inner.equals(r.referent)) { return ty; }
                 return this.arena.get_reference_to(inner, r.mutability);
             }
             TypeKind::Array => {
-                const a: ArrayType* = t as ArrayType*;
+                const a: ArrayType* = t.as_array();
                 const inner: TypeRef = this.subst_assoc_slot(a.element, trait_ty, slot, repl);
                 if (inner.equals(a.element)) { return ty; }
                 return this.arena.get_array_of(inner, a.size);
             }
             TypeKind::Optional => {
-                const o: OptionalType* = t as OptionalType*;
+                const o: OptionalType* = t.as_optional();
                 const inner: TypeRef = this.subst_assoc_slot(o.wrapped, trait_ty, slot, repl);
                 if (inner.equals(o.wrapped)) { return ty; }
                 return this.arena.get_optional_of(inner);
             }
             TypeKind::Function => {
-                const f: FunctionType* = t as FunctionType*;
+                const f: FunctionType* = t.as_function();
                 const new_ret: TypeRef = this.subst_assoc_slot(f.return_type, trait_ty, slot, repl);
                 mut changed: boolean = !new_ret.equals(f.return_type);
                 mut new_params: [TypeRef] = [];
@@ -959,7 +959,7 @@ type struct MethodBinding {
                 return this.arena.get_function(new_ret, new_params, f.is_variadic);
             }
             TypeKind::Tuple => {
-                const tup: TupleType* = t as TupleType*;
+                const tup: TupleType* = t.as_tuple();
                 mut changed_t: boolean = false;
                 mut new_elems: [TypeRef] = [];
                 for (mut i: i64 = 0; i < tup.elements.length; i++) {
@@ -971,7 +971,7 @@ type struct MethodBinding {
                 return this.arena.get_tuple(new_elems);
             }
             TypeKind::InstantiatedType => {
-                const inst: InstantiatedType* = t as InstantiatedType*;
+                const inst: InstantiatedType* = t.as_instantiated();
                 mut changed_i: boolean = false;
                 mut new_args: [TypeRef] = [];
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) {
@@ -1150,10 +1150,10 @@ type struct MethodBinding {
         mut depth: i32 = 0;
         while (owner_t != null && depth < 5) {
             if (owner_t.kind == TypeKind::Pointer) {
-                owner_ref = (owner_t as PointerType*).pointee;
+                owner_ref = owner_t.as_pointer().pointee;
                 owner_t = this.arena.lookup(owner_ref);
             } else if (owner_t.kind == TypeKind::Reference) {
-                owner_ref = (owner_t as ReferenceType*).referent;
+                owner_ref = owner_t.as_reference().referent;
                 owner_t = this.arena.lookup(owner_ref);
             } else {
                 break;
@@ -1384,10 +1384,10 @@ type struct MethodBinding {
         mut depth: i32 = 0;
         while (t != null && depth < 5) {
             if (t.kind == TypeKind::Reference) {
-                peeled = (t as ReferenceType*).referent;
+                peeled = t.as_reference().referent;
                 t = this.arena.lookup(peeled);
             } else if (t.kind == TypeKind::Pointer) {
-                peeled = (t as PointerType*).pointee;
+                peeled = t.as_pointer().pointee;
                 t = this.arena.lookup(peeled);
             } else {
                 break;
@@ -1397,7 +1397,7 @@ type struct MethodBinding {
         if (t == null) { return rc; }
 
         if (t.kind != TypeKind::GenericParam) { return rc; }
-        const gpt: GenericParamType* = t as GenericParamType*;
+        const gpt: GenericParamType* = t.as_generic_param();
 
         mut bound_leaves: [DefId] = [];
         if (this.state.symbolic_impl_node != null) {
@@ -1577,10 +1577,10 @@ type struct MethodBinding {
         mut du: i32 = 0;
         while (ru != null && du < 8) {
             if (ru.kind == TypeKind::Pointer) {
-                recv_type = (ru as PointerType*).pointee;
+                recv_type = ru.as_pointer().pointee;
                 ru = this.arena.lookup(recv_type);
             } else if (ru.kind == TypeKind::Reference) {
-                recv_type = (ru as ReferenceType*).referent;
+                recv_type = ru.as_reference().referent;
                 ru = this.arena.lookup(recv_type);
             } else {
                 break;
@@ -2077,7 +2077,7 @@ type struct MethodBinding {
         if (t == null) { return ty; }
         match (t.kind) {
             TypeKind::AssocProjection => {
-                const proj: AssocProjectionType* = t as AssocProjectionType*;
+                const proj: AssocProjectionType* = t.as_assoc_projection();
                 if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
                 const base: TypeRef = this.reduce_assoc_projections(proj.base);
                 const reduced: TypeRef = this.ctx.type_resolver.concrete_projection(base, proj.slot, proj.owning_trait);
@@ -2088,31 +2088,31 @@ type struct MethodBinding {
                 return ty;
             }
             TypeKind::Pointer => {
-                const p: PointerType* = t as PointerType*;
+                const p: PointerType* = t.as_pointer();
                 const inner: TypeRef = this.reduce_assoc_projections(p.pointee);
                 if (inner.equals(p.pointee)) { return ty; }
                 return this.arena.get_pointer_to(inner);
             }
             TypeKind::Reference => {
-                const r: ReferenceType* = t as ReferenceType*;
+                const r: ReferenceType* = t.as_reference();
                 const inner: TypeRef = this.reduce_assoc_projections(r.referent);
                 if (inner.equals(r.referent)) { return ty; }
                 return this.arena.get_reference_to(inner, r.mutability);
             }
             TypeKind::Array => {
-                const a: ArrayType* = t as ArrayType*;
+                const a: ArrayType* = t.as_array();
                 const inner: TypeRef = this.reduce_assoc_projections(a.element);
                 if (inner.equals(a.element)) { return ty; }
                 return this.arena.get_array_of(inner, a.size);
             }
             TypeKind::Optional => {
-                const o: OptionalType* = t as OptionalType*;
+                const o: OptionalType* = t.as_optional();
                 const inner: TypeRef = this.reduce_assoc_projections(o.wrapped);
                 if (inner.equals(o.wrapped)) { return ty; }
                 return this.arena.get_optional_of(inner);
             }
             TypeKind::Function => {
-                const f: FunctionType* = t as FunctionType*;
+                const f: FunctionType* = t.as_function();
                 const new_ret: TypeRef = this.reduce_assoc_projections(f.return_type);
                 mut changed: boolean = !new_ret.equals(f.return_type);
                 mut new_params: [TypeRef] = [];
@@ -2125,7 +2125,7 @@ type struct MethodBinding {
                 return this.arena.get_function(new_ret, new_params, f.is_variadic);
             }
             TypeKind::Tuple => {
-                const tup: TupleType* = t as TupleType*;
+                const tup: TupleType* = t.as_tuple();
                 mut changed_t: boolean = false;
                 mut new_elems: [TypeRef] = [];
                 for (mut i: i64 = 0; i < tup.elements.length; i++) {
@@ -2137,7 +2137,7 @@ type struct MethodBinding {
                 return this.arena.get_tuple(new_elems);
             }
             TypeKind::InstantiatedType => {
-                const inst: InstantiatedType* = t as InstantiatedType*;
+                const inst: InstantiatedType* = t.as_instantiated();
                 mut changed_i: boolean = false;
                 mut new_args: [TypeRef] = [];
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) {
@@ -2164,10 +2164,10 @@ type struct MethodBinding {
         mut depth: i32 = 0;
         while (st != null && depth < 5) {
             if (st.kind == TypeKind::Reference) {
-                subject_ref = (st as ReferenceType*).referent;
+                subject_ref = st.as_reference().referent;
                 st = this.arena.lookup(subject_ref);
             } else if (st.kind == TypeKind::Pointer) {
-                subject_ref = (st as PointerType*).pointee;
+                subject_ref = st.as_pointer().pointee;
                 st = this.arena.lookup(subject_ref);
             } else {
                 break;

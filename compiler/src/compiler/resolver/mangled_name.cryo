@@ -45,7 +45,7 @@ import compiler::types::compound::{
 import compiler::types::generic::{
     AssocProjectionType, GenericParamType, InstantiatedType
 };
-import compiler::types::type_base::{ FloatType, IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
     ClassType, EnumType, FunctionTemplateType, StructType, TraitType, TypeAliasType
@@ -547,20 +547,20 @@ type struct MangleContext {
         if (ty.kind == TypeKind::VaList) { return "V"; }
 
         if (ty.kind == TypeKind::Int) {
-            const it: IntType* = ty as IntType*;
-            return MangleContext::int_code(it.int_kind);
+            const it: IntegerKind = ty.int_kind();
+            return MangleContext::int_code(it);
         }
         if (ty.kind == TypeKind::Float) {
-            const ft: FloatType* = ty as FloatType*;
-            return MangleContext::float_code(ft.float_kind);
+            const ft: FloatKind = ty.float_kind();
+            return MangleContext::float_code(ft);
         }
 
         if (ty.kind == TypeKind::Pointer) {
-            const p: PointerType* = ty as PointerType*;
+            const p: PointerType* = ty.as_pointer();
             return "P" + this.encode_type_ref(p.pointee, "Pointer.pointee");
         }
         if (ty.kind == TypeKind::Reference) {
-            const r: ReferenceType* = ty as ReferenceType*;
+            const r: ReferenceType* = ty.as_reference();
             return "R" + this.encode_type_ref(r.referent, "Reference.referent");
         }
         if (ty.kind == TypeKind::Array) {
@@ -581,7 +581,7 @@ type struct MangleContext {
             // on `ArrayAnnotation`, and `TypeResolver::array_size_of` folds it
             // at the one site that builds an arena array - so a pending size
             // cannot reach the mangler and split one type across two keys.
-            const a: ArrayType* = ty as ArrayType*;
+            const a: ArrayType* = ty.as_array();
             const elem_a: string = this.encode_type_ref(a.element, "Array.element");
             const len_a: u64 = a.size as u64;
             mut buf_a: string = "A$L";
@@ -593,7 +593,7 @@ type struct MangleContext {
         if (ty.kind == TypeKind::Optional) {
             // Optional<T>: encode as a synthetic named generic so the form
             // is round-trippable through the demangler.
-            const o: OptionalType* = ty as OptionalType*;
+            const o: OptionalType* = ty.as_optional();
             const inner_o: string = this.encode_type_ref(o.wrapped, "Optional.wrapped");
             mut buf_o: string = "N$L8Optional$L";
             buf_o += inner_o;
@@ -602,7 +602,7 @@ type struct MangleContext {
         }
 
         if (ty.kind == TypeKind::Function) {
-            const f: FunctionType* = ty as FunctionType*;
+            const f: FunctionType* = ty.as_function();
             const inner_params: string = this.encode_params(
                 f.param_types, ReceiverKind::None, f.is_variadic);
             const inner_ret: string = this.encode_type_ref(f.return_type, "FunctionType.ret");
@@ -648,12 +648,12 @@ type struct MangleContext {
         }
 
         if (ty.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = ty as InstantiatedType*;
+            const inst: InstantiatedType* = ty.as_instantiated();
             return this.encode_instantiated(ref, inst);
         }
 
         if (ty.kind == TypeKind::GenericParam) {
-            const gp: GenericParamType* = ty as GenericParamType*;
+            const gp: GenericParamType* = ty.as_generic_param();
             // Should be resolved before mangling; emit the param name so any
             // leaks are easy to spot in IR rather than a silent collision.
             return "N$L" + MangleContext::encode_ident(this.table.resolve(gp.param_name)) + "$G";
@@ -665,7 +665,7 @@ type struct MangleContext {
             // stable, distinct placeholder (`base` + `::` + `member`) rather than
             // ICE. A leak into an emitted symbol stays visible (never collides with
             // a genuine named type), matching the GenericParam policy above.
-            const proj: AssocProjectionType* = ty as AssocProjectionType*;
+            const proj: AssocProjectionType* = ty.as_assoc_projection();
             mut buf_pj: string = "N$L";
             buf_pj += this.encode_type_ref(proj.base, "AssocProjection.base");
             buf_pj += "_";   // `::` escape
@@ -681,7 +681,7 @@ type struct MangleContext {
         // to share a spec name, with the second registration overwriting the
         // first in the type registry.
         if (ty.kind == TypeKind::Tuple) {
-            const tup: TupleType* = ty as TupleType*;
+            const tup: TupleType* = ty.as_tuple();
             mut buf_t: string = "N$L5Tuple$L";
             for (mut i: i64 = 0; i < tup.elements.length; i++) {
                 if (i > 0) { buf_t += "_"; }
@@ -707,27 +707,27 @@ type struct MangleContext {
     /// Table-only -> static.
     static encode_named_type_path(table: InternTable*, ty: Type*) -> string {
         if (ty.kind == TypeKind::Struct) {
-            const s: StructType* = ty as StructType*;
+            const s: StructType* = ty.as_struct();
             return MangleContext::encode_named_qname(table, s.qualified_name.spelling());
         }
         if (ty.kind == TypeKind::Class) {
-            const c: ClassType* = ty as ClassType*;
+            const c: ClassType* = ty.as_class();
             return MangleContext::encode_named_qname(table, c.qualified_name.spelling());
         }
         if (ty.kind == TypeKind::Enum) {
-            const e: EnumType* = ty as EnumType*;
+            const e: EnumType* = ty.as_enum();
             return MangleContext::encode_named_qname(table, e.qualified_name.spelling());
         }
         if (ty.kind == TypeKind::Trait) {
-            const tr: TraitType* = ty as TraitType*;
+            const tr: TraitType* = ty.as_trait();
             return MangleContext::encode_named_qname(table, tr.qualified_name.spelling());
         }
         if (ty.kind == TypeKind::TypeAlias) {
-            const ta: TypeAliasType* = ty as TypeAliasType*;
+            const ta: TypeAliasType* = ty.as_alias();
             return MangleContext::encode_named_qname(table, ta.alias_name);
         }
         if (ty.kind == TypeKind::FunctionTemplate) {
-            const ft: FunctionTemplateType* = ty as FunctionTemplateType*;
+            const ft: FunctionTemplateType* = ty.as_function_template();
             return MangleContext::encode_named_qname(table, ft.qualified_name.spelling());
         }
         return MangleContext::encode_ident("?");

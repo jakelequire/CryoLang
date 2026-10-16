@@ -13,7 +13,7 @@ and measured only; nothing in it was built except two throwaway probes
 (section 2.6).  The decisions it needs are in section 9; nothing in a slice
 that depends on one starts before it is answered.
 
-**Status.**  The 13 decisions in section 9 are answered.  Slices 0 and 1
+**Status.**  The 13 decisions in section 9 are answered.  Slices 0 to 4
 are built; their results are recorded under each slice in section 6.
 Every temporary bridge piece is listed in section 10 until it is deleted.
 
@@ -520,7 +520,7 @@ type struct Type {
 }
 
 type enum TypeData {
-    Void; Unit; Bool; Char; String; Never; VaList;
+    Void; Unit; Bool; Char; String; Never; VaList; Error;
     Int(IntegerKind);
     Float(FloatKind);
     Pointer(PointerType*);
@@ -532,7 +532,6 @@ type enum TypeData {
     GenericParam(GenericParamType*);
     Instantiated(InstantiatedType*);
     AssocProjection(AssocProjectionType*);
-    Error(ErrorType*);
     Struct(StructType*);
     Class(ClassType*);
     Enum(EnumType*);
@@ -1105,6 +1104,59 @@ stays as a variant.
 - **Proof:** identical; selfhost; lsp-check.
 - **Prediction:** the 904 type casts go to near zero; the type arena's size
   is unchanged within the header growth.
+
+**Built.**
+
+- `Type` is a struct `{ id, kind, data: TypeData }` in `type_base.cryo`,
+  with one `TypeData` variant per `TypeKind`.  The primitives are the
+  variant alone, or `Int(IntegerKind)` / `Float(FloatKind)`; every other
+  kind points at its payload struct, which keeps its old name
+  (`StructType`, `InstantiatedType`, ...) and its own methods inline, and
+  no longer carries `id` or `kind`.  `kind` is set only by `Type::new`, from
+  `TypeData::kind()`, so the two cannot disagree; deriving it (ruling 390)
+  is then deleting the field.  One commit: a variant group at a time would
+  have needed `Type` to be a class and a struct at once.
+- `display_name`, `size_bytes` and `alignment` are `match` methods on
+  `Type`; the per-kind spelling stays on the payload where it has fields to
+  read.  `InstantiatedType::is_resolved` was an `override` of nothing (no
+  base declared it); its one caller reads `has_resolved_type`.
+  `ErrorType` was never constructed, so it is deleted and `Error` is a
+  plain variant; `TypeRefs::upcoming` lost its last callers with the
+  constructors.
+- Every cast to a payload became a checked accessor on `Type`:
+  `t.as_struct()`, `t.as_instantiated()`, ... and `t.int_kind()` /
+  `t.float_kind()`, which answer the kind enum itself.  An accessor asked
+  for another kind's payload calls `unreachable()`, where the cast read
+  whatever memory was there.  A pointer cast between unrelated structs is
+  accepted by the language, so a cast left behind would have compiled and
+  read the header as a payload; the codemod's own count and a grep for
+  `as [ns::]<payload>*` were the controls (74 `as StructType*` at the
+  parent, 0 after).  Four casts written `as compound::ArrayType*` in the
+  language server escaped the first pattern and crashed in the type-handle
+  tag check under lsp-check, which is how they were found.
+- The places that used a payload as a `Type*` (an upcast, or `.id` read
+  off the payload) take the `Type*` instead: `TypeMapper::map_struct` and
+  `map_class` take the id, `PatternResolver::enum_definition_id` takes the
+  `Type*`, `TypeArena::is_this_placeholder` compares payloads, and the
+  class field walk keeps the `Type*` of each link.  A diagnostic that
+  displayed a bare parameter through such an upcast reads
+  `TypeArena::format_generic_param`, which `format_display` also uses.
+- A one-off codemod (`scripts/type-codemod.py`) rewrote the casts, the
+  `IntType*`/`FloatType*` annotations and their `.int_kind` reads, and the
+  imports; it is in the commit that ran it and deleted in the next.
+- **Measured.**  verify `--require-identical`: 0 test and 0 example
+  objects moved; census, examples, lsp (185), cross, incr and fast OK.
+  Lines casting to a `Type` subclass 872 -> 0: the codemod rewrote 869
+  casts (4 of them by the qualified pattern), the arena's primitive and
+  error reads went by hand; 865 lines call an accessor.  The
+  compiler binary's vtables 25 -> 0 (73 -> 0 symbol lines): the type
+  hierarchy's were the last.  Check time, interleaved x3 against the
+  parent: 7.93 s and 7.95 s (medians); peak 1528.2 and 1529.9 MiB; nodes
+  identical (1,942,788).  Arena use +933,556 bytes over 62,904 types,
+  14.8 bytes per type: the 32-byte header is a second allocation, and the
+  payload no longer holds the table pointer, `id` and `kind` (24 bytes),
+  with the bump allocator's 16-byte rounding on both.  Clean build 0
+  warnings.  Classes 95 -> 69.
 
 ### Slice 5: patterns (the pilot for node conversion)
 

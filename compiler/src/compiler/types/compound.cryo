@@ -1,7 +1,8 @@
 ///! Compound Types
 ///!
-///! Type classes for pointer, reference, array, function, tuple, and optional.
-///! These wrap other types (via TypeRef handles) and are deduplicated by the arena.
+///! The payloads of pointer, reference, array, function, tuple, and optional
+///! types.  These wrap other types (via TypeRef handles) and are deduplicated
+///! by the arena.
 ///!
 ///! NOTE: display_name() on compound types returns raw TypeRef IDs as fallback.
 ///! For human-readable names, use TypeArena::format_display(ty) which resolves
@@ -12,83 +13,66 @@ namespace compiler::types::compound;
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types;
-import compiler::types::{ RefMutability, TypeKind };
-import compiler::types::type_base;
-import compiler::types::type_base::{ Type };
+import compiler::types::{ RefMutability };
 import std::fmt;
 
 
 // PointerType: Raw pointer to another type
 
-type class PointerType : Type {
-public:
+type struct PointerType {
     pointee: TypeRef;
     /// `true` for `const T*` (pointee is const). ABI-identical to a plain
     /// pointer and excluded from mangling; only the type-checker reads it to
     /// forbid implicitly dropping const.
     const_pointee: boolean;
 
-    PointerType(id: u64, pointee: TypeRef, const_pointee: boolean) : Type(id, TypeKind::Pointer) {
-        this.pointee       = pointee;
-        this.const_pointee = const_pointee;
+    static new(pointee: TypeRef, const_pointee: boolean) -> PointerType* {
+        return new PointerType { pointee: pointee, const_pointee: const_pointee };
     }
 
-    override display_name(&this) -> string {
+    display_name(&this) -> string {
         if (this.const_pointee) {
             return fmt::format("const %lu*", this.pointee.key());
         }
         return fmt::format("%lu*", this.pointee.key());
     }
-
-    override size_bytes(&this) -> u64 { return 8; }
-    override alignment(&this) -> u64  { return 8; }
 }
 
 
 // ReferenceType: Borrowed reference (immutable or mutable)
 
-type class ReferenceType : Type {
-public:
+type struct ReferenceType {
     referent:   TypeRef;
     mutability: RefMutability;
 
-    ReferenceType(id: u64, referent: TypeRef, mutability: RefMutability)
-        : Type(id, TypeKind::Reference) {
-        this.referent   = referent;
-        this.mutability = mutability;
+    static new(referent: TypeRef, mutability: RefMutability) -> ReferenceType* {
+        return new ReferenceType { referent: referent, mutability: mutability };
     }
 
     is_mutable(&this) -> boolean {
         return this.mutability.is_mutable();
     }
 
-    override display_name(&this) -> string {
+    display_name(&this) -> string {
         // Cryo spells a mutable reference `mut &T`, not `&mut T`.
         if (this.is_mutable()) {
             return fmt::format("mut &%lu", this.referent.key());
         }
         return fmt::format("&%lu", this.referent.key());
     }
-
-    override size_bytes(&this) -> u64 { return 8; }
-    override alignment(&this) -> u64  { return 8; }
 }
 
 
 // ArrayType: the fixed array `[T; N]`.  The dynamic `[T]` is `Array<T>`.
 
-type class ArrayType : Type {
-public:
+type struct ArrayType {
     element:        TypeRef;
     size:           i64;
     computed_size:  u64;       // Computed by the TypeLowering pass
     computed_align: u64;
 
-    ArrayType(id: u64, element: TypeRef, size: i64) : Type(id, TypeKind::Array) {
-        this.element        = element;
-        this.size           = size;
-        this.computed_size  = 0;
-        this.computed_align = 0;
+    static new(element: TypeRef, size: i64) -> ArrayType* {
+        return new ArrayType { element: element, size: size, computed_size: 0, computed_align: 0 };
     }
 
     /// The type as a program writes it, `[T; N]`, around the text
@@ -97,7 +81,7 @@ public:
         return "[" + element_text + "; " + fmt::format("%ld", this.size) + "]";
     }
 
-    override display_name(&this) -> string {
+    display_name(&this) -> string {
         return fmt::format("%lu[%ld]", this.element.key(), this.size);
     }
 
@@ -105,33 +89,25 @@ public:
         this.computed_size  = size;
         this.computed_align = align;
     }
-
-    override size_bytes(&this) -> u64 {
-        return this.computed_size;
-    }
-
-    override alignment(&this) -> u64 {
-        return this.computed_align;
-    }
 }
 
 
 // FunctionType: Function signature
 
-type class FunctionType : Type {
-public:
+type struct FunctionType {
     return_type: TypeRef;
     param_types: [TypeRef];
     is_variadic: boolean;
 
-    FunctionType(id: u64, return_type: TypeRef, param_types: [TypeRef], is_variadic: boolean)
-        : Type(id, TypeKind::Function) {
-        this.return_type = return_type;
-        this.param_types = param_types;
-        this.is_variadic = is_variadic;
+    static new(return_type: TypeRef, param_types: [TypeRef], is_variadic: boolean) -> FunctionType* {
+        return new FunctionType {
+            return_type: return_type,
+            param_types: param_types,
+            is_variadic: is_variadic,
+        };
     }
 
-    override display_name(&this) -> string {
+    display_name(&this) -> string {
         mut result: string = "(";
         for (mut i: i64 = 0; i < this.param_types.length; i++) {
             if (i > 0) {
@@ -148,28 +124,21 @@ public:
         result = fmt::format("%s) -> %lu", result, this.return_type.key());
         return result;
     }
-
-    override size_bytes(&this) -> u64 { return 8; }  // Function pointer
-    override alignment(&this) -> u64  { return 8; }
 }
 
 
 // TupleType: Heterogeneous fixed-size collection
 
-type class TupleType : Type {
-public:
+type struct TupleType {
     elements:       [TypeRef];
     computed_size:  u64;
     computed_align: u64;
 
-    TupleType(id: u64, elements: [TypeRef]) : Type(id, TypeKind::Tuple) {
-        this.elements       = elements;
-        this.computed_size  = 0;
-        this.computed_align = 0;
+    static new(elements: [TypeRef]) -> TupleType* {
+        return new TupleType { elements: elements, computed_size: 0, computed_align: 0 };
     }
 
-
-    override display_name(&this) -> string {
+    display_name(&this) -> string {
         mut result: string = "(";
         for (mut i: i64 = 0; i < this.elements.length; i++) {
             if (i > 0) {
@@ -185,27 +154,21 @@ public:
         this.computed_size  = size;
         this.computed_align = align;
     }
-
-    override size_bytes(&this) -> u64 { return this.computed_size; }
-    override alignment(&this) -> u64  { return this.computed_align; }
 }
 
 
 // OptionalType: Nullable wrapper (T?)
 
-type class OptionalType : Type {
-public:
+type struct OptionalType {
     wrapped:        TypeRef;
     computed_size:  u64;
     computed_align: u64;
 
-    OptionalType(id: u64, wrapped: TypeRef) : Type(id, TypeKind::Optional) {
-        this.wrapped        = wrapped;
-        this.computed_size  = 0;
-        this.computed_align = 0;
+    static new(wrapped: TypeRef) -> OptionalType* {
+        return new OptionalType { wrapped: wrapped, computed_size: 0, computed_align: 0 };
     }
 
-    override display_name(&this) -> string {
+    display_name(&this) -> string {
         return fmt::format("%lu?", this.wrapped.key());
     }
 
@@ -213,7 +176,4 @@ public:
         this.computed_size  = size;
         this.computed_align = align;
     }
-
-    override size_bytes(&this) -> u64 { return this.computed_size; }
-    override alignment(&this) -> u64  { return this.computed_align; }
 }

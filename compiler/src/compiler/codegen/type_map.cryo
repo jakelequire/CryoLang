@@ -12,7 +12,7 @@ import compiler::codegen::llvm_types;
 import compiler::codegen::llvm_types::{ LContext, LModule, LType, LTypeKind };
 import compiler::types;
 import compiler::types::{
-    arena, compound, FloatKind, generic, type_base, type_ref, TypeKind, user_defined
+    arena, compound, FloatKind, generic, IntegerKind, type_base, type_ref, TypeKind, user_defined
 };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import compiler::diag;
@@ -33,7 +33,7 @@ import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{ InstantiatedType };
-import compiler::types::type_base::{ FloatType, IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
     ClassType, EnumType, EnumVariantInfo, StructType, TypeAliasType
@@ -164,7 +164,7 @@ type struct TypeMapper {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return 1; }
         if (t.kind == TypeKind::Struct) {
-            const st: StructType* = t as StructType*;
+            const st: StructType* = t.as_struct();
             if (st.repr_packed) { return 1; }
             mut a: u64 = 1;
             for (mut i: i64 = 0; i < st.fields.length; i++) {
@@ -174,7 +174,7 @@ type struct TypeMapper {
             return a;
         }
         if (t.kind == TypeKind::Class) {
-            const cl: ClassType* = t as ClassType*;
+            const cl: ClassType* = t.as_class();
             mut a: u64 = 1;
             if (cl.has_virtual_methods || cl.has_base) { a = 8; }
             for (mut i: i64 = 0; i < cl.fields.length; i++) {
@@ -184,16 +184,16 @@ type struct TypeMapper {
             return a;
         }
         if (t.kind == TypeKind::Array) {
-            const arr: ArrayType* = t as ArrayType*;
+            const arr: ArrayType* = t.as_array();
             return this.natural_align(arr.element, depth + 1);
         }
         if (t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+            const inst: InstantiatedType* = t.as_instantiated();
             if (inst.has_resolved_type()) { return this.natural_align(inst.resolved_type, depth + 1); }
             return 1;
         }
         if (t.kind == TypeKind::TypeAlias) {
-            const al: TypeAliasType* = t as TypeAliasType*;
+            const al: TypeAliasType* = t.as_alias();
             if (al.has_target()) { return this.natural_align(al.target, depth + 1); }
             return 1;
         }
@@ -257,13 +257,13 @@ type struct TypeMapper {
             if (!walk.has_base || !walk.base_class.is_valid()) { break; }
             const base_t: Type* = this.arena.lookup(walk.base_class);
             if (base_t == null || base_t.kind != TypeKind::Class) { break; }
-            walk = base_t as ClassType*;
+            walk = base_t.as_class();
             depth += 1;
         }
         mut slot: i64 = if (any_virtual) { 1 } else { 0 };
         for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
             const link: ClassType* = chain[ci];
-            if (link.id == owner.id) {
+            if (link == owner) {
                 if (local_idx >= link.fields.length) { return -1; }
                 return slot + local_idx;
             }
@@ -278,11 +278,11 @@ type struct TypeMapper {
     field_element_index(&this, t: Type*, field_idx: i64) -> i64 {
         if (t == null || field_idx < 0) { return -1; }
         if (t.kind == TypeKind::Class) {
-            const cls: ClassType* = t as ClassType*;
+            const cls: ClassType* = t.as_class();
             return this.class_field_element_index(cls, cls, field_idx);
         }
         if (t.kind == TypeKind::Struct) {
-            return this.struct_field_slot(t as StructType*, field_idx, null);
+            return this.struct_field_slot(t.as_struct(), field_idx, null);
         }
         return field_idx;
     }
@@ -306,12 +306,12 @@ type struct TypeMapper {
         if (t == null || depth < 0 || index < 0) { return -1; }
         if (t.kind == TypeKind::Struct) {
             if (depth != 0) { return -1; }
-            const st: StructType* = t as StructType*;
+            const st: StructType* = t.as_struct();
             if (index >= st.fields.length) { return -1; }
             return this.field_element_index(t, index);
         }
         if (t.kind == TypeKind::Class) {
-            const cls: ClassType* = t as ClassType*;
+            const cls: ClassType* = t.as_class();
             const owner: ClassType* = this.class_at_depth(cls, depth);
             if (owner == null) { return -1; }
             return this.class_field_element_index(cls, owner, index);
@@ -413,8 +413,8 @@ type struct TypeMapper {
             TypeKind::Void             => { LType::void_type() }
             TypeKind::Unit             => { this.map_unit() }
             TypeKind::Bool             => { LType::i1() }
-            TypeKind::Int              => { this.map_int(t as IntType*) }
-            TypeKind::Float            => { this.map_float(t as FloatType*) }
+            TypeKind::Int              => { this.map_int(t.int_kind()) }
+            TypeKind::Float            => { this.map_float(t.float_kind()) }
             TypeKind::Char             => { LType::i32() }
             TypeKind::String           => { this.map_string() }
             TypeKind::Never            => { LType::void_type() }
@@ -423,19 +423,19 @@ type struct TypeMapper {
             // `__va_list_tag[1]` to a pointer; Win64 va_list is `char*`), and
             // this matches what a variadic function's `args` bucket already is.
             TypeKind::VaList           => { LType::pointer_to(LType::i8()) }
-            TypeKind::Pointer          => { this.map_pointer(t as PointerType*) }
-            TypeKind::Reference        => { this.map_reference(t as ReferenceType*) }
-            TypeKind::Array            => { this.map_array(t as ArrayType*) }
-            TypeKind::Function         => { this.map_function(t as FunctionType*) }
-            TypeKind::Tuple            => { this.map_tuple(t as TupleType*) }
-            TypeKind::Optional         => { this.map_optional(t as OptionalType*) }
-            TypeKind::Struct           => { this.map_struct(t as StructType*) }
-            TypeKind::Class            => { this.map_class(t as ClassType*) }
-            TypeKind::Enum             => { this.map_enum(t as EnumType*) }
+            TypeKind::Pointer          => { this.map_pointer(t.as_pointer()) }
+            TypeKind::Reference        => { this.map_reference(t.as_reference()) }
+            TypeKind::Array            => { this.map_array(t.as_array()) }
+            TypeKind::Function         => { this.map_function(t.as_function()) }
+            TypeKind::Tuple            => { this.map_tuple(t.as_tuple()) }
+            TypeKind::Optional         => { this.map_optional(t.as_optional()) }
+            TypeKind::Struct           => { this.map_struct(t.id, t.as_struct()) }
+            TypeKind::Class            => { this.map_class(t.id, t.as_class()) }
+            TypeKind::Enum             => { this.map_enum(t.as_enum()) }
             TypeKind::Trait            => { LType::i8() }
-            TypeKind::TypeAlias        => { this.map_type_alias(t as TypeAliasType*) }
+            TypeKind::TypeAlias        => { this.map_type_alias(t.as_alias()) }
             TypeKind::GenericParam     => { LType::null() }
-            TypeKind::InstantiatedType => { this.map_instantiated(t as InstantiatedType*) }
+            TypeKind::InstantiatedType => { this.map_instantiated(t.as_instantiated()) }
             TypeKind::AssocProjection  => { LType::null() }
             TypeKind::FunctionTemplate => { LType::null() }
             TypeKind::Error            => { LType::null() }
@@ -450,14 +450,14 @@ type struct TypeMapper {
         return LType::literal_struct(null, 0, false);
     }
 
-    /// IntType -> LLVMIntType with correct bit width.
-    map_int(mut &this, t: IntType*) -> LType {
-        return LType::int_type(t.int_kind.bit_width() as u32);
+    /// An integer kind -> the LLVM integer type of its bit width.
+    map_int(mut &this, k: IntegerKind) -> LType {
+        return LType::int_type(k.bit_width() as u32);
     }
 
-    /// FloatType -> LLVMFloatType or LLVMDoubleType.
-    map_float(mut &this, t: FloatType*) -> LType {
-        return match (t.float_kind) {
+    /// A float kind -> LLVM `float` or `double`.
+    map_float(mut &this, k: FloatKind) -> LType {
+        return match (k) {
             FloatKind::F32 => { LType::f32() }
             FloatKind::F64 => { LType::f64() }
         };
@@ -570,11 +570,11 @@ type struct TypeMapper {
     ///   * `repr_transparent` -> no codegen change needed beyond what
     ///     the field list already produces; layout equivalence to the
     ///     inner field is enforced by `compute_struct_layout`.
-    map_struct(mut &this, t: StructType*) -> LType {
+    map_struct(mut &this, id: u64, t: StructType*) -> LType {
         const mangled: MangledName = MangledName::for_struct_type(this.intern, QualifiedName::from_symbol(t.qualified_name.spelling()));
 
         // Check if already forward-declared.
-        const cached: LType = this.lookup_cache(t.id);
+        const cached: LType = this.lookup_cache(id);
         if (cached.is_valid()) {
             return cached;
         }
@@ -591,13 +591,13 @@ type struct TypeMapper {
         // recursive reference); the original creator fills its body.
         const existing: LType = LType::struct_by_name(ctx, mangled);
         if (existing.is_valid()) {
-            this.store_cache(t.id, existing);
+            this.store_cache(id, existing);
             return existing;
         }
 
         // Forward-declare to handle recursive references.
         mut llvm_ty: LType = LType::named_struct(ctx, mangled);
-        this.store_cache(t.id, llvm_ty);
+        this.store_cache(id, llvm_ty);
 
         const packed: boolean = t.repr_packed;
 
@@ -686,10 +686,10 @@ type struct TypeMapper {
     ///   [ this class's own fields ]
     /// A subclass pointer is valid as a base pointer because their struct
     /// layouts share a prefix; no bitcast needed for upcasts.
-    map_class(mut &this, t: ClassType*) -> LType {
+    map_class(mut &this, id: u64, t: ClassType*) -> LType {
         const mangled: MangledName = MangledName::for_struct_type(this.intern, QualifiedName::from_symbol(t.qualified_name.spelling()));
 
-        const cached: LType = this.lookup_cache(t.id);
+        const cached: LType = this.lookup_cache(id);
         if (cached.is_valid()) {
             return cached;
         }
@@ -700,12 +700,12 @@ type struct TypeMapper {
         // across type ids (see `map_struct` for the rationale).
         const existing: LType = LType::struct_by_name(ctx, mangled);
         if (existing.is_valid()) {
-            this.store_cache(t.id, existing);
+            this.store_cache(id, existing);
             return existing;
         }
 
         mut llvm_ty: LType = LType::named_struct(ctx, mangled);
-        this.store_cache(t.id, llvm_ty);
+        this.store_cache(id, llvm_ty);
 
         // Walk the base chain: chain[0] is this class; chain[N-1] is the root.
         // Any ancestor with virtual methods means this subclass also carries
@@ -720,7 +720,7 @@ type struct TypeMapper {
             if (!walk.has_base || !walk.base_class.is_valid()) { break; }
             const base_t: Type* = this.arena.lookup(walk.base_class);
             if (base_t == null || base_t.kind != TypeKind::Class) { break; }
-            walk = base_t as ClassType*;
+            walk = base_t.as_class();
             depth += 1;
         }
 

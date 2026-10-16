@@ -8,7 +8,7 @@ namespace compiler::types::checker;
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::types;
 import compiler::types::{
-    arena, compound, generic, RefMutability, type_base, type_ref, TypeKind, user_defined
+    arena, compound, FloatKind, generic, IntegerKind, RefMutability, type_base, type_ref, TypeKind, user_defined
 };
 import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
@@ -20,7 +20,7 @@ import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType
 };
 import compiler::types::generic::{ InstantiatedType };
-import compiler::types::type_base::{ FloatType, IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
     ClassType, EnumType, FieldInfo, MethodInfo, StructType, TypeAliasType
@@ -133,14 +133,14 @@ type struct TypeChecker {
         mut to_type: Type*   = this.arena.lookup(to);
 
         if (from_type != null && from_type.kind == TypeKind::InstantiatedType) {
-            const from_inst: InstantiatedType* = from_type as InstantiatedType*;
+            const from_inst: InstantiatedType* = from_type.as_instantiated();
             if (from_inst.has_resolved_type()) {
                 effective_from = from_inst.resolved_type;
                 from_type = this.arena.lookup(effective_from);
             }
         }
         if (to_type != null && to_type.kind == TypeKind::InstantiatedType) {
-            const to_inst: InstantiatedType* = to_type as InstantiatedType*;
+            const to_inst: InstantiatedType* = to_type.as_instantiated();
             if (to_inst.has_resolved_type()) {
                 effective_to = to_inst.resolved_type;
                 to_type = this.arena.lookup(effective_to);
@@ -185,8 +185,8 @@ type struct TypeChecker {
 
         // A fixed array is another fixed array of its element and length.
         if (from_type.kind == TypeKind::Array && to_type.kind == TypeKind::Array) {
-            const from_arr: ArrayType* = from_type as ArrayType*;
-            const to_arr: ArrayType* = to_type as ArrayType*;
+            const from_arr: ArrayType* = from_type.as_array();
+            const to_arr: ArrayType* = to_type.as_array();
             // Element identity is plain id equality: elements are interned
             // through the arena's structural hash-cons table, so one semantic
             // element type has exactly one id.  This deliberately does
@@ -214,14 +214,14 @@ type struct TypeChecker {
         // element array can decay to one.  A wider element type would hand
         // `string` a buffer it reads at the wrong stride.
         if (from_type.kind == TypeKind::Array && to_type.kind == TypeKind::String) {
-            const from_arr_s: ArrayType* = from_type as ArrayType*;
+            const from_arr_s: ArrayType* = from_type.as_array();
             const elem_s: Type* = this.arena.lookup(from_arr_s.element);
             if (elem_s != null) {
                 if (elem_s.kind == TypeKind::Char) {
                     return TypeCompatibility::ImplicitConvert;
                 }
                 if (elem_s.kind == TypeKind::Int) {
-                    const ei: IntType* = elem_s as IntType*;
+                    const ei: IntegerKind = elem_s.int_kind();
                     if (ei.bit_width() == 8) {
                         return TypeCompatibility::ImplicitConvert;
                     }
@@ -253,8 +253,8 @@ type struct TypeChecker {
 
         // Pointer conversions
         if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::Pointer) {
-            const from_ptr: PointerType* = from_type as PointerType*;
-            const to_ptr: PointerType* = to_type as PointerType*;
+            const from_ptr: PointerType* = from_type.as_pointer();
+            const to_ptr: PointerType* = to_type.as_pointer();
             // const-correctness: dropping const (`const T*` -> `T*`) is unsafe
             // and is never implicit; it requires an explicit cast. Adding const
             // (`T*` -> `const T*`) is always safe. This gate runs before the
@@ -315,10 +315,10 @@ type struct TypeChecker {
 
         // i8* -> string: C string to Cryo string (string is i8* at LLVM level)
         if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::String) {
-            const from_ptr: PointerType* = from_type as PointerType*;
+            const from_ptr: PointerType* = from_type.as_pointer();
             const pointee: Type* = this.arena.lookup(from_ptr.pointee);
             if (pointee != null && pointee.kind == TypeKind::Int) {
-                const int_t: IntType* = pointee as IntType*;
+                const int_t: IntegerKind = pointee.int_kind();
                 if (int_t.bit_width() == 8) {
                     return TypeCompatibility::ImplicitConvert;
                 }
@@ -335,10 +335,10 @@ type struct TypeChecker {
 
         // string -> i8*: Cryo string to C string
         if (from_type.kind == TypeKind::String && to_type.kind == TypeKind::Pointer) {
-            const to_ptr: PointerType* = to_type as PointerType*;
+            const to_ptr: PointerType* = to_type.as_pointer();
             const pointee: Type* = this.arena.lookup(to_ptr.pointee);
             if (pointee != null && pointee.kind == TypeKind::Int) {
-                const int_t: IntType* = pointee as IntType*;
+                const int_t: IntegerKind = pointee.int_kind();
                 if (int_t.bit_width() == 8) {
                     return TypeCompatibility::ImplicitConvert;
                 }
@@ -376,8 +376,8 @@ type struct TypeChecker {
 
         // &T -> T* (reference to pointer coercion)
         if (from_type.kind == TypeKind::Reference && to_type.kind == TypeKind::Pointer) {
-            const from_ref: ReferenceType* = from_type as ReferenceType*;
-            const to_ptr: PointerType* = to_type as PointerType*;
+            const from_ref: ReferenceType* = from_type.as_reference();
+            const to_ptr: PointerType* = to_type.as_pointer();
             if (from_ref.referent.equals(to_ptr.pointee)) {
                 return TypeCompatibility::ImplicitConvert;
             }
@@ -424,19 +424,19 @@ type struct TypeChecker {
         // silent 32->8 one that turns any byte >= 128 negative.
         const CHAR_BITS: u64 = 32;
         if (from_type.kind == TypeKind::Char && to_type.kind == TypeKind::Int) {
-            const to_i: IntType* = to_type as IntType*;
+            const to_i: IntegerKind = to_type.int_kind();
             return TypeChecker::width_lattice(CHAR_BITS, false,
                                               to_i.bit_width(), to_i.is_signed());
         }
         if (from_type.kind == TypeKind::Int && to_type.kind == TypeKind::Char) {
-            const from_i: IntType* = from_type as IntType*;
+            const from_i: IntegerKind = from_type.int_kind();
             return TypeChecker::width_lattice(from_i.bit_width(), from_i.is_signed(),
                                               CHAR_BITS, false);
         }
 
         // Optional wrapping: T -> T?
         if (to_type.kind == TypeKind::Optional) {
-            mut opt: OptionalType* = to_type as OptionalType*;
+            mut opt: OptionalType* = to_type.as_optional();
             mut inner_compat: TypeCompatibility = this.check_compatibility(from, opt.wrapped);
             if (inner_compat.is_assignable()) {
                 return TypeCompatibility::ImplicitConvert;
@@ -453,13 +453,13 @@ type struct TypeChecker {
             mut orig_from: Type* = this.arena.lookup(from);
             mut orig_to:   Type* = this.arena.lookup(to);
             if (orig_to != null && orig_to.kind == TypeKind::InstantiatedType) {
-                const to_inst: InstantiatedType* = orig_to as InstantiatedType*;
+                const to_inst: InstantiatedType* = orig_to.as_instantiated();
                 if (to_inst.generic_base.equals(from)) {
                     return TypeCompatibility::Compatible;
                 }
             }
             if (orig_from != null && orig_from.kind == TypeKind::InstantiatedType) {
-                const from_inst: InstantiatedType* = orig_from as InstantiatedType*;
+                const from_inst: InstantiatedType* = orig_from.as_instantiated();
                 if (from_inst.generic_base.equals(to)) {
                     return TypeCompatibility::Compatible;
                 }
@@ -468,13 +468,13 @@ type struct TypeChecker {
 
         // TypeAlias: resolve and check
         if (from_type.kind == TypeKind::TypeAlias) {
-            mut alias: TypeAliasType* = from_type as TypeAliasType*;
+            mut alias: TypeAliasType* = from_type.as_alias();
             if (alias.has_target()) {
                 return this.check_compatibility(alias.target, to);
             }
         }
         if (to_type.kind == TypeKind::TypeAlias) {
-            mut alias: TypeAliasType* = to_type as TypeAliasType*;
+            mut alias: TypeAliasType* = to_type.as_alias();
             if (alias.has_target()) {
                 return this.check_compatibility(from, alias.target);
             }
@@ -503,8 +503,8 @@ type struct TypeChecker {
     // Numeric compatibility helpers
 
     check_int_compatibility(&this, _from: Type*, to: Type*) -> TypeCompatibility {
-        mut from_int: IntType* = _from as IntType*;
-        mut to_int: IntType*   = to as IntType*;
+        mut from_int: IntegerKind = _from.int_kind();
+        mut to_int: IntegerKind   = to.int_kind();
 
         return TypeChecker::width_lattice(
             from_int.bit_width(), from_int.is_signed(),
@@ -547,8 +547,8 @@ type struct TypeChecker {
     }
 
     check_float_compatibility(&this, _from: Type*, to: Type*) -> TypeCompatibility {
-        mut from_float: FloatType* = _from as FloatType*;
-        mut to_float: FloatType*   = to as FloatType*;
+        mut from_float: FloatKind = _from.float_kind();
+        mut to_float: FloatKind   = to.float_kind();
 
         if (from_float.bit_width() < to_float.bit_width()) {
             return TypeCompatibility::ImplicitConvert;   // f32 -> f64
@@ -579,8 +579,8 @@ type struct TypeChecker {
         const t: Type* = this.arena.lookup(to);
         if (f == null || t == null) { return false; }
         if (f.kind != TypeKind::Pointer || t.kind != TypeKind::Pointer) { return false; }
-        const fp: PointerType* = f as PointerType*;
-        const tp: PointerType* = t as PointerType*;
+        const fp: PointerType* = f.as_pointer();
+        const tp: PointerType* = t.as_pointer();
         return fp.const_pointee && !tp.const_pointee && fp.pointee.equals(tp.pointee);
     }
 
@@ -603,13 +603,13 @@ type struct TypeChecker {
         const t: Type* = this.arena.lookup(to);
         if (f == null || t == null) { return false; }
         if (f.kind == TypeKind::Int && t.kind == TypeKind::Int) {
-            const fi: IntType* = f as IntType*;
-            const ti: IntType* = t as IntType*;
+            const fi: IntegerKind = f.int_kind();
+            const ti: IntegerKind = t.int_kind();
             return fi.bit_width() > ti.bit_width();
         }
         if (f.kind == TypeKind::Float && t.kind == TypeKind::Float) {
-            const ff: FloatType* = f as FloatType*;
-            const tf: FloatType* = t as FloatType*;
+            const ff: FloatKind = f.float_kind();
+            const tf: FloatKind = t.float_kind();
             return ff.bit_width() > tf.bit_width();
         }
         if (f.kind == TypeKind::Float && t.kind == TypeKind::Int) {
@@ -631,8 +631,8 @@ type struct TypeChecker {
         const t: Type* = this.arena.lookup(to);
         if (f == null || t == null) { return false; }
         if (f.kind != TypeKind::Int || t.kind != TypeKind::Int) { return false; }
-        const fi: IntType* = f as IntType*;
-        const ti: IntType* = t as IntType*;
+        const fi: IntegerKind = f.int_kind();
+        const ti: IntegerKind = t.int_kind();
         return fi.bit_width() == ti.bit_width() &&
                fi.is_signed() != ti.is_signed();
     }
@@ -648,7 +648,7 @@ type struct TypeChecker {
         if (!this.is_same_width_sign_reinterpret(from, to)) { return false; }
         const f: Type* = this.arena.lookup(from);
         if (f == null) { return false; }
-        const fi: IntType* = f as IntType*;
+        const fi: IntegerKind = f.int_kind();
         return fi.bit_width() < 64;
     }
 
@@ -863,7 +863,7 @@ type struct TypeChecker {
         // receiver fails because op_type.kind is InstantiatedType, not
         // Reference.
         if (op_type.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = op_type as InstantiatedType*;
+            const inst: InstantiatedType* = op_type.as_instantiated();
             if (inst.has_resolved_type()) {
                 const inner: Type* = this.arena.lookup(inst.resolved_type);
                 if (inner != null) { op_type = inner; }
@@ -920,11 +920,11 @@ type struct TypeChecker {
         // Dereference: *
         if (op == TokenType::Star) {
             if (op_type.kind == TypeKind::Pointer) {
-                mut ptr: PointerType* = op_type as PointerType*;
+                mut ptr: PointerType* = op_type.as_pointer();
                 return TypeCheckResult::ok(ptr.pointee);
             }
             if (op_type.kind == TypeKind::Reference) {
-                mut ref_type: ReferenceType* = op_type as ReferenceType*;
+                mut ref_type: ReferenceType* = op_type.as_reference();
                 return TypeCheckResult::ok(ref_type.referent);
             }
             if (op_type.kind == TypeKind::String) {
@@ -958,7 +958,7 @@ type struct TypeChecker {
 
         // Dereference InstantiatedType to its concrete resolved type
         if (base_type.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = base_type as InstantiatedType*;
+            const inst: InstantiatedType* = base_type.as_instantiated();
             if (inst.has_resolved_type()) {
                 base_type = this.arena.lookup(inst.resolved_type);
                 if (base_type == null) {
@@ -968,7 +968,7 @@ type struct TypeChecker {
         }
 
         if (base_type.kind == TypeKind::Array) {
-            mut arr: ArrayType* = base_type as ArrayType*;
+            mut arr: ArrayType* = base_type.as_array();
             // Index must be integer
             mut idx_type: Type* = this.arena.lookup(index);
             if (idx_type != null && idx_type.kind == TypeKind::Int) {
@@ -980,7 +980,7 @@ type struct TypeChecker {
         // Pointer indexing is pointer arithmetic (`*(ptr + i)` -> T), whatever
         // the pointer points at, an array among them.
         if (base_type.kind == TypeKind::Pointer) {
-            const ptr_type: PointerType* = base_type as PointerType*;
+            const ptr_type: PointerType* = base_type.as_pointer();
             return TypeCheckResult::ok(ptr_type.pointee);
         }
 
@@ -994,7 +994,7 @@ type struct TypeChecker {
         // (member access auto-derefs references too).  Raw pointers `T*` index
         // as pointer arithmetic above.
         if (base_type.kind == TypeKind::Reference) {
-            const rt: ReferenceType* = base_type as ReferenceType*;
+            const rt: ReferenceType* = base_type.as_reference();
             return this.check_index_access(rt.referent, index);
         }
 
@@ -1029,8 +1029,8 @@ type struct TypeChecker {
 
         // Both float -> wider wins
         if (a_type.kind == TypeKind::Float && b_type.kind == TypeKind::Float) {
-            mut a_float: FloatType* = a_type as FloatType*;
-            mut b_float: FloatType* = b_type as FloatType*;
+            mut a_float: FloatKind = a_type.float_kind();
+            mut b_float: FloatKind = b_type.float_kind();
             if (a_float.bit_width() >= b_float.bit_width()) {
                 return a;
             }
@@ -1039,8 +1039,8 @@ type struct TypeChecker {
 
         // Both int -> wider wins; same width -> prefer unsigned (as C does)
         if (a_type.kind == TypeKind::Int && b_type.kind == TypeKind::Int) {
-            mut a_int: IntType* = a_type as IntType*;
-            mut b_int: IntType* = b_type as IntType*;
+            mut a_int: IntegerKind = a_type.int_kind();
+            mut b_int: IntegerKind = b_type.int_kind();
             if (a_int.bit_width() > b_int.bit_width()) {
                 return a;
             }
@@ -1071,7 +1071,7 @@ type struct TypeChecker {
         while (depth < 32) {
             const t: Type* = this.arena.lookup(current);
             if (t == null || t.kind != TypeKind::Class) { return false; }
-            const ct: ClassType* = t as ClassType*;
+            const ct: ClassType* = t.as_class();
             if (!ct.has_base || !ct.base_class.is_valid()) { return false; }
             if (ct.base_class.equals(base)) { return true; }
             current = ct.base_class;

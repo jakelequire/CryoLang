@@ -154,15 +154,15 @@ type struct MemberResolver {
         while (walk_t != null && depth < 5) {
             match (walk_t.kind) {
                 TypeKind::Pointer => {
-                    walk_ty = (walk_t as PointerType*).pointee;
+                    walk_ty = walk_t.as_pointer().pointee;
                     walk_t = this.arena.lookup(walk_ty);
                 }
                 TypeKind::Reference => {
-                    walk_ty = (walk_t as ReferenceType*).referent;
+                    walk_ty = walk_t.as_reference().referent;
                     walk_t = this.arena.lookup(walk_ty);
                 }
                 TypeKind::InstantiatedType => {
-                    const it: InstantiatedType* = walk_t as InstantiatedType*;
+                    const it: InstantiatedType* = walk_t.as_instantiated();
                     if (!it.has_resolved_type()) { break; }
                     walk_ty = it.resolved_type;
                     walk_t = this.arena.lookup(walk_ty);
@@ -172,7 +172,7 @@ type struct MemberResolver {
             depth += 1;
         }
         if (walk_t != null && walk_t.kind == TypeKind::Tuple) {
-            const tup: TupleType* = walk_t as TupleType*;
+            const tup: TupleType* = walk_t.as_tuple();
             const member_str: string = this.intern.resolve(member.member);
             const idx: i64 = parse_tuple_index(member_str);
             const m_span: SourceSpan = if (member.member_span.has_location()) {
@@ -293,7 +293,7 @@ type struct MemberResolver {
             mut t: Type* = this.arena.lookup(base_ty);
             mut rd: i32 = 0;
             while (t != null && t.kind == TypeKind::Reference && rd < 4) {
-                base_ty = (t as ReferenceType*).referent;
+                base_ty = t.as_reference().referent;
                 t = this.arena.lookup(base_ty);
                 rd += 1;
             }
@@ -358,15 +358,15 @@ type struct MemberResolver {
         while (walk_t != null && depth < 5) {
             match (walk_t.kind) {
                 TypeKind::Pointer => {
-                    walk_ty = (walk_t as PointerType*).pointee;
+                    walk_ty = walk_t.as_pointer().pointee;
                     walk_t = this.arena.lookup(walk_ty);
                 }
                 TypeKind::Reference => {
-                    walk_ty = (walk_t as ReferenceType*).referent;
+                    walk_ty = walk_t.as_reference().referent;
                     walk_t = this.arena.lookup(walk_ty);
                 }
                 TypeKind::InstantiatedType => {
-                    const it: InstantiatedType* = walk_t as InstantiatedType*;
+                    const it: InstantiatedType* = walk_t.as_instantiated();
                     if (!it.has_resolved_type()) { break; }
                     walk_ty = it.resolved_type;
                     walk_t = this.arena.lookup(walk_ty);
@@ -401,7 +401,7 @@ type struct MemberResolver {
             if (entries.length > 0) { return this.shared_entry_return(&entries); }
             const t: Type* = this.arena.lookup(owner);
             if (t == null || t.kind != TypeKind::Class) { break; }
-            const cls: ClassType* = t as ClassType*;
+            const cls: ClassType* = t.as_class();
             if (!cls.has_base || !cls.base_class.is_valid()) { break; }
             owner = cls.base_class;
             depth += 1;
@@ -416,7 +416,7 @@ type struct MemberResolver {
         for (mut k: i64 = 0; k < entries.length; k++) {
             const sig: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[k]));
             if (sig == null || sig.kind != TypeKind::Function) { return TypeRef::invalid(); }
-            const r: TypeRef = this.types.canonicalize_method_return((sig as FunctionType*).return_type);
+            const r: TypeRef = this.types.canonicalize_method_return(sig.as_function().return_type);
             if (ret.is_valid() && !ret.equals(r)) { return TypeRef::invalid(); }
             ret = r;
         }
@@ -441,15 +441,15 @@ type struct MemberResolver {
         mut t: Type* = this.arena.lookup(owner);
         if (t == null) { return FieldAnswer::none(); }
         if (t.kind == TypeKind::Pointer) {
-            owner = (t as PointerType*).pointee;
+            owner = t.as_pointer().pointee;
             t = this.arena.lookup(owner);
         } else if (t.kind == TypeKind::Reference) {
-            owner = (t as ReferenceType*).referent;
+            owner = t.as_reference().referent;
             t = this.arena.lookup(owner);
         }
         if (t == null) { return FieldAnswer::none(); }
         if (t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+            const inst: InstantiatedType* = t.as_instantiated();
             if (!inst.has_resolved_type()) {
                 return this.template_field(inst.generic_base, recv, leaf);
             }
@@ -466,20 +466,20 @@ type struct MemberResolver {
         // reference still standing here is stepped through once more, and a
         // resolved instantiation reached that way is resolved once more.
         if (t.kind == TypeKind::Pointer) {
-            t = this.arena.lookup((t as PointerType*).pointee);
+            t = this.arena.lookup(t.as_pointer().pointee);
         } else if (t.kind == TypeKind::Reference) {
-            t = this.arena.lookup((t as ReferenceType*).referent);
+            t = this.arena.lookup(t.as_reference().referent);
         }
         if (t == null) { return FieldAnswer::none(); }
         if (t.kind == TypeKind::InstantiatedType) {
-            const inner: InstantiatedType* = t as InstantiatedType*;
+            const inner: InstantiatedType* = t.as_instantiated();
             if (inner.has_resolved_type()) {
                 t = this.arena.lookup(inner.resolved_type);
                 if (t == null) { return FieldAnswer::none(); }
             }
         }
         if (t.kind == TypeKind::Struct) {
-            mut st: StructType* = t as StructType*;
+            mut st: StructType* = t.as_struct();
             const i: i64 = st.field_position(leaf);
             if (i >= 0) { return this.field_answer(recv, &st.fields[i], t, 0, i); }
             return FieldAnswer::none();
@@ -487,21 +487,22 @@ type struct MemberResolver {
         // A class's own field wins over a base's of the same name: the chain
         // is searched derived-first, `depth` steps up from the class.
         if (t.kind == TypeKind::Class) {
-            mut current: ClassType* = t as ClassType*;
+            mut current_t: Type* = t;
             mut depth: i64 = 0;
-            while (current != null) {
+            while (current_t != null) {
+                const current: ClassType* = current_t.as_class();
                 const i: i64 = current.own_field_position(leaf);
                 if (i >= 0) {
-                    return this.field_answer(recv, &current.fields[i], current as Type*, depth, i);
+                    return this.field_answer(recv, &current.fields[i], current_t, depth, i);
                 }
-                mut parent: ClassType* = null;
+                mut parent_t: Type* = null;
                 if (current.has_base && current.base_class.is_valid()) {
-                    const parent_t: Type* = this.arena.lookup(current.base_class);
-                    if (parent_t != null && parent_t.kind == TypeKind::Class) {
-                        parent = parent_t as ClassType*;
+                    const base_t: Type* = this.arena.lookup(current.base_class);
+                    if (base_t != null && base_t.kind == TypeKind::Class) {
+                        parent_t = base_t;
                     }
                 }
-                current = parent;
+                current_t = parent_t;
                 depth += 1;
             }
             return FieldAnswer::none();
@@ -579,7 +580,7 @@ type struct MemberResolver {
         if (t == null) { return false; }
         mut tmpl_ref: TypeRef = recv;
         if (t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+            const inst: InstantiatedType* = t.as_instantiated();
             if (inst.has_resolved_type()) { return false; }
             tmpl_ref = inst.generic_base;
         }
@@ -622,7 +623,7 @@ type struct MemberResolver {
         member.set_resolved_type(fa.ty);
         const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
         this.pin_field(member, &fa, acc_span);
-        return (ft as FunctionType*).return_type;
+        return ft.as_function().return_type;
     }
 
 
@@ -651,13 +652,13 @@ type struct MemberResolver {
         mut depth: i32 = 0;
         while (walk_t != null && depth < 5) {
             if (walk_t.kind == TypeKind::Pointer) {
-                walk_ty = (walk_t as PointerType*).pointee;
+                walk_ty = walk_t.as_pointer().pointee;
                 walk_t = this.arena.lookup(walk_ty);
             } else if (walk_t.kind == TypeKind::Reference) {
-                walk_ty = (walk_t as ReferenceType*).referent;
+                walk_ty = walk_t.as_reference().referent;
                 walk_t = this.arena.lookup(walk_ty);
             } else if (walk_t.kind == TypeKind::InstantiatedType) {
-                const it: InstantiatedType* = walk_t as InstantiatedType*;
+                const it: InstantiatedType* = walk_t.as_instantiated();
                 if (!it.has_resolved_type()) { break; }
                 walk_ty = it.resolved_type;
                 walk_t = this.arena.lookup(walk_ty);
@@ -667,7 +668,7 @@ type struct MemberResolver {
             depth += 1;
         }
         if (walk_t != null && walk_t.kind == TypeKind::Tuple) {
-            const tup: TupleType* = walk_t as TupleType*;
+            const tup: TupleType* = walk_t.as_tuple();
             const idx: i64 = sema_const_int_index(access.index);
             if (idx < 0) {
                 this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
@@ -752,7 +753,7 @@ type struct MemberResolver {
         // succeeded in `check_index_access` and never reaches here).
         mut rdepth: i32 = 0;
         while (t != null && t.kind == TypeKind::Reference && rdepth < 4) {
-            base_ty = (t as ReferenceType*).referent;
+            base_ty = t.as_reference().referent;
             t = this.arena.lookup(base_ty);
             rdepth += 1;
         }
@@ -825,7 +826,7 @@ type struct MemberResolver {
         // still lacks an `Index` impl) gets the trait-naming diagnostic too.
         mut rdepth: i32 = 0;
         while (t != null && t.kind == TypeKind::Reference && rdepth < 4) {
-            t = this.arena.lookup((t as ReferenceType*).referent);
+            t = this.arena.lookup(t.as_reference().referent);
             rdepth += 1;
         }
         if (t == null) { return false; }
@@ -905,11 +906,11 @@ type struct MemberResolver {
         mut declaring_name: string = "";
 
         if (base.kind == TypeKind::Struct) {
-            mut st: StructType* = base as StructType*;
+            mut st: StructType* = base.as_struct();
             method = this.ctx.decl_index.type_method(base_ref, method_name, this.arena);
             if (method != null) { declaring_name = st.display_name(); }
         } else if (base.kind == TypeKind::Class) {
-            mut current: ClassType* = base as ClassType*;
+            mut current: ClassType* = base.as_class();
             mut current_ref: TypeRef = base_ref;
             while (current != null) {
                 method = this.ctx.decl_index.type_method(current_ref, method_name, this.arena);
@@ -921,7 +922,7 @@ type struct MemberResolver {
                     const parent_t: Type* = this.arena.lookup(current.base_class);
                     if (parent_t != null && parent_t.kind == TypeKind::Class) {
                         current_ref = current.base_class;
-                        current = parent_t as ClassType*;
+                        current = parent_t.as_class();
                     } else {
                         current = null;
                     }

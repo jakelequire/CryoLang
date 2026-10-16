@@ -289,14 +289,14 @@ type struct PatternResolver {
         }
         if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return payload_types; }
 
-        const et: EnumType* = enum_ty as EnumType*;
+        const et: EnumType* = enum_ty.as_enum();
         // The pattern's own stamp names the enum the SOURCE wrote; the enum
         // above is the subject's.  A variant leaf both declare would match
         // the subject through a pattern of another enum, so the two are
         // held to the same definition before the leaf is read.  Refused on
         // the committed walk only: the symbolic walk may check a pattern
         // against a type that is not its own.
-        if (!this.state.in_symbolic_check && !this.pattern_names_enum(enum_pat, et)) {
+        if (!this.state.in_symbolic_check && !this.pattern_names_enum(enum_pat, enum_ty)) {
             return payload_types;
         }
         const vi: i64 = et.variant_index(enum_pat.variant_name);
@@ -309,7 +309,7 @@ type struct PatternResolver {
         // same in the template and in every copy.  The symbolic walk records
         // it only where the pattern names the subject's own enum, for the
         // reason above.
-        if (!this.state.in_symbolic_check || this.pattern_is_subjects_enum(enum_pat, et)) {
+        if (!this.state.in_symbolic_check || this.pattern_is_subjects_enum(enum_pat, enum_ty)) {
             enum_pat.set_resolved_member(MemberPin::Variant(vi));
         }
         payload_types = sema_copy_type_refs(&variant.payload_types);
@@ -358,9 +358,9 @@ type struct PatternResolver {
 
     /// Whether the pattern's stamp names `subject`'s own enum definition,
     /// without reporting anything.
-    pattern_is_subjects_enum(&this, enum_pat: EnumPatternNode*, subject: EnumType*) -> boolean {
+    pattern_is_subjects_enum(&this, enum_pat: EnumPatternNode*, subject: Type*) -> boolean {
         const named_t: Type* = this.pattern_enum(enum_pat);
-        return named_t != null && PatternResolver::enum_definition_id(named_t as EnumType*)
+        return named_t != null && PatternResolver::enum_definition_id(named_t)
             == PatternResolver::enum_definition_id(subject);
     }
 
@@ -370,13 +370,13 @@ type struct PatternResolver {
     /// synthesized one without a stamp asserts nothing).  A pattern naming
     /// another enum is refused: its variant leaf may be one the subject's
     /// enum also declares, and reading the leaf off the subject would match.
-    pattern_names_enum(mut &this, enum_pat: EnumPatternNode*, subject: EnumType*) -> boolean {
+    pattern_names_enum(mut &this, enum_pat: EnumPatternNode*, subject: Type*) -> boolean {
         const named_t: Type* = this.pattern_enum(enum_pat);
         if (named_t == null) { return true; }
-        if (PatternResolver::enum_definition_id(named_t as EnumType*)
+        if (PatternResolver::enum_definition_id(named_t)
                 == PatternResolver::enum_definition_id(subject)) { return true; }
-        const want: string = this.intern.shown(subject.qualified_name);
-        const got: string = this.intern.shown((named_t as EnumType*).qualified_name);
+        const want: string = this.intern.shown(subject.as_enum().qualified_name);
+        const got: string = this.intern.shown(named_t.as_enum().qualified_name);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,
             fmt::format("pattern names enum `%s`, but the value matched is `%s`", got, want));
         diag = diag.at_with_label(enum_pat.enum_span, fmt::format("expected `%s`", want));
@@ -386,9 +386,10 @@ type struct PatternResolver {
 
     /// The definition an enum type is an instance of: its template's arena
     /// id for an instantiation, its own otherwise.
-    static enum_definition_id(et: EnumType*) -> u64 {
+    static enum_definition_id(t: Type*) -> u64 {
+        const et: EnumType* = t.as_enum();
         if (et.generic_base.is_valid()) { return et.generic_base.key(); }
-        return et.id;
+        return t.id;
     }
 
     /// Report a pattern naming a variant the enum does not have.
@@ -511,7 +512,7 @@ type struct PatternResolver {
             }
         }
         if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return false; }
-        const et: EnumType* = enum_ty as EnumType*;
+        const et: EnumType* = enum_ty.as_enum();
         if (et.variants.length == 0) { return false; }
         for (mut vi: i64 = 0; vi < et.variants.length; vi++) {
             mut v_arms: [EnumPatternNode*] = [];
@@ -668,7 +669,7 @@ type struct PatternResolver {
         if (!subject_type.is_valid()) { return; }
         const enum_ty: Type* = this.types.unwrap_to_enum(subject_type);
         if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return; }
-        const et: EnumType* = enum_ty as EnumType*;
+        const et: EnumType* = enum_ty.as_enum();
         if (et.variants.length == 0) { return; }
 
         // Gather unguarded top-level patterns; an unguarded `_`/binding catches all.

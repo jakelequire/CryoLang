@@ -291,7 +291,7 @@ type struct CallResolver {
     signature_accepts(&this, sig: TypeRef, arg_types: &[TypeRef]) -> boolean {
         const ot: Type* = this.arena.lookup(sig);
         if (ot == null || ot.kind != TypeKind::Function) { return false; }
-        const fn_ty: FunctionType* = ot as FunctionType*;
+        const fn_ty: FunctionType* = ot.as_function();
         if (fn_ty.is_variadic) {
             if (arg_types.length < fn_ty.param_types.length) { return false; }
         } else if (fn_ty.param_types.length != arg_types.length) {
@@ -390,15 +390,15 @@ type struct CallResolver {
         while (base_t != null && depth < 5) {
             match (base_t.kind) {
                 TypeKind::Pointer => {
-                    base_ref = (base_t as PointerType*).pointee;
+                    base_ref = base_t.as_pointer().pointee;
                     base_t = this.arena.lookup(base_ref);
                 }
                 TypeKind::Reference => {
-                    base_ref = (base_t as ReferenceType*).referent;
+                    base_ref = base_t.as_reference().referent;
                     base_t = this.arena.lookup(base_ref);
                 }
                 TypeKind::InstantiatedType => {
-                    const inst: InstantiatedType* = base_t as InstantiatedType*;
+                    const inst: InstantiatedType* = base_t.as_instantiated();
                     if (inst.has_resolved_type()) {
                         base_ref = inst.resolved_type;
                         base_t = this.arena.lookup(base_ref);
@@ -425,19 +425,19 @@ type struct CallResolver {
         mut found: [MethodInfo*] = [];
         const named: [MethodNode*] = this.ctx.decl_index.methods_named(FamilyOwner::Type(base_ref), member.member);
         if (base_t.kind == TypeKind::Class) {
-            const ct: ClassType* = base_t as ClassType*;
+            const ct: ClassType* = base_t.as_class();
             for (mut i: i64 = 0; i < ct.methods.length; i++) {
                 const m: MethodInfo* = &ct.methods[i];
                 if (DeclarationIndex::holds_method(&named, m.ast_node as MethodNode*) && m.param_types.length == arg_count) { found.push(m); }
             }
         } else if (base_t.kind == TypeKind::Struct) {
-            const st: StructType* = base_t as StructType*;
+            const st: StructType* = base_t.as_struct();
             for (mut i: i64 = 0; i < st.methods.length; i++) {
                 const m: MethodInfo* = &st.methods[i];
                 if (DeclarationIndex::holds_method(&named, m.ast_node as MethodNode*) && m.param_types.length == arg_count) { found.push(m); }
             }
         } else if (base_t.kind == TypeKind::Enum) {
-            const et: EnumType* = base_t as EnumType*;
+            const et: EnumType* = base_t.as_enum();
             for (mut i: i64 = 0; i < et.methods.length; i++) {
                 const m: MethodInfo* = &et.methods[i];
                 if (DeclarationIndex::holds_method(&named, m.ast_node as MethodNode*) && m.param_types.length == arg_count) { found.push(m); }
@@ -451,7 +451,7 @@ type struct CallResolver {
             // `where S: AsyncTransport` stays `Unclassified` and each consumer
             // guesses its own answer.
             return this.binding.param_types_through_param_bounds(
-                base_t as GenericParamType*, member.member, arg_count);
+                base_t.as_generic_param(), member.member, arg_count);
         } else {
             return [];
         }
@@ -498,7 +498,7 @@ type struct CallResolver {
         if (inst_base.is_valid()) {
             const base_t: Type* = this.arena.lookup(inst_base);
             if (base_t == null || base_t.kind != TypeKind::Enum) { return []; }
-            const bet: EnumType* = base_t as EnumType*;
+            const bet: EnumType* = base_t.as_enum();
             const bvi: i64 = bet.variant_index(scope.member_name);
             if (bvi < 0) { return []; }
             scope.set_resolved_member(MemberPin::Variant(bvi));
@@ -508,12 +508,12 @@ type struct CallResolver {
         mut enum_t: Type* = this.arena.lookup(type_ref);
         if (enum_t == null) { return []; }
         if (enum_t.kind == TypeKind::Enum) {
-            const et: EnumType* = enum_t as EnumType*;
+            const et: EnumType* = enum_t.as_enum();
             if (et.variants.length == 0 && this.state.expected_type.is_valid()) {
                 mut exp_ref: TypeRef = this.state.expected_type;
                 mut exp_t: Type* = this.arena.lookup(exp_ref);
                 if (exp_t != null && exp_t.kind == TypeKind::TypeAlias) {
-                    const alias: TypeAliasType* = exp_t as TypeAliasType*;
+                    const alias: TypeAliasType* = exp_t.as_alias();
                     if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref); }
                 }
                 // Generic-identity view, not a raw `kind == InstantiatedType` test:
@@ -527,7 +527,7 @@ type struct CallResolver {
             }
         }
         if (enum_t == null || enum_t.kind != TypeKind::Enum) { return []; }
-        const et: EnumType* = enum_t as EnumType*;
+        const et: EnumType* = enum_t.as_enum();
         const vi: i64 = et.variant_index(scope.member_name);
         if (vi < 0) { return []; }
         const variant: EnumVariantInfo* = &et.variants[vi];
@@ -536,7 +536,7 @@ type struct CallResolver {
             mut exp_ref2: TypeRef = this.state.expected_type;
             mut exp_t2: Type* = this.arena.lookup(exp_ref2);
             if (exp_t2 != null && exp_t2.kind == TypeKind::TypeAlias) {
-                const alias2: TypeAliasType* = exp_t2 as TypeAliasType*;
+                const alias2: TypeAliasType* = exp_t2.as_alias();
                 if (alias2.has_target()) { exp_ref2 = alias2.target; exp_t2 = this.arena.lookup(exp_ref2); }
             }
             // Same single-id concern as above: a post-mono concrete expected type
@@ -566,7 +566,7 @@ type struct CallResolver {
             if (pt == null) {
                 result.push(payload[i]);
             } else if (pt.kind == TypeKind::GenericParam) {
-                const gp: GenericParamType* = pt as GenericParamType*;
+                const gp: GenericParamType* = pt.as_generic_param();
                 mut substituted: TypeRef = payload[i];
                 for (mut p: i64 = 0; p < entry.param_count; p++) {
                     if (gp.declared_by(entry.param_syms[p])) { substituted = type_args[p]; break; }
@@ -666,7 +666,7 @@ type struct CallResolver {
             const pt: Type* = this.arena.lookup(param_types[i]);
             if (pt == null) { continue; }
             if (pt.kind != TypeKind::GenericParam) { continue; }
-            const gpt: GenericParamType* = pt as GenericParamType*;
+            const gpt: GenericParamType* = pt.as_generic_param();
             for (mut p: i64 = 0; p < tmpl.param_syms.length; p++) {
                 if (!gpt.declared_by(tmpl.param_syms[p])) { continue; }
                 // Inside the owner's own template body the argument is still the
@@ -741,7 +741,7 @@ type struct CallResolver {
     report_param_receiver_call(mut &this, member: MemberAccessNode*, param: GenericParamType*,
                                bounded: boolean, call: CallExprNode*) -> void {
         const method_name: string = this.intern.resolve(member.member);
-        const param_display: string = this.arena.format_display(param as Type*);
+        const param_display: string = this.arena.format_generic_param(param);
         const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
@@ -900,7 +900,7 @@ type struct CallResolver {
         for (mut ei: i64 = 0; ei < entries.length; ei++) {
             const t: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[ei]));
             if (t == null || t.kind != TypeKind::Function) { continue; }
-            const ft: FunctionType* = t as FunctionType*;
+            const ft: FunctionType* = t.as_function();
             if (ft.is_variadic || ft.param_types.length != argc) { continue; }
             if (!have) {
                 for (mut p: i64 = 0; p < argc; p++) { out.push(ft.param_types[p]); }
@@ -929,7 +929,7 @@ type struct CallResolver {
             if (callee_fn_type.is_valid()) {
                 const ft_raw: Type* = this.arena.lookup(callee_fn_type);
                 if (ft_raw != null && ft_raw.kind == TypeKind::Function) {
-                    param_types = sema_copy_type_refs(&(ft_raw as FunctionType*).param_types);
+                    param_types = sema_copy_type_refs(&ft_raw.as_function().param_types);
                 }
             }
         }
@@ -947,7 +947,7 @@ type struct CallResolver {
                 computed_fn = this.types.peel_indirection(computed_type);
             }
             if (computed_fn.is_valid() && param_types.length == 0) {
-                param_types = sema_copy_type_refs(&(this.arena.lookup(computed_fn) as FunctionType*).param_types);
+                param_types = sema_copy_type_refs(&this.arena.lookup(computed_fn).as_function().param_types);
             }
         }
         if (param_types.length == 0) {
@@ -1174,7 +1174,7 @@ type struct CallResolver {
                         const pt_raw: Type* = this.arena.lookup(pinned_ft);
                         if (pt_raw != null && pt_raw.kind == TypeKind::Function) {
                             this.apply_implicit_conversions_only(visitor, call,
-                                (pt_raw as FunctionType*).param_types.as_slice());
+                                pt_raw.as_function().param_types.as_slice());
                         }
                         return pinned_ret;
                     }
@@ -1267,7 +1267,7 @@ type struct CallResolver {
         // A computed callee was typed above; a call through a function value
         // has that function's return type, as a call through a local does.
         if (computed_fn.is_valid()) {
-            return (this.arena.lookup(computed_fn) as FunctionType*).return_type;
+            return this.arena.lookup(computed_fn).as_function().return_type;
         }
         if (computed_type.is_valid()) {
             this.refuse_call_of_non_function(call.callee.span, computed_type);
@@ -1614,12 +1614,12 @@ type struct CallResolver {
         if (ty.kind == TypeKind::Function)         { return false; }
         if (ty.kind == TypeKind::Unit)             { return false; }
         if (ty.kind == TypeKind::Void)             { return false; }
-        if (ty.kind == TypeKind::Pointer)   { return this.free_infer_type_concrete((ty as PointerType*).pointee); }
-        if (ty.kind == TypeKind::Reference) { return this.free_infer_type_concrete((ty as ReferenceType*).referent); }
-        if (ty.kind == TypeKind::Array)     { return this.free_infer_type_concrete((ty as ArrayType*).element); }
-        if (ty.kind == TypeKind::Optional)  { return this.free_infer_type_concrete((ty as OptionalType*).wrapped); }
+        if (ty.kind == TypeKind::Pointer)   { return this.free_infer_type_concrete(ty.as_pointer().pointee); }
+        if (ty.kind == TypeKind::Reference) { return this.free_infer_type_concrete(ty.as_reference().referent); }
+        if (ty.kind == TypeKind::Array)     { return this.free_infer_type_concrete(ty.as_array().element); }
+        if (ty.kind == TypeKind::Optional)  { return this.free_infer_type_concrete(ty.as_optional().wrapped); }
         if (ty.kind == TypeKind::InstantiatedType) {
-            if (!(ty as InstantiatedType*).has_resolved_type()) { return false; }
+            if (!ty.as_instantiated().has_resolved_type()) { return false; }
         }
         return true;
     }
@@ -1898,7 +1898,7 @@ type struct CallResolver {
             MemberPin::Variant(v) => { v }
             _                     => { -1 }
         };
-        const variants: &[EnumVariantInfo] = &(et as EnumType*).variants;
+        const variants: &[EnumVariantInfo] = &et.as_enum().variants;
         if (variant < 0 || variant >= variants.length) { return true; }
         const payload: &[TypeRef] = &variants[variant].payload_types;
         const call: CallExprNode* = arg as CallExprNode*;
@@ -2087,7 +2087,7 @@ type struct CallResolver {
         if (t == null || t.kind != TypeKind::Enum) { return []; }
         const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(base);
         if (tmpl == null || tmpl.param_count != scope.generic_args.length) { return []; }
-        const et: EnumType* = t as EnumType*;
+        const et: EnumType* = t.as_enum();
         const vi: i64 = et.variant_index(scope.member_name);
         if (vi < 0) { return []; }
         mut rc: ResolutionContext = ResolutionContext::new("");
@@ -2395,7 +2395,7 @@ type struct CallResolver {
         }
         const ft_raw: Type* = this.arena.lookup(overloads[0]);
         if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return; }
-        const ft: FunctionType* = ft_raw as FunctionType*;
+        const ft: FunctionType* = ft_raw.as_function();
         // A variadic callee's declared parameters are parameters: each must
         // be supplied and each is checked against its declared type.  Only
         // the tail past them is unconstrained.
@@ -2503,7 +2503,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < ctors.length; i++) {
             const t: Type* = this.arena.lookup(ctors[i]);
             if (t == null || t.kind != TypeKind::Function) { return; }
-            const ft: FunctionType* = t as FunctionType*;
+            const ft: FunctionType* = t.as_function();
             const takes: i64 = ft.param_types.length - 1;
             if (takes == got) {
                 const params: Slice<TypeRef> = ft.param_types.as_slice();
@@ -2526,7 +2526,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < overloads.length; i++) {
             const t: Type* = this.arena.lookup(overloads[i]);
             if (t == null || t.kind != TypeKind::Function) { return; }
-            const ft: FunctionType* = t as FunctionType*;
+            const ft: FunctionType* = t.as_function();
             if (ft.is_variadic) { any_variadic = true; continue; }
             const ar: i64 = ft.param_types.length;
             uniq_arity = this.diag.note_arity(uniq_arity, ar);
@@ -2794,7 +2794,7 @@ type struct CallResolver {
         if (!fn_type.is_valid()) { return false; }
         const t: Type* = this.arena.lookup(fn_type);
         if (t == null || t.kind != TypeKind::Function) { return false; }
-        return (t as FunctionType*).is_variadic;
+        return t.as_function().is_variadic;
     }
 
     /// The canonical qualified trait a method came from, as stamped when the
@@ -2877,11 +2877,11 @@ type struct CallResolver {
         mut unwrap_depth: i32 = 0;
         while (base_t != null && unwrap_depth < 5) {
             if (base_t.kind == TypeKind::Pointer) {
-                base_ref = (base_t as PointerType*).pointee;
+                base_ref = base_t.as_pointer().pointee;
             } else if (base_t.kind == TypeKind::Reference) {
-                base_ref = (base_t as ReferenceType*).referent;
+                base_ref = base_t.as_reference().referent;
             } else if (base_t.kind == TypeKind::InstantiatedType) {
-                const inst: InstantiatedType* = base_t as InstantiatedType*;
+                const inst: InstantiatedType* = base_t.as_instantiated();
                 if (!inst.has_resolved_type()) {
                     // Not minted yet: the selection tried its template's
                     // methods; a call it bound is checked where it is minted,
@@ -2930,9 +2930,9 @@ type struct CallResolver {
         mut methods_ref: &[MethodInfo] = &empty_minfo;
         mut start_cls: ClassType* = null;
         match (base_t.kind) {
-            TypeKind::Class => { start_cls = base_t as ClassType*; methods_ref = &start_cls.methods; }
-            TypeKind::Struct => { methods_ref = &(base_t as StructType*).methods; }
-            TypeKind::Enum   => { methods_ref = &(base_t as EnumType*).methods; }
+            TypeKind::Class => { start_cls = base_t.as_class(); methods_ref = &start_cls.methods; }
+            TypeKind::Struct => { methods_ref = &base_t.as_struct().methods; }
+            TypeKind::Enum   => { methods_ref = &base_t.as_enum().methods; }
             _ => { }
         }
         // The receiver's inherent methods are the candidates when any of
@@ -3002,7 +3002,7 @@ type struct CallResolver {
                 const parent_t: Type* = this.arena.lookup(walk.base_class);
                 if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
                 cur_owner = walk.base_class;
-                walk = parent_t as ClassType*;
+                walk = parent_t.as_class();
                 cur = &walk.methods;
                 depth += 1;
             }
@@ -3237,7 +3237,7 @@ type struct CallResolver {
         if (entries.length > 1) {
             const sel_t: Type* = this.arena.lookup(overloads[oi]);
             if (sel_t != null && sel_t.kind == TypeKind::Function) {
-                this.classify_args_from_params(call, sema_copy_type_refs(&(sel_t as FunctionType*).param_types));
+                this.classify_args_from_params(call, sema_copy_type_refs(&sel_t.as_function().param_types));
             }
         }
         return this.overload_return_type(overloads[oi]);
@@ -3321,7 +3321,7 @@ type struct CallResolver {
         for (mut oi: i64 = 0; oi < overloads.length; oi++) {
             const t: Type* = this.arena.lookup(overloads[oi]);
             if (t == null || t.kind != TypeKind::Function) { continue; }
-            const ft: FunctionType* = t as FunctionType*;
+            const ft: FunctionType* = t.as_function();
             if (ft.param_types.length != argc) { continue; }
             for (mut p: i64 = 0; p < argc; p++) {
                 cand_params.push(ft.param_types[p]);
@@ -3477,7 +3477,7 @@ type struct CallResolver {
     overload_return_type(&this, fn_ref: TypeRef) -> TypeRef {
         const ft: Type* = this.arena.lookup(fn_ref);
         if (ft == null || ft.kind != TypeKind::Function) { return TypeRef::invalid(); }
-        return (ft as FunctionType*).return_type;
+        return ft.as_function().return_type;
     }
 
     /// What a generic function's instance returns, read off the entry its
@@ -3494,10 +3494,10 @@ type struct CallResolver {
         const at: Type* = this.arena.lookup(arg);
         if (pt == null || at == null) { return false; }
         if (pt.kind == TypeKind::Pointer && at.kind == TypeKind::Reference) {
-            return (pt as PointerType*).pointee.equals((at as ReferenceType*).referent);
+            return pt.as_pointer().pointee.equals(at.as_reference().referent);
         }
         if (pt.kind == TypeKind::Reference && at.kind == TypeKind::Pointer) {
-            return (pt as ReferenceType*).referent.equals((at as PointerType*).pointee);
+            return pt.as_reference().referent.equals(at.as_pointer().pointee);
         }
         return false;
     }
@@ -3521,7 +3521,7 @@ type struct CallResolver {
                             const fp_t: Type* = this.arena.lookup(fp_local);
                             if (fp_t != null && fp_t.kind == TypeKind::Function) {
                                 ident.set_resolved_type(fp_local);
-                                return (fp_t as FunctionType*).return_type;
+                                return fp_t.as_function().return_type;
                             }
                             // A local is a value, and one of no function type is
                             // not called: E0213 at the callee, as for a computed one.
@@ -3547,7 +3547,7 @@ type struct CallResolver {
                 if (ret_t != null) {
                     if (ret_t.kind == TypeKind::FunctionTemplate) { return this.state.expected_type; }
                     if (ret_t.kind == TypeKind::InstantiatedType) {
-                        const inst: InstantiatedType* = ret_t as InstantiatedType*;
+                        const inst: InstantiatedType* = ret_t.as_instantiated();
                         if (!inst.has_resolved_type() && this.types.contains_generic_param(func_ret)) {
                             return this.state.expected_type;
                         }
@@ -3563,7 +3563,7 @@ type struct CallResolver {
             const g_t: Type* = this.arena.lookup(global_ty);
             if (g_t != null && g_t.kind == TypeKind::Function) {
                 ident.set_resolved_type(global_ty);
-                return (g_t as FunctionType*).return_type;
+                return g_t.as_function().return_type;
             }
             this.refuse_call_of_non_function(ident.span, global_ty);
             return TypeRef::invalid();
@@ -3664,13 +3664,13 @@ type struct CallResolver {
         mut unwrap_depth: i32 = 0;
         while (base_t != null && unwrap_depth < 5) {
             if (base_t.kind == TypeKind::Pointer) {
-                base_ref = (base_t as PointerType*).pointee;
+                base_ref = base_t.as_pointer().pointee;
                 base_t = this.arena.lookup(base_ref);
             } else if (base_t.kind == TypeKind::Reference) {
-                base_ref = (base_t as ReferenceType*).referent;
+                base_ref = base_t.as_reference().referent;
                 base_t = this.arena.lookup(base_ref);
             } else if (base_t.kind == TypeKind::InstantiatedType) {
-                const inst: InstantiatedType* = base_t as InstantiatedType*;
+                const inst: InstantiatedType* = base_t.as_instantiated();
                 if (!inst.has_resolved_type()) {
                     owner_inst = base_ref;
                     base_ref = inst.generic_base;
@@ -3719,17 +3719,17 @@ type struct CallResolver {
         mut has_owner: boolean = false;
         match (base_t.kind) {
             TypeKind::Class => {
-                start_cls = base_t as ClassType*;
+                start_cls = base_t.as_class();
                 methods_ref = start_cls.methods.as_slice();
                 has_owner = start_cls.qualified_name.is_valid();
             }
             TypeKind::Struct => {
-                methods_ref = (base_t as StructType*).methods.as_slice();
-                has_owner = (base_t as StructType*).qualified_name.is_valid();
+                methods_ref = base_t.as_struct().methods.as_slice();
+                has_owner = base_t.as_struct().qualified_name.is_valid();
             }
             TypeKind::Enum => {
-                methods_ref = (base_t as EnumType*).methods.as_slice();
-                has_owner = (base_t as EnumType*).qualified_name.is_valid();
+                methods_ref = base_t.as_enum().methods.as_slice();
+                has_owner = base_t.as_enum().qualified_name.is_valid();
             }
             TypeKind::Int | TypeKind::Float | TypeKind::Bool
             | TypeKind::Char | TypeKind::String | TypeKind::Unit => {
@@ -4374,7 +4374,7 @@ type struct CallResolver {
         if (t == null) { return; }
         match (t.kind) {
             TypeKind::AssocProjection => {
-                const proj: AssocProjectionType* = t as AssocProjectionType*;
+                const proj: AssocProjectionType* = t.as_assoc_projection();
                 this.bind_projections(proj.base, subst);
                 const applied: TypeRef = subst.apply(ty, this.arena);
                 if (applied.equals(ty) || this.types.contains_generic_param(applied)) { return; }
@@ -4382,19 +4382,19 @@ type struct CallResolver {
                 const rt: Type* = this.arena.lookup(reduced);
                 if (rt != null && rt.kind != TypeKind::AssocProjection) { subst.add(ty, reduced); }
             }
-            TypeKind::Pointer   => { this.bind_projections((t as PointerType*).pointee, subst); }
-            TypeKind::Reference => { this.bind_projections((t as ReferenceType*).referent, subst); }
+            TypeKind::Pointer   => { this.bind_projections(t.as_pointer().pointee, subst); }
+            TypeKind::Reference => { this.bind_projections(t.as_reference().referent, subst); }
             TypeKind::Function  => {
-                const f: FunctionType* = t as FunctionType*;
+                const f: FunctionType* = t.as_function();
                 for (mut i: i64 = 0; i < f.param_types.length; i++) { this.bind_projections(f.param_types[i], subst); }
                 this.bind_projections(f.return_type, subst);
             }
             TypeKind::Tuple => {
-                const tup: TupleType* = t as TupleType*;
+                const tup: TupleType* = t.as_tuple();
                 for (mut i: i64 = 0; i < tup.elements.length; i++) { this.bind_projections(tup.elements[i], subst); }
             }
             TypeKind::InstantiatedType => {
-                const inst: InstantiatedType* = t as InstantiatedType*;
+                const inst: InstantiatedType* = t.as_instantiated();
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) { this.bind_projections(inst.type_args[i], subst); }
             }
             _ => { }
@@ -4493,7 +4493,7 @@ type struct CallResolver {
                 const parent_t: Type* = this.arena.lookup(walk.base_class);
                 if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
                 cur_owner = walk.base_class;
-                walk = parent_t as ClassType*;
+                walk = parent_t.as_class();
                 cur_methods = walk.methods.as_slice();
                 depth += 1;
             }
@@ -4821,7 +4821,7 @@ type struct CallResolver {
         mut allow_implicit: boolean = true;
         if (tier == 1 && at != null && pt != null
                 && at.kind == TypeKind::Pointer && pt.kind == TypeKind::Pointer
-                && !(at as PointerType*).pointee.equals((pt as PointerType*).pointee)) {
+                && !at.as_pointer().pointee.equals(pt.as_pointer().pointee)) {
             allow_implicit = false;
         }
         if (allow_implicit && this.checker.can_implicit_convert(arg, param)) { return true; }
@@ -4840,14 +4840,14 @@ type struct CallResolver {
         }
         if (pt != null) {
             mut pointee: TypeRef = TypeRef::invalid();
-            if (pt.kind == TypeKind::Pointer) { pointee = (pt as PointerType*).pointee; }
-            else if (pt.kind == TypeKind::Reference) { pointee = (pt as ReferenceType*).referent; }
+            if (pt.kind == TypeKind::Pointer) { pointee = pt.as_pointer().pointee; }
+            else if (pt.kind == TypeKind::Reference) { pointee = pt.as_reference().referent; }
             if (pointee.is_valid()) {
                 if (pointee.equals(arg)) { return true; }
                 if (at != null) {
                     mut arg_pointee: TypeRef = TypeRef::invalid();
-                    if (at.kind == TypeKind::Pointer) { arg_pointee = (at as PointerType*).pointee; }
-                    else if (at.kind == TypeKind::Reference) { arg_pointee = (at as ReferenceType*).referent; }
+                    if (at.kind == TypeKind::Pointer) { arg_pointee = at.as_pointer().pointee; }
+                    else if (at.kind == TypeKind::Reference) { arg_pointee = at.as_reference().referent; }
                     if (arg_pointee.is_valid() && arg_pointee.equals(pointee)) { return true; }
                     if (tier >= 2 && arg_pointee.is_valid()
                             && this.checker.is_subclass_of(arg_pointee, pointee)) { return true; }
@@ -5018,13 +5018,13 @@ type struct CallResolver {
         mut unwrap_depth: i32 = 0;
         while (base_t != null && unwrap_depth < 5) {
             if (base_t.kind == TypeKind::Pointer) {
-                lookup_ref = (base_t as PointerType*).pointee;
+                lookup_ref = base_t.as_pointer().pointee;
                 base_t = this.arena.lookup(lookup_ref);
             } else if (base_t.kind == TypeKind::Reference) {
-                lookup_ref = (base_t as ReferenceType*).referent;
+                lookup_ref = base_t.as_reference().referent;
                 base_t = this.arena.lookup(lookup_ref);
             } else if (base_t.kind == TypeKind::InstantiatedType) {
-                const inst: InstantiatedType* = base_t as InstantiatedType*;
+                const inst: InstantiatedType* = base_t.as_instantiated();
                 if (!inst.has_resolved_type()) { break; }
                 lookup_ref = inst.resolved_type;
                 base_t = this.arena.lookup(lookup_ref);
@@ -5218,13 +5218,13 @@ type struct CallResolver {
         mut depth: i32 = 0;
         while (t != null && depth < 5) {
             if (t.kind == TypeKind::InstantiatedType) { break; }
-            if (t.kind == TypeKind::Reference) { t = this.arena.lookup((t as ReferenceType*).referent); }
-            else if (t.kind == TypeKind::Pointer) { t = this.arena.lookup((t as PointerType*).pointee); }
+            if (t.kind == TypeKind::Reference) { t = this.arena.lookup(t.as_reference().referent); }
+            else if (t.kind == TypeKind::Pointer) { t = this.arena.lookup(t.as_pointer().pointee); }
             else { break; }
             depth += 1;
         }
         if (t == null || t.kind != TypeKind::InstantiatedType) { return false; }
-        const inst: InstantiatedType* = t as InstantiatedType*;
+        const inst: InstantiatedType* = t.as_instantiated();
         const tmpl: TemplateEntry* = reg.template_of_type(inst.generic_base);
         if (tmpl == null || tmpl.ast_node == null) { return false; }
         if (tmpl.param_names.length != inst.type_args.length) { return false; }
@@ -5288,13 +5288,13 @@ type struct CallResolver {
         mut t: Type* = this.arena.lookup(member.object.resolved_type);
         mut depth: i32 = 0;
         while (t != null && depth < 5) {
-            if (t.kind == TypeKind::Reference) { t = this.arena.lookup((t as ReferenceType*).referent); }
-            else if (t.kind == TypeKind::Pointer) { t = this.arena.lookup((t as PointerType*).pointee); }
+            if (t.kind == TypeKind::Reference) { t = this.arena.lookup(t.as_reference().referent); }
+            else if (t.kind == TypeKind::Pointer) { t = this.arena.lookup(t.as_pointer().pointee); }
             else { break; }
             depth += 1;
         }
         if (t == null || t.kind != TypeKind::InstantiatedType) { return; }
-        const inst: InstantiatedType* = t as InstantiatedType*;
+        const inst: InstantiatedType* = t.as_instantiated();
         if (inst.has_resolved_type()) { return; }
         const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(inst.generic_base);
         if (tmpl == null || tmpl.param_syms.length != inst.type_args.length) { return; }
@@ -5307,7 +5307,7 @@ type struct CallResolver {
             if (!arg.is_valid()) { continue; }
             const at: Type* = this.arena.lookup(arg);
             const param: GenericParamType* = if (at != null && at.kind == TypeKind::GenericParam) {
-                at as GenericParamType*
+                at.as_generic_param()
             } else {
                 null
             };
@@ -5656,7 +5656,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < entries.length; i++) {
             const et: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[i]));
             if (et == null || et.kind != TypeKind::Function) { continue; }
-            if ((et as FunctionType*).param_types.length == call.arguments.length) { fits.push(entries[i]); }
+            if (et.as_function().param_types.length == call.arguments.length) { fits.push(entries[i]); }
         }
         if (fits.length == 0) { return; }
         // A tie is reported against the owner as written (`GnTf<i32>`).
@@ -5726,8 +5726,8 @@ type struct CallResolver {
         while (hops < 4) {
             const ot: Type* = this.arena.lookup(owner_ref);
             if (ot == null) { break; }
-            if (ot.kind == TypeKind::Reference) { owner_ref = (ot as ReferenceType*).referent; }
-            else if (ot.kind == TypeKind::Pointer) { owner_ref = (ot as PointerType*).pointee; }
+            if (ot.kind == TypeKind::Reference) { owner_ref = ot.as_reference().referent; }
+            else if (ot.kind == TypeKind::Pointer) { owner_ref = ot.as_pointer().pointee; }
             else { break; }
             hops = hops + 1;
         }
@@ -6004,7 +6004,7 @@ type struct CallResolver {
             mut handle: TypeRef = TypeRef::invalid();
             for (mut k: i64 = 0; k < named.length; k++) {
                 const gt: Type* = this.arena.lookup(named[k]);
-                if (gt != null && (gt as GenericParamType*).param_sym.equals(gps[i].sym_id)) { handle = named[k]; }
+                if (gt != null && gt.as_generic_param().param_sym.equals(gps[i].sym_id)) { handle = named[k]; }
             }
             handles.push(handle);
             bindings.push(if (i < written.length) { written[i] } else { TypeRef::invalid() });
@@ -6180,7 +6180,7 @@ type struct CallResolver {
             is_static = m.is_static;
             const st: Type* = this.arena.lookup(m.function_type);
             if (st == null || st.kind != TypeKind::Function) { return TypeRef::invalid(); }
-            const ft: FunctionType* = st as FunctionType*;
+            const ft: FunctionType* = st.as_function();
             for (mut i: i64 = 0; i < ft.param_types.length; i++) { call_params.push(ft.param_types[i]); }
             ret = ft.return_type;
             variadic = ft.is_variadic;
@@ -6228,7 +6228,7 @@ type struct CallResolver {
             mut handle: TypeRef = TypeRef::invalid();
             for (mut k: i64 = 0; k < named.length; k++) {
                 const gt: Type* = this.arena.lookup(named[k]);
-                if (gt != null && (gt as GenericParamType*).param_sym.equals(gp.sym_id)) { handle = named[k]; }
+                if (gt != null && gt.as_generic_param().param_sym.equals(gp.sym_id)) { handle = named[k]; }
             }
             handles.push(handle);
             syms.push(gp.sym_id);
@@ -6435,7 +6435,7 @@ type struct CallResolver {
                 mut handle: TypeRef = owner_entry.param_types[i];
                 for (mut k: i64 = 0; k < named.length; k++) {
                     const gt: Type* = this.arena.lookup(named[k]);
-                    if (gt != null && (gt as GenericParamType*).param_sym.equals(block.generic_params[i].sym_id)) {
+                    if (gt != null && gt.as_generic_param().param_sym.equals(block.generic_params[i].sym_id)) {
                         handle = named[k];
                     }
                 }
@@ -6454,7 +6454,7 @@ type struct CallResolver {
         const t: Type* = this.arena.lookup(recv);
         if (t == null) { return self_ty; }
         if (t.kind == TypeKind::Reference) {
-            return this.arena.get_reference_to(self_ty, (t as ReferenceType*).mutability);
+            return this.arena.get_reference_to(self_ty, t.as_reference().mutability);
         }
         if (t.kind == TypeKind::Pointer) { return this.arena.get_pointer_to(self_ty); }
         return self_ty;
@@ -6525,7 +6525,7 @@ type struct CallResolver {
         for (mut ei: i64 = 0; ei < entries.length; ei++) {
             const et: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[ei]));
             if (et == null || et.kind != TypeKind::Function) { continue; }
-            const fn_ty: FunctionType* = et as FunctionType*;
+            const fn_ty: FunctionType* = et.as_function();
             if (fn_ty.param_types.length != arg_types.length) { continue; }
             mut first_shared: i64 = -1;
             mut rest_fit: boolean = true;
@@ -6535,8 +6535,8 @@ type struct CallResolver {
                 const at: Type* = this.arena.lookup(arg_types[pi]);
                 const shared_for_exclusive: boolean = pt != null && at != null
                     && pt.kind == TypeKind::Reference && at.kind == TypeKind::Reference
-                    && (pt as ReferenceType*).is_mutable() && !(at as ReferenceType*).is_mutable()
-                    && (pt as ReferenceType*).referent.equals((at as ReferenceType*).referent);
+                    && pt.as_reference().is_mutable() && !at.as_reference().is_mutable()
+                    && pt.as_reference().referent.equals(at.as_reference().referent);
                 if (!shared_for_exclusive) { rest_fit = false; break; }
                 if (first_shared < 0) { first_shared = pi; }
             }
@@ -6658,7 +6658,7 @@ type struct CallResolver {
     type_from_delivered_entry(mut &this, scope: ScopeResolutionNode*, entry: OverloadId) -> void {
         const ft: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entry));
         if (ft != null && ft.kind == TypeKind::Function) {
-            scope.set_resolved_type((ft as FunctionType*).return_type);
+            scope.set_resolved_type(ft.as_function().return_type);
         }
     }
 
@@ -7064,7 +7064,7 @@ type struct CallResolver {
             overloads.push(sig);
             const ft: Type* = this.arena.lookup(sig);
             if (ft == null || ft.kind != TypeKind::Function) { continue; }
-            if ((ft as FunctionType*).param_types.length != arg_types.length) { continue; }
+            if (ft.as_function().param_types.length != arg_types.length) { continue; }
             same_arity = same_arity + 1;
             if (this.static_entry_template(entries[i]) != null) { generic = true; }
         }
@@ -7096,7 +7096,7 @@ type struct CallResolver {
                 if (!ok && autoref) {
                     const pt: Type* = this.arena.lookup(params[pi]);
                     ok = pt != null && pt.kind == TypeKind::Reference
-                        && (pt as ReferenceType*).referent.equals(arg_types[pi]);
+                        && pt.as_reference().referent.equals(arg_types[pi]);
                 }
                 if (!ok) { all_match = false; break; }
             }
@@ -7143,7 +7143,7 @@ type struct CallResolver {
         mut params: [TypeRef] = [];
         const ot: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(e));
         if (ot == null || ot.kind != TypeKind::Function) { return params; }
-        const fn_ty: FunctionType* = ot as FunctionType*;
+        const fn_ty: FunctionType* = ot.as_function();
         const m: MethodNode* = this.ctx.decl_index.entry_method(e);
         if (m != null && m.func != null && m.func.spec_type_args.length > 0) { return params; }
         if (m == null || m.func == null || m.func.generic_params.length == 0) {
@@ -7180,8 +7180,8 @@ type struct CallResolver {
         mut ctx: ResolutionContext = ResolutionContext::new("");
         mut owner: TypeRef = recv_param;
         const rt: Type* = this.arena.lookup(recv_param);
-        if (rt != null && rt.kind == TypeKind::Reference) { owner = (rt as ReferenceType*).referent; }
-        if (rt != null && rt.kind == TypeKind::Pointer) { owner = (rt as PointerType*).pointee; }
+        if (rt != null && rt.kind == TypeKind::Reference) { owner = rt.as_reference().referent; }
+        if (rt != null && rt.kind == TypeKind::Pointer) { owner = rt.as_pointer().pointee; }
         ctx.set_this_type(owner);
         mut targs: &[TypeAnnotation*] = &call.generic_args;
         if (targs.length == 0 && scope != null) { targs = &scope.generic_args; }
@@ -7210,7 +7210,7 @@ type struct CallResolver {
         }
         const ot: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(e));
         if (ot == null || ot.kind != TypeKind::Function) { return; }
-        const fn_ty: FunctionType* = ot as FunctionType*;
+        const fn_ty: FunctionType* = ot.as_function();
         if (fn_ty.param_types.length == 0) { return; }
         mut binds: [TypeRef] = [];
         mut ctx: ResolutionContext = this.path_method_context(m, fn_ty.param_types[0], call, scope, &binds);
@@ -8190,7 +8190,7 @@ type struct CallResolver {
         if (!base.is_valid()) { return; }
         const base_t: Type* = this.arena.lookup(base);
         if (base_t == null || base_t.kind != TypeKind::Enum) { return; }
-        const et: EnumType* = base_t as EnumType*;
+        const et: EnumType* = base_t.as_enum();
         const vi: i64 = et.variant_index(scope.member_name);
         if (vi < 0) { return; }
         const args: [TypeRef] = this.types.view_type_args_copy(instance);
@@ -8231,7 +8231,7 @@ type struct CallResolver {
         mut has_payload: boolean = true;
         const et_t: Type* = this.arena.lookup(enum_ref);
         if (et_t != null && et_t.kind == TypeKind::Enum) {
-            const et: EnumType* = et_t as EnumType*;
+            const et: EnumType* = et_t.as_enum();
             const vi: i64 = et.variant_index(scope.member_name);
             if (vi >= 0) { has_payload = et.variants[vi].payload_types.length > 0; }
         }
@@ -8259,7 +8259,7 @@ type struct CallResolver {
         if (tmpl == null || tmpl.param_count == 0) { return TypeRef::invalid(); }
         const base_t: Type* = this.arena.lookup(base_ref);
         if (base_t == null || base_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
-        const et: EnumType* = base_t as EnumType*;
+        const et: EnumType* = base_t.as_enum();
         // The variant is the one this call's payload lookup already found
         // and pinned on the path (`lookup_scope_variant_payload_types`);
         // the ordinal is the same in the template and every instantiation.
@@ -8280,7 +8280,7 @@ type struct CallResolver {
             if (pt == null) { continue; }
             // Only the direct `T` payload shape (the position IS a bare param).
             mut gpt: GenericParamType* = null;
-            if (pt.kind == TypeKind::GenericParam) { gpt = pt as GenericParamType*; }
+            if (pt.kind == TypeKind::GenericParam) { gpt = pt.as_generic_param(); }
             else { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null || !arg.has_resolved_type()) { continue; }
@@ -8375,7 +8375,7 @@ type struct CallResolver {
         if (!ft.is_valid()) { return []; }
         const ft_raw: Type* = this.arena.lookup(ft);
         if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return []; }
-        return sema_copy_type_refs(&(ft_raw as FunctionType*).param_types);
+        return sema_copy_type_refs(&ft_raw.as_function().param_types);
     }
 
     /// The return type of a module-qualified function (`intrinsics::frexp`),
@@ -8631,7 +8631,7 @@ type struct CallResolver {
         const ret_t: Type* = this.arena.lookup(ret);
         if (ret_t == null) { return ret; }
         const instantiated: boolean = ret_t.kind == TypeKind::InstantiatedType;
-        if (instantiated && (ret_t as InstantiatedType*).is_resolved()) { return ret; }
+        if (instantiated && ret_t.as_instantiated().has_resolved_type()) { return ret; }
         if (!instantiated && !this.types.contains_generic_param(ret)) { return ret; }
         // Turbofish owner args (`Arc<Thing, GlobalAlloc>::try_new`): map them to the
         // OWNER's generic params and substitute throughout the return type. This
@@ -8668,11 +8668,11 @@ type struct CallResolver {
             }
         }
         if (!instantiated || !this.state.expected_type.is_valid()) { return ret; }
-        const ret_inst: InstantiatedType* = ret_t as InstantiatedType*;
+        const ret_inst: InstantiatedType* = ret_t.as_instantiated();
         mut exp_ref: TypeRef = this.state.expected_type;
         mut exp_t: Type* = this.arena.lookup(exp_ref);
         if (exp_t != null && exp_t.kind == TypeKind::TypeAlias) {
-            const alias: TypeAliasType* = exp_t as TypeAliasType*;
+            const alias: TypeAliasType* = exp_t.as_alias();
             if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref); }
         }
         // Sibling of the expected-type peel in `compute_static_owner_bindings`:
@@ -8712,7 +8712,7 @@ type struct CallResolver {
         mut exp_ref: TypeRef = this.state.expected_type;
         mut exp_t: Type* = this.arena.lookup(exp_ref);
         if (exp_t != null && exp_t.kind == TypeKind::TypeAlias) {
-            const alias: TypeAliasType* = exp_t as TypeAliasType*;
+            const alias: TypeAliasType* = exp_t.as_alias();
             if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref); }
         }
         if (exp_t == null) { return found; }
@@ -8785,7 +8785,7 @@ type struct CallResolver {
         if (overloads.length == 1) {
             const ot: Type* = this.arena.lookup(overloads[0]);
             if (ot != null && ot.kind == TypeKind::Function) {
-                const ft: FunctionType* = ot as FunctionType*;
+                const ft: FunctionType* = ot.as_function();
                 // A variadic callee's declared parameters are checked like any
                 // other's; only the tail past them is unconstrained.
                 const expected: i64 = ft.param_types.length;
@@ -8895,7 +8895,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < entries.length; i++) {
             const et: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[i]));
             if (et == null || et.kind != TypeKind::Function) { continue; }
-            const ft: FunctionType* = et as FunctionType*;
+            const ft: FunctionType* = et.as_function();
             if (ft.is_variadic) { return; }
             uniq_arity = this.diag.note_arity(uniq_arity, ft.param_types.length);
             if (ft.param_types.length == argc) { of_arity.push(ft); }
@@ -8938,7 +8938,7 @@ type struct CallResolver {
         mut t: Type* = this.arena.lookup(type_ref);
         mut owner_ref: TypeRef = type_ref;
         if (t != null && t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+            const inst: InstantiatedType* = t.as_instantiated();
             if (!inst.has_resolved_type()) { return; }
             owner_ref = inst.resolved_type;
             t = this.arena.lookup(inst.resolved_type);
@@ -8947,9 +8947,9 @@ type struct CallResolver {
         const named: [MethodNode*] = this.ctx.decl_index.methods_named(FamilyOwner::Type(owner_ref), scope.member_name);
         mut methods: [MethodInfo] = [];
         match (t.kind) {
-            TypeKind::Struct => { methods = (t as StructType*).methods; }
-            TypeKind::Class  => { methods = (t as ClassType*).methods; }
-            TypeKind::Enum   => { methods = (t as EnumType*).methods; }
+            TypeKind::Struct => { methods = t.as_struct().methods; }
+            TypeKind::Class  => { methods = t.as_class().methods; }
+            TypeKind::Enum   => { methods = t.as_enum().methods; }
             _ => { return; }
         }
         const argc: i64 = call.arguments.length;

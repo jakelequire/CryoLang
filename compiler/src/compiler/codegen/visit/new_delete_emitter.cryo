@@ -30,8 +30,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::types;
 import compiler::types::{
-    arena, compound, generic, generic_registry, ownership, type_base, type_ref, TypeKind,
-    user_defined
+    arena, compound, generic, generic_registry, IntegerKind, ownership, type_base, type_ref, TypeKind, user_defined
 };
 import compiler::ast;
 import compiler::ast::{ MemberPin, node, expression, statement };
@@ -67,7 +66,7 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType };
 import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::types::ownership::{ OwnershipQuery };
-import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ ClassType, EnumType, EnumVariantInfo, StructType };
 import compiler::codegen::visit::enum_variant_emitter::{ EnumVariantEmitter };
@@ -114,7 +113,7 @@ type struct NewDeleteEmitter {
             const block: ImplBlockNode* = registry.select_trait_impl(trait_id, cur, this.cg.get_intern());
             if (block != null) { return block; }
             if (t.kind != TypeKind::Class) { return null; }
-            const ct: ClassType* = t as ClassType*;
+            const ct: ClassType* = t.as_class();
             if (!ct.has_base) { return null; }
             cur = ct.base_class;
         }
@@ -168,7 +167,7 @@ type struct NewDeleteEmitter {
         if (node.has_resolved_type()) {
             const rt: Type* = arena_p.lookup(node.resolved_type);
             if (rt != null && rt.kind == TypeKind::Pointer) {
-                type_ref = (rt as PointerType*).pointee;
+                type_ref = rt.as_pointer().pointee;
             }
         }
         const qualified_sym: SymbolStr = arena_p.get_qualified_name(type_ref).spelling();
@@ -186,7 +185,7 @@ type struct NewDeleteEmitter {
         // Heap-allocated enum variant: the one sema pinned inside the enum
         // the stamp names (a leaf the enum lacks was refused there).
         if (t.kind == TypeKind::Enum && node.has_variant()) {
-            const et: EnumType* = t as EnumType*;
+            const et: EnumType* = t.as_enum();
             const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, node.resolved_member);
             if (variant == null) {
                 this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
@@ -214,13 +213,13 @@ type struct NewDeleteEmitter {
         // inheritance in that value.
         mut size: u64 = 0;
         if (t.kind == TypeKind::Class) {
-            const ct: ClassType* = t as ClassType*;
+            const ct: ClassType* = t.as_class();
             size = ct.computed_size;
         } else if (t.kind == TypeKind::Struct) {
-            const st: StructType* = t as StructType*;
+            const st: StructType* = t.as_struct();
             size = st.computed_size;
         } else if (t.kind == TypeKind::Enum) {
-            const et: EnumType* = t as EnumType*;
+            const et: EnumType* = t.as_enum();
             size = et.computed_size;
         } else {
             size = t.size_bytes();
@@ -245,7 +244,7 @@ type struct NewDeleteEmitter {
         }
         mut align: u64 = 16;
         if (t.kind == TypeKind::Class) {
-            const ct_a: ClassType* = t as ClassType*;
+            const ct_a: ClassType* = t.as_class();
             if (ct_a.computed_align > 0) { align = ct_a.computed_align; }
         }
         const raw_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
@@ -271,7 +270,7 @@ type struct NewDeleteEmitter {
         // (no initializer) so the link step resolves it to the owning
         // module's definition.
         if (t.kind == TypeKind::Class) {
-            const cls: ClassType* = t as ClassType*;
+            const cls: ClassType* = t.as_class();
             if (cls.has_virtual_methods && mapped.is_valid() && obj_ptr.is_valid()) {
                 const qname: QualifiedName = QualifiedName::from_symbol(qualified_sym);
                 const vtbl_name: MangledName = MangledName::for_vtable(intern, qname);
@@ -301,7 +300,7 @@ type struct NewDeleteEmitter {
         // parser produces would be a pointer to garbage.
         if (node.struct_init != null && t.kind == TypeKind::Struct && mapped.is_valid()) {
             const lit: StructLiteralNode* = node.struct_init;
-            const st: StructType* = t as StructType*;
+            const st: StructType* = t.as_struct();
             for (mut sfi: i64 = 0; sfi < lit.field_inits.length; sfi++) {
                 const finit: FieldInit = lit.field_inits[sfi];
                 // The field is the one sema pinned on the initializer.
@@ -334,8 +333,8 @@ type struct NewDeleteEmitter {
                                 const field_t: Type* = this.cg.arena_type(
                                     st.fields[sf_fidx].field_type);
                                 if (field_t != null && field_t.kind == TypeKind::Int) {
-                                    const ft_int: IntType* = field_t as IntType*;
-                                    signed_target = ft_int.int_kind.is_signed();
+                                    const ft_int: IntegerKind = field_t.int_kind();
+                                    signed_target = ft_int.is_signed();
                                 }
                                 if (signed_target) {
                                     val = this.cg.builder.build_sext(val, field_lty, "field.widen");
@@ -398,7 +397,7 @@ type struct NewDeleteEmitter {
             out.is_lvalue = false;
             return out;
         }
-        const elem_ref: TypeRef = (result_t as PointerType*).pointee;
+        const elem_ref: TypeRef = result_t.as_pointer().pointee;
         const elem_t: Type* = this.cg.arena_type(elem_ref);
         const elem_llvm: LType = this.cg.type_mapper.map_type(elem_ref);
 
@@ -407,11 +406,11 @@ type struct NewDeleteEmitter {
         mut elem_size: u64 = 0;
         if (elem_t != null) {
             if (elem_t.kind == TypeKind::Class) {
-                elem_size = (elem_t as ClassType*).computed_size;
+                elem_size = elem_t.as_class().computed_size;
             } else if (elem_t.kind == TypeKind::Struct) {
-                elem_size = (elem_t as StructType*).computed_size;
+                elem_size = elem_t.as_struct().computed_size;
             } else if (elem_t.kind == TypeKind::Enum) {
-                elem_size = (elem_t as EnumType*).computed_size;
+                elem_size = elem_t.as_enum().computed_size;
             } else {
                 elem_size = elem_t.size_bytes();
             }
@@ -505,7 +504,7 @@ type struct NewDeleteEmitter {
         if (operand_type.is_valid() && arena_ptr != null) {
             const ot: Type* = arena_ptr.lookup(operand_type);
             if (ot != null && ot.kind == TypeKind::Pointer) {
-                const pt: PointerType* = ot as PointerType*;
+                const pt: PointerType* = ot.as_pointer();
                 pointee = pt.pointee;
             }
         }
@@ -600,7 +599,7 @@ type struct NewDeleteEmitter {
         if (pointee.is_valid() && arena_ptr != null) {
             const del_pt: Type* = arena_ptr.lookup(pointee);
             if (del_pt != null && del_pt.kind == TypeKind::Class) {
-                const del_cpt: ClassType* = del_pt as ClassType*;
+                const del_cpt: ClassType* = del_pt.as_class();
                 if (del_cpt.computed_align > 0) { del_align = del_cpt.computed_align; }
             }
         }

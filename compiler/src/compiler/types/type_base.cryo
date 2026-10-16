@@ -1,37 +1,208 @@
-///! Type Base Class & Primitive Types
+///! The Type
 ///!
-///! Defines the abstract Type base class and all 8 primitive type subclasses.
-///! Each Type is owned by a TypeArena and referenced via TypeRef handles.
+///! Every type is a `Type`: its id, its kind and its data.  A primitive's data
+///! is the variant alone (or its integer or float kind); every other kind's
+///! data points at the payload struct that holds its fields, declared in
+///! `compound`, `generic` or `user_defined`.  Each Type is owned by a TypeArena
+///! and referenced through TypeRef handles.
 
 namespace compiler::types::type_base;
 
 import compiler::types;
 import compiler::types::{ FloatKind, IntegerKind, TypeKind };
 import compiler::types::type_ref;
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{
+    AssocProjectionType, GenericParamType, InstantiatedType
+};
+import compiler::types::user_defined::{
+    ClassType, EnumType, FunctionTemplateType, StructType, TraitType, TypeAliasType
+};
 
 
-// Type: Abstract base class for all types
+/// What a type is, one variant per `TypeKind`.  A `string` is a
+/// null-terminated `i8*` (`type_map.cryo`'s `map_string`), and a `va_list` is
+/// passed as one pointer on every supported ABI, so both are 8 bytes: the
+/// size reported here must match the lowering, or struct layout puts field
+/// offsets where LLVM's GEP stride does not.
+type enum TypeData {
+    Void;
+    Unit;
+    Bool;
+    Char;
+    String;
+    Never;
+    VaList;
+    Int(IntegerKind);
+    Float(FloatKind);
+    Pointer(PointerType*);
+    Reference(ReferenceType*);
+    Array(ArrayType*);
+    Function(FunctionType*);
+    Tuple(TupleType*);
+    Optional(OptionalType*);
+    Struct(StructType*);
+    Class(ClassType*);
+    Enum(EnumType*);
+    Trait(TraitType*);
+    TypeAlias(TypeAliasType*);
+    GenericParam(GenericParamType*);
+    Instantiated(InstantiatedType*);
+    AssocProjection(AssocProjectionType*);
+    FunctionTemplate(FunctionTemplateType*);
+    Error;
+}
 
-/// Base class for every type in the Cryo type system.
-/// Subclassed for each TypeKind category.
-type class Type {
-public:
+implement enum TypeData {
+    /// The kind this data is.
+    kind(&this) -> TypeKind {
+        return match (this) {
+            TypeData::Void                => { TypeKind::Void }
+            TypeData::Unit                => { TypeKind::Unit }
+            TypeData::Bool                => { TypeKind::Bool }
+            TypeData::Char                => { TypeKind::Char }
+            TypeData::String              => { TypeKind::String }
+            TypeData::Never               => { TypeKind::Never }
+            TypeData::VaList              => { TypeKind::VaList }
+            TypeData::Int(_)              => { TypeKind::Int }
+            TypeData::Float(_)            => { TypeKind::Float }
+            TypeData::Pointer(_)          => { TypeKind::Pointer }
+            TypeData::Reference(_)        => { TypeKind::Reference }
+            TypeData::Array(_)            => { TypeKind::Array }
+            TypeData::Function(_)         => { TypeKind::Function }
+            TypeData::Tuple(_)            => { TypeKind::Tuple }
+            TypeData::Optional(_)         => { TypeKind::Optional }
+            TypeData::Struct(_)           => { TypeKind::Struct }
+            TypeData::Class(_)            => { TypeKind::Class }
+            TypeData::Enum(_)             => { TypeKind::Enum }
+            TypeData::Trait(_)            => { TypeKind::Trait }
+            TypeData::TypeAlias(_)        => { TypeKind::TypeAlias }
+            TypeData::GenericParam(_)     => { TypeKind::GenericParam }
+            TypeData::Instantiated(_)     => { TypeKind::InstantiatedType }
+            TypeData::AssocProjection(_)  => { TypeKind::AssocProjection }
+            TypeData::FunctionTemplate(_) => { TypeKind::FunctionTemplate }
+            TypeData::Error               => { TypeKind::Error }
+        };
+    }
+}
+
+
+/// A type: its arena id, its kind, and the data of that kind.  `kind` is
+/// always `data.kind()`; `Type::new` is the one place it is set.
+///
+/// The `as_*` accessors read the payload of the one kind they name.  The
+/// caller has established the kind; asking a type for another kind's
+/// payload is a compiler defect and stops the compilation.
+type struct Type {
     id:   u64;
     kind: TypeKind;
+    data: TypeData;
 
-    Type(id: u64, kind: TypeKind) {
-        this.id   = id;
-        this.kind = kind;
+    /// A type with `data`, at arena id `id`.
+    static new(id: u64, data: TypeData) -> Type* {
+        return new Type { id: id, kind: data.kind(), data: data };
     }
 
     /// Human-readable display name (e.g., "i32", "string", "MyStruct").
-    virtual display_name(&this) -> string;
+    display_name(&this) -> string {
+        return match (this.data) {
+            TypeData::Void                => { "void" }
+            TypeData::Unit                => { "()" }
+            TypeData::Bool                => { "boolean" }
+            TypeData::Char                => { "char" }
+            TypeData::String              => { "string" }
+            TypeData::Never               => { "never" }
+            TypeData::VaList              => { "va_list" }
+            TypeData::Int(k)              => { k.to_string() }
+            TypeData::Float(k)            => { k.to_string() }
+            TypeData::Pointer(p)          => { p.display_name() }
+            TypeData::Reference(p)        => { p.display_name() }
+            TypeData::Array(p)            => { p.display_name() }
+            TypeData::Function(p)         => { p.display_name() }
+            TypeData::Tuple(p)            => { p.display_name() }
+            TypeData::Optional(p)         => { p.display_name() }
+            TypeData::Struct(p)           => { p.display_name() }
+            TypeData::Class(p)            => { p.display_name() }
+            TypeData::Enum(p)             => { p.display_name() }
+            TypeData::Trait(p)            => { p.display_name() }
+            TypeData::TypeAlias(p)        => { p.display_name() }
+            TypeData::GenericParam(p)     => { p.display_name() }
+            TypeData::Instantiated(p)     => { p.display_name() }
+            TypeData::AssocProjection(p)  => { p.display_name() }
+            TypeData::FunctionTemplate(p) => { p.display_name() }
+            TypeData::Error               => { "<error>" }
+        };
+    }
 
     /// Size of this type in bytes (0 for void/unit/never/unresolved).
-    virtual size_bytes(&this) -> u64;
+    size_bytes(&this) -> u64 {
+        return match (this.data) {
+            TypeData::Void                => { 0 }
+            TypeData::Unit                => { 0 }
+            TypeData::Bool                => { 1 }
+            TypeData::Char                => { 4 }
+            TypeData::String              => { 8 }
+            TypeData::Never               => { 0 }
+            TypeData::VaList              => { 8 }
+            TypeData::Int(k)              => { k.byte_size() }
+            TypeData::Float(k)            => { k.byte_size() }
+            TypeData::Pointer(_)          => { 8 }
+            TypeData::Reference(_)        => { 8 }
+            TypeData::Array(p)            => { p.computed_size }
+            TypeData::Function(_)         => { 8 }
+            TypeData::Tuple(p)            => { p.computed_size }
+            TypeData::Optional(p)         => { p.computed_size }
+            TypeData::Struct(p)           => { p.computed_size }
+            TypeData::Class(p)            => { p.computed_size }
+            TypeData::Enum(p)             => { p.computed_size }
+            TypeData::Trait(_)            => { 0 }
+            TypeData::TypeAlias(p)        => { p.computed_size }
+            TypeData::GenericParam(_)     => { 0 }
+            TypeData::Instantiated(p)     => { p.computed_size }
+            TypeData::AssocProjection(_)  => { 0 }
+            TypeData::FunctionTemplate(_) => { 0 }
+            TypeData::Error               => { 0 }
+        };
+    }
 
-    /// Alignment of this type in bytes.
-    virtual alignment(&this) -> u64;
+    /// Alignment of this type in bytes.  A nominal aggregate whose layout is
+    /// not computed yet reports 1.
+    alignment(&this) -> u64 {
+        return match (this.data) {
+            TypeData::Void                => { 0 }
+            TypeData::Unit                => { 1 }
+            TypeData::Bool                => { 1 }
+            TypeData::Char                => { 4 }
+            TypeData::String              => { 8 }
+            TypeData::Never               => { 0 }
+            TypeData::VaList              => { 8 }
+            TypeData::Int(k)              => { k.byte_size() }
+            TypeData::Float(k)            => { k.byte_size() }
+            TypeData::Pointer(_)          => { 8 }
+            TypeData::Reference(_)        => { 8 }
+            TypeData::Array(p)            => { p.computed_align }
+            TypeData::Function(_)         => { 8 }
+            TypeData::Tuple(p)            => { p.computed_align }
+            TypeData::Optional(p)         => { p.computed_align }
+            TypeData::Struct(p)           => { Type::at_least_one(p.computed_align) }
+            TypeData::Class(p)            => { Type::at_least_one(p.computed_align) }
+            TypeData::Enum(p)             => { Type::at_least_one(p.computed_align) }
+            TypeData::Trait(_)            => { 0 }
+            TypeData::TypeAlias(p)        => { p.computed_align }
+            TypeData::GenericParam(_)     => { 0 }
+            TypeData::Instantiated(p)     => { p.computed_align }
+            TypeData::AssocProjection(_)  => { 0 }
+            TypeData::FunctionTemplate(_) => { 0 }
+            TypeData::Error               => { 0 }
+        };
+    }
+
+    static at_least_one(align: u64) -> u64 {
+        if (align > 0) { return align; }
+        return 1;
+    }
 
     /// Whether this type is a numeric type (int or float).
     is_numeric(&this) -> boolean {
@@ -42,140 +213,123 @@ public:
     is_error(&this) -> boolean {
         return this.kind.is_error();
     }
-}
 
-
-// VoidType: The absence of a value
-
-type class VoidType : Type {
-public:
-    VoidType(id: u64) : Type(id, TypeKind::Void) {}
-
-    override display_name(&this) -> string { return "void"; }
-    override size_bytes(&this) -> u64      { return 0; }
-    override alignment(&this) -> u64       { return 0; }
-}
-
-
-// UnitType: Zero-sized value type ()
-
-type class UnitType : Type {
-public:
-    UnitType(id: u64) : Type(id, TypeKind::Unit) {}
-
-    override display_name(&this) -> string { return "()"; }
-    override size_bytes(&this) -> u64      { return 0; }
-    override alignment(&this) -> u64       { return 1; }
-}
-
-
-// BoolType: Boolean (true/false)
-
-type class BoolType : Type {
-public:
-    BoolType(id: u64) : Type(id, TypeKind::Bool) {}
-
-    override display_name(&this) -> string { return "boolean"; }
-    override size_bytes(&this) -> u64      { return 1; }
-    override alignment(&this) -> u64       { return 1; }
-}
-
-
-// IntType: Integer with configurable width and signedness
-
-type class IntType : Type {
-public:
-    int_kind: IntegerKind;
-
-    IntType(id: u64, int_kind: IntegerKind) : Type(id, TypeKind::Int) {
-        this.int_kind = int_kind;
+    int_kind(&this) -> IntegerKind {
+        match (this.data) {
+            TypeData::Int(k) => { return k; }
+            _ => { unreachable(); }
+        }
     }
 
-    override display_name(&this) -> string { return this.int_kind.to_string(); }
-    override size_bytes(&this) -> u64      { return this.int_kind.byte_size(); }
-    override alignment(&this) -> u64       { return this.int_kind.byte_size(); }
-
-    is_signed(&this) -> boolean   { return this.int_kind.is_signed(); }
-    bit_width(&this) -> u64       { return this.int_kind.bit_width(); }
-}
-
-
-// FloatType: Floating-point with configurable width
-
-type class FloatType : Type {
-public:
-    float_kind: FloatKind;
-
-    FloatType(id: u64, float_kind: FloatKind) : Type(id, TypeKind::Float) {
-        this.float_kind = float_kind;
+    float_kind(&this) -> FloatKind {
+        match (this.data) {
+            TypeData::Float(k) => { return k; }
+            _ => { unreachable(); }
+        }
     }
 
-    override display_name(&this) -> string { return this.float_kind.to_string(); }
-    override size_bytes(&this) -> u64      { return this.float_kind.byte_size(); }
-    override alignment(&this) -> u64       { return this.float_kind.byte_size(); }
+    as_pointer(&this) -> PointerType* {
+        match (this.data) {
+            TypeData::Pointer(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
-    bit_width(&this) -> u64 { return this.float_kind.bit_width(); }
-}
+    as_reference(&this) -> ReferenceType* {
+        match (this.data) {
+            TypeData::Reference(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
+    as_array(&this) -> ArrayType* {
+        match (this.data) {
+            TypeData::Array(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
-// CharType: Unicode scalar value (u32)
+    as_function(&this) -> FunctionType* {
+        match (this.data) {
+            TypeData::Function(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
-type class CharType : Type {
-public:
-    CharType(id: u64) : Type(id, TypeKind::Char) {}
+    as_tuple(&this) -> TupleType* {
+        match (this.data) {
+            TypeData::Tuple(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
-    override display_name(&this) -> string { return "char"; }
-    override size_bytes(&this) -> u64      { return 4; }
-    override alignment(&this) -> u64       { return 4; }
-}
+    as_optional(&this) -> OptionalType* {
+        match (this.data) {
+            TypeData::Optional(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
+    as_struct(&this) -> StructType* {
+        match (this.data) {
+            TypeData::Struct(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
-// StringType: null-terminated `i8*` (8 bytes)
-//
-// `string` lowers to `i8*` in `type_map.cryo:map_string`, NOT to a {ptr, len}
-// fat pointer.  The size_bytes()/alignment() reported here MUST match that
-// LLVM lowering; otherwise compute_struct_layout produces field offsets
-// (and a final struct size) that don't line up with LLVM's struct layout,
-// and any `calloc(N, sizeof(StructWithStringField))` allocates buffers
-// striped against the GEP stride the codegen will use.  Reading entries[1+]
-// then drags whatever bytes happen to sit between the rows back through the
-// HashMap probing logic; exactly what manifested as garbage `key` pointers
-// (e.g. 0x1C3) being strcmp'd inside HashMap<string, V>::find_entry.
+    as_class(&this) -> ClassType* {
+        match (this.data) {
+            TypeData::Class(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
-type class StringType : Type {
-public:
-    StringType(id: u64) : Type(id, TypeKind::String) {}
+    as_enum(&this) -> EnumType* {
+        match (this.data) {
+            TypeData::Enum(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
-    override display_name(&this) -> string { return "string"; }
-    override size_bytes(&this) -> u64      { return 8; }
-    override alignment(&this) -> u64       { return 8; }
-}
+    as_trait(&this) -> TraitType* {
+        match (this.data) {
+            TypeData::Trait(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
+    as_alias(&this) -> TypeAliasType* {
+        match (this.data) {
+            TypeData::TypeAlias(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
-// NeverType: Divergent/bottom type (never returns)
+    as_generic_param(&this) -> GenericParamType* {
+        match (this.data) {
+            TypeData::GenericParam(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
-type class NeverType : Type {
-public:
-    NeverType(id: u64) : Type(id, TypeKind::Never) {}
+    as_instantiated(&this) -> InstantiatedType* {
+        match (this.data) {
+            TypeData::Instantiated(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
-    override display_name(&this) -> string { return "never"; }
-    override size_bytes(&this) -> u64      { return 0; }
-    override alignment(&this) -> u64       { return 0; }
-}
+    as_assoc_projection(&this) -> AssocProjectionType* {
+        match (this.data) {
+            TypeData::AssocProjection(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 
-
-// VaListType: C variadic-argument list (`va_list`), an interop type for binding
-// C functions like `vfprintf`/`sqlite3_str_vappendf`.  It lowers to a pointer
-// (`i8*`) in `type_map.cryo` - a C `va_list` argument is passed as a single
-// pointer-width value on every supported ABI (SysV decays `__va_list_tag[1]` to
-// `__va_list_tag*`; Win64 `va_list` is `char*`) - so the reported 8-byte size
-// MUST match that lowering, exactly as `StringType` documents for `i8*`.
-
-type class VaListType : Type {
-public:
-    VaListType(id: u64) : Type(id, TypeKind::VaList) {}
-
-    override display_name(&this) -> string { return "va_list"; }
-    override size_bytes(&this) -> u64      { return 8; }
-    override alignment(&this) -> u64       { return 8; }
+    as_function_template(&this) -> FunctionTemplateType* {
+        match (this.data) {
+            TypeData::FunctionTemplate(p) => { return p; }
+            _ => { unreachable(); }
+        }
+    }
 }

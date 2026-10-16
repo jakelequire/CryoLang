@@ -25,8 +25,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::types;
 import compiler::types::{
-    arena, compound, generic, generic_registry, ownership, resolver, type_base, type_ref,
-    TypeKind, user_defined
+    arena, compound, generic, generic_registry, IntegerKind, ownership, resolver, type_base, type_ref, TypeKind, user_defined
 };
 import compiler::ast;
 import compiler::ast::{
@@ -87,7 +86,7 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::compound::{ ArrayType };
 import compiler::types::generic::{ InstantiatedType };
 import compiler::types::resolver::{ ResolutionContext };
-import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
     ClassType, EnumType, EnumVariantInfo, FieldInfo, StructType
@@ -1007,10 +1006,10 @@ type struct IRGeneratorVisitor {
         const empty_fields: [FieldInfo] = [];
         mut fields_arr: &[FieldInfo] = &empty_fields;
         if (ty.kind == TypeKind::Struct) {
-            const st: StructType* = ty as StructType*;
+            const st: StructType* = ty.as_struct();
             fields_arr = &st.fields;
         } else if (ty.kind == TypeKind::Class) {
-            const ct: ClassType* = ty as ClassType*;
+            const ct: ClassType* = ty.as_class();
             fields_arr = &ct.fields;
         } else {
             return out;  // sema already errored on non-struct destructure
@@ -1094,16 +1093,16 @@ type struct IRGeneratorVisitor {
             mut sty: Type* = this.cg.arena_type(node.resolved_type);
             mut sbd: i32 = 0;
             while (sty != null && sty.kind == TypeKind::InstantiatedType && sbd < 5) {
-                const sinst: InstantiatedType* = sty as InstantiatedType*;
+                const sinst: InstantiatedType* = sty.as_instantiated();
                 if (sinst.has_resolved_type()) {
                     sty = this.cg.arena_type(sinst.resolved_type);
                 } else { break; }
                 sbd += 1;
             }
             if (sty != null && sty.kind == TypeKind::Int) {
-                const sint: IntType* = sty as IntType*;
-                if (sint.int_kind.is_unsigned()) { sign_extend = false; }
-                if (sint.int_kind.bit_width() == 128) { is_128 = true; }
+                const sint: IntegerKind = sty.int_kind();
+                if (sint.is_unsigned()) { sign_extend = false; }
+                if (sint.bit_width() == 128) { is_128 = true; }
             }
             if (is_128) {
                 // A 128-bit literal can hold more than 64 bits, so the u64
@@ -1268,7 +1267,7 @@ type struct IRGeneratorVisitor {
         // access).  Returns the alloca as an lvalue, like the struct path.
         const ult: Type* = this.cg.arena_type(struct_type);
         if (ult != null && ult.kind == TypeKind::Struct) {
-            const ust: StructType* = ult as StructType*;
+            const ust: StructType* = ult.as_struct();
             if (ust.is_union) {
                 if (field_pins.length == 1) {
                     // The active member is the one sema pinned on the
@@ -1305,7 +1304,7 @@ type struct IRGeneratorVisitor {
         mut any_virtual: boolean = false;
         mut leaf_cls: ClassType* = null;
         if (t != null && t.kind == TypeKind::Class) {
-            const cls: ClassType* = t as ClassType*;
+            const cls: ClassType* = t.as_class();
             leaf_cls = cls;
             mut walk: ClassType* = cls;
             mut depth: i32 = 0;
@@ -1314,7 +1313,7 @@ type struct IRGeneratorVisitor {
                 if (!walk.has_base || !walk.base_class.is_valid()) { break; }
                 const base_t: Type* = this.cg.arena_type(walk.base_class);
                 if (base_t == null || base_t.kind != TypeKind::Class) { break; }
-                walk = base_t as ClassType*;
+                walk = base_t.as_class();
                 depth += 1;
             }
         }
@@ -1405,8 +1404,8 @@ type struct IRGeneratorVisitor {
                         const field_t: Type* = this.cg.arena_type(
                             pin_field.field_type);
                         if (field_t != null && field_t.kind == TypeKind::Int) {
-                            const ft_int: IntType* = field_t as IntType*;
-                            signed_target = ft_int.int_kind.is_signed();
+                            const ft_int: IntegerKind = field_t.int_kind();
+                            signed_target = ft_int.is_signed();
                         }
                         if (signed_target) {
                             val = this.cg.builder.build_sext(val, field_lty, "field.widen");
@@ -1737,7 +1736,7 @@ type struct IRGeneratorVisitor {
         mut real_t: Type* = this.cg.arena_type(real_ref);
         mut sr_depth: i32 = 0;
         while (real_t != null && real_t.kind == TypeKind::InstantiatedType && sr_depth < 5) {
-            const inst: InstantiatedType* = real_t as InstantiatedType*;
+            const inst: InstantiatedType* = real_t.as_instantiated();
             if (inst.has_resolved_type()) {
                 real_ref = inst.resolved_type;
                 real_t = this.cg.arena_type(real_ref);
@@ -1746,7 +1745,7 @@ type struct IRGeneratorVisitor {
         }
         if (real_t == null || real_t.kind != TypeKind::Enum) { return Option::None; }
 
-        const et: EnumType* = real_t as EnumType*;
+        const et: EnumType* = real_t.as_enum();
         const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, node.resolved_member);
         if (variant == null) { return Option::None; }
 
