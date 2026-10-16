@@ -67,6 +67,11 @@ type struct SymbolResolver {
     globals:     GlobalRegistry*;
     ctx:         CompilationContext*;
 
+    /// The `![inline]` functions another module defines that this module
+    /// calls, in the order first called: each was declared here, and its
+    /// body is emitted here after the module's own (`inline_bodies.cryo`).
+    inline_copies: [OverloadId];
+
     static null() -> SymbolResolver {
         return SymbolResolver {
             llvm_module: null,
@@ -75,6 +80,7 @@ type struct SymbolResolver {
             functions:   null,
             globals:     null,
             ctx:         null,
+            inline_copies: [],
         };
     }
 
@@ -181,7 +187,8 @@ type struct SymbolResolver {
 
     /// A function by DECLARATION.  The entry gives both the symbol and the
     /// signature: held by this module under that symbol, else declared
-    /// extern at that signature.  Null for an invalid id or a signature
+    /// extern at that signature - and, for an `![inline]` body, queued for
+    /// this module's copy of it.  Null for an invalid id or a signature
     /// that does not lower.
     resolve_decl(mut &this, id: OverloadId) -> LValue {
         const di: DeclarationIndex* = this.ctx.decl_index;
@@ -189,7 +196,11 @@ type struct SymbolResolver {
         if (!sym.is_valid()) { return LValue::null(); }
         const v: LValue = this.held_symbol(sym);
         if (v.is_valid()) { return v; }
-        return this.declare_extern_function_as(di.entry_signature(id), sym);
+        const declared: LValue = this.declare_extern_function_as(di.entry_signature(id), sym);
+        if (declared.is_valid() && di.inline_body(id).is_some()) {
+            this.inline_copies.push(id);
+        }
+        return declared;
     }
 
     /// The constructor of the type definition `d` taking `arity` LLVM

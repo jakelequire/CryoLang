@@ -57,7 +57,7 @@ import compiler::sema::symbolic_checker::{ SymbolicChecker };
 import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::checker::{ TypeChecker, TypeCheckResult };
-import compiler::types::compound::{ FunctionType, PointerType, ReferenceType, TupleType };
+import compiler::types::compound::{ ArrayType, FunctionType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ GenericParamType, InstantiatedType };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
@@ -686,6 +686,15 @@ type struct MemberResolver {
             return tup.elements[idx];
         }
 
+        // A dynamic `[T]` is laid out as `Array<T>` and has its methods, so
+        // it is indexed as `Array<T>` is: through the library's `Index`.
+        if (this.is_dynamic_array_value(array_type)) {
+            const dyn: ExpressionNode* = this.build_index_desugar(visitor, access);
+            if (dyn != null) {
+                access.desugared_call = dyn;
+                return dyn.resolved_type;
+            }
+        }
         const result: TypeCheckResult = this.checker.check_index_access(array_type, index_type);
         if (result.success) { return result.result_type; }
         if (unresolved) {
@@ -714,9 +723,8 @@ type struct MemberResolver {
         // param bounded by `Index`) that implements `Index<Idx, Output>` rewrites
         // `a[i]` into `*(a.index(i))` - the deref of the returned `Output*` is a
         // place, so the one desugar serves read / write / compound assignment.
-        // Arrays, slices, strings, pointers, pointer-to-array, and references
-        // all succeed above and never reach here, so the hot indexing path stays
-        // byte-identical.
+        // Fixed arrays, strings, pointers and references to them all succeed
+        // above and never reach here.
         const de: ExpressionNode* = this.try_index_overload(visitor, access, array_type);
         if (de != null) {
             access.desugared_call = de;
@@ -771,6 +779,18 @@ type struct MemberResolver {
         }
         if (this.trait_checker().select_impl(index_id, base_ty, 0) == null) { return null; }
         return this.build_index_desugar(visitor, access);
+    }
+
+    /// Whether `ty` is a dynamic `[T]`, or a reference to one.  A pointer to
+    /// one is not: indexing a pointer is the pointer's own rule.
+    is_dynamic_array_value(&this, ty: TypeRef) -> boolean {
+        mut t: Type* = this.arena.lookup(ty);
+        mut rdepth: i32 = 0;
+        while (t != null && t.kind == TypeKind::Reference && rdepth < 4) {
+            t = this.arena.lookup((t as ReferenceType*).referent);
+            rdepth += 1;
+        }
+        return t != null && t.kind == TypeKind::Array && (t as ArrayType*).is_dynamic();
     }
 
     /// The index desugar for a base that is a type parameter of the body

@@ -2270,12 +2270,13 @@ arithmetic, bitwise, and shift operator (`+= -= *= /= %= &= |= ^= <<= >>=`).
 **Indexing.** `Index<Idx, Output>::index` returns a **pointer** (`Output*`), so
 the desugar `a[i]` -> `*(a.index(i))` is a *place*: one implementation serves
 reads (`v = a[i]`), writes (`a[i] = v`), and compound assignment (`a[i] += v`).
-Built-in array/slice/string/pointer indexing keeps its native path.  A type may
+Fixed-array, string and pointer indexing keep their native path.  A type may
 implement `Index` once per index type; the call is answered by the
-implementation whose `Idx` is the index's own type.  `Array<T>` is indexed this
-way: the standard library implements `Index` for it once per integer type, so
-`xs[i]` takes an index of any integer type, and an index at or past the length
-(a negative one included) panics.  In a generic body, a container whose type
+implementation whose `Idx` is the index's own type.  `Array<T>` and `[T]` are
+indexed this way: the standard library implements `Index` for `Array<T>` once
+per integer type, marked `![inline]`, so `xs[i]` takes an index of any integer
+type, costs no call, and an index at or past the length (a negative one
+included) panics.  In a generic body, a container whose type
 carries the body's parameters (`xs: &Array<T>`) is indexed through its own
 implementation exactly as a concrete one is.
 
@@ -2902,7 +2903,7 @@ const ptr: int* = &x;       // ptr holds the address of x
 const val: int  = *ptr;     // val is 42
 ```
 
-Pointer indexing is supported: `ptr[0]` is `*ptr`, and `ptr[n]` accesses the n-th element from the pointer's base.
+Pointer indexing is supported: `ptr[0]` is `*ptr`, and `ptr[n]` accesses the n-th element from the pointer's base.  This holds whatever the pointer points at: `p[i]` with `p: [T]*` is the `i`-th array from `p`, not an element of the array `p` points at; write `(*p)[i]` for that.
 
 ### 15.2 Heap Allocation
 
@@ -3281,8 +3282,8 @@ type struct AlignedData {
 
 | Directive                                                 | Target                             | Description                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | --------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `![inline]`                                               | function                           | Inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute (no effect at the default `-O0`).*                                                                                                                                                                                                                                                                                                                   |
-| `![noinline]`                                             | function                           | Anti-inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute.*                                                                                                                                                                                                                                                                                                                                               |
+| `![inline]`                                               | function, method                   | Every call is inlined, at every optimization level and across modules: a module calling the function compiles its own copy of the body, which is discarded once inlined, and the defining module keeps the one definition. A generic function's instances are inlined the same way.                                                                                                                                            |
+| `![noinline]`                                             | function, method                   | The function is never inlined.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `![deprecated]` / `![deprecated("msg")]`                  | any decl                           | Marks a declaration as deprecated. *Parsed and validated; use-site warnings are not yet emitted.*                                                                                                                                                                                                                                                                                                                               |
 | `![symbol("name")]`                                       | extern fn / method / fn definition | Override the linker symbol: Cryo callers use the declared name while the symbol emitted / resolved at link time is `name`. On an extern decl or body-less method it renames the *imported* symbol; on a function *definition* it renames the *emitted* symbol. Used by the C++ binding generator to pin a decl to its Itanium-mangled symbol.                                                                                   |
 | `![no_mangle]`                                            | function / method                  | Emit the definition under its bare declared identifier instead of the mangled `C$…` symbol, so it can be linked from C (or serve as a runtime lang-item) without a wrapper. The preferred unmangling directive; `![symbol("name")]` is for the *rename* case.                                                                                                                                                                   |

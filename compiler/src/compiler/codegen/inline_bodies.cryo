@@ -1,0 +1,131 @@
+///! The bodies of functions marked `![inline]`.
+///!
+///! A call can only be inlined where the callee's body is, and a module's
+///! object holds only its own definitions.  So every module that calls an
+///! `![inline]` function another module defines emits its own copy of the
+///! body, `available_externally`: the optimizer inlines it and the copy is
+///! then discarded, while the defining module keeps the one real
+///! definition for anything that was not inlined.  This file finds those
+///! bodies; codegen emits the copies.
+
+namespace compiler::codegen::inline_bodies;
+
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::decl_index;
+import compiler::decl_index::{ DeclarationIndex, InlineBody };
+import compiler::ast::{ node, declaration, NodeKind };
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::declaration::{
+    ClassDeclNode, FunctionDeclNode, ImplBlockNode, MethodNode, StructDeclNode, UnionDeclNode
+};
+import compiler::resolver::res;
+import compiler::resolver::res::{ ResSlot };
+import compiler::types::type_ref;
+import compiler::types::type_ref::{ TypeRef };
+
+type struct InlineBodies {}
+
+implement struct InlineBodies {
+    /// Whether `root` writes a function or method marked `![inline]` with a
+    /// body, a generic template's among them.  A module calling one embeds
+    /// the body, so its object depends on the source of the module that
+    /// writes it, whatever it imports.
+    static writes_inline_body(root: ProgramNode*) -> boolean {
+        if (root == null) { return false; }
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => {
+                    if (InlineBodies::is_inline_body(stmt as FunctionDeclNode*)) { return true; }
+                }
+                NodeKind::ImplementationBlock => {
+                    if (InlineBodies::any_inline((stmt as ImplBlockNode*).methods)) { return true; }
+                }
+                NodeKind::StructDeclaration => {
+                    if (InlineBodies::any_inline((stmt as StructDeclNode*).methods)) { return true; }
+                }
+                NodeKind::UnionDeclaration => {
+                    if (InlineBodies::any_inline((stmt as UnionDeclNode*).methods)) { return true; }
+                }
+                NodeKind::ClassDeclaration => {
+                    if (InlineBodies::any_inline((stmt as ClassDeclNode*).methods)) { return true; }
+                }
+                _ => { }
+            }
+        }
+        return false;
+    }
+
+    /// Record in the declaration index every `![inline]` body `root` emits:
+    /// the concrete ones, a specialization's among them, as codegen emits
+    /// them.  `root` must have been analysed in this build, since the copy
+    /// is emitted from its lowered body.
+    static record(ctx: CompilationContext*, root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        const di: DeclarationIndex* = ctx.decl_index;
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => {
+                    const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                    if (f.generic_params.length == 0 && InlineBodies::is_inline_body(f)) {
+                        di.record_inline_body(f.overload_entry,
+                            InlineBody { owner: TypeRef::invalid(), base: null });
+                    }
+                }
+                NodeKind::ImplementationBlock => {
+                    const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                    if (ib.generic_params.length > 0) { continue; }
+                    if (ctx.generic_registry.template_of(ib.target_def()) != null) { continue; }
+                    InlineBodies::record_methods(di, ib.methods,
+                        di.impl_owner(ib, "codegen/inline bodies"), null);
+                }
+                NodeKind::StructDeclaration => {
+                    const sd: StructDeclNode* = stmt as StructDeclNode*;
+                    if (sd.generic_params.length > 0) { continue; }
+                    InlineBodies::record_methods(di, sd.methods, di.type_of_def(sd.def), null);
+                }
+                NodeKind::UnionDeclaration => {
+                    const ud: UnionDeclNode* = stmt as UnionDeclNode*;
+                    if (ud.generic_params.length > 0) { continue; }
+                    InlineBodies::record_methods(di, ud.methods, di.type_of_def(ud.def), null);
+                }
+                NodeKind::ClassDeclaration => {
+                    const cd: ClassDeclNode* = stmt as ClassDeclNode*;
+                    if (cd.generic_params.length > 0) { continue; }
+                    InlineBodies::record_methods(di, cd.methods, di.type_of_def(cd.def), &cd.base_res);
+                }
+                _ => { }
+            }
+        }
+    }
+
+    static record_methods(di: DeclarationIndex*, methods: &[MethodNode*], owner: TypeRef,
+                          base: ResSlot*) -> void {
+        if (!owner.is_valid()) { return; }
+        for (mut j: i64 = 0; j < methods.length; j++) {
+            const m: MethodNode* = methods[j];
+            if (m == null || m.func == null) { continue; }
+            const f: FunctionDeclNode* = m.func;
+            if (f.generic_params.length > 0) { continue; }
+            if (f.is_self_returning_default || f.is_lazy_self_growing) { continue; }
+            if (!InlineBodies::is_inline_body(f)) { continue; }
+            di.record_inline_body(f.overload_entry, InlineBody { owner: owner, base: base });
+        }
+    }
+
+    static any_inline(methods: &[MethodNode*]) -> boolean {
+        for (mut j: i64 = 0; j < methods.length; j++) {
+            const m: MethodNode* = methods[j];
+            if (m != null && InlineBodies::is_inline_body(m.func)) { return true; }
+        }
+        return false;
+    }
+
+    static is_inline_body(f: FunctionDeclNode*) -> boolean {
+        return f != null && f.is_inline && f.body != null;
+    }
+}

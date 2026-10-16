@@ -180,6 +180,15 @@ implement trait Eq for struct FamilySlot {
     }
 }
 
+/// What a module emitting its own copy of an `![inline]` body needs
+/// besides the declaration: the type a method is on (invalid for a
+/// function), and a class method's base, which its constructor's
+/// `: Base(args)` names (null otherwise).
+type struct InlineBody {
+    owner: TypeRef;
+    base:  ResSlot*;
+}
+
 /// The key of an owner's copy of a method definition: the owner type and
 /// the definition's slot, packed.  Made only by `copy_key`.
 type struct CopyKey {
@@ -367,6 +376,10 @@ type struct DeclarationIndex {
     // same symbol with another signature is reported against this one.
 private:
     extern_symbol_first: HashMap<u32, Pair<u32, u64>>;
+
+    // Entry position -> the body of a function or method marked
+    // `![inline]`, for the modules that call it to emit a copy of.
+    inline_bodies: HashMap<u32, InlineBody>;
 public:
 
     // --- Module reachability and declaration visibility --------------------
@@ -433,6 +446,7 @@ public:
             overload_func_intrinsic: [],
             overload_index:     HashMap::<FamilySlot, [u32]>::new(),
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
+            inline_bodies:      HashMap::<u32, InlineBody>::new(),
             prelude_modules:    [],
             refused_methods:    HashMap::<FamilySlot, boolean>::new(),
             overload_tag:       g_overload_index_tags,
@@ -622,6 +636,19 @@ public:
     entry_decl(&this, id: OverloadId) -> ASTNode* {
         if (!id.is_valid()) { return null; }
         return this.overload_func_decl[this.slot_of(id)];
+    }
+
+    /// Record that entry `id` is a function or method marked `![inline]`
+    /// whose body was analysed in this build.
+    record_inline_body(mut &this, id: OverloadId, body: InlineBody) -> void {
+        if (!id.is_valid()) { return; }
+        this.inline_bodies.insert(this.slot_of(id) as u32, body);
+    }
+
+    /// The `![inline]` body entry `id` names, if it was recorded.
+    inline_body(&this, id: OverloadId) -> Option<InlineBody> {
+        if (!id.is_valid()) { return Option::None; }
+        return this.inline_bodies.get(&(this.slot_of(id) as u32));
     }
 
     /// The method entry `id` was registered for; null when it names a

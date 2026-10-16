@@ -223,6 +223,36 @@ yet is recorded with the change that builds it, not here.
      so that the compiler exercises the whole language in live code.
      (Jake)
 
+369. **Editor and diagnostic text spells a type the way the user wrote
+     it:** an annotation written `[i32]` displays as `[i32]`, one written
+     `Array<i32>` as `Array<i32>`.  The spelling is remembered per
+     annotation, for display only; it never takes part in identity, keys
+     or resolution.  A type with no written spelling displays as `[T]`
+     when its allocator is the default and as `Array<T, A>` otherwise.
+     (Jake)
+
+370. **A function marked `![inline]` is copied into every module that
+     calls it,** so the call can be inlined there; `Array`'s `index` and
+     the like are marked `![inline]`.  (Jake)
+
+371. **`p[i]` on a pointer to an array is pointer arithmetic,** as on any
+     other pointer; indexing does not look through a pointer to an
+     array.  (Jake)
+
+372. **An attribute makes a function report its caller's source location
+     in a panic,** and the standard library's index bounds check carries
+     it, so an out-of-range index reports the `xs[i]` that wrote it.  The
+     attribute's name is proposed with the change and confirmed by Jake.
+     (Jake)
+
+373. **Emitting only the methods of an instantiated generic that are
+     used** is scouted: built if the work is moderate, recorded as an
+     accepted cost otherwise.  (Jake)
+
+374. **A fill literal `[v; n]` is refused unless its element type is a
+     plain-copy type,** with an error saying so: the one value would
+     otherwise be released `n` times.  (Jake)
+
 ### 2026-10-14
 
 333. **One project's analysis covers every target of its cryoconfig, and

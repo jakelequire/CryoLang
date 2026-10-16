@@ -17,7 +17,8 @@ import compiler::{
 import compiler::passes::{
     pass_id, pass_registry, specialization
 };
-import compiler::codegen::{ llvm, llvm_types, passes, test_main_codegen, type_map };
+import compiler::codegen::{ inline_bodies, llvm, llvm_types, passes, test_main_codegen, type_map };
+import compiler::codegen::inline_bodies::{ InlineBodies };
 import compiler::resolver::{
     intern_table, symbol_str, mangled_name
 };
@@ -1855,6 +1856,17 @@ type struct CompilerInstance {
                                                &pm_implicit, &pm_implicit_short);
                 }
             }
+            // A module calling an `![inline]` function embeds a copy of its
+            // body, so every leaf key folds the source of each module that
+            // writes or holds one (a placed specialization), imported or
+            // not.  Folded in with the implicit set.
+            mut pm_inline: [boolean] = [];
+            for (mut m: u32 = 0; m < n; m++) {
+                const islot: void** = (ast_buf as void**) + m;
+                const writes: boolean = InlineBodies::writes_inline_body(*islot as ProgramNode*);
+                pm_inline.push(writes);
+                if (writes) { pm_implicit[m as i64] = true; }
+            }
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                 const ns: string = ctx.intern_table.shown(mi.path().decl_name());
@@ -1902,6 +1914,17 @@ type struct CompilerInstance {
                         compiler::build_manifest::Manifest::path_module(ctx.intern_table.shown(mi.path().decl_name())));
                     if (metadata::exists(Path::from(objp))) {
                         pm_cached[m as i64] = true;
+                    }
+                }
+                // A rebuilt module copies `![inline]` bodies from the modules
+                // holding them, which must then be analysed in this build too.
+                mut any_rebuilt: boolean = false;
+                for (mut m: u32 = 0; m < n; m++) {
+                    if (!pm_cached[m as i64]) { any_rebuilt = true; }
+                }
+                if (any_rebuilt) {
+                    for (mut m: u32 = 0; m < n; m++) {
+                        if (pm_inline[m as i64]) { pm_cached[m as i64] = false; }
                     }
                 }
             }
@@ -2161,6 +2184,15 @@ type struct CompilerInstance {
             // In-process serial fallback batch (used when `!multiproc`).
             mut cg_jobs: [EmitJob] = [];
             mut cg_pos:  [u32] = [];
+
+            // Every analysed `![inline]` body, for the modules calling one to
+            // copy.  A cached module was not analysed and offers none; the
+            // cache never reuses a module holding one while it rebuilds any.
+            for (mut r: u32 = 0; r < n; r++) {
+                if (pm_active && pm_cached[r as i64]) { continue; }
+                const rslot: void** = (ast_buf as void**) + r;
+                InlineBodies::record(ctx, *rslot as ProgramNode*);
+            }
 
             for (mut i: u32 = 0; i < n; i++) {
                 // An error reported while generating an earlier module fails
