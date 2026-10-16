@@ -1,16 +1,10 @@
 /// Expression Dispatch
 ///
-/// Thin wrapper around the visitor's `accept()` mechanism plus the
+/// Thin wrapper around `IRGeneratorVisitor::dispatch_node` plus the
 /// lvalue->rvalue conversion that codegen needs at most expression sites.
-/// Lives as a separate module so sub-emitters (ArrayLit, Call, Stmt,
-/// Expr, Decl, ...) can recurse into the AST through the parent visitor
-/// - `dispatch.codegen_rvalue(visitor, expr)` - without having to import
-/// the concrete `IRGeneratorVisitor` type (which would form a
-/// module-graph cycle with this module's callers).
-///
-/// `visitor: ASTVisitor*` is the abstract base; double-dispatch via
-/// `expr.accept(visitor)` selects the right `override visit(...)` on
-/// the actual concrete visitor at runtime.
+/// Sub-emitters (ArrayLit, Call, Stmt, Expr, Decl, ...) recurse into the
+/// AST through it - `dispatch.codegen_rvalue(visitor, expr)` - and read the
+/// value the emitter for the expression's kind left on `state.last_value`.
 
 namespace compiler::codegen::visit::expr_dispatch;
 
@@ -21,7 +15,7 @@ import compiler::codegen::state::visitor_state::{ VisitorState };
 import compiler::types;
 import compiler::types::{ compound, type_base, type_ref, TypeKind };
 import compiler::ast;
-import compiler::ast::{ expression, node, NodeKind, statement, visitor };
+import compiler::ast::{ expression, node, NodeKind, statement };
 import utils::logger;
 import utils::logger::{ cdebug };
 import compiler::lex;
@@ -31,7 +25,8 @@ import compiler::ast::expression::{
     ArrayAccessNode, ExpressionNode, IdentifierNode, UnaryExprNode
 };
 import compiler::ast::statement::{ BlockStmtNode, StatementNode };
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::visit::ir_generator;
+import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LBasicBlock, LType, LValue };
 import compiler::types::type_base::{ Type };
@@ -58,10 +53,10 @@ type struct ExprDispatch {
     // Statement / block / expression dispatch
 
     /// Generate a block of statements: push a scope, dispatch each child
-    /// statement through `generate_statement` (which calls accept()),
+    /// statement through `generate_statement`,
     /// pop the scope.  Stops early once the current basic block has a
     /// terminator so we don't emit unreachable IR after an early return.
-    generate_block(mut &this, visitor: ASTVisitor*, block: BlockStmtNode*) -> void {
+    generate_block(mut &this, visitor: IRGeneratorVisitor*, block: BlockStmtNode*) -> void {
         if (block == null) { return; }
         this.cg.values.push_scope();
         cdebug("[IRGen]         block (%lld stmts) at %s:%d:%d\n",
@@ -101,30 +96,27 @@ type struct ExprDispatch {
         this.cg.values.pop_scope();
     }
 
-    /// Dispatch a statement via double-dispatch (`stmt.accept(visitor)` ->
-    /// runtime type calls the right `override visit(SpecificType*)`).
-    generate_statement(mut &this, visitor: ASTVisitor*, stmt: StatementNode*) -> void {
+    /// Emit a statement through the visitor's dispatch on its kind.
+    generate_statement(mut &this, visitor: IRGeneratorVisitor*, stmt: StatementNode*) -> void {
         if (stmt == null) { return; }
         cdebug("[IRGen]           stmt kind=%s\n", stmt.kind.to_string()); libc::fflush(null);
-        stmt.accept(visitor);
+        visitor.dispatch_node(stmt);
     }
 
-    /// Dispatch an expression via double-dispatch (`expr.accept(visitor)`).
-    /// Each expression kind has its own `override visit(SpecificType*)` on
-    /// the visitor.  Unknown kinds fall through to BaseASTVisitor's no-op
-    /// defaults; `state.last_value` stays at its previous value, which the
-    /// caller (codegen_rvalue / codegen_lvalue) treats as "no result".
-    generate_expression(mut &this, visitor: ASTVisitor*, expr: ExpressionNode*) -> void {
+    /// Emit an expression through the visitor's dispatch on its kind.  A kind
+    /// with no emitter leaves `state.last_value` at its previous value, which
+    /// the caller (codegen_rvalue / codegen_lvalue) treats as "no result".
+    generate_expression(mut &this, visitor: IRGeneratorVisitor*, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
         cdebug("[IRGen]             expr kind=%s\n", expr.kind.to_string());
-        expr.accept(visitor);
+        visitor.dispatch_node(expr);
     }
 
 
     // Value-shape helpers (codegen_expr / codegen_rvalue / codegen_lvalue)
 
     /// Codegen an expression, ensuring the result is an rvalue (loaded).
-    codegen_rvalue(mut &this, visitor: ASTVisitor*, expr: ExpressionNode*) -> LValue {
+    codegen_rvalue(mut &this, visitor: IRGeneratorVisitor*, expr: ExpressionNode*) -> LValue {
         if (expr == null) { return LValue::null(); }
         this.generate_expression(visitor, expr);
 
@@ -194,7 +186,7 @@ type struct ExprDispatch {
     }
 
     /// Codegen an expression, ensuring the result is an lvalue (address).
-    codegen_lvalue(mut &this, visitor: ASTVisitor*, expr: ExpressionNode*) -> LValue {
+    codegen_lvalue(mut &this, visitor: IRGeneratorVisitor*, expr: ExpressionNode*) -> LValue {
         if (expr == null) { return LValue::null(); }
         this.generate_expression(visitor, expr);
         return this.state.last_value;

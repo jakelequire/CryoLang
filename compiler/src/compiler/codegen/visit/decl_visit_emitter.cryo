@@ -9,7 +9,7 @@
 /// `state.current_impl_target` traversal context.
 ///
 /// Holds `cg`, `state`, `dispatch` back-pointers.  The visitor is
-/// passed at each call site as `ASTVisitor*` so body statements
+/// passed at each call site as `IRGeneratorVisitor*` so body statements
 /// recurse through `dispatch.generate_block(visitor, ...)`.
 
 namespace compiler::codegen::visit::decl_visit_emitter;
@@ -28,7 +28,7 @@ import compiler::diag::{ diagnostic, source_span };
 import compiler::types;
 import compiler::types::{ type_ref, type_base, arena, compound, generic, generic_registry };
 import compiler::ast;
-import compiler::ast::{ node, visitor, expression, statement, declaration };
+import compiler::ast::{ node, expression, statement, declaration };
 import compiler::resolver::{ symbol_str, intern_table };
 import utils::logger;
 import utils::logger::{ cdebug };
@@ -41,7 +41,8 @@ import compiler::ast::declaration::{
     UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{ ExpressionNode };
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::visit::ir_generator;
+import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LType, LTypeKind, LValue };
 import compiler::resolver::intern_table::{ InternTable };
@@ -75,7 +76,7 @@ type struct DeclVisitEmitter {
 
     // visit() entry points (called by ir_generator.cryo's overrides)
 
-    emit_function_decl(mut &this, visitor: ASTVisitor*, node: FunctionDeclNode*) -> void {
+    emit_function_decl(mut &this, visitor: IRGeneratorVisitor*, node: FunctionDeclNode*) -> void {
         if (node == null) { return; }
         if (node.generic_params.length > 0) { return; }
         if (node.body == null) { return; }
@@ -94,7 +95,7 @@ type struct DeclVisitEmitter {
         cdebug("[IRGen]   func done\n"); libc::fflush(null);
     }
 
-    emit_impl_block_visit(mut &this, visitor: ASTVisitor*, node: ImplBlockNode*) -> void {
+    emit_impl_block_visit(mut &this, visitor: IRGeneratorVisitor*, node: ImplBlockNode*) -> void {
         if (node == null) { return; }
         const impl_target: string = this.cg.resolve(node.target_type);
         cdebug("[IRGen]   impl block: %s (%lld methods)\n",
@@ -103,7 +104,7 @@ type struct DeclVisitEmitter {
         cdebug("[IRGen]   impl done\n"); libc::fflush(null);
     }
 
-    emit_struct_decl(mut &this, visitor: ASTVisitor*, node: StructDeclNode*) -> void {
+    emit_struct_decl(mut &this, visitor: IRGeneratorVisitor*, node: StructDeclNode*) -> void {
         if (node == null) { return; }
         if (node.generic_params.length > 0) { return; }
         if (node.methods.length == 0) { return; }
@@ -120,7 +121,7 @@ type struct DeclVisitEmitter {
 
     /// Emit method bodies for a union declaration.  A union's type is a
     /// StructType, so this mirrors emit_struct_decl exactly.
-    emit_union_decl(mut &this, visitor: ASTVisitor*, node: UnionDeclNode*) -> void {
+    emit_union_decl(mut &this, visitor: IRGeneratorVisitor*, node: UnionDeclNode*) -> void {
         if (node == null) { return; }
         if (node.generic_params.length > 0) { return; }
         if (node.methods.length == 0) { return; }
@@ -131,7 +132,7 @@ type struct DeclVisitEmitter {
         this.state.current_impl_target = TypeRef::invalid();
     }
 
-    emit_class_decl(mut &this, visitor: ASTVisitor*, node: ClassDeclNode*) -> void {
+    emit_class_decl(mut &this, visitor: IRGeneratorVisitor*, node: ClassDeclNode*) -> void {
         if (node == null) { return; }
         if (node.generic_params.length > 0) { return; }
         if (node.methods.length == 0) { return; }
@@ -155,7 +156,7 @@ type struct DeclVisitEmitter {
     // method body without re-entering the visit dispatch for the wrapper.
 
     /// Generate a function body: prologue, block walk, epilogue, validate.
-    generate_function_body(mut &this, visitor: ASTVisitor*, node: FunctionDeclNode*) -> void {
+    generate_function_body(mut &this, visitor: IRGeneratorVisitor*, node: FunctionDeclNode*) -> void {
         // `![naked]`: no prologue/epilogue.  Open the entry block, emit the
         // body (a single `asm { }` block - the directive validator guaranteed
         // this shape), then cap with `unreachable`: inline asm is not a
@@ -200,7 +201,7 @@ type struct DeclVisitEmitter {
     /// constant fold answers - in one function that runs before `main`,
     /// each initializer evaluated as it is written and stored, in
     /// declaration order.
-    emit_global_initializers(mut &this, visitor: ASTVisitor*) -> void {
+    emit_global_initializers(mut &this, visitor: IRGeneratorVisitor*) -> void {
         const fn_val: LValue = this.cg.decl.begin_global_initializer();
         if (!fn_val.is_valid()) { return; }
         for (mut k: i64 = 0; k < this.cg.decl.started.nodes.length; k++) {
@@ -216,7 +217,7 @@ type struct DeclVisitEmitter {
     }
 
     /// Generate every method body for an impl block.
-    generate_impl_block(mut &this, visitor: ASTVisitor*, node: ImplBlockNode*) -> void {
+    generate_impl_block(mut &this, visitor: IRGeneratorVisitor*, node: ImplBlockNode*) -> void {
         if (node.generic_params.length > 0) {
             cdebug("[IRGen]     impl skipped (generic)\n"); libc::fflush(null);
             return;
@@ -255,7 +256,7 @@ type struct DeclVisitEmitter {
     /// no class - a struct, a union, an `implement` block.  A constructor's
     /// `: Base(args)` names that base and nothing else, so the class's answer
     /// is the constructor's.
-    generate_method_body(mut &this, visitor: ASTVisitor*, node: MethodNode*,
+    generate_method_body(mut &this, visitor: IRGeneratorVisitor*, node: MethodNode*,
                          base: ResSlot*) -> void {
         const func: FunctionDeclNode* = node.func;
         if (func == null || func.body == null) { return; }
@@ -306,7 +307,7 @@ type struct DeclVisitEmitter {
     /// constructor with `: BaseClass(args)` initialisation.  `this` (the LLVM
     /// param 0 of the enclosing constructor) is passed as the receiver, and
     /// `node.base_ctor_args` are codegen'd as rvalues for the remaining args.
-    emit_base_ctor_call(mut &this, visitor: ASTVisitor*, node: MethodNode*, fn_val: LValue,
+    emit_base_ctor_call(mut &this, visitor: IRGeneratorVisitor*, node: MethodNode*, fn_val: LValue,
                         base: ResSlot*) -> void {
         const intern: InternTable* = this.cg.get_intern();
         const ctx_ptr: CompilationContext* = this.cg.ctx;

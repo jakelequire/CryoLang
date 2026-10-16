@@ -1,7 +1,8 @@
 /// AST Cloner
 ///
-/// Deep-clones AST subtrees via the visitor pattern.  Each visit() override
-/// allocates a new node, copies scalar fields, and recursively clones children.
+/// Deep-clones AST subtrees.  `dispatch_node` hands a node to the `visit_*`
+/// method for its kind, which allocates a new node, copies scalar fields,
+/// and recursively clones children.
 /// Resolved type fields are left as TypeRef::invalid() on clones (the constructor
 /// default); the type substituter fills them during generic specialization.
 ///
@@ -14,7 +15,7 @@ import compiler::diag;
 import compiler::ast;
 import compiler::ast::{
     declaration, expression, node, NodeKind, pattern, PatternBinding, PatternElement,
-    PatternKind, PatternSub, statement, TypeAnnotation, visitor
+    PatternKind, PatternSub, statement, TypeAnnotation
 };
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -46,12 +47,9 @@ import compiler::ast::statement::{
     MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
     WhileStmtNode
 };
-import compiler::ast::visitor::{ BaseASTVisitor };
 
-type class ASTCloner : BaseASTVisitor {
-public:
-    /// The result of the most recent visit() call.  After calling
-    /// node.accept(this), retrieve the clone from this field.
+type struct ASTCloner {
+    /// The copy the most recent `dispatch_node` (or `visit_*`) made.
     result: ASTNode*;
 
     /// One-shot specialization name applied at the first decl-level visit
@@ -70,17 +68,19 @@ public:
     /// over what is typed.
     carries_types: boolean;
 
-    ASTCloner() : BaseASTVisitor() {
-        this.result        = null;
-        this.spec_name     = SymbolStr::empty();
-        this.skip_generics = false;
-        this.carries_types = false;
+    static new() -> ASTCloner {
+        return ASTCloner {
+            result:        null,
+            spec_name:     SymbolStr::empty(),
+            skip_generics: false,
+            carries_types: false,
+        };
     }
 
     /// A cloner for a copy monomorphization makes: its expressions carry
     /// their template's types.
     static for_monomorphization() -> ASTCloner {
-        mut c: ASTCloner = ASTCloner();
+        mut c: ASTCloner = ASTCloner::new();
         c.carries_types  = true;
         return c;
     }
@@ -96,7 +96,7 @@ public:
 
     /// Read and clear the one-shot specialization name, falling back to
     /// `original` when not specializing.
-    consume_spec_name(original: SymbolStr) -> SymbolStr {
+    consume_spec_name(mut &this, original: SymbolStr) -> SymbolStr {
         if (this.spec_name.is_valid()) {
             const name: SymbolStr = this.spec_name;
             this.spec_name = SymbolStr::empty();
@@ -106,7 +106,7 @@ public:
     }
 
     /// Read and clear the skip_generics flag.
-    consume_skip_generics() -> boolean {
+    consume_skip_generics(mut &this) -> boolean {
         const skip: boolean = this.skip_generics;
         this.skip_generics = false;
         return skip;
@@ -115,23 +115,102 @@ public:
 
     // Top-level entry points
 
+    /// Copy `n` by the method for its kind, leaving the copy on `result`.
+    dispatch_node(mut &this, n: ASTNode*) -> void {
+        if (n == null) { return; }
+        match (n.kind) {
+            NodeKind::Program                   => { this.visit_program(n as ProgramNode*); }
+
+            NodeKind::Literal                   => { this.visit_literal(n as LiteralNode*); }
+            NodeKind::Identifier                => { this.visit_identifier(n as IdentifierNode*); }
+            NodeKind::BinaryExpression          => { this.visit_binary(n as BinaryExprNode*); }
+            NodeKind::UnaryExpression           => { this.visit_unary(n as UnaryExprNode*); }
+            NodeKind::TernaryExpression         => { this.visit_ternary(n as TernaryExprNode*); }
+            NodeKind::IfExpression              => { this.visit_if_expr(n as IfExprNode*); }
+            NodeKind::MatchExpression           => { this.visit_match_expr(n as MatchExprNode*); }
+            NodeKind::StaticMatchExpression     => { this.visit_static_match_expr(n as StaticMatchExprNode*); }
+            NodeKind::CallExpression            => { this.visit_call(n as CallExprNode*); }
+            NodeKind::NewExpression             => { this.visit_new(n as NewExprNode*); }
+            NodeKind::SizeofExpression          => { this.visit_sizeof(n as SizeofExprNode*); }
+            NodeKind::AlignofExpression         => { this.visit_alignof(n as AlignofExprNode*); }
+            NodeKind::CastExpression            => { this.visit_cast(n as CastExprNode*); }
+            NodeKind::StructLiteral             => { this.visit_struct_literal(n as StructLiteralNode*); }
+            NodeKind::ArrayLiteral              => { this.visit_array_literal(n as ArrayLiteralNode*); }
+            NodeKind::TupleLiteral              => { this.visit_tuple_literal(n as TupleLiteralNode*); }
+            NodeKind::LambdaExpression          => { this.visit_lambda(n as LambdaExprNode*); }
+            NodeKind::ArrayAccess               => { this.visit_array_access(n as ArrayAccessNode*); }
+            NodeKind::MemberAccess              => { this.visit_member_access(n as MemberAccessNode*); }
+            NodeKind::ScopeResolution           => { this.visit_scope_resolution(n as ScopeResolutionNode*); }
+            NodeKind::TypeofExpression          => { this.visit_typeof(n as TypeofExprNode*); }
+            NodeKind::DeleteExpression          => { this.visit_delete(n as DeleteExprNode*); }
+            NodeKind::AwaitExpression           => { this.visit_await(n as AwaitExprNode*); }
+            NodeKind::YieldExpression           => { this.visit_yield(n as YieldExprNode*); }
+            NodeKind::TryExpression             => { this.visit_try(n as TryExprNode*); }
+
+            NodeKind::BlockStatement            => { this.visit_block(n as BlockStmtNode*); }
+            NodeKind::UnsafeBlockStatement      => { this.visit_unsafe_block(n as UnsafeBlockStmtNode*); }
+            NodeKind::AsmBlockStatement         => { this.visit_asm_block(n as AsmBlockStmtNode*); }
+            NodeKind::ReturnStatement           => { this.visit_return(n as ReturnStmtNode*); }
+            NodeKind::IfStatement               => { this.visit_if(n as IfStmtNode*); }
+            NodeKind::WhileStatement            => { this.visit_while(n as WhileStmtNode*); }
+            NodeKind::DoWhileStatement          => { this.visit_do_while(n as DoWhileStmtNode*); }
+            NodeKind::ForStatement              => { this.visit_for(n as ForStmtNode*); }
+            NodeKind::MatchStatement            => { this.visit_match_stmt(n as MatchStmtNode*); }
+            NodeKind::StaticMatchStatement      => { this.visit_static_match_stmt(n as StaticMatchStmtNode*); }
+            NodeKind::BreakStatement            => { this.visit_break(n as BreakStmtNode*); }
+            NodeKind::ContinueStatement         => { this.visit_continue(n as ContinueStmtNode*); }
+            NodeKind::ExpressionStatement       => { this.visit_expr_stmt(n as ExprStmtNode*); }
+            NodeKind::DeclarationStatement      => { this.visit_decl_stmt(n as DeclStmtNode*); }
+            NodeKind::LoopStatement             => { this.visit_loop(n as LoopStmtNode*); }
+
+            NodeKind::VariableDeclaration       => { this.visit_var(n as VarDeclNode*); }
+            NodeKind::DestructureDeclaration    => { this.visit_destructure(n as DestructureDeclNode*); }
+            NodeKind::FunctionDeclaration       => { this.visit_function(n as FunctionDeclNode*); }
+            NodeKind::MethodDeclaration         => { this.visit_method(n as MethodNode*); }
+            NodeKind::IntrinsicDeclaration      => { this.visit_intrinsic(n as IntrinsicDeclNode*); }
+            NodeKind::IntrinsicConstDeclaration => { this.visit_intrinsic_const(n as IntrinsicConstDeclNode*); }
+            NodeKind::ImportDeclaration         => { this.visit_import(n as ImportDeclNode*); }
+            NodeKind::ModuleDeclaration         => { this.visit_module(n as ModuleDeclNode*); }
+            NodeKind::StructDeclaration         => { this.visit_struct(n as StructDeclNode*); }
+            NodeKind::UnionDeclaration          => { this.visit_union(n as UnionDeclNode*); }
+            NodeKind::ClassDeclaration          => { this.visit_class(n as ClassDeclNode*); }
+            NodeKind::TraitDeclaration          => { this.visit_trait(n as TraitDeclNode*); }
+            NodeKind::TypeAliasDeclaration      => { this.visit_type_alias(n as TypeAliasDeclNode*); }
+            NodeKind::EnumDeclaration           => { this.visit_enum(n as EnumDeclNode*); }
+            NodeKind::EnumVariant               => { this.visit_enum_variant(n as EnumVariantNode*); }
+            NodeKind::ImplementationBlock       => { this.visit_impl(n as ImplBlockNode*); }
+            NodeKind::ExternBlock               => { this.visit_extern_block(n as ExternBlockNode*); }
+            NodeKind::FieldDeclaration          => { this.visit_field(n as FieldDeclNode*); }
+            NodeKind::GenericParamDeclaration   => { this.visit_generic_param(n as GenericParamNode*); }
+
+            NodeKind::MatchArm                  => { this.visit_match_arm(n as MatchArmNode*); }
+            NodeKind::StaticMatchArm            => { this.visit_static_match_arm(n as StaticMatchArmNode*); }
+            NodeKind::Directive                 => { this.visit_directive(n as DirectiveNode*); }
+            NodeKind::Pattern                   => { this.clone_pattern(n as PatternNode*); }
+
+            // Kinds no node is built with.
+            NodeKind::EnumPattern | NodeKind::Expression | NodeKind::Statement
+            | NodeKind::Declaration | NodeKind::AsyncExpression | NodeKind::Unknown => { }
+        }
+    }
+
     /// Clone any ASTNode.
-    clone_node(node: ASTNode*) -> ASTNode* {
+    clone_node(mut &this, node: ASTNode*) -> ASTNode* {
         if (node == null) { return null; }
-        node.accept(this);
+        this.dispatch_node(node);
         this.keep_generated(node);
         return this.result;
     }
 
     /// A copy of a node the compiler wrote is one too.
-    keep_generated(node: ASTNode*) -> void {
+    keep_generated(mut &this, node: ASTNode*) -> void {
         if (this.result != null) { this.result.generated = node.generated; }
     }
 
     /// Clone an expression node (cast wrapper).
-    clone_expr(node: ExpressionNode*) -> ExpressionNode* {
+    clone_expr(mut &this, node: ExpressionNode*) -> ExpressionNode* {
         if (node == null) { return null; }
-        node.accept(this);
+        this.dispatch_node(node);
         this.keep_generated(node as ASTNode*);
         const e: ExpressionNode* = this.result as ExpressionNode*;
         if (this.carries_types && e != null && !e.resolved_type.is_valid()) {
@@ -141,17 +220,17 @@ public:
     }
 
     /// Clone a statement node (cast wrapper).
-    clone_stmt(node: StatementNode*) -> StatementNode* {
+    clone_stmt(mut &this, node: StatementNode*) -> StatementNode* {
         if (node == null) { return null; }
-        node.accept(this);
+        this.dispatch_node(node);
         this.keep_generated(node as ASTNode*);
         return this.result as StatementNode*;
     }
 
     /// Clone a declaration node (cast wrapper).
-    clone_decl(node: DeclarationNode*) -> DeclarationNode* {
+    clone_decl(mut &this, node: DeclarationNode*) -> DeclarationNode* {
         if (node == null) { return null; }
-        node.accept(this);
+        this.dispatch_node(node);
         this.keep_generated(node as ASTNode*);
         return this.result as DeclarationNode*;
     }
@@ -161,12 +240,12 @@ public:
 
     /// Deep-copy a type annotation tree.  Null-safe wrapper around
     /// the TypeAnnotation::clone() method defined in compiler::ast.
-    clone_type_annotation(ann: TypeAnnotation*) -> TypeAnnotation* {
+    clone_type_annotation(mut &this, ann: TypeAnnotation*) -> TypeAnnotation* {
         return TypeAnnotation::clone_ptr(ann);
     }
 
     /// Deep-copy an array of type annotations.
-    clone_type_annotations(anns: &[TypeAnnotation*]) -> [TypeAnnotation*] {
+    clone_type_annotations(mut &this, anns: &[TypeAnnotation*]) -> [TypeAnnotation*] {
         mut result: [TypeAnnotation*] = [];
         for (mut i: i64 = 0; i < anns.length; i++) {
             result.push(TypeAnnotation::clone_ptr(anns[i]));
@@ -177,7 +256,7 @@ public:
 
     // Helper: copy DeclarationNode base fields
 
-    copy_decl_base(src: DeclarationNode*, dst: DeclarationNode*) -> void {
+    copy_decl_base(mut &this, src: DeclarationNode*, dst: DeclarationNode*) -> void {
         dst.documentation = src.documentation;
         dst.source_file = src.source_file;
         dst.name_span     = src.name_span;
@@ -185,7 +264,7 @@ public:
         for (mut i: i64 = 0; i < src.attached_directives.length; i++) {
             const orig: DirectiveNode* = src.attached_directives[i];
             if (orig != null) {
-                this.visit(orig);
+                this.visit_directive(orig);
                 dst.attached_directives.push(this.result as DirectiveNode*);
             }
         }
@@ -194,7 +273,7 @@ public:
 
     // Expression visitors
 
-    override visit(node: LiteralNode*) -> void {
+    visit_literal(mut &this, node: LiteralNode*) -> void {
         mut c: LiteralNode* = new LiteralNode(node.value, node.literal_kind, node.span);
         c.has_error = node.has_error;
         // The suffix is the literal's type. A generic template body is cloned
@@ -205,7 +284,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: IdentifierNode*) -> void {
+    visit_identifier(mut &this, node: IdentifierNode*) -> void {
         mut c: IdentifierNode* = new IdentifierNode(node.name, node.span);
         c.is_global_reference = node.is_global_reference;
         c.is_this_keyword     = node.is_this_keyword;
@@ -229,7 +308,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: BinaryExprNode*) -> void {
+    visit_binary(mut &this, node: BinaryExprNode*) -> void {
         mut c: BinaryExprNode* = new BinaryExprNode(
             node.op,
             this.clone_expr(node.left),
@@ -248,7 +327,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: UnaryExprNode*) -> void {
+    visit_unary(mut &this, node: UnaryExprNode*) -> void {
         mut c: UnaryExprNode* = new UnaryExprNode(
             node.op,
             this.clone_expr(node.operand),
@@ -264,7 +343,7 @@ public:
         this.result    = c;
     }
 
-    override visit(node: TernaryExprNode*) -> void {
+    visit_ternary(mut &this, node: TernaryExprNode*) -> void {
         mut c: TernaryExprNode* = new TernaryExprNode(
             this.clone_expr(node.condition),
             this.clone_expr(node.true_expr),
@@ -275,7 +354,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: IfExprNode*) -> void {
+    visit_if_expr(mut &this, node: IfExprNode*) -> void {
         mut c: IfExprNode* = new IfExprNode(
             this.clone_expr(node.condition),
             this.clone_expr(node.then_expr),
@@ -286,7 +365,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: MatchExprNode*) -> void {
+    visit_match_expr(mut &this, node: MatchExprNode*) -> void {
         mut c: MatchExprNode* = new MatchExprNode(
             this.clone_expr(node.subject), node.span
         );
@@ -297,7 +376,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: StaticMatchExprNode*) -> void {
+    visit_static_match_expr(mut &this, node: StaticMatchExprNode*) -> void {
         mut c: StaticMatchExprNode* = new StaticMatchExprNode(
             this.clone_type_annotation(node.scrutinee), node.span
         );
@@ -308,7 +387,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: CallExprNode*) -> void {
+    visit_call(mut &this, node: CallExprNode*) -> void {
         mut c: CallExprNode* = new CallExprNode(
             this.clone_expr(node.callee), node.span
         );
@@ -349,7 +428,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: NewExprNode*) -> void {
+    visit_new(mut &this, node: NewExprNode*) -> void {
         mut c: NewExprNode* = new NewExprNode(node.type_name, node.span);
         c.variant_name    = node.variant_name;
         c.res             = node.res;
@@ -369,7 +448,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: SizeofExprNode*) -> void {
+    visit_sizeof(mut &this, node: SizeofExprNode*) -> void {
         mut c: SizeofExprNode* = new SizeofExprNode(
             this.clone_type_annotation(node.type_ann), node.span);
         // The operand's type is carried as every decided type is; a copy's
@@ -379,7 +458,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: AlignofExprNode*) -> void {
+    visit_alignof(mut &this, node: AlignofExprNode*) -> void {
         mut c: AlignofExprNode* = new AlignofExprNode(
             this.clone_type_annotation(node.type_ann), node.span);
         c.set_operand_type(node.operand_type);
@@ -387,7 +466,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: CastExprNode*) -> void {
+    visit_cast(mut &this, node: CastExprNode*) -> void {
         mut c: CastExprNode* = new CastExprNode(
             this.clone_expr(node.expression),
             this.clone_type_annotation(node.target_annotation),
@@ -400,7 +479,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: StructLiteralNode*) -> void {
+    visit_struct_literal(mut &this, node: StructLiteralNode*) -> void {
         mut c: StructLiteralNode* = new StructLiteralNode(node.struct_type, node.span);
         c.generic_args = this.clone_type_annotations(node.generic_args);
         c.res          = node.res;
@@ -418,7 +497,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: ArrayLiteralNode*) -> void {
+    visit_array_literal(mut &this, node: ArrayLiteralNode*) -> void {
         mut c: ArrayLiteralNode* = new ArrayLiteralNode(node.span);
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             c.add_element(this.clone_expr(node.elements[i]));
@@ -431,7 +510,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: TupleLiteralNode*) -> void {
+    visit_tuple_literal(mut &this, node: TupleLiteralNode*) -> void {
         mut c: TupleLiteralNode* = new TupleLiteralNode(node.span);
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             c.add_element(this.clone_expr(node.elements[i]));
@@ -440,7 +519,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: LambdaExprNode*) -> void {
+    visit_lambda(mut &this, node: LambdaExprNode*) -> void {
         mut c: LambdaExprNode* = new LambdaExprNode(node.span);
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             c.add_parameter(this.clone_var_decl(node.parameters[i]));
@@ -468,7 +547,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: ArrayAccessNode*) -> void {
+    visit_array_access(mut &this, node: ArrayAccessNode*) -> void {
         mut c: ArrayAccessNode* = new ArrayAccessNode(
             this.clone_expr(node.array),
             this.clone_expr(node.index),
@@ -484,7 +563,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: MemberAccessNode*) -> void {
+    visit_member_access(mut &this, node: MemberAccessNode*) -> void {
         mut c: MemberAccessNode* = new MemberAccessNode(
             this.clone_expr(node.object),
             node.member,
@@ -500,7 +579,7 @@ public:
         this.result       = c;
     }
 
-    override visit(node: ScopeResolutionNode*) -> void {
+    visit_scope_resolution(mut &this, node: ScopeResolutionNode*) -> void {
         mut c: ScopeResolutionNode* = new ScopeResolutionNode(
             node.scope_name, node.member_name, node.span
         );
@@ -528,7 +607,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: TypeofExprNode*) -> void {
+    visit_typeof(mut &this, node: TypeofExprNode*) -> void {
         mut c: TypeofExprNode* = new TypeofExprNode(
             this.clone_expr(node.operand), node.span
         );
@@ -536,7 +615,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: DeleteExprNode*) -> void {
+    visit_delete(mut &this, node: DeleteExprNode*) -> void {
         mut c: DeleteExprNode* = new DeleteExprNode(
             this.clone_expr(node.operand), node.span
         );
@@ -544,7 +623,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: AwaitExprNode*) -> void {
+    visit_await(mut &this, node: AwaitExprNode*) -> void {
         mut c: AwaitExprNode* = new AwaitExprNode(
             this.clone_expr(node.operand), node.span
         );
@@ -552,7 +631,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: YieldExprNode*) -> void {
+    visit_yield(mut &this, node: YieldExprNode*) -> void {
         const operand: ExpressionNode* = node.has_operand()
             ? this.clone_expr(node.operand)
             : null;
@@ -561,7 +640,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: TryExprNode*) -> void {
+    visit_try(mut &this, node: TryExprNode*) -> void {
         mut c: TryExprNode* = new TryExprNode(
             this.clone_expr(node.operand), node.span
         );
@@ -593,7 +672,7 @@ public:
 
     // Statement visitors
 
-    override visit(node: BlockStmtNode*) -> void {
+    visit_block(mut &this, node: BlockStmtNode*) -> void {
         mut c: BlockStmtNode* = new BlockStmtNode(node.span);
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             c.add_statement(this.clone_stmt(node.statements[i]));
@@ -607,15 +686,15 @@ public:
         this.result = c;
     }
 
-    override visit(node: UnsafeBlockStmtNode*) -> void {
-        node.block.accept(this);
+    visit_unsafe_block(mut &this, node: UnsafeBlockStmtNode*) -> void {
+        this.dispatch_node(node.block);
         const cloned_block: BlockStmtNode* = this.result as BlockStmtNode*;
         mut c: UnsafeBlockStmtNode* = new UnsafeBlockStmtNode(cloned_block, node.span);
         c.has_error = node.has_error;
         this.result = c;
     }
 
-    override visit(node: AsmBlockStmtNode*) -> void {
+    visit_asm_block(mut &this, node: AsmBlockStmtNode*) -> void {
         mut c: AsmBlockStmtNode* = new AsmBlockStmtNode(node.span);
         c.arch = node.arch;
         c.dialect = node.dialect;
@@ -638,7 +717,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: ReturnStmtNode*) -> void {
+    visit_return(mut &this, node: ReturnStmtNode*) -> void {
         mut c: ReturnStmtNode* = new ReturnStmtNode(
             this.clone_expr(node.expression), node.span
         );
@@ -646,7 +725,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: IfStmtNode*) -> void {
+    visit_if(mut &this, node: IfStmtNode*) -> void {
         mut c: IfStmtNode* = new IfStmtNode(
             this.clone_expr(node.condition),
             this.clone_stmt(node.then_stmt),
@@ -657,7 +736,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: WhileStmtNode*) -> void {
+    visit_while(mut &this, node: WhileStmtNode*) -> void {
         mut c: WhileStmtNode* = new WhileStmtNode(
             this.clone_expr(node.condition),
             this.clone_stmt(node.body),
@@ -667,7 +746,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: DoWhileStmtNode*) -> void {
+    visit_do_while(mut &this, node: DoWhileStmtNode*) -> void {
         mut c: DoWhileStmtNode* = new DoWhileStmtNode(
             this.clone_stmt(node.body),
             this.clone_expr(node.condition),
@@ -677,7 +756,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: ForStmtNode*) -> void {
+    visit_for(mut &this, node: ForStmtNode*) -> void {
         mut c: ForStmtNode* = new ForStmtNode(
             this.clone_node(node.init),
             this.clone_expr(node.condition),
@@ -689,7 +768,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: MatchStmtNode*) -> void {
+    visit_match_stmt(mut &this, node: MatchStmtNode*) -> void {
         mut c: MatchStmtNode* = new MatchStmtNode(
             this.clone_expr(node.subject), node.span
         );
@@ -700,7 +779,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: StaticMatchStmtNode*) -> void {
+    visit_static_match_stmt(mut &this, node: StaticMatchStmtNode*) -> void {
         mut c: StaticMatchStmtNode* = new StaticMatchStmtNode(
             this.clone_type_annotation(node.scrutinee), node.span
         );
@@ -711,19 +790,19 @@ public:
         this.result = c;
     }
 
-    override visit(node: BreakStmtNode*) -> void {
+    visit_break(mut &this, node: BreakStmtNode*) -> void {
         mut c: BreakStmtNode* = new BreakStmtNode(node.span);
         c.has_error = node.has_error;
         this.result = c;
     }
 
-    override visit(node: ContinueStmtNode*) -> void {
+    visit_continue(mut &this, node: ContinueStmtNode*) -> void {
         mut c: ContinueStmtNode* = new ContinueStmtNode(node.span);
         c.has_error = node.has_error;
         this.result = c;
     }
 
-    override visit(node: ExprStmtNode*) -> void {
+    visit_expr_stmt(mut &this, node: ExprStmtNode*) -> void {
         mut c: ExprStmtNode* = new ExprStmtNode(
             this.clone_expr(node.expression), node.span
         );
@@ -731,7 +810,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: DeclStmtNode*) -> void {
+    visit_decl_stmt(mut &this, node: DeclStmtNode*) -> void {
         mut c: DeclStmtNode* = new DeclStmtNode(
             this.clone_decl(node.declaration), node.span
         );
@@ -739,7 +818,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: LoopStmtNode*) -> void {
+    visit_loop(mut &this, node: LoopStmtNode*) -> void {
         mut c: LoopStmtNode* = new LoopStmtNode(
             this.clone_stmt(node.body), node.span
         );
@@ -750,7 +829,7 @@ public:
 
     // Declaration visitors
 
-    override visit(node: VarDeclNode*) -> void {
+    visit_var(mut &this, node: VarDeclNode*) -> void {
         const c: VarDeclNode* = this.clone_var_decl(node);
         // A local declaration's decided type is carried, and a copy's
         // substitution rewrites it.  Only the statement: a parameter's type
@@ -759,7 +838,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: DestructureDeclNode*) -> void {
+    visit_destructure(mut &this, node: DestructureDeclNode*) -> void {
         mut c: DestructureDeclNode* = new DestructureDeclNode(node.span);
         this.copy_decl_base(node, c);
         c.set_mutable(node.is_mutable);
@@ -782,7 +861,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: FunctionDeclNode*) -> void {
+    visit_function(mut &this, node: FunctionDeclNode*) -> void {
         const name: SymbolStr = this.consume_spec_name(node.name);
         const skip_gp: boolean = this.consume_skip_generics();
         mut c: FunctionDeclNode* = new FunctionDeclNode(name, node.span);
@@ -830,13 +909,13 @@ public:
             c.set_return_type_annotation(this.clone_type_annotation(node.return_type_annotation));
         }
         if (node.has_body()) {
-            node.body.accept(this);
+            this.dispatch_node(node.body);
             c.set_body(this.result as BlockStmtNode*);
         }
         this.result = c;
     }
 
-    override visit(node: MethodNode*) -> void {
+    visit_method(mut &this, node: MethodNode*) -> void {
         const cloned_func: FunctionDeclNode* = this.clone_func_decl(node.func);
         mut c: MethodNode* = new MethodNode(cloned_func, node.span);
         this.copy_decl_base(node, c);
@@ -862,21 +941,21 @@ public:
         this.result = c;
     }
 
-    override visit(node: IntrinsicDeclNode*) -> void {
+    visit_intrinsic(mut &this, node: IntrinsicDeclNode*) -> void {
         mut c: IntrinsicDeclNode* = new IntrinsicDeclNode(node.name, node.span);
         this.copy_decl_base(node, c);
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             c.add_parameter(this.clone_var_decl(node.parameters[i]));
         }
         if (node.has_body()) {
-            node.body.accept(this);
+            this.dispatch_node(node.body);
             c.set_body(this.result as BlockStmtNode*);
         }
         // resolved_return_type left as TypeRef::invalid() (constructor default)
         this.result = c;
     }
 
-    override visit(node: IntrinsicConstDeclNode*) -> void {
+    visit_intrinsic_const(mut &this, node: IntrinsicConstDeclNode*) -> void {
         mut c: IntrinsicConstDeclNode* = new IntrinsicConstDeclNode(node.name, node.span);
         this.copy_decl_base(node, c);
         if (node.type_annotation != null) {
@@ -887,7 +966,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: ImportDeclNode*) -> void {
+    visit_import(mut &this, node: ImportDeclNode*) -> void {
         mut c: ImportDeclNode* = new ImportDeclNode(node.module_path, node.style, node.span);
         this.copy_decl_base(node, c);
         c.alias = node.alias;
@@ -903,13 +982,13 @@ public:
         this.result = c;
     }
 
-    override visit(node: ModuleDeclNode*) -> void {
+    visit_module(mut &this, node: ModuleDeclNode*) -> void {
         mut c: ModuleDeclNode* = new ModuleDeclNode(node.path, node.is_public, node.span);
         this.copy_decl_base(node, c);
         this.result = c;
     }
 
-    override visit(node: StructDeclNode*) -> void {
+    visit_struct(mut &this, node: StructDeclNode*) -> void {
         const name: SymbolStr = this.consume_spec_name(node.name);
         const skip_gp: boolean = this.consume_skip_generics();
         mut c: StructDeclNode* = new StructDeclNode(name, node.span);
@@ -935,7 +1014,7 @@ public:
             c.add_field(this.clone_field_decl(node.fields[i]));
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
+            this.dispatch_node(node.methods[i]);
             c.add_method(this.result as MethodNode*);
         }
         // Bindgen-only blob accessors (shallow: shares the value_type annotation
@@ -947,7 +1026,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: UnionDeclNode*) -> void {
+    visit_union(mut &this, node: UnionDeclNode*) -> void {
         const name: SymbolStr = this.consume_spec_name(node.name);
         const skip_gp: boolean = this.consume_skip_generics();
         mut c: UnionDeclNode* = new UnionDeclNode(name, node.span);
@@ -970,13 +1049,13 @@ public:
             c.add_field(this.clone_field_decl(node.fields[i]));
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
+            this.dispatch_node(node.methods[i]);
             c.add_method(this.result as MethodNode*);
         }
         this.result = c;
     }
 
-    override visit(node: ClassDeclNode*) -> void {
+    visit_class(mut &this, node: ClassDeclNode*) -> void {
         const name: SymbolStr = this.consume_spec_name(node.name);
         const skip_gp: boolean = this.consume_skip_generics();
         mut c: ClassDeclNode* = new ClassDeclNode(name, node.span);
@@ -1000,13 +1079,13 @@ public:
             c.add_field(this.clone_field_decl(node.fields[i]));
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
+            this.dispatch_node(node.methods[i]);
             c.add_method(this.result as MethodNode*);
         }
         this.result = c;
     }
 
-    override visit(node: TraitDeclNode*) -> void {
+    visit_trait(mut &this, node: TraitDeclNode*) -> void {
         mut c: TraitDeclNode* = new TraitDeclNode(node.name, node.span);
         this.copy_decl_base(node, c);
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
@@ -1022,7 +1101,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: TypeAliasDeclNode*) -> void {
+    visit_type_alias(mut &this, node: TypeAliasDeclNode*) -> void {
         mut c: TypeAliasDeclNode* = new TypeAliasDeclNode(node.alias_name, node.span);
         this.copy_decl_base(node, c);
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
@@ -1035,7 +1114,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: EnumDeclNode*) -> void {
+    visit_enum(mut &this, node: EnumDeclNode*) -> void {
         const name: SymbolStr = this.consume_spec_name(node.name);
         const skip_gp: boolean = this.consume_skip_generics();
         mut c: EnumDeclNode* = new EnumDeclNode(name, node.span);
@@ -1059,12 +1138,12 @@ public:
         this.result = c;
     }
 
-    override visit(node: EnumVariantNode*) -> void {
+    visit_enum_variant(mut &this, node: EnumVariantNode*) -> void {
         mut c: EnumVariantNode* = this.clone_enum_variant(node);
         this.result = c;
     }
 
-    override visit(node: ImplBlockNode*) -> void {
+    visit_impl(mut &this, node: ImplBlockNode*) -> void {
         mut c: ImplBlockNode* = new ImplBlockNode(node.target_type, node.span);
         this.copy_decl_base(node, c);
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
@@ -1110,13 +1189,13 @@ public:
             c.assoc_binding_annotations.push(this.clone_type_annotation(node.assoc_binding_annotations[i]));
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
+            this.dispatch_node(node.methods[i]);
             c.add_method(this.result as MethodNode*);
         }
         this.result = c;
     }
 
-    override visit(node: ExternBlockNode*) -> void {
+    visit_extern_block(mut &this, node: ExternBlockNode*) -> void {
         mut c: ExternBlockNode* = new ExternBlockNode(node.linkage_type, node.span);
         this.copy_decl_base(node, c);
         for (mut i: i64 = 0; i < node.functions.length; i++) {
@@ -1125,12 +1204,12 @@ public:
         this.result = c;
     }
 
-    override visit(node: FieldDeclNode*) -> void {
+    visit_field(mut &this, node: FieldDeclNode*) -> void {
         const c: FieldDeclNode* = this.clone_field_decl(node);
         this.result = c;
     }
 
-    override visit(node: GenericParamNode*) -> void {
+    visit_generic_param(mut &this, node: GenericParamNode*) -> void {
         const c: GenericParamNode* = this.clone_generic_param(node);
         this.result = c;
     }
@@ -1138,7 +1217,7 @@ public:
 
     // Other visitors
 
-    override visit(node: ProgramNode*) -> void {
+    visit_program(mut &this, node: ProgramNode*) -> void {
         mut c: ProgramNode* = new ProgramNode(node.span);
         c.namespace_name = node.namespace_name;
         for (mut i: i64 = 0; i < node.statements.length; i++) {
@@ -1148,12 +1227,12 @@ public:
         this.result = c;
     }
 
-    override visit(node: MatchArmNode*) -> void {
+    visit_match_arm(mut &this, node: MatchArmNode*) -> void {
         const c: MatchArmNode* = this.clone_match_arm(node);
         this.result = c;
     }
 
-    override visit(node: PatternNode*) -> void {
+    visit_pattern(mut &this, node: PatternNode*) -> void {
         mut c: PatternNode* = new PatternNode(node.pattern_kind, node.span);
         c.value        = node.value;
         c.binding_name = node.binding_name;
@@ -1165,7 +1244,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: EnumPatternNode*) -> void {
+    visit_enum_pattern(mut &this, node: EnumPatternNode*) -> void {
         mut c: EnumPatternNode* = new EnumPatternNode(node.span);
         c.value        = node.value;
         c.binding_name = node.binding_name;
@@ -1224,7 +1303,7 @@ public:
         this.result = c;
     }
 
-    override visit(node: DirectiveNode*) -> void {
+    visit_directive(mut &this, node: DirectiveNode*) -> void {
         mut c: DirectiveNode* = new DirectiveNode(node.directive_kind, node.span);
         // Deep-clone typed args; nested DirectiveNode* references must be
         // cloned recursively so two callers don't alias the same nested call.
@@ -1232,7 +1311,7 @@ public:
             const orig: DirectiveArg = node.args[i];
             mut copy: DirectiveArg = orig;
             if (orig.kind == DirectiveArgKind::Nested && orig.nested != null) {
-                this.visit(orig.nested);
+                this.visit_directive(orig.nested);
                 copy.nested = this.result as DirectiveNode*;
             }
             c.args.push(copy);
@@ -1245,7 +1324,7 @@ public:
     // Typed clone helpers (avoid code duplication)
 
     /// Clone a VarDeclNode.
-    clone_var_decl(node: VarDeclNode*) -> VarDeclNode* {
+    clone_var_decl(mut &this, node: VarDeclNode*) -> VarDeclNode* {
         mut c: VarDeclNode* = new VarDeclNode(node.name, node.span);
         this.copy_decl_base(node, c);
         c.is_mutable       = node.is_mutable;
@@ -1281,7 +1360,7 @@ public:
     }
 
     /// Clone a FunctionDeclNode.
-    clone_func_decl(node: FunctionDeclNode*) -> FunctionDeclNode* {
+    clone_func_decl(mut &this, node: FunctionDeclNode*) -> FunctionDeclNode* {
         mut c: FunctionDeclNode* = new FunctionDeclNode(node.name, node.span);
         this.copy_decl_base(node, c);
         c.is_public   = node.is_public;
@@ -1325,7 +1404,7 @@ public:
             c.set_return_type_annotation(this.clone_type_annotation(node.return_type_annotation));
         }
         if (node.has_body()) {
-            node.body.accept(this);
+            this.dispatch_node(node.body);
             c.set_body(this.result as BlockStmtNode*);
         }
         // resolved_return_type left as TypeRef::invalid() (constructor default)
@@ -1333,7 +1412,7 @@ public:
     }
 
     /// Clone a FieldDeclNode.
-    clone_field_decl(node: FieldDeclNode*) -> FieldDeclNode* {
+    clone_field_decl(mut &this, node: FieldDeclNode*) -> FieldDeclNode* {
         mut c: FieldDeclNode* = new FieldDeclNode(node.name, node.span);
         this.copy_decl_base(node, c);
         c.visibility = node.visibility;
@@ -1348,7 +1427,7 @@ public:
     }
 
     /// Clone a GenericParamNode.
-    clone_generic_param(node: GenericParamNode*) -> GenericParamNode* {
+    clone_generic_param(mut &this, node: GenericParamNode*) -> GenericParamNode* {
         mut c: GenericParamNode* = new GenericParamNode(node.name, node.span);
         this.copy_decl_base(node, c);
         // The template's symbol, as every `Res` in the body is the template's.
@@ -1360,7 +1439,7 @@ public:
     }
 
     /// Clone an EnumVariantNode.
-    clone_enum_variant(node: EnumVariantNode*) -> EnumVariantNode* {
+    clone_enum_variant(mut &this, node: EnumVariantNode*) -> EnumVariantNode* {
         mut c: EnumVariantNode* = new EnumVariantNode(node.name, node.span);
         this.copy_decl_base(node, c);
         // Deep-clone type annotations (not shallow copy)
@@ -1373,21 +1452,18 @@ public:
     }
 
     /// Clone a single pattern node.
-    /// Uses an explicit kind check instead of accept() virtual dispatch to
-    /// avoid an overloaded-vtable miscompile (visit(PatternNode*) can be
-    /// called instead of visit(EnumPatternNode*), losing binding data).
-    clone_pattern(pat: PatternNode*) -> PatternNode* {
+    clone_pattern(mut &this, pat: PatternNode*) -> PatternNode* {
         if (pat == null) { return null; }
         if (pat.pattern_kind == PatternKind::Enum) {
-            this.visit(pat as EnumPatternNode*);
+            this.visit_enum_pattern(pat as EnumPatternNode*);
         } else {
-            this.visit(pat);
+            this.visit_pattern(pat);
         }
         return this.result as PatternNode*;
     }
 
     /// Clone a MatchArmNode.
-    clone_match_arm(node: MatchArmNode*) -> MatchArmNode* {
+    clone_match_arm(mut &this, node: MatchArmNode*) -> MatchArmNode* {
         mut c: MatchArmNode* = new MatchArmNode(node.span);
         for (mut i: i64 = 0; i < node.patterns.length; i++) {
             c.add_pattern(this.clone_pattern(node.patterns[i]));
@@ -1404,7 +1480,7 @@ public:
 
     /// Clone a StaticMatchArmNode (type-pattern(s) + body). An empty
     /// `type_patterns` is the wildcard `_` and clones to an empty list.
-    clone_static_match_arm(node: StaticMatchArmNode*) -> StaticMatchArmNode* {
+    clone_static_match_arm(mut &this, node: StaticMatchArmNode*) -> StaticMatchArmNode* {
         mut c: StaticMatchArmNode* = new StaticMatchArmNode(node.span);
         for (mut i: i64 = 0; i < node.type_patterns.length; i++) {
             c.add_type_pattern(this.clone_type_annotation(node.type_patterns[i]));
@@ -1445,7 +1521,7 @@ public:
                 if (p == 0) {
                     one.set_body(arm.body);
                 } else {
-                    mut cloner: ASTCloner = ASTCloner();
+                    mut cloner: ASTCloner = ASTCloner::new();
                     one.set_body(cloner.clone_stmt(arm.body));
                 }
                 one.has_error = arm.has_error;
@@ -1455,7 +1531,7 @@ public:
         return out;
     }
 
-    override visit(node: StaticMatchArmNode*) -> void {
+    visit_static_match_arm(mut &this, node: StaticMatchArmNode*) -> void {
         this.result = this.clone_static_match_arm(node) as ASTNode*;
     }
 }

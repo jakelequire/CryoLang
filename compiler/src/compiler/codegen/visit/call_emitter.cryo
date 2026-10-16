@@ -12,7 +12,7 @@
 /// Holds the full bundle of back-pointers needed to evaluate argument
 /// expressions (`dispatch`), look up symbols (`cg.resolver`), and
 /// construct enum variant values (`enum_variant`).  The visitor passes
-/// itself as `ASTVisitor*` so element-expression evaluation can recurse
+/// itself as `IRGeneratorVisitor*` so element-expression evaluation can recurse
 /// via `accept(visitor)` through `dispatch.codegen_rvalue`.
 
 namespace compiler::codegen::visit::call_emitter;
@@ -38,7 +38,7 @@ import compiler::types::{
 };
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, LiteralKind, MemberPin, node, NodeKind, statement, visitor
+    declaration, expression, LiteralKind, MemberPin, node, NodeKind, statement
 };
 import compiler::lex;
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
@@ -54,7 +54,8 @@ import compiler::ast::expression::{
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::statement::{ ExprStmtNode };
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::visit::ir_generator;
+import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::abi::{ SignaturePlan };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
@@ -195,7 +196,7 @@ type struct CallEmitter {
     /// pointer was computed, so it is no LLVM function: neither its type nor
     /// the call site's sret/byval attributes can be read off it, and both
     /// come from `plan`, classified from the value's Cryo function type.
-    call_through_value(mut &this, visitor: ASTVisitor*, node: CallExprNode*,
+    call_through_value(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*,
                        fn_ptr: LValue, plan: SignaturePlan) -> void {
         // The seam returns `void` when sret applies, else the Direct
         // return slot's type; a void call gets no result name.
@@ -260,9 +261,9 @@ type struct CallEmitter {
 
     /// Lower `node.callee(args)` into LLVM IR.  Mirrors the visitor's
     /// `override visit(CallExprNode*)`; the visitor passes itself as
-    /// `visitor: ASTVisitor*` so argument expressions can recurse via
+    /// `visitor: IRGeneratorVisitor*` so argument expressions can recurse via
     /// `accept(visitor)` through `dispatch.codegen_rvalue`.
-    emit(mut &this, visitor: ASTVisitor*, node: CallExprNode*) -> void {
+    emit(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> void {
         mut callee_val: LValue = LValue::null();
 
         // Break pointer chains into locals (see the codegen helper note).
@@ -1088,7 +1089,7 @@ type struct CallEmitter {
     /// The schedule-driven core lives on `ExprOps` (reachable from the
     /// synthesized-check origins too); this forwards the ordinary-call schedule
     /// to it.
-    emit_cleanup_landingpad(mut &this, visitor: ASTVisitor*, node: CallExprNode*,
+    emit_cleanup_landingpad(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*,
                             cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
         this.cg.expr_ops.emit_cleanup_landingpad_sched(
             visitor, &node.unwind_cleanup, cur_fn, lpad_bb);
@@ -1123,7 +1124,7 @@ type struct CallEmitter {
     /// call is a function call, or names an intrinsic the dispatcher
     /// declines (an arity it does not take), which then goes through the
     /// pin as a call.
-    emit_pinned_intrinsic(mut &this, visitor: ASTVisitor*, node: CallExprNode*) -> boolean {
+    emit_pinned_intrinsic(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> boolean {
         const kind: IntrinsicKind = this.pinned_intrinsic_kind(node);
         if (kind == IntrinsicKind::Call) { return false; }
         // `try_catch(body, data)` - the catch_unwind primitive.  Needs an
@@ -1166,7 +1167,7 @@ type struct CallEmitter {
         };
     }
 
-    emit_panic_unwind(mut &this, visitor: ASTVisitor*, node: CallExprNode*,
+    emit_panic_unwind(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*,
                       msg: LValue, file: LValue, line: LValue) -> void {
         const cur_fn: LValue = this.get_current_function();
         if (!cur_fn.is_valid()) {
@@ -1230,7 +1231,7 @@ type struct CallEmitter {
     /// `__cryo_panic_taken_*` symbols.  The default path never reaches here (the
     /// stdlib `catch_unwind` is generic and uninstantiated unless a program
     /// calls it), so this leaves the default IR byte-identical.
-    emit_catch_unwind(mut &this, visitor: ASTVisitor*, node: CallExprNode*) -> void {
+    emit_catch_unwind(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> void {
         if (node.arguments.length != 2) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
                 "codegen: try_catch expects exactly two arguments (body, data)",
@@ -1363,7 +1364,7 @@ type struct CallEmitter {
     /// caller suppresses the "no method" error.  Structs/classes recurse
     /// into each droppable field in place; other aggregate kinds are not yet
     /// expanded and return true as a no-op (keeping today's behavior).
-    emit_drop_glue(mut &this, visitor: ASTVisitor*, receiver: ExpressionNode*,
+    emit_drop_glue(mut &this, visitor: IRGeneratorVisitor*, receiver: ExpressionNode*,
                    ty: TypeRef) -> boolean {
         const arena: TypeArena* = this.cg.get_arena();
         if (arena == null) { return false; }
@@ -1421,7 +1422,7 @@ type struct CallEmitter {
     /// branch), so the element access is built exactly like a struct field's
     /// and re-enters the normal `.drop()` lowering - elements without a user
     /// drop recurse back through glue.
-    emit_tuple_element_drops(mut &this, visitor: ASTVisitor*,
+    emit_tuple_element_drops(mut &this, visitor: IRGeneratorVisitor*,
                              receiver: ExpressionNode*, tt: TupleType*) -> void {
         if (tt == null) { return; }
         const arena: TypeArena* = this.cg.get_arena();
@@ -1448,7 +1449,7 @@ type struct CallEmitter {
             this.cg.bind_destructor_call(call);
             mut stmt: ExprStmtNode* = new ExprStmtNode(
                 call as ExpressionNode*, receiver.span);
-            stmt.accept(visitor);
+            visitor.dispatch_node(stmt);
         }
     }
 
@@ -1456,7 +1457,7 @@ type struct CallEmitter {
     /// `receiver[i].drop()` calls.  Re-enters the normal `.drop()` lowering
     /// per element, so elements that themselves lack a user drop recurse
     /// through glue (e.g. an array of structs of strings drops every string).
-    emit_fixed_array_drops(mut &this, visitor: ASTVisitor*,
+    emit_fixed_array_drops(mut &this, visitor: IRGeneratorVisitor*,
                            receiver: ExpressionNode*, at: ArrayType*) -> void {
         if (at == null) { return; }
         const arena: TypeArena* = this.cg.get_arena();
@@ -1481,7 +1482,7 @@ type struct CallEmitter {
             this.cg.bind_destructor_call(call);
             mut stmt: ExprStmtNode* = new ExprStmtNode(
                 call as ExpressionNode*, receiver.span);
-            stmt.accept(visitor);
+            visitor.dispatch_node(stmt);
         }
     }
 
@@ -1490,7 +1491,7 @@ type struct CallEmitter {
     /// drops, Copy no-ops, and recursive glue).  In place: the member access
     /// yields a pointer into the receiver, so a leaf drop nulls that storage
     /// and any later re-drop is a no-op.
-    emit_field_drops(mut &this, visitor: ASTVisitor*, receiver: ExpressionNode*,
+    emit_field_drops(mut &this, visitor: IRGeneratorVisitor*, receiver: ExpressionNode*,
                      fields: &[FieldInfo]) -> void {
         const arena: TypeArena* = this.cg.get_arena();
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
@@ -1515,7 +1516,7 @@ type struct CallEmitter {
             this.cg.bind_destructor_call(call);
             mut stmt: ExprStmtNode* = new ExprStmtNode(
                 call as ExpressionNode*, receiver.span);
-            stmt.accept(visitor);
+            visitor.dispatch_node(stmt);
         }
     }
 
@@ -1525,7 +1526,7 @@ type struct CallEmitter {
     /// registered as a synthetic named lvalue and dropped via the normal
     /// `.drop()` lowering (so a payload that itself lacks a user drop recurses
     /// through glue).  `enum_ref` is the concrete (peeled) enum TypeRef.
-    emit_enum_drop_glue(mut &this, visitor: ASTVisitor*, receiver: ExpressionNode*,
+    emit_enum_drop_glue(mut &this, visitor: IRGeneratorVisitor*, receiver: ExpressionNode*,
                         et: EnumType*, enum_ref: TypeRef) -> void {
         if (et == null) { return; }
         if (et.is_simple_enum()) { return; }   // no payloads -> nothing to drop
@@ -1618,7 +1619,7 @@ type struct CallEmitter {
                     this.cg.bind_destructor_call(call);
                     mut stmt: ExprStmtNode* = new ExprStmtNode(
                         call as ExpressionNode*, receiver.span);
-                    stmt.accept(visitor);
+                    visitor.dispatch_node(stmt);
                 }
             }
 

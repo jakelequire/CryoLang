@@ -34,7 +34,7 @@ import compiler::ast;
 import compiler::ast::{
     cloner, declaration, expression, GenericAnnotation, ImplTraitAnnotation, LiteralKind,
     MemberPin, NamedAnnotation, node, node_locator, NodeKind, pattern, PatternBinding, PatternElement,
-    statement, TraitRef, TypeAnnotation, visitor
+    statement, TraitRef, TypeAnnotation
 };
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult, Provision };
@@ -139,7 +139,6 @@ import compiler::types::user_defined::{
 };
 import std::core::mem::{ swap };
 import std::core::option::{ Option };
-import compiler::ast::visitor::{ BaseASTVisitor };
 
 
 /// Operator -> (language trait, method) overloading map. `valid == false` means
@@ -214,8 +213,7 @@ type struct OperatorTraitMap {
 }
 
 
-type class SemaVisitor : BaseASTVisitor {
-public:
+type struct SemaVisitor {
     // -- Immutable environment + the by-value checker (handed to collaborators
     //    as pointers via wire()) --
     arena:    TypeArena*;
@@ -246,32 +244,32 @@ public:
     member:   MemberResolver;
     calls:    CallResolver;
 
-    SemaVisitor(arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*) : BaseASTVisitor() {
-        this.arena    = arena;
-        this.checker  = TypeChecker::new(arena, ctx.decl_index);
-        this.intern   = intern;
-        this.ctx      = ctx;
-        this.this_sym = intern.intern("this");
-        this.resolver = null;
-        this.state    = SemaState::new();
-        this.scopes   = ScopeManager::null();
-        this.types    = TypeUtils::null();
-        this.literals = LiteralResolver::null();
-        this.diag     = Diagnostics::null();
-        this.dispatch = SemaDispatch::null();
-        this.symbolic = SymbolicChecker::null();
-        this.binding  = MethodBinding::null();
-        this.patterns = PatternResolver::null();
-        this.lambda   = LambdaSynth::null();
-        this.async_lower = AsyncLower::null();
-        this.member   = MemberResolver::null();
-        this.calls    = CallResolver::null();
-    }
-
     /// Build from the compilation context (declaration lookups go through
     /// ctx.decl_index, so no AST scan here).
     static build(ctx: CompilationContext*) -> SemaVisitor {
-        return SemaVisitor(ctx.type_arena, ctx.get_intern_table(), ctx);
+        const arena: TypeArena* = ctx.type_arena;
+        const intern: InternTable* = ctx.get_intern_table();
+        return SemaVisitor {
+            arena:       arena,
+            checker:     TypeChecker::new(arena, ctx.decl_index),
+            intern:      intern,
+            ctx:         ctx,
+            this_sym:    intern.intern("this"),
+            resolver:    null,
+            state:       SemaState::new(),
+            scopes:      ScopeManager::null(),
+            types:       TypeUtils::null(),
+            literals:    LiteralResolver::null(),
+            diag:        Diagnostics::null(),
+            dispatch:    SemaDispatch::null(),
+            symbolic:    SymbolicChecker::null(),
+            binding:     MethodBinding::null(),
+            patterns:    PatternResolver::null(),
+            lambda:      LambdaSynth::null(),
+            async_lower: AsyncLower::null(),
+            member:      MemberResolver::null(),
+            calls:       CallResolver::null(),
+        };
     }
 
     /// Two-phase init step 2: set every collaborator's back-pointers.  MUST run
@@ -319,7 +317,7 @@ public:
         if (call.callee.kind != NodeKind::MemberAccess) { return; }
         const member: MemberAccessNode* = call.callee as MemberAccessNode*;
         if (member.object == null || !member.object.resolved_type.is_valid()) { return; }
-        this.calls.bind_destructor(this as ASTVisitor*, call, member.object.resolved_type);
+        this.calls.bind_destructor(this as SemaVisitor*, call, member.object.resolved_type);
     }
 
     /// A fresh trait checker over the shared arena + registry (a 4-pointer view).
@@ -330,7 +328,7 @@ public:
 
     // -- Top-level + statement recursion seams --
 
-    override visit(mut &this, node: ProgramNode*) -> void {
+    visit_program(mut &this, node: ProgramNode*) -> void {
         this.declare_async_futures(node);
         this.type_unwritten_globals(node);
         this.state.unbound_variants.clear();
@@ -544,7 +542,7 @@ public:
                 }
             }
         }
-        stmt.accept(this);
+        this.dispatch_node(stmt);
         if (needs_restore) {
             const resolver: Resolver* = this.ctx.get_resolver();
             if (resolver != null) {
@@ -557,13 +555,13 @@ public:
     /// Dispatch a statement to its typed visit() override via double-dispatch.
     dispatch_stmt(mut &this, stmt: StatementNode*) -> void {
         if (stmt == null) { return; }
-        stmt.accept(this);
+        this.dispatch_node(stmt);
     }
 
 
     // -- Declaration visitors --
 
-    override visit(mut &this, node: FunctionDeclNode*) -> void {
+    visit_function(mut &this, node: FunctionDeclNode*) -> void {
         if (node.body == null) { return; }
         if (node.is_generic()) {
             // A generic body is typed by the symbolic walk, against abstract
@@ -579,7 +577,7 @@ public:
             return;
         }
         this.enter_function(node, TypeRef::invalid());
-        this.visit(node.body);
+        this.visit_block(node.body);
         this.state.body_count += 1;
         this.check_function_returns(node);
         this.check_opaque_return_item(node);
@@ -590,7 +588,7 @@ public:
         }
     }
 
-    override visit(mut &this, node: StructDeclNode*) -> void {
+    visit_struct(mut &this, node: StructDeclNode*) -> void {
         // The declaration's own registration, by the id it stamped - for an
         // injected specialization the one its injector wrote, whichever
         // module the clone was placed in.
@@ -602,7 +600,7 @@ public:
         this.visit_methods(node.methods, st_type);
     }
 
-    override visit(mut &this, node: UnionDeclNode*) -> void {
+    visit_union(mut &this, node: UnionDeclNode*) -> void {
         const un_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:UnionDeclNode");
         if (node.is_generic()) {
             this.symbolic_check_owner_methods(node.methods, un_type, node.generic_params);
@@ -611,7 +609,7 @@ public:
         this.visit_methods(node.methods, un_type);
     }
 
-    override visit(mut &this, node: ClassDeclNode*) -> void {
+    visit_class(mut &this, node: ClassDeclNode*) -> void {
         const cl_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:ClassDeclNode");
         if (node.is_generic()) {
             this.symbolic_check_owner_methods(node.methods, cl_type, node.generic_params);
@@ -620,7 +618,7 @@ public:
         this.visit_methods(node.methods, cl_type);
     }
 
-    override visit(mut &this, node: TraitDeclNode*) -> void {
+    visit_trait(mut &this, node: TraitDeclNode*) -> void {
         if (node.is_generic()) { return; }
         const this_name: SymbolStr = this.intern.intern("This");
         const this_placeholder: TypeRef = this.arena.this_placeholder(this_name);
@@ -641,7 +639,7 @@ public:
         this.state.symbolic_trait = saved_trait;
     }
 
-    override visit(mut &this, node: ImplBlockNode*) -> void {
+    visit_impl(mut &this, node: ImplBlockNode*) -> void {
         if (node.is_generic()) {
             const impl_target: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/visit:ImplBlockNode");
             const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
@@ -750,7 +748,7 @@ public:
                     this.resolve_expr(method.base_ctor_args[k]);
                 }
             }
-            this.visit(method.func.body);
+            this.visit_block(method.func.body);
             this.state.body_count += 1;
             if (!method.is_constructor && !method.is_destructor) {
                 this.check_function_returns(method.func);
@@ -844,7 +842,7 @@ public:
             if (written.is_valid()) { eff_this = written; }
         }
         this.enter_function(func, eff_this);
-        this.visit(func.body);
+        this.visit_block(func.body);
 
         if (ar != null) { ar.set_symbolic_no_demand(saved_no_demand); }
         swap(&this.state.symbolic_method_param_nodes, &saved_method_nodes);
@@ -974,7 +972,7 @@ public:
 
     // -- Statement visitors --
 
-    override visit(mut &this, block: BlockStmtNode*) -> void {
+    visit_block(mut &this, block: BlockStmtNode*) -> void {
         if (block == null) { return; }
         const save: i64 = this.scopes.save_scope();
         for (mut i: i64 = 0; i < block.statements.length; i++) {
@@ -983,11 +981,11 @@ public:
         this.scopes.restore_scope(save);
     }
 
-    override visit(mut &this, node: ExprStmtNode*) -> void {
+    visit_expr_stmt(mut &this, node: ExprStmtNode*) -> void {
         this.resolve_expr(node.expression);
     }
 
-    override visit(mut &this, node: ReturnStmtNode*) -> void {
+    visit_return(mut &this, node: ReturnStmtNode*) -> void {
         if (node.has_expression()) {
             const saved_expected: TypeRef = this.state.expected_type;
             const declared: TypeRef = this.symbolic.symbolic_narrowed(this.state.return_type);
@@ -1031,31 +1029,31 @@ public:
             want, ty, "a condition must be a `boolean`", SourceSpan::none(), cond);
     }
 
-    override visit(mut &this, node: IfStmtNode*) -> void {
+    visit_if(mut &this, node: IfStmtNode*) -> void {
         this.resolve_condition(node.condition);
         this.dispatch_stmt(node.then_stmt);
         if (node.has_else()) { this.dispatch_stmt(node.else_stmt); }
     }
 
-    override visit(mut &this, node: WhileStmtNode*) -> void {
+    visit_while(mut &this, node: WhileStmtNode*) -> void {
         this.resolve_condition(node.condition);
         this.state.loop_depth += 1;
         this.dispatch_stmt(node.body);
         this.state.loop_depth -= 1;
     }
 
-    override visit(mut &this, node: DoWhileStmtNode*) -> void {
+    visit_do_while(mut &this, node: DoWhileStmtNode*) -> void {
         this.state.loop_depth += 1;
         this.dispatch_stmt(node.body);
         this.state.loop_depth -= 1;
         this.resolve_condition(node.condition);
     }
 
-    override visit(mut &this, node: ForStmtNode*) -> void {
+    visit_for(mut &this, node: ForStmtNode*) -> void {
         const save: i64 = this.scopes.save_scope();
         if (node.init != null) {
             if (node.init.kind == NodeKind::DeclarationStatement) {
-                this.visit(node.init as DeclStmtNode*);
+                this.visit_decl_stmt(node.init as DeclStmtNode*);
             } else if (node.init.kind == NodeKind::VariableDeclaration) {
                 const var_node: VarDeclNode* = node.init as VarDeclNode*;
                 if (var_node.type_annotation == null) {
@@ -1088,31 +1086,31 @@ public:
         this.scopes.restore_scope(save);
     }
 
-    override visit(mut &this, node: LoopStmtNode*) -> void {
+    visit_loop(mut &this, node: LoopStmtNode*) -> void {
         this.state.loop_depth += 1;
         this.dispatch_stmt(node.body);
         this.state.loop_depth -= 1;
     }
 
-    override visit(mut &this, node: BreakStmtNode*) -> void {
+    visit_break(mut &this, node: BreakStmtNode*) -> void {
         if (this.state.loop_depth == 0) {
             this.ctx.emit_error_at(ErrorCode::E0400_INVALID_BREAK,
                 "`break` outside of a loop", node.span);
         }
     }
 
-    override visit(mut &this, node: ContinueStmtNode*) -> void {
+    visit_continue(mut &this, node: ContinueStmtNode*) -> void {
         if (this.state.loop_depth == 0) {
             this.ctx.emit_error_at(ErrorCode::E0401_INVALID_CONTINUE,
                 "`continue` outside of a loop", node.span);
         }
     }
 
-    override visit(mut &this, node: UnsafeBlockStmtNode*) -> void {
-        this.visit(node.block);
+    visit_unsafe_block(mut &this, node: UnsafeBlockStmtNode*) -> void {
+        this.visit_block(node.block);
     }
 
-    override visit(mut &this, node: AsmBlockStmtNode*) -> void {
+    visit_asm_block(mut &this, node: AsmBlockStmtNode*) -> void {
         // A mandatory `![arch(<arch>, <dialect>)]` directive supplies the
         // arch (gating) and dialect; its absence is an error.
         if (node.arch == "") {
@@ -1137,7 +1135,7 @@ public:
         }
     }
 
-    override visit(mut &this, node: MatchStmtNode*) -> void {
+    visit_match_stmt(mut &this, node: MatchStmtNode*) -> void {
         const subject_type: TypeRef = this.resolve_expr(node.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
@@ -1154,7 +1152,7 @@ public:
         this.patterns.check_literal_patterns(node.arms, subject_type);
     }
 
-    override visit(mut &this, node: StaticMatchStmtNode*) -> void {
+    visit_static_match_stmt(mut &this, node: StaticMatchStmtNode*) -> void {
         if (node == null || node.arms.length == 0) { return; }
         if (node.arms.length > 1 && !this.state.in_symbolic_check) {
             this.ctx.emit_error_at(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
@@ -1173,11 +1171,11 @@ public:
         }
     }
 
-    override visit(mut &this, node: DeclStmtNode*) -> void {
+    visit_decl_stmt(mut &this, node: DeclStmtNode*) -> void {
         if (node.declaration == null) { return; }
         const decl: ASTNode* = node.declaration;
         if (decl.kind == NodeKind::DestructureDeclaration) {
-            this.visit(decl as DestructureDeclNode*);
+            this.visit_destructure(decl as DestructureDeclNode*);
             return;
         }
         if (decl.kind != NodeKind::VariableDeclaration) { return; }
@@ -1196,7 +1194,7 @@ public:
     ///
     /// Guarded on `is_global` so this cannot become a second answering path for
     /// a local; the statement form and the for-loop form own those.
-    override visit(mut &this, node: VarDeclNode*) -> void {
+    visit_var(mut &this, node: VarDeclNode*) -> void {
         if (node == null || !node.is_global) { return; }
         if (this.typed_before_bodies(node)) { return; }
         this.check_var_decl(node);
@@ -1446,7 +1444,7 @@ public:
         this.scopes.set_kw_span(var_node.sym_id, var_node.kw_span);
     }
 
-    override visit(mut &this, node: DestructureDeclNode*) -> void {
+    visit_destructure(mut &this, node: DestructureDeclNode*) -> void {
         if (!node.has_resolved_type() && node.type_annotation != null) {
             mut res_ctx: ResolutionContext = this.body_res_ctx();
             this.symbolic.symbolic_bind_params(&res_ctx);
@@ -1615,33 +1613,66 @@ public:
     }
 
 
-    // -- Expression visit() overrides (thin recursion-seam delegates) --
+    // -- Dispatch by kind --
 
-    override visit(mut &this, node: LiteralNode*) -> void          { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: IdentifierNode*) -> void       { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: BinaryExprNode*) -> void       { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: UnaryExprNode*) -> void        { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: TernaryExprNode*) -> void      { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: IfExprNode*) -> void           { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: MatchExprNode*) -> void        { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: StaticMatchExprNode*) -> void  { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: CallExprNode*) -> void         { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: NewExprNode*) -> void          { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: SizeofExprNode*) -> void       { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: AlignofExprNode*) -> void      { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: CastExprNode*) -> void         { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: StructLiteralNode*) -> void    { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: ArrayLiteralNode*) -> void     { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: TupleLiteralNode*) -> void     { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: LambdaExprNode*) -> void       { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: ArrayAccessNode*) -> void      { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: MemberAccessNode*) -> void     { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: ScopeResolutionNode*) -> void  { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: TypeofExprNode*) -> void       { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: DeleteExprNode*) -> void       { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: AwaitExprNode*) -> void        { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: YieldExprNode*) -> void        { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
-    override visit(mut &this, node: TryExprNode*) -> void          { this.state.last_expr_type = this.resolve_expr(node as ExpressionNode*); }
+    /// Hand `n` to the check for its kind.  An expression's type is left on
+    /// `state.last_expr_type`.  The kinds with no check of their own are
+    /// reached through their owners (a method through its implement block, a
+    /// match arm through its match) or need none.
+    dispatch_node(mut &this, n: ASTNode*) -> void {
+        if (n == null) { return; }
+        match (n.kind) {
+            NodeKind::Program                => { this.visit_program(n as ProgramNode*); }
+
+            NodeKind::Literal | NodeKind::Identifier | NodeKind::BinaryExpression
+            | NodeKind::UnaryExpression | NodeKind::TernaryExpression | NodeKind::IfExpression
+            | NodeKind::MatchExpression | NodeKind::StaticMatchExpression
+            | NodeKind::CallExpression | NodeKind::NewExpression | NodeKind::SizeofExpression
+            | NodeKind::AlignofExpression | NodeKind::CastExpression | NodeKind::StructLiteral
+            | NodeKind::ArrayLiteral | NodeKind::TupleLiteral | NodeKind::LambdaExpression
+            | NodeKind::ArrayAccess | NodeKind::MemberAccess | NodeKind::ScopeResolution
+            | NodeKind::TypeofExpression | NodeKind::DeleteExpression | NodeKind::AwaitExpression
+            | NodeKind::YieldExpression | NodeKind::TryExpression => {
+                this.state.last_expr_type = this.resolve_expr(n as ExpressionNode*);
+            }
+
+            NodeKind::BlockStatement         => { this.visit_block(n as BlockStmtNode*); }
+            NodeKind::UnsafeBlockStatement   => { this.visit_unsafe_block(n as UnsafeBlockStmtNode*); }
+            NodeKind::AsmBlockStatement      => { this.visit_asm_block(n as AsmBlockStmtNode*); }
+            NodeKind::ReturnStatement        => { this.visit_return(n as ReturnStmtNode*); }
+            NodeKind::IfStatement            => { this.visit_if(n as IfStmtNode*); }
+            NodeKind::WhileStatement         => { this.visit_while(n as WhileStmtNode*); }
+            NodeKind::DoWhileStatement       => { this.visit_do_while(n as DoWhileStmtNode*); }
+            NodeKind::ForStatement           => { this.visit_for(n as ForStmtNode*); }
+            NodeKind::MatchStatement         => { this.visit_match_stmt(n as MatchStmtNode*); }
+            NodeKind::StaticMatchStatement   => { this.visit_static_match_stmt(n as StaticMatchStmtNode*); }
+            NodeKind::BreakStatement         => { this.visit_break(n as BreakStmtNode*); }
+            NodeKind::ContinueStatement      => { this.visit_continue(n as ContinueStmtNode*); }
+            NodeKind::ExpressionStatement    => { this.visit_expr_stmt(n as ExprStmtNode*); }
+            NodeKind::DeclarationStatement   => { this.visit_decl_stmt(n as DeclStmtNode*); }
+            NodeKind::LoopStatement          => { this.visit_loop(n as LoopStmtNode*); }
+
+            NodeKind::VariableDeclaration    => { this.visit_var(n as VarDeclNode*); }
+            NodeKind::DestructureDeclaration => { this.visit_destructure(n as DestructureDeclNode*); }
+            NodeKind::FunctionDeclaration    => { this.visit_function(n as FunctionDeclNode*); }
+            NodeKind::StructDeclaration      => { this.visit_struct(n as StructDeclNode*); }
+            NodeKind::UnionDeclaration       => { this.visit_union(n as UnionDeclNode*); }
+            NodeKind::ClassDeclaration       => { this.visit_class(n as ClassDeclNode*); }
+            NodeKind::TraitDeclaration       => { this.visit_trait(n as TraitDeclNode*); }
+            NodeKind::ImplementationBlock    => { this.visit_impl(n as ImplBlockNode*); }
+
+            NodeKind::MethodDeclaration | NodeKind::IntrinsicDeclaration
+            | NodeKind::IntrinsicConstDeclaration | NodeKind::ImportDeclaration
+            | NodeKind::ModuleDeclaration | NodeKind::TypeAliasDeclaration
+            | NodeKind::EnumDeclaration | NodeKind::EnumVariant | NodeKind::ExternBlock
+            | NodeKind::FieldDeclaration | NodeKind::GenericParamDeclaration
+            | NodeKind::MatchArm | NodeKind::StaticMatchArm | NodeKind::Pattern
+            | NodeKind::EnumPattern | NodeKind::Directive => { }
+
+            NodeKind::Expression | NodeKind::Statement | NodeKind::Declaration
+            | NodeKind::AsyncExpression | NodeKind::Unknown => { }
+        }
+    }
 
 
     // -- The authoritative expression dispatch --
@@ -3642,7 +3673,7 @@ public:
     fill_field_default(mut &this, lit: StructLiteralNode*, field: FieldInfo*,
                        index: i64, name: SymbolStr) -> void {
         if (field.default_value == null) { return; }
-        mut cloner: ASTCloner = ASTCloner();
+        mut cloner: ASTCloner = ASTCloner::new();
         const cloned: ExpressionNode* = cloner.clone_expr(field.default_value);
         if (cloned == null) { return; }
         const field_type: TypeRef = field.field_type;
@@ -4618,7 +4649,7 @@ type struct SemanticPasses {
         const _box_v: Box<SemaVisitor> = Box::<SemaVisitor>::new(SemaVisitor::build(ctx));
         const v: SemaVisitor* = _box_v.leak();
         v.wire();
-        v.visit(root);
+        v.visit_program(root);
 
         if (ctx.options.verbose) {
             cdebug("[Sema] Type-checked %lld function bodies\n", v.state.body_count);

@@ -5,7 +5,7 @@
 /// / `tup[0]`, plus the field/method/type visibility enforcement (E0353/E0503).
 ///
 /// `resolve_member_access` / `resolve_array_access` recurse into the receiver via
-/// the dispatch seam, so they take `visitor: ASTVisitor*`.  The visibility and
+/// the dispatch seam, so they take `visitor: SemaVisitor*`.  The visibility and
 /// template-field helpers are pure callbacks.
 ///
 /// Env (arena/intern/ctx/checker) + peers: state, types (TypeUtils), symbolic
@@ -18,7 +18,7 @@ import compiler::types::{
 };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::ast;
-import compiler::ast::{ declaration, expression, MemberPin, node, NodeKind, TypeAnnotation, visitor };
+import compiler::ast::{ declaration, expression, MemberPin, node, NodeKind, TypeAnnotation };
 import compiler::lex;
 import compiler::lex::{ Token, TokenType };
 import compiler::diag;
@@ -39,7 +39,8 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     ArrayAccessNode, CallExprNode, ExpressionNode, MemberAccessNode, UnaryExprNode
 };
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::sema::sema;
+import compiler::sema::sema::{ SemaVisitor };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
@@ -125,7 +126,7 @@ type struct MemberResolver {
 
     // -- Member access (`obj.field` / `obj.0` / `obj.method`) --
 
-    resolve_member_access(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*) -> TypeRef {
+    resolve_member_access(mut &this, visitor: SemaVisitor*, member: MemberAccessNode*) -> TypeRef {
         const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
 
@@ -282,7 +283,7 @@ type struct MemberResolver {
     /// original `member.object` is left untouched and `invalid` returned.
     /// Restricted to concrete user receivers; a bounded `T: Deref` param is not
     /// coerced (its abstract pointee has no field/method to bind pre-mono).
-    try_deref_coercion(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*) -> TypeRef {
+    try_deref_coercion(mut &this, visitor: SemaVisitor*, member: MemberAccessNode*) -> TypeRef {
         if (member.object == null) { return TypeRef::invalid(); }
         mut cur_obj: ExpressionNode* = member.object;
         mut cur_ty:  TypeRef         = member.object.resolved_type;
@@ -630,7 +631,7 @@ type struct MemberResolver {
 
     // -- Index access (`arr[i]` / `tup[0]`) --
 
-    resolve_array_access(mut &this, visitor: ASTVisitor*, access: ArrayAccessNode*) -> TypeRef {
+    resolve_array_access(mut &this, visitor: SemaVisitor*, access: ArrayAccessNode*) -> TypeRef {
         // Idempotent: a prior resolution may have rewritten `a[i]` into
         // `*(a.index(i))`.  Return its type without re-running
         // `check_index_access`, which would re-reject the user-typed base.
@@ -739,7 +740,7 @@ type struct MemberResolver {
     /// applies.  Deliberately does NOT unwrap pointers / references: a raw
     /// pointer or `&T` keeps its primitive indexing rule (which already
     /// succeeded in `check_index_access`), mirroring the arithmetic desugar.
-    try_index_overload(mut &this, visitor: ASTVisitor*, access: ArrayAccessNode*,
+    try_index_overload(mut &this, visitor: SemaVisitor*, access: ArrayAccessNode*,
                        ty: TypeRef) -> ExpressionNode* {
         mut base_ty: TypeRef = ty;
         mut t: Type* = this.arena.lookup(base_ty);
@@ -776,7 +777,7 @@ type struct MemberResolver {
     /// being walked, when a bound in scope gives the parameter
     /// `std::core::ops::Index` - itself or as a supertrait of the trait it
     /// names.  Null for any other base.
-    try_bounded_index(mut &this, visitor: ASTVisitor*, access: ArrayAccessNode*,
+    try_bounded_index(mut &this, visitor: SemaVisitor*, access: ArrayAccessNode*,
                       ty: TypeRef) -> ExpressionNode* {
         const param: GenericParamType* = this.binding.receiver_type_param(ty);
         if (param == null) { return null; }
@@ -787,7 +788,7 @@ type struct MemberResolver {
 
     /// Build and resolve `*(a.index(i))` for `access`; null when it does not
     /// type.
-    build_index_desugar(mut &this, visitor: ASTVisitor*, access: ArrayAccessNode*) -> ExpressionNode* {
+    build_index_desugar(mut &this, visitor: SemaVisitor*, access: ArrayAccessNode*) -> ExpressionNode* {
         // The index expression is passed BY VALUE - the trait is
         // `index(&this, idx: Idx)`, not `&Idx` - so no synthetic `&`.
         const member: MemberAccessNode* = this.lang_method_callee(access.array, LangItem::IndexIndex, access.span);

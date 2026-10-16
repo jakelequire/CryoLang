@@ -34,7 +34,7 @@ import compiler::types::{
     user_defined
 };
 import compiler::ast;
-import compiler::ast::{ MemberPin, node, visitor, expression, statement };
+import compiler::ast::{ MemberPin, node, expression, statement };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
 import std::collections::pair;
 import std::collections::pair::{ Pair };
@@ -50,7 +50,8 @@ import compiler::ast::declaration;
 import compiler::ast::declaration::{ ImplBlockNode, MethodNode };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::visit::ir_generator;
+import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LType, LTypeKind, LValue };
 import compiler::codegen::visit::expr_dispatch::{ ExprDispatch };
@@ -140,7 +141,7 @@ type struct NewDeleteEmitter {
 
     // new T(args) / new T { fields }
 
-    emit_new(mut &this, visitor: ASTVisitor*, node: NewExprNode*) -> void {
+    emit_new(mut &this, visitor: IRGeneratorVisitor*, node: NewExprNode*) -> void {
         // Array allocation `new T[n]` is handled up front: it allocates raw
         // memory and the element may be a primitive (`new int[100]`) whose
         // name is a keyword not in the decl index, so the type_name lookup
@@ -385,7 +386,7 @@ type struct NewDeleteEmitter {
     /// The element type is read from the sema-resolved `T*` result type so
     /// primitive elements (whose name is a keyword, not a decl-index entry)
     /// resolve the same way user types do.
-    emit_new_array(mut &this, visitor: ASTVisitor*, node: NewExprNode*) -> void {
+    emit_new_array(mut &this, visitor: IRGeneratorVisitor*, node: NewExprNode*) -> void {
         const result_t: Type* = this.cg.arena_type(node.resolved_type);
         if (result_t == null || result_t.kind != TypeKind::Pointer) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
@@ -477,7 +478,7 @@ type struct NewDeleteEmitter {
 
     // delete ptr
 
-    emit_delete(mut &this, visitor: ASTVisitor*, node: DeleteExprNode*) -> void {
+    emit_delete(mut &this, visitor: IRGeneratorVisitor*, node: DeleteExprNode*) -> void {
         // `delete ptr` is the manual-memory dual of an end-of-scope drop:
         //   1. Release the pointee as a scope exit releases a value of its
         //      type: its destructor, if it has one, then its owned fields.
@@ -577,7 +578,7 @@ type struct NewDeleteEmitter {
             this.cg.bind_destructor_call(call);
             mut stmt: ExprStmtNode* = new ExprStmtNode(
                 call as ExpressionNode*, node.span);
-            stmt.accept(visitor);
+            visitor.dispatch_node(stmt);
 
             this.cg.values.remove(recv_bind);
         }

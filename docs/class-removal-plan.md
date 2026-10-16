@@ -1024,6 +1024,31 @@ every visitor.
   two indirect calls per node become a `switch`.
 - **Wrong if:** arena bytes do not drop by about 8 x node count.
 
+**Built (3a, the dispatch).**
+
+- `SemaVisitor`, `IRGeneratorVisitor` and `ASTCloner` are structs, each
+  with a `dispatch_node(n)` that matches the node's kind exhaustively and
+  calls `visit_<kind>` (the old overrides, renamed); the kinds a visitor
+  never handled are explicit empty arms, where `BaseASTVisitor`'s empty
+  defaults used to answer.  Sema's 25 expression overrides, each a
+  delegate to `resolve_expr`, are one arm.
+- Every `x.accept(v)` is `v.dispatch_node(x)`, and every `visitor:
+  ASTVisitor*` parameter takes the concrete visitor.  The seams
+  (`SemaDispatch`, `ExprDispatch`) said a collaborator naming the
+  concrete visitor would make a module cycle; it compiles, so the seams
+  now name it.
+- `ASTVisitor`, `BaseASTVisitor`, `visitor.cryo`, and the 68 `accept`
+  methods (69 counting `ASTNode`'s abstract one) are deleted.  No AST
+  class has a virtual method left.
+- A one-off codemod (`scripts/visit-codemod.py`) made the renames; it is
+  in the commit that ran it and deleted in the next.
+- **Measured.**  verify `--require-identical`: 0 objects moved.  Check
+  time, interleaved x3 against slice 2: 7.94 s and 7.95 s (medians).
+  Node bytes 334,062,200 -> 318,534,064: down 15,528,136, exactly 8 x
+  1,941,017 nodes, the table pointer, as predicted.  Arena use down
+  15,848,181; peak 1544.3 -> 1530.0 MiB.  Clean build 0 warnings.
+  Classes 100 -> 95.
+
 ### Slice 4: the types
 
 `Type` + 25 classes become `Type` + `TypeData` (section 2.5), one
@@ -1359,4 +1384,5 @@ final audit greps for each name listed and expects none.
 
 | piece | where | written in | deleted when |
 |---|---|---|---|
-| (none yet) | | | |
+| `implement class XNode { static walk_children ... }`, one per node class with children | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | each moves to `implement struct` on its kind's payload struct as that category converts (slices 5-6); none left when the last category does |
+| `Walk::walk_node`'s `match (n.kind)` plus a cast per arm | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | becomes `walk_expr`/`walk_stmt`/... matching on `ExprKind` etc. as each category converts; deleted with `NodeKind` |

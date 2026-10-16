@@ -10,7 +10,7 @@
 /// Holds `cg: CodegenContext*` (heavy machinery - type mapper, function
 /// registry, IR-flow allocas, builder) and `state: VisitorState*` (for
 /// the per-module `lambda_counter`).  The visitor passes itself as
-/// `ASTVisitor*` so body statements can recurse via `accept(visitor)`
+/// `IRGeneratorVisitor*` so body statements can recurse via `accept(visitor)`
 /// without importing the concrete `IRGeneratorVisitor` type (which
 /// would form a module-graph cycle).
 
@@ -27,7 +27,7 @@ import compiler::diag::{ ErrorCode };
 import compiler::types;
 import compiler::types::{ type_ref, resolver };
 import compiler::ast;
-import compiler::ast::{ declaration, expression, MemberPin, node, NodeKind, statement, visitor };
+import compiler::ast::{ declaration, expression, MemberPin, node, NodeKind, statement };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::types::arena;
 import compiler::types::arena::{ TypeArena };
@@ -38,7 +38,8 @@ import compiler::ast::expression::{
     ExpressionNode, FieldInit, IdentifierNode, LambdaExprNode, StructLiteralNode
 };
 import compiler::ast::statement::{ BlockStmtNode, StatementNode };
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::visit::ir_generator;
+import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
 import compiler::resolver::intern_table::{ InternTable };
@@ -89,11 +90,11 @@ type struct LambdaEmitter {
     ///    synthesised `__call__` method, which goes through ordinary
     ///    method codegen as part of the injected StructDecl.
     ///
-    /// `visitor` is the parent IRGeneratorVisitor, accepted as `ASTVisitor*`
+    /// `visitor` is the parent IRGeneratorVisitor, accepted as `IRGeneratorVisitor*`
     /// so this module doesn't have to import the concrete visitor type
     /// (cycle-avoidance - `ir_generator.cryo` already imports this module
     /// to hold a `LambdaEmitter` field).
-    emit(mut &this, visitor: ASTVisitor*, node: LambdaExprNode*) -> void {
+    emit(mut &this, visitor: IRGeneratorVisitor*, node: LambdaExprNode*) -> void {
         if (node == null) {
             this.state.last_value     = LValue::null();
             this.state.last_is_lvalue = false;
@@ -234,11 +235,11 @@ type struct LambdaEmitter {
                     }
                     const stmt: StatementNode* = blk.statements[bi];
                     if (stmt != null) {
-                        stmt.accept(visitor);
+                        visitor.dispatch_node(stmt);
                     }
                 }
             } else {
-                node.body.accept(visitor);
+                visitor.dispatch_node(node.body);
             }
         }
 
@@ -290,7 +291,7 @@ type struct LambdaEmitter {
     /// lives on the synthesised `<closure_struct>::__call__` method,
     /// emitted by ordinary method codegen when the StructDecl Sema
     /// injected reaches Phase 7's codegen sweep.
-    emit_capturing(mut &this, visitor: ASTVisitor*, node: LambdaExprNode*) -> void {
+    emit_capturing(mut &this, visitor: IRGeneratorVisitor*, node: LambdaExprNode*) -> void {
         const closure_ty: TypeRef = node.resolved_type;
         if (!closure_ty.is_valid()) {
             // Sema should have set this; if not, fall back to a null value
@@ -329,6 +330,6 @@ type struct LambdaEmitter {
         // Dispatch through the visitor so the existing StructLiteral
         // codegen path runs (alloca, GEP-store per field, set
         // state.last_value to the alloca address with last_is_lvalue=true).
-        lit.accept(visitor);
+        visitor.dispatch_node(lit);
     }
 }
