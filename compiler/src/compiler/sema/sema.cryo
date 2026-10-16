@@ -126,6 +126,7 @@ import compiler::types::checker::{ TypeChecker, TypeCheckResult, TypeCompatibili
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ AssocProjectionType, GenericParamType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::ownership::{ OwnershipQuery };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::resolver::{ ResolutionContext };
@@ -4033,6 +4034,18 @@ public:
             }
         }
         if (arr.repeat_count_expr != null) { this.resolve_expr(arr.repeat_count_expr); }
+        // `[value; n]` evaluates `value` once and stores it in every slot,
+        // so every slot would release the one value: the element must be a
+        // plain-copy type.  An element still written in a generic body's
+        // parameters is checked in each copy of the body.
+        if ((arr.repeat_count > 0 || arr.repeat_count_expr != null) && elem_type.is_valid()
+                && !this.symbolic.symbolic_type_unresolved(elem_type)
+                && !OwnershipQuery::is_copy(this.arena, this.ctx.generic_registry, this.intern, elem_type)) {
+            this.ctx.emit_error_at(ErrorCode::E0453_DOUBLE_FREE,
+                fmt::format("`[value; n]` stores one value in every slot, so its element must be a plain-copy type; `%s` is not, and the one value would be released once per slot",
+                    this.arena.resolve_display_name_short(elem_type)),
+                arr.span);
+        }
         if (!elem_type.is_valid() && this.state.expected_type.is_valid()
             && arr.elements.length == 0 && arr.repeat_count == 0 && arr.repeat_count_expr == null) {
             mut exp_t: Type* = this.arena.lookup(this.state.expected_type);
