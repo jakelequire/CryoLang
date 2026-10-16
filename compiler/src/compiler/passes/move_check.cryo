@@ -24,8 +24,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, sink, snapshot, source_span };
 import compiler::ast;
 import compiler::ast::{
-    ArgBinding, declaration, expression, node, NodeKind, pattern, PatternBinding,
-    PatternKind, statement
+    ArgBinding, declaration, expression, node, NodeKind, pattern, PatternBinding, statement
 };
 import compiler::lex;
 import compiler::lex::{ TokenType };
@@ -65,7 +64,7 @@ import compiler::ast::expression::{
     TryExprNode, TupleLiteralNode, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
-import compiler::ast::pattern::{ EnumPatternNode, MatchArmNode, PatternNode };
+import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::ast::statement::{
     BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
     LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
@@ -345,26 +344,26 @@ type struct MoveChecker {
     register_arm_pat_bindings(mut &this, arm: MatchArmNode*) -> void {
         if (arm == null) { return; }
         for (mut p: i64 = 0; p < arm.patterns.length; p++) {
-            const pat: PatternNode* = arm.patterns[p];
+            const pat: Pattern* = arm.patterns[p];
             if (pat == null) { continue; }
-            if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-                // The binding IS the subject, taken by value: giving it away
-                // twice releases it twice, as for a declared local, and a field
-                // moved out of it is refused as out of a payload, the subject's
-                // glue suppression being whole-value only.
-                if (this.require_identity(pat.binding_sym, pat.binding_name, pat.span)) {
-                    this.pat_binding_keys.push(pat.binding_sym.key());
-                    this.register_binding(pat.binding_sym, pat.binding_type,
-                                          pat.binding_name, pat.span);
+            match (pat.shape) {
+                PatternKind::Binding(b) => {
+                    // The binding IS the subject, taken by value: giving it away
+                    // twice releases it twice, as for a declared local, and a field
+                    // moved out of it is refused as out of a payload, the subject's
+                    // glue suppression being whole-value only.
+                    if (this.require_identity(b.binding_sym, b.name, pat.span)) {
+                        this.pat_binding_keys.push(b.binding_sym.key());
+                        this.register_binding(b.binding_sym, b.binding_type, b.name, pat.span);
+                    }
                 }
-                continue;
+                PatternKind::Enum(e) => { this.register_enum_pat_bindings(e); }
+                _ => { }
             }
-            if (pat.pattern_kind != PatternKind::Enum) { continue; }
-            this.register_enum_pat_bindings(pat as EnumPatternNode*);
         }
     }
 
-    register_enum_pat_bindings(mut &this, epat: EnumPatternNode*) -> void {
+    register_enum_pat_bindings(mut &this, epat: EnumPattern*) -> void {
         if (epat == null) { return; }
         for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
             const pb: PatternBinding* = epat.binding_at(pos);
@@ -378,10 +377,8 @@ type struct MoveChecker {
                 }
                 continue;
             }
-            const sub: PatternNode* = epat.sub_at(pos);
-            if (sub != null && sub.pattern_kind == PatternKind::Enum) {
-                this.register_enum_pat_bindings(sub as EnumPatternNode*);
-            }
+            const sub: Pattern* = epat.sub_at(pos);
+            if (sub != null) { this.register_enum_pat_bindings(sub.enum_payload()); }
         }
     }
 

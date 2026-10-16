@@ -44,7 +44,7 @@ import compiler::diag::{ diagnostic, ErrorCode, sink, snapshot, source_span };
 import compiler::ast;
 import compiler::ast::{
     ArgBinding, declaration, expression, LiteralKind, MemberPin, node, NodeKind, pattern,
-    PatternBinding, PatternKind, statement
+    PatternBinding, statement
 };
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
@@ -87,7 +87,7 @@ import compiler::ast::expression::{
     TryExprNode, TupleLiteralNode, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
-import compiler::ast::pattern::{ EnumPatternNode, MatchArmNode, PatternNode };
+import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::ast::statement::{
     BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
     LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
@@ -1533,21 +1533,24 @@ type struct DropInserter {
                                   proxy_ty: TypeRef, subject_id: u64) -> i64 {
         mut count: i64 = 0;
         for (mut p: i64 = 0; p < arm.patterns.length; p++) {
-            const pat: PatternNode* = arm.patterns[p];
+            const pat: Pattern* = arm.patterns[p];
             if (pat == null) { continue; }
-            if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-                // The binding is a copy of the whole subject: consuming it
-                // moves the subject, as consuming a payload does.
-                if (!this.require_identity(pat.binding_sym, pat.binding_name, pat.span)) { continue; }
-                this.register_param_type(pat.binding_name, pat.binding_sym, proxy_ty, pat.span);
-                this.link_payload.push(pat.binding_sym.key());
-                this.link_subject.push(subject_id);
-                count = count + 1;
-                continue;
+            match (pat.shape) {
+                PatternKind::Binding(b) => {
+                    // The binding is a copy of the whole subject: consuming it
+                    // moves the subject, as consuming a payload does.
+                    if (this.require_identity(b.binding_sym, b.name, pat.span)) {
+                        this.register_param_type(b.name, b.binding_sym, proxy_ty, pat.span);
+                        this.link_payload.push(b.binding_sym.key());
+                        this.link_subject.push(subject_id);
+                        count = count + 1;
+                    }
+                }
+                PatternKind::Enum(e) => {
+                    count = count + this.register_enum_pattern_bindings(e, proxy_ty, subject_id);
+                }
+                _ => { }
             }
-            if (pat.pattern_kind != PatternKind::Enum) { continue; }
-            count = count + this.register_enum_pattern_bindings(
-                pat as EnumPatternNode*, proxy_ty, subject_id);
         }
         return count;
     }
@@ -1556,7 +1559,7 @@ type struct DropInserter {
     /// consumption detection. Recurses into sub-patterns so a consumed
     /// nested binding (`Wrap(Inner(s))` then `s.drop()`) still suppresses the
     /// subject's drop glue and avoids a double-free.
-    register_enum_pattern_bindings(mut &this, epat: EnumPatternNode*,
+    register_enum_pattern_bindings(mut &this, epat: EnumPattern*,
                                    proxy_ty: TypeRef, subject_id: u64) -> i64 {
         mut count: i64 = 0;
         for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
@@ -1569,10 +1572,10 @@ type struct DropInserter {
                 count = count + 1;
                 continue;
             }
-            const sub: PatternNode* = epat.sub_at(pos);
-            if (sub != null && sub.pattern_kind == PatternKind::Enum) {
-                count = count + this.register_enum_pattern_bindings(
-                    sub as EnumPatternNode*, proxy_ty, subject_id);
+            const sub: Pattern* = epat.sub_at(pos);
+            const sub_enum: EnumPattern* = if (sub != null) { sub.enum_payload() } else { null };
+            if (sub_enum != null) {
+                count = count + this.register_enum_pattern_bindings(sub_enum, proxy_ty, subject_id);
             }
         }
         return count;

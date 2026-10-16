@@ -17,7 +17,7 @@
 namespace compiler::ast::walk;
 
 import compiler::ast;
-import compiler::ast::{ node, expression, statement, declaration, pattern, NodeKind, PatternKind };
+import compiler::ast::{ node, expression, statement, declaration, pattern, NodeKind };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureDeclNode, EnumDeclNode, EnumVariantNode,
     ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
@@ -34,7 +34,8 @@ import compiler::ast::expression::{
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{
-    DirectiveNode, EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode
+    BindingPattern, ConstantPattern, DirectiveNode, EnumPattern, LiteralPattern, MatchArmNode,
+    Pattern, PatternKind, RangePattern, StaticMatchArmNode
 };
 import compiler::ast::statement::{
     AsmBlockStmtNode, BlockStmtNode, BreakStmtNode, ContinueStmtNode, DeclStmtNode,
@@ -114,19 +115,10 @@ type trait Walk {
             NodeKind::MatchArm                  => { this.walk_match_arm(n as MatchArmNode*); }
             NodeKind::StaticMatchArm            => { this.walk_static_match_arm(n as StaticMatchArmNode*); }
             NodeKind::Directive                 => { this.walk_directive(n as DirectiveNode*); }
-            NodeKind::Pattern                   => {
-                const p: PatternNode* = n as PatternNode*;
-                if (p.pattern_kind == PatternKind::Enum) {
-                    this.walk_enum_pattern(p as EnumPatternNode*);
-                } else {
-                    this.walk_pattern(p);
-                }
-            }
+            NodeKind::Pattern                   => { this.walk_pattern(n as Pattern*); }
 
-            // Category and placeholder kinds that no node is built with; an
-            // enum pattern is a `Pattern` whose `pattern_kind` says so.
-            NodeKind::EnumPattern               => { }
-            NodeKind::Expression                => { }
+            // Category and placeholder kinds that no node is built with.
+            NodeKind::Expression               => { }
             NodeKind::Statement                 => { }
             NodeKind::Declaration               => { }
             NodeKind::AsyncExpression           => { }
@@ -230,8 +222,24 @@ type trait Walk {
     walk_static_match_arm(mut &this, n: StaticMatchArmNode*) -> void {
         StaticMatchArmNode::walk_children(n, this);
     }
-    walk_pattern(mut &this, n: PatternNode*) -> void { }
-    walk_enum_pattern(mut &this, n: EnumPatternNode*) -> void { EnumPatternNode::walk_children(n, this); }
+
+    /// A pattern, dispatched on its kind.
+    walk_pattern(mut &this, p: Pattern*) -> void {
+        match (p.shape) {
+            PatternKind::Wildcard    => { this.walk_wildcard_pattern(p); }
+            PatternKind::Literal(n)  => { this.walk_literal_pattern(p, n); }
+            PatternKind::Range(n)    => { this.walk_range_pattern(p, n); }
+            PatternKind::Binding(n)  => { this.walk_binding_pattern(p, n); }
+            PatternKind::Constant(n) => { this.walk_constant_pattern(p, n); }
+            PatternKind::Enum(n)     => { this.walk_enum_pattern(p, n); }
+        }
+    }
+    walk_wildcard_pattern(mut &this, p: Pattern*) -> void { }
+    walk_literal_pattern(mut &this, p: Pattern*, n: LiteralPattern*) -> void { }
+    walk_range_pattern(mut &this, p: Pattern*, n: RangePattern*) -> void { }
+    walk_binding_pattern(mut &this, p: Pattern*, n: BindingPattern*) -> void { }
+    walk_constant_pattern(mut &this, p: Pattern*, n: ConstantPattern*) -> void { }
+    walk_enum_pattern(mut &this, p: Pattern*, n: EnumPattern*) -> void { EnumPattern::walk_children(n, this); }
     walk_directive(mut &this, n: DirectiveNode*) -> void { }
 }
 
@@ -565,11 +573,5 @@ implement class MatchArmNode {
 implement class StaticMatchArmNode {
     static walk_children<V>(n: StaticMatchArmNode*, v: mut &V) -> void where V: Walk {
         v.walk_stmt(n.body);
-    }
-}
-
-implement class EnumPatternNode {
-    static walk_children<V>(n: EnumPatternNode*, v: mut &V) -> void where V: Walk {
-        for (mut i: i64 = 0; i < n.elements.length; i++) { v.walk_node(n.sub_at(i) as ASTNode*); }
     }
 }

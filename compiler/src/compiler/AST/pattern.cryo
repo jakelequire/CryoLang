@@ -1,13 +1,13 @@
 /// AST Pattern & Miscellaneous Nodes
 ///
-/// PatternNode, EnumPatternNode, MatchArmNode, and DirectiveNode.
+/// Pattern, MatchArmNode, StaticMatchArmNode and DirectiveNode.
 
 namespace compiler::ast::pattern;
 
 import compiler::diag;
 import compiler::ast;
 import compiler::ast::{
-    LiteralKind, MemberPin, NodeKind, PatternBinding, PatternElement, PatternKind, TypeAnnotation
+    LiteralKind, MemberPin, NodeKind, PatternBinding, PatternElement, TypeAnnotation
 };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
@@ -16,6 +16,8 @@ import compiler::ast::statement;
 import compiler::ast::statement::{ StatementNode };
 import compiler::ast::expression;
 import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::walk::{ Walk };
+import compiler::codegen::ast_arena::{ cryo_ast_arena_alloc };
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
@@ -28,89 +30,146 @@ import std::fmt;
 import compiler::ast::node::{ ASTNode };
 import utils::keyword::{ Keyword };
 
-type class PatternNode : ASTNode {
+
+/// Every pattern: the node header, and which kind of pattern it is.
+///
+/// The header is still an `ASTNode`, so a pattern travels wherever any node
+/// does (the binding table, the editor's node at a position) until those
+/// handles are a `Node`; its kind is `shape` because `kind` is the header's
+/// `NodeKind`.
+type class Pattern : ASTNode {
 public:
-    pattern_kind: PatternKind;
+    shape: PatternKind;
+
+    Pattern(shape: PatternKind, span: SourceSpan) : ASTNode(NodeKind::Pattern, span) {
+        this.shape = shape;
+    }
+
+    /// `_`.
+    static wildcard(span: SourceSpan) -> Pattern* {
+        return new Pattern(PatternKind::Wildcard, span);
+    }
+
+    /// A literal whose text is `value`; `literal_kind` says which literal
+    /// the text spells.
+    static literal(value: SymbolStr, literal_kind: LiteralKind, span: SourceSpan) -> Pattern* {
+        return new Pattern(PatternKind::Literal(LiteralPattern::new(value, literal_kind)), span);
+    }
+
+    /// A name, binding the whole subject; name resolution turns it into a
+    /// `Constant` when the name is a constant's.
+    static binding(name: SymbolStr, span: SourceSpan) -> Pattern* {
+        return new Pattern(PatternKind::Binding(BindingPattern::new(name)), span);
+    }
+
+    /// `Enum::Variant`, with no elements yet.
+    static enum_variant(enum_name: SymbolStr, variant_name: SymbolStr, span: SourceSpan) -> Pattern* {
+        return new Pattern(PatternKind::Enum(EnumPattern::new(enum_name, variant_name, span)), span);
+    }
+
+    /// The enum pattern this is, or null for another kind.
+    enum_payload(&this) -> EnumPattern* {
+        return match (this.shape) {
+            PatternKind::Enum(e) => { e }
+            _                    => { null }
+        };
+    }
+
+    /// Whether this pattern accepts every value without a test: `_`, or a
+    /// name that binds.
+    is_irrefutable(&this) -> boolean {
+        return match (this.shape) {
+            PatternKind::Wildcard   => { true }
+            PatternKind::Binding(_) => { true }
+            _                       => { false }
+        };
+    }
+}
+
+/// What a pattern is, one variant per kind.
+type enum PatternKind {
+    Wildcard;
+    Literal(LiteralPattern*);
+    Range(RangePattern*);
+    Binding(BindingPattern*);
+    Constant(ConstantPattern*);
+    Enum(EnumPattern*);
+}
+
+/// A literal pattern: `value` is the literal's text.  Which literal that is
+/// cannot be recovered from the text - `0` and `'0'` both intern to "0", and
+/// `true` / `false` to "true" / "false" - so `literal_kind` says it, and
+/// codegen emits the constant it names.
+type struct LiteralPattern {
     value:        SymbolStr;
-    binding_name: SymbolStr;
-    /// For `PatternKind::Literal` patterns only: which kind of literal the
-    /// `value` text denotes.  This disambiguation cannot be recovered from
-    /// the text; `0` (the integer) and `'0'` (the char) both intern to
-    /// the string "0", and `true` / `false` intern to "true" / "false";
-    /// so codegen relies on this field to emit the right constant instead
-    /// of guessing.  Defaults to `Integer`; unused for non-Literal kinds.
     literal_kind: LiteralKind;
-    /// For `PatternKind::Range` patterns only: the interned text of the
-    /// *high* bound (`lo..hi`, inclusive).  The low bound reuses `value`
-    /// and both bounds share `literal_kind` (a range is `char`-vs-`char`
-    /// or `int`-vs-`int`).  Empty / unused for every other pattern kind.
-    high_value:   SymbolStr;
-    /// For an `Identifier` pattern that names a CONSTANT (`value` set,
-    /// `binding_name` cleared): what that constant is, stamped by
-    /// NameResolution from the scope the pattern was written in - a
-    /// module-level constant by its canonical name, a local one as the
-    /// local it is.  Codegen compares the subject against the value this
-    /// names; the leaf alone cannot say which module's constant that is.
-    /// Unanswered for every other pattern kind.
-    const_res:    ResSlot;
-    /// For an `Identifier` pattern that BINDS (`binding_name` set): the
-    /// binding the name layer declared for it, and the payload of every
+
+    static new(value: SymbolStr, literal_kind: LiteralKind) -> LiteralPattern* {
+        return new LiteralPattern { value: value, literal_kind: literal_kind };
+    }
+}
+
+/// An inclusive range `low..high` (or `low..=high`).  Both bounds are the
+/// same kind of literal, integer or char, so they share `literal_kind`.
+type struct RangePattern {
+    low:          SymbolStr;
+    high:         SymbolStr;
+    literal_kind: LiteralKind;
+
+    static new(low: SymbolStr, high: SymbolStr, literal_kind: LiteralKind) -> RangePattern* {
+        return new RangePattern { low: low, high: high, literal_kind: literal_kind };
+    }
+}
+
+/// A name that binds the whole subject.
+type struct BindingPattern {
+    name:         SymbolStr;
+    /// The binding the name layer declared for it, and the payload of every
     /// `Res::Local` stamped on a use of it.  The binding is the whole
     /// subject, so a pass that tracks ownership keys it here and links it to
     /// the subject exactly as it does an enum payload; without it `y =>
     /// { consume(y); }` gives the subject away with nobody seeing it, and the
-    /// subject is released again at its scope exit.  Invalid for every other
-    /// pattern kind.
+    /// subject is released again at its scope exit.
     binding_sym:  SymbolID;
     /// The binding's type, as sema bound it against the subject.  Invalid
     /// until sema walks the arm; a clone is typed when its own body is
     /// checked.
     binding_type: TypeRef;
 
-    PatternNode(span: SourceSpan) : ASTNode(NodeKind::Pattern, span) {
-        this.pattern_kind = PatternKind::Wildcard;
-        this.value        = SymbolStr::empty();
-        this.binding_name = SymbolStr::empty();
-        this.literal_kind = LiteralKind::Integer;
-        this.high_value   = SymbolStr::empty();
-        this.const_res    = ResSlot::Pending;
-        this.binding_sym  = SymbolID::invalid();
-        this.binding_type = TypeRef::invalid();
+    static new(name: SymbolStr) -> BindingPattern* {
+        return new BindingPattern {
+            name:         name,
+            binding_sym:  SymbolID::invalid(),
+            binding_type: TypeRef::invalid(),
+        };
     }
-
-    PatternNode(kind: PatternKind, span: SourceSpan) : ASTNode(NodeKind::Pattern, span) {
-        this.pattern_kind = kind;
-        this.value        = SymbolStr::empty();
-        this.binding_name = SymbolStr::empty();
-        this.literal_kind = LiteralKind::Integer;
-        this.high_value   = SymbolStr::empty();
-        this.const_res    = ResSlot::Pending;
-        this.binding_sym  = SymbolID::invalid();
-        this.binding_type = TypeRef::invalid();
-    }
-
-    /// Record what the constant this pattern names refers to.  First answer
-    /// wins.
-    set_const_res(r: Res) -> void {
-        this.const_res.answer(r);
-    }
-
-    set_pattern_kind(k: PatternKind) -> void  { this.pattern_kind = k; }
-    set_value(v: SymbolStr) -> void           { this.value = v; }
-    set_binding_name(n: SymbolStr) -> void    { this.binding_name = n; }
-    set_literal_kind(k: LiteralKind) -> void  { this.literal_kind = k; }
-    set_high_value(v: SymbolStr) -> void      { this.high_value = v; }
 }
 
-type class EnumPatternNode : PatternNode {
-public:
+/// A name that is a constant's: the subject is compared against the
+/// constant's value.  Name resolution makes one from a `Binding` whose name
+/// it finds bound to a constant.
+type struct ConstantPattern {
+    name: SymbolStr;
+    /// What the constant is, stamped by NameResolution from the scope the
+    /// pattern was written in - a module-level constant by its canonical
+    /// name, a local one as the local it is.  The leaf alone cannot say
+    /// which module's constant that is.
+    res:  ResSlot;
+
+    static new(name: SymbolStr) -> ConstantPattern* {
+        return new ConstantPattern { name: name, res: ResSlot::Pending };
+    }
+}
+
+/// `Enum::Variant` or `Enum::Variant(elements)`.
+type struct EnumPattern {
     enum_name:    SymbolStr;
     variant_name: SymbolStr;
     elements:     [PatternElement];
     // Per-segment spans so tooling (LSP hover) can tell the cursor apart on
     // the enum-path side (`Option` in `Option::Some`) from the variant side
-    // (`Some`).  Default to the whole `span`; `parse_enum_pattern_internal`
-    // overrides them for real source.
+    // (`Some`).  Default to the whole pattern's span;
+    // `parse_enum_pattern_internal` overrides them for real source.
     enum_span:    SourceSpan;
     variant_span: SourceSpan;
 
@@ -131,47 +190,47 @@ public:
     /// carriage rule.
     pin_carried: boolean;
 
-    EnumPatternNode(span: SourceSpan) : PatternNode(PatternKind::Enum, span) {
-        this.enum_name       = SymbolStr::empty();
-        this.variant_name    = SymbolStr::empty();
-        this.elements        = [];
-        this.enum_span       = span;
-        this.variant_span    = span;
-        this.res             = ResSlot::Pending;
-        this.resolved_member = MemberPin::None;
-        this.pin_carried     = false;
+    static new(enum_name: SymbolStr, variant_name: SymbolStr, span: SourceSpan) -> EnumPattern* {
+        return new EnumPattern {
+            enum_name:       enum_name,
+            variant_name:    variant_name,
+            elements:        [],
+            enum_span:       span,
+            variant_span:    span,
+            res:             ResSlot::Pending,
+            resolved_member: MemberPin::None,
+            pin_carried:     false,
+        };
     }
 
     /// Record what the pattern's enum name refers to.  First answer wins.
-    set_res(r: Res) -> void {
+    set_res(mut &this, r: Res) -> void {
         this.res.answer(r);
     }
 
-    set_resolved_member(pin: MemberPin) -> void {
+    set_resolved_member(mut &this, pin: MemberPin) -> void {
         this.resolved_member = pin;
         this.pin_carried     = false;
     }
 
     /// Keep the pin a clone inherited and mark it carried.
-    carry_resolved_member() -> void {
+    carry_resolved_member(mut &this) -> void {
         this.pin_carried = this.resolved_member.is_some();
     }
 
-    set_enum_name(n: SymbolStr) -> void    { this.enum_name = n; }
-    set_variant_name(n: SymbolStr) -> void { this.variant_name = n; }
-    set_segment_spans(enum_span: SourceSpan, variant_span: SourceSpan) -> void {
+    set_segment_spans(mut &this, enum_span: SourceSpan, variant_span: SourceSpan) -> void {
         this.enum_span    = enum_span;
         this.variant_span = variant_span;
     }
 
-    add_element(elem: PatternElement) -> void {
+    add_element(mut &this, elem: PatternElement) -> void {
         this.elements.push(elem);
     }
 
     /// Returns the binding at element-position `i`, or null if that element
     /// is not a binding. Sema, codegen, and the monomorphizer iterate
     /// `elements` and call this to grab the name+span for binding registration.
-    binding_at(i: i64) -> PatternBinding* {
+    binding_at(&this, i: i64) -> PatternBinding* {
         if (i < 0 || i >= this.elements.length) { return null; }
         return match (this.elements[i]) {
             PatternElement::Binding(pb) => { pb }
@@ -181,12 +240,11 @@ public:
 
     /// Returns the nested sub-pattern at element-position `i` (for
     /// `Some(Some(n))`-style nesting), or null when that element is a leaf
-    /// (binding / wildcard / literal). The pattern is stored opaquely as
-    /// `void*` in the AST root module; cast it back here.
-    sub_at(i: i64) -> PatternNode* {
+    /// (binding / wildcard / literal).
+    sub_at(&this, i: i64) -> Pattern* {
         if (i < 0 || i >= this.elements.length) { return null; }
         return match (this.elements[i]) {
-            PatternElement::Sub(ps) => { ps.pattern as PatternNode* }
+            PatternElement::Sub(ps) => { ps.pattern }
             _                       => { null }
         };
     }
@@ -194,7 +252,7 @@ public:
     /// True if this pattern introduces any bindings - directly (a `Binding`
     /// element) or through a nested sub-pattern. Codegen uses this to decide
     /// whether to walk payloads for binding extraction.
-    has_bindings() -> boolean {
+    has_bindings(&this) -> boolean {
         for (mut i: i64 = 0; i < this.elements.length; i++) {
             match (this.elements[i]) {
                 PatternElement::Binding(_) => { return true; }
@@ -204,11 +262,48 @@ public:
         }
         return false;
     }
+
+    /// Visit the nested sub-patterns in source order.
+    static walk_children<V>(n: EnumPattern*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.elements.length; i++) { v.walk_node(n.sub_at(i)); }
+    }
+}
+
+/// `new` of a pattern payload takes its storage from the AST arena, as the
+/// header's does.
+implement trait Allocate for struct LiteralPattern {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct RangePattern {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct BindingPattern {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct ConstantPattern {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct EnumPattern {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
 }
 
 type class MatchArmNode : ASTNode {
 public:
-    patterns: [PatternNode*];
+    patterns: [Pattern*];
     body:     StatementNode*;
     /// Optional pattern guard: `pattern if (cond) => body`. When non-null,
     /// the arm matches only if every pattern matches AND `guard` evaluates
@@ -223,7 +318,7 @@ public:
         this.guard    = null;
     }
 
-    add_pattern(pat: PatternNode*) -> void {
+    add_pattern(pat: Pattern*) -> void {
         this.patterns.push(pat);
     }
 

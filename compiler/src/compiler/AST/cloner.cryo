@@ -15,8 +15,9 @@ import compiler::diag;
 import compiler::ast;
 import compiler::ast::{
     declaration, expression, node, NodeKind, pattern, PatternBinding, PatternElement,
-    PatternKind, PatternSub, statement, TypeAnnotation
+    PatternSub, statement, TypeAnnotation
 };
+import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::type_ref;
@@ -38,8 +39,8 @@ import compiler::ast::expression::{
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{
-    DirectiveArg, DirectiveArgKind, DirectiveNode, EnumPatternNode, MatchArmNode,
-    PatternNode, StaticMatchArmNode
+    BindingPattern, ConstantPattern, DirectiveArg, DirectiveArgKind, DirectiveNode, EnumPattern,
+    LiteralPattern, MatchArmNode, Pattern, PatternKind, RangePattern, StaticMatchArmNode
 };
 import compiler::ast::statement::{
     AsmBlockStmtNode, AsmOperand, AsmPiece, BlockStmtNode, BreakStmtNode, ContinueStmtNode,
@@ -182,10 +183,10 @@ type struct ASTCloner {
             NodeKind::MatchArm                  => { return this.visit_match_arm(n as MatchArmNode*); }
             NodeKind::StaticMatchArm            => { return this.visit_static_match_arm(n as StaticMatchArmNode*); }
             NodeKind::Directive                 => { return this.visit_directive(n as DirectiveNode*); }
-            NodeKind::Pattern                   => { return this.clone_pattern(n as PatternNode*); }
+            NodeKind::Pattern                   => { return this.clone_pattern(n as Pattern*); }
 
             // Kinds no node is built with.
-            NodeKind::EnumPattern | NodeKind::Expression | NodeKind::Statement
+            NodeKind::Expression | NodeKind::Statement
             | NodeKind::Declaration | NodeKind::AsyncExpression | NodeKind::Unknown => { return null; }
         }
     }
@@ -1215,30 +1216,14 @@ type struct ASTCloner {
         return c;
     }
 
-    visit_pattern(mut &this, node: PatternNode*) -> ASTNode* {
-        mut c: PatternNode* = new PatternNode(node.pattern_kind, node.span);
-        c.value        = node.value;
-        c.binding_name = node.binding_name;
-        c.literal_kind = node.literal_kind;
-        c.high_value   = node.high_value;
-        c.const_res    = node.const_res;
-        c.binding_sym  = node.binding_sym;
-        c.has_error    = node.has_error;
-        return c;
-    }
-
-    visit_enum_pattern(mut &this, node: EnumPatternNode*) -> ASTNode* {
-        mut c: EnumPatternNode* = new EnumPatternNode(node.span);
-        c.value        = node.value;
-        c.binding_name = node.binding_name;
-        c.literal_kind = node.literal_kind;
-        c.high_value   = node.high_value;
-        c.enum_name       = node.enum_name;
-        c.variant_name    = node.variant_name;
+    /// A copy of the enum pattern `node`; its segment spans are the whole
+    /// pattern's span.
+    clone_enum_pattern(mut &this, node: EnumPattern*, span: SourceSpan) -> EnumPattern* {
+        mut c: EnumPattern* = EnumPattern::new(node.enum_name, node.variant_name, span);
         c.res             = node.res;
         c.resolved_member = node.resolved_member;
         c.pin_carried     = node.pin_carried;
-        // Deep-clone the elements. A `Sub` element OWNS a nested PatternNode
+        // Deep-clone the elements. A `Sub` element OWNS a nested Pattern
         // that the substituter rewrites in place, so two specializations must
         // not alias it. (Before this, nested patterns like `Some(Some(n))`
         // aliased the template and skipped substitution -> a generic body
@@ -1264,7 +1249,7 @@ type struct ASTCloner {
                         span:    sub.span,
                     };
                     if (sub.pattern != null) {
-                        ns.pattern = this.clone_pattern(sub.pattern as PatternNode*) as void*;
+                        ns.pattern = this.clone_pattern(sub.pattern);
                     }
                     new_elems.push(PatternElement::Sub(ns));
                 }
@@ -1281,8 +1266,7 @@ type struct ASTCloner {
                 _ => { new_elems.push(el); }
             }
         }
-        c.elements     = new_elems;
-        c.has_error    = node.has_error;
+        c.elements = new_elems;
         return c;
     }
 
@@ -1433,12 +1417,28 @@ type struct ASTCloner {
     }
 
     /// Clone a single pattern node.
-    clone_pattern(mut &this, pat: PatternNode*) -> PatternNode* {
+    clone_pattern(mut &this, pat: Pattern*) -> Pattern* {
         if (pat == null) { return null; }
-        if (pat.pattern_kind == PatternKind::Enum) {
-            return this.visit_enum_pattern(pat as EnumPatternNode*) as PatternNode*;
-        }
-        return this.visit_pattern(pat) as PatternNode*;
+        const shape: PatternKind = match (pat.shape) {
+            PatternKind::Wildcard    => { PatternKind::Wildcard }
+            PatternKind::Literal(n)  => { PatternKind::Literal(LiteralPattern::new(n.value, n.literal_kind)) }
+            PatternKind::Range(n)    => { PatternKind::Range(RangePattern::new(n.low, n.high, n.literal_kind)) }
+            PatternKind::Binding(n)  => {
+                // A clone is typed when its own body is checked.
+                mut b: BindingPattern* = BindingPattern::new(n.name);
+                b.binding_sym = n.binding_sym;
+                PatternKind::Binding(b)
+            }
+            PatternKind::Constant(n) => {
+                mut k: ConstantPattern* = ConstantPattern::new(n.name);
+                k.res = n.res;
+                PatternKind::Constant(k)
+            }
+            PatternKind::Enum(n)     => { PatternKind::Enum(this.clone_enum_pattern(n, pat.span)) }
+        };
+        mut c: Pattern* = new Pattern(shape, pat.span);
+        c.has_error = pat.has_error;
+        return c;
     }
 
     /// Clone a MatchArmNode.

@@ -21,7 +21,7 @@ import lsp::protocol::conv;
 
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast;
-import compiler::ast::{ MemberPin, NamedAnnotation, NodeKind, PatternElement, PatternKind, TypeAnnotation };
+import compiler::ast::{ MemberPin, NamedAnnotation, NodeKind, PatternElement, TypeAnnotation };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::node_locator;
 import compiler::ast::node_locator::{ NodeLocator };
@@ -35,7 +35,7 @@ import compiler::ast::expression::{
     CallExprNode, CalleePin, CastExprNode, ExpressionNode, IdentifierNode, MemberAccessNode,
     NewExprNode, ScopeResolutionNode, StructLiteralNode
 };
-import compiler::ast::pattern::{ EnumPatternNode, PatternNode };
+import compiler::ast::pattern::{ EnumPattern, Pattern, PatternKind };
 import compiler::decl_index::{ DeclarationIndex, OverloadId };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::res::{ DefId, DefKind, Res, ResBase, ResSlot };
@@ -281,8 +281,7 @@ type struct Locator {
             NodeKind::CastExpression => {
                 return this.annotation((n as CastExprNode*).target_annotation);
             }
-            NodeKind::Pattern => { return this.pattern(n as PatternNode*); }
-            NodeKind::EnumPattern => { return this.pattern(n as PatternNode*); }
+            NodeKind::Pattern => { return this.pattern(n as Pattern*); }
             NodeKind::VariableDeclaration => { return this.var_decl(n as VarDeclNode*); }
             NodeKind::FunctionDeclaration => {
                 const f: FunctionDeclNode* = n as FunctionDeclNode*;
@@ -521,47 +520,50 @@ type struct Locator {
 
     // -- Patterns --
 
-    pattern(&this, p: PatternNode*) -> Answer {
-        const at: SourceSpan = (p as ASTNode*).span;
-        if ((p as ASTNode*).kind == NodeKind::EnumPattern) {
-            const ep: EnumPatternNode* = p as EnumPatternNode*;
-            if (this.holds(ep.enum_span)) {
-                return Answer::of(this.res_target(&ep.res), ep.enum_span, TypeRef::invalid());
+    pattern(&this, p: Pattern*) -> Answer {
+        const at: SourceSpan = p.span;
+        match (p.shape) {
+            PatternKind::Binding(b) => {
+                return Answer::of(Target::Local(b.binding_sym), at, b.binding_type);
             }
-            if (this.holds(ep.variant_span)) {
-                match (&ep.resolved_member) {
-                    MemberPin::Variant(ord) => {
-                        const owner: DefId = this.res_def(&ep.res);
-                        if (owner.is_valid()) {
-                            return Answer::of(Target::Variant(owner, ord), ep.variant_span, TypeRef::invalid());
-                        }
-                    }
-                    _ => { }
-                }
-                return Answer::nothing();
+            PatternKind::Constant(c) => {
+                return Answer::of(this.res_target(&c.res), at, TypeRef::invalid());
             }
-            for (mut i: i64 = 0; i < ep.elements.length; i++) {
-                match (ep.elements[i]) {
-                    PatternElement::Binding(b) => {
-                        if (b != null && this.holds(b.span)) {
-                            return Answer::of(Target::Local(b.sym_id), b.span, b.resolved_type);
-                        }
+            PatternKind::Enum(ep) => { return this.enum_pattern(ep); }
+            _ => { return Answer::nothing(); }
+        }
+    }
+
+    enum_pattern(&this, ep: EnumPattern*) -> Answer {
+        if (this.holds(ep.enum_span)) {
+            return Answer::of(this.res_target(&ep.res), ep.enum_span, TypeRef::invalid());
+        }
+        if (this.holds(ep.variant_span)) {
+            match (&ep.resolved_member) {
+                MemberPin::Variant(ord) => {
+                    const owner: DefId = this.res_def(&ep.res);
+                    if (owner.is_valid()) {
+                        return Answer::of(Target::Variant(owner, ord), ep.variant_span, TypeRef::invalid());
                     }
-                    PatternElement::Sub(s) => {
-                        if (s != null && this.holds(s.span)) {
-                            return this.pattern(s.pattern as PatternNode*);
-                        }
-                    }
-                    _ => { }
                 }
+                _ => { }
             }
             return Answer::nothing();
         }
-        if (p.binding_name.is_valid()) {
-            return Answer::of(Target::Local(p.binding_sym), at, p.binding_type);
-        }
-        if (p.pattern_kind == PatternKind::Identifier) {
-            return Answer::of(this.res_target(&p.const_res), at, TypeRef::invalid());
+        for (mut i: i64 = 0; i < ep.elements.length; i++) {
+            match (ep.elements[i]) {
+                PatternElement::Binding(b) => {
+                    if (b != null && this.holds(b.span)) {
+                        return Answer::of(Target::Local(b.sym_id), b.span, b.resolved_type);
+                    }
+                }
+                PatternElement::Sub(s) => {
+                    if (s != null && this.holds(s.span)) {
+                        return this.pattern(s.pattern);
+                    }
+                }
+                _ => { }
+            }
         }
         return Answer::nothing();
     }

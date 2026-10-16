@@ -11,8 +11,7 @@ import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, LiteralKind, node, pattern, PatternKind, statement,
-    TypeAnnotation, walk
+    declaration, expression, LiteralKind, node, pattern, statement, TypeAnnotation, walk
 };
 import compiler::resolver::{ symbol_str, intern_table };
 import std::fmt;
@@ -33,8 +32,8 @@ import compiler::ast::expression::{
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{
-    DirectiveArg, DirectiveNode, EnumPatternNode, MatchArmNode, PatternNode,
-    StaticMatchArmNode
+    BindingPattern, ConstantPattern, DirectiveArg, DirectiveNode, EnumPattern, LiteralPattern,
+    MatchArmNode, Pattern, RangePattern, StaticMatchArmNode
 };
 import compiler::ast::statement::{
     AsmBlockStmtNode, AsmOperand, BlockStmtNode, BreakStmtNode, ContinueStmtNode,
@@ -188,6 +187,22 @@ type struct ASTDumper {
         this.push_level(is_last);
         this.walk_node(node);
         this.pop_level();
+    }
+
+    /// A leaf pattern's line: its kind's label, then `value` and a range's
+    /// `high` bound where the kind has them.
+    print_pattern(mut &this, p: Pattern*, label: string, value: SymbolStr, high: SymbolStr) -> void {
+        this.print_prefix();
+        fmt::printf("\x1b[1;36mPattern\x1b[0m");
+        this.print_location(p.span);
+        fmt::printf(" %s", label);
+        if (value.is_valid()) {
+            fmt::printf(" '%s'", this.resolve(value));
+        }
+        if (high.is_valid()) {
+            fmt::printf("..'%s'", this.resolve(high));
+        }
+        fmt::printf("\n");
     }
 }
 
@@ -1238,34 +1253,32 @@ implement trait Walk for struct ASTDumper {
         }
     }
 
-    walk_pattern(mut &this, node: PatternNode*) -> void {
-        this.print_prefix();
-        fmt::printf("\x1b[1;36mPattern\x1b[0m");
-        this.print_location(node.span);
-
-        match (node.pattern_kind) {
-            PatternKind::Literal    => { fmt::printf(" literal"); }
-            PatternKind::Identifier => { fmt::printf(" identifier"); }
-            PatternKind::Wildcard   => { fmt::printf(" wildcard"); }
-            PatternKind::Enum       => { fmt::printf(" enum"); }
-            PatternKind::Range      => { fmt::printf(" range"); }
-        }
-
-        if (node.value.is_valid()) {
-            fmt::printf(" '%s'", this.resolve(node.value));
-        }
-        if (node.pattern_kind == PatternKind::Range && node.high_value.is_valid()) {
-            fmt::printf("..'%s'", this.resolve(node.high_value));
-        }
-        fmt::printf("\n");
+    walk_wildcard_pattern(mut &this, p: Pattern*) -> void {
+        this.print_pattern(p, "wildcard", SymbolStr::empty(), SymbolStr::empty());
     }
 
-    walk_enum_pattern(mut &this, node: EnumPatternNode*) -> void {
+    walk_literal_pattern(mut &this, p: Pattern*, n: LiteralPattern*) -> void {
+        this.print_pattern(p, "literal", n.value, SymbolStr::empty());
+    }
+
+    walk_range_pattern(mut &this, p: Pattern*, n: RangePattern*) -> void {
+        this.print_pattern(p, "range", n.low, n.high);
+    }
+
+    walk_binding_pattern(mut &this, p: Pattern*, n: BindingPattern*) -> void {
+        this.print_pattern(p, "identifier", SymbolStr::empty(), SymbolStr::empty());
+    }
+
+    walk_constant_pattern(mut &this, p: Pattern*, n: ConstantPattern*) -> void {
+        this.print_pattern(p, "identifier", n.name, SymbolStr::empty());
+    }
+
+    walk_enum_pattern(mut &this, p: Pattern*, n: EnumPattern*) -> void {
         this.print_prefix();
         fmt::printf("\x1b[1;36mEnumPattern\x1b[0m");
-        this.print_location(node.span);
-        if (node.enum_name.is_valid()) {
-            fmt::printf(" \x1b[1;37m'%s'::'%s'\x1b[0m", this.resolve(node.enum_name), this.resolve(node.variant_name));
+        this.print_location(p.span);
+        if (n.enum_name.is_valid()) {
+            fmt::printf(" \x1b[1;37m'%s'::'%s'\x1b[0m", this.resolve(n.enum_name), this.resolve(n.variant_name));
         }
         fmt::printf("\n");
     }

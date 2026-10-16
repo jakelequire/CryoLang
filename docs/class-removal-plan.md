@@ -13,7 +13,7 @@ and measured only; nothing in it was built except two throwaway probes
 (section 2.6).  The decisions it needs are in section 9; nothing in a slice
 that depends on one starts before it is answered.
 
-**Status.**  The 13 decisions in section 9 are answered.  Slices 0 to 4
+**Status.**  The 13 decisions in section 9 are answered.  Slices 0 to 5
 are built; their results are recorded under each slice in section 6.
 Every temporary bridge piece is listed in section 10 until it is deleted.
 
@@ -1158,6 +1158,21 @@ stays as a variant.
   with the bump allocator's 16-byte rounding on both.  Clean build 0
   warnings.  Classes 95 -> 69.
 
+**Deriving `kind` (decision 9, ruling 390): measured, not landed.**  With
+the stored field deleted and every read (1,130: 1,115 in the compiler, 15
+in the language server) turned into a `kind()` that matches on the data,
+verify was identical and `cryo check` on the compiler went from 8.01 s to
+9.20 s, and to 8.91 s with `kind()` and `TypeData::kind()` marked
+`![inline]` (the inline copies took: no call to `kind` was left in the
+callers' objects).  The cost is the `match` itself: a project build runs no
+LLVM pipeline, and code generation lowers a `match` on a tag to a chain of
+compares, not a `switch`, so each read walks up to 25 compares.  The field
+stays until that is answered (open question in the session's report).  The
+reads were found by deleting the field and the method together, so the
+type check refused each one (E0204); with a method named `kind` in place,
+a read written `t.kind` passes the type check and only code generation
+refuses it, one module at a time (logged as a bug).
+
 ### Slice 5: patterns (the pilot for node conversion)
 
 `PatternNode`/`EnumPatternNode` become `Pattern`/`PatternKind`.  It is
@@ -1174,6 +1189,82 @@ large categories.
   other categories here, before they start.
 - **Wrong if:** the extrapolated cost for expressions exceeds what question
   1 accepted.  Then stop and ask.
+
+**Built.**
+
+- `PatternKind` (in `AST/pattern.cryo`) is the pattern's kind with its
+  payload: `Wildcard`, `Literal(LiteralPattern*)`, `Range(RangePattern*)`,
+  `Binding(BindingPattern*)`, `Constant(ConstantPattern*)`,
+  `Enum(EnumPattern*)`.  The old flat `PatternNode` carried every kind's
+  fields and told a binding from a constant by which of two names was
+  empty; the payloads carry one kind's each.  A name is parsed as a
+  `Binding`, and name resolution replaces the shape with a `Constant` when
+  the name is a constant's, where it used to move the name between fields.
+- The header is `Pattern`, still a class deriving from `ASTNode`: the
+  binding table, the language server's node at a position and the lang-ref
+  list hold patterns as `ASTNode*`, and until that handle is `Node`
+  (slice 6's end) a pattern has to be one.  Its kind field is `shape`,
+  since `kind` is the header's `NodeKind`.  Both are bridge pieces
+  (section 10).  `PatternSub.pattern` is a typed `Pattern*`.
+- Each payload struct implements `Allocate` over the AST arena; factories
+  `Pattern::wildcard`, `literal`, `binding` and `enum_variant`; one
+  checked projection, `enum_payload()`, for the places that ask "is this an
+  enum pattern" of a nested pattern.  `EnumPattern::walk_children` is inline
+  in its body, the first bridge row's first deletion.
+- `Walk::walk_pattern` dispatches on the shape to one hook per kind; the
+  dumper overrides the five leaf hooks and prints exactly the lines it
+  printed before, the name resolver overrides `walk_binding_pattern`.
+- Consumers `match` on the shape.  Every place that tested
+  "`Identifier` with a binding name" reads `Binding`; the
+  wildcard-or-binding test is `Pattern::is_irrefutable`.
+- `NodeKind::EnumPattern`, which no node was ever built with, is deleted,
+  and the five tests against it now ask the shape, so their branches run
+  for the first time:
+  - the stamp checker checks an enum pattern's stamp and its nested
+    patterns.  Gate pair, by hand: with name resolution changed to leave an
+    enum pattern's stamp unanswered, the parent's compiler checked a match
+    over a payload enum as "No errors found."; this one refuses it,
+    "E0900: 354 written name(s) left name resolution with no answer;
+    first: enum pattern at src/main.cryo:10:9".  No committed test: the
+    check's test switch plants an identifier only.
+  - the lang-ref settling answers the `??` and `for` desugarings' patterns
+    with the language's `Option`, so a subject of a program's own enum with
+    `Some` and `None` variants is refused (E0200), as the spec's `??` is
+    defined over `Option<T>`; the parent built `a ?? 9` on such an enum by
+    matching the variant leaves.  New negative file
+    `E0200_coalesce_on_other_option.cryo` (declared in
+    `tests/started-passing`; the parent refused it as E0238 "expected
+    `i32`").
+  - the language server answers definition, hover and references on an
+    enum pattern: four new checks (189), each failing on the parent's
+    sources (definition of the enum and of the variant "got null", the
+    payload binding hovered as `const r: i64`, its references missing the
+    binding).
+- A one-off codemod (`scripts/pattern-codemod.py`) renamed `PatternNode`
+  to `Pattern`; `EnumPatternNode` was left undefined so the type check
+  pointed at each use, because its fields moved to a payload and a blind
+  rename would have turned its casts into pointer reinterpretation.
+- **Measured.**  verify `--require-identical`: 0 test and 0 example
+  objects moved.  The dumper's `--ast` output, parent against this
+  compiler, byte-identical over 1,053 files (every unit, negative and
+  example file; 5.6 GB of dumps); control: a dumper with the wildcard label
+  changed differs on all 163 files of `tests/tests/lang`.  Casts to a
+  pattern class 46 -> 6, each from an `ASTNode*` handle.  Check time x5
+  interleaved: 8.00 s and 8.01 s (medians); peak 1530.9 -> 1527.0 MiB.
+  Node allocations +75,353 (75,337 payloads for the 75,947 patterns that
+  are not wildcards, and 16 constants replacing bindings), node bytes
+  -3,032,648, arena -2,190,966.  The prediction said bytes up; they went
+  down because the flat header's every-kind fields (about 56 bytes) cost
+  more than the payload pointer and the second allocation.  Clean build 0
+  warnings.  Classes 69 -> 68.
+- **Extrapolation to the other categories.**  An expression, statement or
+  declaration class already holds only its kind's fields, so splitting it
+  saves nothing: the header gains the 16-byte kind enum, and the payload is
+  a second allocation the arena aligns to 16.  Over the compiler's
+  1,942,948 nodes that is about 31 MB more requested node bytes (+10%) and
+  about 15 MB of alignment, near +3% of the arena's 1.58 GB and of peak
+  memory; time measured flat for patterns.  Ruling 382 accepted the second
+  allocation without a bound, so this is reported, not stopped on.
 
 ### Slice 6: statements, declarations, expressions
 
@@ -1481,3 +1572,5 @@ final audit greps for each name listed and expects none.
 |---|---|---|---|
 | `implement class XNode { static walk_children ... }`, one per node class with children | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | each moves inline into its kind's payload struct body (ruling 397) as that category converts (slices 5-6); none left when the last category does |
 | `Walk::walk_node`'s `match (n.kind)` plus a cast per arm | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | becomes `walk_expr`/`walk_stmt`/... matching on `ExprKind` etc. as each category converts; deleted with `NodeKind` |
+| `Pattern` a class deriving from `ASTNode`, so an `ASTNode*` can hold it; the six `as Pattern*` casts from such handles (cloner, walker, lang-ref settling, three in the language server) | `compiler/src/compiler/AST/pattern.cryo` and the casts' files | slice 5 | the header becomes a struct when the "any node" handle is `Node` (slice 6, `Program` and `Node`); the casts become `Node::Pattern(p)` arms |
+| `Pattern.shape`, the pattern's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/pattern.cryo` | slice 5 | renamed `kind` when the header stops deriving from `ASTNode` |

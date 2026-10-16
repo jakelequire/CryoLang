@@ -36,7 +36,7 @@ import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast;
 import compiler::ast::{
     ArgBinding, ArrayAnnotation, cloner, declaration, expression, GenericAnnotation,
-    LiteralKind, MemberPin, NamedAnnotation, node, NodeKind, pattern, PatternBinding, PatternKind,
+    LiteralKind, MemberPin, NamedAnnotation, node, NodeKind, pattern, PatternBinding,
     PointerAnnotation, ProjectionAnnotation, ReferenceAnnotation, statement,
     TypeAnnotation, Visibility
 };
@@ -69,7 +69,7 @@ import compiler::ast::expression::{
     TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode };
-import compiler::ast::pattern::{ EnumPatternNode, MatchArmNode, PatternNode };
+import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::ast::statement::{
     BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
     LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
@@ -1628,9 +1628,8 @@ type struct AsyncLower {
     /// `LiteralKind::Integer`, no type suffix); the `u32` state type is inferred
     /// from the match subject, so the pattern text stays a bare integer.
     match_arm_int(&this, value: u64, body: BlockStmtNode*, span: SourceSpan) -> MatchArmNode* {
-        mut pat: PatternNode* = new PatternNode(PatternKind::Literal, span);
-        pat.set_value(this.intern.intern(fmt::format("%llu", value)));
-        pat.set_literal_kind(LiteralKind::Integer);
+        const pat: Pattern* = Pattern::literal(
+            this.intern.intern(fmt::format("%llu", value)), LiteralKind::Integer, span);
         mut arm: MatchArmNode* = new MatchArmNode(span);
         arm.add_pattern(pat);
         arm.set_body(body as StatementNode*);
@@ -1640,7 +1639,7 @@ type struct AsyncLower {
     /// A `match` arm `_ => { <body> }` (the wildcard, making the state dispatch
     /// exhaustive over the open `u32` domain).
     match_arm_wild(&this, body: BlockStmtNode*, span: SourceSpan) -> MatchArmNode* {
-        mut pat: PatternNode* = new PatternNode(PatternKind::Wildcard, span);
+        const pat: Pattern* = Pattern::wildcard(span);
         mut arm: MatchArmNode* = new MatchArmNode(span);
         arm.add_pattern(pat);
         arm.set_body(body as StatementNode*);
@@ -3695,22 +3694,25 @@ type struct AsyncLower {
         }
     }
 
-    collect_pat_bindings(mut &this, pat: PatternNode*, value_type: TypeRef,
+    collect_pat_bindings(mut &this, pat: Pattern*, value_type: TypeRef,
                          bs: BindingCapture*) -> void {
         if (pat == null) { return; }
-        if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-            bs.push_unique(pat.binding_sym, pat.binding_name, value_type);
-            return;
+        mut epat: EnumPattern* = null;
+        match (pat.shape) {
+            PatternKind::Binding(b) => {
+                bs.push_unique(b.binding_sym, b.name, value_type);
+                return;
+            }
+            PatternKind::Enum(e) => { epat = e; }
+            _ => { return; }
         }
-        if (pat.pattern_kind != PatternKind::Enum) { return; }
-        const epat: EnumPatternNode* = pat as EnumPatternNode*;
         const payloads: [TypeRef] = this.patterns.resolve_variant_payload_types(value_type, epat);
         for (mut j: i64 = 0; j < epat.elements.length; j++) {
             mut elem_ty: TypeRef = value_type;
             if (j < payloads.length && payloads[j].is_valid()) { elem_ty = payloads[j]; }
             const pb: PatternBinding* = epat.binding_at(j);
             if (pb != null && pb.name.is_valid()) { bs.push_unique(pb.sym_id, pb.name, elem_ty); continue; }
-            const sub: PatternNode* = epat.sub_at(j);
+            const sub: Pattern* = epat.sub_at(j);
             if (sub != null) { this.collect_pat_bindings(sub, elem_ty, bs); }
         }
     }
@@ -6408,19 +6410,21 @@ type struct AsyncLower {
 
     /// Collect the distinct bindings introduced by `pat` (a top-level
     /// identifier binding, an enum-variant payload binding, or a nested
-    /// sub-pattern) into `binds`. A const-value identifier pattern (its
-    /// `binding_name` was cleared by name resolution) introduces no binding.
-    collect_pat_binding_syms(&this, pat: PatternNode*, binds: ArmBindings*) -> void {
+    /// sub-pattern) into `binds`. A constant's name introduces no binding.
+    collect_pat_binding_syms(&this, pat: Pattern*, binds: ArmBindings*) -> void {
         if (pat == null) { return; }
-        if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-            if (!binds.holds(pat.binding_sym)) {
-                binds.syms.push(pat.binding_sym);
-                binds.names.push(pat.binding_name);
+        mut epat: EnumPattern* = null;
+        match (pat.shape) {
+            PatternKind::Binding(b) => {
+                if (!binds.holds(b.binding_sym)) {
+                    binds.syms.push(b.binding_sym);
+                    binds.names.push(b.name);
+                }
+                return;
             }
-            return;
+            PatternKind::Enum(e) => { epat = e; }
+            _ => { return; }
         }
-        if (pat.pattern_kind != PatternKind::Enum) { return; }
-        const epat: EnumPatternNode* = pat as EnumPatternNode*;
         for (mut j: i64 = 0; j < epat.elements.length; j++) {
             const pb: PatternBinding* = epat.binding_at(j);
             if (pb != null && pb.name.is_valid()) {
@@ -6430,23 +6434,26 @@ type struct AsyncLower {
                 }
                 continue;
             }
-            const sub: PatternNode* = epat.sub_at(j);
+            const sub: Pattern* = epat.sub_at(j);
             if (sub != null) { this.collect_pat_binding_syms(sub, binds); }
         }
     }
 
     /// Rewrite each binding name in `pat` to its binding's fresh name, in place
-    /// (mutating `PatternNode.binding_name` / `PatternBinding.name` through the
+    /// (mutating `BindingPattern.name` / `PatternBinding.name` through the
     /// AST node). The mirror of `collect_pat_binding_syms`.
-    rn_pat_apply(&this, pat: PatternNode*, map: RenameMap*) -> void {
+    rn_pat_apply(&this, pat: Pattern*, map: RenameMap*) -> void {
         if (pat == null) { return; }
-        if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-            const f: SymbolStr = map.fresh_of(pat.binding_sym);
-            if (f.is_valid()) { pat.set_binding_name(f); }
-            return;
+        mut epat: EnumPattern* = null;
+        match (pat.shape) {
+            PatternKind::Binding(b) => {
+                const f: SymbolStr = map.fresh_of(b.binding_sym);
+                if (f.is_valid()) { b.name = f; }
+                return;
+            }
+            PatternKind::Enum(e) => { epat = e; }
+            _ => { return; }
         }
-        if (pat.pattern_kind != PatternKind::Enum) { return; }
-        const epat: EnumPatternNode* = pat as EnumPatternNode*;
         for (mut j: i64 = 0; j < epat.elements.length; j++) {
             mut pb: PatternBinding* = epat.binding_at(j);
             if (pb != null && pb.name.is_valid()) {
@@ -6454,7 +6461,7 @@ type struct AsyncLower {
                 if (f.is_valid()) { pb.name = f; }
                 continue;
             }
-            const sub: PatternNode* = epat.sub_at(j);
+            const sub: Pattern* = epat.sub_at(j);
             if (sub != null) { this.rn_pat_apply(sub, map); }
         }
     }
@@ -6741,15 +6748,18 @@ type struct AsyncLower {
         this.rb_leave(ctx);
     }
 
-    rb_pattern(mut &this, ctx: RebindCtx*, pat: PatternNode*) -> void {
+    rb_pattern(mut &this, ctx: RebindCtx*, pat: Pattern*) -> void {
         if (pat == null) { return; }
-        if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-            if (!pat.binding_sym.is_valid()) { pat.binding_sym = this.resolver.alloc_synthetic_binding(); }
-            this.rb_bind(ctx, pat.binding_sym, pat.binding_sym);
-            return;
+        mut epat: EnumPattern* = null;
+        match (pat.shape) {
+            PatternKind::Binding(b) => {
+                if (!b.binding_sym.is_valid()) { b.binding_sym = this.resolver.alloc_synthetic_binding(); }
+                this.rb_bind(ctx, b.binding_sym, b.binding_sym);
+                return;
+            }
+            PatternKind::Enum(e) => { epat = e; }
+            _ => { return; }
         }
-        if (pat.pattern_kind != PatternKind::Enum) { return; }
-        const epat: EnumPatternNode* = pat as EnumPatternNode*;
         for (mut j: i64 = 0; j < epat.elements.length; j++) {
             mut pb: PatternBinding* = epat.binding_at(j);
             if (pb != null && pb.name.is_valid()) {
@@ -6757,7 +6767,7 @@ type struct AsyncLower {
                 this.rb_bind(ctx, pb.sym_id, pb.sym_id);
                 continue;
             }
-            const sub: PatternNode* = epat.sub_at(j);
+            const sub: Pattern* = epat.sub_at(j);
             if (sub != null) { this.rb_pattern(ctx, sub); }
         }
     }

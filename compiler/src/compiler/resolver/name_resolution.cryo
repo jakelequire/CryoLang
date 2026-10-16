@@ -26,7 +26,7 @@ import compiler::diag::diagnostic;
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::ast;
 import compiler::ast::{
-    GenericAnnotation, ImportStyle, NamedAnnotation, NodeKind, PatternBinding, PatternKind, ProjectionAnnotation,
+    GenericAnnotation, ImportStyle, NamedAnnotation, NodeKind, PatternBinding, ProjectionAnnotation,
     TraitBound, TraitRef, TypeAnnotation, Visibility, declaration, expression, node,
     pattern, statement
 };
@@ -56,7 +56,8 @@ import compiler::ast::expression::{
 };
 import compiler::ast::node::{ ASTNode, ProgramNode, StaticAssertItem };
 import compiler::ast::pattern::{
-    DirectiveArgKind, DirectiveNode, EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode
+    BindingPattern, ConstantPattern, DirectiveArgKind, DirectiveNode, EnumPattern, MatchArmNode,
+    Pattern, PatternKind, StaticMatchArmNode
 };
 import compiler::ast::statement::{
     AsmBlockStmtNode, AsmOperand, BlockStmtNode, DeclStmtNode, DoWhileStmtNode,
@@ -3843,42 +3844,37 @@ implement trait Walk for struct NameResolver {
         this.resolver.exit_scope();
     }
 
-    walk_pattern(mut &this, node: PatternNode*) -> void {
+    walk_binding_pattern(mut &this, p: Pattern*, node: BindingPattern*) -> void {
         // A bare identifier pattern is normally a fresh binding. But if the
         // name resolves to an existing `const`, it is a *value* pattern -
         // compare the subject against the constant - not a binding: a named
         // constant in a pattern is a value. Without this, a match
         // like `match (code) { ENOENT => ...; EAGAIN => ... }` silently treats
         // every const arm as a catch-all binding, so only the first arm ever
-        // runs. Reclassify by moving the name into `value` and clearing
-        // `binding_name`; downstream passes (sema, codegen) treat an Identifier
-        // pattern with no `binding_name` as a constant-value pattern.
-        if (node.pattern_kind == PatternKind::Identifier) {
-            const sym: SymbolID = this.resolver.lookup(
-                node.binding_name, this.resolver.current_scope);
-            if (sym.is_valid()
-                    && this.resolver.get_symbol(sym).kind == SymbolKind::Constant) {
-                this.resolver.record_resolution(node.span, sym);
-                node.set_value(node.binding_name);
-                node.set_binding_name(SymbolStr::empty());
-                // The same answer an identifier naming this constant gets,
-                // recorded on the node for the stage that compares against it.
-                match (this.bare_name_res(sym)) {
-                    ResSlot::Answered(r) => { node.set_const_res(r); }
-                    _                    => { }
-                }
-            } else {
-                node.binding_sym = this.declare_pattern_binding(node.binding_name, node.span);
+        // runs.  The pattern becomes a `Constant` over the same name.
+        const sym: SymbolID = this.resolver.lookup(node.name, this.resolver.current_scope);
+        if (sym.is_valid()
+                && this.resolver.get_symbol(sym).kind == SymbolKind::Constant) {
+            this.resolver.record_resolution(p.span, sym);
+            mut c: ConstantPattern* = ConstantPattern::new(node.name);
+            // The same answer an identifier naming this constant gets,
+            // recorded on the node for the stage that compares against it.
+            match (this.bare_name_res(sym)) {
+                ResSlot::Answered(r) => { c.res.answer(r); }
+                _                    => { }
             }
+            p.shape = PatternKind::Constant(c);
+        } else {
+            node.binding_sym = this.declare_pattern_binding(node.name, p.span);
         }
     }
 
-    walk_enum_pattern(mut &this, node: EnumPatternNode*) -> void {
+    walk_enum_pattern(mut &this, p: Pattern*, node: EnumPattern*) -> void {
         // Resolve enum name
         const enum_sym: SymbolID = this.resolver.lookup(
             node.enum_name, this.resolver.current_scope);
         if (enum_sym.is_valid()) {
-            this.resolver.record_resolution(node.span, enum_sym);
+            this.resolver.record_resolution(p.span, enum_sym);
         }
         // The pattern names a TYPE, and its spelling may be qualified, so it is
         // the annotation's question rather than the single-segment scope lookup
@@ -3899,7 +3895,7 @@ implement trait Walk for struct NameResolver {
                 pb.sym_id = this.declare_pattern_binding(pb.name, pb.span);
                 continue;
             }
-            const sub: PatternNode* = node.sub_at(i);
+            const sub: Pattern* = node.sub_at(i);
             if (sub != null) { this.walk_node(sub); }
         }
     }

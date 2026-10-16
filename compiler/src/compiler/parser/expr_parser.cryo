@@ -20,7 +20,7 @@ import compiler::ast;
 import compiler::ast::{
     ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
     ImplTraitAnnotation, LiteralKind, MemberPin, NamedAnnotation, node, NodeKind, pattern,
-    PatternBinding, PatternElement, PatternKind, PatternLiteralFloat, PatternLiteralInt,
+    PatternBinding, PatternElement, PatternLiteralFloat, PatternLiteralInt,
     PatternSub, PatternWildcard, PointerAnnotation, PrimitiveAnnotation,
     ProjectionAnnotation, ReferenceAnnotation, statement, ThisTypeAnnotation,
     TupleAnnotation, TypeAnnotation, TypeofAnnotation
@@ -59,7 +59,8 @@ import compiler::ast::expression::{
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::pattern::{
-    EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode
+    EnumPattern, LiteralPattern, MatchArmNode, Pattern, PatternKind, RangePattern,
+    StaticMatchArmNode
 };
 import compiler::ast::statement::{ BlockStmtNode, ExprStmtNode, MatchStmtNode, StatementNode };
 import compiler::resolver::qualified_name::{ QualifiedName };
@@ -245,14 +246,14 @@ implement struct Parser {
         mut match_expr: MatchExprNode* = new MatchExprNode(left, span);
 
         // Some(v) => { v }
-        mut some_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "Some", op_span);
+        const some_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "Some", op_span);
         const pb: PatternBinding* = new PatternBinding {
             name: bind_name, span: op_span, sym_id: SymbolID::invalid(),
             resolved_type: TypeRef::invalid(), written_mut: false
         };
-        some_pat.add_element(PatternElement::Binding(pb));
+        some_pat.enum_payload().add_element(PatternElement::Binding(pb));
         mut some_arm: MatchArmNode* = new MatchArmNode(op_span);
-        some_arm.add_pattern(some_pat as PatternNode*);
+        some_arm.add_pattern(some_pat);
         const some_ident: IdentifierNode* = new IdentifierNode(bind_name, op_span);
         const some_stmt:  ExprStmtNode*   = new ExprStmtNode(some_ident as ExpressionNode*, op_span);
         mut some_block: BlockStmtNode* = new BlockStmtNode(op_span);
@@ -261,9 +262,9 @@ implement struct Parser {
         match_expr.add_arm(some_arm);
 
         // None => { b }
-        const none_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "None", op_span);
+        const none_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "None", op_span);
         mut none_arm: MatchArmNode* = new MatchArmNode(op_span);
-        none_arm.add_pattern(none_pat as PatternNode*);
+        none_arm.add_pattern(none_pat);
         const none_stmt: ExprStmtNode* = new ExprStmtNode(right, right.span);
         mut none_block: BlockStmtNode* = new BlockStmtNode(right.span);
         none_block.add_statement(none_stmt as StatementNode*);
@@ -283,12 +284,11 @@ implement struct Parser {
     /// a module declaring its own `Option` would otherwise have its enum
     /// matched against the language's value and refused.  The leaf stays on
     /// the node for a diagnostic to print.
-    lang_variant_pattern(item: LangItem, variant: string, span: SourceSpan) -> EnumPatternNode* {
-        mut pat: EnumPatternNode* = new EnumPatternNode(span);
-        pat.set_enum_name(this.ctx.intern(item.leaf()));
-        pat.set_variant_name(this.ctx.intern(variant));
-        pat.res = ResSlot::Lang(item);
-        this.ctx.note_lang_ref(pat as ASTNode*, item);
+    lang_variant_pattern(item: LangItem, variant: string, span: SourceSpan) -> Pattern* {
+        mut pat: Pattern* = Pattern::enum_variant(
+            this.ctx.intern(item.leaf()), this.ctx.intern(variant), span);
+        pat.enum_payload().res = ResSlot::Lang(item);
+        this.ctx.note_lang_ref(pat, item);
         return pat;
     }
 
@@ -2092,7 +2092,7 @@ implement struct Parser {
 
         // Parse pattern(s) separated by |
         while (true) {
-            const pat: PatternNode* = this.parse_pattern_internal();
+            const pat: Pattern* = this.parse_pattern_internal();
             if (pat != null) {
                 arm.add_pattern(pat);
             }
@@ -2186,13 +2186,13 @@ implement struct Parser {
 
 
     /// Parse a pattern (internal, used by match expressions and statements).
-    parse_pattern_internal() -> PatternNode* {
+    parse_pattern_internal() -> Pattern* {
         const start: Token = this.current();
 
         // Wildcard: _
         if (this.check(TokenType::Identifier) && this.current().lexeme == "_") {
             this.advance();
-            return new PatternNode(PatternKind::Wildcard, this.span_from(start));
+            return Pattern::wildcard(this.span_from(start));
         }
 
         // Enum pattern: EnumName::Variant or EnumName::Variant(bindings)
@@ -2207,21 +2207,20 @@ implement struct Parser {
             this.current().kind == TokenType::KwTrue ||
             this.current().kind == TokenType::KwFalse) {
             const lit_tok: Token = this.advance();
-            mut pat: PatternNode* = new PatternNode(PatternKind::Literal, this.span_from(start));
-            pat.set_value(this.intern_lexeme(lit_tok));
             // Record which kind of literal this is.  Codegen cannot recover
             // it from the interned text alone; `0` and `'0'` both intern
             // to "0", `true`/`false` to "true"/"false", so without this
             // it would mis-emit single-digit ints as chars and bools as 0.
-            pat.set_literal_kind(match (lit_tok.kind) {
+            const lk: LiteralKind = match (lit_tok.kind) {
                 TokenType::NumericConstant => { LiteralKind::Integer }
                 TokenType::StringLiteral   => { LiteralKind::String }
                 TokenType::CharConstant    => { LiteralKind::Char }
                 TokenType::KwTrue          => { LiteralKind::Boolean }
                 TokenType::KwFalse         => { LiteralKind::Boolean }
                 _                          => { LiteralKind::Integer }
-            });
-            return this.finish_range_pattern(pat);
+            };
+            return this.finish_range_pattern(
+                Pattern::literal(this.intern_lexeme(lit_tok), lk, this.span_from(start)));
         }
 
         // Negative number literal: -123
@@ -2229,18 +2228,14 @@ implement struct Parser {
             this.advance(); // consume '-'
             const lit_tok: Token = this.advance();
             const neg_value: string = "-" + lit_tok.lexeme;
-            mut pat: PatternNode* = new PatternNode(PatternKind::Literal, this.span_from(start));
-            pat.set_value(this.ctx.intern(neg_value));
-            pat.set_literal_kind(LiteralKind::Integer);
-            return this.finish_range_pattern(pat);
+            return this.finish_range_pattern(Pattern::literal(
+                this.ctx.intern(neg_value), LiteralKind::Integer, this.span_from(start)));
         }
 
         // Identifier pattern (binding)
         if (this.check(TokenType::Identifier)) {
             const id_tok: Token = this.advance();
-            mut pat: PatternNode* = new PatternNode(PatternKind::Identifier, this.span_from(start));
-            pat.set_binding_name(this.intern_lexeme(id_tok));
-            return pat;
+            return Pattern::binding(this.intern_lexeme(id_tok), this.span_from(start));
         }
 
         this.report_error(ErrorCode::E0113_INVALID_PATTERN,
@@ -2253,21 +2248,24 @@ implement struct Parser {
     /// Both spellings are accepted and both are inclusive in pattern
     /// position (`..=` is the explicit inclusive form; `..` is inclusive
     /// here too, unlike a range *expression* where `..` is exclusive).  The
-    /// low bound is already in `pat` (its `value` + `literal_kind`); this
-    /// consumes the operator and the high-bound literal, records the high
-    /// text in `high_value`, and flips the kind to `Range`.  Returns `pat`
-    /// unchanged when there is no range operator.
+    /// low bound is the literal `pat` already is; this consumes the operator
+    /// and the high-bound literal and makes `pat` a `Range` over both.
+    /// Returns `pat` unchanged when there is no range operator.
     ///
     /// Only integer and char literals form a range, and both ends must be
     /// the same kind: the two bounds share a single `literal_kind`, so a
     /// mixed `'a'..9` would make codegen decode one end with the wrong
     /// reader.  Such cases are rejected here rather than silently miscompiled.
-    finish_range_pattern(mut &this, pat: PatternNode*) -> PatternNode* {
+    finish_range_pattern(mut &this, pat: Pattern*) -> Pattern* {
         if (!this.check(TokenType::DotDot)
             && !this.check(TokenType::DotDotEq)) { return pat; }
 
-        if (pat.literal_kind != LiteralKind::Integer
-            && pat.literal_kind != LiteralKind::Char) {
+        const lit: LiteralPattern* = match (pat.shape) {
+            PatternKind::Literal(l) => { l }
+            _                       => { null }
+        };
+        if (lit.literal_kind != LiteralKind::Integer
+            && lit.literal_kind != LiteralKind::Char) {
             this.report_error(ErrorCode::E0113_INVALID_PATTERN,
                 "range patterns require integer or char bounds");
             return pat;
@@ -2300,7 +2298,7 @@ implement struct Parser {
                 "'-' is only valid before an integer range bound");
             return pat;
         }
-        if (hi_kind != pat.literal_kind) {
+        if (hi_kind != lit.literal_kind) {
             this.report_error(ErrorCode::E0113_INVALID_PATTERN,
                 "range pattern bounds must be the same kind (both char or both integer)");
             return pat;
@@ -2309,8 +2307,8 @@ implement struct Parser {
         this.advance(); // consume the high-bound literal
         mut hi_text: string = hi_tok.lexeme;
         if (neg) { hi_text = "-" + hi_text; }
-        pat.set_high_value(this.ctx.intern(hi_text));
-        pat.set_pattern_kind(PatternKind::Range);
+        pat.shape = PatternKind::Range(
+            RangePattern::new(lit.value, this.ctx.intern(hi_text), lit.literal_kind));
         return pat;
     }
 
@@ -2321,7 +2319,7 @@ implement struct Parser {
     /// final identifier becomes the variant name.  The match-arm consumer
     /// (sema) only needs the enum's resolved type; the joined string is
     /// purely for diagnostics.
-    parse_enum_pattern_internal() -> PatternNode* {
+    parse_enum_pattern_internal() -> Pattern* {
         const start: Token = this.current();
         const first_tok: Token = this.advance(); // first identifier
         this.consume(TokenType::ColonColon, "'::'");
@@ -2343,9 +2341,9 @@ implement struct Parser {
             variant_tok = this.consume(TokenType::Identifier, "variant name");
         }
 
-        mut pat: EnumPatternNode* = new EnumPatternNode(this.span_from_token(start));
-        pat.set_enum_name(this.ctx.intern(enum_path));
-        pat.set_variant_name(this.intern_lexeme(variant_tok));
+        mut node: Pattern* = Pattern::enum_variant(
+            this.ctx.intern(enum_path), this.intern_lexeme(variant_tok), this.span_from_token(start));
+        mut pat: EnumPattern* = node.enum_payload();
         pat.set_segment_spans(
             Parser::merge_spans(this.span_from_token(first_tok),
                                     this.span_from_token(path_end_tok)),
@@ -2374,9 +2372,9 @@ implement struct Parser {
                     // `Branch(Leaf(x), r)`. A qualified `Ident::...` element is
                     // itself an enum pattern; recurse and store it as a Sub
                     // element (sema/codegen destructure it level by level).
-                    const sub: PatternNode* = this.parse_enum_pattern_internal();
+                    const sub: Pattern* = this.parse_enum_pattern_internal();
                     const ps: PatternSub* = new PatternSub {
-                        pattern: sub as void*,
+                        pattern: sub,
                         span:    sub.span,
                     };
                     pat.add_element(PatternElement::Sub(ps));
@@ -2426,8 +2424,8 @@ implement struct Parser {
             this.consume(TokenType::RParen, "')'");
         }
 
-        pat.span = this.span_from(start);
-        return pat;
+        node.span = this.span_from(start);
+        return node;
     }
 
 

@@ -18,7 +18,7 @@ import compiler::ast::{ NodeKind, PatternBinding, PatternElement };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::node_locator;
 import compiler::ast::declaration::{ EnumVariantNode, FieldDeclNode, VarDeclNode };
-import compiler::ast::pattern::{ EnumPatternNode, PatternNode };
+import compiler::ast::pattern::{ EnumPattern, Pattern, PatternKind };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::res::{ DefId, DefKind };
 import compiler::resolver::symbol_id::{ SymbolID };
@@ -117,17 +117,16 @@ type struct Declared {
     /// a name inside a variant's pattern.
     static is_pattern_binding(ctx: CompilationContext*, s: SymbolID) -> boolean {
         const n: ASTNode* = Declared::binding_node(ctx, s);
-        if (n == null) { return false; }
-        if (n.kind == NodeKind::Pattern) {
-            return (n as PatternNode*).binding_sym.equals(s);
-        }
-        return Declared::element_binding(n, s) != null;
+        if (n == null || n.kind != NodeKind::Pattern) { return false; }
+        return match ((n as Pattern*).shape) {
+            PatternKind::Binding(b) => { b.binding_sym.equals(s) }
+            PatternKind::Enum(e)    => { Declared::element_binding(e, s) != null }
+            _                       => { false }
+        };
     }
 
     /// The binding `s` among an enum pattern's elements, or null.
-    static element_binding(n: ASTNode*, s: SymbolID) -> PatternBinding* {
-        if (n.kind != NodeKind::EnumPattern) { return null; }
-        const ep: EnumPatternNode* = n as EnumPatternNode*;
+    static element_binding(ep: EnumPattern*, s: SymbolID) -> PatternBinding* {
         for (mut i: i64 = 0; i < ep.elements.length; i++) {
             match (ep.elements[i]) {
                 PatternElement::Binding(b) => {
@@ -149,13 +148,17 @@ type struct Declared {
             if (v.sym_id.equals(s)) { return v.resolved_type; }
             return TypeRef::invalid();
         }
-        if (n.kind == NodeKind::Pattern) {
-            const p: PatternNode* = n as PatternNode*;
-            if (p.binding_sym.equals(s)) { return p.binding_type; }
-            return TypeRef::invalid();
+        if (n.kind != NodeKind::Pattern) { return TypeRef::invalid(); }
+        match ((n as Pattern*).shape) {
+            PatternKind::Binding(b) => {
+                if (b.binding_sym.equals(s)) { return b.binding_type; }
+            }
+            PatternKind::Enum(e) => {
+                const pb: PatternBinding* = Declared::element_binding(e, s);
+                if (pb != null) { return pb.resolved_type; }
+            }
+            _ => { }
         }
-        const b: PatternBinding* = Declared::element_binding(n, s);
-        if (b != null) { return b.resolved_type; }
         return TypeRef::invalid();
     }
 

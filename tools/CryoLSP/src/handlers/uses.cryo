@@ -11,7 +11,7 @@ import std::core::mem;
 
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast;
-import compiler::ast::{ MemberPin, NodeKind, PatternElement, PatternKind, TypeAnnotation };
+import compiler::ast::{ MemberPin, NodeKind, PatternElement, TypeAnnotation };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::declaration::{
     ClassDeclNode, DestructureDeclNode, EnumDeclNode, ExternBlockNode, FieldDeclNode,
@@ -25,7 +25,7 @@ import compiler::ast::expression::{
     StaticMatchExprNode, StructLiteralNode, TernaryExprNode, TryExprNode, TupleLiteralNode,
     TypeofExprNode, UnaryExprNode, YieldExprNode, AlignofExprNode
 };
-import compiler::ast::pattern::{ EnumPatternNode, MatchArmNode, PatternNode };
+import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::ast::statement::{
     AsmBlockStmtNode, BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
     LoopStmtNode, MatchStmtNode, ReturnStmtNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
@@ -367,36 +367,35 @@ type struct Uses {
         }
     }
 
-    pattern(mut &this, p: PatternNode*) -> void {
+    pattern(mut &this, p: Pattern*) -> void {
         if (p == null) { return; }
-        const at: SourceSpan = (p as ASTNode*).span;
-        if ((p as ASTNode*).kind == NodeKind::EnumPattern) {
-            const ep: EnumPatternNode* = p as EnumPatternNode*;
-            const owner: DefId = this.loc.res_def(&ep.res);
-            this.add(ep.enum_span, this.loc.res_target(&ep.res), false);
-            match (&ep.resolved_member) {
-                MemberPin::Variant(ord) => {
-                    if (owner.is_valid()) { this.add(ep.variant_span, Target::Variant(owner, ord), false); }
+        match (p.shape) {
+            PatternKind::Binding(b)  => { this.add(p.span, Target::Local(b.binding_sym), true); }
+            PatternKind::Constant(c) => { this.add(p.span, this.loc.res_target(&c.res), false); }
+            PatternKind::Enum(ep)    => { this.enum_pattern(ep); }
+            _                        => { }
+        }
+    }
+
+    enum_pattern(mut &this, ep: EnumPattern*) -> void {
+        const owner: DefId = this.loc.res_def(&ep.res);
+        this.add(ep.enum_span, this.loc.res_target(&ep.res), false);
+        match (&ep.resolved_member) {
+            MemberPin::Variant(ord) => {
+                if (owner.is_valid()) { this.add(ep.variant_span, Target::Variant(owner, ord), false); }
+            }
+            _ => { }
+        }
+        for (mut i: i64 = 0; i < ep.elements.length; i++) {
+            match (ep.elements[i]) {
+                PatternElement::Binding(b) => {
+                    if (b != null) { this.add(b.span, Target::Local(b.sym_id), true); }
+                }
+                PatternElement::Sub(s) => {
+                    if (s != null) { this.pattern(s.pattern); }
                 }
                 _ => { }
             }
-            for (mut i: i64 = 0; i < ep.elements.length; i++) {
-                match (ep.elements[i]) {
-                    PatternElement::Binding(b) => {
-                        if (b != null) { this.add(b.span, Target::Local(b.sym_id), true); }
-                    }
-                    PatternElement::Sub(s) => {
-                        if (s != null) { this.pattern(s.pattern as PatternNode*); }
-                    }
-                    _ => { }
-                }
-            }
-            return;
-        }
-        if (p.binding_name.is_valid()) {
-            this.add(at, Target::Local(p.binding_sym), true);
-        } else if (p.pattern_kind == PatternKind::Identifier) {
-            this.add(at, this.loc.res_target(&p.const_res), false);
         }
     }
 
