@@ -197,6 +197,32 @@ yet is recorded with the change that builds it, not here.
      loop-carried report ("moved inside a loop is used again on the next
      iteration").  (Jake)
 
+363. **`[T]` means exactly `Array<T>` with the default allocator.**  An
+     array with another allocator is written `Array<T, A>`; `[T]` never
+     names one.  (Jake)
+
+364. **`Array<T>` is indexed through `Index` implementations in the
+     standard library,** not by extending the compiler's built-in
+     indexing: `xs[i]` on an `Array<T>` is `*(xs.index(i))`.  (Jake)
+
+365. **The `length` field of an array stays readable for now;** whether it
+     stays public is decided in the standard library's visibility pass.
+     (Jake)
+
+366. **`&[T]` stays a reference to the owning array,** and a borrowed view
+     stays `Slice<T>`.  (Jake)
+
+367. **The change that renames the dynamic array's symbols is proved by a
+     one-off comparison** of the compiled output with old symbol names
+     mapped to new ones; the comparison script is deleted in the next
+     commit.  (Jake)
+
+368. **The compiler and the standard library use Cryo's own language
+     features wherever one fits** - `Eq`, `Index`, `Drop`, `Allocate` and
+     the other traits - rather than an ad-hoc method of the same purpose,
+     so that the compiler exercises the whole language in live code.
+     (Jake)
+
 ### 2026-10-14
 
 333. **One project's analysis covers every target of its cryoconfig, and

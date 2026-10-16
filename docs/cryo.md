@@ -348,6 +348,8 @@ mut   v:      Array<int>;  // growable, heap-backed; from collections::array
 
 For everything except FFI and stack-allocated scratch buffers, prefer `Array<T>` from the standard library. The shorthand `[T]` desugars to `Array<T>` in expression position when the prelude is loaded.
 
+An array literal written where an `Array<T>` with the default allocator is expected builds that array, in every form: `[a, b]`, `[]`, and `[value; n]` with `n` fixed or known only at run time.  The literal allocates the storage, so an `Array<T, A>` with another allocator is not initialised by one.
+
 The `N` in `[T; N]` is a **compile-time integer**: an integer literal, a named `const` (declared in this module or another, written bare or qualified), an enum variant, a cast between integer types, or arithmetic, comparison, logical, and bitwise operators over those. The repeat expression `[value; N]` accepts exactly the same set and yields `[T; N]`, so a field and the initializer that fills it can share one name for their length; a count that is *not* a compile-time integer is legal there and yields a dynamic `[T]` sized at run time. A size that is neither is E0239.
 
 ```cryo
@@ -2268,7 +2270,14 @@ arithmetic, bitwise, and shift operator (`+= -= *= /= %= &= |= ^= <<= >>=`).
 **Indexing.** `Index<Idx, Output>::index` returns a **pointer** (`Output*`), so
 the desugar `a[i]` -> `*(a.index(i))` is a *place*: one implementation serves
 reads (`v = a[i]`), writes (`a[i] = v`), and compound assignment (`a[i] += v`).
-Built-in array/slice/string/pointer indexing keeps its native path.
+Built-in array/slice/string/pointer indexing keeps its native path.  A type may
+implement `Index` once per index type; the call is answered by the
+implementation whose `Idx` is the index's own type.  `Array<T>` is indexed this
+way: the standard library implements `Index` for it once per integer type, so
+`xs[i]` takes an index of any integer type, and an index at or past the length
+(a negative one included) panics.  In a generic body, a container whose type
+carries the body's parameters (`xs: &Array<T>`) is indexed through its own
+implementation exactly as a concrete one is.
 
 ```cryo
 type struct Grid { cells: [i32; 9]; }

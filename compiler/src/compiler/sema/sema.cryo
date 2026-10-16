@@ -3946,15 +3946,22 @@ public:
         return this.arena.get_pointer_to(base);
     }
 
-    expected_is_dynamic_array(&this) -> boolean {
-        if (!this.state.expected_type.is_valid()) { return false; }
+    /// The element of the owning dynamic array an array literal written
+    /// here builds: the expected type's, when it is `[T]` or `Array<T>` with
+    /// the default allocator, whose storage the literal allocates; invalid
+    /// for any other expected type.
+    expected_dynamic_element(&this) -> TypeRef {
+        if (!this.state.expected_type.is_valid()) { return TypeRef::invalid(); }
+        const owned: TypeRef = this.ctx.type_resolver.dynamic_array_element(this.state.expected_type);
+        if (owned.is_valid()) { return owned; }
         mut exp_t: Type* = this.arena.lookup(this.state.expected_type);
         if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = exp_t as InstantiatedType*;
             if (inst.has_resolved_type()) { exp_t = this.arena.lookup(inst.resolved_type); }
         }
-        if (exp_t == null || exp_t.kind != TypeKind::Array) { return false; }
-        return !(exp_t as ArrayType*).is_fixed();
+        if (exp_t == null || exp_t.kind != TypeKind::Array) { return TypeRef::invalid(); }
+        if ((exp_t as ArrayType*).is_fixed()) { return TypeRef::invalid(); }
+        return (exp_t as ArrayType*).element;
     }
 
     /// The element count of a `[value; N]` repeat expression, or -1 when `N`
@@ -3976,8 +3983,9 @@ public:
     }
 
     resolve_array_literal(mut &this, arr: ArrayLiteralNode*) -> TypeRef {
-        mut elem_expected: TypeRef = TypeRef::invalid();
-        if (this.state.expected_type.is_valid()) {
+        const dynamic_elem: TypeRef = this.expected_dynamic_element();
+        mut elem_expected: TypeRef = dynamic_elem;
+        if (!elem_expected.is_valid() && this.state.expected_type.is_valid()) {
             mut exp_t: Type* = this.arena.lookup(this.state.expected_type);
             if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = exp_t as InstantiatedType*;
@@ -4033,6 +4041,7 @@ public:
                 if (inst.has_resolved_type()) { exp_t = this.arena.lookup(inst.resolved_type); }
             }
             if (exp_t != null && exp_t.kind == TypeKind::Array) { return this.state.expected_type; }
+            if (dynamic_elem.is_valid()) { return this.state.expected_type; }
         }
         if (elem_type.is_valid()) {
             mut size: i64 = arr.elements.length;
@@ -4040,10 +4049,17 @@ public:
                 size = arr.repeat_count;
             } else if (arr.repeat_count_expr != null) {
                 size = -1;
-                if (!this.expected_is_dynamic_array()) {
+                if (!dynamic_elem.is_valid()) {
                     const fill_count: i64 = this.const_repeat_count(arr);
                     if (fill_count >= 0) { size = fill_count; }
                 }
+            }
+            // A literal written where an `Array<T>` is expected is that
+            // array, its elements in storage the literal allocates, in
+            // every form: listed, or filled to a count fixed or run-time.
+            if (this.ctx.type_resolver.dynamic_array_element(this.state.expected_type).is_valid()
+                    && this.checker.can_assign(elem_type, dynamic_elem)) {
+                return this.state.expected_type;
             }
             if (this.state.expected_type.is_valid() && arr.repeat_count == 0 && arr.repeat_count_expr == null) {
                 mut exp_t: Type* = this.arena.lookup(this.state.expected_type);

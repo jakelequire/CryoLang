@@ -36,6 +36,20 @@ additive feature, or an internal rewrite such as the HIR and MIR pipeline
 or compile-time execution, comes after it.  The other items here are not
 ordered yet.
 
+## The language, used by its own compiler
+
+An ongoing principle rather than an item (ruling 368): the compiler and
+the standard library use Cryo's own language features wherever one fits -
+`Eq`, `Index`, `Drop`, `Allocate` and the other traits - instead of an
+ad-hoc method that does the same job, so that the compiler exercises the
+whole language in live code and its defects surface there first.  A type
+with an `equal` method that does not implement `Eq` is the shape to
+remove.
+
+Open: a survey of the compiler and the standard library for ad-hoc
+`equal`, compare, hash and to-string style methods that should be trait
+implementations, each one a candidate for its trait.  Not started.
+
 ## Merge notes
 
 `naming-impl` is merged into `main`, and CI runs verify's gate list.  These
@@ -294,19 +308,21 @@ nothing outside the library using it, reported) or done by review alone.
 ## One dynamic array type
 
 `[T]` names a builtin dynamic array, and that is not `Array<T>`: the two
-mangle differently, refuse each other by value, only the builtin indexes
-with `[]`, and an array literal initialises only the builtin.  The builtin
-borrows its methods from `Array<T>`, and nested builtin arrays (`[[T]]`)
-crash at run time where `Array<Array<T>>` does not; the drop pass and the
-type resolver carry comments that route around the nested shape.  The two
-are made one type in a change of its own, before the class removal, so
-the class removal writes its thousands of array types against the type
-that remains: the AST's child lists are `[ExpressionNode*]`,
-`[StatementNode*]` and `[TypeAnnotation*]` today, and become arrays of
-whatever the AST's enums are.  The end state is `Array<T>`: `[T]` becomes
-its spelling.  Open: what that does to mangling and layout, and to `&[T]` -
-a reference to an owning, growable array - as against `Slice<T>`, the
-borrowed view, which a reader may expect `[T]` to spell.
+mangle differently, refuse each other by value, and only `Array<T>` is
+iterated by `for`.  The builtin borrows its methods from `Array<T>`, and
+nested builtin arrays (`[[T]]`) crash at run time where `Array<Array<T>>`
+does not; the drop pass and the type resolver carry comments that route
+around the nested shape.  The two are made one type in a change of its
+own, before the class removal, so the class removal writes its thousands
+of array types against the type that remains: the AST's child lists are
+`[ExpressionNode*]`, `[StatementNode*]` and `[TypeAnnotation*]` today, and
+become arrays of whatever the AST's enums are.  The end state is
+`Array<T>` with the default allocator, and `[T]` is its spelling (ruling
+363); `&[T]` stays a reference to it (366).  The plan, its measurements
+and its slices are `docs/array-unify-plan.md`.
+
+Built: `Array<T>` is indexed through the library's `Index`
+implementations (364), and an array literal initialises it.
 
 ## The class removal
 

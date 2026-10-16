@@ -1,0 +1,136 @@
+/// An array literal written where an `Array<T>` is expected builds that
+/// array - listed, empty, or filled to a count fixed or known at run time,
+/// nested, as a field and as a return value - and `xs[i]` on it is
+/// `*(xs.index(i))` through `std::core::ops::Index`, so one place serves a
+/// read, a write and a compound assignment.  `Array` implements `Index` once
+/// per integer type, and the index's own type selects the implementation.
+///
+/// The elements of the release checks count their own releases: every
+/// element a literal stores is released exactly once with its array.
+/// `main` prints how many checks passed and exits 0 only when all did.
+namespace ArrayLiteralAndIndex::Main;
+
+import std::fmt;
+import std::core::drop::{ Drop };
+import std::collections::array::{ Array };
+
+mut g_released: i64 = 0;
+
+type struct Counted { v: i64; }
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void {
+        g_released = g_released + 1;
+    }
+}
+
+type struct Holder {
+    items: Array<i64>;
+}
+
+function total(xs: &Array<i64>) -> i64 {
+    mut s: i64 = 0;
+    mut i: u64 = 0;
+    while (i < xs.length) {
+        s += xs[i];
+        i += 1;
+    }
+    return s;
+}
+
+function names() -> Array<string> {
+    return ["x", "y", "z"];
+}
+
+function last_of<T>(xs: &Array<T>) -> T where T: Copy {
+    const at: u64 = xs.length - 1;
+    return xs[at];
+}
+
+function every_index_type() -> boolean {
+    const xs: Array<i64> = [10, 20, 30, 40];
+    const a: i8 = 1;
+    const b: i16 = 2;
+    const c: i32 = 3;
+    const d: i64 = 0;
+    const e: isize = 1;
+    const f: u8 = 2;
+    const g: u16 = 3;
+    const h: u32 = 0;
+    const k: u64 = 1;
+    const m: usize = 2;
+    const sum: i64 = xs[a] + xs[b] + xs[c] + xs[d] + xs[e] + xs[f] + xs[g] + xs[h] + xs[k] + xs[m];
+    return sum == 20 + 30 + 40 + 10 + 20 + 30 + 40 + 10 + 20 + 30 && xs[3] == 40;
+}
+
+function write_and_compound() -> boolean {
+    mut xs: Array<i64> = [1, 2, 3];
+    xs[0] = 5;
+    const i: i32 = 1;
+    xs[i] += 10;
+    xs[2] *= 3;
+    return xs[0] == 5 && xs[1] == 12 && xs[2] == 9 && xs.length == 3;
+}
+
+function every_literal_form() -> boolean {
+    const empty: Array<i32> = [];
+    const n: u64 = 3;
+    const run_time_fill: Array<i64> = [7; n];
+    const fixed_fill: Array<i64> = [5; 4];
+    mut grown: Array<i64> = [1, 2];
+    grown.push(3);
+    return empty.length == 0 && total(&run_time_fill) == 21 && run_time_fill.length == 3
+        && total(&fixed_fill) == 20 && fixed_fill.length == 4 && total(&grown) == 6;
+}
+
+function field_and_return() -> boolean {
+    const h: Holder = Holder { items: [10, 20] };
+    const ns: Array<string> = names();
+    return total(&h.items) == 30 && ns.length == 3 && ns[2] == "z";
+}
+
+function nested() -> boolean {
+    mut grid: Array<Array<i32>> = [[1, 2], [3]];
+    grid[1].push(4);
+    grid[0][1] = 9;
+    return grid.length == 2 && grid[0][1] == 9 && grid[1][1] == 4 && grid[1].length == 2;
+}
+
+function generic_body() -> boolean {
+    const xs: Array<i64> = [4, 5, 6];
+    const ws: Array<string> = ["a", "b"];
+    return last_of(&xs) == 6 && last_of(&ws) == "b";
+}
+
+function literal_released_once() -> boolean {
+    g_released = 0;
+    {
+        const xs: Array<Counted> = [Counted { v: 1 }, Counted { v: 2 }];
+        if (xs[1].v != 2) { return false; }
+    }
+    return g_released == 2;
+}
+
+function nested_literal_released_once() -> boolean {
+    g_released = 0;
+    {
+        const xs: Array<Array<Counted>> = [[Counted { v: 1 }], [Counted { v: 2 }, Counted { v: 3 }]];
+        if (xs[1][0].v != 2) { return false; }
+    }
+    return g_released == 3;
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    if (every_index_type()) { passed += 1; } else { fmt::println("FAIL every_index_type"); }
+    if (write_and_compound()) { passed += 1; } else { fmt::println("FAIL write_and_compound"); }
+    if (every_literal_form()) { passed += 1; } else { fmt::println("FAIL every_literal_form"); }
+    if (field_and_return()) { passed += 1; } else { fmt::println("FAIL field_and_return"); }
+    if (nested()) { passed += 1; } else { fmt::println("FAIL nested"); }
+    if (generic_body()) { passed += 1; } else { fmt::println("FAIL generic_body"); }
+    if (literal_released_once()) { passed += 1; } else { fmt::println("FAIL literal_released_once"); }
+    if (nested_literal_released_once()) { passed += 1; } else { fmt::println("FAIL nested_literal_released_once"); }
+    fmt::println(f"array_literal_and_index: {passed} of 8 passed");
+    if (passed != 8) { return 1; }
+    return 0;
+}
