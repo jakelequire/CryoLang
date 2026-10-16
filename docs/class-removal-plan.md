@@ -973,9 +973,9 @@ every visitor.
   became a dispatching `this.walk_node(child)`; each direct
   `this.visit(child)` became a direct hook call; and then an override whose
   body was exactly its kind's default recursion was deleted.  The renames
-  were made by `scripts/walk-codemod.py`, which also moves a type's hooks
-  out of its body into its `Walk` implementation; it is deleted in the next
-  commit.
+  were made by a one-off codemod, `scripts/walk-codemod.py`, which also
+  moved a type's hooks out of its body into its `Walk` implementation; it
+  is in the commit that ran it (`1d9945cf`) and deleted in the next.
   - The substituter: 53 overrides -> 41 hooks, 22 of them continuing
     through `walk_children`.  It keeps its own recursion where it skips a child
     (a match arm's guard, a self-returning default's body) or visits one
