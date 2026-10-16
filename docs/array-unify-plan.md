@@ -71,7 +71,8 @@ the array-syntax change):
   E0453 (377).  Built.
 - `Array`'s `length` and `capacity` are `i64` (375).
 - A `![caller_location]` function taken as a value is refused before
-  code generation (376); the attribute keeps its name (378).
+  code generation (376), by the type check where a name or path is
+  typed as a value; the attribute keeps its name (378).  Built.
 
 ## 3. Units
 

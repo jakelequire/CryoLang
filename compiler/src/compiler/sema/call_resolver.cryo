@@ -824,6 +824,38 @@ type struct CallResolver {
         return entries[0];
     }
 
+    /// `ty`, the type of the value `expr` - a function named by a bare name
+    /// or a path - or invalid when the function is `![caller_location]` and
+    /// is refused as a value (E0151): it takes its caller's location as
+    /// hidden arguments, and a call through the value has none to pass.
+    located_value_checked(&this, expr: ExpressionNode*, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return ty; }
+        mut entry: OverloadId = OverloadId::invalid();
+        mut template: TypeRef = TypeRef::invalid();
+        const n: ASTNode* = expr as ASTNode*;
+        if (n.kind == NodeKind::Identifier) {
+            const ident: IdentifierNode* = expr as IdentifierNode*;
+            entry = ident.resolved_callee.decl_entry();
+            template = ident.value_template;
+        } else if (n.kind == NodeKind::ScopeResolution) {
+            const scope: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+            entry = scope.resolved_callee.decl_entry();
+            template = scope.value_template;
+        }
+        mut decl: ASTNode* = null;
+        if (entry.is_valid()) {
+            decl = this.ctx.decl_index.entry_decl(entry);
+        } else if (template.is_valid()) {
+            const tm: TemplateEntry* = this.ctx.generic_registry.template_of_type(template);
+            if (tm != null) { decl = tm.ast_node; }
+        }
+        if (!FunctionDeclNode::caller_located(decl)) { return ty; }
+        this.ctx.emit_error_at(ErrorCode::E0151_DIRECTIVE_MISPLACED,
+            "a `![caller_location]` function cannot be taken as a value: a call through the value would have no caller location to pass it",
+            expr.span);
+        return TypeRef::invalid();
+    }
+
 
     /// The entry of the bare callee's family that a call passing capturing
     /// closures selects, by the one selection a call's arguments make

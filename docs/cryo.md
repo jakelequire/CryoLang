@@ -891,7 +891,7 @@ The compiler also expands two source-location pseudo-constants at the call site:
 
 These are used by `panic`, `assert`, and the testing framework to report failure locations without the caller passing them by hand.
 
-Inside a function marked `![caller_location]`, `FILE` and `LINE` are instead the location of the call to that function: every call passes its own location as two hidden trailing arguments, and a call made from inside another `![caller_location]` function passes on the location that one was given, so a chain of them reports the first call outside the chain.  The standard library's index bounds check is marked this way, so an out-of-range `xs[i]` reports the line of the `xs[i]`.  Such a function cannot be taken as a value (E0151): a call through the value would have no location to pass.
+Inside a function marked `![caller_location]`, `FILE` and `LINE` are instead the location of the call to that function: every call passes its own location as two hidden trailing arguments, and a call made from inside another `![caller_location]` function passes on the location that one was given, so a chain of them reports the first call outside the chain.  The standard library's index bounds check is marked this way, so an out-of-range `xs[i]` reports the line of the `xs[i]`.  Such a function cannot be taken as a value (E0151), by its name, its path, or a static method's path: a call through the value would have no location to pass.  The type check refuses it, so `cryo check` and the editor report it.
 
 ```cryo
 ![caller_location]
