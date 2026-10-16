@@ -17,15 +17,6 @@ import compiler::types::type_base;
 import compiler::types::type_base::{ Type };
 import std::fmt;
 
-// ArrayType.size sentinels for the two `size < 0` shapes (kept as literals
-// at their use sites - see `is_heap_dynamic` and the parser - because a
-// module-level `const` referenced from a method does not reliably resolve):
-//   -1  ARRAY_SIZE_HEAP_DYNAMIC   `[T]`, owns a malloc'd buffer, droppable
-//   -2  ARRAY_SIZE_FIXED_PENDING  `[T; N]` with named-const/computed N,
-//                                 fixed (no heap buffer), size resolved later
-// Both satisfy `is_dynamic()` (size < 0) so every existing layout/codegen
-// path is unaffected; only ownership analysis distinguishes them.
-
 
 // PointerType: Raw pointer to another type
 
@@ -84,13 +75,13 @@ public:
 }
 
 
-// ArrayType: Fixed-size or dynamic array
+// ArrayType: the fixed array `[T; N]`.  The dynamic `[T]` is `Array<T>`.
 
 type class ArrayType : Type {
 public:
     element:        TypeRef;
-    size:           i64;       // -1 = dynamic/unsized
-    computed_size:  u64;       // Computed by TypeLowering pass for fixed arrays
+    size:           i64;
+    computed_size:  u64;       // Computed by the TypeLowering pass
     computed_align: u64;
 
     ArrayType(id: u64, element: TypeRef, size: i64) : Type(id, TypeKind::Array) {
@@ -100,36 +91,13 @@ public:
         this.computed_align = 0;
     }
 
-    is_dynamic(&this) -> boolean { return this.size < 0; }
-    is_fixed(&this) -> boolean   { return this.size >= 0; }
-
-    // The two `size < 0` shapes that `is_dynamic()` lumps together. Named
-    // via static accessors rather than a module `const`, because a const
-    // referenced from a method does not reliably resolve in the self-host
-    // (it silently reads as 0, defeating the comparison).
-    //
-    //   heap-dynamic `[T]`  : heap-backed growable fat pointer that OWNS a
-    //                         malloc'd buffer; needs a buffer-freeing drop.
-    //   fixed-pending `[T; N]`: N is a named const / computed expression; a
-    //                         FIXED array awaiting size resolution, owns no
-    //                         separate heap buffer, so it must NOT be freed.
-    // Both report `is_dynamic()`, so every layout/codegen path is unchanged;
-    // only ownership analysis distinguishes them.
-    static heap_dynamic_size()  -> i64 { return -1; }
-
-    is_heap_dynamic(&this) -> boolean { return this.size == ArrayType::heap_dynamic_size(); }
-
-    /// The type as a program writes it, `[T]` or `[T; N]`, around the text
+    /// The type as a program writes it, `[T; N]`, around the text
     /// `element_text` its caller wrote for the element.
     spelled(&this, element_text: string) -> string {
-        if (this.is_dynamic()) { return "[" + element_text + "]"; }
         return "[" + element_text + "; " + fmt::format("%ld", this.size) + "]";
     }
 
     override display_name(&this) -> string {
-        if (this.is_dynamic()) {
-            return fmt::format("%lu[]", this.element.key());
-        }
         return fmt::format("%lu[%ld]", this.element.key(), this.size);
     }
 
@@ -139,12 +107,10 @@ public:
     }
 
     override size_bytes(&this) -> u64 {
-        if (this.is_dynamic()) { return 24; }
         return this.computed_size;
     }
 
     override alignment(&this) -> u64 {
-        if (this.is_dynamic()) { return 8; }
         return this.computed_align;
     }
 }

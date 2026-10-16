@@ -3978,7 +3978,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::primitives`   | Methods on built-in types (`(-5 as i32).abs()`, `(2.0).sqrt()`, `x.clamp(lo, hi)`, `char::is_digit`, ...)             |
 | `core::varargs`      | `VaArgs`, the compiler-assigned type of a function's `args...` bucket                                                 |
 | `core::drop`, `core::marker`, `core::cmp`, `core::clone` | `Drop`, the marker traits (`Copy`, `Send`, `Sync`), `Eq` / `Ord` / `Ordering`, `Clone` |
-| `collections::array` | `Array<T>`, needed because `[T]` desugars to `Array<T>`                                                               |
+| `collections::array` | `Array<T>`, the type `[T]` names                                                                                       |
 | `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: [T; N]`)                 |
 | `core::ops`          | `Range` / `RangeInclusive`, backing range literals (`a..b` desugars to `Range::new`)                                  |
 | `core::iter`         | `Iterator`, the trait the for-in sugar drives the scrutinee through                                                   |

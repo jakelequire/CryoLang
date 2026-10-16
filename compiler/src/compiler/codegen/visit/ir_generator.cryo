@@ -1190,14 +1190,7 @@ public:
             }
         }
 
-        // Store each field value at its GEP index.  If a field expects a
-        // dynamic-array fat pointer (`{T*, i64, i64}`) but the value is a
-        // fixed LLVM array (`[N x T]`; happens when the source literal
-        // `[a, b, c]` resolved to a fixed ArrayType but the field is
-        // dynamic), convert by malloc'ing a buffer, memcpy'ing the literal
-        // contents, and packaging into a fat pointer.  Without this, the
-        // store writes only the first few bytes of the field, leaving the
-        // rest uninitialised, and downstream `provisions[k]` reads garbage.
+        // Store each field value at its GEP index.
         const t: Type* = this.cg.arena_type(struct_type);
         // Each initializer carries the coordinates of the field it names -
         // `(depth, index)`, a base class's field included - and the slot is
@@ -1277,7 +1270,6 @@ public:
             const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, slot, "field");
             mut val: LValue = field_values[i];
             if (val.is_valid()) {
-                val = this.cg.expr_ops.coerce_fixed_array_to_fat_ptr(val, pin_field.field_type);
                 // Widen/narrow integer literals to the field's declared
                 // width before storing.  `HashMap { len: 0, cap: 0, ... }`
                 // arrives with each `0` as `i32 0` (codegen_literal defaults
@@ -1453,34 +1445,16 @@ public:
             this.state.last_is_lvalue = false;
         } else if (src_t != null && dst_is_ptr_like &&
                    src_t.kind == TypeKind::Array) {
-            // Array -> Pointer / String: extract the data-pointer
-            // field from the fat-pointer `{ptr, i64}` struct.
-            // Fixed arrays (`[N x T]`) don't have a fat pointer;
-            // their lvalue is already a pointer to the storage, so
-            // pointer-cast that directly.  For dynamic arrays we
-            // need an explicit extract to avoid the illegal
-            // `bitcast { ptr, i64 } to ptr` that the generic path
-            // emits.
-            const arr_t: ArrayType* = src_t as ArrayType*;
+            // A fixed array (`[N x T]`) to a pointer or a string: its
+            // lvalue is already a pointer to the storage, so pointer-cast
+            // that.
             const dst_lty: LType = this.cg.type_mapper.map_type(node.resolved_target);
-            if (arr_t.is_fixed()) {
-                const addr: LValue = this.dispatch.codegen_lvalue(this,node.expression);
-                if (addr.is_valid() && dst_lty.is_valid()) {
-                    this.state.last_value = this.cg.builder.build_pointer_cast(
-                        addr, dst_lty, "arrcast");
-                } else {
-                    this.state.last_value = addr;
-                }
+            const addr: LValue = this.dispatch.codegen_lvalue(this,node.expression);
+            if (addr.is_valid() && dst_lty.is_valid()) {
+                this.state.last_value = this.cg.builder.build_pointer_cast(
+                    addr, dst_lty, "arrcast");
             } else {
-                const val: LValue = this.dispatch.codegen_rvalue(this,node.expression);
-                const data_ptr: LValue = this.cg.builder.build_extract_value(
-                    val, 0, "arrdata");
-                if (data_ptr.is_valid() && dst_lty.is_valid()) {
-                    this.state.last_value = this.cg.builder.build_pointer_cast(
-                        data_ptr, dst_lty, "arrcast");
-                } else {
-                    this.state.last_value = data_ptr;
-                }
+                this.state.last_value = addr;
             }
             this.state.last_is_lvalue = false;
         } else {

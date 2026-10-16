@@ -284,46 +284,6 @@ type struct Monomorphizer {
             }
         }
 
-        // Second pass: discover Array<T> for standalone [T] usages.  The nested
-        // discovery above only catches arrays that appear as fields of other
-        // monomorphized types.  Standalone [T] creates ArrayType without
-        // InstantiatedType.  Scan the arena once for dynamic ArrayTypes with
-        // concrete elements and enqueue any missing Array<T> instantiations.
-        const array_entry: TemplateEntry* =
-            this.generic_registry.template_of(this.generic_registry.wellknown(LangItem::Array));
-        if (array_entry != null) {
-            const array_base: TypeRef = array_entry.base_type;
-            const type_count: i64 = this.arena.type_count();
-            for (mut ti: i64 = 0; ti < type_count; ti++) {
-                const at: Type* = this.arena.types[ti];
-                if (at == null || at.kind != TypeKind::Array) { continue; }
-                const arr: ArrayType* = at as ArrayType*;
-                if (!arr.is_dynamic() || !arr.element.is_valid()) { continue; }
-                const elem_t: Type* = this.arena.lookup(arr.element);
-                if (elem_t == null) { continue; }
-                if (elem_t.kind == TypeKind::GenericParam) { continue; }
-                mut arr_args: [TypeRef] = [];
-                arr_args.push(arr.element);
-                mut arr_ctx: ResolutionContext = ResolutionContext::new("");
-                arr_args = this.type_resolver.expand_default_type_args(array_entry, arr_args, &arr_ctx);
-                const inst_ref: TypeRef = this.generic_registry.instantiate(array_base, arr_args);
-                this.state.enqueue_from_type_ref(inst_ref);
-            }
-            // Process any newly enqueued Array<T> instantiations.
-            while (this.state.pending_cursor < this.state.pending.length) {
-                const req: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
-                this.state.pending_cursor += 1;
-                const rkey: TypeKey = this.make_key(req);
-                if (this.is_cached(rkey)) {
-                    this.propagate_cached_resolution(rkey, req);
-                    this.generic_registry.mark_monomorphized(req.base_type, req.type_args);
-                    continue;
-                }
-                const rsuccess: boolean = this.specialize_request(req, rkey);
-                if (!rsuccess) { this.state.error_count += 1; }
-            }
-        }
-
         // Mark ALL collected items as monomorphized, including those that
         // enqueue_from_type_ref() filtered out, so collect_unmonomorphized()
         // doesn't keep returning them on every subsequent module in a batch build.

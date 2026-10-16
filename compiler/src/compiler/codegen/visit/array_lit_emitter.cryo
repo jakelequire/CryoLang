@@ -2,7 +2,7 @@
 ///
 /// Lowering for the three array-literal shapes:
 ///   1. element-form fixed `[a, b, c]`          -> alloca `[N x T]`, store per slot
-///   2. element-form dynamic `[a, b, c]: [T]`   -> malloc + fat pointer `{T*, i64, i64}`
+///   2. element-form dynamic `[a, b, c]: [T]`   -> malloc + `Array<T>` {ptr, length, capacity}
 ///   3. fill-form    `[value; N]`               -> alloca + fill loop (fixed or dynamic)
 ///
 /// The fill-loop emitters (`emit_fill_loop_indexed` / `emit_fill_loop_raw`)
@@ -89,10 +89,10 @@ type struct ArrayLitEmitter {
         // Fill form `[value; N]`: single element repeated N times.  Needs
         // its own codegen path: allocate the backing storage, run a fill
         // loop writing the value at every slot, and (for dynamic arrays)
-        // wire up the fat-pointer struct.  The element-form path below
-        // would write only slot 0 and GEP as if the alloca's outer type
-        // were a flat array, which is wrong for both fixed `[N x T]`
-        // alloca shapes and dynamic `{T*, i64}` fat pointers.
+        // fill in the `Array<T>`.  The element-form path below would write
+        // only slot 0 and GEP as if the alloca's outer type were a flat
+        // array, which is wrong for both fixed `[N x T]` alloca shapes and
+        // an `Array<T>`.
         const is_fill: boolean = (node.repeat_count > 0 || node.repeat_count_expr != null)
                                  && node.elements.length == 1;
         if (is_fill) {
@@ -153,11 +153,9 @@ type struct ArrayLitEmitter {
     // Element-form dynamic (`[a, b, c]: [T]`)
 
     /// Emit element-form `[a, b, c]` where the expected type is an owning
-    /// dynamic array of `element` (`{T*, i64, i64, ...}`).  Allocate a
-    /// buffer for N elements, store each element into it, then stash (data,
-    /// len, cap) into the array's alloca.  Without this path, we'd alloca
-    /// `[N x T]` and hand back a fixed-size array to a caller expecting
-    /// `{ptr, i64}`, failing LLVM verification.
+    /// dynamic array of `element` (`Array<T>`: pointer, length, capacity,
+    /// allocator).  Allocate a buffer for N elements, store each element
+    /// into it, then stash (data, len, cap) into the array's alloca.
     emit_dynamic(mut &this, visitor: ASTVisitor*, node: ArrayLiteralNode*,
                   element: TypeRef) -> void {
         const elem_ty: LType = this.cg.type_mapper.map_type(element);
@@ -248,8 +246,7 @@ type struct ArrayLitEmitter {
     emit_fill(mut &this, visitor: ASTVisitor*, node: ArrayLiteralNode*) -> void {
         const arr_t_raw: Type* = this.cg.arena_type(node.resolved_type);
         mut fixed: ArrayType* = null;
-        if (arr_t_raw != null && arr_t_raw.kind == TypeKind::Array
-                && (arr_t_raw as ArrayType*).is_fixed()) {
+        if (arr_t_raw != null && arr_t_raw.kind == TypeKind::Array) {
             fixed = arr_t_raw as ArrayType*;
         }
         const element: TypeRef = if (fixed != null) { fixed.element } else { this.dynamic_element(node.resolved_type) };
@@ -330,9 +327,9 @@ type struct ArrayLitEmitter {
             this.state.last_value     = alloca;
             this.state.last_is_lvalue = true;
         } else {
-            // Dynamic `{T*, i64}` fat pointer.  Alloca the struct, malloc
-            // a buffer of `count * sizeof(T)` bytes, fill it, then store
-            // the (data_ptr, count) into the fat pointer.
+            // Dynamic `Array<T>`.  Alloca the struct, malloc a buffer of
+            // `count * sizeof(T)` bytes, fill it, then store the
+            // (data_ptr, count) into the struct.
             const fat_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
             const fat: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", fat_ty);
 

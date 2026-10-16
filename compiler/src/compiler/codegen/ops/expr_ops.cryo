@@ -2255,76 +2255,6 @@ type struct ExprOps {
         return this.builder.build_zext(rhs, lhs_ty, "match.coerce.zext");
     }
 
-    /// Promote a value of a fixed-size array slot to a fat pointer
-    /// `{T*, i64, i64}` when stored into a dynamic-array field.
-    coerce_fixed_array_to_fat_ptr(mut &this, val: LValue, field_type: TypeRef) -> LValue {
-        if (!val.is_valid()) { return val; }
-        const ft: Type* = this.arena_type(field_type);
-        if (ft == null || ft.kind != TypeKind::Array) { return val; }
-        const arr_t: ArrayType* = ft as ArrayType*;
-        if (arr_t.is_fixed()) { return val; }
-
-        const got_ty: void* = llvm::LLVMTypeOf(val.raw);
-        if (LType::kind_of(got_ty) != LTypeKind::Array) { return val; }
-
-        const elem_count: u32 = llvm::LLVMGetArrayLength(got_ty);
-        const elem_lty: LType = LType { raw: llvm::LLVMGetElementType(got_ty) };
-
-        const elem_t_raw: Type* = this.arena_type(arr_t.element);
-        mut elem_size: u64 = 1;
-        if (elem_t_raw != null && elem_t_raw.size_bytes() > 0) {
-            elem_size = elem_t_raw.size_bytes();
-        }
-        const total_bytes: u64 = elem_size * (elem_count as u64);
-        const total_bytes_val: LValue = LType::const_int(LType::i64(), total_bytes, false);
-
-        const current_bb: LBasicBlock = this.builder.get_insert_block();
-        if (!current_bb.is_valid()) { return val; }
-        const fn_val: LValue = current_bb.get_parent();
-        if (!fn_val.is_valid()) { return val; }
-
-        // Stash the fixed array on the stack so we have a source pointer for memcpy.
-        const src: LValue = this.flow.create_entry_alloca(fn_val, "arrlit.src", LType { raw: got_ty });
-        this.builder.build_store(val, src);
-
-        // malloc(N * sizeof(T)) for the fat-pointer's owned buffer.
-        const malloc_fn: LValue = this.lang_function(LangItem::Malloc);
-        if (!malloc_fn.is_valid()) { return val; }
-        const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-        mut malloc_args: [Pair<LValue, TypeRef>] = [];
-        malloc_args.push(Pair::<LValue, TypeRef>::new(total_bytes_val, TypeRef::invalid()));
-        mut data_ptr: LValue = LValue::null();
-        data_ptr = this.codegen_call(malloc_fn, malloc_ty, malloc_args, "arrlit.heap");
-        if (!data_ptr.is_valid()) { return val; }
-
-        llvm::LLVMBuildMemCpy(this.builder.raw,
-                              data_ptr.raw, 1,
-                              src.raw, 1,
-                              total_bytes_val.raw);
-
-        // Build the fat-pointer struct: { data_ptr, count, count }.
-        const elem_ptr_lty: LType = LType::pointer_to(elem_lty);
-        const i64_ty: LType = LType::i64();
-        const buf: void* = libc::malloc(24);
-        const slots: void** = buf as void**;
-        slots[0] = elem_ptr_lty.raw;
-        slots[1] = i64_ty.raw;
-        slots[2] = i64_ty.raw;
-        const fat_ty: LType = LType::literal_struct(buf, 3, false);
-        libc::free(buf);
-
-        const fat: LValue = this.flow.create_entry_alloca(fn_val, "arrlit.fat", fat_ty);
-        const ptr_slot: LValue = this.builder.build_struct_gep(fat_ty, fat, 0, "fat.ptr");
-        this.builder.build_store(data_ptr, ptr_slot);
-        const len_slot: LValue = this.builder.build_struct_gep(fat_ty, fat, 1, "fat.len");
-        const count_val: LValue = LType::const_int(LType::i64(), elem_count as u64, false);
-        this.builder.build_store(count_val, len_slot);
-        const cap_slot: LValue = this.builder.build_struct_gep(fat_ty, fat, 2, "fat.cap");
-        this.builder.build_store(count_val, cap_slot);
-
-        return this.builder.build_load(fat_ty, fat, "arrlit.fat.val");
-    }
-
 
     // Heap allocation / deallocation funnel
 
@@ -2741,58 +2671,6 @@ type struct ExprOps {
             if (want_bits < got_bits) {
                 return this.builder.build_trunc(val, want_lty, "ret.trunc");
             }
-        }
-
-        // Fixed-size array `[N x T]` -> dynamic fat pointer `{T*, i64}`.
-        // Happens when a function typed `[T]` returns `[a, b, ...]` and
-        // sema didn't propagate the dynamic expected_type into the
-        // array-literal's resolved shape.  Stash the loaded array on the
-        // stack, malloc N*sizeof(T), memcpy the contents, and build the
-        // fat pointer, keeping IR verifiable even when upstream
-        // inference is incomplete.
-        if (want_kind == LTypeKind::Struct && got_kind == LTypeKind::Array) {
-            const len: u32 = llvm::LLVMGetArrayLength(got_ty_raw);
-            const elem_ty_raw: void* = llvm::LLVMGetElementType(got_ty_raw);
-            const elem_size_val: LValue = LValue { raw: llvm::LLVMSizeOf(elem_ty_raw) };
-            const len_val: LValue = LType::const_int(LType::i64(), len as u64, false);
-            const byte_count: LValue = this.builder.build_mul(
-                len_val, elem_size_val, "ret.bytecnt");
-
-            const src_alloca: LValue = this.flow.create_entry_alloca(
-                fn, "ret.src", LType { raw: got_ty_raw });
-            this.builder.build_store(val, src_alloca);
-
-            const malloc_fn: LValue = this.lang_function(LangItem::Malloc);
-            if (!malloc_fn.is_valid()) {
-                return val;
-            }
-            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-            mut malloc_args: [Pair<LValue, TypeRef>] = [];
-            malloc_args.push(Pair::<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
-            mut data_ptr: LValue = LValue::null();
-            data_ptr = this.codegen_call(malloc_fn, malloc_ty, malloc_args, "ret.data");
-            if (!data_ptr.is_valid()) {
-                return val;
-            }
-
-            llvm::LLVMBuildMemCpy(this.builder.raw,
-                                  data_ptr.raw, 1,
-                                  src_alloca.raw, 1,
-                                  byte_count.raw);
-
-            const fat_alloca: LValue = this.flow.create_entry_alloca(fn, "ret.fat", want_lty);
-            const ptr_slot: LValue = this.builder.build_struct_gep(
-                want_lty, fat_alloca, 0, "ret.fat.ptr");
-            this.builder.build_store(data_ptr, ptr_slot);
-            const len_slot: LValue = this.builder.build_struct_gep(
-                want_lty, fat_alloca, 1, "ret.fat.len");
-            this.builder.build_store(len_val, len_slot);
-            const cap_slot: LValue = this.builder.build_struct_gep(
-                want_lty, fat_alloca, 2, "ret.fat.cap");
-            this.builder.build_store(len_val, cap_slot);
-
-            const loaded: LValue = this.builder.build_load(want_lty, fat_alloca, "ret.fat.val");
-            return loaded;
         }
 
         return val;

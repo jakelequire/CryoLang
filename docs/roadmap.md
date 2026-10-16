@@ -307,22 +307,32 @@ nothing outside the library using it, reported) or done by review alone.
 
 ## One dynamic array type
 
-`[T]` names a builtin dynamic array, and that is not `Array<T>`: the two
-mangle differently, refuse each other by value, and only `Array<T>` is
-iterated by `for`.  The builtin borrows its methods from `Array<T>`, and
-nested builtin arrays (`[[T]]`) crash at run time where `Array<Array<T>>`
-does not; the drop pass and the type resolver carry comments that route
-around the nested shape.  The two are made one type in a change of its
-own, before the class removal, so the class removal writes its thousands
-of array types against the type that remains: the AST's child lists are
-`[ExpressionNode*]`, `[StatementNode*]` and `[TypeAnnotation*]` today, and
-become arrays of whatever the AST's enums are.  The end state is
-`Array<T>` with the default allocator, and `[T]` is its spelling (ruling
-363); `&[T]` stays a reference to it (366).  The plan, its measurements
-and its slices are `docs/array-unify-plan.md`.
+Done: `[T]` is `Array<T>` with the default allocator (ruling 363), indexed
+through the library's `Index` implementations (364), with `length` and
+`capacity` of type `i64` (375).  The symbol rename was proved by comparing
+compiled output with old names mapped to new (367); the one difference in
+compiled code, the calling convention of a `[T]` passed by value, was made
+alike first.  What stays open:
 
-Built: `Array<T>` is indexed through the library's `Index`
-implementations (364), and an array literal initialises it.
+- **A fixed array converted to a dynamic one.**  `const d: [i32] = buf;`
+  with `buf: [i32; 3]` is refused (E0200).  The built-in `[T]` accepted it
+  and miscompiled it; whether the conversion is built (allocate and copy,
+  moving an owning element) is undecided.
+- **`xs[i] = v` does not release the displaced element**, as `cryo.md`
+  states for a run-time index.
+- **Operators on a generic container in a generic body** (`a + b` with
+  `a: Vec<T>`) have the gap indexing had: only a bare bounded parameter is
+  desugared there.
+- **Every method of an instantiated generic is emitted**, `Array`'s
+  eleven `index` and `element_at` among them, used or not: about 1% of a
+  stripped binary.  Emitting only the used ones needs reachability over
+  every reference to a specialization's methods, codegen's own synthesized
+  calls among them, where a missed one is a link failure (373: accepted).
+- **The written spelling reaches declaration mismatches only.**  An
+  argument mismatch shows the parameter as `[T]` even where the parameter
+  was written `Array<T>`: the check holds the types, not the annotations.
+- **The demangler prints `[T]` as the instance it is**,
+  `std::collections::array::Array<i64, std::alloc::allocator::GlobalAlloc>`.
 
 ## The class removal
 

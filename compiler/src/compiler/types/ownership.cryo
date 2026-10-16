@@ -104,12 +104,10 @@ type struct OwnershipQuery {
             return true;
         }
 
-        // Compound: array, optional, tuple are Copy if their components
-        // are Copy. Dynamic arrays carry a heap buffer, so they are
-        // never Copy regardless of element type.
+        // Compound: a fixed array, optional, tuple are Copy if their
+        // components are Copy.
         if (k == TypeKind::Array) {
             const at: ArrayType* = t as ArrayType*;
-            if (at.is_dynamic()) { return false; }
             return OwnershipQuery::is_copy_at_depth(arena, registry, intern,
                                                      at.element, depth + 1);
         }
@@ -301,11 +299,6 @@ type struct OwnershipQuery {
         // Compound aggregates: thread-safe if every component is.
         if (k == TypeKind::Array) {
             const at: ArrayType* = t as ArrayType*;
-            if (at.is_dynamic()) {
-                // A dynamic-array type alone isn't a value position;
-                // Array<T> is a Struct and walks the field rule below.
-                return false;
-            }
             return OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
                                                             at.element, depth + 1);
         }
@@ -582,18 +575,7 @@ type struct OwnershipQuery {
 
         if (k == TypeKind::Array) {
             const at: ArrayType* = t as ArrayType*;
-            // A heap-backed `[T]` owns a malloc'd buffer (and transitively
-            // its elements), so it always needs drop regardless of element
-            // type.  Its synthesized `.drop()` dispatches to the
-            // byte-compatible `Array<T>::drop` (call_emitter), which drops
-            // each element in place and then frees the buffer.
-            if (at.is_heap_dynamic()) { return true; }
-            // A fixed array whose named-const/computed size is still pending
-            // (FIXED_PENDING) owns no heap buffer; we also can't see its
-            // element count, so don't synthesize a drop (matches the prior
-            // behavior for all `size < 0` arrays).
-            if (at.is_dynamic()) { return false; }
-            // A resolved fixed array `[E; N]` drops if its element does.
+            // A fixed array `[E; N]` drops if its element does.
             return OwnershipQuery::needs_drop_at_depth(arena, registry, intern,
                                                        at.element, depth + 1);
         }
