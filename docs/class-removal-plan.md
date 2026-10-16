@@ -1041,7 +1041,8 @@ every visitor.
   methods (69 counting `ASTNode`'s abstract one) are deleted.  No AST
   class has a virtual method left.
 - A one-off codemod (`scripts/visit-codemod.py`) made the renames; it is
-  in the commit that ran it and deleted in the next.
+  in the commits that ran it (`26d905f0`, `a4e6a647`) and deleted in the
+  next.
 - **Measured.**  verify `--require-identical`: 0 objects moved.  Check
   time, interleaved x3 against slice 2: 7.94 s and 7.95 s (medians).
   Node bytes 334,062,200 -> 318,534,064: down 15,528,136, exactly 8 x
