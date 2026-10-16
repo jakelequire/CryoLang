@@ -134,6 +134,25 @@ type struct CallEmitter {
     /// `&mut` borrow sees the caller's storage.  Otherwise (rvalue: a
     /// literal, a global like a string constant, a computed value) we spill
     /// it to a fresh stack slot and return that slot's address.
+    /// Append the location a `![caller_location]` callee reports as its
+    /// caller's: `span`, the call's own, or - inside such a function
+    /// itself - the location its own caller passed, so a chain of them
+    /// reports the first call outside the chain.
+    push_caller_location(mut &this, args: [Pair<LValue, TypeRef>]*, span: SourceSpan) -> void {
+        const arena: TypeArena* = this.cg.get_arena();
+        if (this.cg.decl.caller_file.is_valid()) {
+            (*args).push(Pair::<LValue, TypeRef>::new(this.cg.decl.caller_file, arena.get_string()));
+            (*args).push(Pair::<LValue, TypeRef>::new(this.cg.decl.caller_line, arena.get_u32()));
+            return;
+        }
+        mut file: string = span.file;
+        if (file == null || file.length() == 0) { file = "<unknown>"; }
+        (*args).push(Pair::<LValue, TypeRef>::new(
+            this.cg.builder.build_global_string_ptr(file, "FILE.str"), arena.get_string()));
+        (*args).push(Pair::<LValue, TypeRef>::new(
+            LType::const_int(LType::i32(), span.start_line as u64, false), arena.get_u32()));
+    }
+
     /// Stack slot for a value spilled so its address can be taken.
     entry_spill_slot(&this, ty: LType, name: string) -> LValue {
         return this.cg.flow.temp_slot(ty, name);
@@ -794,7 +813,8 @@ type struct CallEmitter {
         if (node.resolved_callee.is_some()
                 && (node.callee.kind == NodeKind::Identifier
                     || node.callee.kind == NodeKind::ScopeResolution)) {
-            const pinned_ft: TypeRef = this.cg.resolver.pinned_signature(node.resolved_callee);
+            const pinned_ft: TypeRef = this.cg.resolver.call_signature(
+                this.cg.resolver.pinned_entry(node.resolved_callee));
             const pinned_t: Type* = if (pinned_ft.is_valid()) { this.cg.arena_type(pinned_ft) } else { null };
             if (pinned_t != null && pinned_t.kind == TypeKind::Function) {
                 const pinned_lty: LType = this.cg.resolver.build_function_ltype(pinned_t as FunctionType*);
@@ -882,6 +902,12 @@ type struct CallEmitter {
         // Live anonymous arg temps in an enclosing in-progress call also force an
         // invoke: if this call unwinds, its pad must drop them (the callee that
         // would own them never runs on the unwind path).
+        // A `![caller_location]` callee takes its caller's `FILE` and `LINE`
+        // after its own arguments: this call's location, or, inside another
+        // such function, the location that one was given.
+        if (this.cg.resolver.caller_located(this.cg.resolver.pinned_entry(node.resolved_callee))) {
+            this.push_caller_location(&args, node.span);
+        }
         const needs_invoke: boolean = this.cg.ctx.options.unwinds()
             && (node.unwind_cleanup.length > 0
                 || this.cg.expr_ops.has_live_arg_temps());

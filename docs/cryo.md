@@ -883,9 +883,24 @@ The compiler also expands two source-location pseudo-constants at the call site:
 | Constant | Expands to                               |
 | -------- | ---------------------------------------- |
 | `FILE`   | The current source file path (`string`). |
-| `LINE`   | The current line number (`i32`).         |
+| `LINE`   | The current line number (`u32`).         |
 
 These are used by `panic`, `assert`, and the testing framework to report failure locations without the caller passing them by hand.
+
+Inside a function marked `![caller_location]`, `FILE` and `LINE` are instead the location of the call to that function: every call passes its own location as two hidden trailing arguments, and a call made from inside another `![caller_location]` function passes on the location that one was given, so a chain of them reports the first call outside the chain.  Such a function cannot be taken as a value (E0151): a call through the value would have no location to pass.
+
+```cryo
+![caller_location]
+function expect_positive(n: i64) -> i64 {
+    if (n <= 0) { core::panic("expected a positive number", FILE, LINE); }
+    return n;
+}
+
+function main() -> i32 {
+    expect_positive(-1);   // panics reporting this line
+    return 0;
+}
+```
 
 ### 4.6 Overloading
 
@@ -3284,6 +3299,7 @@ type struct AlignedData {
 | --------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `![inline]`                                               | function, method                   | Every call is inlined, at every optimization level and across modules: a module calling the function compiles its own copy of the body, which is discarded once inlined, and the defining module keeps the one definition. A generic function's instances are inlined the same way.                                                                                                                                            |
 | `![noinline]`                                             | function, method                   | The function is never inlined.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `![caller_location]`                                      | function, method                   | `FILE` and `LINE` in the body are the location of the call ([section 4.5](#45-intrinsic-functions)). The function cannot be taken as a value.                                                                                                                                                                                                                                                                                            |
 | `![deprecated]` / `![deprecated("msg")]`                  | any decl                           | Marks a declaration as deprecated. *Parsed and validated; use-site warnings are not yet emitted.*                                                                                                                                                                                                                                                                                                                               |
 | `![symbol("name")]`                                       | extern fn / method / fn definition | Override the linker symbol: Cryo callers use the declared name while the symbol emitted / resolved at link time is `name`. On an extern decl or body-less method it renames the *imported* symbol; on a function *definition* it renames the *emitted* symbol. Used by the C++ binding generator to pin a decl to its Itanium-mangled symbol.                                                                                   |
 | `![no_mangle]`                                            | function / method                  | Emit the definition under its bare declared identifier instead of the mangled `C$…` symbol, so it can be linked from C (or serve as a runtime lang-item) without a wrapper. The preferred unmangling directive; `![symbol("name")]` is for the *rename* case.                                                                                                                                                                   |

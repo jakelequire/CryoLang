@@ -129,9 +129,17 @@ type struct DeclarationEmitter {
     ctx:         CompilationContext*;
     started:     StartedGlobals;
 
+    /// While a `![caller_location]` function's body is emitted, the two
+    /// trailing parameters its callers pass their `FILE` and `LINE` in;
+    /// null for any other body.
+    caller_file: LValue;
+    caller_line: LValue;
+
     static null() -> DeclarationEmitter {
         return DeclarationEmitter {
             started:     StartedGlobals { nodes: [], slots: [] },
+            caller_file: LValue::null(),
+            caller_line: LValue::null(),
             llvm_module: null,
             builder:     null,
             type_mapper: null,
@@ -530,6 +538,10 @@ type struct DeclarationEmitter {
                 if (param != null && param.resolved_type.is_valid()) {
                     params.push(param.resolved_type);
                 }
+            }
+            if (node.is_caller_located) {
+                const extra: [TypeRef] = SymbolResolver::caller_location_params(this.get_arena());
+                for (mut ci: i64 = 0; ci < extra.length; ci++) { params.push(extra[ci]); }
             }
             const plan: SignaturePlan = this.abi.classify_signature(
                 params, node.resolved_return_type, node.is_variadic);
@@ -1087,6 +1099,14 @@ type struct DeclarationEmitter {
                 user_plans.push(pplan_n);
             }
         }
+        if (func.is_caller_located) {
+            const extra: [TypeRef] = SymbolResolver::caller_location_params(this.get_arena());
+            for (mut ci: i64 = 0; ci < extra.length; ci++) {
+                const pplan_c: ParamPlan = this.abi.classify_param(extra[ci]);
+                total_user_slots += pplan_c.llvm_slots.length as u32;
+                user_plans.push(pplan_c);
+            }
+        }
 
         const total_params: u32 = total_user_slots + sret_inc;
 
@@ -1109,7 +1129,7 @@ type struct DeclarationEmitter {
         }
 
         mut params_valid: boolean = true;
-        for (mut i: u32 = 0; i < fixed_user_count; i++) {
+        for (mut i: u32 = 0; i < user_plans.length as u32; i++) {
             const pplan: &ParamPlan = &user_plans[i as i64];
             if (pplan.cls == ArgClass::Indirect
                     && pplan.attr == AbiAttr::ByVal
@@ -1593,6 +1613,17 @@ type struct DeclarationEmitter {
     /// location. No-op unless `-g`. The subroutine type carries no
     /// parameter list (sufficient for function-level file:line backtraces;
     /// per-argument types and per-statement line granularity are follow-ups).
+    /// Enter the body of `func`, defined as `fn_val`: a `![caller_location]`
+    /// body reads `FILE` and `LINE` from its last two parameters.
+    open_caller_site(mut &this, fn_val: LValue, func: FunctionDeclNode*) -> void {
+        this.caller_file = LValue::null();
+        this.caller_line = LValue::null();
+        if (!func.is_caller_located) { return; }
+        const n: u32 = llvm::LLVMCountParams(fn_val.raw);
+        this.caller_file = fn_val.get_param(n - 2);
+        this.caller_line = fn_val.get_param(n - 1);
+    }
+
     emit_debug_subprogram(mut &this, fn_val: LValue, node: FunctionDeclNode*) -> void {
         const ctx_ptr: CompilationContext* = this.ctx;
         if (!this.debug_info.is_on()) { return; }
@@ -1714,6 +1745,7 @@ type struct DeclarationEmitter {
         // inlinable calls in a function that carries debug info). No-op
         // unless `-g`.
         this.emit_debug_subprogram(fn_val, node);
+        this.open_caller_site(fn_val, node);
 
         // Create allocas for each parameter and store the incoming value.
         this.values.push_scope();
@@ -2082,6 +2114,7 @@ type struct DeclarationEmitter {
 
         const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
         this.builder.position_at_end(entry_bb);
+        this.open_caller_site(fn_val, func);
 
         this.values.push_scope();
 

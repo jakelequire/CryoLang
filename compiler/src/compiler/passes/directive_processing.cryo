@@ -211,7 +211,7 @@ type struct DirectiveProcessingPasses {
     /// side-effects; they're still registered so user tooling can read them.
     static is_known_builtin(name: Keyword) -> boolean {
         return match (name.as_string()) {
-            "inline" | "noinline" | "entry" | "test" | "ignore"
+            "inline" | "noinline" | "caller_location" | "entry" | "test" | "ignore"
             | "should_panic" | "config" | "deprecated" | "align"
             | "repr" | "link" | "symbol" | "target" | "allow" | "warn" | "deny"
             | "derive"
@@ -292,7 +292,9 @@ type struct DirectiveProcessingPasses {
             // `![inline]` / `![noinline]`: zero args; function- or method-target.
             // Both apply to anything that lowers to an LLVM function body, so a
             // method (whose body is a function too) is a valid target.
-            "inline" | "noinline" => {
+            // `![caller_location]`: the same shape - it changes how the
+            // function's body and its calls are emitted.
+            "inline" | "noinline" | "caller_location" => {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
@@ -846,7 +848,7 @@ type struct DirectiveProcessingPasses {
                 // enough to embed inline here; updating it tracks
                 // `is_known_builtin` above.
                 mut cands: [string] = [
-                    "inline", "noinline", "entry", "test", "ignore",
+                    "inline", "noinline", "caller_location", "entry", "test", "ignore",
                     "should_panic", "config", "deprecated", "align",
                     "repr", "link", "symbol", "no_mangle", "weak", "naked", "section",
                     "target", "allow", "warn", "deny",
@@ -1088,6 +1090,10 @@ type struct DirectiveProcessingPasses {
                 fn.is_inline   = false;
                 return;
             }
+            if (name.eq("caller_location")) {
+                fn.is_caller_located = true;
+                return;
+            }
             if (name.eq("implicit")) {
                 // Converter registration (for single-param `![implicit]`
                 // functions / static methods) happens in a dedicated walk after
@@ -1274,6 +1280,10 @@ type struct DirectiveProcessingPasses {
                     m.func.is_noinline = true;
                     m.func.is_inline   = false;
                 }
+                return;
+            }
+            if (name.eq("caller_location")) {
+                if (m.func != null) { m.func.is_caller_located = true; }
                 return;
             }
             // `![symbol("sym")]` on a method: pin the LLVM symbol of the wrapped

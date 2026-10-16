@@ -31,8 +31,10 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::codegen::state::{ function_registry, global_registry };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
-import compiler::ast::expression;
+import compiler::ast::{ expression, node, declaration, NodeKind };
 import compiler::ast::expression::{ CalleePin };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::declaration::{ FunctionDeclNode, MethodNode };
 import compiler::decl_index;
 import compiler::decl_index::{ DeclarationIndex, GlobalEntry };
 import compiler::types;
@@ -185,6 +187,44 @@ type struct SymbolResolver {
         return this.llvm_module.get_named_function(MangledName::new(this.ctx.intern_table.resolve(sym)));
     }
 
+    /// The two argument types a `![caller_location]` function takes after
+    /// its own, the caller's `FILE` and `LINE`: in its definition, in every
+    /// module's declaration of it, and at every call.
+    static caller_location_params(arena: TypeArena*) -> [TypeRef] {
+        return [arena.get_string(), arena.get_u32()];
+    }
+
+    /// Whether entry `id` declares a `![caller_location]` function.
+    caller_located(&this, id: OverloadId) -> boolean {
+        const d: ASTNode* = this.ctx.decl_index.entry_decl(id);
+        if (d == null) { return false; }
+        if (d.kind == NodeKind::MethodDeclaration) {
+            const m: MethodNode* = d as MethodNode*;
+            return m.func != null && m.func.is_caller_located;
+        }
+        if (d.kind == NodeKind::FunctionDeclaration) {
+            return (d as FunctionDeclNode*).is_caller_located;
+        }
+        return false;
+    }
+
+    /// The signature entry `id` is called at: its own, followed, for a
+    /// `![caller_location]` function, by the caller's location.  Invalid
+    /// for an invalid id.
+    call_signature(&this, id: OverloadId) -> TypeRef {
+        const sig: TypeRef = this.ctx.decl_index.entry_signature(id);
+        if (!this.caller_located(id)) { return sig; }
+        const arena: TypeArena* = this.ctx.type_arena;
+        const st: Type* = arena.lookup(sig);
+        if (st == null || st.kind != TypeKind::Function) { return TypeRef::invalid(); }
+        const ft: FunctionType* = st as FunctionType*;
+        mut ps: [TypeRef] = [];
+        for (mut i: i64 = 0; i < ft.param_types.length; i++) { ps.push(ft.param_types[i]); }
+        const extra: [TypeRef] = SymbolResolver::caller_location_params(arena);
+        for (mut i: i64 = 0; i < extra.length; i++) { ps.push(extra[i]); }
+        return arena.get_function(ft.return_type, ps, ft.is_variadic);
+    }
+
     /// A function by DECLARATION.  The entry gives both the symbol and the
     /// signature: held by this module under that symbol, else declared
     /// extern at that signature - and, for an `![inline]` body, queued for
@@ -196,7 +236,7 @@ type struct SymbolResolver {
         if (!sym.is_valid()) { return LValue::null(); }
         const v: LValue = this.held_symbol(sym);
         if (v.is_valid()) { return v; }
-        const declared: LValue = this.declare_extern_function_as(di.entry_signature(id), sym);
+        const declared: LValue = this.declare_extern_function_as(this.call_signature(id), sym);
         if (declared.is_valid() && di.inline_body(id).is_some()) {
             this.inline_copies.push(id);
         }
@@ -241,32 +281,25 @@ type struct SymbolResolver {
         return this.resolve_decl(this.ctx.decl_index.entry_of_def(d));
     }
 
-    /// The signature of a pinned callee: the declaration's entry, an
-    /// instance's copy's entry; invalid for an unpinned callee.
-    pinned_signature(&this, pin: CalleePin) -> TypeRef {
-        match (pin) {
-            CalleePin::Decl(e) => { return this.ctx.decl_index.entry_signature(e); }
-            CalleePin::Instance(i) => {
-                return this.ctx.decl_index.entry_signature(this.ctx.decl_index.entry_of_instance(i));
-            }
-            _ => { }
-        }
-        return TypeRef::invalid();
+    /// The entry a pin names, by the kind of answer the pin says it is: a
+    /// declaration's own, an instance's copy's.  One question each; a pin
+    /// of the one kind is never asked as another.  Invalid for no pin.
+    pinned_entry(&this, pin: CalleePin) -> OverloadId {
+        return match (pin) {
+            CalleePin::Decl(e)     => { e }
+            CalleePin::Instance(i) => { this.ctx.decl_index.entry_of_instance(i) }
+            _                      => { OverloadId::invalid() }
+        };
     }
 
+    /// The signature of a pinned callee; invalid for an unpinned callee.
+    pinned_signature(&this, pin: CalleePin) -> TypeRef {
+        return this.ctx.decl_index.entry_signature(this.pinned_entry(pin));
+    }
 
-    /// A pinned callee, by the kind of answer the pin says it is: a
-    /// declaration resolves through its entry, an instance through its
-    /// copy's entry.  One question each; a pin of the one kind is never
-    /// asked as another.
+    /// A pinned callee, through its entry.
     resolve_pinned(mut &this, pin: CalleePin) -> LValue {
-        return match (pin) {
-            CalleePin::Decl(e)   => { this.resolve_decl(e) }
-            CalleePin::Instance(i) => {
-                this.resolve_decl(this.ctx.decl_index.entry_of_instance(i))
-            }
-            _                    => { LValue::null() }
-        };
+        return this.resolve_decl(this.pinned_entry(pin));
     }
 
     /// The global registered at `slot` - the coordinate sema pinned on a
