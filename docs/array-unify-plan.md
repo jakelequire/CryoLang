@@ -57,6 +57,18 @@ the array-syntax change):
 - The symbol rename is proved by a one-off comparison of compiled output
   with old names mapped to new ones, deleted in the next commit (367).
 - The compiler and stdlib prefer Cryo's own language features (368).
+- Editor and diagnostic text spells a type as the annotation wrote it;
+  with no written spelling, `[T]` for the default allocator,
+  `Array<T, A>` otherwise (369).
+- `![inline]` functions are copied into every calling module; `Array`'s
+  `index` and `element_at` are marked (370).  Built.
+- `p[i]` on a pointer to an array is pointer arithmetic (371).  Built.
+- An attribute reports the caller's location in a panic, on the index
+  bounds check (372).
+- Emitting only the used methods of an instantiated generic is scouted
+  (373).
+- A fill literal is refused unless its element is plain-copy (374).
+  Built.
 
 ## 3. Units
 
@@ -100,19 +112,27 @@ Not done additively, on purpose:
 dynamic arrays) and the codegen paths for the builtin are deleted.
 `TypeKind::Array` keeps only the fixed array.
 
-What must keep working, each with a measurement before and after:
+Blocked on the type of `length` (open question 1): the builtin's
+`.length` is an implicit `i64` field, `Array<T>`'s `length` field is a
+`u64`.  With `[T]` resolved to `Array<T>` (the resolver's annotation case
+and a run-time fill literal's type, nothing else), building the compiler
+reports 2,348 W0005 implicit `i64`/`u64` widenings and 177 E0200, every
+one "expected `i64`, found `u64`", and ~40 E0358 where an overload no
+longer fits (`push` of a `u64` onto an `[i64]`); nothing else.
 
-- **Indexing** through `Index` instead of the inline check.  The
-  out-of-range panic now reports the library's `element_at` and says
-  "Array: index out of range" where the builtin reported the indexing site
-  with "index N out of bounds for length L" (open question 1).  The cost is
-  a call per index unless inlined: time `cryo check` on the compiler before
-  and after.
-- **A pointer to an array, indexed** (`p[i]` with `p: [T]*`): the builtin
-  auto-derefs, a pointer to a struct does pointer arithmetic.  Every such
-  site in the tree must be found (they type-check as the wrong type, mostly
-  refused) and rewritten to `(*p)[i]` or a reference; the rule in
-  `check_index_access` is then deleted.
+Done ahead of the switch:
+
+- **Indexing** through `Index`, for `[T]` as for `Array<T>`, with the
+  calls inlined across modules: `cryo check` on the compiler +3%.  Not
+  inside a generic body: there `xs[i]` on a `[T]` still takes the
+  compiler's built-in check, because the method bridge from `[T]` to
+  `Array<T>` is keyed by a concrete element; the switch removes both.
+- **The out-of-range report** names the `xs[i]`: the bounds check is
+  `![caller_location]`.
+- **A pointer to an array, indexed** is pointer arithmetic; the one site
+  in the tree reads `(*sched)[i]` and the look-through is deleted.
+
+What must keep working, each with a measurement before and after:
 - **Fixed to dynamic conversion**, implicit today.
 - **Display**: hover and diagnostics print `[T]` for `Array<T>` with the
   default allocator, or `Array<T>` everywhere - decided in this unit and
@@ -139,19 +159,14 @@ spec drops the dynamic `A` row; the roadmap item goes.
 - `xs[i] = v` does not release the displaced element, for the builtin and
   for `Array<T>` alike - as `cryo.md` states for a run-time index.  The
   switch must keep this identical, not fix it silently.
-- A fill literal of an owning element releases the one value `n` times
-  (bug 0053).
 - Binary and unary operators on a generic container (`a + b` with
   `a: Vec<T>`) in a generic body have the gap indexing had: only a bare
   bounded parameter is desugared there.
 
 ## 5. Open questions (for Jake)
 
-1. **Where an out-of-range index reports.**  A) the library's
-   `element_at`, with its own message (as built: a backtrace shows the
-   caller).  B) a caller-location attribute, so a library function reports
-   its caller's site - a new language feature.  C) the compiler keeps
-   emitting the check inline at the indexing site for `Array<T>`.  Lean A
-   now, B later; C contradicts 364.
-2. **What hover and diagnostics print** for `Array<T>` with the default
-   allocator: `[T]` or `Array<T>`.
+1. **The type of an array's `length`.**  A) `Array<T>`'s `length` and
+   `capacity` become `i64`, as every `[T]` in the tree was written
+   against, and the library adapts inside `array.cryo`.  B) they stay
+   `u64` and the ~2,400 sites in the tree that compare or pass `.length`
+   as an `i64` are rewritten.  Lean A.
