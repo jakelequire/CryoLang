@@ -134,6 +134,21 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-16
+
+379. **A fixed-size array does not convert implicitly to a dynamic `[T]`:**
+     `const d: [i32] = buf;` with `buf: [i32; 3]` stays refused with E0200.
+     (Dispatch, delegated)
+
+380. **The demangler prints the full `Array<...>` type a `[T]` symbol
+     names** - `std::collections::array::Array<i64,
+     std::alloc::allocator::GlobalAlloc>` - rather than sugaring it back to
+     `[i64]`.  (Dispatch, delegated)
+
+381. **A call-site argument error spells a dynamic array `[T]`;** only
+     declaration-site text follows the written spelling (ruling 369).
+     (Dispatch, delegated)
+
 ### 2026-10-15
 
 347. **Fixed-size arrays change syntax with dynamic ones:** `T[N]` is

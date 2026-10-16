@@ -35,10 +35,18 @@ namespace compiler::codegen::ast_arena;
 import std::alloc::arena::{ Arena, GlobalArena };
 
 import std::alloc::arena;       // Arena (+ inherent `bump`)
+import std::fmt;
 
 /// Process-wide AST arena.  Heap-boxed + leaked so module-global init is a
 /// single null check; reset (not drop) reclaims it between targets.
 mut g_ast_arena: Arena* = null;
+
+/// Node allocations through `cryo_ast_arena_alloc`, and their bytes as
+/// requested, since the last reset or release.  Read by the `CRYO_TIMINGS`
+/// report; the arena's own `used()` also counts the container heap routed
+/// into it, so it cannot tell node storage apart.
+mut g_ast_node_count: u64 = 0;
+mut g_ast_node_bytes: u64 = 0;
 
 /// Lazy-init accessor.  Idempotent; every call after the first returns the
 /// same handle.  8 MiB chunks keep the chunk list short for the ~1 GB of AST
@@ -71,6 +79,8 @@ public function cryo_ast_arena_alloc(size: u64, align: u64) -> void* {
     if (sz == 0) { sz = 1; }       // malloc(0) is UB on some platforms
     mut al: u64 = align;
     if (al == 0) { al = 16; }      // malloc-parity alignment floor
+    g_ast_node_count += 1;
+    g_ast_node_bytes += sz;
     // Call the inherent raw bump directly (not the `Allocator` trait) so this
     // hot path doesn't depend on cross-module trait-impl resolution and needs
     // no `allocator`/`layout`/`result` imports.  Returns null on OOM, matching
@@ -157,6 +167,8 @@ public function cryo_ast_arena_reset() -> void {
     // it activates at Frontend.
     mut a: Arena* = get_ast_arena();
     a.reset();
+    g_ast_node_count = 0;
+    g_ast_node_bytes = 0;
 }
 
 /// Free the entire AST arena's chunks back to the allocator (and, for the
@@ -170,4 +182,17 @@ public function cryo_ast_arena_release() -> void {
     // to the OS.
     mut a: Arena* = get_ast_arena();
     a.release();
+    g_ast_node_count = 0;
+    g_ast_node_bytes = 0;
+}
+
+/// Print the arena's figures for the `CRYO_TIMINGS` report: the node
+/// allocations and their bytes, then everything the arena holds (nodes and
+/// routed containers) and the chunk capacity behind it.
+public function cryo_ast_arena_report() -> void {
+    mut a: Arena* = get_ast_arena();
+    fmt::printf("  %-28s %llu allocations, %llu bytes\n", "AST nodes",
+        g_ast_node_count, g_ast_node_bytes);
+    fmt::printf("  %-28s %llu bytes used, %llu bytes capacity\n", "AST arena",
+        a.used(), a.capacity());
 }

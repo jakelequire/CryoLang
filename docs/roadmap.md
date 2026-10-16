@@ -342,7 +342,8 @@ work, compile-time execution and what follows them.  What remains is
 structs, enums and traits.  The compiler's AST goes straight to enums and
 `match` (ruling 290: no intermediate struct-node stage).
 
-It starts with a read-only scoping audit.  What is known now:
+The plan, its measured inventory and the decisions it waits on are in
+`docs/class-removal-plan.md`.  What is known now:
 
 - 109 classes, all in the compiler; the standard library, the language
   server and the examples declare none.

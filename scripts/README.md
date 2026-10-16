@@ -54,4 +54,5 @@ one; the history keeps it.
 | script | what it does | called by |
 |---|---|---|
 | `annotate-negative-tests.py` | Writes `//~` annotations into compile-fail files from a real `cryo check` run, keeping only ones that verify | a person adding a negative test |
+| `check-cost.py` | Wall time, peak memory and AST arena figures of `cryo check` over the compiler, for one or more compilers interleaved; deleted with `docs/class-removal-plan.md` | a person measuring a class-removal slice |
 | `install-lsp-windows.cmd` | Windows host: packages `tools/CryoAnalyzer` and installs it into VS Code, replacing the installed extension | `make install-lsp` (Windows) |
