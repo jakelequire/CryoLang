@@ -187,12 +187,20 @@ type struct CallEmitter {
     location_constant(mut &this, lty: LType, span: SourceSpan) -> LValue {
         mut file: string = span.file;
         if (file == null || file.length() == 0) { file = "<unknown>"; }
+        if (!this.cg.decl.location_file_global.is_valid() || this.cg.decl.location_file != file) {
+            this.cg.decl.location_file = file;
+            this.cg.decl.location_file_global = this.cg.builder.build_global_string_ptr(file, "location.file");
+        }
+        if (!this.cg.decl.function_name_global.is_valid()) {
+            this.cg.decl.function_name_global =
+                this.cg.builder.build_global_string_ptr(this.cg.decl.function_name, "location.function");
+        }
         const buf: void* = libc::malloc(32);
         const slots: void** = buf as void**;
-        slots[0] = this.cg.builder.build_global_string_ptr(file, "location.file").raw;
+        slots[0] = this.cg.decl.location_file_global.raw;
         slots[1] = LType::const_int(LType::i32(), span.start_line as u64, false).raw;
         slots[2] = LType::const_int(LType::i32(), span.start_col as u64, false).raw;
-        slots[3] = this.cg.builder.build_global_string_ptr(this.cg.decl.function_name, "location.function").raw;
+        slots[3] = this.cg.decl.function_name_global.raw;
         const init: LValue = LType::const_named_struct(lty, buf, 4);
         libc::free(buf);
         return init;
@@ -957,9 +965,9 @@ type struct CallEmitter {
         // Live anonymous arg temps in an enclosing in-progress call also force an
         // invoke: if this call unwinds, its pad must drop them (the callee that
         // would own them never runs on the unwind path).
-        // A `![caller_location]` callee takes its caller's `FILE` and `LINE`
-        // after its own arguments: this call's location, or, inside another
-        // such function, the location that one was given.
+        // A `![caller_location]` callee takes the address of its caller's
+        // `Location` after its own arguments: this call's place, or, inside
+        // another such function, the one that function was given.
         if (this.cg.resolver.caller_located(this.cg.resolver.pinned_entry(node.resolved_callee))) {
             this.push_caller_location(&args, node.span);
         }

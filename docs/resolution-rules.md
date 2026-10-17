@@ -111,7 +111,6 @@ or reads the store by identity.  Locked so far:
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
 | `primitive` | `ResBase::primitive_of_alias` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: alias keywords |
 | `primitive` | `ResBase::primitive_position` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: a primitive's position, which its definition is kept under |
-| `primitive` | `SourceLoc::of_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed table of source-location pseudo-constants (`FILE`, `LINE`), declared nowhere |
 | `lang-item` | `GenericRegistry::claim_wellknown` | `compiler/src/compiler/types/generic_registry.cryo` | the fixed language-item table |
 | `lang-item` | `LangModule::is_written` | `compiler/src/compiler/resolver/lang_item.cryo` | the fixed table of modules the compiler imports on a program's behalf: whether an import's written path names one (the prelude a file already globs) |
 | `lang-item` | `IntrinsicKind::from_name` | `compiler/src/compiler/intrinsic_kind.cryo` | the fixed intrinsic table: an `intrinsic function` declaration's name to the operation it lowers as |
