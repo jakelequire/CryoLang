@@ -24,7 +24,7 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::ast::{ NodeKind };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumDeclNode, EnumVariant, FieldDecl, FunctionDeclNode,
+    ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, EnumVariant, FieldDecl, FunctionDeclNode,
     ImplBlockNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::module_graph::{ ModulePath, ModuleSpellingMatch };
@@ -333,8 +333,16 @@ type struct Completer {
             NodeKind::StructDeclaration    => { (n as StructDeclNode*).def }
             NodeKind::ClassDeclaration     => { (n as ClassDeclNode*).def }
             NodeKind::UnionDeclaration     => { (n as UnionDeclNode*).def }
-            NodeKind::EnumDeclaration      => { (n as EnumDeclNode*).def }
             NodeKind::ImplementationBlock  => { (n as ImplBlockNode*).target_def() }
+            NodeKind::Declaration          => {
+                match ((n as DeclarationNode*).shape) {
+                    DeclKind::Enum(e) => { e.def }
+                    DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::IntrinsicConst(_)
+                    | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                    | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
+                    | DeclKind::GenericParam(_) | DeclKind::Legacy => { DefId::invalid() }
+                }
+            }
             _                              => { DefId::invalid() }
         };
     }
@@ -570,8 +578,16 @@ type struct Completer {
         return match (decl.kind) {
             NodeKind::StructDeclaration => { CK_STRUCT }
             NodeKind::UnionDeclaration  => { CK_STRUCT }
-            NodeKind::EnumDeclaration   => { CK_ENUM }
             NodeKind::TraitDeclaration  => { CK_INTERFACE }
+            NodeKind::Declaration       => {
+                match ((decl as DeclarationNode*).shape) {
+                    DeclKind::Enum(_) => { CK_ENUM }
+                    DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::IntrinsicConst(_)
+                    | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                    | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
+                    | DeclKind::GenericParam(_) | DeclKind::Legacy => { CK_CLASS }
+                }
+            }
             _                           => { CK_CLASS }
         };
     }
@@ -587,9 +603,10 @@ type struct Completer {
             }
             Member::Variant(o, i) => {
                 const decl: ASTNode* = this.ctx.decl_index.declaration_of(o);
-                if (decl == null || decl.kind != NodeKind::EnumDeclaration) { return; }
+                const en: EnumDecl* = DeclarationNode::enum_of(decl);
+                if (en == null) { return; }
                 shown.variant(o, i);
-                const v: EnumVariant* = DeclarationNode::variant_of((decl as EnumDeclNode*).variants[i]);
+                const v: EnumVariant* = DeclarationNode::variant_of(en.variants[i]);
                 this.push(this.ctx.intern_table.resolve(v.name),
                           shown.text, CK_ENUM_MEMBER);
             }

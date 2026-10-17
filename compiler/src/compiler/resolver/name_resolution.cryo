@@ -41,7 +41,7 @@ import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DestructureBinding, DestructureDecl, EnumDeclNode, EnumVariant,
+    ClassDeclNode, DestructureBinding, DestructureDecl, EnumDecl, EnumVariant,
     ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlockNode,
     DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDecl, UnionDeclNode, VarDeclNode
@@ -419,21 +419,6 @@ type struct NameResolver {
                         union_node.binding_namespace, union_node.name, union_node.span));
                 }
             }
-            NodeKind::EnumDeclaration => {
-                const enum_node: EnumDeclNode* = node as EnumDeclNode*;
-                if (!enum_node.binding_namespace.is_valid()) {
-                    const sym_id: SymbolID = this.resolver.declare_type(
-                        enum_node.name, enum_node.span, enum_node.is_public);
-                    enum_node.def = this.type_def_of(sym_id);
-                    if (enum_node.is_public) {
-                        this.resolver.export_symbol(sym_id);
-                    }
-                } else {
-                    enum_node.def = this.type_def_of(this.declare_c_imported(
-                        enum_node.binding_namespace, enum_node.name, enum_node.span));
-                }
-                this.record_enum_decl(enum_node);
-            }
             NodeKind::ClassDeclaration => {
                 const class_node: ClassDeclNode* = node as ClassDeclNode*;
                 const sym_id: SymbolID = this.resolver.declare_type(
@@ -577,6 +562,20 @@ type struct NameResolver {
                         this.resolver.export_symbol(declared_id);
                         ic_node.def = this.resolver.get_symbol(declared_id).def;
                     }
+                    DeclKind::Enum(enum_node) => {
+                        if (!enum_node.binding_namespace.is_valid()) {
+                            const sym_id: SymbolID = this.resolver.declare_type(
+                                enum_node.name, decl.span, enum_node.is_public);
+                            enum_node.def = this.type_def_of(sym_id);
+                            if (enum_node.is_public) {
+                                this.resolver.export_symbol(sym_id);
+                            }
+                        } else {
+                            enum_node.def = this.type_def_of(this.declare_c_imported(
+                                enum_node.binding_namespace, enum_node.name, decl.span));
+                        }
+                        this.record_enum_decl(enum_node);
+                    }
                     DeclKind::TypeAlias(alias_node) => {
                         this.ctx.note_alias_decl(node);
                         if (!alias_node.binding_namespace.is_valid()) {
@@ -623,7 +622,6 @@ type struct NameResolver {
         const d: DefId = match (node.kind) {
             NodeKind::StructDeclaration    => { (node as StructDeclNode*).def }
             NodeKind::UnionDeclaration     => { (node as UnionDeclNode*).def }
-            NodeKind::EnumDeclaration      => { (node as EnumDeclNode*).def }
             NodeKind::ClassDeclaration     => { (node as ClassDeclNode*).def }
             NodeKind::TraitDeclaration     => { (node as TraitDeclNode*).def }
             NodeKind::VariableDeclaration  => { (node as VarDeclNode*).def }
@@ -632,6 +630,7 @@ type struct NameResolver {
                     DeclKind::Intrinsic(i)       => { i.def }
                     DeclKind::IntrinsicConst(ic) => { ic.def }
                     DeclKind::TypeAlias(a)       => { a.def }
+                    DeclKind::Enum(e)            => { e.def }
                     DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
                     | DeclKind::Variant(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
                     | DeclKind::Destructure(_) | DeclKind::Legacy => {
@@ -2425,7 +2424,7 @@ type struct NameResolver {
     /// wherever a compile-time integer is wanted.  Kept under the enum's
     /// definition, which a use's stamp carries; called once the declaration
     /// has one.
-    record_enum_decl(&this, node: EnumDeclNode*) -> void {
+    record_enum_decl(&this, node: EnumDecl*) -> void {
         if (this.ctx == null || this.ctx.const_table == null) { return; }
         this.ctx.const_table.register_enum(node);
     }
@@ -3206,9 +3205,9 @@ implement trait Walk for struct NameResolver {
         this.resolver.exit_scope();
     }
 
-    walk_enum(mut &this, node: EnumDeclNode*) -> void {
+    walk_enum(mut &this, d: DeclarationNode*, node: EnumDecl*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] visit(EnumDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
-        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
+        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), d.span);
 
         // Declare generic params
         this.declare_generics(node.generic_params);
@@ -4013,7 +4012,8 @@ type struct NameDeclarationPass {
         if (node == null) { return DefId::invalid(); }
         if (node.kind == NodeKind::StructDeclaration)    { return (node as StructDeclNode*).def; }
         if (node.kind == NodeKind::UnionDeclaration)     { return (node as UnionDeclNode*).def; }
-        if (node.kind == NodeKind::EnumDeclaration)      { return (node as EnumDeclNode*).def; }
+        const en: EnumDecl* = DeclarationNode::enum_of(node);
+        if (en != null) { return en.def; }
         const alias: TypeAliasDecl* = DeclarationNode::alias_of(node);
         if (alias != null) { return alias.def; }
         return DefId::invalid();

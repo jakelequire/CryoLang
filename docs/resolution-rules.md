@@ -99,7 +99,7 @@ or reads the store by identity.  Locked so far:
 | `member-field` | `StructType::field_position` | `compiler/src/compiler/types/user_defined.cryo` | member: a field of a struct in hand, by leaf, to its position among the struct's fields |
 | `member-field` | `ClassType::own_field_position` | `compiler/src/compiler/types/user_defined.cryo` | member: a field of a class in hand, by leaf, to its position among the class's own fields |
 | `member-variant` | `EnumType::variant_index` | `compiler/src/compiler/types/user_defined.cryo` | member: an enum variant, by owner type and leaf |
-| `member-variant` | `EnumDeclNode::variant_position` | `compiler/src/compiler/AST/declaration.cryo` | member: an enum variant, by the enum's declaration and leaf, to its position among the declared variants - for a constant folded off the declaration |
+| `member-variant` | `EnumDecl::variant_position` | `compiler/src/compiler/AST/declaration.cryo` | member: an enum variant, by the enum's declaration and leaf, to its position among the declared variants - for a constant folded off the declaration |
 | `trait-method` | `GenericRegistry::trait_item_slot` | `compiler/src/compiler/types/generic_registry.cryo` | member: a trait's declared method, by trait identity and leaf, to its position in the trait |
 | `assoc-type` | `TraitDeclNode::assoc_type_index` | `compiler/src/compiler/AST/declaration.cryo` | member: a trait's associated type, by the trait's declaration and leaf, to its position among the trait's associated types |
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
@@ -169,6 +169,16 @@ yet is recorded with the change that builds it, not here.
      counted first; if any is, every field is copied and a test added; if
      none is, that is recorded and the defect stays open.  (Dispatch,
      delegated)
+
+411. **The three places a type alias is not transparent** - calling a
+     value typed by a function-type alias, an operator on a call returning
+     an alias, and a struct literal through a generic alias - are fixed as
+     one change after every declaration kind but classes has converted to
+     a payload, not before.  (Dispatch, delegated)
+
+413. **Class declarations are not converted to a declaration payload:** the
+     class feature is deleted outright, so a class stays a subclass behind
+     the declaration bridge until then.  (Jake)
 
 ### 2026-10-16
 

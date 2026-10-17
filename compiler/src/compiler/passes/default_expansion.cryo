@@ -51,9 +51,9 @@ import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumDeclNode, EnumVariant, FieldDecl, FunctionDeclNode,
+    ClassDeclNode, DeclarationNode, DeclKind, EnumVariant, FieldDecl, FunctionDeclNode,
     GenericParamDecl, ImplBlockNode, MethodNode, StructDeclNode, TraitDeclNode,
-    TypeAliasDecl, UnionDeclNode, VarDeclNode
+    UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode,
@@ -222,21 +222,6 @@ type struct DefaultExpansionPasses {
                 }
                 if (is_generic) { scope.pop(); }
             }
-            NodeKind::EnumDeclaration => {
-                const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                const is_generic: boolean = node.generic_params.length > 0;
-                if (is_generic) { scope.push(node.def); }
-                // Enum variant payload annotations (if any).
-                for (mut i: i64 = 0; i < node.variants.length; i++) {
-                    const v: EnumVariant* = DeclarationNode::variant_of(node.variants[i]);
-                    if (v == null) { continue; }
-                    for (mut j: i64 = 0; j < v.associated_types.length; j++) {
-                        DefaultExpansionPasses::rewrite_annotation_in_place(
-                            v.associated_types[j], reg, scope);
-                    }
-                }
-                if (is_generic) { scope.pop(); }
-            }
             NodeKind::FunctionDeclaration => {
                 DefaultExpansionPasses::rewrite_function_decl(
                     stmt as FunctionDeclNode*, reg, scope);
@@ -267,16 +252,36 @@ type struct DefaultExpansionPasses {
                 if (is_generic) { scope.pop(); }
             }
             NodeKind::Declaration => {
-                // Of the kinds with a payload only an alias holds an annotation.
-                const node: TypeAliasDecl* = DeclarationNode::alias_of(stmt);
-                if (node == null) { return; }
-                const is_generic: boolean = node.generic_params.length > 0;
-                if (is_generic) { scope.push(node.def); }
-                if (node.target_annotation != null) {
-                    DefaultExpansionPasses::rewrite_annotation_in_place(
-                        node.target_annotation, reg, scope);
+                match ((stmt as DeclarationNode*).shape) {
+                    DeclKind::Enum(node) => {
+                        const is_generic: boolean = node.generic_params.length > 0;
+                        if (is_generic) { scope.push(node.def); }
+                        // Enum variant payload annotations (if any).
+                        for (mut i: i64 = 0; i < node.variants.length; i++) {
+                            const v: EnumVariant* = DeclarationNode::variant_of(node.variants[i]);
+                            if (v == null) { continue; }
+                            for (mut j: i64 = 0; j < v.associated_types.length; j++) {
+                                DefaultExpansionPasses::rewrite_annotation_in_place(
+                                    v.associated_types[j], reg, scope);
+                            }
+                        }
+                        if (is_generic) { scope.pop(); }
+                    }
+                    DeclKind::TypeAlias(node) => {
+                        const is_generic: boolean = node.generic_params.length > 0;
+                        if (is_generic) { scope.push(node.def); }
+                        if (node.target_annotation != null) {
+                            DefaultExpansionPasses::rewrite_annotation_in_place(
+                                node.target_annotation, reg, scope);
+                        }
+                        if (is_generic) { scope.pop(); }
+                    }
+                    // No other kind with a payload holds an annotation here.
+                    DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::IntrinsicConst(_)
+                    | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                    | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+                    | DeclKind::Legacy => {}
                 }
-                if (is_generic) { scope.pop(); }
             }
             _ => {}
         }

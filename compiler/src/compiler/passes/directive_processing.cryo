@@ -60,7 +60,7 @@ import utils::logger;
 import utils::logger::{ cdebug };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, EnumDeclNode, ExternBlock, FunctionDeclNode,
+    ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDeclNode,
     ImplBlockNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -163,12 +163,12 @@ implement enum DirectiveTarget {
             NodeKind::StructDeclaration     => { DirectiveTarget::Struct   }
             NodeKind::UnionDeclaration      => { DirectiveTarget::Union    }
             NodeKind::ClassDeclaration      => { DirectiveTarget::Class    }
-            NodeKind::EnumDeclaration       => { DirectiveTarget::Enum     }
             NodeKind::TraitDeclaration      => { DirectiveTarget::Trait    }
             NodeKind::VariableDeclaration   => { DirectiveTarget::Variable }
             NodeKind::ImplementationBlock   => { DirectiveTarget::Impl     }
             NodeKind::Declaration => {
                 match ((n as DeclarationNode*).shape) {
+                    DeclKind::Enum(_)           => { DirectiveTarget::Enum   }
                     DeclKind::Extern(_)         => { DirectiveTarget::Extern }
                     DeclKind::Import(_)         => { DirectiveTarget::Import }
                     DeclKind::Module(_)         => { DirectiveTarget::Module }
@@ -1042,7 +1042,7 @@ type struct DirectiveProcessingPasses {
 
     static apply_layout_effects_enum(ctx: CompilationContext*,
                                        dir: DirectiveNode*,
-                                       ed: EnumDeclNode*,
+                                       ed: EnumDecl*,
                                        name: Keyword) -> void {
         // Enums accept only `repr(C)` and `![align(N)]` today; the validator
         // has already rejected `repr(packed)` / `repr(transparent)` on
@@ -1234,8 +1234,8 @@ type struct DirectiveProcessingPasses {
             DirectiveProcessingPasses::apply_layout_effects_class(ctx, dir, cd, dir.directive_kind);
             return;
         }
-        if (decl.kind == NodeKind::EnumDeclaration) {
-            const ed: EnumDeclNode* = decl as EnumDeclNode*;
+        const ed: EnumDecl* = DeclarationNode::enum_of(decl as ASTNode*);
+        if (ed != null) {
             DirectiveProcessingPasses::apply_layout_effects_enum(ctx, dir, ed, dir.directive_kind);
             return;
         }
@@ -1813,9 +1813,10 @@ type struct DirectiveProcessingPasses {
                     ct.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
                     ct.set_min_alignment(node.min_alignment);
                 }
-                NodeKind::EnumDeclaration => {
-                    const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                    if (node.is_generic()) { continue; }
+                NodeKind::Declaration => {
+                    // Of the kinds with a payload only an enum has a layout.
+                    const node: EnumDecl* = DeclarationNode::enum_of(stmt);
+                    if (node == null || node.is_generic()) { continue; }
                     if (!node.repr_c && node.min_alignment == 0) { continue; }
                     const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/enum layout");
                     if (!tref.is_valid()) { continue; }

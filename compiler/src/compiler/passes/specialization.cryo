@@ -40,9 +40,8 @@ import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumDeclNode, FunctionDeclNode, GenericParamDecl,
-    ImplBlockNode, MethodNode, StructDeclNode, TraitDeclNode, TypeAliasDecl,
-    UnionDeclNode
+    ClassDeclNode, DeclarationNode, DeclKind, FunctionDeclNode, GenericParamDecl,
+    ImplBlockNode, MethodNode, StructDeclNode, TraitDeclNode, UnionDeclNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::mono::monomorphizer::{ Monomorphizer };
@@ -84,7 +83,7 @@ type struct SpecInjector {
             && (node.kind == NodeKind::StructDeclaration
                 || node.kind == NodeKind::UnionDeclaration
                 || node.kind == NodeKind::ClassDeclaration
-                || node.kind == NodeKind::EnumDeclaration);
+                || DeclarationNode::enum_of(node) != null);
         if (!named) {
             SpecInjector::register_injected_decl(node, ctx);
         }
@@ -181,13 +180,6 @@ type struct SpecializationPasses {
                             ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
                     }
                 }
-                NodeKind::EnumDeclaration => {
-                    const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                    if (node.is_generic()) {
-                        SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, TemplateKind::Enum, node.def, registry, arena, ctx);
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) {
@@ -216,12 +208,25 @@ type struct SpecializationPasses {
                     }
                 }
                 NodeKind::Declaration => {
-                    // Of the kinds with a payload only an alias can be generic;
-                    // its template holds the declaration's header.
-                    const node: TypeAliasDecl* = DeclarationNode::alias_of(stmt);
-                    if (node != null && node.is_generic()) {
-                        SpecializationPasses::register_generic_template(node.alias_name, node.generic_params,
-                            stmt, TemplateKind::TypeAlias, node.def, registry, arena, ctx);
+                    // A template holds the declaration's header.
+                    match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Enum(node) => {
+                            if (node.is_generic()) {
+                                SpecializationPasses::register_generic_template(node.name, node.generic_params,
+                                    stmt, TemplateKind::Enum, node.def, registry, arena, ctx);
+                            }
+                        }
+                        DeclKind::TypeAlias(node) => {
+                            if (node.is_generic()) {
+                                SpecializationPasses::register_generic_template(node.alias_name, node.generic_params,
+                                    stmt, TemplateKind::TypeAlias, node.def, registry, arena, ctx);
+                            }
+                        }
+                        // No other kind with a payload can be generic.
+                        DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::IntrinsicConst(_)
+                        | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                        | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+                        | DeclKind::Legacy => {}
                     }
                 }
                 NodeKind::ImplementationBlock => {

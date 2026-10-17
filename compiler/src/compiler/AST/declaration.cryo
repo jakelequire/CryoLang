@@ -156,6 +156,16 @@ public:
         };
     }
 
+    /// The enum declaration `n` is, or null.
+    static enum_of(n: ASTNode*) -> EnumDecl* {
+        const d: DeclarationNode* = DeclarationNode::with_shape(n);
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Enum(e) => { e }
+            _                 => { null }
+        };
+    }
+
     /// The import (or export) declaration `n` is, or null.
     static import_of(n: ASTNode*) -> ImportDecl* {
         const d: DeclarationNode* = DeclarationNode::with_shape(n);
@@ -285,7 +295,7 @@ public:
     /// When set, this global was synthesized by the C-header import engine and
     /// is reachable ONLY through its extern-module alias namespace
     /// (`cit::SOME_CONST`, via the decl_index qualified key) - never bare.
-    /// Mirrors StructDeclNode/EnumDeclNode/TypeAliasDecl.binding_namespace.
+    /// Mirrors StructDeclNode/EnumDecl/TypeAliasDecl.binding_namespace.
     /// None for ordinary source-level declarations.
     binding_namespace: ModulePath;
     /// `![thread_local]`: emit this global as an LLVM thread-local so each
@@ -798,6 +808,7 @@ public:
 type enum DeclKind {
     Legacy;
     Destructure(DestructureDecl*);
+    Enum(EnumDecl*);
     Extern(ExternBlock*);
     Field(FieldDecl*);
     GenericParam(GenericParamDecl*);
@@ -1458,8 +1469,8 @@ implement trait Allocate for struct TypeAliasDecl {
 }
 
 
-type class EnumDeclNode : DeclarationNode {
-public:
+/// `type enum Name<T> : D { variants }`
+type struct EnumDecl {
     name:           SymbolStr;
     generic_params: [DeclarationNode*];
     /// Each a declaration whose shape is `DeclKind::Variant`, read through
@@ -1491,35 +1502,22 @@ public:
     /// the key from the name and the file.
     def:               DefId;
 
-    EnumDeclNode(name: SymbolStr, span: SourceSpan)
-        : DeclarationNode(NodeKind::EnumDeclaration, span) {
-        this.name                    = name;
-        this.generic_params          = [];
-        this.variants                = [];
-        this.discriminant_annotation = null;
-        this.repr_c                  = false;
-        this.min_alignment           = 0;
-        this.is_public               = true;
-        this.binding_namespace       = ModulePath::none();
-        this.where_bounds            = [];
-        this.def                     = DefId::invalid();
+    static new(name: SymbolStr) -> EnumDecl* {
+        return new EnumDecl {
+            name:                    name,
+            generic_params:          [],
+            variants:                [],
+            discriminant_annotation: null,
+            repr_c:                  false,
+            min_alignment:           0,
+            is_public:               true,
+            binding_namespace:       ModulePath::none(),
+            where_bounds:            [],
+            def:                     DefId::invalid(),
+        };
     }
 
-    is_generic() -> boolean { return this.generic_params.length > 0; }
-    add_where_bound(mut &this, bound: TraitBound) -> void { this.where_bounds.push(bound); }
-    set_public(p: boolean) -> void { this.is_public = p; }
-
-    add_generic_param(param: DeclarationNode*) -> void {
-        this.generic_params.push(param);
-    }
-
-    add_variant(variant: DeclarationNode*) -> void {
-        this.variants.push(variant);
-    }
-
-    set_discriminant_annotation(mut &this, ann: TypeAnnotation*) -> void {
-        this.discriminant_annotation = ann;
-    }
+    is_generic(&this) -> boolean { return this.generic_params.length > 0; }
 
     /// A compile-time constant written `E::V` is
     /// folded off the enum's declaration, which is what the constant table
@@ -1560,6 +1558,16 @@ public:
             tags.push(tag);
         }
         return tags;
+    }
+
+    static walk_children<V>(n: EnumDecl*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.variants.length; i++) { v.walk_decl(n.variants[i]); }
+    }
+}
+
+implement trait Allocate for struct EnumDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

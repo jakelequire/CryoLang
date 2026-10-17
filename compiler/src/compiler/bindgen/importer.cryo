@@ -65,7 +65,7 @@ import std::fs::path::{ Path };
 import std::env;
 import std::core::mem;
 import compiler::ast::declaration::{
-    BindingAccessor, DeclarationNode, DeclKind, EnumDeclNode, EnumVariant, ExternBlock,
+    BindingAccessor, DeclarationNode, DeclKind, EnumDecl, EnumVariant, ExternBlock,
     FieldDecl,
     FunctionDeclNode, ImplBlockNode, MethodNode, ReceiverForm, StructDeclNode,
     TypeAliasDecl, UnionDeclNode, VarDeclNode
@@ -208,7 +208,7 @@ type struct Importer {
     /// Transient targets for the nested walks (set just before the synchronous
     /// `clang_visitChildren`, read by the nested visitors).  `cur_enum_int`
     /// points at a stack-local CXType live for the duration of the walk.
-    cur_enum:       EnumDeclNode*;
+    cur_enum:       EnumDecl*;
     cur_enum_int:   CXType*;
     /// Transient per-NAMED-enum dup-value tracking.  C enums permit several
     /// constants to share a value (deliberate aliases - e.g. SDL's
@@ -504,7 +504,8 @@ type struct Importer {
     static type_decl_tag(node: ASTNode*) -> SymbolStr {
         if (node.kind == NodeKind::StructDeclaration)    { return (node as StructDeclNode*).name; }
         if (node.kind == NodeKind::UnionDeclaration)     { return (node as UnionDeclNode*).name; }
-        if (node.kind == NodeKind::EnumDeclaration)      { return (node as EnumDeclNode*).name; }
+        const en: EnumDecl* = DeclarationNode::enum_of(node);
+        if (en != null) { return en.name; }
         const alias: TypeAliasDecl* = DeclarationNode::alias_of(node);
         if (alias != null) { return alias.alias_name; }
         return SymbolStr::empty();
@@ -1209,7 +1210,7 @@ type struct Importer {
         }
         if (this.name_seen(name_sym)) { return; }
 
-        mut enode: EnumDeclNode* = new EnumDeclNode(name_sym, SourceSpan::none());
+        const enode: EnumDecl* = EnumDecl::new(name_sym);
         enode.binding_namespace = this.alias;
         enode.repr_c = true;
         enode.discriminant_annotation =
@@ -1225,7 +1226,7 @@ type struct Importer {
 
         this.seen_names.push(name_sym);
         this.type_names.push(name_sym);
-        this.emit_top_level(enode as ASTNode*);
+        this.emit_top_level(DeclarationNode::of(DeclKind::Enum(enode), SourceSpan::none()) as ASTNode*);
 
         // Duplicate-valued constants (C enum aliases) can't be enum variants in
         // Cryo (unique discriminants required), so emit each as a namespaced
@@ -1271,7 +1272,7 @@ type struct Importer {
         }
         const vnode: EnumVariant* = EnumVariant::new(cname);
         vnode.set_explicit_value(value);
-        this.cur_enum.add_variant(DeclarationNode::of(DeclKind::Variant(vnode), SourceSpan::none()));
+        this.cur_enum.variants.push(DeclarationNode::of(DeclKind::Variant(vnode), SourceSpan::none()));
         this.cur_enum_values.push(value);
         this.cur_enum_value_names.push(cname);
         // W2: record so an identifier-alias `#define` can resolve to this

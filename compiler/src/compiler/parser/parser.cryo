@@ -38,7 +38,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
-    DestructureDecl, EnumDeclNode, EnumVariant, ExternBlock, FieldDecl,
+    DestructureDecl, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
     FunctionDeclNode, GenericParamDecl, ImplBlockNode, ImportDecl,
     IntrinsicConstDecl, IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDeclNode,
@@ -181,7 +181,6 @@ implement struct Parser {
             NodeKind::StructDeclaration     => { true }
             NodeKind::UnionDeclaration      => { true }
             NodeKind::ClassDeclaration      => { true }
-            NodeKind::EnumDeclaration       => { true }
             NodeKind::TraitDeclaration      => { true }
             NodeKind::VariableDeclaration   => { true }
             NodeKind::ImplementationBlock   => { true }
@@ -521,9 +520,9 @@ implement struct Parser {
                 return cd;
             }
             if (next.kind == TokenType::KwEnum) {
-                const ed: EnumDeclNode* = this.parse_enum_declaration();
+                const ed: DeclarationNode* = this.parse_enum_declaration();
                 if (ed != null) {
-                    ed.set_public(is_public);
+                    DeclarationNode::enum_of(ed).is_public = is_public;
                     if (doc != "") { ed.set_documentation(doc_text); }
                 }
                 return ed;
@@ -1644,21 +1643,22 @@ implement struct Parser {
     }
 
     /// Parse an enum declaration: type enum Name<T> { variants }
-    parse_enum_declaration() -> EnumDeclNode* {
+    parse_enum_declaration() -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_enum_declaration()");
         const start: Token = this.advance(); // consume 'type'
         this.advance(); // consume 'enum'
 
         const name_tok: Token = this.consume(TokenType::Identifier, "enum name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: EnumDeclNode* = new EnumDeclNode(name, this.span_from_token(start));
+        const en: EnumDecl* = EnumDecl::new(name);
+        const node: DeclarationNode* = DeclarationNode::of(DeclKind::Enum(en), this.span_from_token(start));
         node.set_name_span(this.span_from_token(name_tok));
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
             const gen_params: [DeclarationNode*] = this.parse_generic_params(false);
             for (mut i: i64 = 0; i < gen_params.length; i++) {
-                node.add_generic_param(gen_params[i]);
+                en.generic_params.push(gen_params[i]);
             }
         }
 
@@ -1667,7 +1667,7 @@ implement struct Parser {
         if (this.match_tok(TokenType::Colon)) {
             const disc: TypeAnnotation* = this.parse_type_annotation();
             if (disc != null) {
-                node.set_discriminant_annotation(disc);
+                en.discriminant_annotation = disc;
             }
         }
 
@@ -1676,7 +1676,7 @@ implement struct Parser {
         if (this.check(TokenType::KwWhere)) {
             const bounds: [TraitBound] = this.parse_trait_bounds();
             for (mut wi: i64 = 0; wi < bounds.length; wi++) {
-                node.add_where_bound(bounds[wi].clone());
+                en.where_bounds.push(bounds[wi].clone());
             }
         }
 
@@ -1691,7 +1691,7 @@ implement struct Parser {
             const variant: DeclarationNode* = this.parse_enum_variant();
             if (variant != null) {
                 if (doc != "") { variant.set_documentation(doc); }
-                node.add_variant(variant);
+                en.variants.push(variant);
             }
 
             // Progress guard: parse_enum_variant recovers via non-advancing

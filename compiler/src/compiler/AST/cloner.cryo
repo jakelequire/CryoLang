@@ -23,7 +23,7 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDeclNode,
+    ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDecl,
     EnumVariant, ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl,
     DeclKind, ImplBlockNode, ImportDecl, IntrinsicConstDecl, IntrinsicDecl, MethodNode,
     ModuleDecl, StructDeclNode, TraitDeclNode, TypeAliasDecl, UnionDeclNode,
@@ -50,7 +50,7 @@ import compiler::ast::statement::{
 
 type struct ASTCloner {
     /// One-shot specialization name applied at the first decl-level visit
-    /// (StructDeclNode / ClassDeclNode / EnumDeclNode / FunctionDeclNode).
+    /// (StructDeclNode / ClassDeclNode / EnumDecl / FunctionDeclNode).
     /// `consume_spec_name()` reads and clears it so child decls keep their
     /// own names.
     spec_name: SymbolStr;
@@ -153,7 +153,6 @@ type struct ASTCloner {
             NodeKind::UnionDeclaration          => { return this.visit_union(n as UnionDeclNode*); }
             NodeKind::ClassDeclaration          => { return this.visit_class(n as ClassDeclNode*); }
             NodeKind::TraitDeclaration          => { return this.visit_trait(n as TraitDeclNode*); }
-            NodeKind::EnumDeclaration           => { return this.visit_enum(n as EnumDeclNode*); }
             NodeKind::ImplementationBlock       => { return this.visit_impl(n as ImplBlockNode*); }
 
             NodeKind::MatchArm                  => { return this.visit_match_arm(n as MatchArmNode*); }
@@ -849,6 +848,28 @@ type struct ASTCloner {
                 }
                 DeclKind::Destructure(c)
             }
+            DeclKind::Enum(n) => {
+                const c: EnumDecl* = EnumDecl::new(this.consume_spec_name(n.name));
+                const skip_gp: boolean = this.consume_skip_generics();
+                // The definition is stamped on the copy by whoever places it;
+                // the binding namespace is left as `new` leaves it.
+                c.repr_c        = n.repr_c;
+                c.min_alignment = n.min_alignment;
+                c.is_public     = n.is_public;
+                c.where_bounds  = n.where_bounds;
+                if (!skip_gp) {
+                    for (mut i: i64 = 0; i < n.generic_params.length; i++) {
+                        c.generic_params.push(this.copy_decl_shape(n.generic_params[i]));
+                    }
+                }
+                if (n.discriminant_annotation != null) {
+                    c.discriminant_annotation = this.clone_type_annotation(n.discriminant_annotation);
+                }
+                for (mut i: i64 = 0; i < n.variants.length; i++) {
+                    c.variants.push(this.copy_decl_shape(n.variants[i]));
+                }
+                DeclKind::Enum(c)
+            }
             DeclKind::Extern(n) => {
                 // Only the linkage and the functions are copied.
                 const c: ExternBlock* = ExternBlock::new(n.linkage_type);
@@ -1055,30 +1076,6 @@ type struct ASTCloner {
             c.add_base_trait(node.base_traits[i].clone());
         }
         c.sym_id      = node.sym_id;
-        return c;
-    }
-
-    visit_enum(mut &this, node: EnumDeclNode*) -> ASTNode* {
-        const name: SymbolStr = this.consume_spec_name(node.name);
-        const skip_gp: boolean = this.consume_skip_generics();
-        mut c: EnumDeclNode* = new EnumDeclNode(name, node.span);
-        this.copy_decl_base(node, c);
-        // See StructDeclNode clone: carry layout flags onto the spec.
-        c.repr_c        = node.repr_c;
-        c.min_alignment = node.min_alignment;
-        c.is_public     = node.is_public;
-        c.where_bounds  = node.where_bounds;
-        if (!skip_gp) {
-            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
-            }
-        }
-        if (node.discriminant_annotation != null) {
-            c.set_discriminant_annotation(this.clone_type_annotation(node.discriminant_annotation));
-        }
-        for (mut i: i64 = 0; i < node.variants.length; i++) {
-            c.add_variant(this.copy_decl_shape(node.variants[i]));
-        }
         return c;
     }
 
