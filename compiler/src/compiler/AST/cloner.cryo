@@ -26,7 +26,7 @@ import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDecl,
     EnumVariant, ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl,
     DeclKind, ImplBlockNode, ImportDecl, IntrinsicDecl, MethodNode,
-    ModuleDecl, StructDeclNode, TraitDecl, TypeAliasDecl, UnionDeclNode,
+    ModuleDecl, StructDeclNode, TraitDecl, TypeAliasDecl, UnionDecl,
     VarDeclNode
 };
 import compiler::ast::expression::{
@@ -150,7 +150,6 @@ type struct ASTCloner {
             NodeKind::MethodDeclaration         => { return this.visit_method(n as MethodNode*); }
             NodeKind::Declaration               => { return this.copy_decl_shape(n as DeclarationNode*); }
             NodeKind::StructDeclaration         => { return this.visit_struct(n as StructDeclNode*); }
-            NodeKind::UnionDeclaration          => { return this.visit_union(n as UnionDeclNode*); }
             NodeKind::ClassDeclaration          => { return this.visit_class(n as ClassDeclNode*); }
             NodeKind::ImplementationBlock       => { return this.visit_impl(n as ImplBlockNode*); }
 
@@ -958,6 +957,32 @@ type struct ASTCloner {
                 }
                 DeclKind::TypeAlias(c)
             }
+            DeclKind::Union(n) => {
+                const c: UnionDecl* = UnionDecl::new(this.consume_spec_name(n.name));
+                const skip_gp: boolean = this.consume_skip_generics();
+                // See StructDeclNode clone: carry layout flags onto the spec so the
+                // monomorphizer can stamp the chosen layout on the concrete type.
+                // The definition is stamped on the copy by whoever places it.
+                c.repr_c            = n.repr_c;
+                c.repr_packed       = n.repr_packed;
+                c.repr_transparent  = n.repr_transparent;
+                c.min_alignment     = n.min_alignment;
+                c.is_public         = n.is_public;
+                c.where_bounds      = n.where_bounds;
+                c.binding_namespace = n.binding_namespace;
+                if (!skip_gp) {
+                    for (mut i: i64 = 0; i < n.generic_params.length; i++) {
+                        c.generic_params.push(this.copy_decl_shape(n.generic_params[i]));
+                    }
+                }
+                for (mut i: i64 = 0; i < n.fields.length; i++) {
+                    c.fields.push(this.copy_decl_shape(n.fields[i]));
+                }
+                for (mut i: i64 = 0; i < n.methods.length; i++) {
+                    c.methods.push(this.dispatch_node(n.methods[i]) as MethodNode*);
+                }
+                DeclKind::Union(c)
+            }
             DeclKind::Variant(n) => {
                 const c: EnumVariant* = EnumVariant::new(n.name);
                 // Deep-clone type annotations (not shallow copy)
@@ -1010,34 +1035,6 @@ type struct ASTCloner {
         // struct, so this is a no-op outside the C-import path.
         for (mut i: i64 = 0; i < node.binding_accessors.length; i++) {
             c.add_accessor(node.binding_accessors[i]);
-        }
-        return c;
-    }
-
-    visit_union(mut &this, node: UnionDeclNode*) -> ASTNode* {
-        const name: SymbolStr = this.consume_spec_name(node.name);
-        const skip_gp: boolean = this.consume_skip_generics();
-        mut c: UnionDeclNode* = new UnionDeclNode(name, node.span);
-        this.copy_decl_base(node, c);
-        // See StructDeclNode clone: carry layout flags onto the spec so the
-        // monomorphizer can stamp the chosen layout on the concrete type.
-        c.repr_c            = node.repr_c;
-        c.repr_packed       = node.repr_packed;
-        c.repr_transparent  = node.repr_transparent;
-        c.min_alignment     = node.min_alignment;
-        c.is_public         = node.is_public;
-        c.where_bounds      = node.where_bounds;
-        c.binding_namespace = node.binding_namespace;
-        if (!skip_gp) {
-            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
-            }
-        }
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            c.add_field(this.copy_decl_shape(node.fields[i]));
-        }
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            c.add_method(this.dispatch_node(node.methods[i]) as MethodNode*);
         }
         return c;
     }

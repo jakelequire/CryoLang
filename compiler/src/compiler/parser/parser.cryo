@@ -42,7 +42,7 @@ import compiler::ast::declaration::{
     FunctionDeclNode, GenericParamDecl, ImplBlockNode, ImportDecl,
     IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDeclNode,
-    TraitDecl, TypeAliasDecl, UnionDeclNode, VarDeclNode
+    TraitDecl, TypeAliasDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
     CallExprNode, ExpressionNode, IdentifierNode, MemberAccessNode
@@ -179,7 +179,6 @@ implement struct Parser {
         return match (node.kind) {
             NodeKind::FunctionDeclaration   => { true }
             NodeKind::StructDeclaration     => { true }
-            NodeKind::UnionDeclaration      => { true }
             NodeKind::ClassDeclaration      => { true }
             NodeKind::VariableDeclaration   => { true }
             NodeKind::ImplementationBlock   => { true }
@@ -503,9 +502,9 @@ implement struct Parser {
                 return sd;
             }
             if (next.kind == TokenType::KwUnion) {
-                const ud: UnionDeclNode* = this.parse_union_declaration();
+                const ud: DeclarationNode* = this.parse_union_declaration();
                 if (ud != null) {
-                    ud.set_public(is_public);
+                    DeclarationNode::union_of(ud).is_public = is_public;
                     if (doc != "") { ud.set_documentation(doc_text); }
                 }
                 return ud;
@@ -1062,23 +1061,24 @@ implement struct Parser {
 
     /// Parse a union declaration: type union Name<T> { fields, methods }
     /// Shares the struct member-grammar; an untagged C-style union where all
-    /// fields overlap at offset 0 (see UnionDeclNode).
-    parse_union_declaration() -> UnionDeclNode* {
+    /// fields overlap at offset 0 (see UnionDecl).
+    parse_union_declaration() -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_union_declaration()");
         const start: Token = this.advance(); // consume 'type'
         this.advance(); // consume 'union'
 
         const name_tok: Token = this.consume(TokenType::Identifier, "union name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: UnionDeclNode* = new UnionDeclNode(name, this.span_from_token(start));
-        node.set_name_span(this.span_from_token(name_tok));
+        const node: UnionDecl* = UnionDecl::new(name);
+        const decl: DeclarationNode* = DeclarationNode::of(DeclKind::Union(node), this.span_from_token(start));
+        decl.set_name_span(this.span_from_token(name_tok));
         this.current_type_name = name_tok.lexeme;
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
             const gen_params: [DeclarationNode*] = this.parse_generic_params(false);
             for (mut i: i64 = 0; i < gen_params.length; i++) {
-                node.add_generic_param(gen_params[i]);
+                node.generic_params.push(gen_params[i]);
             }
         }
 
@@ -1087,7 +1087,7 @@ implement struct Parser {
         if (this.check(TokenType::KwWhere)) {
             const bounds: [TraitBound] = this.parse_trait_bounds();
             for (mut wi: i64 = 0; wi < bounds.length; wi++) {
-                node.add_where_bound(bounds[wi].clone());
+                node.where_bounds.push(bounds[wi].clone());
             }
         }
 
@@ -1096,8 +1096,8 @@ implement struct Parser {
         this.consume(TokenType::RBrace, "'}'");
 
         this.current_type_name = "";
-        node.span = this.span_from(start);
-        return node;
+        decl.span = this.span_from(start);
+        return decl;
     }
 
     /// Parse a class declaration: type class Name<T> : Base { fields, methods }
@@ -1153,7 +1153,7 @@ implement struct Parser {
     ///   Class: no default visibility.  Every member MUST appear inside an explicit
     ///            `public:`, `private:`, or `protected:` block.
     parse_type_body(struct_node: StructDeclNode*, class_node: ClassDeclNode*,
-                    union_node: UnionDeclNode*) -> void {
+                    union_node: UnionDecl*) -> void {
         // Unions share the struct member-grammar (default-public, no
         // `protected`); only their layout/codegen differ.
         const is_struct: boolean = (struct_node != null) || (union_node != null);
@@ -1287,7 +1287,7 @@ implement struct Parser {
                     method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.add_method(method); }
+                    if (union_node != null) { union_node.methods.push(method); }
                 }
                 continue;
             }
@@ -1310,7 +1310,7 @@ implement struct Parser {
                     method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.add_method(method); }
+                    if (union_node != null) { union_node.methods.push(method); }
                 }
                 continue;
             }
@@ -1327,7 +1327,7 @@ implement struct Parser {
                     method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.add_method(method); }
+                    if (union_node != null) { union_node.methods.push(method); }
                 }
                 continue;
             }
@@ -1344,7 +1344,7 @@ implement struct Parser {
                     method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.add_method(method); }
+                    if (union_node != null) { union_node.methods.push(method); }
                 }
                 continue;
             }
@@ -1361,7 +1361,7 @@ implement struct Parser {
                     method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.add_method(method); }
+                    if (union_node != null) { union_node.methods.push(method); }
                 }
                 continue;
             }
@@ -1391,7 +1391,7 @@ implement struct Parser {
                         method.note_modifier_span(member_modifier_span);
                         if (struct_node != null) { struct_node.add_method(method); }
                         if (class_node != null) { class_node.add_method(method); }
-                        if (union_node != null) { union_node.add_method(method); }
+                        if (union_node != null) { union_node.methods.push(method); }
                     }
                 } else if (this.check(TokenType::Identifier)
                            || next.kind == TokenType::Colon) {
@@ -1410,7 +1410,7 @@ implement struct Parser {
                         field.note_modifier_span(member_modifier_span);
                         if (struct_node != null) { struct_node.add_field(field); }
                         if (class_node != null) { class_node.add_field(field); }
-                        if (union_node != null) { union_node.add_field(field); }
+                        if (union_node != null) { union_node.fields.push(field); }
                     }
                 } else {
                     // A keyword followed by neither `(`/`<` nor `:` names no

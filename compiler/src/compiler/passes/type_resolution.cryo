@@ -52,7 +52,7 @@ import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDecl, EnumDecl,
     EnumVariant, FieldDecl, FunctionDeclNode, GenericParamDecl,
     DeclKind, ImplBlockNode, MethodNode, StructDeclNode,
-    TraitDecl, TypeAliasDecl, UnionDeclNode, VarDeclNode
+    TraitDecl, TypeAliasDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
     AlignofExprNode, ArrayAccessNode, BinaryExprNode, CallExprNode, CastExprNode,
@@ -1373,16 +1373,23 @@ type struct TypeResolutionPasses {
                         ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
                     }
                 }
-                NodeKind::UnionDeclaration => {
-                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                    if (ctx.generic_registry.template_of(node.def) != null) {
-                        ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (ctx.generic_registry.template_of(node.def) != null) {
                         ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
+                    }
+                }
+                NodeKind::Declaration => {
+                    match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Union(node) => {
+                            if (ctx.generic_registry.template_of(node.def) != null) {
+                                ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
+                            }
+                        }
+                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                        | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => { }
                     }
                 }
                 NodeKind::ImplementationBlock => {
@@ -1403,10 +1410,6 @@ type struct TypeResolutionPasses {
             NodeKind::StructDeclaration => {
                 const node: StructDeclNode* = stmt as StructDeclNode*;
                 ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register struct methods"), node.methods, ctx.intern_table, arena, "type_resolution/register struct methods");
-            }
-            NodeKind::UnionDeclaration => {
-                const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register union methods"), node.methods, ctx.intern_table, arena, "type_resolution/register union methods");
             }
             NodeKind::ClassDeclaration => {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
@@ -1632,6 +1635,17 @@ type struct TypeResolutionPasses {
                     ctx.decl_index.impl_owner(node, "type_resolution/register impl methods"),
                     node.methods, &head, &node.trait_arg_types, ctx.intern_table, arena,
                     "type_resolution/register impl methods");
+            }
+            NodeKind::Declaration => {
+                match ((stmt as DeclarationNode*).shape) {
+                    DeclKind::Union(node) => {
+                        ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register union methods"), node.methods, ctx.intern_table, arena, "type_resolution/register union methods");
+                    }
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                    | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                }
             }
             _ => {}
         }
@@ -2612,6 +2626,70 @@ type struct TypeResolutionPasses {
         return false;
     }
 
+    /// Record a non-generic union's resolved fields and methods on its arena
+    /// type (a StructType with is_union set); false when there is nothing to
+    /// record - a template, or no arena type to record on.  A field whose type
+    /// did not resolve is refused (E0203) and left out.
+    static sync_union_members(node: UnionDecl*, ctx: CompilationContext*, arena: TypeArena*) -> boolean {
+        if (node.is_generic()) { return false; }
+
+        const type_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/union field sync");
+        if (!type_ref.is_valid()) { return false; }
+
+        const base_type: Type* = arena.lookup(type_ref);
+        if (base_type == null || base_type.kind != TypeKind::Struct) { return false; }
+
+        mut st: StructType* = base_type.as_struct();
+        mut field_infos: [FieldInfo] = [];
+        for (mut j: i64 = 0; j < node.fields.length; j++) {
+            const field_decl: DeclarationNode* = node.fields[j];
+            const field: FieldDecl* = DeclarationNode::field_of(field_decl);
+            if (field == null) { continue; }
+            if (!field.resolved_type.is_valid()) {
+                const fname: string = ctx.intern_table.resolve(field.name);
+                const sname: string = ctx.intern_table.resolve(node.name);
+                ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+                    fmt::format("cannot resolve type for field `%s` of `%s`", fname, sname),
+                    field_decl.span);
+                continue;
+            }
+            const is_pub: boolean = field.visibility == Visibility::Public;
+            const is_prot: boolean = field.visibility == Visibility::Protected;
+            mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true);
+            fi.set_default_value(field.default_value);
+            field_infos.push(fi);
+        }
+        st.set_fields(field_infos);
+
+        for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
+            const mnode: MethodNode* = node.methods[jm];
+            if (mnode == null || mnode.func == null) { continue; }
+            const fn_node: FunctionDeclNode* = mnode.func;
+            mut ptypes: [TypeRef] = [];
+            for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                const pp: VarDeclNode* = fn_node.parameters[pi];
+                if (pp == null) { continue; }
+                if (pp.is_receiver()) { continue; }
+                ptypes.push(pp.resolved_type);
+            }
+            const fn_ty: TypeRef = arena.get_function(
+                fn_node.resolved_return_type, ptypes, fn_node.is_variadic);
+            const minfo: MethodInfo = MethodInfo {
+                name:          fn_node.name,
+                function_type: fn_ty,
+                is_public:     mnode.visibility == Visibility::Public,
+                is_protected:  mnode.visibility == Visibility::Protected,
+                is_static:     mnode.is_static,
+                is_virtual:    mnode.is_virtual,
+                is_override:   mnode.is_override,
+                param_types:   ptypes,
+                ast_node:      mnode as void*,
+            };
+            st.add_method(minfo);
+        }
+        return true;
+    }
+
     // Pass 1: FunctionSignature (order 7)
 
     /// A trait's method signatures, resolved and recorded on its arena type;
@@ -2764,15 +2842,6 @@ type struct TypeResolutionPasses {
                     runner.resolve_method_signatures(node.methods, &struct_ctx, struct_owner, node.def, &struct_args);
                     sig_count += node.methods.length;
                 }
-                NodeKind::UnionDeclaration => {
-                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                    mut union_ctx: ResolutionContext = runner.make_generic_context(
-                        node.generic_params, &runner.res_ctx);
-                    const union_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/union methods");
-                    const union_args: [TypeRef] = runner.decl_owner_args(node.generic_params, &union_ctx);
-                    runner.resolve_method_signatures(node.methods, &union_ctx, union_owner, node.def, &union_args);
-                    sig_count += node.methods.length;
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     mut class_ctx: ResolutionContext = runner.make_generic_context(
@@ -2834,6 +2903,14 @@ type struct TypeResolutionPasses {
                     match (decl.shape) {
                         DeclKind::Trait(node) => {
                             sig_count += TypeResolutionPasses::trait_signatures(&runner, node, ctx, arena);
+                        }
+                        DeclKind::Union(node) => {
+                            mut union_ctx: ResolutionContext = runner.make_generic_context(
+                                node.generic_params, &runner.res_ctx);
+                            const union_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/union methods");
+                            const union_args: [TypeRef] = runner.decl_owner_args(node.generic_params, &union_ctx);
+                            runner.resolve_method_signatures(node.methods, &union_ctx, union_owner, node.def, &union_args);
+                            sig_count += node.methods.length;
                         }
                         DeclKind::Extern(node) => {
                             for (mut j: i64 = 0; j < node.functions.length; j++) {
@@ -3112,15 +3189,6 @@ type struct TypeResolutionPasses {
                     runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &struct_ctx);
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
-                NodeKind::UnionDeclaration => {
-                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                    mut union_ctx: ResolutionContext = runner.make_generic_context(
-                        node.generic_params, &runner.res_ctx);
-                    runner.resolve_fields(node.fields, &union_ctx);
-                    field_count += node.fields.length;
-                    runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &union_ctx);
-                    runner.emit_method_signature_diagnostics(node.methods);
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     mut class_ctx: ResolutionContext = runner.make_generic_context(
@@ -3169,6 +3237,25 @@ type struct TypeResolutionPasses {
                     runner.emit_method_signature_diagnostics(node.methods);
                     runner.check_impl_conformance(node, &impl_ctx);
                 }
+                NodeKind::Declaration => {
+                    match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Union(node) => {
+                            mut union_ctx: ResolutionContext = runner.make_generic_context(
+                                node.generic_params, &runner.res_ctx);
+                            runner.resolve_fields(node.fields, &union_ctx);
+                            field_count += node.fields.length;
+                            runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &union_ctx);
+                            runner.emit_method_signature_diagnostics(node.methods);
+                        }
+                        // Enum variant associated types (now TypeAnnotation*) are
+                        // resolved during monomorphization for generic enums;
+                        // non-generic enums' by sema when it checks match arms.
+                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                        | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                    }
+                }
                 _ => {
                     // Enum variant associated types (now TypeAnnotation*) are resolved
                     // during monomorphization for generic enums.  Non-generic enums'
@@ -3216,21 +3303,6 @@ type struct TypeResolutionPasses {
                         }
                     }
                 }
-                NodeKind::UnionDeclaration => {
-                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                    if (!node.is_generic()) {
-                        for (mut j: i64 = 0; j < node.methods.length; j++) {
-                            const method: MethodNode* = node.methods[j];
-                            if (method != null && method.func != null && method.func.body != null) {
-                                mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                    method.func.generic_params, &runner.res_ctx);
-                                runner.resolve_var_types_in_statement(
-                                    method.func.body as ASTNode*, &m_ctx);
-                                body_count++;
-                            }
-                        }
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (!node.is_generic()) {
@@ -3248,6 +3320,20 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Union(node) => {
+                            if (!node.is_generic()) {
+                                for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                    const method: MethodNode* = node.methods[j];
+                                    if (method != null && method.func != null && method.func.body != null) {
+                                        mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                            method.func.generic_params, &runner.res_ctx);
+                                        runner.resolve_var_types_in_statement(
+                                            method.func.body as ASTNode*, &m_ctx);
+                                        body_count++;
+                                    }
+                                }
+                            }
+                        }
                         DeclKind::Trait(node) => {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
@@ -3331,17 +3417,6 @@ type struct TypeResolutionPasses {
                         }
                     }
                 }
-                NodeKind::UnionDeclaration => {
-                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                    if (!node.is_generic()) {
-                        for (mut j: i64 = 0; j < node.methods.length; j++) {
-                            const method: MethodNode* = node.methods[j];
-                            if (method != null && method.func != null && method.func.body != null) {
-                                runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
-                            }
-                        }
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (!node.is_generic()) {
@@ -3362,6 +3437,24 @@ type struct TypeResolutionPasses {
                                 runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
                             }
                         }
+                    }
+                }
+                NodeKind::Declaration => {
+                    match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Union(node) => {
+                            if (!node.is_generic()) {
+                                for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                    const method: MethodNode* = node.methods[j];
+                                    if (method != null && method.func != null && method.func.body != null) {
+                                        runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
+                                    }
+                                }
+                            }
+                        }
+                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                        | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -3598,67 +3691,6 @@ type struct TypeResolutionPasses {
                     }
                     struct_count++;
                 }
-                NodeKind::UnionDeclaration => {
-                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                    if (node.is_generic()) { continue; }
-
-                    const type_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/union field sync");
-                    if (!type_ref.is_valid()) { continue; }
-
-                    const base_type: Type* = arena.lookup(type_ref);
-                    // A union is a StructType (with is_union=true).
-                    if (base_type == null || base_type.kind != TypeKind::Struct) { continue; }
-
-                    mut st: StructType* = base_type.as_struct();
-                    mut field_infos: [FieldInfo] = [];
-                    for (mut j: i64 = 0; j < node.fields.length; j++) {
-                        const field_decl: DeclarationNode* = node.fields[j];
-                        const field: FieldDecl* = DeclarationNode::field_of(field_decl);
-                        if (field == null) { continue; }
-                        if (!field.resolved_type.is_valid()) {
-                            const fname: string = ctx.intern_table.resolve(field.name);
-                            const sname: string = ctx.intern_table.resolve(node.name);
-                            ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
-                                fmt::format("cannot resolve type for field `%s` of `%s`", fname, sname),
-                                field_decl.span);
-                            continue;
-                        }
-                        const is_pub: boolean = field.visibility == Visibility::Public;
-                        const is_prot: boolean = field.visibility == Visibility::Protected;
-                        mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true);
-                        fi.set_default_value(field.default_value);
-                        field_infos.push(fi);
-                    }
-                    st.set_fields(field_infos);
-
-                    for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
-                        const mnode: MethodNode* = node.methods[jm];
-                        if (mnode == null || mnode.func == null) { continue; }
-                        const fn_node: FunctionDeclNode* = mnode.func;
-                        mut ptypes: [TypeRef] = [];
-                        for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
-                            const pp: VarDeclNode* = fn_node.parameters[pi];
-                            if (pp == null) { continue; }
-                            if (pp.is_receiver()) { continue; }
-                            ptypes.push(pp.resolved_type);
-                        }
-                        const fn_ty: TypeRef = arena.get_function(
-                            fn_node.resolved_return_type, ptypes, fn_node.is_variadic);
-                        const minfo: MethodInfo = MethodInfo {
-                            name:          fn_node.name,
-                            function_type: fn_ty,
-                            is_public:     mnode.visibility == Visibility::Public,
-                            is_protected:  mnode.visibility == Visibility::Protected,
-                            is_static:     mnode.is_static,
-                            is_virtual:    mnode.is_virtual,
-                            is_override:   mnode.is_override,
-                            param_types:   ptypes,
-                            ast_node:      mnode as void*,
-                        };
-                        st.add_method(minfo);
-                    }
-                    struct_count++;
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) { continue; }
@@ -3778,9 +3810,19 @@ type struct TypeResolutionPasses {
                     class_count++;
                 }
                 NodeKind::Declaration => {
-                    // Of the kinds with a payload only an enum has members to sync.
+                    match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Union(un) => {
+                            if (TypeResolutionPasses::sync_union_members(un, ctx, arena)) { struct_count++; }
+                            continue;
+                        }
+                        DeclKind::Enum(_) => { }
+                        // No other kind with a payload has members to sync.
+                        DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Field(_)
+                        | DeclKind::GenericParam(_) | DeclKind::Import(_) | DeclKind::Intrinsic(_)
+                        | DeclKind::Module(_) | DeclKind::Trait(_) | DeclKind::TypeAlias(_)
+                        | DeclKind::Variant(_) | DeclKind::Legacy => { continue; }
+                    }
                     const node: EnumDecl* = DeclarationNode::enum_of(stmt);
-                    if (node == null) { continue; }
 
                     const type_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/enum field sync");
                     if (!type_ref.is_valid()) { continue; }

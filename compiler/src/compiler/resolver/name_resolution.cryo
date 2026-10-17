@@ -44,7 +44,7 @@ import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDecl, EnumDecl, EnumVariant,
     ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlockNode,
     DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDeclNode,
-    TraitDecl, TypeAliasDecl, UnionDeclNode, VarDeclNode
+    TraitDecl, TypeAliasDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
     AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
@@ -404,21 +404,6 @@ type struct NameResolver {
                         struct_node.binding_namespace, struct_node.name, struct_node.span));
                 }
             }
-            NodeKind::UnionDeclaration => {
-                const union_node: UnionDeclNode* = node as UnionDeclNode*;
-                // Same binding_namespace rule as structs (see above).
-                if (!union_node.binding_namespace.is_valid()) {
-                    const sym_id: SymbolID = this.resolver.declare_type(
-                        union_node.name, union_node.span, union_node.is_public);
-                    union_node.def = this.type_def_of(sym_id);
-                    if (union_node.is_public) {
-                        this.resolver.export_symbol(sym_id);
-                    }
-                } else {
-                    union_node.def = this.type_def_of(this.declare_c_imported(
-                        union_node.binding_namespace, union_node.name, union_node.span));
-                }
-            }
             NodeKind::ClassDeclaration => {
                 const class_node: ClassDeclNode* = node as ClassDeclNode*;
                 const sym_id: SymbolID = this.resolver.declare_type(
@@ -567,6 +552,20 @@ type struct NameResolver {
                         }
                         this.record_enum_decl(enum_node);
                     }
+                    DeclKind::Union(union_node) => {
+                        // Same binding_namespace rule as structs (see above).
+                        if (!union_node.binding_namespace.is_valid()) {
+                            const sym_id: SymbolID = this.resolver.declare_type(
+                                union_node.name, decl.span, union_node.is_public);
+                            union_node.def = this.type_def_of(sym_id);
+                            if (union_node.is_public) {
+                                this.resolver.export_symbol(sym_id);
+                            }
+                        } else {
+                            union_node.def = this.type_def_of(this.declare_c_imported(
+                                union_node.binding_namespace, union_node.name, decl.span));
+                        }
+                    }
                     DeclKind::TypeAlias(alias_node) => {
                         this.ctx.note_alias_decl(node);
                         if (!alias_node.binding_namespace.is_valid()) {
@@ -612,7 +611,6 @@ type struct NameResolver {
     keep_declared(&this, node: ASTNode*) -> void {
         const d: DefId = match (node.kind) {
             NodeKind::StructDeclaration    => { (node as StructDeclNode*).def }
-            NodeKind::UnionDeclaration     => { (node as UnionDeclNode*).def }
             NodeKind::ClassDeclaration     => { (node as ClassDeclNode*).def }
             NodeKind::VariableDeclaration  => { (node as VarDeclNode*).def }
             NodeKind::Declaration => {
@@ -621,6 +619,7 @@ type struct NameResolver {
                     DeclKind::Trait(t)           => { t.def }
                     DeclKind::TypeAlias(a)       => { a.def }
                     DeclKind::Enum(e)            => { e.def }
+                    DeclKind::Union(u)           => { u.def }
                     DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
                     | DeclKind::Variant(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
                     | DeclKind::Destructure(_) | DeclKind::Legacy => {
@@ -3095,10 +3094,10 @@ implement trait Walk for struct NameResolver {
         this.resolver.exit_scope();
     }
 
-    walk_union(mut &this, node: UnionDeclNode*) -> void {
+    walk_union(mut &this, d: DeclarationNode*, node: UnionDecl*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] visit(UnionDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
         // Enter type body scope
-        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
+        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), d.span);
 
         // Declare generic params
         this.declare_generics(node.generic_params);
@@ -3989,7 +3988,7 @@ type struct NameDeclarationPass {
     static type_decl_def(node: ASTNode*) -> DefId {
         if (node == null) { return DefId::invalid(); }
         if (node.kind == NodeKind::StructDeclaration)    { return (node as StructDeclNode*).def; }
-        if (node.kind == NodeKind::UnionDeclaration)     { return (node as UnionDeclNode*).def; }
+        if (DeclarationNode::union_of(node) != null)     { return (DeclarationNode::union_of(node)).def; }
         const en: EnumDecl* = DeclarationNode::enum_of(node);
         if (en != null) { return en.def; }
         const alias: TypeAliasDecl* = DeclarationNode::alias_of(node);

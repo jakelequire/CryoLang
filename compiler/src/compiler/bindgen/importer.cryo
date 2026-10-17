@@ -68,7 +68,7 @@ import compiler::ast::declaration::{
     BindingAccessor, DeclarationNode, DeclKind, EnumDecl, EnumVariant, ExternBlock,
     FieldDecl,
     FunctionDeclNode, ImplBlockNode, MethodNode, ReceiverForm, StructDeclNode,
-    TypeAliasDecl, UnionDeclNode, VarDeclNode
+    TypeAliasDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::diag::diagnostic::{ Diagnostic };
@@ -503,7 +503,7 @@ type struct Importer {
     /// invalid one for a node that declares no type.
     static type_decl_tag(node: ASTNode*) -> SymbolStr {
         if (node.kind == NodeKind::StructDeclaration)    { return (node as StructDeclNode*).name; }
-        if (node.kind == NodeKind::UnionDeclaration)     { return (node as UnionDeclNode*).name; }
+        if (DeclarationNode::union_of(node) != null)     { return (DeclarationNode::union_of(node)).name; }
         const en: EnumDecl* = DeclarationNode::enum_of(node);
         if (en != null) { return en.name; }
         const alias: TypeAliasDecl* = DeclarationNode::alias_of(node);
@@ -865,7 +865,7 @@ type struct Importer {
             const size: i64 = clang::clang_Type_getSizeOf(ct);
             const align: i64 = clang::clang_Type_getAlignOf(ct);
             if (size <= 0) { return; }
-            mut unode: UnionDeclNode* = new UnionDeclNode(name_sym, SourceSpan::none());
+            const unode: UnionDecl* = UnionDecl::new(name_sym);
             unode.binding_namespace = this.alias;
             unode.repr_c = true;
             // Keep the C ABI alignment even when a member is approximated to a
@@ -873,7 +873,7 @@ type struct Importer {
             if (align > 0) { unode.min_alignment = align as u64; }
             this.seen_names.push(name_sym);
             this.type_names.push(name_sym);
-            this.emit_top_level(unode as ASTNode*);
+            this.emit_top_level(DeclarationNode::of(DeclKind::Union(unode), SourceSpan::none()) as ASTNode*);
             this.field_cursors = [];
             clang::clang_visitChildren(cursor, Importer::visit_collect_member, this as void*);
             this.populate_union_fields(unode);
@@ -1057,7 +1057,7 @@ type struct Importer {
     /// anonymous nested record *member* (a nameless `struct {...};`/`union {...};` with no
     /// FieldDecl) has no name to bind, so it becomes an aligned opaque blob `_anonN`
     /// (Cryo has no anonymous union fields).  Each lossy member is reported.
-    populate_union_fields(mut &this, node: UnionDeclNode*) -> void {
+    populate_union_fields(mut &this, node: UnionDecl*) -> void {
         const uname: string = this.ctx.intern_table.resolve(node.name);
         mut anon_n: i32 = 0;
         for (mut i: i64 = 0; i < this.field_cursors.length; i++) {
@@ -1073,7 +1073,7 @@ type struct Importer {
                     this.ctx.intern_table.intern(fmt::format("_anon%d", anon_n));
                 mut fnode: FieldDecl* = FieldDecl::new(fname);
                 fnode.type_annotation = this.types.aligned_blob(sz, al);
-                node.add_field(DeclarationNode::of(DeclKind::Field(fnode), SourceSpan::none()));
+                node.fields.push(DeclarationNode::of(DeclKind::Field(fnode), SourceSpan::none()));
                 this.report.approx(fmt::format("anonymous member in union '%s' -> field '_anon%d': %lld-byte opaque blob (no field access)",
                                           uname, anon_n, sz));
                 anon_n = anon_n + 1;
@@ -1085,7 +1085,7 @@ type struct Importer {
             const fname: SymbolStr = cur.intern_spelling(this.ctx);
             mut fnode: FieldDecl* = FieldDecl::new(fname);
             fnode.type_annotation = this.types.map(ftype);
-            node.add_field(DeclarationNode::of(DeclKind::Field(fnode), SourceSpan::none()));
+            node.fields.push(DeclarationNode::of(DeclKind::Field(fnode), SourceSpan::none()));
             if (ftype.is_anonymous_record()) {
                 this.report.approx(fmt::format("field '%s' of anonymous type in union '%s' -> opaque blob (no field access)",
                                           this.ctx.intern_table.resolve(fname), uname));

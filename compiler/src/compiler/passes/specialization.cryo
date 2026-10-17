@@ -41,7 +41,7 @@ import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, FunctionDeclNode, GenericParamDecl,
-    ImplBlockNode, MethodNode, StructDeclNode, TraitDecl, UnionDeclNode
+    ImplBlockNode, MethodNode, StructDeclNode, TraitDecl, UnionDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::mono::monomorphizer::{ Monomorphizer };
@@ -81,7 +81,7 @@ type struct SpecInjector {
         if (node == null) { return; }
         const named: boolean = spec_type.is_valid()
             && (node.kind == NodeKind::StructDeclaration
-                || node.kind == NodeKind::UnionDeclaration
+                || DeclarationNode::union_of(node) != null
                 || node.kind == NodeKind::ClassDeclaration
                 || DeclarationNode::enum_of(node) != null);
         if (!named) {
@@ -164,22 +164,6 @@ type struct SpecializationPasses {
                             ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
                     }
                 }
-                NodeKind::UnionDeclaration => {
-                    // Mirrors the struct arm: a union is a StructType-backed
-                    // owner, so generic unions register as templates and
-                    // non-generic ones expose static/instance method templates.
-                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                    if (node.is_generic()) {
-                        SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, TemplateKind::Union, node.def, registry, arena, ctx);
-                    }
-                    if (!node.is_generic()) {
-                        SpecializationPasses::register_static_method_templates(node.methods,
-                            registry, arena, ctx);
-                        SpecializationPasses::register_inherent_owner(
-                            ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) {
@@ -219,6 +203,21 @@ type struct SpecializationPasses {
                             if (node.is_generic()) {
                                 SpecializationPasses::register_generic_template(node.alias_name, node.generic_params,
                                     stmt, TemplateKind::TypeAlias, node.def, registry, arena, ctx);
+                            }
+                        }
+                        DeclKind::Union(node) => {
+                            // Mirrors the struct arm: a union is a StructType-backed
+                            // owner, so generic unions register as templates and
+                            // non-generic ones expose static/instance method templates.
+                            if (node.is_generic()) {
+                                SpecializationPasses::register_generic_template(node.name, node.generic_params,
+                                    stmt, TemplateKind::Union, node.def, registry, arena, ctx);
+                            }
+                            if (!node.is_generic()) {
+                                SpecializationPasses::register_static_method_templates(node.methods,
+                                    registry, arena, ctx);
+                                SpecializationPasses::register_inherent_owner(
+                                    ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
                             }
                         }
                         // No other kind with a payload can be generic.
@@ -699,8 +698,8 @@ type struct SpecializationPasses {
             SpecializationPasses::mark_methods((node as StructDeclNode*).methods);
         } else if (node.kind == NodeKind::ClassDeclaration) {
             SpecializationPasses::mark_methods((node as ClassDeclNode*).methods);
-        } else if (node.kind == NodeKind::UnionDeclaration) {
-            SpecializationPasses::mark_methods((node as UnionDeclNode*).methods);
+        } else if (DeclarationNode::union_of(node) != null) {
+            SpecializationPasses::mark_methods((DeclarationNode::union_of(node)).methods);
         } else if (node.kind == NodeKind::ImplementationBlock) {
             SpecializationPasses::mark_methods((node as ImplBlockNode*).methods);
         }

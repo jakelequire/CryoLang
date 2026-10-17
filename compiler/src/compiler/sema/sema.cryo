@@ -70,7 +70,7 @@ import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
     FunctionDeclNode, GenericParamDecl, ImplBlockNode, MethodNode,
-    StructDeclNode, TraitDecl, UnionDeclNode, VarDeclNode
+    StructDeclNode, TraitDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
     CalleePin,
@@ -370,11 +370,6 @@ type struct SemaVisitor {
                     this.declare_async_methods(s.methods, s.generic_params,
                         this.ctx.decl_index.type_of_decl(s.def, "sema/async declare struct"), s.name, null);
                 }
-                NodeKind::UnionDeclaration => {
-                    const u: UnionDeclNode* = stmt as UnionDeclNode*;
-                    this.declare_async_methods(u.methods, u.generic_params,
-                        this.ctx.decl_index.type_of_decl(u.def, "sema/async declare union"), u.name, null);
-                }
                 NodeKind::ClassDeclaration => {
                     const c: ClassDeclNode* = stmt as ClassDeclNode*;
                     this.declare_async_methods(c.methods, c.generic_params,
@@ -387,6 +382,18 @@ type struct SemaVisitor {
                     mut owner_params: [DeclarationNode*] = this.impl_owner_params(ib);
                     this.declare_async_methods(ib.methods, owner_params,
                         this.ctx.decl_index.impl_owner(ib, "sema/async declare"), ib.target_type, ib);
+                }
+                NodeKind::Declaration => {
+                    match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Union(u) => {
+                            this.declare_async_methods(u.methods, u.generic_params,
+                                this.ctx.decl_index.type_of_decl(u.def, "sema/async declare union"), u.name, null);
+                        }
+                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                        | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => { }
+                    }
                 }
                 _ => { }
             }
@@ -503,7 +510,7 @@ type struct SemaVisitor {
             return this.clone_generic_params(DeclarationNode::enum_of(tmpl.ast_node).generic_params);
         }
         if (tmpl.kind == TemplateKind::Union) {
-            return this.clone_generic_params((tmpl.ast_node as UnionDeclNode*).generic_params);
+            return this.clone_generic_params((DeclarationNode::union_of(tmpl.ast_node)).generic_params);
         }
         return [];
     }
@@ -610,8 +617,8 @@ type struct SemaVisitor {
         this.visit_methods(node.methods, st_type);
     }
 
-    visit_union(mut &this, node: UnionDeclNode*) -> void {
-        const un_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:UnionDeclNode");
+    visit_union(mut &this, node: UnionDecl*) -> void {
+        const un_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:UnionDecl");
         if (node.is_generic()) {
             this.symbolic_check_owner_methods(node.methods, un_type, node.generic_params);
             return;
@@ -697,7 +704,7 @@ type struct SemaVisitor {
                             DeclarationNode::enum_of(tmpl.ast_node).generic_params);
                     } else if (tmpl.kind == TemplateKind::Union) {
                         this.symbolic_check_owner_methods(node.methods, owner_ty,
-                            (tmpl.ast_node as UnionDeclNode*).generic_params);
+                            (DeclarationNode::union_of(tmpl.ast_node)).generic_params);
                     }
                     this.state.symbolic_impl_node = saved_impl;
                 }
@@ -1658,7 +1665,6 @@ type struct SemaVisitor {
             NodeKind::VariableDeclaration    => { this.visit_var(n as VarDeclNode*); }
             NodeKind::FunctionDeclaration    => { this.visit_function(n as FunctionDeclNode*); }
             NodeKind::StructDeclaration      => { this.visit_struct(n as StructDeclNode*); }
-            NodeKind::UnionDeclaration       => { this.visit_union(n as UnionDeclNode*); }
             NodeKind::ClassDeclaration       => { this.visit_class(n as ClassDeclNode*); }
             NodeKind::ImplementationBlock    => { this.visit_impl(n as ImplBlockNode*); }
 
@@ -1671,6 +1677,7 @@ type struct SemaVisitor {
                 match (d.shape) {
                     DeclKind::Destructure(dd) => { this.visit_destructure(d, dd); }
                     DeclKind::Trait(t)        => { this.visit_trait(t); }
+                    DeclKind::Union(u)        => { this.visit_union(u); }
                     // None of these has a check.
                     DeclKind::Import(_) | DeclKind::Intrinsic(_)
                     | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Extern(_)

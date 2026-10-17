@@ -176,6 +176,16 @@ public:
         };
     }
 
+    /// The union declaration `n` is, or null.
+    static union_of(n: ASTNode*) -> UnionDecl* {
+        const d: DeclarationNode* = DeclarationNode::with_shape(n);
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Union(u) => { u }
+            _                  => { null }
+        };
+    }
+
     /// The import (or export) declaration `n` is, or null.
     static import_of(n: ASTNode*) -> ImportDecl* {
         const d: DeclarationNode* = DeclarationNode::with_shape(n);
@@ -815,8 +825,8 @@ public:
         mut methods: &[MethodNode*] = &empty;
         if (decl.kind == NodeKind::StructDeclaration) {
             methods = &(decl as StructDeclNode*).methods;
-        } else if (decl.kind == NodeKind::UnionDeclaration) {
-            methods = &(decl as UnionDeclNode*).methods;
+        } else if (DeclarationNode::union_of(decl) != null) {
+            methods = &(DeclarationNode::union_of(decl)).methods;
         } else if (decl.kind == NodeKind::ClassDeclaration) {
             methods = &(decl as ClassDeclNode*).methods;
         } else if (decl.kind == NodeKind::ImplementationBlock) {
@@ -845,6 +855,7 @@ type enum DeclKind {
     Module(ModuleDecl*);
     Trait(TraitDecl*);
     TypeAlias(TypeAliasDecl*);
+    Union(UnionDecl*);
     Variant(EnumVariant*);
 }
 
@@ -1189,8 +1200,7 @@ public:
 /// (TypeLowering) and member-access codegen (a bitcast at offset 0 instead of a
 /// struct GEP).  Reading a field other than the one last written is the
 /// programmer's responsibility (untagged) - use `type enum` for a tagged union.
-type class UnionDeclNode : DeclarationNode {
-public:
+type struct UnionDecl {
     name:           SymbolStr;
     generic_params: [DeclarationNode*];
     /// Each a declaration whose shape is `DeclKind::Field`, read through
@@ -1216,36 +1226,34 @@ public:
     /// the key from the name and the file.
     def:               DefId;
 
-    UnionDeclNode(name: SymbolStr, span: SourceSpan)
-        : DeclarationNode(NodeKind::UnionDeclaration, span) {
-        this.name              = name;
-        this.generic_params    = [];
-        this.fields            = [];
-        this.methods           = [];
-        this.repr_c            = false;
-        this.repr_packed       = false;
-        this.repr_transparent  = false;
-        this.min_alignment     = 0;
-        this.is_public         = true;
-        this.binding_namespace = ModulePath::none();
-        this.where_bounds      = [];
-        this.def               = DefId::invalid();
+    static new(name: SymbolStr) -> UnionDecl* {
+        return new UnionDecl {
+            name:              name,
+            generic_params:    [],
+            fields:            [],
+            methods:           [],
+            repr_c:            false,
+            repr_packed:       false,
+            repr_transparent:  false,
+            min_alignment:     0,
+            is_public:         true,
+            binding_namespace: ModulePath::none(),
+            where_bounds:      [],
+            def:               DefId::invalid(),
+        };
     }
 
-    is_generic() -> boolean { return this.generic_params.length > 0; }
-    add_where_bound(mut &this, bound: TraitBound) -> void { this.where_bounds.push(bound); }
-    set_public(p: boolean) -> void { this.is_public = p; }
+    is_generic(&this) -> boolean { return this.generic_params.length > 0; }
 
-    add_generic_param(param: DeclarationNode*) -> void {
-        this.generic_params.push(param);
+    static walk_children<V>(n: UnionDecl*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.fields.length; i++) { v.walk_decl(n.fields[i]); }
+        for (mut i: i64 = 0; i < n.methods.length; i++) { v.walk_decl(n.methods[i] as DeclarationNode*); }
     }
+}
 
-    add_field(field: DeclarationNode*) -> void {
-        this.fields.push(field);
-    }
-
-    add_method(method: MethodNode*) -> void {
-        this.methods.push(method);
+implement trait Allocate for struct UnionDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

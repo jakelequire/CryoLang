@@ -59,7 +59,7 @@ import compiler::artifacts::{ ASTOutput, TokenStream };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, ImplBlockNode, ImportDecl,
     MethodNode, StructDeclNode,
-    TraitDecl, UnionDeclNode
+    TraitDecl, UnionDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::compilation_context::{ CompilationContext, LangRef, SourceOverride };
@@ -692,10 +692,6 @@ type struct PassRegistry {
                     const n: StructDeclNode* = stmt as StructDeclNode*;
                     def = n.def; leaf = n.name; tspan = n.span;
                 }
-                NodeKind::UnionDeclaration => {
-                    const n: UnionDeclNode* = stmt as UnionDeclNode*;
-                    def = n.def; leaf = n.name; tspan = n.span;
-                }
                 NodeKind::ClassDeclaration => {
                     const n: ClassDeclNode* = stmt as ClassDeclNode*;
                     def = n.def; leaf = n.name; tspan = n.span;
@@ -705,6 +701,7 @@ type struct PassRegistry {
                         DeclKind::Enum(n)      => { def = n.def; leaf = n.name; tspan = stmt.span; }
                         DeclKind::Trait(n)     => { def = n.def; leaf = n.name; tspan = stmt.span; }
                         DeclKind::TypeAlias(n) => { def = n.def; leaf = n.alias_name; tspan = stmt.span; }
+                        DeclKind::Union(n)     => { def = n.def; leaf = n.name; tspan = stmt.span; }
                         // No other kind with a payload declares a type.
                         DeclKind::Import(_) | DeclKind::Intrinsic(_)
                         | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
@@ -753,18 +750,6 @@ type struct PassRegistry {
                     // Whether this IS the language's `Array`, `Slice`, `Rc`, ...
                     // is decided by the identity, claimed where it is minted.
                     ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                    type_count++;
-                }
-                NodeKind::UnionDeclaration => {
-                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                    const _internu: InternTable* = ctx.get_intern_table();
-                    const _dbgu: string = _internu.resolve(node.name);
-                    cdebug("[TypeDecl]   -> Union '%s'\n", _dbgu);
-                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
-                    const union_ref: TypeRef =
-                        arena.create_union(qualified_sym, ctx.declaring_module(node.def));
-                    ctx.decl_index.register_type(node.def, union_ref, node.is_public);
-                    PassRegistry::claim_method_items(ctx, &node.methods);
                     type_count++;
                 }
                 NodeKind::ClassDeclaration => {
@@ -830,6 +815,17 @@ type struct PassRegistry {
                             // (before Phase 4 populates the index for other types).
                             // An alias carries no visibility modifier: public.
                             ctx.decl_index.register_type(node.def, alias_ref, true);
+                            type_count++;
+                        }
+                        DeclKind::Union(node) => {
+                            const _internu: InternTable* = ctx.get_intern_table();
+                            const _dbgu: string = _internu.resolve(node.name);
+                            cdebug("[TypeDecl]   -> Union '%s'\n", _dbgu);
+                            const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, stmt.span.file);
+                            const union_ref: TypeRef =
+                                arena.create_union(qualified_sym, ctx.declaring_module(node.def));
+                            ctx.decl_index.register_type(node.def, union_ref, node.is_public);
+                            PassRegistry::claim_method_items(ctx, &node.methods);
                             type_count++;
                         }
                         // No other kind with a payload declares a type.
