@@ -68,7 +68,7 @@ import compiler::passes::type_resolution;
 import compiler::passes::type_resolution::{ TypeResolutionPasses, TypeResolutionRunner };
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
-    AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDeclNode,
+    AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
     EnumDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
     StructDeclNode, TraitDeclNode, UnionDeclNode, VarDeclNode
 };
@@ -1188,8 +1188,9 @@ type struct SemaVisitor {
     visit_decl_stmt(mut &this, stmt: Stmt*, node: DeclStmt*) -> void {
         if (node.declaration == null) { return; }
         const decl: ASTNode* = node.declaration;
-        if (decl.kind == NodeKind::DestructureDeclaration) {
-            this.visit_destructure(decl as DestructureDeclNode*);
+        const dd: DestructureDecl* = DeclarationNode::destructure_of(node.declaration);
+        if (dd != null) {
+            this.visit_destructure(node.declaration, dd);
             return;
         }
         if (decl.kind != NodeKind::VariableDeclaration) { return; }
@@ -1458,7 +1459,7 @@ type struct SemaVisitor {
         this.scopes.set_kw_span(var_node.sym_id, var_node.kw_span);
     }
 
-    visit_destructure(mut &this, node: DestructureDeclNode*) -> void {
+    visit_destructure(mut &this, d: DeclarationNode*, node: DestructureDecl*) -> void {
         if (!node.has_resolved_type() && node.type_annotation != null) {
             mut res_ctx: ResolutionContext = this.body_res_ctx();
             this.symbolic.symbolic_bind_params(&res_ctx);
@@ -1472,9 +1473,9 @@ type struct SemaVisitor {
             this.state.expected_type = saved_expected;
             if (node.has_resolved_type() && init_type.is_valid()) {
                 this.lambda.refuse_stored_closure(init_type, node.resolved_type,
-                    if (node.initializer != null) { node.initializer.span } else { node.span }, "a variable");
+                    if (node.initializer != null) { node.initializer.span } else { d.span }, "a variable");
                 if (!this.checker.can_assign(init_type, node.resolved_type)) {
-                    const value_span: SourceSpan = if (node.initializer != null) { node.initializer.span } else { node.span };
+                    const value_span: SourceSpan = if (node.initializer != null) { node.initializer.span } else { d.span };
                     const ann_span: SourceSpan = annotation_span(node.type_annotation);
                     this.diag.emit_declared_mismatch(
                         ErrorCode::E0200_TYPE_MISMATCH, value_span, node.resolved_type, node.type_annotation,
@@ -1484,7 +1485,7 @@ type struct SemaVisitor {
             }
         }
         if (this.symbolic.symbolic_defer_type(node.resolved_type)) {
-            this.register_destructure_locals_abstract(node);
+            this.register_destructure_locals_abstract(d, node);
             return;
         }
         if (!node.has_resolved_type()) { this.register_destructure_locals_void(node); return; }
@@ -1499,14 +1500,14 @@ type struct SemaVisitor {
         if (!got_fields) {
             const ty_name: string = this.arena.format_display(ty);
             this.ctx.emit_error_at(ErrorCode::E0361_DESTRUCTURE_NON_STRUCT,
-                fmt::format("cannot destructure non-struct type '%s'", ty_name), node.span);
+                fmt::format("cannot destructure non-struct type '%s'", ty_name), d.span);
             this.register_destructure_locals_void(node);
             return;
         }
 
         mut names: [SymbolStr] = [];
         for (mut k: i64 = 0; k < fields_ptr.length; k++) { names.push(fields_ptr[k].decl_name().spelling()); }
-        const positions: [i64] = this.check_destructure_shape(node, &names,
+        const positions: [i64] = this.check_destructure_shape(d, node, &names,
             this.arena.format_display(ty));
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             mut b: DestructureBinding = node.bindings[i];
@@ -1526,7 +1527,7 @@ type struct SemaVisitor {
     /// of the type it destructures (`ty_name` in the messages): a field bound
     /// twice, a field the type does not have, a field left out.  Each
     /// binding's field position in `names`, or -1 for one reported here.
-    check_destructure_shape(mut &this, node: DestructureDeclNode*, names: &[SymbolStr],
+    check_destructure_shape(mut &this, d: DeclarationNode*, node: DestructureDecl*, names: &[SymbolStr],
                             ty_name: string) -> [i64] {
         mut positions: [i64] = [];
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
@@ -1582,7 +1583,7 @@ type struct SemaVisitor {
             }
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0362_DESTRUCTURE_INCOMPLETE,
                 fmt::format("destructure of `%s` must bind all %lld field(s); missing: %s", ty_name, names.length, missing));
-            diag = diag.at_with_label(node.span, fmt::format("missing %lld field%s", count, if (count == 1) { "" } else { "s" }));
+            diag = diag.at_with_label(d.span, fmt::format("missing %lld field%s", count, if (count == 1) { "" } else { "s" }));
             this.ctx.emit_diagnostic(diag);
         }
         return positions;
@@ -1598,11 +1599,11 @@ type struct SemaVisitor {
     /// A type with no field list on the generic body (a type parameter, a
     /// projection) is not checked.  Each binding's type is recorded on the
     /// template, which every copy substitutes.
-    register_destructure_locals_abstract(mut &this, node: DestructureDeclNode*) -> void {
+    register_destructure_locals_abstract(mut &this, d: DeclarationNode*, node: DestructureDecl*) -> void {
         mut names: [SymbolStr] = [];
         mut positions: [i64] = [];
         if (node.has_resolved_type() && this.member.template_field_names(node.resolved_type, &names)) {
-            positions = this.check_destructure_shape(node, &names,
+            positions = this.check_destructure_shape(d, node, &names,
                 this.arena.resolve_display_name(node.resolved_type));
         }
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
@@ -1619,7 +1620,7 @@ type struct SemaVisitor {
         }
     }
 
-    register_destructure_locals_void(mut &this, node: DestructureDeclNode*) -> void {
+    register_destructure_locals_void(mut &this, node: DestructureDecl*) -> void {
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             const b: DestructureBinding = node.bindings[i];
             this.scopes.declare(b.sym_id, this.arena.get_void(), b.is_mutable);
@@ -1653,7 +1654,6 @@ type struct SemaVisitor {
             NodeKind::Statement              => { this.dispatch_stmt(n as Stmt*); }
 
             NodeKind::VariableDeclaration    => { this.visit_var(n as VarDeclNode*); }
-            NodeKind::DestructureDeclaration => { this.visit_destructure(n as DestructureDeclNode*); }
             NodeKind::FunctionDeclaration    => { this.visit_function(n as FunctionDeclNode*); }
             NodeKind::StructDeclaration      => { this.visit_struct(n as StructDeclNode*); }
             NodeKind::UnionDeclaration       => { this.visit_union(n as UnionDeclNode*); }
@@ -1668,8 +1668,10 @@ type struct SemaVisitor {
             | NodeKind::Directive => { }
 
             NodeKind::Declaration => {
-                // None of these has a check.
-                match ((n as DeclarationNode*).shape) {
+                const d: DeclarationNode* = n as DeclarationNode*;
+                match (d.shape) {
+                    DeclKind::Destructure(dd) => { this.visit_destructure(d, dd); }
+                    // None of these has a check.
                     DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::IntrinsicConst(_)
                     | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Extern(_) => { }
                     DeclKind::Legacy => { }

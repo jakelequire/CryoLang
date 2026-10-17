@@ -38,7 +38,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
-    DestructureDeclNode, EnumDeclNode, EnumVariant, ExternBlock, FieldDeclNode,
+    DestructureDecl, EnumDeclNode, EnumVariant, ExternBlock, FieldDeclNode,
     FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDecl,
     IntrinsicConstDecl, IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDeclNode,
@@ -625,13 +625,13 @@ implement struct Parser {
 
     /// Parse a struct destructure declaration: `const { f1, f2: alias, mut f3 }: T = expr;`.
     /// Caller has confirmed the next-after-const/mut token is `{`.
-    parse_destructure_decl() -> DestructureDeclNode* {
+    parse_destructure_decl() -> DeclarationNode* {
         const start: Token = this.current();
         const is_mutable: boolean = this.current().kind == TokenType::KwMut;
         this.advance(); // consume 'const' or 'mut'
 
-        mut node: DestructureDeclNode* = new DestructureDeclNode(this.span_from_token(start));
-        node.set_mutable(is_mutable);
+        const node: DestructureDecl* = DestructureDecl::new();
+        node.is_mutable = is_mutable;
 
         this.consume(TokenType::LBrace, "'{'");
 
@@ -692,15 +692,14 @@ implement struct Parser {
             const binding: DestructureBinding = DestructureBinding::new(
                 source_field, local_name, entry_mut || is_mutable,
                 entry_span, name_span);
-            node.add_binding(binding);
+            node.bindings.push(binding);
         }
 
         this.consume(TokenType::RBrace, "'}'");
 
         // Required `: Type` annotation
         if (this.match_tok(TokenType::Colon)) {
-            const type_ann: TypeAnnotation* = this.parse_type_annotation();
-            node.set_type_annotation(type_ann);
+            node.type_annotation = this.parse_type_annotation();
         } else {
             this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
                 "destructure binding requires ': Type' after the pattern");
@@ -708,16 +707,14 @@ implement struct Parser {
 
         // Initializer is mandatory for destructure (can't bind fields of nothing)
         if (this.match_tok(TokenType::Equal)) {
-            const init: ExpressionNode* = this.parse_expression();
-            node.set_initializer(init);
+            node.initializer = this.parse_expression();
         } else {
             this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
                 "destructure binding requires an initializer (`= expr`)");
         }
 
         this.consume(TokenType::Semicolon, "';'");
-        node.span = this.span_from(start);
-        return node;
+        return DeclarationNode::of(DeclKind::Destructure(node), this.span_from(start));
     }
 
     /// Parse a function declaration: `function name<T>(params) -> RetType { body }`.
@@ -3179,7 +3176,7 @@ implement struct Parser {
         // (`const { f }: T = expr;`); otherwise the standard var decl path.
         if (tok.kind == TokenType::KwConst || tok.kind == TokenType::KwMut) {
             if (this.peek_at(1).kind == TokenType::LBrace) {
-                const dd: DestructureDeclNode* = this.parse_destructure_decl();
+                const dd: DeclarationNode* = this.parse_destructure_decl();
                 if (dd != null) {
                     return Stmt::decl_stmt(dd, dd.span);
                 }

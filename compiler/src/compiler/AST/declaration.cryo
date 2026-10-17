@@ -106,6 +106,16 @@ public:
         };
     }
 
+    /// The destructuring declaration `d` is, or null: what a declaration
+    /// statement holds is a variable or one of these.
+    static destructure_of(d: DeclarationNode*) -> DestructureDecl* {
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Destructure(dd) => { dd }
+            _                         => { null }
+        };
+    }
+
     /// The extern block `n` is, or null.
     static extern_of(n: ASTNode*) -> ExternBlock* {
         const d: DeclarationNode* = DeclarationNode::with_shape(n);
@@ -355,7 +365,7 @@ public:
 }
 
 
-// DestructureDeclNode: `const { f1, f2: alias, mut f3 }: T = expr;`
+// DestructureDecl: `const { f1, f2: alias, mut f3 }: T = expr;`
 //
 // Binds individual fields of a struct/class value to fresh locals.  Full
 // destructure (every field of T bound) consumes the RHS, which the move-
@@ -392,34 +402,35 @@ type struct DestructureBinding {
 }
 
 
-type class DestructureDeclNode : DeclarationNode {
-public:
+type struct DestructureDecl {
     bindings:        [DestructureBinding];
     type_annotation: TypeAnnotation*;
     initializer:     ExpressionNode*;
     resolved_type:   TypeRef;       // resolved composite type
     is_mutable:      boolean;       // declaration-level (`const` vs `mut`)
 
-    DestructureDeclNode(span: SourceSpan)
-        : DeclarationNode(NodeKind::DestructureDeclaration, span) {
-        this.bindings        = [];
-        this.type_annotation = null;
-        this.initializer     = null;
-        this.resolved_type   = TypeRef::invalid();
-        this.is_mutable      = false;
+    static new() -> DestructureDecl* {
+        return new DestructureDecl {
+            bindings:        [],
+            type_annotation: null,
+            initializer:     null,
+            resolved_type:   TypeRef::invalid(),
+            is_mutable:      false,
+        };
     }
 
-    has_initializer() -> boolean     { return this.initializer != null; }
-    has_type_annotation() -> boolean { return this.type_annotation != null; }
-    has_resolved_type() -> boolean   { return this.resolved_type.is_valid(); }
+    has_initializer(&this) -> boolean   { return this.initializer != null; }
+    has_resolved_type(&this) -> boolean { return this.resolved_type.is_valid(); }
 
-    add_binding(b: DestructureBinding) -> void {
-        this.bindings.push(b);
+    static walk_children<V>(n: DestructureDecl*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.initializer);
     }
+}
 
-    set_initializer(expr: ExpressionNode*) -> void  { this.initializer = expr; }
-    set_type_annotation(a: TypeAnnotation*) -> void { this.type_annotation = a; }
-    set_mutable(v: boolean) -> void                 { this.is_mutable = v; }
+implement trait Allocate for struct DestructureDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
 }
 
 
@@ -756,6 +767,7 @@ public:
 /// `DeclarationNode`; it goes when the last kind converts.
 type enum DeclKind {
     Legacy;
+    Destructure(DestructureDecl*);
     Extern(ExternBlock*);
     Import(ImportDecl*);
     Intrinsic(IntrinsicDecl*);

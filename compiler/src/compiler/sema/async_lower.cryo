@@ -57,7 +57,7 @@ import compiler::types::generic::{
 };
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
-    DeclarationNode, DestructureBinding, DestructureDeclNode, FieldDeclNode, FunctionDeclNode,
+    DeclarationNode, DestructureBinding, DestructureDecl, FieldDeclNode, FunctionDeclNode,
     GenericParamNode, ImplBlockNode, MethodNode, ReceiverForm, StructDeclNode, TraitDeclNode,
     VarDeclNode
 };
@@ -2346,9 +2346,8 @@ type struct AsyncLower {
         if (ds.declaration.kind == NodeKind::VariableDeclaration) {
             return (ds.declaration as VarDeclNode*).initializer;
         }
-        if (ds.declaration.kind == NodeKind::DestructureDeclaration) {
-            return (ds.declaration as DestructureDeclNode*).initializer;
-        }
+        const dd: DestructureDecl* = DeclarationNode::destructure_of(ds.declaration);
+        if (dd != null) { return dd.initializer; }
         return null;
     }
 
@@ -2356,8 +2355,8 @@ type struct AsyncLower {
         if (ds == null || ds.declaration == null) { return; }
         if (ds.declaration.kind == NodeKind::VariableDeclaration) {
             (ds.declaration as VarDeclNode*).initializer = init;
-        } else if (ds.declaration.kind == NodeKind::DestructureDeclaration) {
-            (ds.declaration as DestructureDeclNode*).initializer = init;
+        } else if (DeclarationNode::destructure_of(ds.declaration) != null) {
+            DeclarationNode::destructure_of(ds.declaration).initializer = init;
         }
     }
 
@@ -6322,7 +6321,7 @@ type struct AsyncLower {
 
     /// Rename a destructure: its initializer first, then each field's local,
     /// exactly as `rn_var_decl` renames one.
-    rn_destructure(mut &this, map: RenameMap*, dd: DestructureDeclNode*) -> void {
+    rn_destructure(mut &this, map: RenameMap*, dd: DestructureDecl*) -> void {
         if (dd == null) { return; }
         this.rn_expr(map, dd.initializer);
         for (mut i: i64 = 0; i < dd.bindings.length; i++) {
@@ -6360,11 +6359,8 @@ type struct AsyncLower {
                 }
             };
             if (ds == null) { out.push(s); continue; }
-            if (ds.declaration == null
-                    || ds.declaration.kind != NodeKind::DestructureDeclaration) {
-                out.push(s); continue;
-            }
-            mut dd: DestructureDeclNode* = ds.declaration as DestructureDeclNode*;
+            const dd: DestructureDecl* = DeclarationNode::destructure_of(ds.declaration);
+            if (dd == null) { out.push(s); continue; }
             if (dd.initializer == null || !this.destructure_typed(dd)) { out.push(s); continue; }
             const span: SourceSpan = s.span;
             const src: SymbolStr = this.intern.intern("__ds");
@@ -6399,7 +6395,7 @@ type struct AsyncLower {
     /// body a destructure of a generic type has none until it is specialized
     /// - sema defers its fields - so it is renamed where it stands and not
     /// split, and a field of it read across a suspend is not carried.
-    destructure_typed(&this, dd: DestructureDeclNode*) -> boolean {
+    destructure_typed(&this, dd: DestructureDecl*) -> boolean {
         if (!dd.resolved_type.is_valid()) { return false; }
         for (mut i: i64 = 0; i < dd.bindings.length; i++) {
             if (!dd.bindings[i].resolved_type.is_valid()) { return false; }
@@ -6632,9 +6628,8 @@ type struct AsyncLower {
             StmtKind::Decl(ds) => {
                 if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
                     this.rn_var_decl(map, ds.declaration as VarDeclNode*);
-                } else if (ds.declaration != null &&
-                           ds.declaration.kind == NodeKind::DestructureDeclaration) {
-                    this.rn_destructure(map, ds.declaration as DestructureDeclNode*);
+                } else if (DeclarationNode::destructure_of(ds.declaration) != null) {
+                    this.rn_destructure(map, DeclarationNode::destructure_of(ds.declaration));
                 }
             }
             StmtKind::Block(b)       => { this.rn_block(map, b); }
@@ -6933,9 +6928,8 @@ type struct AsyncLower {
             StmtKind::Decl(ds) => {
                 if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
                     this.rb_var_decl(ctx, ds.declaration as VarDeclNode*);
-                } else if (ds.declaration != null &&
-                           ds.declaration.kind == NodeKind::DestructureDeclaration) {
-                    mut dd: DestructureDeclNode* = ds.declaration as DestructureDeclNode*;
+                } else if (DeclarationNode::destructure_of(ds.declaration) != null) {
+                    const dd: DestructureDecl* = DeclarationNode::destructure_of(ds.declaration);
                     this.rb_expr(ctx, dd.initializer);
                     for (mut i: i64 = 0; i < dd.bindings.length; i++) {
                         if (!dd.bindings[i].sym_id.is_valid()) {

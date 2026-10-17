@@ -23,7 +23,7 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDeclNode, EnumDeclNode,
+    ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDeclNode,
     EnumVariant, ExternBlock, FieldDeclNode, FunctionDeclNode, GenericParamNode,
     DeclKind, ImplBlockNode, ImportDecl, IntrinsicConstDecl, IntrinsicDecl, MethodNode,
     ModuleDecl, StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode,
@@ -146,7 +146,6 @@ type struct ASTCloner {
             NodeKind::Statement                 => { return this.copy_stmt(n as Stmt*); }
 
             NodeKind::VariableDeclaration       => { return this.visit_var(n as VarDeclNode*); }
-            NodeKind::DestructureDeclaration    => { return this.visit_destructure(n as DestructureDeclNode*); }
             NodeKind::FunctionDeclaration       => { return this.visit_function(n as FunctionDeclNode*); }
             NodeKind::MethodDeclaration         => { return this.visit_method(n as MethodNode*); }
             NodeKind::Declaration               => { return this.copy_decl_shape(n as DeclarationNode*); }
@@ -750,29 +749,6 @@ type struct ASTCloner {
         return c;
     }
 
-    visit_destructure(mut &this, node: DestructureDeclNode*) -> ASTNode* {
-        mut c: DestructureDeclNode* = new DestructureDeclNode(node.span);
-        this.copy_decl_base(node, c);
-        c.set_mutable(node.is_mutable);
-        for (mut i: i64 = 0; i < node.bindings.length; i++) {
-            const b: DestructureBinding = node.bindings[i];
-            mut nb: DestructureBinding = DestructureBinding::new(
-                b.source_field, b.local_name, b.is_mutable, b.span, b.name_span);
-            nb.sym_id = b.sym_id;
-            nb.resolved_type = b.resolved_type;
-            nb.field_index = b.field_index;
-            c.add_binding(nb);
-        }
-        c.resolved_type = node.resolved_type;
-        if (node.has_type_annotation()) {
-            c.set_type_annotation(this.clone_type_annotation(node.type_annotation));
-        }
-        if (node.has_initializer()) {
-            c.set_initializer(this.clone_expr(node.initializer));
-        }
-        return c;
-    }
-
     visit_function(mut &this, node: FunctionDeclNode*) -> ASTNode* {
         const name: SymbolStr = this.consume_spec_name(node.name);
         const skip_gp: boolean = this.consume_skip_generics();
@@ -855,6 +831,27 @@ type struct ASTCloner {
     /// The copy of a declaration whose kind has a payload.
     copy_decl_shape(mut &this, node: DeclarationNode*) -> DeclarationNode* {
         const shape: DeclKind = match (node.shape) {
+            DeclKind::Destructure(n) => {
+                const c: DestructureDecl* = DestructureDecl::new();
+                c.is_mutable = n.is_mutable;
+                for (mut i: i64 = 0; i < n.bindings.length; i++) {
+                    const b: DestructureBinding = n.bindings[i];
+                    mut nb: DestructureBinding = DestructureBinding::new(
+                        b.source_field, b.local_name, b.is_mutable, b.span, b.name_span);
+                    nb.sym_id = b.sym_id;
+                    nb.resolved_type = b.resolved_type;
+                    nb.field_index = b.field_index;
+                    c.bindings.push(nb);
+                }
+                c.resolved_type = n.resolved_type;
+                if (n.type_annotation != null) {
+                    c.type_annotation = this.clone_type_annotation(n.type_annotation);
+                }
+                if (n.initializer != null) {
+                    c.initializer = this.clone_expr(n.initializer);
+                }
+                DeclKind::Destructure(c)
+            }
             DeclKind::Extern(n) => {
                 // Only the linkage and the functions are copied.
                 const c: ExternBlock* = ExternBlock::new(n.linkage_type);

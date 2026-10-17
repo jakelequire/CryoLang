@@ -1439,6 +1439,21 @@ committed with the change and deleted in the next commit.
   copies only the linkage and the functions, as before.  Control: a
   dumper with the `ExternBlock` label changed differs on all 164 files of
   `tests/tests/lang`.
+- `Destructure(DestructureDecl*)` followed.  A declaration statement
+  holds a variable (still a subclass) or one of these, and every place
+  that took it apart (sema, codegen, drop insertion, the move check, dead
+  code, type resolution, the call specializer, the async lowering) asks
+  `DeclarationNode::destructure_of`, the projection `variant_of` is for a
+  variant.  Sema's destructure checks take the header beside the payload
+  for the spans they report at.  Control: a dumper with the
+  `DestructureDecl` label changed differs on all 164 files of
+  `tests/tests/lang`.
+- Left: the type declarations and functions.  `TypeAlias` is the
+  smallest, but the generic registry records a template's kind as its
+  `NodeKind` (`TypeAliasDeclaration`, `StructDeclaration`, ...) and mono
+  dispatches on it, so before any type declaration converts the registry
+  needs a kind of its own (a `TemplateKind` the entry carries), proven
+  identical on its own.
 - `NodeKind::is_declaration` answers true for `Declaration`.  A module
   declaration was outside its list; the two callers read `name_span`,
   which the parser never sets on a module declaration, so they answer as

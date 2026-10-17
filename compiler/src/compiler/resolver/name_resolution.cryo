@@ -41,7 +41,7 @@ import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DestructureBinding, DestructureDeclNode, EnumDeclNode, EnumVariant,
+    ClassDeclNode, DestructureBinding, DestructureDecl, EnumDeclNode, EnumVariant,
     ExternBlock, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
     DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
@@ -588,8 +588,10 @@ type struct NameResolver {
                         ic_node.def = this.resolver.get_symbol(declared_id).def;
                     }
                     // A module declaration introduces no name of this module.
-                    // A variant is declared with its enum.
-                    DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                    // A variant is declared with its enum; a destructure's
+                    // locals where the walk meets them.
+                    DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                    | DeclKind::Legacy => {}
                 }
             }
             NodeKind::Statement => {
@@ -627,7 +629,9 @@ type struct NameResolver {
                     DeclKind::Intrinsic(i)       => { i.def }
                     DeclKind::IntrinsicConst(ic) => { ic.def }
                     DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
-                    | DeclKind::Variant(_) | DeclKind::Legacy => { DefId::invalid() }
+                    | DeclKind::Variant(_) | DeclKind::Destructure(_) | DeclKind::Legacy => {
+                        DefId::invalid()
+                    }
                 }
             }
             _ => { DefId::invalid() }
@@ -841,7 +845,7 @@ type struct NameResolver {
     }
 
     /// Whether binding `i` of a destructuring repeats an earlier binding's local name.
-    static repeats_binding(node: DestructureDeclNode*, i: i64) -> boolean {
+    static repeats_binding(node: DestructureDecl*, i: i64) -> boolean {
         for (mut j: i64 = 0; j < i; j++) {
             if (node.bindings[j].local_name.id == node.bindings[i].local_name.id) { return true; }
         }
@@ -3393,7 +3397,7 @@ implement trait Walk for struct NameResolver {
         }
     }
 
-    walk_destructure(mut &this, node: DestructureDeclNode*) -> void {
+    walk_destructure(mut &this, d: DeclarationNode*, node: DestructureDecl*) -> void {
         this.stamp_annotation(node.type_annotation);
         // Resolve the initializer first; its identifiers must bind to the
         // outer scope, before the new field locals shadow anything.
