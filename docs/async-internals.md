@@ -20,7 +20,7 @@ Three consequences fall out of that choice, and they are why it was made:
 
 - **The unwinder is unchanged.** A panic inside an `async function` unwinds the native frame of
   whoever called `poll`. There is no coroutine stack to walk, so async surfaces panics through the
-  existing `__cryo_panic` funnel.
+  existing `__cryo_panic_at` funnel.
 - **No new thread-local machinery.** Task-local state is ordinary struct fields in the generated
   future.
 - **`async` is a compile-time transformation.** The executor is an ordinary library

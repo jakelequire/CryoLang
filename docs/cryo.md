@@ -875,7 +875,7 @@ intrinsic function malloc(size: u64) -> void*;
 intrinsic function free(ptr: void*) -> void;
 intrinsic function popcount64(value: u64) -> u32;
 intrinsic function sqrt64(value: f64) -> f64;
-intrinsic function panic(message: string, file: string, line: u32) -> never;
+intrinsic function panic(message: string, loc: Location) -> never;
 ```
 
 `printf`, `print`, `println`, `eprint` and `eprintln` are *not* intrinsics - they are ordinary functions in `std::fmt`. C library functions such as `memcpy` and `strlen` are `extern "C"` declarations in `std::ffi::libc`.
@@ -912,7 +912,7 @@ Inside a function marked `![caller_location]`, `location()` is instead the place
 ![caller_location]
 function expect_positive(n: i64) -> i64 {
     if (n <= 0) {
-        core::panic("expected a positive number", intrinsics::location().file, intrinsics::location().line);
+        core::panic("expected a positive number", intrinsics::location());
     }
     return n;
 }
@@ -922,6 +922,8 @@ function main() -> i32 {
     return 0;
 }
 ```
+
+`panic` takes the place as a `Location`, `core::panic(message, intrinsics::location())`, and a panic's report names all of it: `panicked at <file>:<line>:<column> in <function>: <message>`, here the file, line and column of `expect_positive(-1)` and the qualified name of `main`.  The checks the compiler inserts (division by zero, a `match` with no arm for its value, an out-of-range index) report their place the same way.  A place with no column leaves it out, and one with no function leaves out `in ...`.
 
 ### 4.6 Overloading
 
@@ -1945,7 +1947,7 @@ implement enum Option<T> {
         match (this) {
             Option::Some(value) => { return value; }
             Option::None        => {
-                panic("unwrap on None", intrinsics::location().file, intrinsics::location().line);
+                panic("unwrap on None", intrinsics::location());
             }
         }
     }
@@ -4005,7 +4007,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 
 | Module               | What it brings in                                                                                                     |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `core`               | `panic(message: string, file: string, line: u32) -> never` (does not return; aborts the process)                      |
+| `core`               | `panic(message: string, loc: intrinsics::Location) -> never` (does not return; aborts the process)                    |
 | `core::option`       | `Option<T>` (`Some` / `None`) and its methods                                                                         |
 | `core::result`       | `Result<T, E>` (`Ok` / `Err`) and its methods                                                                         |
 | `core::primitives`   | Methods on built-in types (`(-5 as i32).abs()`, `(2.0).sqrt()`, `x.clamp(lo, hi)`, `char::is_digit`, ...)             |

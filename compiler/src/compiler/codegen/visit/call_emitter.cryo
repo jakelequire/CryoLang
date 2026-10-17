@@ -1178,18 +1178,10 @@ type struct CallEmitter {
     }
 
     /// `intrinsics::panic(message, loc)`: the funnel, given the message and
-    /// the address of `loc`.  The three-argument form `panic(message, file,
-    /// line)`, which a standard library older than the `Location` parameter
-    /// writes, reaches it with a `Location` built from the two parts.
+    /// the address of `loc`.
     emit_panic(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> Emitted {
         const msg: LValue = this.dispatch.codegen_rvalue(visitor, node.arguments[0]);
-        mut loc: LValue = LValue::null();
-        if (node.arguments.length == 3) {
-            loc = this.location_of_parts(this.dispatch.codegen_rvalue(visitor, node.arguments[1]),
-                                         this.dispatch.codegen_rvalue(visitor, node.arguments[2]));
-        } else {
-            loc = this.location_address(this.dispatch.codegen_rvalue(visitor, node.arguments[1]));
-        }
+        const loc: LValue = this.location_address(this.dispatch.codegen_rvalue(visitor, node.arguments[1]));
         // `--panic=unwind` direct-panic drop-completeness: route the panic
         // funnel through an invoke + cleanup landing pad so the frame's live
         // droppable locals drop on unwind (a plain call bypasses the
@@ -1215,25 +1207,6 @@ type struct CallEmitter {
         g.set_global_constant(true);
         g.set_linkage(LLinkage::Private);
         return g;
-    }
-
-    /// The address of a `Location` holding `file` and `line`, with no column
-    /// and no function.
-    location_of_parts(mut &this, file: LValue, line: LValue) -> LValue {
-        const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const buf: void* = libc::malloc(32);
-        const slots: void** = buf as void**;
-        slots[0] = LType::const_pointer_null(ptr_ty).raw;
-        slots[1] = LType::const_int(LType::i32(), 0, false).raw;
-        slots[2] = LType::const_int(LType::i32(), 0, false).raw;
-        slots[3] = LType::const_pointer_null(ptr_ty).raw;
-        const empty: LValue = LType::const_struct(buf, 4, false);
-        libc::free(buf);
-        const with_file: LValue = this.cg.builder.build_insert_value(empty, file, 0, "");
-        const whole: LValue = this.cg.builder.build_insert_value(with_file, line, 1, "");
-        const slot: LValue = this.entry_spill_slot(whole.type_of(), "panic.location");
-        this.cg.builder.build_store(whole, slot);
-        return slot;
     }
 
     /// Direct-panic origin under `--panic=unwind`: emit the funnel as an

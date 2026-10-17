@@ -307,7 +307,7 @@ endif
 
 # ---- self-hosted compiler via the pin ---------------------------------
 # Depends on `runtime-tiers` because linking ANY hosted binary - including this
-# compiler - needs the panic tier to resolve `__cryo_panic`.  Harmless before the
+# compiler - needs the panic tier to resolve `__cryo_panic_at`.  Harmless before the
 # pin emits that call; required the moment it does.
 #
 # The stdlib archive is a FILE prerequisite, not the phony `stdlib`: the phony
@@ -390,7 +390,7 @@ $(LIBCRYO_A): $(STDLIB_SOURCES) $(STDLIB_PIN)
 # .toolchains/llvm-win import lib).  Requires the cross toolchain + the
 # fetched windows libLLVM-C; prints an actionable hint and fails if absent.
 # Depends on `runtime-tiers-win`: this is a CROSS link, so it needs the tiers
-# built for the windows triple to resolve `__cryo_panic`, not the host ones.
+# built for the windows triple to resolve `__cryo_panic_at`, not the host ones.
 cryo-exe: cryo runtime-tiers-win
 	@command -v $(MINGW_GCC) >/dev/null 2>&1 || { echo "ERROR: $(MINGW_GCC) not found (install gcc-mingw-w64-x86-64)."; exit 1; }
 	@test -f "$(WIN_LLVM_LIB)" || { echo "ERROR: windows libLLVM-C import lib missing at"; echo "       $(WIN_LLVM_LIB)"; echo "       Run: scripts/fetch-windows-llvm.sh"; exit 1; }
@@ -518,7 +518,7 @@ ifeq ($(HOST_OS),windows)
 # Same single-line shape as `pin` so it Just Works whether you invoked
 # `make` from cmd / PowerShell or from MSYS2 / Git Bash.
 # `runtime-tiers` first: the check's stage-2 and stage-3 rounds are hosted links
-# that need libcryort-panic-abort-hosted.a to resolve `__cryo_panic`.  It wipes
+# that need libcryort-panic-abort-hosted.a to resolve `__cryo_panic_at`.  It wipes
 # stdlib/.bin and compiler/build but not runtime/.bin, so building the tiers up
 # front survives every round.
 selfhost-check: runtime-tiers
@@ -797,17 +797,17 @@ endif
 
 # ---- runtime tier archives --------------------------------------------
 # NOT optional, and not only for freestanding projects: codegen emits a call to
-# the external `__cryo_panic` for every panic, so a HOSTED link needs
+# the external `__cryo_panic_at` for every panic, so a HOSTED link needs
 # libcryort-panic-abort-hosted.a on the line or it fails on an undefined symbol.
 # Built with the PIN, not the self-hosted compiler, and that is load bearing:
-# once the pin itself emits `__cryo_panic`, LINKING the self-hosted compiler
+# once the pin itself emits `__cryo_panic_at`, LINKING the self-hosted compiler
 # needs these archives, so making them depend on that compiler would be a
 # bootstrap cycle (tiers -> cryo -> tiers).  The pin is a known-good compiler
 # and the tier sources do not depend on any newer codegen.
 #
 # Two workspaces over the same sources: `runtime/` builds them freestanding,
 # `runtime/hosted/` rebuilds the abort tier with `no_runtime = false` so its
-# `__cryo_panic` exits through libc (flushing stdio) instead of a raw syscall.
+# `__cryo_panic_at` exits through libc (flushing stdio) instead of a raw syscall.
 # Both write into `runtime/.bin/$(HOST_TRIPLE)`, one directory per target.
 #
 # The per-target directory is what keeps two toolchains apart.  A project's
