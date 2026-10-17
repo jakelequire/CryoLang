@@ -10,7 +10,7 @@
 ///      type aliases, struct/class fields, local variables, cast expressions.
 ///
 ///   3. StructFieldTypeSync (order 10): Syncs resolved field types from AST
-///      FieldDeclNode nodes back to StructType/ClassType objects in the arena.
+///      field declarations back to StructType/ClassType objects in the arena.
 
 namespace compiler::passes::type_resolution;
 
@@ -50,7 +50,7 @@ import std::fmt;
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDecl, EnumDeclNode,
-    EnumVariant, FieldDeclNode, FunctionDeclNode, GenericParamNode,
+    EnumVariant, FieldDecl, FunctionDeclNode, GenericParamNode,
     DeclKind, ImplBlockNode, MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDecl, UnionDeclNode, VarDeclNode
 };
@@ -785,19 +785,20 @@ type struct TypeResolutionRunner {
         }
     }
 
-    /// Resolves type annotations on an array of FieldDeclNode.
-    resolve_fields(&this, fields: &[FieldDeclNode*],
+    /// Resolves type annotations on a type's field declarations.
+    resolve_fields(&this, fields: &[DeclarationNode*],
                    res_ctx: ResolutionContext*) -> void {
         // Core resolution
         this.resolver.resolve_fields(fields, res_ctx);
 
         // Emit diagnostics for unresolved fields
         for (mut i: i64 = 0; i < fields.length; i++) {
-            const field: FieldDeclNode* = fields[i];
+            const field_decl: DeclarationNode* = fields[i];
+            const field: FieldDecl* = DeclarationNode::field_of(field_decl);
             if (field == null) { continue; }
             if (field.type_annotation != null && !field.resolved_type.is_valid()) {
                 this.emit_undefined_type(field.type_annotation,
-                    "type", this.ctx.resolve_str(field.name), field.span);
+                    "type", this.ctx.resolve_str(field.name), field_decl.span);
             }
         }
     }
@@ -3000,7 +3001,7 @@ type struct TypeResolutionPasses {
                             }
                         }
                         DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Variant(_)
-                        | DeclKind::Destructure(_) | DeclKind::TypeAlias(_)
+                        | DeclKind::Destructure(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
                         | DeclKind::Legacy => {}
                     }
                 }
@@ -3484,7 +3485,7 @@ type struct TypeResolutionPasses {
 
     // Pass 3: StructFieldTypeSync (order 10)
 
-    /// Syncs resolved field types from AST FieldDeclNode nodes back to
+    /// Syncs resolved field types from the AST's field declarations back to
     /// StructType/ClassType [FieldInfo] arrays in the TypeArena.
     static run_struct_field_sync(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
@@ -3526,7 +3527,8 @@ type struct TypeResolutionPasses {
                     mut st: StructType* = base_type.as_struct();
                     mut field_infos: [FieldInfo] = [];
                     for (mut j: i64 = 0; j < node.fields.length; j++) {
-                        const field: FieldDeclNode* = node.fields[j];
+                        const field_decl: DeclarationNode* = node.fields[j];
+                        const field: FieldDecl* = DeclarationNode::field_of(field_decl);
                         if (field == null) { continue; }
                         // An unresolved field type must never be baked into the
                         // arena: TypeLowering would size the struct from the id-0
@@ -3539,7 +3541,7 @@ type struct TypeResolutionPasses {
                             const sname: string = ctx.intern_table.resolve(node.name);
                             ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
                                 fmt::format("cannot resolve type for field `%s` of `%s`", fname, sname),
-                                field.span);
+                                field_decl.span);
                             continue;
                         }
                         const is_pub: boolean = field.visibility == Visibility::Public;
@@ -3602,14 +3604,15 @@ type struct TypeResolutionPasses {
                     mut st: StructType* = base_type.as_struct();
                     mut field_infos: [FieldInfo] = [];
                     for (mut j: i64 = 0; j < node.fields.length; j++) {
-                        const field: FieldDeclNode* = node.fields[j];
+                        const field_decl: DeclarationNode* = node.fields[j];
+                        const field: FieldDecl* = DeclarationNode::field_of(field_decl);
                         if (field == null) { continue; }
                         if (!field.resolved_type.is_valid()) {
                             const fname: string = ctx.intern_table.resolve(field.name);
                             const sname: string = ctx.intern_table.resolve(node.name);
                             ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
                                 fmt::format("cannot resolve type for field `%s` of `%s`", fname, sname),
-                                field.span);
+                                field_decl.span);
                             continue;
                         }
                         const is_pub: boolean = field.visibility == Visibility::Public;
@@ -3661,7 +3664,8 @@ type struct TypeResolutionPasses {
                     mut ct: ClassType* = base_type.as_class();
                     mut field_infos: [FieldInfo] = [];
                     for (mut j: i64 = 0; j < node.fields.length; j++) {
-                        const field: FieldDeclNode* = node.fields[j];
+                        const field_decl: DeclarationNode* = node.fields[j];
+                        const field: FieldDecl* = DeclarationNode::field_of(field_decl);
                         if (field == null) { continue; }
                         // See the StructDeclaration arm: never bake an unresolved
                         // field type into the arena. Emit E0203 so the pass fails
@@ -3672,7 +3676,7 @@ type struct TypeResolutionPasses {
                             const sname: string = ctx.intern_table.resolve(node.name);
                             ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
                                 fmt::format("cannot resolve type for field `%s` of `%s`", fname, sname),
-                                field.span);
+                                field_decl.span);
                             continue;
                         }
                         const is_pub: boolean = field.visibility == Visibility::Public;

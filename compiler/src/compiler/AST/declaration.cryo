@@ -106,6 +106,16 @@ public:
         };
     }
 
+    /// The field `d` is; null for a null slot.  A type's field list holds
+    /// nothing else.
+    static field_of(d: DeclarationNode*) -> FieldDecl* {
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Field(f) => { f }
+            _                  => { null }
+        };
+    }
+
     /// The destructuring declaration `d` is, or null: what a declaration
     /// statement holds is a variable or one of these.
     static destructure_of(d: DeclarationNode*) -> DestructureDecl* {
@@ -779,6 +789,7 @@ type enum DeclKind {
     Legacy;
     Destructure(DestructureDecl*);
     Extern(ExternBlock*);
+    Field(FieldDecl*);
     Import(ImportDecl*);
     Intrinsic(IntrinsicDecl*);
     IntrinsicConst(IntrinsicConstDecl*);
@@ -1061,7 +1072,9 @@ type class StructDeclNode : DeclarationNode {
 public:
     name:           SymbolStr;
     generic_params: [GenericParamNode*];
-    fields:         [FieldDeclNode*];
+    /// Each a declaration whose shape is `DeclKind::Field`, read through
+    /// `DeclarationNode::field_of`.
+    fields:         [DeclarationNode*];
     methods:        [MethodNode*];
     /// Synthesized field accessors for a C-imported union/bitfield blob (set
     /// only by the bindgen engine; rendered only by the vendor serializer).
@@ -1136,7 +1149,7 @@ public:
         this.generic_params.push(param);
     }
 
-    add_field(field: FieldDeclNode*) -> void {
+    add_field(field: DeclarationNode*) -> void {
         this.fields.push(field);
     }
 
@@ -1157,7 +1170,9 @@ type class UnionDeclNode : DeclarationNode {
 public:
     name:           SymbolStr;
     generic_params: [GenericParamNode*];
-    fields:         [FieldDeclNode*];
+    /// Each a declaration whose shape is `DeclKind::Field`, read through
+    /// `DeclarationNode::field_of`.
+    fields:         [DeclarationNode*];
     methods:        [MethodNode*];
     /// Layout attributes - see StructDeclNode for the full description.
     repr_c:           boolean;
@@ -1202,7 +1217,7 @@ public:
         this.generic_params.push(param);
     }
 
-    add_field(field: FieldDeclNode*) -> void {
+    add_field(field: DeclarationNode*) -> void {
         this.fields.push(field);
     }
 
@@ -1216,7 +1231,9 @@ type class ClassDeclNode : DeclarationNode {
 public:
     name:           SymbolStr;
     generic_params: [GenericParamNode*];
-    fields:         [FieldDeclNode*];
+    /// Each a declaration whose shape is `DeclKind::Field`, read through
+    /// `DeclarationNode::field_of`.
+    fields:         [DeclarationNode*];
     methods:        [MethodNode*];
     base_class:     SymbolStr;
     /// What `base_class` refers to, stamped by NameResolution from the scope
@@ -1274,7 +1291,7 @@ public:
         this.generic_params.push(param);
     }
 
-    add_field(field: FieldDeclNode*) -> void {
+    add_field(field: DeclarationNode*) -> void {
         this.fields.push(field);
     }
 
@@ -1979,30 +1996,37 @@ implement trait Allocate for struct ExternBlock {
 }
 
 
-type class FieldDeclNode : DeclarationNode {
-public:
+/// A field of a struct, union or class.  The type's `fields` hold the
+/// headers, read through `DeclarationNode::field_of`.
+type struct FieldDecl {
     name:            SymbolStr;
     visibility:      Visibility;
     default_value:   ExpressionNode*;
     type_annotation: TypeAnnotation*;
     resolved_type:   TypeRef;
 
-    FieldDeclNode(name: SymbolStr, span: SourceSpan)
-        : DeclarationNode(NodeKind::FieldDeclaration, span) {
-        this.name            = name;
-        this.visibility      = Visibility::Public;
-        this.default_value   = null;
-        this.type_annotation = null;
-        this.resolved_type   = TypeRef::invalid();
+    static new(name: SymbolStr) -> FieldDecl* {
+        return new FieldDecl {
+            name:            name,
+            visibility:      Visibility::Public,
+            default_value:   null,
+            type_annotation: null,
+            resolved_type:   TypeRef::invalid(),
+        };
     }
 
-    has_default_value() -> boolean   { return this.default_value != null; }
-    has_type_annotation() -> boolean { return this.type_annotation != null; }
+    has_default_value(&this) -> boolean   { return this.default_value != null; }
+    has_type_annotation(&this) -> boolean { return this.type_annotation != null; }
 
-    set_visibility(v: Visibility) -> void           { this.visibility = v; }
-    set_default_value(v: ExpressionNode*) -> void   { this.default_value = v; }
-    set_type_annotation(a: TypeAnnotation*) -> void { this.type_annotation = a; }
-    set_resolved_type(t: TypeRef) -> void           { this.resolved_type = t; }
+    static walk_children<V>(n: FieldDecl*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.default_value);
+    }
+}
+
+implement trait Allocate for struct FieldDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
 }
 
 

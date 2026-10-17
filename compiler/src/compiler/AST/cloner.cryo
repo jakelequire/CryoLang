@@ -24,7 +24,7 @@ import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDeclNode,
-    EnumVariant, ExternBlock, FieldDeclNode, FunctionDeclNode, GenericParamNode,
+    EnumVariant, ExternBlock, FieldDecl, FunctionDeclNode, GenericParamNode,
     DeclKind, ImplBlockNode, ImportDecl, IntrinsicConstDecl, IntrinsicDecl, MethodNode,
     ModuleDecl, StructDeclNode, TraitDeclNode, TypeAliasDecl, UnionDeclNode,
     VarDeclNode
@@ -155,7 +155,6 @@ type struct ASTCloner {
             NodeKind::TraitDeclaration          => { return this.visit_trait(n as TraitDeclNode*); }
             NodeKind::EnumDeclaration           => { return this.visit_enum(n as EnumDeclNode*); }
             NodeKind::ImplementationBlock       => { return this.visit_impl(n as ImplBlockNode*); }
-            NodeKind::FieldDeclaration          => { return this.visit_field(n as FieldDeclNode*); }
             NodeKind::GenericParamDeclaration   => { return this.visit_generic_param(n as GenericParamNode*); }
 
             NodeKind::MatchArm                  => { return this.visit_match_arm(n as MatchArmNode*); }
@@ -859,6 +858,18 @@ type struct ASTCloner {
                 }
                 DeclKind::Extern(c)
             }
+            DeclKind::Field(n) => {
+                const c: FieldDecl* = FieldDecl::new(n.name);
+                c.visibility = n.visibility;
+                if (n.has_default_value()) {
+                    c.default_value = this.clone_expr(n.default_value);
+                }
+                if (n.has_type_annotation()) {
+                    c.type_annotation = this.clone_type_annotation(n.type_annotation);
+                }
+                // resolved_type left invalid, as `new` leaves it
+                DeclKind::Field(c)
+            }
             DeclKind::Import(n) => {
                 // The path segments and private export entries are not copied.
                 const c: ImportDecl* = ImportDecl::new(n.module_path, n.style);
@@ -952,7 +963,7 @@ type struct ASTCloner {
             }
         }
         for (mut i: i64 = 0; i < node.fields.length; i++) {
-            c.add_field(this.clone_field_decl(node.fields[i]));
+            c.add_field(this.copy_decl_shape(node.fields[i]));
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             c.add_method(this.dispatch_node(node.methods[i]) as MethodNode*);
@@ -986,7 +997,7 @@ type struct ASTCloner {
             }
         }
         for (mut i: i64 = 0; i < node.fields.length; i++) {
-            c.add_field(this.clone_field_decl(node.fields[i]));
+            c.add_field(this.copy_decl_shape(node.fields[i]));
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             c.add_method(this.dispatch_node(node.methods[i]) as MethodNode*);
@@ -1015,7 +1026,7 @@ type struct ASTCloner {
             }
         }
         for (mut i: i64 = 0; i < node.fields.length; i++) {
-            c.add_field(this.clone_field_decl(node.fields[i]));
+            c.add_field(this.copy_decl_shape(node.fields[i]));
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             c.add_method(this.dispatch_node(node.methods[i]) as MethodNode*);
@@ -1114,10 +1125,6 @@ type struct ASTCloner {
         return c;
     }
 
-    visit_field(mut &this, node: FieldDeclNode*) -> ASTNode* {
-        const c: FieldDeclNode* = this.clone_field_decl(node);
-        return c;
-    }
 
     visit_generic_param(mut &this, node: GenericParamNode*) -> ASTNode* {
         const c: GenericParamNode* = this.clone_generic_param(node);
@@ -1299,21 +1306,6 @@ type struct ASTCloner {
             c.set_body(this.copy_stmt(node.body));
         }
         // resolved_return_type left as TypeRef::invalid() (constructor default)
-        return c;
-    }
-
-    /// Clone a FieldDeclNode.
-    clone_field_decl(mut &this, node: FieldDeclNode*) -> FieldDeclNode* {
-        mut c: FieldDeclNode* = new FieldDeclNode(node.name, node.span);
-        this.copy_decl_base(node, c);
-        c.visibility = node.visibility;
-        if (node.has_default_value()) {
-            c.set_default_value(this.clone_expr(node.default_value));
-        }
-        if (node.has_type_annotation()) {
-            c.set_type_annotation(this.clone_type_annotation(node.type_annotation));
-        }
-        // resolved_type left as TypeRef::invalid() (constructor default)
         return c;
     }
 

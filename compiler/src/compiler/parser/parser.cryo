@@ -38,7 +38,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
-    DestructureDecl, EnumDeclNode, EnumVariant, ExternBlock, FieldDeclNode,
+    DestructureDecl, EnumDeclNode, EnumVariant, ExternBlock, FieldDecl,
     FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDecl,
     IntrinsicConstDecl, IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDeclNode,
@@ -1247,7 +1247,7 @@ implement struct Parser {
             // continue'd past this point, so directives placed between
             // labels and members reach this drain.  If the next thing
             // turns out to be a field, the directives are still attached
-            // (FieldDeclNode is a DeclarationNode); the directive_
+            // (a field is a declaration); the directive_
             // processing pass will surface a placement error if the
             // directive isn't valid on a field.
             mut pending_dirs: [DirectiveNode*] = [];
@@ -1408,9 +1408,9 @@ implement struct Parser {
                             "only a method can be `async`; a field holds a value, not a computation to suspend",
                             member_modifier_span);
                     }
-                    const field: FieldDeclNode* = this.parse_field_declaration();
+                    const field: DeclarationNode* = this.parse_field_declaration();
                     if (field != null) {
-                        field.set_visibility(member_visibility);
+                        DeclarationNode::field_of(field).visibility = member_visibility;
                         if (doc != "") { field.set_documentation(doc); }
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                             field.add_directive(pending_dirs[pi]);
@@ -1622,22 +1622,20 @@ implement struct Parser {
     }
 
     /// Parse a field declaration: name: Type [= default];
-    parse_field_declaration() -> FieldDeclNode* {
+    parse_field_declaration() -> DeclarationNode* {
         const start: Token = this.current();
         const name_tok: Token = this.advance(); // consume field name
-        const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut field: FieldDeclNode* = new FieldDeclNode(name, this.span_from_token(start));
+        const f: FieldDecl* = FieldDecl::new(this.intern_lexeme(name_tok));
+        mut field: DeclarationNode* = DeclarationNode::of(DeclKind::Field(f), this.span_from_token(start));
         field.set_name_span(this.span_from_token(name_tok));
 
         // Type annotation
         this.consume(TokenType::Colon, "':'");
-        const type_ann: TypeAnnotation* = this.parse_type_annotation();
-        field.set_type_annotation(type_ann);
+        f.type_annotation = this.parse_type_annotation();
 
         // Optional default value
         if (this.match_tok(TokenType::Equal)) {
-            const default_val: ExpressionNode* = this.parse_expression();
-            field.set_default_value(default_val);
+            f.default_value = this.parse_expression();
         }
 
         this.consume(TokenType::Semicolon, "';'");

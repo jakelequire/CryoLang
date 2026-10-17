@@ -1486,6 +1486,27 @@ committed with the change and deleted in the next commit.
   through a function-type alias, an operator on a call returning an
   alias, and a struct literal through a generic alias reported as a
   mismatch instead of E0233.
+- `Field(FieldDecl*)` followed.  A struct's, union's or class's `fields`
+  hold the headers (`[DeclarationNode*]`), read through
+  `DeclarationNode::field_of`, the projection `variant_of` is for a
+  variant: a field carries a span, a name span, documentation and
+  directives.  Where a loop took a field apart it now holds both, the
+  header for spans and directives and the payload for the rest; a field is
+  walked, dumped, substituted and cloned through its shape arm, and the
+  cloner copies it in `copy_decl_shape` as it does a variant.  The
+  locator's `pick_array_field` was `pick_array_decl` over another element
+  type and is gone; the language server's `Members::field_decl` returns
+  the header, as `variant_decl` does.  A one-off codemod
+  (`scripts/field-codemod.py`) rewrote the element loads, the field-list
+  parameters and the imports; the header reads it left behind were the
+  type check's to point at.
+- The cloner's partial copies of an intrinsic, an import and an extern
+  block are never exercised: an assertion in each of the three arms
+  passed verify whole (tests, examples, the language server and the cross
+  build, which compile the compiler's own source), and the same assertion
+  in the variant arm fires at once.  The cloner is entered only through a
+  template, an impl block, an async parameter and a lambda, and none
+  holds those kinds.
 - Left: the type declarations and functions.
 - `NodeKind::is_declaration` answers true for `Declaration`.  A module
   declaration was outside its list; the two callers read `name_span`,
