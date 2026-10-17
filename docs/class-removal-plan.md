@@ -1415,6 +1415,17 @@ committed with the change and deleted in the next commit.
   reads.  The cloner leaves an import's path segments and private export
   entries uncopied, as before.  Control: a dumper with the `ImportDecl`
   label changed differs on all 164 files of `tests/tests/lang`.
+- `Variant(EnumVariant*)` followed.  An enum's `variants` holds the
+  headers (`[DeclarationNode*]`, a slot may be null), since a variant
+  carries a span, a name span, documentation and directives, and is read
+  through `DeclarationNode::variant_of`, the projection a holder whose
+  element kind is fixed uses, as `Stmt::as_block` is for blocks.  The
+  locator's `pick_array_variant` became `pick_array_decl`; the language
+  server's `Members::variant_decl` returns the header.  Everywhere a
+  variant reached a dispatch on its own it was a no-op (it is declared,
+  checked and emitted with its enum), and stays one.  Control: a dumper
+  with the `EnumVariant` label changed differs on all 164 files of
+  `tests/tests/lang`.
 - `NodeKind::is_declaration` answers true for `Declaration`.  A module
   declaration was outside its list; the two callers read `name_span`,
   which the parser never sets on a module declaration, so they answer as

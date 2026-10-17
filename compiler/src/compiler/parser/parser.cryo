@@ -38,7 +38,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
-    DestructureDeclNode, EnumDeclNode, EnumVariantNode, ExternBlockNode, FieldDeclNode,
+    DestructureDeclNode, EnumDeclNode, EnumVariant, ExternBlockNode, FieldDeclNode,
     FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDecl,
     IntrinsicConstDecl, IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDeclNode,
@@ -1695,7 +1695,7 @@ implement struct Parser {
             if (this.check(TokenType::RBrace)) { break; }
             const doc: string = this.take_documentation();
 
-            const variant: EnumVariantNode* = this.parse_enum_variant();
+            const variant: DeclarationNode* = this.parse_enum_variant();
             if (variant != null) {
                 if (doc != "") { variant.set_documentation(doc); }
                 node.add_variant(variant);
@@ -1715,12 +1715,11 @@ implement struct Parser {
     }
 
     /// Parse an enum variant: Name; or Name(Type); or Name = value;
-    parse_enum_variant() -> EnumVariantNode* {
+    parse_enum_variant() -> DeclarationNode* {
         const start: Token = this.current();
         const name_tok: Token = this.consume(TokenType::Identifier, "variant name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut variant: EnumVariantNode* = new EnumVariantNode(name, this.span_from_token(start));
-        variant.set_name_span(this.span_from_token(name_tok));
+        const variant: EnumVariant* = EnumVariant::new(name);
 
         // Associated types: Variant(Type1, Type2)
         // Uses parse_type_annotation() so generics, pointers, arrays, etc.
@@ -1730,7 +1729,7 @@ implement struct Parser {
             while (!this.check(TokenType::RParen) && !this.is_at_end()) {
                 const ann: TypeAnnotation* = this.parse_type_annotation();
                 if (ann != null) {
-                    variant.add_associated_type(ann);
+                    variant.associated_types.push(ann);
                 }
                 if (!this.match_tok(TokenType::Comma)) { break; }
             }
@@ -1755,8 +1754,9 @@ implement struct Parser {
         }
 
         this.consume(TokenType::Semicolon, "';'");
-        variant.span = this.span_from(start);
-        return variant;
+        const d: DeclarationNode* = DeclarationNode::of(DeclKind::Variant(variant), this.span_from(start));
+        d.set_name_span(this.span_from_token(name_tok));
+        return d;
     }
 
     /// Parse a trait declaration: type trait Name<T> [: Base] { methods }

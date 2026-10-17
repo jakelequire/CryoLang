@@ -96,6 +96,16 @@ public:
         };
     }
 
+    /// The enum variant `d` is; null for a null slot.  An enum's variant
+    /// list holds nothing else.
+    static variant_of(d: DeclarationNode*) -> EnumVariant* {
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Variant(v) => { v }
+            _                    => { null }
+        };
+    }
+
     /// The import (or export) declaration `n` is, or null.
     static import_of(n: ASTNode*) -> ImportDecl* {
         const d: DeclarationNode* = DeclarationNode::with_shape(n);
@@ -740,6 +750,7 @@ type enum DeclKind {
     Intrinsic(IntrinsicDecl*);
     IntrinsicConst(IntrinsicConstDecl*);
     Module(ModuleDecl*);
+    Variant(EnumVariant*);
 }
 
 
@@ -1387,7 +1398,9 @@ type class EnumDeclNode : DeclarationNode {
 public:
     name:           SymbolStr;
     generic_params: [GenericParamNode*];
-    variants:       [EnumVariantNode*];
+    /// Each a declaration whose shape is `DeclKind::Variant`, read through
+    /// `DeclarationNode::variant_of`; a slot may be null.
+    variants:       [DeclarationNode*];
     /// Optional explicit discriminant type: `type enum Foo : i32 { ... }`.
     /// Null when omitted (the default integer width applies). Used by FFI
     /// enums that must round-trip through a specific C ABI width.
@@ -1436,7 +1449,7 @@ public:
         this.generic_params.push(param);
     }
 
-    add_variant(variant: EnumVariantNode*) -> void {
+    add_variant(variant: DeclarationNode*) -> void {
         this.variants.push(variant);
     }
 
@@ -1453,7 +1466,7 @@ public:
     /// The position of the first declared variant named `leaf`, or -1.
     variant_position(&this, leaf: SymbolStr) -> i64 {
         for (mut i: i64 = 0; i < this.variants.length; i++) {
-            const v: EnumVariantNode* = this.variants[i];
+            const v: EnumVariant* = DeclarationNode::variant_of(this.variants[i]);
             if (v != null && v.name.id == leaf.id) {
                 return i;
             }
@@ -1475,7 +1488,7 @@ public:
         mut tags: [i64] = [];
         mut next_tag: i64 = 0;
         for (mut i: i64 = 0; i < this.variants.length; i++) {
-            const v: EnumVariantNode* = this.variants[i];
+            const v: EnumVariant* = DeclarationNode::variant_of(this.variants[i]);
             if (v == null) { tags.push(0); continue; }
             mut tag: i64 = next_tag;
             if (v.has_value) { tag = v.explicit_value; }
@@ -1487,28 +1500,31 @@ public:
 }
 
 
-type class EnumVariantNode : DeclarationNode {
-public:
+/// One variant of an enum: `V`, `V(T, U)`, `V = 4`.
+type struct EnumVariant {
     name:             SymbolStr;
     associated_types: [TypeAnnotation*];
     explicit_value:   i64;
     has_value:        boolean;
 
-    EnumVariantNode(name: SymbolStr, span: SourceSpan)
-        : DeclarationNode(NodeKind::EnumVariant, span) {
-        this.name             = name;
-        this.associated_types = [];
-        this.explicit_value   = 0;
-        this.has_value        = false;
+    static new(name: SymbolStr) -> EnumVariant* {
+        return new EnumVariant {
+            name:             name,
+            associated_types: [],
+            explicit_value:   0,
+            has_value:        false,
+        };
     }
 
-    add_associated_type(t: TypeAnnotation*) -> void {
-        this.associated_types.push(t);
-    }
-
-    set_explicit_value(v: i64) -> void {
+    set_explicit_value(mut &this, v: i64) -> void {
         this.explicit_value = v;
         this.has_value      = true;
+    }
+}
+
+implement trait Allocate for struct EnumVariant {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

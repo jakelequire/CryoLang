@@ -24,7 +24,7 @@ import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDeclNode, EnumDeclNode,
-    EnumVariantNode, ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode,
+    EnumVariant, ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode,
     DeclKind, ImplBlockNode, ImportDecl, IntrinsicConstDecl, IntrinsicDecl, MethodNode,
     ModuleDecl, StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode,
     VarDeclNode
@@ -156,7 +156,6 @@ type struct ASTCloner {
             NodeKind::TraitDeclaration          => { return this.visit_trait(n as TraitDeclNode*); }
             NodeKind::TypeAliasDeclaration      => { return this.visit_type_alias(n as TypeAliasDeclNode*); }
             NodeKind::EnumDeclaration           => { return this.visit_enum(n as EnumDeclNode*); }
-            NodeKind::EnumVariant               => { return this.visit_enum_variant(n as EnumVariantNode*); }
             NodeKind::ImplementationBlock       => { return this.visit_impl(n as ImplBlockNode*); }
             NodeKind::ExternBlock               => { return this.visit_extern_block(n as ExternBlockNode*); }
             NodeKind::FieldDeclaration          => { return this.visit_field(n as FieldDeclNode*); }
@@ -895,6 +894,16 @@ type struct ASTCloner {
                 DeclKind::IntrinsicConst(ic)
             }
             DeclKind::Module(n) => { DeclKind::Module(ModuleDecl::new(n.path, n.is_public)) }
+            DeclKind::Variant(n) => {
+                const c: EnumVariant* = EnumVariant::new(n.name);
+                // Deep-clone type annotations (not shallow copy)
+                for (mut i: i64 = 0; i < n.associated_types.length; i++) {
+                    c.associated_types.push(this.clone_type_annotation(n.associated_types[i]));
+                }
+                c.explicit_value = n.explicit_value;
+                c.has_value      = n.has_value;
+                DeclKind::Variant(c)
+            }
             // Built with its own `NodeKind`, which `dispatch_node` copies.
             DeclKind::Legacy => { unreachable() }
         };
@@ -1046,13 +1055,8 @@ type struct ASTCloner {
             c.set_discriminant_annotation(this.clone_type_annotation(node.discriminant_annotation));
         }
         for (mut i: i64 = 0; i < node.variants.length; i++) {
-            c.add_variant(this.clone_enum_variant(node.variants[i]));
+            c.add_variant(this.copy_decl_shape(node.variants[i]));
         }
-        return c;
-    }
-
-    visit_enum_variant(mut &this, node: EnumVariantNode*) -> ASTNode* {
-        mut c: EnumVariantNode* = this.clone_enum_variant(node);
         return c;
     }
 
@@ -1328,19 +1332,6 @@ type struct ASTCloner {
         if (node.default_annotation != null) {
             c.set_default_annotation(this.clone_type_annotation(node.default_annotation));
         }
-        return c;
-    }
-
-    /// Clone an EnumVariantNode.
-    clone_enum_variant(mut &this, node: EnumVariantNode*) -> EnumVariantNode* {
-        mut c: EnumVariantNode* = new EnumVariantNode(node.name, node.span);
-        this.copy_decl_base(node, c);
-        // Deep-clone type annotations (not shallow copy)
-        for (mut i: i64 = 0; i < node.associated_types.length; i++) {
-            c.add_associated_type(this.clone_type_annotation(node.associated_types[i]));
-        }
-        c.explicit_value   = node.explicit_value;
-        c.has_value        = node.has_value;
         return c;
     }
 
