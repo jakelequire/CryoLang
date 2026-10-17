@@ -1,11 +1,11 @@
 /// Pattern Emitter
 ///
 /// Match-arm / pattern lowering: enum-subject normalisation, payload
-/// binding, per-arm comparison chain emission, and pattern-value
+/// binding, per-arm tests and switch case values, and pattern-value
 /// lowering (literal, identifier, enum-tag).  Shared by the `match`
 /// statement (`visit(MatchStmtNode*)`) and the `match` expression
 /// (`visit(MatchExprNode*)`); both pass through `prepare_match_subject`
-/// + `emit_match_arm_comparison` + `bind_arm_enum_payloads`.
+/// + `IRGeneratorVisitor::emit_match_dispatch` + `bind_arm_enum_payloads`.
 ///
 /// Held by IRGeneratorVisitor (not by CodegenContext), so this module
 /// can safely import `compiler::codegen::context` and hold the context
@@ -532,6 +532,84 @@ type struct PatternEmitter {
         if (tail.is_valid() && !tail.has_terminator()) {
             this.cg.builder.build_br(next_bb);
         }
+    }
+
+    // Switch dispatch
+
+    /// The integer a `switch` over this subject dispatches on: an enum's
+    /// tag, or an integer-typed subject itself (a character or boolean
+    /// included).  Null when the subject has no such value, a string
+    /// among them.
+    switch_condition(mut &this, minfo: MatchSubjectInfo, subject: LValue,
+                     is_string_subj: boolean) -> LValue {
+        if (minfo.enum_type != null) { return minfo.tag_val; }
+        if (is_string_subj || !subject.is_valid()) { return LValue::null(); }
+        if (LType::kind_of(llvm::LLVMTypeOf(subject.raw)) != LTypeKind::Integer) {
+            return LValue::null();
+        }
+        return subject;
+    }
+
+    /// True when one of the arm's patterns takes every value.
+    static arm_takes_all(arm: MatchArmNode*) -> boolean {
+        for (mut p: i64 = 0; p < arm.patterns.length; p++) {
+            const pat: Pattern* = arm.patterns[p];
+            if (pat != null && pat.is_irrefutable()) { return true; }
+        }
+        return false;
+    }
+
+    /// True when every pattern of the arm is irrefutable or has a case
+    /// value (`switch_case_value`), so the arm can be a `switch` case.
+    arm_is_switchable(mut &this, arm: MatchArmNode*, minfo: MatchSubjectInfo,
+                      subject: LValue, cond: LValue) -> boolean {
+        if (arm.patterns.length == 0) { return false; }
+        for (mut p: i64 = 0; p < arm.patterns.length; p++) {
+            const pat: Pattern* = arm.patterns[p];
+            if (pat == null) { return false; }
+            if (pat.is_irrefutable()) { continue; }
+            if (!this.switch_case_value(pat, minfo, subject, cond).is_valid()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// The constant a pattern matches, at the type of `cond`: an enum
+    /// pattern's tag when its payload needs no test of its own, or an
+    /// integer, character or boolean literal at the subject's width.  The
+    /// value is the one `emit_match_arm_comparison` compares against.
+    /// Null for any other pattern.
+    switch_case_value(mut &this, pat: Pattern*, minfo: MatchSubjectInfo,
+                      subject: LValue, cond: LValue) -> LValue {
+        mut v: LValue = LValue::null();
+        match (pat.shape) {
+            PatternKind::Enum(epat) => {
+                if (minfo.enum_type != null && minfo.tag_val.is_valid()
+                        && !this.enum_pattern_needs_payload_test(epat)) {
+                    const variant: EnumVariantInfo* =
+                        CodegenUtil::pinned_variant(minfo.enum_type, epat.resolved_member);
+                    if (variant != null) {
+                        v = LType::const_int(this.cg.type_mapper.enum_tag_ltype(minfo.enum_type),
+                                             variant.tag_value, false);
+                    }
+                }
+            }
+            PatternKind::Literal(lit) => {
+                if (minfo.enum_type == null) {
+                    const raw: LValue = this.lower_scalar_literal(
+                        this.cg.get_intern().resolve(lit.value), lit.literal_kind,
+                        minfo.subject_ty);
+                    if (raw.is_valid()) {
+                        v = this.cg.expr_ops.coerce_icmp_operands(subject, raw, minfo.subject_ty);
+                    }
+                }
+            }
+            _ => { }
+        }
+        if (!v.is_valid() || llvm::LLVMIsConstant(v.raw) == 0) { return LValue::null(); }
+        if (llvm::LLVMTypeOf(v.raw) != llvm::LLVMTypeOf(cond.raw)) { return LValue::null(); }
+        return v;
     }
 
     /// True when an enum pattern's payload requires a value/tag check beyond

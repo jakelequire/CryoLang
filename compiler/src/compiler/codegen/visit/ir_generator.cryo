@@ -57,7 +57,7 @@ import compiler::ast::expression::{
     YieldExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
-import compiler::ast::pattern::{ MatchArmNode };
+import compiler::ast::pattern::{ MatchArmNode, Pattern };
 import compiler::ast::statement::{
     AsmBlockStmtNode, AsmConstraintKind, AsmDialect, AsmOpDir, AsmOperand, AsmPiece,
     BlockStmtNode, BreakStmtNode, ContinueStmtNode, DeclStmtNode, DoWhileStmtNode,
@@ -116,7 +116,7 @@ type struct IRGeneratorVisitor {
     dispatch: ExprDispatch;
 
     /// Match / pattern lowering (subject prep, payload binding, per-arm
-    /// comparison chain, pattern-value lowering).  Holds `cg: CodegenContext*`
+    /// tests, switch cases, pattern-value lowering).  Holds `cg: CodegenContext*`
     /// set by `wire()` below.
     patterns: PatternEmitter;
 
@@ -827,7 +827,7 @@ type struct IRGeneratorVisitor {
         const num_arms: i64 = node.arms.length;
 
         // Create basic blocks: one per arm, a dedicated no_match block, and a merge.
-        // no_match_bb is the terminus of the comparison chain when no arm fires;
+        // no_match_bb is where the dispatch goes when no arm fires;
         // it gets `unreachable` so a runtime discriminant outside the matched
         // set traps cleanly instead of falling through into the next function
         // in the binary (which is what bug-in-the-wild triggered when a garbage
@@ -840,41 +840,8 @@ type struct IRGeneratorVisitor {
         const no_match_bb: LBasicBlock = LBasicBlock::append(current_fn, "match.no_match");
         const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "match.end");
 
-        // Generate the comparison chain.
-        // For each arm, compare subject against the pattern(s).
-        // Wildcard (_) matches unconditionally; branch directly.
-        for (mut i: i64 = 0; i < num_arms; i++) {
-            const arm: MatchArmNode* = node.arms[i];
-            if (arm == null) { continue; }
-
-            // Determine the next block to fall through to if this arm doesn't match.
-            // The last arm's "no match" edge points at no_match_bb so non-matching
-            // discriminants hit `unreachable` rather than the post-match join.
-            mut next_bb: LBasicBlock = no_match_bb;
-            if (i + 1 < num_arms) {
-                next_bb = LBasicBlock::append(current_fn, fmt::format("match.test%lld", i + 1));
-            }
-
-            // Emit the OR-pattern comparison chain for this arm.  A hit on
-            // any pattern branches to arm_bbs[i] (or, for a guarded arm, to a
-            // guard block that re-checks the condition before committing); a
-            // full miss falls through to next_bb.
-            if (arm.guard != null) {
-                const guard_bb: LBasicBlock = LBasicBlock::append(current_fn,
-                    fmt::format("match.guard%lld", i));
-                this.patterns.emit_match_arm_comparison(arm, guard_bb, next_bb,
-                    minfo, is_string_subj, subject, current_fn, "match");
-                this.emit_guard_block(arm, guard_bb, arm_bbs[i], next_bb, minfo);
-            } else {
-                this.patterns.emit_match_arm_comparison(arm, arm_bbs[i], next_bb,
-                    minfo, is_string_subj, subject, current_fn, "match");
-            }
-
-            // Position at next_bb for the next test (if not the last arm).
-            if (i + 1 < num_arms) {
-                this.cg.builder.position_at_end(next_bb);
-            }
-        }
+        this.emit_match_dispatch(&node.arms, &arm_bbs, no_match_bb, minfo,
+            is_string_subj, subject, current_fn, "match");
 
         // Generate each arm's body.
         mut any_arm_falls_through: boolean = false;
@@ -934,7 +901,140 @@ type struct IRGeneratorVisitor {
         return out;
     }
 
-    /// Emit a pattern-guard test block. The comparison chain branches here
+    /// Emit the dispatch from the current block to the arm that matches,
+    /// arm `i` landing in `arm_bbs[i]` and a subject no arm takes in
+    /// `no_match_bb`.  Arms are taken in runs: a run of arms whose every
+    /// pattern is a constant (an enum tag with no payload test, an integer,
+    /// character or boolean literal) or irrefutable becomes one `switch`,
+    /// so finding the arm costs one jump whatever the arm count; any other
+    /// arm is tested on its own by `emit_match_arm_comparison`.  A run ends
+    /// after an arm with a guard, whose failure must go on to test every
+    /// later arm, and after an irrefutable pattern, which takes every value
+    /// left and so is the switch's default.  A value repeated in a later
+    /// arm is left out of the switch: the first arm that names it wins, as
+    /// it does in a chain of compares.  `name_prefix` names the
+    /// synthesised blocks ("match" for statements, "mexpr" for
+    /// expressions).
+    emit_match_dispatch(mut &this, arms: &[MatchArmNode*], arm_bbs: &[LBasicBlock],
+                        no_match_bb: LBasicBlock, minfo: MatchSubjectInfo,
+                        is_string_subj: boolean, subject: LValue,
+                        current_fn: LValue, name_prefix: string) -> void {
+        const num_arms: i64 = arms.length;
+        const cond: LValue = this.patterns.switch_condition(minfo, subject, is_string_subj);
+        mut i: i64 = 0;
+        while (i < num_arms) {
+            const arm: MatchArmNode* = arms[i];
+            if (arm == null) { i += 1; continue; }
+
+            // The run of switchable arms starting at `i` ends at `run_end`
+            // (exclusive); `catch_all` is the arm whose irrefutable pattern
+            // ends it, or -1.
+            mut run_end: i64 = i;
+            mut catch_all: i64 = -1;
+            if (cond.is_valid()) {
+                while (run_end < num_arms) {
+                    const ra: MatchArmNode* = arms[run_end];
+                    if (ra == null) { run_end += 1; continue; }
+                    if (!this.patterns.arm_is_switchable(ra, minfo, subject, cond)) { break; }
+                    run_end += 1;
+                    if (PatternEmitter::arm_takes_all(ra)) { catch_all = run_end - 1; break; }
+                    if (ra.guard != null) { break; }
+                }
+            }
+            // An unguarded catch-all leaves no value for a later arm.
+            const ends_all: boolean = catch_all >= 0 && arms[catch_all].guard == null;
+
+            // Where control goes when arms `i..run_end` (or arm `i` alone)
+            // do not take the subject: the next arm's test, or the trap.
+            const after: i64 = if (run_end > i) { run_end } else { i + 1 };
+            mut next_bb: LBasicBlock = no_match_bb;
+            if (after < num_arms && !ends_all) {
+                next_bb = LBasicBlock::append(current_fn,
+                    fmt::format("%s.test%lld", name_prefix, after));
+            }
+
+            if (run_end > i) {
+                this.emit_switch_run(arms, arm_bbs, i, run_end, catch_all, next_bb,
+                                     minfo, subject, cond, current_fn, name_prefix);
+                if (ends_all) { return; }
+            } else if (arm.guard != null) {
+                const guard_bb: LBasicBlock = LBasicBlock::append(current_fn,
+                    fmt::format("%s.guard%lld", name_prefix, i));
+                this.patterns.emit_match_arm_comparison(arm, guard_bb, next_bb,
+                    minfo, is_string_subj, subject, current_fn, name_prefix);
+                this.emit_guard_block(arm, guard_bb, arm_bbs[i], next_bb, minfo);
+            } else {
+                this.patterns.emit_match_arm_comparison(arm, arm_bbs[i], next_bb,
+                    minfo, is_string_subj, subject, current_fn, name_prefix);
+            }
+
+            if (after < num_arms) {
+                this.cg.builder.position_at_end(next_bb);
+            }
+            i = after;
+        }
+    }
+
+    /// Emit one `switch` over arms `first..end` (see `emit_match_dispatch`).
+    /// A guarded arm's values go to its guard block, whose failure goes to
+    /// `next_bb`; the switch's default is the catch-all arm (or its guard)
+    /// when `catch_all` names one, else `next_bb`.
+    emit_switch_run(mut &this, arms: &[MatchArmNode*], arm_bbs: &[LBasicBlock],
+                    first: i64, end: i64, catch_all: i64, next_bb: LBasicBlock,
+                    minfo: MatchSubjectInfo, subject: LValue, cond: LValue,
+                    current_fn: LValue, name_prefix: string) -> void {
+        // Each arm's entry: its body, or the guard block that tests first.
+        mut entries: [LBasicBlock] = [];
+        for (mut k: i64 = first; k < end; k++) {
+            const arm: MatchArmNode* = arms[k];
+            mut entry: LBasicBlock = arm_bbs[k];
+            if (arm != null && arm.guard != null) {
+                entry = LBasicBlock::append(current_fn,
+                    fmt::format("%s.guard%lld", name_prefix, k));
+            }
+            entries.push(entry);
+        }
+
+        mut default_bb: LBasicBlock = next_bb;
+        if (catch_all >= 0) { default_bb = entries[catch_all - first]; }
+
+        mut values: [LValue] = [];
+        mut targets: [LBasicBlock] = [];
+        for (mut k: i64 = first; k < end; k++) {
+            const arm: MatchArmNode* = arms[k];
+            if (arm == null) { continue; }
+            for (mut p: i64 = 0; p < arm.patterns.length; p++) {
+                const pat: Pattern* = arm.patterns[p];
+                if (pat == null || pat.is_irrefutable()) { continue; }
+                const v: LValue = this.patterns.switch_case_value(pat, minfo, subject, cond);
+                mut seen: boolean = false;
+                for (mut s: i64 = 0; s < values.length; s++) {
+                    if (values[s].raw == v.raw) { seen = true; break; }
+                }
+                if (seen) { continue; }
+                values.push(v);
+                targets.push(entries[k - first]);
+            }
+        }
+
+        if (values.length == 0) {
+            this.cg.builder.build_br(default_bb);
+        } else {
+            const sw: LValue = this.cg.builder.build_switch(cond, default_bb, values.length as u32);
+            for (mut c: i64 = 0; c < values.length; c++) {
+                sw.add_case(values[c], targets[c]);
+            }
+        }
+
+        for (mut k: i64 = first; k < end; k++) {
+            const arm: MatchArmNode* = arms[k];
+            if (arm != null && arm.guard != null) {
+                this.emit_guard_block(arm, entries[k - first], arm_bbs[k], next_bb, minfo);
+            }
+        }
+    }
+
+    /// Emit a pattern-guard test block. The arm dispatch branches here
     /// when the arm's pattern(s) matched; we bind the pattern payloads,
     /// evaluate the guard with those bindings in scope, then branch to
     /// `body_bb` when the guard holds or `next_bb` (the next arm's test, or
@@ -1754,7 +1854,7 @@ type struct IRGeneratorVisitor {
     }
 
     /// Match expression: produces a value via phi node.
-    /// Same comparison chain as visit_match_stmt, but each arm evaluates
+    /// Same arm dispatch as visit_match_stmt, but each arm evaluates
     /// to a value and the merge block collects them with a phi.
     /// Static match used as an expression. The monomorphizer reduced it to a
     /// single live arm, so there is no discriminant, no per-arm basic blocks,
@@ -1835,34 +1935,8 @@ type struct IRGeneratorVisitor {
         const default_bb: LBasicBlock = LBasicBlock::append(current_fn, "mexpr.no_match");
         const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "mexpr.end");
 
-        // Comparison chain, same as visit_match_stmt.
-        for (mut i: i64 = 0; i < num_arms; i++) {
-            const arm: MatchArmNode* = node.arms[i];
-            if (arm == null) { continue; }
-
-            mut next_bb: LBasicBlock = default_bb;
-            if (i + 1 < num_arms) {
-                next_bb = LBasicBlock::append(current_fn, fmt::format("mexpr.test%lld", i + 1));
-            }
-
-            // Emit the OR-pattern comparison chain for this arm (see
-            // visit(MatchStmtNode*); identical lowering, "mexpr" prefix).
-            // Guarded arms route a pattern hit through a guard block first.
-            if (arm.guard != null) {
-                const guard_bb: LBasicBlock = LBasicBlock::append(current_fn,
-                    fmt::format("mexpr.guard%lld", i));
-                this.patterns.emit_match_arm_comparison(arm, guard_bb, next_bb,
-                    minfo, is_string_subj_e, subject, current_fn, "mexpr");
-                this.emit_guard_block(arm, guard_bb, arm_bbs[i], next_bb, minfo);
-            } else {
-                this.patterns.emit_match_arm_comparison(arm, arm_bbs[i], next_bb,
-                    minfo, is_string_subj_e, subject, current_fn, "mexpr");
-            }
-
-            if (i + 1 < num_arms) {
-                this.cg.builder.position_at_end(next_bb);
-            }
-        }
+        this.emit_match_dispatch(&node.arms, &arm_bbs, default_bb, minfo,
+            is_string_subj_e, subject, current_fn, "mexpr");
 
         // Generate arm bodies and collect values + end blocks for phi.
         // Allocate num_arms + 1 for the default block entry.

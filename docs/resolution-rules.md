@@ -216,6 +216,26 @@ yet is recorded with the change that builds it, not here.
      methods need is a `where` on those methods, which works inline on a
      generic struct.  (Jake)
 
+398. **A `match` whose arms test constants dispatches through one
+     `switch`,** built as its own change ahead of deriving `TypeKind`
+     (ruling 390), which then follows.  Every object with such a `match`
+     moves, so verify is re-baselined on it.  (Jake)
+
+399. **A method's name read as a field is refused by the type check with
+     E0204,** with a help line naming the call: "`kind` is a method; call
+     it: `t.kind()`".  (Jake)
+
+400. **The stamp checker's planting test switch plants a name of any
+     kind,** not only an identifier, and the enum-pattern check has a
+     committed test through it.  (Jake)
+
+401. **`??` and `for` accept only the language's `Option`;** a program's
+     own enum spelled like it is refused (E0200).  (Jake)
+
+402. **Statements convert as the class-removal plan designs them,** with
+     the node split's memory cost (about 3% of the arena) accepted.
+     (Jake)
+
 ### 2026-10-15
 
 347. **Fixed-size arrays change syntax with dynamic ones:** `T[N]` is
