@@ -96,6 +96,16 @@ public:
         };
     }
 
+    /// The import (or export) declaration `n` is, or null.
+    static import_of(n: ASTNode*) -> ImportDecl* {
+        const d: DeclarationNode* = DeclarationNode::with_shape(n);
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Import(i) => { i }
+            _                   => { null }
+        };
+    }
+
     has_name_span() -> boolean     { return this.name_span.has_location(); }
 
     set_documentation(doc_text: string) -> void  { const doc: string = doc_text; this.documentation = doc; }
@@ -726,6 +736,7 @@ public:
 /// `DeclarationNode`; it goes when the last kind converts.
 type enum DeclKind {
     Legacy;
+    Import(ImportDecl*);
     Intrinsic(IntrinsicDecl*);
     IntrinsicConst(IntrinsicConstDecl*);
     Module(ModuleDecl*);
@@ -811,8 +822,9 @@ implement trait Allocate for struct IntrinsicConstDecl {
 }
 
 
-type class ImportDeclNode : DeclarationNode {
-public:
+/// `import M;`, `import M::{ a, b as c };`, `import M::*;`, `import A::B as
+/// C;`, and the same forms written `export`.
+type struct ImportDecl {
     /// The module path as written (`compiler::ast`): a spelling, which the
     /// name layer turns into the module it names.
     module_path:      SymbolStr;
@@ -878,30 +890,29 @@ public:
     /// module the graph holds (refused there).
     resolved_module: ModulePath;
 
-    ImportDeclNode(module_path: SymbolStr, style: ImportStyle, span: SourceSpan)
-        : DeclarationNode(NodeKind::ImportDeclaration, span) {
-        this.module_path        = module_path;
-        this.alias              = SymbolStr::empty();
-        this.specific_imports   = [];
-        this.specific_aliases   = [];
-        this.specific_spans     = [];
-        this.specific_alias_spans = [];
-        this.specific_defs      = [];
-        this.specific_def_entries = [];
-        this.style              = style;
-        this.path_segments      = [];
-        this.path_segment_spans = [];
-        this.is_export          = false;
-        this.path_entry         = false;
-        this.private_export_entries = [];
-        this.resolved_module    = ModulePath::none();
+    static new(module_path: SymbolStr, style: ImportStyle) -> ImportDecl* {
+        return new ImportDecl {
+            module_path:            module_path,
+            alias:                  SymbolStr::empty(),
+            specific_imports:       [],
+            specific_aliases:       [],
+            specific_spans:         [],
+            specific_alias_spans:   [],
+            specific_defs:          [],
+            specific_def_entries:   [],
+            style:                  style,
+            path_segments:          [],
+            path_segment_spans:     [],
+            is_export:              false,
+            path_entry:             false,
+            private_export_entries: [],
+            resolved_module:        ModulePath::none(),
+        };
     }
 
-    has_alias() -> boolean { return !this.alias.is_empty(); }
+    has_alias(&this) -> boolean { return !this.alias.is_empty(); }
 
-    set_alias(a: SymbolStr) -> void { this.alias = a; }
-
-    add_specific_import(name: SymbolStr, alias: SymbolStr,
+    add_specific_import(mut &this, name: SymbolStr, alias: SymbolStr,
                         span: SourceSpan, alias_span: SourceSpan) -> void {
         this.specific_imports.push(name);
         this.specific_aliases.push(alias);
@@ -910,14 +921,20 @@ public:
     }
 
     /// Records that the entry at `entry` names `def`.
-    add_entry_def(entry: i64, def: DefId) -> void {
+    add_entry_def(mut &this, entry: i64, def: DefId) -> void {
         this.specific_defs.push(def);
         this.specific_def_entries.push(entry);
     }
 
-    add_path_segment(name: SymbolStr, span: SourceSpan) -> void {
+    add_path_segment(mut &this, name: SymbolStr, span: SourceSpan) -> void {
         this.path_segments.push(name);
         this.path_segment_spans.push(span);
+    }
+}
+
+implement trait Allocate for struct ImportDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -928,7 +945,7 @@ type struct ModuleDecl {
     path:      string;
     is_public: boolean;
 
-    /// Per-segment metadata mirroring `ImportDeclNode`, populated by
+    /// Per-segment metadata mirroring `ImportDecl`, populated by
     /// the parser for both `namespace X::Y::Z;` and
     /// `public module X::Y;` decls so the LSP can hover/go-to on an
     /// individual segment.

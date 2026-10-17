@@ -39,7 +39,7 @@ import std::fmt;
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
     DestructureDeclNode, EnumDeclNode, EnumVariantNode, ExternBlockNode, FieldDeclNode,
-    FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDeclNode,
+    FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDecl,
     IntrinsicConstDecl, IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDeclNode,
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
@@ -187,7 +187,6 @@ implement struct Parser {
             NodeKind::VariableDeclaration   => { true }
             NodeKind::ImplementationBlock   => { true }
             NodeKind::ExternBlock           => { true }
-            NodeKind::ImportDeclaration     => { true }
             NodeKind::Declaration           => { true }
             _                               => { false }
         };
@@ -382,7 +381,7 @@ implement struct Parser {
 
         // Import declaration
         if (tok.kind == TokenType::KwImport) {
-            const imp: ImportDeclNode* = this.parse_import_declaration();
+            const imp: DeclarationNode* = this.parse_import_declaration();
             if (imp != null && doc != "") {
                 imp.set_documentation(doc);
             }
@@ -391,7 +390,7 @@ implement struct Parser {
 
         // Export declaration (symbol re-export).
         if (tok.kind == TokenType::KwExport) {
-            const exp: ImportDeclNode* = this.parse_export_declaration();
+            const exp: DeclarationNode* = this.parse_export_declaration();
             if (exp != null && doc != "") {
                 exp.set_documentation(doc);
             }
@@ -1894,20 +1893,20 @@ implement struct Parser {
     }
 
     /// Parse an import declaration (5 styles).
-    parse_import_declaration() -> ImportDeclNode* {
+    parse_import_declaration() -> DeclarationNode* {
         return this.parse_import_form(false);
     }
 
     /// Parse an export declaration: the import form minus the wildcard.
     /// `export A::B::{X, Y};`, `export A::B as C;`, `export A::B;`.
-    parse_export_declaration() -> ImportDeclNode* {
+    parse_export_declaration() -> DeclarationNode* {
         return this.parse_import_form(true);
     }
 
     /// Shared body of `import` and `export`.  They differ in exactly two
     /// places - whether a `*` form is accepted, and the flag stamped on the
     /// node - so they share one production rather than drifting as two.
-    parse_import_form(is_export: boolean) -> ImportDeclNode* {
+    parse_import_form(is_export: boolean) -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_import_form(is_export=%d)",
                   is_export as i32);
         const start: Token = this.advance(); // consume 'import' / 'export'
@@ -1931,7 +1930,7 @@ implement struct Parser {
         mut prefix_sym: SymbolStr = SymbolStr::empty();
 
         // Per-segment tracking for the LSP; each segment's name +
-        // span gets stamped on the resulting `ImportDeclNode` so
+        // span gets stamped on the resulting `ImportDecl` so
         // hover/go-to-def can target an individual segment.
         mut seg_names: [SymbolStr] = [];
         mut seg_spans: [SourceSpan] = [];
@@ -1964,18 +1963,17 @@ implement struct Parser {
                 // module-graph lookup misses and the import binds nothing -
                 // silently, because a wildcard that binds no names is
                 // indistinguishable from a module that exports none.
-                mut imp: ImportDeclNode* = new ImportDeclNode(path_sym, ImportStyle::Wildcard, this.span_from_token(start));
+                const imp: ImportDecl* = ImportDecl::new(path_sym, ImportStyle::Wildcard);
                 for (mut i: i64 = 0; i < seg_names.length; i++) {
                     imp.add_path_segment(seg_names[i], seg_spans[i]);
                 }
                 this.consume(TokenType::Semicolon, "';'");
-                imp.span = this.span_from(start);
-                return imp;
+                return DeclarationNode::of(DeclKind::Import(imp), this.span_from(start));
             }
             if (next.kind == TokenType::LBrace) {
                 // Selective import: import A::B::{X, Y}
                 this.advance(); // consume '{'
-                mut imp: ImportDeclNode* = new ImportDeclNode(path_sym, ImportStyle::Specific, this.span_from_token(start));
+                const imp: ImportDecl* = ImportDecl::new(path_sym, ImportStyle::Specific);
                 imp.is_export = is_export;
                 for (mut i: i64 = 0; i < seg_names.length; i++) {
                     imp.add_path_segment(seg_names[i], seg_spans[i]);
@@ -1998,8 +1996,7 @@ implement struct Parser {
                 }
                 this.consume(TokenType::RBrace, "'}'");
                 this.consume(TokenType::Semicolon, "';'");
-                imp.span = this.span_from(start);
-                return imp;
+                return DeclarationNode::of(DeclKind::Import(imp), this.span_from(start));
             }
             // Append "::segment" and intern to pin on the heap
             const prev: string = this.ctx.resolve_str(path_sym);
@@ -2019,8 +2016,7 @@ implement struct Parser {
         if (this.check(TokenType::KwAs) && !is_export && seg_names.length >= 2) {
             this.advance();
             const entry_alias: Token = this.consume(TokenType::Identifier, "alias name");
-            mut ent: ImportDeclNode* = new ImportDeclNode(
-                prefix_sym, ImportStyle::Specific, this.span_from_token(start));
+            const ent: ImportDecl* = ImportDecl::new(prefix_sym, ImportStyle::Specific);
             for (mut i: i64 = 0; i < seg_names.length - 1; i++) {
                 ent.add_path_segment(seg_names[i], seg_spans[i]);
             }
@@ -2028,15 +2024,14 @@ implement struct Parser {
                                     seg_spans[seg_spans.length - 1], this.span_from_token(entry_alias));
             ent.path_entry = true;
             this.consume(TokenType::Semicolon, "';'");
-            ent.span = this.span_from(start);
-            return ent;
+            return DeclarationNode::of(DeclKind::Import(ent), this.span_from(start));
         }
 
         // `import A::B;` names the module and binds nothing from it.  A name
         // it reaches is either written in braces or spelled through the
         // qualifier; the path itself stays a module reference, which is what
         // records the dependency edge and what `B::X` resolves against.
-        mut imp: ImportDeclNode* = new ImportDeclNode(path_sym, ImportStyle::Module, this.span_from_token(start));
+        const imp: ImportDecl* = ImportDecl::new(path_sym, ImportStyle::Module);
         imp.is_export = is_export;
         for (mut i: i64 = 0; i < seg_names.length; i++) {
             imp.add_path_segment(seg_names[i], seg_spans[i]);
@@ -2046,12 +2041,11 @@ implement struct Parser {
         if (this.check(TokenType::KwAs)) {
             this.advance();
             const alias_tok: Token = this.consume(TokenType::Identifier, "alias name");
-            imp.set_alias(this.intern_lexeme(alias_tok));
+            imp.alias = this.intern_lexeme(alias_tok);
         }
 
         this.consume(TokenType::Semicolon, "';'");
-        imp.span = this.span_from(start);
-        return imp;
+        return DeclarationNode::of(DeclKind::Import(imp), this.span_from(start));
     }
 
     /// Parse a namespace declaration: namespace A::B;

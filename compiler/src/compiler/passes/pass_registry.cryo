@@ -57,7 +57,8 @@ import compiler::types::user_defined::{ TypeAliasType };
 import std::fmt;
 import compiler::artifacts::{ ASTOutput, TokenStream };
 import compiler::ast::declaration::{
-    ClassDeclNode, EnumDeclNode, ImplBlockNode, ImportDeclNode, MethodNode, StructDeclNode,
+    ClassDeclNode, DeclarationNode, DeclKind, EnumDeclNode, ImplBlockNode, ImportDecl,
+    MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -1004,8 +1005,8 @@ type struct PassRegistry {
         // A same-module re-import (if the user also wrote it) is silently
         // de-duplicated during name resolution.
         if (root.uses_fstring) {
-            const interp_import: ImportDeclNode* = new ImportDeclNode(
-                ctx.intern_table.intern(LangModule::Interp.path()), ImportStyle::Wildcard, SourceSpan::none());
+            const interp_import: DeclarationNode* = DeclarationNode::of(DeclKind::Import(ImportDecl::new(
+                ctx.intern_table.intern(LangModule::Interp.path()), ImportStyle::Wildcard)), SourceSpan::none());
             mut with_interp: [ASTNode*] = [];
             with_interp.push(interp_import as ASTNode*);
             for (mut fi: i64 = 0; fi < root.statements.length; fi++) {
@@ -1027,8 +1028,8 @@ type struct PassRegistry {
         const prelude_path: SymbolStr = ctx.intern_table.intern(LangModule::Prelude.path());
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
-            if (stmt != null && stmt.kind == NodeKind::ImportDeclaration) {
-                const imp: ImportDeclNode* = stmt as ImportDeclNode*;
+            const imp: ImportDecl* = DeclarationNode::import_of(stmt);
+            if (imp != null) {
                 if (LangModule::Prelude.is_written(imp.module_path, ctx.intern_table)
                     && imp.style == ImportStyle::Wildcard) {
                     if (ctx.options.verbose) {
@@ -1040,8 +1041,8 @@ type struct PassRegistry {
         }
 
         // Inject a synthetic `import std::prelude;` (wildcard) as the first statement.
-        const prelude_import: ImportDeclNode* = new ImportDeclNode(
-            prelude_path, ImportStyle::Wildcard, SourceSpan::none());
+        const prelude_import: DeclarationNode* = DeclarationNode::of(
+            DeclKind::Import(ImportDecl::new(prelude_path, ImportStyle::Wildcard)), SourceSpan::none());
 
         // Build a new statement list with the prelude import at position 0.
         const old_len: i64 = root.statements.length;
@@ -1092,9 +1093,8 @@ type struct PassRegistry {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
-            if (stmt.kind != NodeKind::ImportDeclaration) { continue; }
-
-            const import_node: ImportDeclNode* = stmt as ImportDeclNode*;
+            const import_node: ImportDecl* = DeclarationNode::import_of(stmt);
+            if (import_node == null) { continue; }
             const module_path: string = ctx.intern_table.resolve(import_node.module_path);
             import_count += 1;
 
@@ -1106,13 +1106,13 @@ type struct PassRegistry {
             // imports (e.g. the synthetic `std::prelude`) carry no source
             // location and are trusted; blaming the user for them - or for a
             // virtual module with no backing file - would be wrong.
-            if (single_file_mode && import_node.span.has_location()) {
+            if (single_file_mode && stmt.span.has_location()) {
                 const resolved: string = sf_loader.resolve_import_path(
                     ctx.intern_table, import_node.module_path, "");
                 if (resolved.length() == 0) {
                     ctx.emit_error_at(ErrorCode::E0500_MODULE_NOT_FOUND,
                         fmt::format("module '%s' not found", module_path),
-                        import_node.span);
+                        stmt.span);
                     error_count += 1;
                 }
             }

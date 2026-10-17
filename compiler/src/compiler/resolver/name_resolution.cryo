@@ -43,7 +43,7 @@ import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDeclNode, EnumDeclNode, EnumVariantNode,
     ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
-    DeclarationNode, DeclKind, ImportDeclNode, IntrinsicDecl, MethodNode, StructDeclNode,
+    DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -507,16 +507,17 @@ type struct NameResolver {
                     this.declare_c_imported_global(var_node.binding_namespace, var_node);
                 }
             }
-            NodeKind::ImportDeclaration => {
-                // Deliberately NOT processed here.  An import is answered from
-                // the declaring module's exports, so processing it while this
-                // module is still declaring its own names binds it against
-                // whatever happens to have been declared so far.  It is done on
-                // the walk instead, by which point every module has declared.
-            }
             NodeKind::Declaration => {
                 const decl: DeclarationNode* = node as DeclarationNode*;
                 match (decl.shape) {
+                    DeclKind::Import(_) => {
+                        // Deliberately NOT processed here.  An import is
+                        // answered from the declaring module's exports, so
+                        // processing it while this module is still declaring
+                        // its own names binds it against whatever happens to
+                        // have been declared so far.  It is done on the walk
+                        // instead, by which point every module has declared.
+                    }
                     DeclKind::Intrinsic(intr_node) => {
                         const id: SymbolID = this.resolver.alloc_symbol_id();
                         // The declaring module is the symbol's canonical
@@ -625,7 +626,7 @@ type struct NameResolver {
                 match ((node as DeclarationNode*).shape) {
                     DeclKind::Intrinsic(i)       => { i.def }
                     DeclKind::IntrinsicConst(ic) => { ic.def }
-                    DeclKind::Module(_) | DeclKind::Legacy => { DefId::invalid() }
+                    DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Legacy => { DefId::invalid() }
                 }
             }
             _ => { DefId::invalid() }
@@ -2559,13 +2560,13 @@ type struct NameResolver {
     /// not a declaration, not a re-export, not a sub-module.  The module's
     /// offering is named so the writer can see what to write instead; a
     /// close spelling is offered as the fix.
-    refuse_unoffered_import(&this, node: ImportDeclNode*, m: ModulePath,
+    refuse_unoffered_import(&this, decl: DeclarationNode*, node: ImportDecl*, m: ModulePath,
                             resolved_module: string, name_str: string) -> void {
         const offered: [string] = this.offered_leaves(m, resolved_module);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0502_INVALID_IMPORT,
             fmt::format("`%s` does not offer `%s`", resolved_module, name_str));
-        d = d.at_with_label(node.span, "no declaration, re-export or sub-module of that name");
+        d = d.at_with_label(decl.span, "no declaration, re-export or sub-module of that name");
         mut listed: string = "";
         const count: i64 = offered.length;
         const cap: i64 = if (count < 12) { count } else { 12 };
@@ -2594,11 +2595,11 @@ type struct NameResolver {
     /// as the fix, because that is the mistake the shape comes from - the
     /// path a QUALIFIER may abbreviate to is written where the whole name
     /// is required.
-    refuse_unknown_module_import(&this, node: ImportDeclNode*, module_path: string) -> void {
+    refuse_unknown_module_import(&this, decl: DeclarationNode*, node: ImportDecl*, module_path: string) -> void {
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0502_INVALID_IMPORT,
             fmt::format("`%s` is not a module's name", module_path));
-        d = d.at_with_label(node.span, "no module is registered under this name");
+        d = d.at_with_label(decl.span, "no module is registered under this name");
         const abbreviated: [ModulePath] = this.ctx.module_graph.modules_abbreviated_by(module_path, this.resolver.intern_table);
         mut named: string = "";
         for (mut k: i64 = 0; k < abbreviated.length; k++) {
@@ -2615,13 +2616,13 @@ type struct NameResolver {
     /// `import A::{ B as C }` - where `A` offers an item `B` and `A::B` is a
     /// module too.  The entry names both, and neither is chosen, so the
     /// writer renames one of the two.  `import A::B;` imports the module.
-    refuse_item_or_module_import(&this, node: ImportDeclNode*, i: i64) -> void {
+    refuse_item_or_module_import(&this, decl: DeclarationNode*, node: ImportDecl*, i: i64) -> void {
         const owner: string = this.resolver.intern_table.resolve(node.module_path);
         const leaf: string = this.resolver.intern_table.resolve(node.specific_imports[i]);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0244_IMPORT_ITEM_OR_MODULE,
             fmt::format("`%s::%s` names both an item of `%s` and a module", owner, leaf, owner));
-        d = d.at_with_label(node.span,
+        d = d.at_with_label(decl.span,
             fmt::format("`%s` is declared in `%s`, and `%s::%s` is a module", leaf, owner, owner, leaf));
         d = d.help(fmt::format(
             "rename the item `%s` or the module `%s::%s`", leaf, owner, leaf));
@@ -2630,14 +2631,14 @@ type struct NameResolver {
 
     /// The graph's index of the sub-module an import's `i`th entry names,
     /// `<module_path>::<entry>`, or -1 when there is none.
-    sub_module_index(&this, node: ImportDeclNode*, i: i64) -> i64 {
+    sub_module_index(&this, decl: DeclarationNode*, node: ImportDecl*, i: i64) -> i64 {
         const sub_module: ModulePath = this.ctx.module_graph.module_beside_item(
             this.resolver.intern_table.resolve(node.module_path), this.resolver.intern_table.resolve(node.specific_imports[i]),
             this.resolver.intern_table);
         return this.ctx.module_graph.find_module_index(sub_module);
     }
 
-    process_import(mut &this, node: ImportDeclNode*) -> void {
+    process_import(mut &this, decl: DeclarationNode*, node: ImportDecl*) -> void {
         const module_path: string = this.resolver.intern_table.resolve(node.module_path);
         LOG_DEBUG(LogComponent::General, "[NameResolver] process_import() module='%s'", module_path);
 
@@ -2674,7 +2675,7 @@ type struct NameResolver {
         // `import A::B as C;` asks its prefix only for an item: the path
         // names the module `A::B` whether or not `A` is a module.
         if (imported_idx < 0 && !node.path_entry) {
-            this.refuse_unknown_module_import(node, module_path);
+            this.refuse_unknown_module_import(decl, node, module_path);
             return;
         }
         if (imported_idx >= 0) { node.resolved_module = imported; }
@@ -2704,7 +2705,7 @@ type struct NameResolver {
                     const id: SymbolID = this.resolver.alloc_symbol_id();
                     const import_sym: Symbol = Symbol::import_sym(
                         id, export_sym.name, this.resolver.current_scope,
-                        node.span, export_sym.source_module, export_sym.def);
+                        decl.span, export_sym.source_module, export_sym.def);
                     this.resolver.declare_import(import_sym, this.resolver.declaration_of(exports[i]), false, false);
                 }
             }
@@ -2731,7 +2732,7 @@ type struct NameResolver {
                     const rid: SymbolID = this.resolver.alloc_symbol_id();
                     const rimp: Symbol = Symbol::import_sym(
                         rid, rx_sym.name, this.resolver.current_scope,
-                        node.span, rx_sym.source_module, rx_sym.def);
+                        decl.span, rx_sym.source_module, rx_sym.def);
                     this.resolver.declare_import(rimp, this.resolver.declaration_of(rx_exports[re]), false, false);
                 }
             }
@@ -2783,10 +2784,10 @@ type struct NameResolver {
                 // The sub-module `<resolved_module>::<name>`, when there is
                 // one: an entry names an item or a module and must not name
                 // both, braced or not, aliased or not.
-                const sub_idx: i64 = this.sub_module_index(node, i);
+                const sub_idx: i64 = this.sub_module_index(decl, node, i);
                 if (offered.length > 0 && sub_idx >= 0) {
-                    this.refuse_item_or_module_import(node, i);
-                    this.resolver.declare_refused(bind_as, node.span);
+                    this.refuse_item_or_module_import(decl, node, i);
+                    this.resolver.declare_refused(bind_as, decl.span);
                     continue;
                 }
                 if (offered.length > 0) {
@@ -2816,7 +2817,7 @@ type struct NameResolver {
                         const id: SymbolID = this.resolver.alloc_symbol_id();
                         mut import_sym: Symbol = Symbol::import_sym(
                             id, bind_as, this.resolver.current_scope,
-                            node.span, src, osym.def);
+                            decl.span, src, osym.def);
                         // `export M::{ printf }` offers the binding itself,
                         // and nothing else of `M`; `export M::{ printf as
                         // print }` offers `print`, naming the declaration
@@ -2832,7 +2833,7 @@ type struct NameResolver {
                         if (first.is_valid()) {
                             now = 2;
                             if (!refused_twice) {
-                                this.refuse_repeated_import(bind_as, node.span, first);
+                                this.refuse_repeated_import(bind_as, decl.span, first);
                                 refused_twice = true;
                             }
                         }
@@ -2854,12 +2855,12 @@ type struct NameResolver {
                         fmt::format("`%s::%s` is private and cannot be imported into `%s`",
                             resolved_module, name_str,
                             if (this.ctx.has_namespace()) { this.ctx.namespace_display() } else { this.ctx.source_file }));
-                    d = d.at_with_label(node.span, "private declaration named by this import");
+                    d = d.at_with_label(decl.span, "private declaration named by this import");
                     this.ctx.emit_diagnostic(d);
                     // The name is bound to nothing, HERE: a use of it is then
                     // `Err` with this as its report, not a second diagnostic
                     // saying the name does not exist.
-                    this.resolver.declare_refused(bind_as, node.span);
+                    this.resolver.declare_refused(bind_as, decl.span);
                 } else if (node.is_export
                            && this.resolver.private_declarations(imported, name).length > 0) {
                     // An `export` naming a private declaration is E0241,
@@ -2878,8 +2879,8 @@ type struct NameResolver {
                         // use site - which may never exist - to say so.  The
                         // import is where the name is written, and what the
                         // module DOES offer is what a writer needs to fix it.
-                        this.refuse_unoffered_import(node, imported, resolved_module, name_str);
-                        this.resolver.declare_refused(bind_as, node.span);
+                        this.refuse_unoffered_import(decl, node, imported, resolved_module, name_str);
+                        this.resolver.declare_refused(bind_as, decl.span);
                         continue;
                     }
                     // `import A::{ B as C }` (and `import A::B as C;`, which
@@ -2892,7 +2893,7 @@ type struct NameResolver {
                         const sub_alias_id: SymbolID = this.resolver.alloc_symbol_id();
                         mut sub_alias: Symbol = Symbol::import_sym(
                             sub_alias_id, alias, this.resolver.current_scope,
-                            node.span, sub_module, this.ctx.module_graph.get_module(sub_idx).def);
+                            decl.span, sub_module, this.ctx.module_graph.get_module(sub_idx).def);
                         if (node.is_export) { sub_alias.visibility = SymbolVisibility::Public; }
                         this.resolver.declare(sub_alias);
                         if (node.is_export) { this.resolver.export_symbol(sub_alias_id); }
@@ -2906,7 +2907,7 @@ type struct NameResolver {
                             const id: SymbolID = this.resolver.alloc_symbol_id();
                             const import_sym: Symbol = Symbol::import_sym(
                                 id, sub_export_sym.name, this.resolver.current_scope,
-                                node.span, sub_export_sym.source_module, sub_export_sym.def);
+                                decl.span, sub_export_sym.source_module, sub_export_sym.def);
                             this.resolver.declare_import(import_sym, this.resolver.declaration_of(sub_exports[j]), false, false);
                         }
                     }
@@ -2924,7 +2925,7 @@ type struct NameResolver {
             const alias_id: SymbolID = this.resolver.alloc_symbol_id();
             mut alias_sym: Symbol = Symbol::import_sym(
                 alias_id, node.alias, this.resolver.current_scope,
-                node.span, imported, this.ctx.module_graph.get_module(imported_idx).def);
+                decl.span, imported, this.ctx.module_graph.get_module(imported_idx).def);
             // `export M as V;` offers the alias: an importer of this module
             // is offered `V`, naming the module `M`.
             if (node.is_export) { alias_sym.visibility = SymbolVisibility::Public; }
@@ -3431,7 +3432,7 @@ implement trait Walk for struct NameResolver {
         this.resolver.exit_scope();
     }
 
-    walk_import(mut &this, node: ImportDeclNode*) -> void {
+    walk_import(mut &this, d: DeclarationNode*, node: ImportDecl*) -> void {
         // Every module has declared and exported its own names by now, so the
         // exports this import reads from exist whichever order the modules are
         // walked in - including inside an import cycle, where no order can put
@@ -3440,7 +3441,7 @@ implement trait Walk for struct NameResolver {
         // Running after this module's own declarations rather than before them
         // does not change which of the two wins: the scope tiers them, so a
         // declaration owns the slot and shadows the import either way.
-        this.process_import(node);
+        this.process_import(d, node);
     }
 
     walk_extern_block(mut &this, node: ExternBlockNode*) -> void {

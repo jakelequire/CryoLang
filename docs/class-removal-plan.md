@@ -1404,6 +1404,17 @@ committed with the change and deleted in the next commit.
   dump carries 71 of them (a dumper with the label changed differs there).
   The cloner copies an intrinsic's parameters and body but not its
   definition, return annotation or variadic flag, as it did before.
+- `Import(ImportDecl*)` followed, `export` included (one payload with
+  `is_export`).  The places that scan a program's items for its imports
+  (the prelude and f-string injection, import validation, the export
+  check, the diagnostics' import anchor, the language server's semantic
+  tokens) ask `DeclarationNode::import_of(n)`, a bridge helper like
+  `module_of`.  The name layer's import functions take the header beside
+  the payload for the span they report at; a one-off codemod
+  (`scripts/import-codemod.py`) rewrote their signatures and `node.span`
+  reads.  The cloner leaves an import's path segments and private export
+  entries uncopied, as before.  Control: a dumper with the `ImportDecl`
+  label changed differs on all 164 files of `tests/tests/lang`.
 - `NodeKind::is_declaration` answers true for `Declaration`.  A module
   declaration was outside its list; the two callers read `name_span`,
   which the parser never sets on a module declaration, so they answer as
@@ -1696,4 +1707,4 @@ final audit greps for each name listed and expects none.
 | `Stmt` a class deriving from `ASTNode`, so an `ASTNode*` (a program item, a `for` initializer, the editor's node at a position) can hold a statement; the 21 `as Stmt*` casts from such handles, each behind a `NodeKind::Statement` test | `compiler/src/compiler/AST/statement.cryo` and the casts' files | slice 6 (statements) | the header becomes a struct when the "any node" handle is `Node`; the casts become `Node::Stmt(s)` arms |
 | `Stmt.shape`, the statement's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/statement.cryo` | slice 6 (statements) | renamed `kind` when the header stops deriving from `ASTNode` |
 | `DeclKind::Legacy` and every `match` arm for it; `DeclarationNode.shape` on a declaration whose kind is still a subclass; the `NodeKind`-per-kind dispatch for those kinds beside the `NodeKind::Declaration` arms | `compiler/src/compiler/AST/declaration.cryo` and every declaration consumer | slice 6 (declarations, `IntrinsicConst` and `Module`) | when the last declaration kind converts; then `shape` is renamed `kind` with the header's struct |
-| `DeclarationNode::with_shape` and `DeclarationNode::module_of`, and the `as DeclarationNode*` casts behind a `NodeKind::Declaration` test (walker, cloner, sema, codegen, type resolution, name resolution x2, stamp check, directive processing, language server identity) | `compiler/src/compiler/AST/declaration.cryo` and those files | slice 6 (declarations) | the casts become `Node::Decl(d)` arms when the "any node" handle is `Node`; `module_of` then matches on `Node` |
+| `DeclarationNode::with_shape`, `DeclarationNode::module_of` and `DeclarationNode::import_of` (instance, diagnostics, pass registry x3, language server semantic tokens), and the `as DeclarationNode*` casts behind a `NodeKind::Declaration` test (walker, cloner, sema, codegen, type resolution, name resolution x2, stamp check, directive processing, language server identity) | `compiler/src/compiler/AST/declaration.cryo` and those files | slice 6 (declarations) | the casts become `Node::Decl(d)` arms when the "any node" handle is `Node`; `module_of` and `import_of` then match on `Node` |
