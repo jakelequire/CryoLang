@@ -47,7 +47,7 @@ import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::{ state, type_utils };
 import compiler::ast::declaration::{
-    ClassDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
+    ClassDeclNode, FunctionDeclNode, DeclarationNode, GenericParamDecl, ImplBlockNode, MethodNode,
     StructDeclNode, UnionDeclNode
 };
 import compiler::sema::state::{ SemaState };
@@ -88,11 +88,13 @@ type struct SymbolicChecker {
     symbolic_param_in_scope(&this, sid: SymbolID) -> boolean {
         if (!this.state.in_symbolic_check) { return false; }
         for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
-            const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
+            const p_decl: DeclarationNode* = this.state.symbolic_owner_param_nodes[i];
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
             if (p != null && p.sym_id.equals(sid)) { return true; }
         }
         for (mut j: i64 = 0; j < this.state.symbolic_method_param_nodes.length; j++) {
-            const p: GenericParamNode* = this.state.symbolic_method_param_nodes[j];
+            const p_decl: DeclarationNode* = this.state.symbolic_method_param_nodes[j];
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
             if (p != null && p.sym_id.equals(sid)) { return true; }
         }
         return false;
@@ -141,11 +143,13 @@ type struct SymbolicChecker {
         if (!this.symbolic_scope_is_generic_param(scope)) { return TypeRef::invalid(); }
         const sid: SymbolID = scope.scope_res.relative_param_sym();
         for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
-            const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
+            const p_decl: DeclarationNode* = this.state.symbolic_owner_param_nodes[i];
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
             if (p != null && p.sym_id.equals(sid)) { return this.symbolic_param_ref(p, i as u64); }
         }
         for (mut j: i64 = 0; j < this.state.symbolic_method_param_nodes.length; j++) {
-            const p: GenericParamNode* = this.state.symbolic_method_param_nodes[j];
+            const p_decl: DeclarationNode* = this.state.symbolic_method_param_nodes[j];
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
             if (p != null && p.sym_id.equals(sid)) { return this.symbolic_param_ref(p, j as u64); }
         }
         return TypeRef::invalid();
@@ -160,18 +164,20 @@ type struct SymbolicChecker {
         if (this.arena == null) { return; }
         rc.symbolic_no_demand = true;
         for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
-            const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
+            const p_decl: DeclarationNode* = this.state.symbolic_owner_param_nodes[i];
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
             if (p != null) { rc.add_binding(p.sym_id, p.name, this.symbolic_param_here(p, i as u64)); }
         }
         for (mut j: i64 = 0; j < this.state.symbolic_method_param_nodes.length; j++) {
-            const p: GenericParamNode* = this.state.symbolic_method_param_nodes[j];
+            const p_decl: DeclarationNode* = this.state.symbolic_method_param_nodes[j];
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
             if (p != null) { rc.add_binding(p.sym_id, p.name, this.symbolic_param_here(p, j as u64)); }
         }
     }
 
     /// The type an in-scope param stands for where the walk is: the type the
     /// innermost `static match` arm narrowing it listed, else its abstract ref.
-    symbolic_param_here(&this, p: GenericParamNode*, index: u64) -> TypeRef {
+    symbolic_param_here(&this, p: GenericParamDecl*, index: u64) -> TypeRef {
         for (mut k: i64 = this.state.symbolic_narrow_syms.length - 1; k >= 0; k--) {
             if (this.state.symbolic_narrow_syms[k].equals(p.sym_id)) {
                 return this.state.symbolic_narrow_types[k];
@@ -184,7 +190,7 @@ type struct SymbolicChecker {
     /// `GenericParam`, arena-deduped by (name.id, index).  A bound on the param
     /// is written in a `where` clause on the enclosing declaration, and the
     /// symbolic walk reads it from there rather than from the param.
-    symbolic_param_ref(&this, p: GenericParamNode*, index: u64) -> TypeRef {
+    symbolic_param_ref(&this, p: GenericParamDecl*, index: u64) -> TypeRef {
         return this.arena.create_generic_param(p.sym_id, p.name, index);
     }
 
@@ -222,7 +228,8 @@ type struct SymbolicChecker {
         }
         mut args: [TypeRef] = [];
         for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
-            const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
+            const p_decl: DeclarationNode* = this.state.symbolic_owner_param_nodes[i];
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
             if (p == null) { mem::drop(args); return owner_type; }
             args.push(this.symbolic_param_ref(p, i as u64));
         }
@@ -490,11 +497,13 @@ type struct SymbolicChecker {
     /// when no parameter of the body under check is `sym`.
     symbolic_param_of(&this, sym: SymbolID) -> TypeRef {
         for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
-            const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
+            const p_decl: DeclarationNode* = this.state.symbolic_owner_param_nodes[i];
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
             if (p != null && p.sym_id.equals(sym)) { return this.symbolic_param_ref(p, i as u64); }
         }
         for (mut j: i64 = 0; j < this.state.symbolic_method_param_nodes.length; j++) {
-            const p: GenericParamNode* = this.state.symbolic_method_param_nodes[j];
+            const p_decl: DeclarationNode* = this.state.symbolic_method_param_nodes[j];
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
             if (p != null && p.sym_id.equals(sym)) { return this.symbolic_param_ref(p, j as u64); }
         }
         return TypeRef::invalid();

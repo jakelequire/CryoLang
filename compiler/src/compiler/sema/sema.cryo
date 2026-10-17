@@ -69,7 +69,7 @@ import compiler::passes::type_resolution::{ TypeResolutionPasses, TypeResolution
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
-    EnumDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
+    EnumDeclNode, FunctionDeclNode, GenericParamDecl, ImplBlockNode, MethodNode,
     StructDeclNode, TraitDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -384,7 +384,7 @@ type struct SemaVisitor {
                     const ib: ImplBlockNode* = stmt as ImplBlockNode*;
                     // The head's owner, off the stamp; the written target is
                     // what a refusal names.
-                    mut owner_params: [GenericParamNode*] = this.impl_owner_params(ib);
+                    mut owner_params: [DeclarationNode*] = this.impl_owner_params(ib);
                     this.declare_async_methods(ib.methods, owner_params,
                         this.ctx.decl_index.impl_owner(ib, "sema/async declare"), ib.target_type, ib);
                 }
@@ -405,7 +405,7 @@ type struct SemaVisitor {
     /// otherwise); a trait impl uses it to bind the trait's implicit
     /// `<Method>Fut` associated type to the future each method lowers to.
     declare_async_methods(mut &this, methods: &[MethodNode*],
-                          owner_params: &[GenericParamNode*],
+                          owner_params: &[DeclarationNode*],
                           owner_ty: TypeRef, written: SymbolStr,
                           impl_node: ImplBlockNode*) -> void {
         if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, written); return; }
@@ -459,7 +459,7 @@ type struct SemaVisitor {
     /// The owner type as a method body sees `this`: the type itself, or the
     /// template instantiated over its own parameters for a generic owner
     /// (`Box<T>`), which is what the symbolic walk binds `this` to.
-    async_owner_instance(mut &this, base: TypeRef, params: &[GenericParamNode*]) -> TypeRef {
+    async_owner_instance(mut &this, base: TypeRef, params: &[DeclarationNode*]) -> TypeRef {
         if (!base.is_valid() || params.length == 0) { return base; }
         const t: Type* = this.arena.lookup(base);
         if (t == null || t.kind == TypeKind::InstantiatedType) { return base; }
@@ -479,7 +479,7 @@ type struct SemaVisitor {
     /// symbolically, and a body walked concretely while an abstract projection
     /// (`S::ReadFut::Output`) is still in it fails every check against that
     /// projection instead of deferring until monomorphization resolves it.
-    impl_owner_params(mut &this, ib: ImplBlockNode*) -> [GenericParamNode*] {
+    impl_owner_params(mut &this, ib: ImplBlockNode*) -> [DeclarationNode*] {
         if (ib.generic_params.length > 0) {
             return this.clone_generic_params(ib.generic_params);
         }
@@ -508,8 +508,8 @@ type struct SemaVisitor {
         return [];
     }
 
-    clone_generic_params(&this, params: &[GenericParamNode*]) -> [GenericParamNode*] {
-        mut out: [GenericParamNode*] = [];
+    clone_generic_params(&this, params: &[DeclarationNode*]) -> [DeclarationNode*] {
+        mut out: [DeclarationNode*] = [];
         for (mut i: i64 = 0; i < params.length; i++) { out.push(params[i]); }
         return out;
     }
@@ -831,17 +831,18 @@ type struct SemaVisitor {
         const saved_symbolic: boolean = this.state.in_symbolic_check;
         const saved_cur_func: FunctionDeclNode* = this.state.symbolic_current_func;
         this.state.symbolic_current_func = func;
-        mut saved_method_nodes: [GenericParamNode*] = [];
+        mut saved_method_nodes: [DeclarationNode*] = [];
         swap(&this.state.symbolic_method_param_nodes, &saved_method_nodes);
         this.state.current_owner_type = owner_type;
         this.state.in_symbolic_check  = true;
         const ar: TypeArena* = this.arena;
         const saved_no_demand: boolean = if (ar != null) { ar.symbolic_no_demand_active } else { false };
         if (ar != null) { ar.set_symbolic_no_demand(true); }
-        mut method_nodes: [GenericParamNode*] = [];
+        mut method_nodes: [DeclarationNode*] = [];
         for (mut gp: i64 = 0; gp < func.generic_params.length; gp++) {
-            const pnode: GenericParamNode* = func.generic_params[gp];
-            if (pnode != null) { method_nodes.push(pnode); }
+            const pnode_decl: DeclarationNode* = func.generic_params[gp];
+            const pnode: GenericParamDecl* = DeclarationNode::generic_param_of(pnode_decl);
+            if (pnode != null) { method_nodes.push(pnode_decl); }
         }
         this.state.symbolic_method_param_nodes = method_nodes;
 
@@ -896,14 +897,15 @@ type struct SemaVisitor {
     /// generic owner reaches sema only here, so this is also where an `async` one
     /// is lowered, off the types the walk leaves on its body.
     symbolic_check_owner_methods(mut &this, methods: &[MethodNode*], owner_type: TypeRef,
-                                 owner_params: &[GenericParamNode*]) -> void {
+                                 owner_params: &[DeclarationNode*]) -> void {
         const saved_owner_generic: boolean = this.state.symbolic_owner_is_generic;
-        mut saved_owner_nodes: [GenericParamNode*] = [];
+        mut saved_owner_nodes: [DeclarationNode*] = [];
         swap(&this.state.symbolic_owner_param_nodes, &saved_owner_nodes);
-        mut onodes: [GenericParamNode*] = [];
+        mut onodes: [DeclarationNode*] = [];
         for (mut i: i64 = 0; i < owner_params.length; i++) {
-            const p: GenericParamNode* = owner_params[i];
-            if (p != null) { onodes.push(p); }
+            const p_decl: DeclarationNode* = owner_params[i];
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
+            if (p != null) { onodes.push(p_decl); }
         }
         this.state.symbolic_owner_param_nodes = onodes;
         this.state.symbolic_owner_is_generic  = true;
@@ -1663,7 +1665,6 @@ type struct SemaVisitor {
 
             NodeKind::MethodDeclaration
             | NodeKind::EnumDeclaration
-            | NodeKind::GenericParamDeclaration
             | NodeKind::MatchArm | NodeKind::StaticMatchArm | NodeKind::Pattern
             | NodeKind::Directive => { }
 
@@ -1674,7 +1675,7 @@ type struct SemaVisitor {
                     // None of these has a check.
                     DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::IntrinsicConst(_)
                     | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Extern(_)
-                    | DeclKind::TypeAlias(_) | DeclKind::Field(_) => { }
+                    | DeclKind::TypeAlias(_) | DeclKind::Field(_) | DeclKind::GenericParam(_) => { }
                     DeclKind::Legacy => { }
                 }
             }

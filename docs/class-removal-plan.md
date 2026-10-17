@@ -1500,6 +1500,18 @@ committed with the change and deleted in the next commit.
   (`scripts/field-codemod.py`) rewrote the element loads, the field-list
   parameters and the imports; the header reads it left behind were the
   type check's to point at.
+- `GenericParam(GenericParamDecl*)` followed, the same way: every
+  declaration's `generic_params` (functions, structs, unions, classes,
+  enums, traits, aliases, impl blocks) hold the headers, read through
+  `DeclarationNode::generic_param_of`, and so do the lists the async
+  lowering and the symbolic walk build.  The parser's duplicate check, the
+  generic-parameter shadowing refusal and the template registration read
+  the name from the payload and the span from the header; the cloner copies
+  a parameter in `copy_decl_shape` (its symbol carried over, as before).  A
+  one-off codemod (`scripts/generic-param-codemod.py`) rewrote the element
+  loads, every `[GenericParamNode*]` list type and the imports.  No
+  dispatch had an arm for a generic parameter of its own; each is an
+  explicit no-op arm now.
 - The cloner's partial copies of an intrinsic, an import and an extern
   block are never exercised: an assertion in each of the three arms
   passed verify whole (tests, examples, the language server and the cross

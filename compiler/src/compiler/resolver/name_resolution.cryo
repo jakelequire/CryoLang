@@ -42,7 +42,7 @@ import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDecl, EnumDeclNode, EnumVariant,
-    ExternBlock, FieldDecl, FunctionDeclNode, GenericParamNode, ImplBlockNode,
+    ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlockNode,
     DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDecl, UnionDeclNode, VarDeclNode
 };
@@ -148,8 +148,8 @@ type struct NameResolver {
 
     /// The parameters `This` is written with in the body of `decl`: an
     /// inherent impl's, or a struct declaration's own.
-    static this_owner_params_of(decl: ASTNode*) -> [GenericParamNode*] {
-        mut out: [GenericParamNode*] = [];
+    static this_owner_params_of(decl: ASTNode*) -> [DeclarationNode*] {
+        mut out: [DeclarationNode*] = [];
         if (decl == null) { return out; }
         if (decl.kind == NodeKind::ImplementationBlock) {
             const ib: ImplBlockNode* = decl as ImplBlockNode*;
@@ -172,10 +172,11 @@ type struct NameResolver {
         if (!node.scope_is_this_type) { return false; }
         if (this.this_owner_decl == null || this.this_trait.is_valid()) { return false; }
         if (node.scope_generic_args.length > 0) { return false; }
-        const params: [GenericParamNode*] = NameResolver::this_owner_params_of(this.this_owner_decl);
+        const params: [DeclarationNode*] = NameResolver::this_owner_params_of(this.this_owner_decl);
         mut args: [TypeAnnotation*] = [];
         for (mut i: i64 = 0; i < params.length; i++) {
-            const p: GenericParamNode* = params[i];
+            const p_decl: DeclarationNode* = params[i];
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
             args.push(TypeAnnotation::answered(p.name, Res::GenericParam(p.sym_id), node.span));
         }
         node.set_scope_generic_args(args);
@@ -200,10 +201,11 @@ type struct NameResolver {
     /// `type struct T`) is the ordinary case - the nearer rib wins - and is
     /// not this.  Declared one at a time so a duplicate in one list meets
     /// the first as an enclosing symbol.
-    declare_generics(mut &this, generic_params: &[GenericParamNode*]) -> void {
+    declare_generics(mut &this, generic_params: &[DeclarationNode*]) -> void {
         if (generic_params.length == 0) { return; }
         for (mut i: i64 = 0; i < generic_params.length; i++) {
-            const gp: GenericParamNode* = generic_params[i];
+            const gp_decl: DeclarationNode* = generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             const prior_id: SymbolID = this.resolver.lookup(gp.name, this.resolver.current_scope);
             if (prior_id.is_valid()) {
                 const prior: Symbol = this.resolver.get_symbol(prior_id);
@@ -213,14 +215,14 @@ type struct NameResolver {
                         ErrorCode::E0311_GENERIC_PARAM_SHADOWED,
                         fmt::format("the generic parameter `%s` shadows a generic parameter of the same name",
                             name_str));
-                    d = d.at_with_label(gp.span, "declared again here");
+                    d = d.at_with_label(gp_decl.span, "declared again here");
                     d = d.also_at(prior.declaring_span, "first declared here");
                     d = d.with_note(
                         "a generic parameter is in scope for every declaration nested in its owner; give the inner one a distinct name");
                     this.ctx.emit_diagnostic(d);
                 }
             }
-            gp.set_sym_id(this.resolver.declare_generic_param(gp.name, gp.span));
+            gp.sym_id = this.resolver.declare_generic_param(gp.name, gp_decl.span);
         }
 
         // A parameter's default (`struct Array<T, A = GlobalAlloc>`) is written
@@ -234,7 +236,8 @@ type struct NameResolver {
         // (`<T, U = T>`) is answered by that parameter instead of being searched
         // for among declarations.
         for (mut i: i64 = 0; i < generic_params.length; i++) {
-            const gp: GenericParamNode* = generic_params[i];
+            const gp_decl: DeclarationNode* = generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp.has_default_annotation()) {
                 this.stamp_annotation(gp.default_annotation);
             }
@@ -587,9 +590,11 @@ type struct NameResolver {
                         }
                     }
                     // A module declaration introduces no name of this module.
-                    // A variant or a field is declared with its type; a
+                    // A variant or a field is declared with its type, a
+                    // generic parameter in its declaration's scope; a
                     // destructure's locals where the walk meets them.
                     DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Field(_)
+                    | DeclKind::GenericParam(_)
                     | DeclKind::Destructure(_) | DeclKind::Legacy => {}
                 }
             }
@@ -628,8 +633,8 @@ type struct NameResolver {
                     DeclKind::IntrinsicConst(ic) => { ic.def }
                     DeclKind::TypeAlias(a)       => { a.def }
                     DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
-                    | DeclKind::Variant(_) | DeclKind::Field(_) | DeclKind::Destructure(_)
-                    | DeclKind::Legacy => {
+                    | DeclKind::Variant(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+                    | DeclKind::Destructure(_) | DeclKind::Legacy => {
                         DefId::invalid()
                     }
                 }
@@ -906,7 +911,7 @@ type struct NameResolver {
         mut head_params: string = "";
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
             if (i > 0) { head_params = head_params + ", "; }
-            head_params = head_params + intern.resolve(node.generic_params[i].name);
+            head_params = head_params + intern.resolve(DeclarationNode::generic_param_of(node.generic_params[i]).name);
         }
         mut listed: string = "";
         for (mut i: i64 = 0; i < undeclared.length; i++) {

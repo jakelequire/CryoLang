@@ -58,7 +58,7 @@ import compiler::types::generic::{
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, DestructureBinding, DestructureDecl, FieldDecl, FunctionDeclNode,
-    GenericParamNode, ImplBlockNode, MethodNode, ReceiverForm, StructDeclNode, TraitDeclNode,
+    GenericParamDecl, ImplBlockNode, MethodNode, ReceiverForm, StructDeclNode, TraitDeclNode,
     VarDeclNode
 };
 import compiler::ast::expression::{
@@ -292,7 +292,7 @@ type struct AsyncOwner {
     written:      SymbolStr;
     /// The owner's generic parameters. The future is generic in these as well
     /// as in the method's own, since the body may mention either.
-    params:       [GenericParamNode*];
+    params:       [DeclarationNode*];
     /// The enclosing impl block when the owner is one, else null. Carried so an
     /// `async` method implementing an `async` TRAIT method can bind the trait's
     /// implicit `<Method>Fut` associated type to the future it lowers to.
@@ -334,7 +334,7 @@ type struct AsyncDecl {
     generic:     boolean;
     // The parameters the future is generic in: the owner's followed by the
     // function's own. Empty when `generic` is false.
-    fut_params:  [GenericParamNode*];
+    fut_params:  [DeclarationNode*];
 
     // Null when this is a free function. Non-null makes `lower` capture the
     // receiver and skip the free-function overload rebuild, which a method has
@@ -688,7 +688,7 @@ type struct AsyncLower {
     /// nothing; a synthesized node is stamped by nothing but its synthesizer.
     /// A DECLARATION spelled by the lowering goes through `named_ann_def` for
     /// the same reason.
-    named_ann(&this, gp: GenericParamNode*, span: SourceSpan) -> TypeAnnotation* {
+    named_ann(&this, gp: GenericParamDecl*, span: SourceSpan) -> TypeAnnotation* {
         mut n: NamedAnnotation* = new NamedAnnotation {
             name: gp.name, span: span, pre_resolved: TypeRef::invalid(),
             res: ResSlot::Pending,
@@ -703,9 +703,10 @@ type struct AsyncLower {
     /// parameter types carry the symbol their declaration bound; the
     /// declaration being lowered owns the parameters (the owner's, then the
     /// function's own) a type its body computed can mention.
-    param_bound_by(&this, params: &[GenericParamNode*], t: GenericParamType*) -> GenericParamNode* {
+    param_bound_by(&this, params: &[DeclarationNode*], t: GenericParamType*) -> GenericParamDecl* {
         for (mut i: i64 = 0; i < params.length; i++) {
-            const gp: GenericParamNode* = params[i];
+            const gp_decl: DeclarationNode* = params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp != null && t.declared_by(gp.sym_id)) { return gp; }
         }
         return null;
@@ -732,10 +733,11 @@ type struct AsyncLower {
     /// form the monomorphizer's substituter rewrites. A fresh array of fresh
     /// nodes per call: substitution edits annotations IN PLACE, so two uses may
     /// not share one node.
-    generic_param_anns(&this, params: &[GenericParamNode*], span: SourceSpan) -> [TypeAnnotation*] {
+    generic_param_anns(&this, params: &[DeclarationNode*], span: SourceSpan) -> [TypeAnnotation*] {
         mut args: [TypeAnnotation*] = [];
         for (mut i: i64 = 0; i < params.length; i++) {
-            const gp: GenericParamNode* = params[i];
+            const gp_decl: DeclarationNode* = params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { continue; }
             args.push(this.named_ann(gp, span));
         }
@@ -805,7 +807,7 @@ type struct AsyncLower {
     /// spelling, or a parameter that is none of `params` (the future's own);
     /// the caller reports that rather than emitting a field whose type would
     /// silently stay generic.
-    type_ann_for(mut &this, ty: TypeRef, params: &[GenericParamNode*],
+    type_ann_for(mut &this, ty: TypeRef, params: &[DeclarationNode*],
                  span: SourceSpan) -> TypeAnnotation* {
         if (!ty.is_valid()) { return null; }
         if (!this.arena.contains_generic_param(ty)) { return this.make_type_ann(ty, span); }
@@ -813,7 +815,7 @@ type struct AsyncLower {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return null; }
         if (t.kind == TypeKind::GenericParam) {
-            const gp: GenericParamNode* = this.param_bound_by(params, t.as_generic_param());
+            const gp: GenericParamDecl* = this.param_bound_by(params, t.as_generic_param());
             if (gp == null) { return null; }
             return this.named_ann(gp, span);
         }
@@ -7351,7 +7353,7 @@ type struct AsyncLower {
         // The future is generic in the OWNER's parameters as well as the
         // function's own: an `async` method on `Box<T>` may mention `T`
         // anywhere its free-function counterpart could mention its own.
-        mut fut_params: [GenericParamNode*] = [];
+        mut fut_params: [DeclarationNode*] = [];
         for (mut oi: i64 = 0; oi < owner.params.length; oi++) {
             if (owner.params[oi] != null) { fut_params.push(owner.params[oi]); }
         }
@@ -7430,8 +7432,9 @@ type struct AsyncLower {
             mut param_syms: [SymbolID] = [];
             mut param_types: [TypeRef] = [];
             for (mut gi: i64 = 0; gi < fut_params.length; gi++) {
-                param_names.push(fut_params[gi].name);
-                param_syms.push(fut_params[gi].sym_id);
+                const fp: GenericParamDecl* = DeclarationNode::generic_param_of(fut_params[gi]);
+                param_names.push(fp.name);
+                param_syms.push(fp.sym_id);
                 param_types.push(param_refs[gi]);
             }
             // The unit's module: the monomorphizer resolves the template's

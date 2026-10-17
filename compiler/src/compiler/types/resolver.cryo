@@ -48,7 +48,7 @@ import compiler::types::user_defined;
 import compiler::types::user_defined::{ TypeAliasType };
 import std::fmt;
 import compiler::ast::declaration::{
-    DeclarationNode, FieldDecl, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
+    DeclarationNode, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlockNode, MethodNode,
     TraitDeclNode, TypeAliasDecl, VarDeclNode
 };
 import compiler::ast::expression::{ ExpressionNode, StructLiteralNode };
@@ -1285,7 +1285,8 @@ type struct TypeResolver {
             if (method.func.is_generic()) {
                 mut method_ctx: ResolutionContext = res_ctx.clone();
                 for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
-                    const gp: GenericParamNode* = method.func.generic_params[j];
+                    const gp_decl: DeclarationNode* = method.func.generic_params[j];
+                    const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
                     method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
@@ -1359,11 +1360,11 @@ type struct TypeResolver {
         }
     }
 
-    /// Create the arena TypeRef for a `GenericParamNode` at position `index`.
+    /// Create the arena TypeRef for a generic parameter at position `index`.
     /// A bound on the param is not carried here: it is written in a `where`
     /// clause on the enclosing declaration, so the arena entry is the bare
     /// `GenericParamType` and consumers needing the bound read the clause.
-    create_param_type(&this, gp: GenericParamNode*, index: u64) -> TypeRef {
+    create_param_type(&this, gp: GenericParamDecl*, index: u64) -> TypeRef {
         if (gp == null) { return TypeRef::invalid(); }
         return this.arena.create_generic_param(gp.sym_id, gp.name, index);
     }
@@ -1379,12 +1380,13 @@ type struct TypeResolver {
                              ctx: ResolutionContext*) -> [TypeRef] {
         if (entry == null) { return args; }
         if (args.length >= entry.param_count) { return args; }
-        const params: [GenericParamNode*] = entry.get_generic_params();
+        const params: [DeclarationNode*] = entry.get_generic_params();
         const start: i64 = args.length;
         mut filled: [TypeRef] = args;
         for (mut i: i64 = start; i < entry.param_count; i++) {
             if (i >= params.length) { return filled; }
-            const gp: GenericParamNode* = params[i];
+            const gp_decl: DeclarationNode* = params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null || !gp.has_default_annotation()) { return filled; }
             // A default annotation (`struct String<A = GlobalAlloc>`) is syntax
             // written in the TEMPLATE'S module and carries that module's answer
@@ -1451,7 +1453,8 @@ type struct TypeResolver {
             if (func.is_generic()) {
                 mut method_ctx: ResolutionContext = res_ctx.clone();
                 for (mut j: i64 = 0; j < func.generic_params.length; j++) {
-                    const gp: GenericParamNode* = func.generic_params[j];
+                    const gp_decl: DeclarationNode* = func.generic_params[j];
+                    const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
                     method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
@@ -1535,10 +1538,11 @@ type struct TypeResolver {
         const entry: TemplateEntry* =
             this.generic_registry.template_of_type(ty);
         if (entry == null || entry.param_count <= 0) { return ty; }
-        const params: [GenericParamNode*] = entry.get_generic_params();
+        const params: [DeclarationNode*] = entry.get_generic_params();
         if (params.length < entry.param_count) { return ty; }
         for (mut i: i64 = 0; i < entry.param_count; i++) {
-            const gp: GenericParamNode* = params[i];
+            const gp_decl: DeclarationNode* = params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null || !gp.has_default_annotation()) { return ty; }
         }
         // The defaults carry their own stamps; this context holds nothing but
@@ -1559,10 +1563,12 @@ type struct TypeResolver {
         const entry: TemplateEntry* = this.generic_registry.template_of(
             this.generic_registry.wellknown(LangItem::Array));
         if (entry == null || entry.param_count != 2) { return; }
-        const params: [GenericParamNode*] = entry.get_generic_params();
-        if (params.length != 2 || params[1] == null || !params[1].has_default_annotation()) { return; }
+        const params: [DeclarationNode*] = entry.get_generic_params();
+        if (params.length != 2) { return; }
+        const alloc_param: GenericParamDecl* = DeclarationNode::generic_param_of(params[1]);
+        if (alloc_param == null || !alloc_param.has_default_annotation()) { return; }
         mut ctx: ResolutionContext = ResolutionContext::new("");
-        const alloc: TypeRef = this.resolve(params[1].default_annotation, &ctx);
+        const alloc: TypeRef = this.resolve(alloc_param.default_annotation, &ctx);
         if (!alloc.is_valid()) { return; }
         this.arena.set_dynamic_array_shape(entry.base_type, alloc);
     }

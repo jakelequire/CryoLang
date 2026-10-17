@@ -50,7 +50,7 @@ import std::fmt;
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDecl, EnumDeclNode,
-    EnumVariant, FieldDecl, FunctionDeclNode, GenericParamNode,
+    EnumVariant, FieldDecl, FunctionDeclNode, GenericParamDecl,
     DeclKind, ImplBlockNode, MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDecl, UnionDeclNode, VarDeclNode
 };
@@ -150,21 +150,22 @@ type struct TypeResolutionRunner {
 
     // Generic context helpers
 
-    /// For each GenericParamNode, creates a GenericParamType in the arena and
+    /// For each generic parameter, creates a GenericParamType in the arena and
     /// adds a binding (e.g., T -> GenericParamType(T, 0)) to the resolution context.
-    bind_generic_params(&this, generic_params: &[GenericParamNode*],
+    bind_generic_params(&this, generic_params: &[DeclarationNode*],
                         res_ctx: ResolutionContext*) -> void {
         const refs: [TypeRef] = TypeResolutionPasses::create_generic_param_types(
             generic_params, this.arena);
         for (mut i: i64 = 0; i < generic_params.length; i++) {
-            const gp: GenericParamNode* = generic_params[i];
+            const gp_decl: DeclarationNode* = generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             res_ctx.add_binding(gp.sym_id, gp.name, refs[i]);
         }
     }
 
     /// If `generic_params` is non-empty, creates a copy of `base_ctx` with
     /// generic param types bound.  Otherwise returns `base_ctx` as-is.
-    make_generic_context(&this, generic_params: &[GenericParamNode*],
+    make_generic_context(&this, generic_params: &[DeclarationNode*],
                          base_ctx: ResolutionContext*) -> ResolutionContext {
         mut result: ResolutionContext = base_ctx.clone();
         if (generic_params.length > 0) {
@@ -215,7 +216,8 @@ type struct TypeResolutionRunner {
             if (ngp != nargs) { return; }
             mut written: [TypeRef] = [];
             for (mut i: i64 = 0; i < nargs; i++) {
-                const gp: GenericParamNode* = trait_decl.generic_params[i];
+                const gp_decl: DeclarationNode* = trait_decl.generic_params[i];
+                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                 if (gp == null) { continue; }
                 const arg_ty: TypeRef = this.resolver.resolve(gen.args[i], res_ctx);
                 if (!arg_ty.is_valid()) { continue; }
@@ -377,7 +379,8 @@ type struct TypeResolutionRunner {
         }
         if (impl_node.trait_arg_types.length == decl.generic_params.length) {
             for (mut gi: i64 = 0; gi < decl.generic_params.length; gi++) {
-                const gp: GenericParamNode* = decl.generic_params[gi];
+                const gp_decl: DeclarationNode* = decl.generic_params[gi];
+                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                 if (gp == null) { continue; }
                 terms.subst.add(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64),
                                 impl_node.trait_arg_types[gi]);
@@ -412,8 +415,10 @@ type struct TypeResolutionRunner {
             const tm: FunctionDeclNode* = decl.methods[slot];
             if (tm.generic_params.length == m.func.generic_params.length) {
                 for (mut gi: i64 = 0; gi < tm.generic_params.length; gi++) {
-                    const tg: GenericParamNode* = tm.generic_params[gi];
-                    const fg: GenericParamNode* = m.func.generic_params[gi];
+                    const tg_decl: DeclarationNode* = tm.generic_params[gi];
+                    const tg: GenericParamDecl* = DeclarationNode::generic_param_of(tg_decl);
+                    const fg_decl: DeclarationNode* = m.func.generic_params[gi];
+                    const fg: GenericParamDecl* = DeclarationNode::generic_param_of(fg_decl);
                     if (tg == null || fg == null) { continue; }
                     terms.subst.add(this.arena.create_generic_param(tg.sym_id, tg.name, gi as u64),
                                     this.arena.create_generic_param(fg.sym_id, fg.name, gi as u64));
@@ -816,11 +821,12 @@ type struct TypeResolutionRunner {
 
     /// A generic declaration's own parameters, as `res_ctx` binds them: the
     /// arguments its inline methods' `This` is the declaration over.
-    decl_owner_args(&this, generic_params: &[GenericParamNode*],
+    decl_owner_args(&this, generic_params: &[DeclarationNode*],
                     res_ctx: ResolutionContext*) -> [TypeRef] {
         mut out: [TypeRef] = [];
         for (mut i: i64 = 0; i < generic_params.length; i++) {
-            const gp: GenericParamNode* = generic_params[i];
+            const gp_decl: DeclarationNode* = generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             out.push(if (gp != null) { res_ctx.lookup_binding(gp.sym_id) } else { TypeRef::invalid() });
         }
         return out;
@@ -848,7 +854,7 @@ type struct TypeResolutionRunner {
     /// runs.  Idempotent for already-resolved return/param types.
     resolve_inline_method_signatures(&this, owner: DefId,
                                      methods: &[MethodNode*],
-                                     generic_params: &[GenericParamNode*],
+                                     generic_params: &[DeclarationNode*],
                                      res_ctx: ResolutionContext*) -> void {
         const owner_ty: TypeRef = this.ctx.decl_index.type_of_def(owner);
         if (owner_ty.is_invalid()) { return; }
@@ -1306,10 +1312,10 @@ type struct TypeResolutionRunner {
 
 type struct TypeResolutionPasses {
 
-    // Shared utility: [GenericParamNode] -> [TypeRef]
+    // Shared utility: generic parameter declarations -> [TypeRef]
 
     /// Single source of truth for creating GenericParamType entries in the
-    /// arena from an array of GenericParamNode*.  Returns parallel [TypeRef]
+    /// arena from a list of generic parameter declarations.  Returns parallel [TypeRef]
     /// where refs[i] is the GenericParamType for generic_params[i].
     ///
     /// A bound on the parameter does not reach the arena entry: a bound is
@@ -1319,11 +1325,12 @@ type struct TypeResolutionPasses {
     /// Used by:
     ///   - TypeResolutionRunner::bind_generic_params()
     ///   - SpecializationPasses::run_template_registration()
-    static create_generic_param_types(generic_params: &[GenericParamNode*],
+    static create_generic_param_types(generic_params: &[DeclarationNode*],
                                       arena: TypeArena*) -> [TypeRef] {
         mut refs: [TypeRef] = [];
         for (mut i: i64 = 0; i < generic_params.length; i++) {
-            const gp: GenericParamNode* = generic_params[i];
+            const gp_decl: DeclarationNode* = generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             refs.push(arena.create_generic_param(gp.sym_id, gp.name, i as u64));
         }
         return refs;
@@ -1933,7 +1940,7 @@ type struct TypeResolutionPasses {
         if (written_count == tmpl.param_count) { return; }
 
         const target: string = intern.resolve(node.target_type);
-        const tmpl_params: [GenericParamNode*] = tmpl.get_generic_params();
+        const tmpl_params: [DeclarationNode*] = tmpl.get_generic_params();
 
         // The head as the writer would spell it with every parameter named:
         // its own parameters first, then the template's missing ones under the
@@ -1941,7 +1948,7 @@ type struct TypeResolutionPasses {
         mut own_params: string = "";
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
             if (i > 0) { own_params = own_params + ", "; }
-            own_params = own_params + intern.resolve(node.generic_params[i].name);
+            own_params = own_params + intern.resolve(DeclarationNode::generic_param_of(node.generic_params[i]).name);
         }
         mut head_params: string = own_params;
         mut target_args: string = "";
@@ -1952,15 +1959,16 @@ type struct TypeResolutionPasses {
         mut concrete_args: string = target_args;
         mut all_defaulted: boolean = true;
         for (mut i: i64 = written_count; i < tmpl_params.length; i++) {
-            const pname: string = intern.resolve(tmpl_params[i].name);
+            const tp: GenericParamDecl* = DeclarationNode::generic_param_of(tmpl_params[i]);
+            const pname: string = intern.resolve(tp.name);
             if (head_params.length() > 0) { head_params = head_params + ", "; }
             head_params = head_params + pname;
             if (target_args.length() > 0) { target_args = target_args + ", "; }
             target_args = target_args + pname;
             if (concrete_args.length() > 0) { concrete_args = concrete_args + ", "; }
-            if (tmpl_params[i].has_default_annotation()) {
+            if (tp.has_default_annotation()) {
                 concrete_args = concrete_args + TypeAnnotation::spell(
-                    tmpl_params[i].default_annotation, intern);
+                    tp.default_annotation, intern);
             } else {
                 concrete_args = concrete_args + "..";
                 all_defaulted = false;
@@ -2306,7 +2314,8 @@ type struct TypeResolutionPasses {
     static impl_param_position(node: ImplBlockNode*, sym: SymbolID) -> i64 {
         if (node == null || !sym.is_valid()) { return -1; }
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            const gp: GenericParamNode* = node.generic_params[i];
+            const gp_decl: DeclarationNode* = node.generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp != null && gp.sym_id.equals(sym)) { return i; }
         }
         return -1;
@@ -2511,7 +2520,8 @@ type struct TypeResolutionPasses {
         mut trait_param_syms: [SymbolID] = [];
         if (arg_count == trait_decl.generic_params.length) {
             for (mut gi: i64 = 0; gi < trait_decl.generic_params.length; gi++) {
-                const gp: GenericParamNode* = trait_decl.generic_params[gi];
+                const gp_decl: DeclarationNode* = trait_decl.generic_params[gi];
+                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                 if (gp == null) {
                     trait_param_syms = [];
                     break;
@@ -3002,7 +3012,7 @@ type struct TypeResolutionPasses {
                         }
                         DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Variant(_)
                         | DeclKind::Destructure(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
-                        | DeclKind::Legacy => {}
+                        | DeclKind::GenericParam(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {
@@ -3806,7 +3816,8 @@ type struct TypeResolutionPasses {
                     const refs: [TypeRef] = TypeResolutionPasses::create_generic_param_types(
                         node.generic_params, arena);
                     for (mut gpi: i64 = 0; gpi < node.generic_params.length; gpi++) {
-                        const gp: GenericParamNode* = node.generic_params[gpi];
+                        const gp_decl: DeclarationNode* = node.generic_params[gpi];
+                        const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                         if (gp == null) { continue; }
                         res_ctx.add_binding(gp.sym_id, gp.name, refs[gpi]);
                     }

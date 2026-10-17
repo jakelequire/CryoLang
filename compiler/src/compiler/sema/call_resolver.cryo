@@ -59,7 +59,7 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, DefKind, FamilyOwner, Res, ResBase, ResSlot };
 import compiler::decl_index::{ OverloadId };
 import compiler::ast::declaration::{
-    ClassDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
+    ClassDeclNode, FunctionDeclNode, DeclarationNode, GenericParamDecl, ImplBlockNode, MethodNode,
     StructDeclNode, TraitDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -2141,7 +2141,8 @@ type struct CallResolver {
         // (`Array<T>`, `Option<T>`) for free.
         mut pctx: ResolutionContext = owner_ctx.clone();
         for (mut i: i64 = 0; i < n_method_params; i++) {
-            const gp: GenericParamNode* = orig_func.generic_params[i];
+            const gp_decl: DeclarationNode* = orig_func.generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { return out; }
             pctx.add_binding(gp.sym_id, gp.name, bindings[i]);
         }
@@ -3970,7 +3971,8 @@ type struct CallResolver {
         if (f == null || f.generic_params.length != call.resolved_type_args.length) { return ret; }
         mut view: TypeSubstitution = TypeSubstitution::empty();
         for (mut i: i64 = 0; i < f.generic_params.length; i++) {
-            const gp: GenericParamNode* = f.generic_params[i];
+            const gp_decl: DeclarationNode* = f.generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { return ret; }
             view.add(this.ctx.type_resolver.create_param_type(gp, i as u64), call.resolved_type_args[i]);
         }
@@ -4340,7 +4342,8 @@ type struct CallResolver {
         if (decl.length != params.length) { return sema_copy_type_refs(params); }
         mut pids: [TypeRef] = [];
         for (mut i: i64 = 0; i < func.generic_params.length; i++) {
-            const gp: GenericParamNode* = func.generic_params[i];
+            const gp_decl: DeclarationNode* = func.generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { return sema_copy_type_refs(params); }
             pids.push(this.symbolic.symbolic_param_ref(gp, i as u64));
         }
@@ -4619,7 +4622,8 @@ type struct CallResolver {
                 if (!n.param_sym().is_valid()) { return; }
                 if (this.trait_checker().lookup_subst_for_param(n.param_sym(), view).is_valid()) { return; }
                 for (mut gi: i64 = 0; gi < block.generic_params.length; gi++) {
-                    const gp: GenericParamNode* = block.generic_params[gi];
+                    const gp_decl: DeclarationNode* = block.generic_params[gi];
+                    const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                     if (gp == null || !gp.sym_id.equals(n.param_sym())) { continue; }
                     view.add(this.symbolic.symbolic_param_ref(gp, gi as u64), concrete);
                     return;
@@ -4764,7 +4768,8 @@ type struct CallResolver {
         }
         mut pids: [TypeRef] = [];
         for (mut i: i64 = 0; i < n_own; i++) {
-            const gp: GenericParamNode* = func.generic_params[i];
+            const gp_decl: DeclarationNode* = func.generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { return false; }
             pids.push(this.symbolic.symbolic_param_ref(gp, i as u64));
         }
@@ -5990,7 +5995,7 @@ type struct CallResolver {
         const node: MethodNode* = this.ctx.decl_index.entry_method(entry);
         const sig: TypeRef = this.ctx.decl_index.entry_signature(entry);
         if (node == null || node.func == null || !sig.is_valid()) { return TypeRef::invalid(); }
-        const gps: &[GenericParamNode*] = &node.func.generic_params;
+        const gps: &[DeclarationNode*] = &node.func.generic_params;
         if (gps.length == 0) {
             if (written.length == 0 && expected.is_valid() && sig.equals(expected)) { return sig; }
             return TypeRef::invalid();
@@ -6004,7 +6009,7 @@ type struct CallResolver {
             mut handle: TypeRef = TypeRef::invalid();
             for (mut k: i64 = 0; k < named.length; k++) {
                 const gt: Type* = this.arena.lookup(named[k]);
-                if (gt != null && gt.as_generic_param().param_sym.equals(gps[i].sym_id)) { handle = named[k]; }
+                if (gt != null && gt.as_generic_param().param_sym.equals(DeclarationNode::generic_param_of(gps[i]).sym_id)) { handle = named[k]; }
             }
             handles.push(handle);
             bindings.push(if (i < written.length) { written[i] } else { TypeRef::invalid() });
@@ -6224,7 +6229,8 @@ type struct CallResolver {
         mut syms: [SymbolID] = [];
         mut bindings: [TypeRef] = [];
         for (mut i: i64 = 0; i < node.func.generic_params.length; i++) {
-            const gp: GenericParamNode* = node.func.generic_params[i];
+            const gp_decl: DeclarationNode* = node.func.generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             mut handle: TypeRef = TypeRef::invalid();
             for (mut k: i64 = 0; k < named.length; k++) {
                 const gt: Type* = this.arena.lookup(named[k]);
@@ -6303,7 +6309,7 @@ type struct CallResolver {
         }
         for (mut i: i64 = 0; i < bindings.length; i++) {
             if (bindings[i].is_valid()) { continue; }
-            this.report_uninferable_value(this.intern.resolve(node.func.generic_params[i].name),
+            this.report_uninferable_value(this.intern.resolve(DeclarationNode::generic_param_of(node.func.generic_params[i]).name),
                 shown, with_args, scope.span);
             return TypeRef::invalid();
         }
@@ -6435,7 +6441,7 @@ type struct CallResolver {
                 mut handle: TypeRef = owner_entry.param_types[i];
                 for (mut k: i64 = 0; k < named.length; k++) {
                     const gt: Type* = this.arena.lookup(named[k]);
-                    if (gt != null && gt.as_generic_param().param_sym.equals(block.generic_params[i].sym_id)) {
+                    if (gt != null && gt.as_generic_param().param_sym.equals(DeclarationNode::generic_param_of(block.generic_params[i]).sym_id)) {
                         handle = named[k];
                     }
                 }
@@ -7188,7 +7194,8 @@ type struct CallResolver {
         const binds: [TypeRef] = this.binding.solve_method_bindings_at(m.func, &ctx, targs, call, 1);
         if (binds.length != m.func.generic_params.length) { return ctx; }
         for (mut i: i64 = 0; i < binds.length; i++) {
-            const gp: GenericParamNode* = m.func.generic_params[i];
+            const gp_decl: DeclarationNode* = m.func.generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { return ctx; }
             ctx.add_binding(gp.sym_id, gp.name, binds[i]);
         }
@@ -7594,7 +7601,8 @@ type struct CallResolver {
         if (!this.owner_param_handles(tmpl, m, &named, &tparams)) { return false; }
         *out = TypeSubstitution::from_params(&tparams, owner_args);
         for (mut i: i64 = 0; i < func.generic_params.length; i++) {
-            const gp: GenericParamNode* = func.generic_params[i];
+            const gp_decl: DeclarationNode* = func.generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { return false; }
             out.add(this.arena.create_generic_param(gp.sym_id, gp.name, i as u64), method_args[i]);
         }
@@ -7628,7 +7636,8 @@ type struct CallResolver {
         if (n == 0) { return empty; }
         mut pids: [TypeRef] = [];
         for (mut i: i64 = 0; i < n; i++) {
-            const gp: GenericParamNode* = func.generic_params[i];
+            const gp_decl: DeclarationNode* = func.generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { return empty; }
             const pref: TypeRef = this.arena.create_generic_param(gp.sym_id, gp.name, i as u64);
             pids.push(pref);
@@ -7669,7 +7678,7 @@ type struct CallResolver {
         // `make<F, R>(fut: F) -> R where F: Future<R>`) projects off its now-bound
         // subject; `ictx.bindings[i]` is index-aligned with `func.generic_params[i]`.
         mut method_syms_d: [SymbolID] = [];
-        for (mut i: i64 = 0; i < n; i++) { method_syms_d.push(func.generic_params[i].sym_id); }
+        for (mut i: i64 = 0; i < n; i++) { method_syms_d.push(DeclarationNode::generic_param_of(func.generic_params[i]).sym_id); }
         this.ctx.type_resolver.project_where_bound_params_into(
             &func.trait_bounds, &method_syms_d, &ictx, this.ctx.source_file,
             this.state.in_symbolic_check);

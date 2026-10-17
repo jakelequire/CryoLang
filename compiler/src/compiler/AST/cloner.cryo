@@ -24,7 +24,7 @@ import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDeclNode,
-    EnumVariant, ExternBlock, FieldDecl, FunctionDeclNode, GenericParamNode,
+    EnumVariant, ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl,
     DeclKind, ImplBlockNode, ImportDecl, IntrinsicConstDecl, IntrinsicDecl, MethodNode,
     ModuleDecl, StructDeclNode, TraitDeclNode, TypeAliasDecl, UnionDeclNode,
     VarDeclNode
@@ -155,7 +155,6 @@ type struct ASTCloner {
             NodeKind::TraitDeclaration          => { return this.visit_trait(n as TraitDeclNode*); }
             NodeKind::EnumDeclaration           => { return this.visit_enum(n as EnumDeclNode*); }
             NodeKind::ImplementationBlock       => { return this.visit_impl(n as ImplBlockNode*); }
-            NodeKind::GenericParamDeclaration   => { return this.visit_generic_param(n as GenericParamNode*); }
 
             NodeKind::MatchArm                  => { return this.visit_match_arm(n as MatchArmNode*); }
             NodeKind::StaticMatchArm            => { return this.visit_static_match_arm(n as StaticMatchArmNode*); }
@@ -782,7 +781,7 @@ type struct ASTCloner {
         }
         if (!skip_gp) {
             for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
             }
         }
         // A copy owns its bounds as it owns its parameters: a bound's
@@ -870,6 +869,15 @@ type struct ASTCloner {
                 // resolved_type left invalid, as `new` leaves it
                 DeclKind::Field(c)
             }
+            DeclKind::GenericParam(n) => {
+                const c: GenericParamDecl* = GenericParamDecl::new(n.name);
+                // The template's symbol, as every `Res` in the body is the template's.
+                c.sym_id = n.sym_id;
+                if (n.default_annotation != null) {
+                    c.default_annotation = this.clone_type_annotation(n.default_annotation);
+                }
+                DeclKind::GenericParam(c)
+            }
             DeclKind::Import(n) => {
                 // The path segments and private export entries are not copied.
                 const c: ImportDecl* = ImportDecl::new(n.module_path, n.style);
@@ -914,7 +922,7 @@ type struct ASTCloner {
                 // `new` leaves them.
                 const c: TypeAliasDecl* = TypeAliasDecl::new(n.alias_name);
                 for (mut i: i64 = 0; i < n.generic_params.length; i++) {
-                    c.generic_params.push(this.clone_generic_param(n.generic_params[i]));
+                    c.generic_params.push(this.copy_decl_shape(n.generic_params[i]));
                 }
                 if (n.target_annotation != null) {
                     c.target_annotation = this.clone_type_annotation(n.target_annotation);
@@ -959,7 +967,7 @@ type struct ASTCloner {
         c.where_bounds     = node.where_bounds;
         if (!skip_gp) {
             for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
             }
         }
         for (mut i: i64 = 0; i < node.fields.length; i++) {
@@ -993,7 +1001,7 @@ type struct ASTCloner {
         c.binding_namespace = node.binding_namespace;
         if (!skip_gp) {
             for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
             }
         }
         for (mut i: i64 = 0; i < node.fields.length; i++) {
@@ -1022,7 +1030,7 @@ type struct ASTCloner {
         c.base_span  = node.base_span;
         if (!skip_gp) {
             for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
             }
         }
         for (mut i: i64 = 0; i < node.fields.length; i++) {
@@ -1038,7 +1046,7 @@ type struct ASTCloner {
         mut c: TraitDeclNode* = new TraitDeclNode(node.name, node.span);
         this.copy_decl_base(node, c);
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+            c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             c.add_method(this.clone_func_decl(node.methods[i]));
@@ -1062,7 +1070,7 @@ type struct ASTCloner {
         c.where_bounds  = node.where_bounds;
         if (!skip_gp) {
             for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
             }
         }
         if (node.discriminant_annotation != null) {
@@ -1078,7 +1086,7 @@ type struct ASTCloner {
         mut c: ImplBlockNode* = new ImplBlockNode(node.target_type, node.span);
         this.copy_decl_base(node, c);
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+            c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
         }
         if (node.trait_annotation != null) {
             c.set_trait_annotation(this.clone_type_annotation(node.trait_annotation));
@@ -1126,10 +1134,6 @@ type struct ASTCloner {
     }
 
 
-    visit_generic_param(mut &this, node: GenericParamNode*) -> ASTNode* {
-        const c: GenericParamNode* = this.clone_generic_param(node);
-        return c;
-    }
 
 
     // Other visitors
@@ -1291,7 +1295,7 @@ type struct ASTCloner {
             c.add_parameter(this.clone_var_decl(node.parameters[i]));
         }
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+            c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
         }
         // A copy owns its bounds as it owns its parameters: a bound's
         // projection subject caches what it resolved to in its own
@@ -1306,18 +1310,6 @@ type struct ASTCloner {
             c.set_body(this.copy_stmt(node.body));
         }
         // resolved_return_type left as TypeRef::invalid() (constructor default)
-        return c;
-    }
-
-    /// Clone a GenericParamNode.
-    clone_generic_param(mut &this, node: GenericParamNode*) -> GenericParamNode* {
-        mut c: GenericParamNode* = new GenericParamNode(node.name, node.span);
-        this.copy_decl_base(node, c);
-        // The template's symbol, as every `Res` in the body is the template's.
-        c.set_sym_id(node.sym_id);
-        if (node.default_annotation != null) {
-            c.set_default_annotation(this.clone_type_annotation(node.default_annotation));
-        }
         return c;
     }
 
