@@ -195,6 +195,91 @@ yet is recorded with the change that builds it, not here.
      refuses it.  `Location` is read-only to programs: the standard
      library's visibility pass closes construction.  (Jake)
 
+415. **Borrowed trait objects are built after the class feature is
+     deleted,** not before it as ruling 384 had it.  The table emission
+     copies the few dozen lines of the class vtable code it needs rather
+     than sharing code with the class path, which is deleted.  (Jake, on
+     the trait-object audit)
+
+416. **A trait object's type is a type kind of its own,** not a pointer or
+     reference to a trait.  (Jake, on the trait-object audit)
+
+417. **A method is callable on a trait object only if `This`, the
+     concrete type, appears in its signature as the receiver alone.**  Any
+     other use of `This` - a parameter, a return, a type argument - makes
+     that method unavailable on the object; the trait is still usable as an
+     object through its other methods.  (Jake, on the trait-object audit)
+
+418. **Every trait-object table starts with three reserved words: drop,
+     size and alignment,** before any method slot, so owning boxes after
+     v1.0 need no change to the table's shape.  (Jake, on the trait-object
+     audit)
+
+419. **A table holds the supertraits' slots first,** then the trait's own
+     methods.  (Jake, on the trait-object audit)
+
+420. **A table is emitted in the module that holds the implementation** of
+     the trait for the type.  (Jake, on the trait-object audit)
+
+421. **The trait-object codes and symbol:** E0314, a method unavailable on
+     an object; E0315, a conversion to an object whose type does not
+     implement the trait, or implements it generically; E0316, `virtual`
+     written on something that is not a trait, or an object in an
+     `extern` signature.  A table's symbol is `C$vt$<trait>$f<type>`.
+     (Jake, on the trait-object audit)
+
+422. **A trait's associated types are bound positionally in an object
+     type,** as type arguments in declaration order: `virtual mut
+     &Iterator<i32>`.  (Jake, on the trait-object audit)
+
+423. **Printing goes through objects by a non-generic formatting method**
+     taking a `virtual mut &FmtWrite` formatter, added in the standard
+     library's visibility pass.  (Jake, on the trait-object audit)
+
+424. **A trait that declares two methods with the same name is refused**
+     where the trait is declared.  (Jake, on the trait-object audit)
+
+425. **Converting a value whose trait implementation is generic to an
+     object is deferred,** and revisited before the language freeze.
+     (Jake, on the trait-object audit)
+
+426. **A raw object pointer `virtual T*` accepts `null` and compares only
+     with `== null` and `!= null`;** a borrowed object never compares.
+     (Jake, on the trait-object audit)
+
+427. **A trait object satisfies its own trait wherever the trait is
+     required.**  The compiler makes the implementation: a method without a
+     default calls through the table, and a default method is compiled
+     with `This` as the object type.  (Jake, on the trait-object audit)
+
+428. **The concrete type behind `implement Trait` in type position is
+     hidden:** only the trait's methods are visible through it.  Built in
+     the slice and API pass before v1.0.  (Jake, on the trait-object audit)
+
+429. **A function's `-> implement Trait` promise is checked at the
+     function itself,** not at its callers.  Built in the slice and API
+     pass.  (Jake, on the trait-object audit)
+
+430. **`implement Trait` in a parameter, a field, an alias or a type
+     argument is refused with a message of its own** suggesting a bounded
+     type parameter or `virtual &Trait`, instead of an unrelated error or
+     `void`.  Built in the slice and API pass.  (Jake, on the trait-object
+     audit)
+
+431. **`panic` takes a `Location` instead of separate file and line
+     arguments,** so the column and the function name reach the panic
+     message.  Built as a change of its own with a pin refresh.  (Jake, on
+     class-removal session 9's questions)
+
+432. **`Location.function` is the full qualified path of the function**
+     (`App::Main::Probe::own`); a lambda, closure or async body is named for
+     the function it is written in, a specialization for its generic.
+     (Jake, on class-removal session 9's questions)
+
+433. **The unrelated-types refusal (E0200, ruling 412) applies to every
+     comparison operator,** not only `==` and `!=`, as built.  (Jake, on
+     class-removal session 9's questions)
+
 ### 2026-10-16
 
 379. **A fixed-size array does not convert implicitly to a dynamic `[T]`:**

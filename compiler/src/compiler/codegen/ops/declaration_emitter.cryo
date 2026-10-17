@@ -133,24 +133,11 @@ type struct DeclarationEmitter {
     /// parameter its callers pass the address of their `Location` in; null
     /// for any other body.
     caller_location: LValue;
-    /// The readable qualified name of the function whose body is emitted,
-    /// the `function` of a `Location` made in it.
-    function_name: string;
-    /// The string constants a `Location` made in this function points at,
-    /// made once per function and shared by every place in it: the
-    /// function's name, and the file last asked for with its text.
-    function_name_global: LValue;
-    location_file:        string;
-    location_file_global: LValue;
 
     static null() -> DeclarationEmitter {
         return DeclarationEmitter {
             started:     StartedGlobals { nodes: [], slots: [] },
             caller_location: LValue::null(),
-            function_name:   "",
-            function_name_global: LValue::null(),
-            location_file:        "",
-            location_file_global: LValue::null(),
             llvm_module: null,
             builder:     null,
             type_mapper: null,
@@ -1622,6 +1609,18 @@ type struct DeclarationEmitter {
     /// 4. Push scope, bind parameter names
     /// 5. The visitor will visit the body (a block)
     /// 6. Handle implicit return for void functions
+    /// Enter the body of `func`, defined as `fn_val`: record its name for the
+    /// `Location`s made in it, and for a `![caller_location]` body the last
+    /// parameter, the address of its caller's `Location`.
+    open_caller_site(mut &this, fn_val: LValue, func: FunctionDeclNode*) -> void {
+        this.intrinsics.open_function(this.ctx.intern_table.shown(
+            this.ctx.defs.path_of(FunctionDeclNode::written_in_of(func))));
+        this.caller_location = LValue::null();
+        if (!func.is_caller_located) { return; }
+        const n: u32 = llvm::LLVMCountParams(fn_val.raw);
+        this.caller_location = fn_val.get_param(n - 1);
+    }
+
     /// Attach a DWARF DISubprogram to `fn_val` and set the builder's
     /// current debug location to the function's declaration line, scoped
     /// to that subprogram. Called from the prologue once the builder is at
@@ -1629,21 +1628,6 @@ type struct DeclarationEmitter {
     /// location. No-op unless `-g`. The subroutine type carries no
     /// parameter list (sufficient for function-level file:line backtraces;
     /// per-argument types and per-statement line granularity are follow-ups).
-    /// Enter the body of `func`, defined as `fn_val`: record its name, and
-    /// for a `![caller_location]` body the last parameter, the address of
-    /// its caller's `Location`.
-    open_caller_site(mut &this, fn_val: LValue, func: FunctionDeclNode*) -> void {
-        this.function_name = this.ctx.intern_table.shown(
-            this.ctx.defs.path_of(FunctionDeclNode::written_in_of(func)));
-        this.function_name_global = LValue::null();
-        this.location_file        = "";
-        this.location_file_global = LValue::null();
-        this.caller_location = LValue::null();
-        if (!func.is_caller_located) { return; }
-        const n: u32 = llvm::LLVMCountParams(fn_val.raw);
-        this.caller_location = fn_val.get_param(n - 1);
-    }
-
     emit_debug_subprogram(mut &this, fn_val: LValue, node: FunctionDeclNode*) -> void {
         const ctx_ptr: CompilationContext* = this.ctx;
         if (!this.debug_info.is_on()) { return; }

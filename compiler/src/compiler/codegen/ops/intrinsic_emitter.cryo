@@ -46,19 +46,20 @@ type struct IntrinsicEmitter {
     /// for the active target (SysV-amd64 vs Win64).
     /// Null between `null()` and `wire()`.
     abi:         AbiClassifier*;
-    /// `[compiler] no_runtime`: in a freestanding build there is no `@panic`
-    /// runtime (it prints via libc and `abort()`s), so `emit_panic_call`
-    /// routes divergent check failures through `llvm.trap` (`ud2`, no libc)
-    /// instead.  Wired from `ctx.options.freestanding()`.
+    /// `[compiler] no_runtime`: a freestanding build links no panic tier, so
+    /// `emit_panic_call` diverges through `llvm.trap` (`ud2`) instead of the
+    /// funnel.  Wired from `ctx.options.freestanding()`.
     no_runtime:  boolean;
 
-    /// `--panic=unwind`: route `emit_panic_call` to the external raising
-    /// `__cryo_panic` (linked from the `panic/unwind` runtime tier) instead of
-    /// the per-module `linkonce_odr` libc `@panic`, so a panic RAISES and the
-    /// Phase-C cleanup landing pads run as the unwind passes through their
-    /// frames.  Wired from `ctx.options.unwinds()`; false on the default
-    /// abort path keeps the emitted IR byte-identical.
-    panic_unwind: boolean;
+    /// The readable qualified name of the function whose body is emitted,
+    /// the `function` of a `Location` made in it.
+    function_name: string;
+    /// The string constants a `Location` made in this function points at,
+    /// made once per function and shared by every place in it: the
+    /// function's name, and the file last asked for with its text.
+    function_name_global: LValue;
+    location_file:        string;
+    location_file_global: LValue;
 
     static null() -> IntrinsicEmitter {
         return IntrinsicEmitter {
@@ -66,17 +67,69 @@ type struct IntrinsicEmitter {
             builder:      null,
             abi:          null,
             no_runtime:   false,
-            panic_unwind: false,
+            function_name:       "",
+            function_name_global: LValue::null(),
+            location_file:        "",
+            location_file_global: LValue::null(),
         };
     }
 
+    /// Start the body of the function named `name`: the `Location`s made
+    /// from here on name it.
+    open_function(mut &this, name: string) -> void {
+        this.function_name        = name;
+        this.function_name_global = LValue::null();
+        this.location_file        = "";
+        this.location_file_global = LValue::null();
+    }
+
+    /// `span`'s `Location` in the function being emitted: file, line,
+    /// column, function.  A constant of `lty`, the lowered
+    /// `std::core::intrinsics::Location`, or with `lty` null a literal struct
+    /// of the same layout (`runtime/abi/layout.def`), for the places that
+    /// hand one to the runtime whether or not the program declares the type.
+    location_constant(mut &this, lty: LType, span: SourceSpan) -> LValue {
+        mut file: string = span.file;
+        if (file == null || file.length() == 0) { file = "<unknown>"; }
+        if (!this.location_file_global.is_valid() || this.location_file != file) {
+            this.location_file = file;
+            this.location_file_global = this.builder.build_global_string_ptr(file, "location.file");
+        }
+        if (!this.function_name_global.is_valid()) {
+            this.function_name_global =
+                this.builder.build_global_string_ptr(this.function_name, "location.function");
+        }
+        const buf: void* = libc::malloc(32);
+        const slots: void** = buf as void**;
+        slots[0] = this.location_file_global.raw;
+        slots[1] = LType::const_int(LType::i32(), span.start_line as u64, false).raw;
+        slots[2] = LType::const_int(LType::i32(), span.start_col as u64, false).raw;
+        slots[3] = this.function_name_global.raw;
+        const init: LValue = lty.is_valid()
+            ? LType::const_named_struct(lty, buf, 4)
+            : LType::const_struct(buf, 4, false);
+        libc::free(buf);
+        return init;
+    }
+
+    /// The address of a private constant holding `span`'s `Location`, for
+    /// the runtime's panic funnel and check handlers.  Read-only data: no
+    /// code runs to build it.
+    location_global(mut &this, span: SourceSpan) -> LValue {
+        const init: LValue = this.location_constant(LType::null(), span);
+        mut g: LValue = this.llvm_module.add_global(init.type_of(), MangledName::new("panic.location"));
+        g.set_initializer(init);
+        g.set_global_constant(true);
+        g.set_linkage(LLinkage::Private);
+        return g;
+    }
+
     wire(mut &this, llvm_module: LModule*, builder: LBuilder*,
-         abi: AbiClassifier*, no_runtime: boolean, panic_unwind: boolean) -> void {
-        this.llvm_module  = llvm_module;
-        this.builder      = builder;
-        this.abi          = abi;
-        this.no_runtime   = no_runtime;
-        this.panic_unwind = panic_unwind;
+         abi: AbiClassifier*, no_runtime: boolean) -> void {
+        this.llvm_module = llvm_module;
+        this.builder     = builder;
+        this.abi         = abi;
+        this.no_runtime  = no_runtime;
     }
 
 
@@ -467,14 +520,13 @@ type struct IntrinsicEmitter {
             IntrinsicKind::Call         => { -1 }
             IntrinsicKind::TryCatch     => { -1 }
             IntrinsicKind::Location     => { -1 }
+            IntrinsicKind::Panic        => { -1 }
             IntrinsicKind::DropInPlace  => { -1 }
             IntrinsicKind::PtrDiff      => { 2 }
             IntrinsicKind::Rotl32       => { 2 }
             IntrinsicKind::Rotl64       => { 2 }
             IntrinsicKind::Rotr32       => { 2 }
             IntrinsicKind::Rotr64       => { 2 }
-            // panic(message: string, file: string, line: u32)
-            IntrinsicKind::Panic        => { 3 }
             // Atomic loads: (ptr, order) - 2 args.
             IntrinsicKind::AtomicLoadU8    => { 2 }
             IntrinsicKind::AtomicLoadU32   => { 2 }
@@ -549,6 +601,7 @@ type struct IntrinsicEmitter {
             IntrinsicKind::Call     => { LValue::null() }   // declined above
             IntrinsicKind::TryCatch => { LValue::null() }   // declined above
             IntrinsicKind::Location => { LValue::null() }   // declined above
+            IntrinsicKind::Panic    => { LValue::null() }   // declined above
             IntrinsicKind::DropInPlace => { LValue::null() }   // declined above
 
             // -- Pointer arithmetic (no auto-deref of args[0]; this
@@ -650,14 +703,6 @@ type struct IntrinsicEmitter {
             IntrinsicKind::DirentName  => { this.emit_dirent_name(args[0]) }
             IntrinsicKind::DirentType  => { this.emit_dirent_type(args[0]) }
 
-            // -- panic(msg, file, line) -> ensure @panic is declared, call
-            //    it, then build_unreachable since panic diverges.  The
-            //    dispatcher's early return in visit_call_expr bypasses
-            //    the post-call divergent-name check, so the unreachable
-            //    must be emitted here.  Returns LValue::null() (panic
-            //    returns void). --
-            IntrinsicKind::Panic       => { this.emit_panic_call(args[0], args[1], args[2]) }
-
             // -- va_arg_*(va): pluck the next variadic argument of the given
             //    width from the va_list `va` points at.  `args[0]` is the
             //    va_list pointer (the prologue's `[24 x i8]` alloca); not
@@ -727,30 +772,29 @@ type struct IntrinsicEmitter {
 
     // Per-intrinsic emission paths
 
-    /// Get-or-declare the external raising panic funnel `__cryo_panic(msg, file,
-    /// line)` (defined by the `panic/unwind` runtime tier, resolved at link).
-    /// Signature `(ptr, ptr, i32) -> void`, matching the abort funnel's call
-    /// shape; the caller emits `unreachable` after the call since it diverges.
+    /// Get-or-declare the panic funnel `__cryo_panic_at(msg, loc)`, defined by
+    /// whichever panic tier the link names (`runtime/abi/lang_items.def`):
+    /// the message and the address of a `Location`.  Typed `(ptr, ptr) ->
+    /// void`; the caller emits `unreachable` after the call since it diverges.
     get_or_decl_cryo_panic(mut &this) -> LValue {
-        mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("__cryo_panic"));
+        mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("__cryo_panic_at"));
         if (fn.is_valid()) { return fn; }
         const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const param_buf: void* = libc::malloc(24);
+        const param_buf: void* = libc::malloc(16);
         const param_slots: void** = param_buf as void**;
         param_slots[0] = ptr_ty.raw;
         param_slots[1] = ptr_ty.raw;
-        param_slots[2] = LType::i32().raw;
-        const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
+        const fty: LType = LType::function_type(LType::void_type(), param_buf, 2, false);
         libc::free(param_buf);
-        return this.llvm_module.add_function(MangledName::new("__cryo_panic"), fty);
+        return this.llvm_module.add_function(MangledName::new("__cryo_panic_at"), fty);
     }
 
-    /// Emit `call @panic(msg, file, line); unreachable`.  Ensures the
-    /// `@panic` runtime function is declared in the current module first.
-    emit_panic_call(mut &this, msg: LValue, file: LValue, line: LValue) -> LValue {
-        // Freestanding: no libc-backed `@panic` runtime.  A check failure
-        // diverges through `llvm.trap` (`ud2`/SIGILL) instead.  The message
-        // is discarded - there is nothing to print to.
+    /// Emit `call @__cryo_panic_at(msg, loc); unreachable`, `loc` the address
+    /// of a `Location`.
+    emit_panic_call(mut &this, msg: LValue, loc: LValue) -> LValue {
+        // Freestanding: no panic tier is linked.  The panic diverges through
+        // `llvm.trap` (`ud2`/SIGILL) instead, and the message is discarded -
+        // there is nothing to print to.
         if (this.no_runtime) {
             const trap_fn: LValue = this.get_or_decl_void_noarg(MangledName::new("llvm.trap"));
             if (trap_fn.is_valid()) {
@@ -760,7 +804,7 @@ type struct IntrinsicEmitter {
             this.builder.build_unreachable();
             return LValue::null();
         }
-        // Every panic goes through the external `__cryo_panic`, declared here and
+        // Every panic goes through the external funnel, declared here and
         // defined by whichever panic tier the link line names: `panic/abort`
         // prints and terminates, `panic/unwind` raises through libunwind so the
         // cleanup landing pads on the enclosing calls run as the unwind passes
@@ -768,20 +812,12 @@ type struct IntrinsicEmitter {
         // codegen one, which is why nothing here branches on it.
         const panic_fn: LValue = this.get_or_decl_cryo_panic();
         if (!panic_fn.is_valid()) { return LValue::null(); }
-        const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const param_buf: void* = libc::malloc(24);
-        const param_slots: void** = param_buf as void**;
-        param_slots[0] = ptr_ty.raw;
-        param_slots[1] = ptr_ty.raw;
-        param_slots[2] = LType::i32().raw;
-        const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
-        libc::free(param_buf);
-        const arg_buf: void* = libc::malloc(24);
+        const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(panic_fn.raw) };
+        const arg_buf: void* = libc::malloc(16);
         const arg_slots: void** = arg_buf as void**;
         arg_slots[0] = msg.raw;
-        arg_slots[1] = file.raw;
-        arg_slots[2] = line.raw;
-        this.builder.build_call(fty, panic_fn, arg_buf, 3, "");
+        arg_slots[1] = loc.raw;
+        this.builder.build_call(fty, panic_fn, arg_buf, 2, "");
         libc::free(arg_buf);
         this.builder.build_unreachable();
         return LValue::null();
@@ -1023,40 +1059,14 @@ type struct IntrinsicEmitter {
     // made every panic tier of `runtime/` fail its own acceptance check while
     // still compiling. These route the five check sites to the runtime's own
     // handlers instead, which format the operands and diverge through
-    // `__cryo_panic` (exit 101 for the abort tier, an unwind for the unwind
+    // `__cryo_panic_at` (exit 101 for the abort tier, an unwind for the unwind
     // tier — chosen by which archive is on the link line, no caller change).
-
-    /// A private constant `SourceLoc` — `{ i8* file, i32 line, i32 col }`, the
-    /// `layout.def` POD — for one check site, returning its ADDRESS.
-    ///
-    /// Passed by pointer rather than by value so neither side has to classify a
-    /// 16-byte POD by hand under two different C ABIs. Still zero-alloc: the
-    /// initializer is entirely compile-time data, so this is a `.rodata` entry,
-    /// not a runtime construction.
-    emit_source_loc_ptr(mut &this, span: SourceSpan) -> LValue {
-        mut filename: string = span.file;
-        if (filename == null || filename.length() == 0) { filename = "<unknown>"; }
-        const file: LValue = this.builder.build_global_string_ptr(filename, "srcloc.file");
-        const line: LValue = LType::const_int(LType::i32(), span.start_line as u64, false);
-        const col:  LValue = LType::const_int(LType::i32(), span.start_col as u64, false);
-
-        const buf: void* = libc::malloc(24);
-        const slots: void** = buf as void**;
-        slots[0] = file.raw;
-        slots[1] = line.raw;
-        slots[2] = col.raw;
-        const init: LValue = LType::const_struct(buf, 3, false);
-        libc::free(buf);
-
-        mut g: LValue = this.llvm_module.add_global(init.type_of(), MangledName::new("srcloc"));
-        g.set_initializer(init);
-        g.set_global_constant(true);
-        g.set_linkage(LLinkage::Private);
-        return g;
-    }
+    // The place is passed as the address of a `Location` (`location_global`),
+    // by pointer so neither side has to classify the aggregate by hand under
+    // two different C ABIs.
 
     /// Get-or-declare one of the runtime's check handlers. Every one takes the
-    /// `SourceLoc*` first and returns void (declared `-> never` on the runtime
+    /// `Location*` first and returns void (declared `-> never` on the runtime
     /// side; the caller emits the `unreachable`).  The rest of its parameters
     /// have the types of `operands`, which the caller has already widened to
     /// the handler's declared types (`lang_items.def`): an overflow's `op` is
@@ -1077,7 +1087,7 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function(name, fty);
     }
 
-    /// `call @<handler>(&srcloc, <operands...>); unreachable`.
+    /// `call @<handler>(&location, <operands...>); unreachable`.
     ///
     /// Returns false when there is no handler for this shape, so the caller can
     /// keep its previous behaviour rather than emit a call to nothing.
@@ -1085,7 +1095,7 @@ type struct IntrinsicEmitter {
                             operands: &[LValue]) -> boolean {
         const fn: LValue = this.get_or_decl_check_handler(name, operands);
         if (!fn.is_valid()) { return false; }
-        const loc: LValue = this.emit_source_loc_ptr(span);
+        const loc: LValue = this.location_global(span);
 
         const count: i64 = 1 + operands.length;
         const arg_buf: void* = libc::malloc((count * 8) as u64);

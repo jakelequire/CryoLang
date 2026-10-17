@@ -768,7 +768,26 @@ an implementation with a missing method refused; one with a mismatched
 signature refused; two traits with a same-named method dispatching to the
 right one; a default method reached through the table.
 
-### 5.4 When: B, folded in
+### 5.4 When: after the class deletion
+
+**Decided: C, after the class feature is deleted (ruling 415, superseding
+384's B).**  The table emission copies the few dozen lines of the class
+vtable code it needs (the table global, the dispatch sequence) rather than
+generalizing them and sharing them with the class path, which slice 9
+deletes; where the table in 5.1 says "reused", read "copied".  The rest of
+the design is fixed by rulings 416-427: the object type is a type kind of its
+own; `This` is allowed only as the receiver; every table starts with drop,
+size and alignment words, then the supertraits' slots, then the trait's own;
+a table is emitted in the implementation's module, as
+`C$vt$<trait>$f<type>`; E0314 (method unavailable on an object), E0315
+(the type does not implement the trait, or implements it generically, at a
+conversion), E0316 (`virtual` on a non-trait, or an object in an `extern`
+signature); associated types bound positionally (`virtual mut
+&Iterator<i32>`); `virtual T*` compares only with `null`; an object
+satisfies its own trait, its methods without a default calling through the
+table and its default methods compiled with `This` as the object type.
+
+The options as they were put:
 
 - **A) Before the AST conversion.**  Nothing in the AST needs open
   dispatch: every hierarchy is closed, and the walker is static.  Building
@@ -786,7 +805,7 @@ right one; a default method reached through the table.
   emission still works for classes until they are deleted.  Then the class
   deletion removes only what is class-specific.
 
-**Recommendation: B.**
+The recommendation was B; the decision is C, above.
 
 Dogfood: there is one genuine open-dispatch boundary in the tree, the
 compiler library's yield hook.  `yield_hook: (void*) -> void` plus a
@@ -1594,30 +1613,10 @@ committed with the change and deleted in the next commit.
   a defect today; give each one a test.
 - **Proof:** identical; selfhost.
 
-### Slice 8: borrowed trait objects
+### Slice 9: delete the class feature (built before slice 8)
 
-- **8a. Front end.**  `virtual` in type position, object safety, coercion,
-  calls, with the new codes (question 10).  Tests: unit, negative files
-  with `//~` annotations, a project.  Each test is shown to fail on the
-  slice-7 compiler.
-- **8b. Back end.**  `codegen_vtable_for_class` generalized to emit a
-  table from a list of functions; the trait table built from item
-  positions; the dispatch sequence shared; the pair layout in
-  `docs/abi.md`; the table symbol in `docs/cryo-mangling-spec.md` and the
-  demangler, with its test (ruling 359).  The class path keeps working
-  through the generalized emitter until slice 9.
-- **8c. Dogfood**, after a re-pin: the yield hook (question 11).
-- **Proof:** census with the new tests; verify declaring in
-  `tests/started-compiling` the programs E0313 refused that now compile;
-  every other object identical; selfhost; the gate pairs below.
-- **Gate pairs**, each shown on a broken tree, each refusal shown with the
-  trait-object path and absent with the class path's old behaviour:
-  - Delete a method from an implementation: the class path compiled the
-    equivalent silently; E0312 refuses.
-  - Swap two trait methods' positions in the table builder: the
-    same-name/two-traits test fails.
-
-### Slice 9: delete the class feature
+Ruling 415 orders the class deletion before trait objects; the slices keep
+their numbers so the references to "slice 9" elsewhere stay true.
 
 - **Refused syntax.**  `type class`, `virtual` and `override` as member
   modifiers, `protected:`, base lists, base-constructor initializers, the
@@ -1634,6 +1633,35 @@ committed with the change and deleted in the next commit.
   port, not by the compiler.  Selfhost; lsp-check; cross-check.
 - **Gate pair:** the old compiler accepts `type class A {}`; the new one
   refuses it with the new code.
+
+### Slice 8: borrowed trait objects (after slice 9)
+
+- **8a. Front end.**  `virtual` in type position as a type kind of its own
+  (416), object safety with `This` only as the receiver (417), conversion,
+  calls, associated types bound positionally (422), `null` comparison for
+  `virtual T*` only (426), an object satisfying its own trait (427), with
+  E0314-E0316 (421).  Tests: unit, negative files with `//~` annotations, a
+  project.  Each test is shown to fail on the slice-9 compiler.
+- **8b. Back end.**  The table global and the dispatch sequence copied
+  from the deleted class vtable code (415); the table built from item
+  positions, with the drop, size and alignment words first (418) and the
+  supertraits' slots before the trait's own (419), emitted in the
+  implementation's module (420); the pair layout in `docs/abi.md`; the
+  table symbol `C$vt$<trait>$f<type>` in `docs/cryo-mangling-spec.md` and
+  the demangler, with its test (ruling 359).
+- **8c. Dogfood**, after a re-pin: the yield hook (question 11), and the
+  non-generic formatting method over `virtual mut &FmtWrite` in the
+  standard library's visibility pass (423).
+- **Proof:** census with the new tests; verify declaring in
+  `tests/started-compiling` the programs E0313 refused that now compile;
+  every other object identical; selfhost; the gate pairs below.
+- **Gate pairs**, each shown on a broken tree:
+  - Delete a method from an implementation: E0312 refuses (the deleted
+    class path compiled the equivalent silently; the slice-9 compiler is
+    no control, so the pair is the refusal and its absence with the check
+    disabled).
+  - Swap two trait methods' positions in the table builder: the
+    same-name/two-traits test fails.
 
 ### Slice 10: docs (in each slice's own commit, listed here so nothing is missed)
 
@@ -1657,8 +1685,8 @@ committed with the change and deleted in the next commit.
    the trait-slot tables, and the language server's identity handlers.
 2. **Slice 6, the async lowering's group**: 7,157 lines, 383 `NodeKind`
    references, restructuring trees in place.
-3. **Slice 8b**: the generalized emitter is shared with the class path
-   until slice 9, and a miscompile of dispatch that reproduces itself is
+3. **Slice 8b**: the table emission is copied code with no class tests left
+   to exercise it, and a miscompile of dispatch that reproduces itself is
    invisible to selfhost.  The trait-object tests must run programs, not
    only compile them.
 4. **Slice 2**: a default traversal that visits a child the old visitor
@@ -1738,14 +1766,14 @@ group finds an identity defect, as the naming migration's groups did.
 |---|---|
 | 1 | A: a header struct with a `kind` enum of per-kind struct pointers (382) |
 | 2 | A: one small `Allocate` implementation per node struct (383) |
-| 3 | B: folded in, after the compiler is class-free and before the class feature is deleted, reusing the class vtable code (384) |
+| 3 | B: folded in, after the compiler is class-free and before the class feature is deleted, reusing the class vtable code (384); superseded by C, after the class deletion, with the table code copied (415) |
 | 4 | A for declarations and expressions, B for patterns and statements; the bridge is deleted at the end of each category and tracked in section 10 until it is (385) |
 | 5 | A: class-feature tests deleted, incidental users ported to structs (386) |
 | 6 | A: removed with classes, after measuring their use (387) |
 | 7 | A: one new code, a help line per form; the code and wording are proposed in a report first (388) |
 | 8 | A: a separate commit after the dispatch change (389) |
 | 9 | B, as a follow-up after slice 4 (390) |
-| 10 | the implementing agent's call, reported (391) |
+| 10 | the implementing agent's call, reported (391); settled as E0314-E0316 and `C$vt$<trait>$f<type>` (421) |
 | 11 | A: the yield hook becomes `virtual YieldHook*` (392) |
 | 12 | A: supertrait methods callable directly on the object (393) |
 | 13 | A: `protected` removed (394) |

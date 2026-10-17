@@ -131,12 +131,6 @@ type struct CallEmitter {
     }
 
 
-    /// Produce the ADDRESS of a value for auto-ref (a by-value argument
-    /// passed to a `&T` parameter).  When `v` is a `load` instruction we
-    /// recover its pointer operand - the original lvalue's address - so a
-    /// `&mut` borrow sees the caller's storage.  Otherwise (rvalue: a
-    /// literal, a global like a string constant, a computed value) we spill
-    /// it to a fresh stack slot and return that slot's address.
     /// Append the location a `![caller_location]` callee reports as its
     /// caller's: the address of `span`'s `Location`, the call's own, or -
     /// inside such a function itself - the address its own caller passed,
@@ -156,7 +150,7 @@ type struct CallEmitter {
                 LType::const_pointer_null(LType::pointer_to(LType::i8())), ptr_ty));
             return;
         }
-        const init: LValue = this.location_constant(lty, span);
+        const init: LValue = this.cg.intrinsics.location_constant(lty, span);
         mut g: LValue = this.cg.llvm_module.add_global(lty, MangledName::new("caller.location"));
         g.set_initializer(init);
         g.set_global_constant(true);
@@ -171,7 +165,7 @@ type struct CallEmitter {
         if (this.cg.decl.caller_location.is_valid()) {
             return this.cg.builder.build_load(lty, this.cg.decl.caller_location, "caller.location");
         }
-        return this.location_constant(lty, node.span);
+        return this.cg.intrinsics.location_constant(lty, node.span);
     }
 
     /// The lowered `Location`, or an invalid type when the program does not
@@ -182,35 +176,17 @@ type struct CallEmitter {
         return this.cg.type_mapper.map_type(this.cg.ctx.decl_index.type_of_def(def));
     }
 
-    /// `span`'s `Location` in the function being emitted, a constant of
-    /// `lty`, the lowered `Location`: file, line, column, function.
-    location_constant(mut &this, lty: LType, span: SourceSpan) -> LValue {
-        mut file: string = span.file;
-        if (file == null || file.length() == 0) { file = "<unknown>"; }
-        if (!this.cg.decl.location_file_global.is_valid() || this.cg.decl.location_file != file) {
-            this.cg.decl.location_file = file;
-            this.cg.decl.location_file_global = this.cg.builder.build_global_string_ptr(file, "location.file");
-        }
-        if (!this.cg.decl.function_name_global.is_valid()) {
-            this.cg.decl.function_name_global =
-                this.cg.builder.build_global_string_ptr(this.cg.decl.function_name, "location.function");
-        }
-        const buf: void* = libc::malloc(32);
-        const slots: void** = buf as void**;
-        slots[0] = this.cg.decl.location_file_global.raw;
-        slots[1] = LType::const_int(LType::i32(), span.start_line as u64, false).raw;
-        slots[2] = LType::const_int(LType::i32(), span.start_col as u64, false).raw;
-        slots[3] = this.cg.decl.function_name_global.raw;
-        const init: LValue = LType::const_named_struct(lty, buf, 4);
-        libc::free(buf);
-        return init;
-    }
-
     /// Stack slot for a value spilled so its address can be taken.
     entry_spill_slot(&this, ty: LType, name: string) -> LValue {
         return this.cg.flow.temp_slot(ty, name);
     }
 
+    /// Produce the ADDRESS of a value for auto-ref (a by-value argument
+    /// passed to a `&T` parameter).  When `v` is a `load` instruction we
+    /// recover its pointer operand - the original lvalue's address - so a
+    /// `&mut` borrow sees the caller's storage.  Otherwise (rvalue: a
+    /// literal, a global like a string constant, a computed value) we spill
+    /// it to a fresh stack slot and return that slot's address.
     address_of_value(&this, v: LValue) -> LValue {
         // LLVMOpcode::Load == 27.  On non-instruction values (globals,
         // constants) GetInstructionOpcode won't return 27, so we fall
@@ -1154,17 +1130,6 @@ type struct CallEmitter {
             visitor, &node.unwind_cleanup, cur_fn, lpad_bb);
     }
 
-    /// Direct-panic origin under `--panic=unwind`: emit the raising
-    /// `__cryo_panic(msg,file,line)` funnel as an `invoke` into a cleanup
-    /// landing pad that drops the frame's live locals (innermost-first) before
-    /// the unwind continues, then `resume`s.  Without this the panic intrinsic
-    /// lowers to a plain `call` (`emit_panic_call`) that bypasses the ordinary
-    /// call's invoke-swap, so a droppable local live at the panic point leaks.
-    /// Reuses `node.unwind_cleanup` (DropInsertion populates it for EVERY call,
-    /// panic included).  Only taken when the frame has live droppable locals and
-    /// the hosted raising funnel applies; the plain-call fast-path (empty
-    /// schedule / abort mode / freestanding trap) stays byte-identical through
-    /// `emit_panic_call`.
     /// The kind of the INTRINSIC a call is pinned to, or `Call` when the
     /// call is a function call.  The pin decides, by the kind the
     /// intrinsic's registration put on its entry: any other pin - the
@@ -1196,6 +1161,9 @@ type struct CallEmitter {
         if (kind == IntrinsicKind::Location) {
             return Option::Some(Emitted::rvalue(this.emit_location(node)));
         }
+        if (kind == IntrinsicKind::Panic) {
+            return Option::Some(this.emit_panic(visitor, node));
+        }
         // `args` is scoped to this call: it is built and moved into
         // `try_emit` unconditionally, so nothing is left conditionally
         // moved past the if.
@@ -1203,33 +1171,83 @@ type struct CallEmitter {
         for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
             args.push(this.dispatch.codegen_rvalue(visitor, node.arguments[ai]));
         }
-        // `--panic=unwind` direct-panic drop-completeness: route the panic
-        // funnel through an invoke + cleanup landing pad so the frame's live
-        // droppable locals drop on unwind (the plain-call `emit_panic_call`
-        // path bypasses the invoke-swap and leaks them).  Gated on a hosted
-        // unwind build WITH live locals; every other case falls through to
-        // the byte-identical `try_emit` plain-call path below.
-        if (kind == IntrinsicKind::Panic
-            && this.cg.ctx.options.unwinds()
-            && !this.cg.intrinsics.no_runtime
-            && (node.unwind_cleanup.length > 0
-                || this.cg.expr_ops.has_live_arg_temps())
-            && args.length >= 3) {
-            return Option::Some(this.emit_panic_unwind(visitor, node, args[0], args[1], args[2]));
-        }
         return match (this.cg.intrinsics.try_emit(kind, args)) {
             Option::Some(v) => { Option::Some(Emitted::rvalue(v)) }
             Option::None    => { Option::None }
         };
     }
 
+    /// `intrinsics::panic(message, loc)`: the funnel, given the message and
+    /// the address of `loc`.  The three-argument form `panic(message, file,
+    /// line)`, which a standard library older than the `Location` parameter
+    /// writes, reaches it with a `Location` built from the two parts.
+    emit_panic(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> Emitted {
+        const msg: LValue = this.dispatch.codegen_rvalue(visitor, node.arguments[0]);
+        mut loc: LValue = LValue::null();
+        if (node.arguments.length == 3) {
+            loc = this.location_of_parts(this.dispatch.codegen_rvalue(visitor, node.arguments[1]),
+                                         this.dispatch.codegen_rvalue(visitor, node.arguments[2]));
+        } else {
+            loc = this.location_address(this.dispatch.codegen_rvalue(visitor, node.arguments[1]));
+        }
+        // `--panic=unwind` direct-panic drop-completeness: route the panic
+        // funnel through an invoke + cleanup landing pad so the frame's live
+        // droppable locals drop on unwind (a plain call bypasses the
+        // invoke-swap and leaks them).  Gated on a hosted unwind build WITH
+        // live locals; every other case is the plain call.
+        if (this.cg.ctx.options.unwinds()
+            && !this.cg.intrinsics.no_runtime
+            && (node.unwind_cleanup.length > 0
+                || this.cg.expr_ops.has_live_arg_temps())) {
+            return this.emit_panic_unwind(visitor, node, msg, loc);
+        }
+        this.cg.intrinsics.emit_panic_call(msg, loc);
+        return Emitted::rvalue(LValue::null());
+    }
+
+    /// The address of the `Location` value `v`: a constant one (a
+    /// `location()` outside a `![caller_location]` body) as a private
+    /// constant, any other through `address_of_value`.
+    location_address(mut &this, v: LValue) -> LValue {
+        if (llvm::LLVMIsConstant(v.raw) == 0) { return this.address_of_value(v); }
+        mut g: LValue = this.cg.llvm_module.add_global(v.type_of(), MangledName::new("panic.location"));
+        g.set_initializer(v);
+        g.set_global_constant(true);
+        g.set_linkage(LLinkage::Private);
+        return g;
+    }
+
+    /// The address of a `Location` holding `file` and `line`, with no column
+    /// and no function.
+    location_of_parts(mut &this, file: LValue, line: LValue) -> LValue {
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const buf: void* = libc::malloc(32);
+        const slots: void** = buf as void**;
+        slots[0] = LType::const_pointer_null(ptr_ty).raw;
+        slots[1] = LType::const_int(LType::i32(), 0, false).raw;
+        slots[2] = LType::const_int(LType::i32(), 0, false).raw;
+        slots[3] = LType::const_pointer_null(ptr_ty).raw;
+        const empty: LValue = LType::const_struct(buf, 4, false);
+        libc::free(buf);
+        const with_file: LValue = this.cg.builder.build_insert_value(empty, file, 0, "");
+        const whole: LValue = this.cg.builder.build_insert_value(with_file, line, 1, "");
+        const slot: LValue = this.entry_spill_slot(whole.type_of(), "panic.location");
+        this.cg.builder.build_store(whole, slot);
+        return slot;
+    }
+
+    /// Direct-panic origin under `--panic=unwind`: emit the funnel as an
+    /// `invoke` into a cleanup landing pad that drops the frame's live locals
+    /// (innermost-first) before the unwind continues, then `resume`s.  Reuses
+    /// `node.unwind_cleanup` (DropInsertion populates it for EVERY call, panic
+    /// included).
     emit_panic_unwind(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*,
-                      msg: LValue, file: LValue, line: LValue) -> Emitted {
+                      msg: LValue, loc: LValue) -> Emitted {
         mut out: Emitted = Emitted::none();
         const cur_fn: LValue = this.get_current_function();
         if (!cur_fn.is_valid()) {
             // No enclosing function to hang a landing pad on; diverge plainly.
-            this.cg.intrinsics.emit_panic_call(msg, file, line);
+            this.cg.intrinsics.emit_panic_call(msg, loc);
             return out;
         }
         const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "panic.cont");
@@ -1237,19 +1255,18 @@ type struct CallEmitter {
 
         const panic_fn: LValue = this.cg.intrinsics.get_or_decl_cryo_panic();
         const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(panic_fn.raw) };
-        const arg_buf: void* = libc::malloc(24);
+        const arg_buf: void* = libc::malloc(16);
         const arg_slots: void** = arg_buf as void**;
         arg_slots[0] = msg.raw;
-        arg_slots[1] = file.raw;
-        arg_slots[2] = line.raw;
+        arg_slots[1] = loc.raw;
 
         // Arm the invoke swap so `build_call_maybe_invoke` emits
-        // `invoke @__cryo_panic(...) to cont unwind lpad` and leaves the builder
-        // at `cont`.
+        // `invoke @__cryo_panic_at(...) to cont unwind lpad` and leaves the
+        // builder at `cont`.
         this.cg.expr_ops.invoke_active = true;
         this.cg.expr_ops.invoke_normal = cont_bb;
         this.cg.expr_ops.invoke_lpad   = lpad_bb;
-        this.cg.expr_ops.build_call_maybe_invoke(fty, panic_fn, arg_buf, 3, "");
+        this.cg.expr_ops.build_call_maybe_invoke(fty, panic_fn, arg_buf, 2, "");
         this.cg.expr_ops.invoke_active = false;
         libc::free(arg_buf);
 

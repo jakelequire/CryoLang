@@ -1167,31 +1167,24 @@ type struct ExprOps {
         if (saved_bb.is_valid()) { this.builder.position_at_end(saved_bb); }
     }
 
-    /// Emit a diverging raise through `__cryo_panic(msg, file, line)` for a
+    /// Emit a diverging raise through `__cryo_panic_at(msg, loc)` for a
     /// synthesized check (div-by-zero, non-exhaustive match, `new[]` overflow)
-    /// under `--panic=unwind`.  When the frame has live droppable locals
-    /// (`sched` non-empty) the raise is an `invoke` into a cleanup landing pad
-    /// that drops them before the unwind continues; otherwise a plain `call`.
-    /// Either way it diverges (`unreachable` on the normal edge).  Callers gate
-    /// this on `ctx.options.unwinds()` and keep the `abort` trap on the
-    /// default path, so emitted IR is unchanged there.
+    /// under `--panic=unwind`, `loc` the address of a `Location`.  When the
+    /// frame has live droppable locals (`sched` non-empty) the raise is an
+    /// `invoke` into a cleanup landing pad that drops them before the unwind
+    /// continues; otherwise a plain `call`.  Either way it diverges
+    /// (`unreachable` on the normal edge).  Callers gate this on
+    /// `ctx.options.unwinds()` and keep the `abort` trap on the default path,
+    /// so emitted IR is unchanged there.
     emit_panic_diverge_cleanup(mut &this, visitor: IRGeneratorVisitor*, sched: [ASTNode*]*,
-                               msg: LValue, file: LValue, line: LValue) -> void {
+                               msg: LValue, loc: LValue) -> void {
         const panic_fn: LValue = this.intrinsics.get_or_decl_cryo_panic();
         if (!panic_fn.is_valid()) { return; }
-        const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const param_buf: void* = libc::malloc(24);
-        const param_slots: void** = param_buf as void**;
-        param_slots[0] = ptr_ty.raw;
-        param_slots[1] = ptr_ty.raw;
-        param_slots[2] = LType::i32().raw;
-        const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
-        libc::free(param_buf);
-        const arg_buf: void* = libc::malloc(24);
+        const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(panic_fn.raw) };
+        const arg_buf: void* = libc::malloc(16);
         const arg_slots: void** = arg_buf as void**;
         arg_slots[0] = msg.raw;
-        arg_slots[1] = file.raw;
-        arg_slots[2] = line.raw;
+        arg_slots[1] = loc.raw;
 
         // Live anonymous arg temps also demand the invoke+pad path even when the
         // frame has no named schedule (`sched` empty): a div/bounds/no-match/
@@ -1207,30 +1200,26 @@ type struct ExprOps {
             this.invoke_active = true;
             this.invoke_normal = cont_bb;
             this.invoke_lpad   = lpad_bb;
-            this.build_call_maybe_invoke(fty, panic_fn, arg_buf, 3, "");
+            this.build_call_maybe_invoke(fty, panic_fn, arg_buf, 2, "");
             this.invoke_active = false;
             libc::free(arg_buf);
             this.builder.build_unreachable();
             this.emit_cleanup_landingpad_sched(visitor, sched, cur_fn, lpad_bb);
         } else {
-            this.builder.build_call(fty, panic_fn, arg_buf, 3, "");
+            this.builder.build_call(fty, panic_fn, arg_buf, 2, "");
             libc::free(arg_buf);
             this.builder.build_unreachable();
         }
     }
 
-    /// Build the `(message, file, line)` args for a synthesized check from a
-    /// compile-time `message` and the origin's `span`, then raise + clean up via
-    /// `emit_panic_diverge_cleanup`.  The shared body of every synthesized-check
-    /// raise (div-by-zero, non-exhaustive match, `new[]` overflow).
+    /// Raise a synthesized check's compile-time `message` at the origin's
+    /// `span`, cleaning up via `emit_panic_diverge_cleanup`.  The shared body
+    /// of every synthesized-check raise (div-by-zero, non-exhaustive match,
+    /// `new[]` overflow).
     emit_check_raise(mut &this, visitor: IRGeneratorVisitor*, sched: [ASTNode*]*,
                      span: SourceSpan, message: string) -> void {
         const msg: LValue = this.builder.build_global_string_ptr(message, "check.msg");
-        mut filename: string = span.file;
-        if (filename == null || filename.length() == 0) { filename = "<unknown>"; }
-        const file: LValue = this.builder.build_global_string_ptr(filename, "check.file");
-        const line: LValue = LType::const_int(LType::i32(), span.start_line as u64, false);
-        this.emit_panic_diverge_cleanup(visitor, sched, msg, file, line);
+        this.emit_panic_diverge_cleanup(visitor, sched, msg, this.intrinsics.location_global(span));
     }
 
     /// The pre-Phase-1 call lowering: coerce integer widths to match

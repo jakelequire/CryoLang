@@ -16,10 +16,12 @@ language server".  From there, in order, to the v1.0 freeze:
    the postfix forms are refused.  Built, on `type-syntax-impl`.
 2. **One dynamic array type.**  `[T]` becomes `Array<T>`, which also
    removes the crash of nested builtin arrays (below).
-3. **The class removal, and borrowed trait objects** (`virtual &T`,
-   rulings 285, 288, 289) right after it or folded into it, built on the
-   class vtable machinery (ruling 360).  Owning boxes, upcasting and
-   generic implementations coerced to an object come after v1.0.
+3. **The class removal, then borrowed trait objects** (`virtual &T`,
+   rulings 285, 288, 289), built after the class feature is deleted, with
+   the table emission copied from the class vtable code rather than shared
+   with it (ruling 415).  Owning boxes and upcasting come after v1.0;
+   generic implementations converted to an object are revisited before the
+   freeze (ruling 425).
 4. **Associated constants on concrete types** (`i32::MAX`,
    `Config::DEFAULT_PORT`), with the decision whether `max_value()` stays.
    Trait constants used as values come after v1.0; trait constants as
@@ -29,7 +31,22 @@ language server".  From there, in order, to the v1.0 freeze:
    today, so internals such as `Array`'s grower are public API.  The pass
    decides what stays public, and which standard-library APIs want trait
    objects.
-7. **Bug fixing and bug hunting** before the freeze.
+7. **The slice and API pass**, after the class removal and the visibility
+   pass:
+   - first, the fix for a by-value struct parameter accepting
+     `&OtherStruct` (bug 0063);
+   - `&this` enforced as read-only (D37), with const pointers following;
+   - `Read` taking a `Slice`;
+   - `Slice` finished: `s[i]`, `Eq` and `Hash`, `s.slice(1..4)`, and
+     `as_slice()` on fixed-size arrays;
+   - `implement Trait` in type position: the concrete type hidden, the
+     return promise checked at the function, and a refusal of its own in
+     parameters, fields, aliases and type arguments (rulings 428-430);
+   - a trait declaring two methods with the same name refused at the
+     declaration (ruling 424);
+   - `![implicit]`'s conversion of a string literal written down in
+     `docs/cryo.md` (the directive stays).
+8. **Bug fixing and bug hunting** before the freeze.
 
 The rule of thumb: a breaking change goes in before the freeze; an
 additive feature, or an internal rewrite such as the HIR and MIR pipeline
