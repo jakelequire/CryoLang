@@ -1043,10 +1043,14 @@ type struct AsyncLower {
                     }
                 }
             }
-            // A return inside `unsafe { }` or a `static match` arm is not
-            // rewritten.
-            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
-            | StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::UnsafeBlock(u) => { this.rewrite_returns(u.block, poll_out, span); }
+            // Every arm: the one this instantiation keeps is chosen later.
+            StmtKind::StaticMatch(sms) => {
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] != null) { this.rewrite_returns(sms.arms[i].body, poll_out, span); }
+                }
+            }
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
@@ -1844,8 +1848,14 @@ type struct AsyncLower {
                 }
                 return false;
             }
-            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
-            | StmtKind::Break | StmtKind::Continue => { return false; }
+            StmtKind::UnsafeBlock(u) => { return this.name_read_in_stmt(u.block, key); }
+            StmtKind::StaticMatch(sms) => {
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] != null && this.name_read_in_stmt(sms.arms[i].body, key)) { return true; }
+                }
+                return false;
+            }
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => { return false; }
         }
     }
 
@@ -2296,8 +2306,18 @@ type struct AsyncLower {
                     }
                 }
             }
-            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
-            | StmtKind::Break | StmtKind::Continue => {}
+            // A scope like a bare block: its statements run in this state.
+            StmtKind::UnsafeBlock(u) => {
+                this.subst_name_stmt(u.block, key, field, struct_ref, ty, span);
+            }
+            StmtKind::StaticMatch(sms) => {
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] != null) {
+                        this.subst_nested_stmt(sms.arms[i].body, key, field, struct_ref, ty, span);
+                    }
+                }
+            }
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
@@ -2573,10 +2593,18 @@ type struct AsyncLower {
             // move its body out of the node into flat states, where pruning can no
             // longer drop the arms this instantiation did not pick — so every arm's
             // code would reach codegen, narrowed to a type it does not have.
+            // A `break` or `continue` out of an awaiting loop is a state
+            // transition, so it needs the arm exploded just the same.
             StmtKind::StaticMatch(_) => {
-                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                    "async: an `await` inside a `static match` arm is not supported — the arms are selected after the body is lowered, so the suspend cannot be placed; bind it to a `const` ahead of the `static match`",
-                    stmt.span);
+                if (this.stmt_await_count(stmt) == 0) {
+                    this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                        "async: a `break`/`continue` inside a `static match` arm is not supported inside a loop that awaits — the arms are selected after the body is lowered, so the edge cannot become a state transition; set a flag in the arm and test it after the `static match`",
+                        stmt.span);
+                } else {
+                    this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                        "async: an `await` inside a `static match` arm is not supported — the arms are selected after the body is lowered, so the suspend cannot be placed; bind it to a `const` ahead of the `static match`",
+                        stmt.span);
+                }
                 sm.ok = false;
                 return cur;
             }
@@ -2584,9 +2612,15 @@ type struct AsyncLower {
             // would spread its statements over states the scope cannot reach, so
             // the operations it authorises would be checked as safe.
             StmtKind::UnsafeBlock(_) => {
-                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                    "async: an `await` inside an `unsafe` block is not supported — the block is split at each resume point, so the `unsafe` scope cannot span it; move the `await` ahead of the block",
-                    stmt.span);
+                if (this.stmt_await_count(stmt) == 0) {
+                    this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                        "async: a `break`/`continue` inside an `unsafe` block is not supported inside a loop that awaits — the block cannot be split into states, so the edge cannot leave it as a state transition; move the `break`/`continue` out of the block",
+                        stmt.span);
+                } else {
+                    this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                        "async: an `await` inside an `unsafe` block is not supported — the block is split at each resume point, so the `unsafe` scope cannot span it; move the `await` ahead of the block",
+                        stmt.span);
+                }
                 sm.ok = false;
                 return cur;
             }
@@ -3877,8 +3911,19 @@ type struct AsyncLower {
                 }
                 return true;
             }
-            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
-            | StmtKind::While(_) | StmtKind::DoWhile(_) | StmtKind::For(_) => { return false; }
+            StmtKind::UnsafeBlock(u) => { return this.stmt_diverges(u.block); }
+            // Monomorphization keeps exactly one arm or refuses the program, so
+            // the statement diverges when every arm does.
+            StmtKind::StaticMatch(sms) => {
+                if (sms.arms.length == 0) { return false; }
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] == null || !this.stmt_diverges(sms.arms[i].body)) { return false; }
+                }
+                return true;
+            }
+            StmtKind::Asm(_) | StmtKind::While(_) | StmtKind::DoWhile(_) | StmtKind::For(_) => {
+                return false;
+            }
         }
     }
 
@@ -3915,6 +3960,14 @@ type struct AsyncLower {
                 if (!this.patterns.match_is_exhaustive(m.subject, m.arms)) { return false; }
                 for (mut i: i64 = 0; i < m.arms.length; i++) {
                     if (m.arms[i] == null || !this.stmt_returns(m.arms[i].body)) { return false; }
+                }
+                return true;
+            }
+            StmtKind::UnsafeBlock(u) => { return this.stmt_returns(u.block); }
+            StmtKind::StaticMatch(sms) => {
+                if (sms.arms.length == 0) { return false; }
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] == null || !this.stmt_returns(sms.arms[i].body)) { return false; }
                 }
                 return true;
             }
@@ -3974,11 +4027,19 @@ type struct AsyncLower {
             StmtKind::Decl(d) => {
                 return this.expr_has_free_edge(this.decl_stmt_init(d), break_only);
             }
+            StmtKind::UnsafeBlock(u) => { return this.has_free_edge(u.block, break_only); }
+            StmtKind::StaticMatch(sms) => {
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] != null && this.has_free_edge(sms.arms[i].body, break_only)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
             // While/For/Loop/DoWhile capture their own break/continue — not free
-            // here.  An edge inside `unsafe { }` or a `static match` arm is not
-            // looked for.
+            // here.
             StmtKind::While(_) | StmtKind::For(_) | StmtKind::Loop(_) | StmtKind::DoWhile(_)
-            | StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_) => {
+            | StmtKind::Asm(_) => {
                 return false;
             }
         }
@@ -4154,9 +4215,17 @@ type struct AsyncLower {
                 }
                 return 0;
             }
+            StmtKind::UnsafeBlock(u) => { return this.stmt_first_use(u.block, key); }
+            StmtKind::StaticMatch(sms) => {
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] == null) { continue; }
+                    const a: i64 = this.stmt_first_use(sms.arms[i].body, key);
+                    if (a != 0) { return a; }
+                }
+                return 0;
+            }
             // Anything else can only mention the name by reading it.
-            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
-            | StmtKind::Break | StmtKind::Continue => {
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {
                 if (this.name_read_in_stmt(s, key)) { return 1; }
                 return 0;
             }
@@ -4385,8 +4454,18 @@ type struct AsyncLower {
                     }
                 }
             }
-            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
-            | StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::UnsafeBlock(u) => {
+                this.mark_last_use_stmt(u.block, key, out);
+            }
+            StmtKind::StaticMatch(sms) => {
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] == null) { continue; }
+                    if (!this.stmt_returns(sms.arms[i].body)) {
+                        this.mark_last_use_stmt(sms.arms[i].body, key, out);
+                    }
+                }
+            }
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
@@ -4822,8 +4901,16 @@ type struct AsyncLower {
                     this.store_before_suspends(sm, m.arms[i].body, field, opt_ty, name, key, lty, span);
                 }
             }
-            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
-            | StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue
+            StmtKind::UnsafeBlock(u) => {
+                this.store_before_suspends(sm, u.block, field, opt_ty, name, key, lty, span);
+            }
+            StmtKind::StaticMatch(sms) => {
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] == null) { continue; }
+                    this.store_before_suspends(sm, sms.arms[i].body, field, opt_ty, name, key, lty, span);
+                }
+            }
+            StmtKind::Asm(_) | StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue
             | StmtKind::Expr(_) | StmtKind::Decl(_) => {}
         }
     }
@@ -5003,8 +5090,14 @@ type struct AsyncLower {
                     this.release_before_ready(sm, m.arms[i].body, fields, opts, span);
                 }
             }
-            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
-            | StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue
+            StmtKind::UnsafeBlock(u) => { this.release_before_ready(sm, u.block, fields, opts, span); }
+            StmtKind::StaticMatch(sms) => {
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] == null) { continue; }
+                    this.release_before_ready(sm, sms.arms[i].body, fields, opts, span);
+                }
+            }
+            StmtKind::Asm(_) | StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue
             | StmtKind::Expr(_) | StmtKind::Decl(_) => {}
         }
     }
@@ -6152,6 +6245,8 @@ type struct AsyncLower {
                 }
                 f.body = this.hoist_branch(f.body);
             }
+            // One holding an `await`, `break` or `continue` is refused by the
+            // state builder, which cannot split it.
             StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
             | StmtKind::Break | StmtKind::Continue => {}
         }
@@ -6574,9 +6669,13 @@ type struct AsyncLower {
                 this.rn_expr(map, m.subject);
                 for (mut i: i64 = 0; i < m.arms.length; i++) { this.rn_arm(map, m.arms[i]); }
             }
-            // Break / Continue / Asm carry no local read or declaration; a
-            // `static match` arm is not walked.
-            StmtKind::Break | StmtKind::Continue | StmtKind::Asm(_) | StmtKind::StaticMatch(_) => {}
+            StmtKind::StaticMatch(sms) => {
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] != null) { this.rn_stmt(map, sms.arms[i].body); }
+                }
+            }
+            // Break / Continue / Asm carry no local read or declaration.
+            StmtKind::Break | StmtKind::Continue | StmtKind::Asm(_) => {}
         }
     }
 
@@ -6880,7 +6979,12 @@ type struct AsyncLower {
                 this.rb_expr(ctx, m.subject);
                 for (mut i: i64 = 0; i < m.arms.length; i++) { this.rb_arm(ctx, m.arms[i]); }
             }
-            StmtKind::Break | StmtKind::Continue | StmtKind::Asm(_) | StmtKind::StaticMatch(_) => {}
+            StmtKind::StaticMatch(sms) => {
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] != null) { this.rb_scoped(ctx, sms.arms[i].body); }
+                }
+            }
+            StmtKind::Break | StmtKind::Continue | StmtKind::Asm(_) => {}
         }
     }
 

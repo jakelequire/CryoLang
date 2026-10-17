@@ -1,0 +1,36 @@
+// E0600: a `break` inside an `unsafe` block, out of a loop that awaits, is
+// rejected.
+//
+// A loop holding a suspend is split into states, and a `break` out of it
+// becomes a state transition at the point it is written.  An `unsafe` block
+// cannot be split (its scope would end at the first state boundary), so a
+// `break` inside it cannot become that transition.  Left as written it would
+// leave the loop that dispatches the states instead of the program's loop.
+//
+// The rewrite is to decide inside the block and leave outside it:
+//   mut stop = false;
+//   unsafe { stop = … ; }
+//   if (stop) { break; }
+![config(testing)]
+![config(negative, E0600)]
+namespace CryoTests::Negative::E0600BreakInUnsafeBlockInAwaitingLoop;
+
+import std::future;
+import std::future::{ PendingThenReady };
+
+async function breaks_inside_unsafe(n: i64) -> i64 {
+    mut i: i64 = 0;
+    mut sum: i64 = 0;
+    while (i < n) {
+        sum += await PendingThenReady::<i64>::new(1, i);
+        unsafe {                                 //~ ERROR[E0600] async: a `break`/`continue` inside an `unsafe` block is not supported
+            if (sum > 5) { break; }
+        }
+        i = i + 1;
+    }
+    return sum;
+}
+
+function main() -> i32 {
+    return future::block_on(breaks_inside_unsafe(10)) as i32;
+}

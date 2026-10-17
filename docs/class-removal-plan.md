@@ -1350,9 +1350,11 @@ committed with the change and deleted in the next commit.
   statement became an explicit test of the initializer's kind.
 - Kinds that fell through the old chains' silent defaults are now explicit
   arms, behaviour unchanged, each commented where it is not obviously
-  right.  The ones that read as defects: the async lowering's walks skip
-  `unsafe` blocks and `static match` arms, so a `return` in an await-free
-  `unsafe` block of an `async function` is refused (bug 0064); the W0001
+  right.  The ones that read as defects: the async lowering's walks
+  skipped `unsafe` blocks and `static match` arms, so a `return` in an
+  await-free `unsafe` block of an `async function` was refused (fixed
+  after the statement conversion: every walk descends into both, and a
+  `break`/`continue` there out of an awaiting loop is refused); the W0001
   and W0009 lints skip `unsafe` blocks; the generic-call collection in type
   resolution skips `unsafe` and `do`-`while` bodies; no walk that scans for
   moves, writes or calls looks into `asm` operands; position lookup does

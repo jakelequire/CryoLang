@@ -134,6 +134,25 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-17
+
+405. **A `return` inside an await-free `unsafe` block or `static match`
+     arm of an `async function` compiles,** fixed in its own change ahead
+     of the remaining declaration kinds: every walk of the async lowering
+     descends into both forms as it does into a block or a `match` arm.
+     (Dispatch, delegated)
+
+406. **`intrinsic const` is left as it is, parked for Jake:** reading one
+     emits invalid IR, nothing is built on the form, and it is neither
+     deleted nor given a value source until he decides.  (Dispatch,
+     delegated)
+
+407. **The error code for the removed class syntax (ruling 388) and the
+     trait-object symbol spelling (ruling 391) are chosen by whoever
+     implements those slices,** and reported.  How verify treats a moved
+     project object is likewise the implementer's call if it blocks the
+     work, and otherwise stays as it is.  (Dispatch, delegated)
+
 ### 2026-10-16
 
 379. **A fixed-size array does not convert implicitly to a dynamic `[T]`:**

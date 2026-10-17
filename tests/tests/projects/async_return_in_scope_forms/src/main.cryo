@@ -1,0 +1,158 @@
+// State-machine lowering: a `return`, a carried local and a release inside an
+// `unsafe` block or a `static match` arm.
+//
+// Neither form may hold an `await`, but both hold statements, and every
+// rewrite the lowering applies to a statement has to reach the statements
+// inside them:
+//
+//   * A `return E;` becomes `return Poll::Ready(E);`.  Missed, the bare value
+//     is returned from a `poll` declared to return `Poll<T>`.
+//
+//   * A local read after a suspend is carried in a field of the future.
+//     Missed, the read inside the block names a local the resumed state never
+//     declared.
+//
+//   * Values the future owns are released at its `return`, while it is still
+//     alive.  Missed, a `return` from inside the block leaves them to the
+//     future's own drop.
+//
+//   * A `break` inside the block is left alone when its loop does not
+//     suspend: only a loop that suspends is split into states, and only a
+//     `break` out of one of those has to become a state transition (which
+//     these forms cannot hold, and the lowering refuses).
+//
+// A `static match` arm is chosen after the lowering runs, so every arm is
+// rewritten; the instantiations below take different arms.
+//
+// The exit code names the first case that went wrong.
+namespace AsyncReturnInScopeForms::Main;
+
+import std::core::drop::{ Drop };
+import std::future::ready::{ PendingThenReady };
+import std::future::traits::{ Future };
+import std::future::poll::{ Poll };
+import std::future::waker::{ Context, Waker };
+
+mut drops: i32 = 0;
+mut drops_at_ready: i32 = -1;
+
+type struct Held {
+    id: i64;
+}
+
+implement trait Drop for struct Held {
+    drop(mut &this) -> void {
+        drops = drops + 1;
+    }
+}
+
+/// Polls to completion and records the release count when the future reports
+/// Ready, while it is still alive: a value the future failed to release at its
+/// `return` is released only later, when the finished future is dropped.
+function drive<F, R>(fut: F) -> R
+where F: Future<R> {
+    drops = 0;
+    drops_at_ready = -1;
+    mut f:  F       = fut;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (f.poll(&cx)) {
+            Poll::Ready(v) => { drops_at_ready = drops; return v; }
+            Poll::Pending  => { }
+        }
+    }
+}
+
+// ---- `unsafe { }` ----
+
+async function return_in_unsafe(x: i64) -> i64 {
+    unsafe {
+        return x + 1;
+    }
+}
+
+async function return_in_unsafe_after_suspend(x: i64) -> i64 {
+    const a = await PendingThenReady::<i64>::new(1, 10);
+    unsafe {
+        return x + a;
+    }
+}
+
+async function carried_read_in_unsafe(x: i64) -> i64 {
+    const before: i64 = x * 2;
+    const a = await PendingThenReady::<i64>::new(1, 10);
+    mut out: i64 = 0;
+    unsafe {
+        out = before + a;
+    }
+    return out;
+}
+
+async function owned_released_on_unsafe_return(x: i64) -> i64 {
+    const h = Held { id: x };
+    const a = await PendingThenReady::<i64>::new(1, 10);
+    unsafe {
+        return h.id + a;
+    }
+}
+
+async function break_in_unsafe_in_a_loop_that_does_not_suspend(n: i64) -> i64 {
+    const a = await PendingThenReady::<i64>::new(1, 10);
+    mut i: i64 = 0;
+    mut sum: i64 = 0;
+    while (i < n) {
+        sum += i;
+        unsafe {
+            if (sum > 5) { break; }
+        }
+        i = i + 1;
+    }
+    return sum * 100 + i + a;
+}
+
+// ---- `static match` ----
+
+async function return_in_static_arm<T>(x: i64) -> i64 {
+    const a = await PendingThenReady::<i64>::new(1, 10);
+    static match (T) {
+        i32 => { return x + a; }
+        _   => { return x * a; }
+    }
+}
+
+async function carried_read_in_static_arm<T>(x: i64) -> i64 {
+    const before: i64 = x + 1;
+    const a = await PendingThenReady::<i64>::new(1, 10);
+    mut out: i64 = 0;
+    static match (T) {
+        i32 => { out = before + a; }
+        _   => { out = before * a; }
+    }
+    return out;
+}
+
+async function owned_released_on_static_arm_return<T>(x: i64) -> i64 {
+    const h = Held { id: x };
+    const a = await PendingThenReady::<i64>::new(1, 10);
+    static match (T) {
+        i32 => { return h.id + a; }
+        _   => { return h.id * a; }
+    }
+}
+
+function main() -> i32 {
+    if (drive(return_in_unsafe(41)) != 42) { return 1; }
+    if (drive(return_in_unsafe_after_suspend(5)) != 15) { return 2; }
+    if (drive(carried_read_in_unsafe(4)) != 18) { return 3; }
+    if (drive(owned_released_on_unsafe_return(7)) != 17) { return 4; }
+    if (drops_at_ready != 1) { return 5; }
+    // 0 + 1 + 2 + 3 = 6 > 5 at i == 3.
+    if (drive(break_in_unsafe_in_a_loop_that_does_not_suspend(10)) != 613) { return 6; }
+    if (drive(return_in_static_arm::<i32>(3)) != 13) { return 7; }
+    if (drive(return_in_static_arm::<u8>(3)) != 30) { return 8; }
+    if (drive(carried_read_in_static_arm::<i32>(4)) != 15) { return 9; }
+    if (drive(carried_read_in_static_arm::<u8>(4)) != 50) { return 10; }
+    if (drive(owned_released_on_static_arm_return::<u8>(7)) != 70) { return 11; }
+    if (drops_at_ready != 1) { return 12; }
+    return 0;
+}

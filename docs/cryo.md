@@ -3814,6 +3814,9 @@ The rules below exist to keep futures free of self-references, which is what mak
 | An `async` method's future must be awaited at the call, not stored and awaited later.                                                                                      | `E0455`    |
 | An `async` function may not await itself, directly or transitively - the state machine would contain itself and have no finite size. Rewrite the recursion as a loop.      | `E0600`    |
 | `async` may not be combined with `virtual` or `override`, and there are no `async` constructors, destructors, or fields.                                                   | `E0364`    |
+| An `await`, or a `break`/`continue` leaving a loop that awaits, may not stand inside an `unsafe` block or a `static match` arm (see below).                                | `E0600`    |
+
+The last rule has a different reason: a suspend and an edge out of an awaiting loop each become a transition between states, and neither form can be split into states. An `unsafe` block's scope would end at the first state boundary, and a `static match` keeps its arm only after the body has been compiled into states. Everything else is allowed inside them, `return` included. The rewrite keeps the decision inside and the transition outside: bind the awaited value to a `const` ahead of the block, or set a flag inside it and `break` after it.
 
 Each suspension runs on a fresh frame, which is why frame addresses do not survive one:
 
