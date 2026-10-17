@@ -1383,8 +1383,8 @@ committed with the change and deleted in the next commit.
   and its shape is `DeclKind::Legacy`.  Every `match` on a declaration's
   shape is exhaustive, so a kind converted later is refused wherever it
   is not handled; each `Legacy` arm is dead and says so.
-- Converted: `IntrinsicConst(IntrinsicConstDecl*)` and
-  `Module(ModuleDecl*)`; `NodeKind::IntrinsicConstDeclaration` and
+- Converted: `IntrinsicConst(IntrinsicConstDecl*)` (the form is deleted
+  since) and `Module(ModuleDecl*)`; `NodeKind::IntrinsicConstDeclaration` and
   `NodeKind::ModuleDeclaration` are deleted.  `Walk::walk_decl_shape`
   hands a converted kind to its hook with the header and the payload;
   the cloner copies through `copy_decl_shape`; sema and codegen dispatch
@@ -1553,12 +1553,11 @@ committed with the change and deleted in the next commit.
   declaration was outside its list; the two callers read `name_span`,
   which the parser never sets on a module declaration, so they answer as
   before.
-- Not covered by any test: no file of the standard library, tests or
-  examples writes an `intrinsic const`, and reading one emits invalid IR
-  (bug 0065).  The `--ast` comparison was run over a probe that declares
-  and reads one; both compilers' outputs are byte-identical, and a dumper
-  with the `IntrinsicConstDecl` label changed differs on it (and on no
-  file of `tests/tests/lang`, which is how the gap was found).
+- No file of the standard library, tests or examples wrote an `intrinsic
+  const`, and reading one emitted invalid IR.  The `--ast` comparison was
+  run over a probe that declares and reads one.  The form has since been
+  deleted with its payload: a source location is the intrinsic function
+  `location()`, and the parser refuses `intrinsic const`.
 - **Measured.**  verify `--require-identical`: 0 objects moved; census,
   examples, lsp (189), cross, incr, fast OK.  `--ast` identical over 1,057
   files.  Check time x5 medians 8.48 s and 8.51 s; peak 1,533.9 ->

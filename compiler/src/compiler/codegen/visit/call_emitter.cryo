@@ -58,7 +58,9 @@ import compiler::codegen::visit::ir_generator;
 import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::abi::{ SignaturePlan };
 import compiler::codegen::context::{ CodegenContext };
-import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
+import compiler::codegen::llvm_types::{ LBasicBlock, LLinkage, LType, LTypeKind, LValue };
+import compiler::codegen::ops::symbol_resolver;
+import compiler::codegen::ops::symbol_resolver::{ SymbolResolver };
 import compiler::codegen::visit::expr_dispatch::{ ExprDispatch };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
@@ -69,7 +71,7 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::res;
-import compiler::resolver::res::{ FamilyOwner, Res, ResSlot };
+import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResSlot };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
     ArrayType, FunctionType, PointerType, ReferenceType, TupleType
@@ -136,22 +138,64 @@ type struct CallEmitter {
     /// literal, a global like a string constant, a computed value) we spill
     /// it to a fresh stack slot and return that slot's address.
     /// Append the location a `![caller_location]` callee reports as its
-    /// caller's: `span`, the call's own, or - inside such a function
-    /// itself - the location its own caller passed, so a chain of them
-    /// reports the first call outside the chain.
+    /// caller's: the address of `span`'s `Location`, the call's own, or -
+    /// inside such a function itself - the address its own caller passed,
+    /// so a chain of them reports the first call outside the chain.  A
+    /// program that does not declare `Location` passes null, and can make
+    /// no `location()` call to read it.
     push_caller_location(mut &this, args: [Pair<LValue, TypeRef>]*, span: SourceSpan) -> void {
         const arena: TypeArena* = this.cg.get_arena();
-        if (this.cg.decl.caller_file.is_valid()) {
-            (*args).push(Pair::<LValue, TypeRef>::new(this.cg.decl.caller_file, arena.get_string()));
-            (*args).push(Pair::<LValue, TypeRef>::new(this.cg.decl.caller_line, arena.get_u32()));
+        const ptr_ty: TypeRef = SymbolResolver::caller_location_params(arena)[0];
+        if (this.cg.decl.caller_location.is_valid()) {
+            (*args).push(Pair::<LValue, TypeRef>::new(this.cg.decl.caller_location, ptr_ty));
             return;
         }
+        const lty: LType = this.location_type();
+        if (!lty.is_valid()) {
+            (*args).push(Pair::<LValue, TypeRef>::new(
+                LType::const_pointer_null(LType::pointer_to(LType::i8())), ptr_ty));
+            return;
+        }
+        const init: LValue = this.location_constant(lty, span);
+        mut g: LValue = this.cg.llvm_module.add_global(lty, MangledName::new("caller.location"));
+        g.set_initializer(init);
+        g.set_global_constant(true);
+        g.set_linkage(LLinkage::Private);
+        (*args).push(Pair::<LValue, TypeRef>::new(g, ptr_ty));
+    }
+
+    /// `location()`: the `Location` of the call, or in a `![caller_location]`
+    /// body the one its caller passed the address of.
+    emit_location(mut &this, node: CallExprNode*) -> LValue {
+        const lty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        if (this.cg.decl.caller_location.is_valid()) {
+            return this.cg.builder.build_load(lty, this.cg.decl.caller_location, "caller.location");
+        }
+        return this.location_constant(lty, node.span);
+    }
+
+    /// The lowered `Location`, or an invalid type when the program does not
+    /// declare it.
+    location_type(&this) -> LType {
+        const def: DefId = this.cg.ctx.generic_registry.wellknown(LangItem::Location);
+        if (!def.is_valid()) { return LType::null(); }
+        return this.cg.type_mapper.map_type(this.cg.ctx.decl_index.type_of_def(def));
+    }
+
+    /// `span`'s `Location` in the function being emitted, a constant of
+    /// `lty`, the lowered `Location`: file, line, column, function.
+    location_constant(mut &this, lty: LType, span: SourceSpan) -> LValue {
         mut file: string = span.file;
         if (file == null || file.length() == 0) { file = "<unknown>"; }
-        (*args).push(Pair::<LValue, TypeRef>::new(
-            this.cg.builder.build_global_string_ptr(file, "FILE.str"), arena.get_string()));
-        (*args).push(Pair::<LValue, TypeRef>::new(
-            LType::const_int(LType::i32(), span.start_line as u64, false), arena.get_u32()));
+        const buf: void* = libc::malloc(32);
+        const slots: void** = buf as void**;
+        slots[0] = this.cg.builder.build_global_string_ptr(file, "location.file").raw;
+        slots[1] = LType::const_int(LType::i32(), span.start_line as u64, false).raw;
+        slots[2] = LType::const_int(LType::i32(), span.start_col as u64, false).raw;
+        slots[3] = this.cg.builder.build_global_string_ptr(this.cg.decl.function_name, "location.function").raw;
+        const init: LValue = LType::const_named_struct(lty, buf, 4);
+        libc::free(buf);
+        return init;
     }
 
     /// Stack slot for a value spilled so its address can be taken.
@@ -1140,6 +1184,9 @@ type struct CallEmitter {
         // lowered here rather than by the inline dispatcher.
         if (kind == IntrinsicKind::TryCatch) {
             return Option::Some(this.emit_catch_unwind(visitor, node));
+        }
+        if (kind == IntrinsicKind::Location) {
+            return Option::Some(Emitted::rvalue(this.emit_location(node)));
         }
         // `args` is scoped to this call: it is built and moved into
         // `try_emit` unconditionally, so nothing is left conditionally

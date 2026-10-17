@@ -1,0 +1,87 @@
+/// `location()`: each call is the place it is written - file, line, column
+/// and the readable name of the function it is in - and in the body of a
+/// `![caller_location]` function the place that function was called from,
+/// through a chain of them the first call outside it, for a free function
+/// and a method alike.  Code the compiler moves into a function of its own
+/// is named for the function it was written in: a lambda's, a capturing
+/// closure's and an async function's body, and a generic's specialization.
+namespace LocationReportsCallSite::Main;
+
+import std::fmt;
+import std::future;
+import std::core::intrinsics;
+import std::core::intrinsics::{ Location };
+
+function show(tag: string, at: Location) -> void {
+    fmt::println(f"{tag} {at.file}:{at.line}:{at.column} in {at.function}");
+}
+
+![caller_location]
+function caller_of() -> Location {
+    return intrinsics::location();
+}
+
+![caller_location]
+function forwards() -> Location {
+    return caller_of();
+}
+
+/// A lambda in a `![caller_location]` body is a function of its own: its
+/// place is its own, and the enclosing call's place is the enclosing body's.
+![caller_location]
+function lambda_inside() -> u32 {
+    const f: () -> Location = () -> Location { return intrinsics::location(); };
+    return f().line * 1000 + intrinsics::location().line;
+}
+
+type struct Probe {
+    k: i32;
+
+    ![caller_location]
+    caller_of(&this) -> Location { return intrinsics::location(); }
+
+    own(&this) -> Location { return intrinsics::location(); }
+}
+
+type struct Holder<T> {
+    v: T;
+    at(&this) -> Location { return intrinsics::location(); }
+}
+
+function helper() -> Location {
+    return intrinsics::location();
+}
+
+function generic<T>(x: T) -> Location {
+    return intrinsics::location();
+}
+
+async function step() -> i64 { return 1; }
+
+async function suspended() -> Location {
+    const z: i64 = await step();
+    return intrinsics::location();
+}
+
+function main() -> i32 {
+    show("here", intrinsics::location());
+    show("free", caller_of());
+    show("chain", forwards());
+    const p: Probe = Probe { k: 1 };
+    show("method", p.caller_of());
+    show("own", p.own());
+    show("helper", helper());
+    const first: Location = intrinsics::location(); const second: Location = intrinsics::location();
+    fmt::println(f"same line {first.line == second.line} columns {first.column} {second.column}");
+    const f: () -> Location = () -> Location { return intrinsics::location(); };
+    show("lambda", f());
+    const k: u32 = 7;
+    const c = () -> Location { if (k > 9) { fmt::println("k"); } return intrinsics::location(); };
+    show("closure", c());
+    show("generic", generic::<i32>(1));
+    const h: Holder<u8> = Holder::<u8> { v: 2 };
+    show("generic method", h.at());
+    show("async", future::block_on(suspended()));
+    fmt::println(f"lambda inside {lambda_inside()}");
+    return 0;
+}

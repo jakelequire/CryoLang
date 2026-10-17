@@ -186,6 +186,16 @@ yet is recorded with the change that builds it, not here.
      class feature is deleted outright, so a class stays a subclass behind
      the declaration bridge until then.  (Jake)
 
+414. **`intrinsic const` is replaced by the declared intrinsic function
+     `location() -> Location`** in `std::core::intrinsics`.  A call
+     evaluates to its own place - file, line, column and the readable
+     qualified name of the enclosing function - and in a
+     `![caller_location]` body to its caller's, the same `Location` that
+     function is passed.  `FILE` and `LINE` migrate to it and are
+     deleted; the `intrinsic const` form is deleted and the parser
+     refuses it.  `Location` is read-only to programs: the standard
+     library's visibility pass closes construction.  (Jake)
+
 ### 2026-10-16
 
 379. **A fixed-size array does not convert implicitly to a dynamic `[T]`:**

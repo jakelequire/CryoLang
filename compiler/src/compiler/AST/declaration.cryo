@@ -495,9 +495,15 @@ public:
     /// emits no inlining attribute at all - the two directives are mutually
     /// exclusive and the validator rejects applying both.
     is_noinline:            boolean;
-    /// `![caller_location]` was applied: `FILE` and `LINE` in the body are
-    /// its caller's, passed by every call as two trailing arguments.
+    /// `![caller_location]` was applied: `location()`, `FILE` and `LINE` in
+    /// the body are its caller's, passed by every call as the address of a
+    /// trailing `Location`.
     is_caller_located:      boolean;
+    /// For a function the compiler synthesizes from code written in another
+    /// - an async function's `poll`, a capturing lambda's `__call__` - that
+    /// function's definition; invalid for a function written as itself.  A
+    /// `Location` made in the body names it (`FunctionDeclNode::written_in_of`).
+    written_in:             DefId;
     is_variadic:            boolean;
     /// `![implicit]` was applied. Permits the inference engine to recover
     /// omitted generic type args at a call site by unifying this function's
@@ -645,6 +651,7 @@ public:
         this.is_inline              = false;
         this.is_noinline            = false;
         this.is_caller_located      = false;
+        this.written_in             = DefId::invalid();
         this.is_variadic            = false;
         this.is_implicit            = false;
         this.is_synthesized_body    = false;
@@ -672,6 +679,17 @@ public:
     has_body() -> boolean                 { return this.body != null; }
     is_generic() -> boolean               { return this.generic_params.length > 0; }
     has_resolved_return_type() -> boolean { return this.resolved_return_type.is_valid(); }
+
+    /// The definition the code of `f` was written as: for a synthesized
+    /// function the one it was made from, for a copy (a specialization, a
+    /// placed trait default) the definition it copies - `def` is invalid
+    /// there - and otherwise its own.
+    static written_in_of(f: FunctionDeclNode*) -> DefId {
+        if (f == null) { return DefId::invalid(); }
+        if (f.written_in.is_valid()) { return f.written_in; }
+        if (f.copy_of.is_valid()) { return f.copy_of; }
+        return f.def;
+    }
 
     /// Whether `decl`, a function's or a method's declaration, carries
     /// `![caller_location]`.
@@ -814,7 +832,6 @@ type enum DeclKind {
     GenericParam(GenericParamDecl*);
     Import(ImportDecl*);
     Intrinsic(IntrinsicDecl*);
-    IntrinsicConst(IntrinsicConstDecl*);
     Module(ModuleDecl*);
     TypeAlias(TypeAliasDecl*);
     Variant(EnumVariant*);
@@ -867,33 +884,6 @@ type struct IntrinsicDecl {
 }
 
 implement trait Allocate for struct IntrinsicDecl {
-    static allocate(size: u64, align: u64) -> void* {
-        return cryo_ast_arena_alloc(size, align);
-    }
-}
-
-
-/// `intrinsic const name: T;`: a constant the compiler supplies.
-type struct IntrinsicConstDecl {
-    name:            SymbolStr;
-    type_annotation: TypeAnnotation*;
-    resolved_type:   TypeRef;
-    /// The definition this constant is, stamped by NameDeclaration.
-    def:             DefId;
-
-    static new(name: SymbolStr) -> IntrinsicConstDecl* {
-        return new IntrinsicConstDecl {
-            name:            name,
-            type_annotation: null,
-            resolved_type:   TypeRef::invalid(),
-            def:             DefId::invalid(),
-        };
-    }
-
-    has_resolved_type(&this) -> boolean { return this.resolved_type.is_valid(); }
-}
-
-implement trait Allocate for struct IntrinsicConstDecl {
     static allocate(size: u64, align: u64) -> void* {
         return cryo_ast_arena_alloc(size, align);
     }

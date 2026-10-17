@@ -129,17 +129,19 @@ type struct DeclarationEmitter {
     ctx:         CompilationContext*;
     started:     StartedGlobals;
 
-    /// While a `![caller_location]` function's body is emitted, the two
-    /// trailing parameters its callers pass their `FILE` and `LINE` in;
-    /// null for any other body.
-    caller_file: LValue;
-    caller_line: LValue;
+    /// While a `![caller_location]` function's body is emitted, the trailing
+    /// parameter its callers pass the address of their `Location` in; null
+    /// for any other body.
+    caller_location: LValue;
+    /// The readable qualified name of the function whose body is emitted,
+    /// the `function` of a `Location` made in it.
+    function_name: string;
 
     static null() -> DeclarationEmitter {
         return DeclarationEmitter {
             started:     StartedGlobals { nodes: [], slots: [] },
-            caller_file: LValue::null(),
-            caller_line: LValue::null(),
+            caller_location: LValue::null(),
+            function_name:   "",
             llvm_module: null,
             builder:     null,
             type_mapper: null,
@@ -246,7 +248,7 @@ type struct DeclarationEmitter {
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
                         DeclKind::Enum(n) => { this.declare_enum_type(n); }
-                        DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::IntrinsicConst(_)
+                        DeclKind::Import(_) | DeclKind::Intrinsic(_)
                         | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
                         | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
                         | DeclKind::GenericParam(_) | DeclKind::Legacy => {}
@@ -341,7 +343,7 @@ type struct DeclarationEmitter {
                     match ((stmt as DeclarationNode*).shape) {
                         DeclKind::Intrinsic(n) => { this.declare_intrinsic(n); }
                         DeclKind::Extern(n)    => { this.declare_extern_block(n); }
-                        DeclKind::Import(_) | DeclKind::IntrinsicConst(_) | DeclKind::Module(_)
+                        DeclKind::Import(_) | DeclKind::Module(_)
                         | DeclKind::Variant(_) | DeclKind::Destructure(_) | DeclKind::TypeAlias(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Enum(_)
                         | DeclKind::Legacy => {}
@@ -1618,15 +1620,16 @@ type struct DeclarationEmitter {
     /// location. No-op unless `-g`. The subroutine type carries no
     /// parameter list (sufficient for function-level file:line backtraces;
     /// per-argument types and per-statement line granularity are follow-ups).
-    /// Enter the body of `func`, defined as `fn_val`: a `![caller_location]`
-    /// body reads `FILE` and `LINE` from its last two parameters.
+    /// Enter the body of `func`, defined as `fn_val`: record its name, and
+    /// for a `![caller_location]` body the last parameter, the address of
+    /// its caller's `Location`.
     open_caller_site(mut &this, fn_val: LValue, func: FunctionDeclNode*) -> void {
-        this.caller_file = LValue::null();
-        this.caller_line = LValue::null();
+        this.function_name = this.ctx.intern_table.shown(
+            this.ctx.defs.path_of(FunctionDeclNode::written_in_of(func)));
+        this.caller_location = LValue::null();
         if (!func.is_caller_located) { return; }
         const n: u32 = llvm::LLVMCountParams(fn_val.raw);
-        this.caller_file = fn_val.get_param(n - 2);
-        this.caller_line = fn_val.get_param(n - 1);
+        this.caller_location = fn_val.get_param(n - 1);
     }
 
     emit_debug_subprogram(mut &this, fn_val: LValue, node: FunctionDeclNode*) -> void {

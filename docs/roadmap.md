@@ -323,6 +323,13 @@ Everything in the standard library is public today, so its internals -
 v1.0.  The pass goes through the library deciding what stays public, and
 decides at the same time which of its APIs want borrowed trait objects.
 
+`std::core::intrinsics::Location` is one it must close: only the compiler
+makes one (`location()`, and the caller of a `![caller_location]`
+function), and a program reads its fields.  A program must not be able to
+build one with a struct literal, so that adding a field later is not a
+breaking change; its fields read, and nothing outside the compiler
+constructs it.
+
 Open: whether the pass is gated (a public item with no documentation, or
 nothing outside the library using it, reported) or done by review alone.
 

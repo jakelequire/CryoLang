@@ -891,7 +891,31 @@ The compiler also expands two source-location pseudo-constants at the call site:
 
 These are used by `panic`, `assert`, and the testing framework to report failure locations without the caller passing them by hand.
 
-Inside a function marked `![caller_location]`, `FILE` and `LINE` are instead the location of the call to that function: every call passes its own location as two hidden trailing arguments, and a call made from inside another `![caller_location]` function passes on the location that one was given, so a chain of them reports the first call outside the chain.  The standard library's index bounds check is marked this way, so an out-of-range `xs[i]` reports the line of the `xs[i]`.  Such a function cannot be taken as a value (E0151), by its name, its path, or a static method's path: a call through the value would have no location to pass.  The type check refuses it, so `cryo check` and the editor report it.  The directive is refused on a variadic function or method (E0151): the hidden pair follows the written arguments, and a variadic call's written arguments have no fixed end.
+The intrinsic function `location()` answers the whole place as a value, a `Location` (both declared in `std::core::intrinsics`):
+
+```cryo
+type struct Location {
+    file:     string;   // the source file, as the build was given it
+    line:     u32;      // from 1
+    column:   u32;      // from 1
+    function: string;   // the readable qualified name of the enclosing function
+}
+```
+
+Each call answers the place it is written: the line and column of the call itself, and the function it is written in, named by its qualified path (`App::Main::main`, `App::Main::Probe::own`), never by its linker symbol. Two calls on one line answer two columns. Code the compiler moves into a function of its own is named for the function it is written in: a lambda's or a closure's body names the enclosing function, an `async function`'s body the async function, and every specialization of a generic function or method the generic as written (`App::Main::Holder::at`).
+
+```cryo
+import std::fmt;
+import std::core::intrinsics;
+
+function main() -> i32 {
+    const here: intrinsics::Location = intrinsics::location();
+    fmt::println(f"{here.file}:{here.line}:{here.column} in {here.function}");
+    return 0;
+}
+```
+
+Inside a function marked `![caller_location]`, `location()`, `FILE` and `LINE` are instead the place of the call to that function: every call passes the address of its own `Location` as a hidden trailing argument, and a call made from inside another `![caller_location]` function passes on the one it was given, so a chain of them reports the first call outside the chain - its file, line, column and function. A lambda written in such a body is a function of its own and not `![caller_location]`: a place made in it is its own.  The standard library's index bounds check is marked this way, so an out-of-range `xs[i]` reports the line of the `xs[i]`.  Such a function cannot be taken as a value (E0151), by its name, its path, or a static method's path: a call through the value would have no location to pass.  The type check refuses it, so `cryo check` and the editor report it.  The directive is refused on a variadic function or method (E0151): the hidden argument follows the written ones, and a variadic call's written arguments have no fixed end.
 
 ```cryo
 ![caller_location]
@@ -3314,7 +3338,7 @@ type struct AlignedData {
 | --------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `![inline]`                                               | function, method                   | Every call is inlined, at every optimization level and across modules: a module calling the function compiles its own copy of the body, which is discarded once inlined, and the defining module keeps the one definition. A generic function's instances are inlined the same way.                                                                                                                                            |
 | `![noinline]`                                             | function, method                   | The function is never inlined.                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `![caller_location]`                                      | function, method                   | `FILE` and `LINE` in the body are the location of the call ([section 4.5](#45-intrinsic-functions)). The function cannot be taken as a value, and cannot be variadic.                                                                                                                                                                                                                                                                                            |
+| `![caller_location]`                                      | function, method                   | `location()`, `FILE` and `LINE` in the body are the place of the call ([section 4.5](#45-intrinsic-functions)). The function cannot be taken as a value, and cannot be variadic.                                                                                                                                                                                                                                                                                 |
 | `![deprecated]` / `![deprecated("msg")]`                  | any decl                           | Marks a declaration as deprecated. *Parsed and validated; use-site warnings are not yet emitted.*                                                                                                                                                                                                                                                                                                                               |
 | `![symbol("name")]`                                       | extern fn / method / fn definition | Override the linker symbol: Cryo callers use the declared name while the symbol emitted / resolved at link time is `name`. On an extern decl or body-less method it renames the *imported* symbol; on a function *definition* it renames the *emitted* symbol. Used by the C++ binding generator to pin a decl to its Itanium-mangled symbol.                                                                                   |
 | `![no_mangle]`                                            | function / method                  | Emit the definition under its bare declared identifier instead of the mangled `C$…` symbol, so it can be linked from C (or serve as a runtime lang-item) without a wrapper. The preferred unmangling directive; `![symbol("name")]` is for the *rename* case.                                                                                                                                                                   |

@@ -40,7 +40,7 @@ import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
     DestructureDecl, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
     FunctionDeclNode, GenericParamDecl, ImplBlockNode, ImportDecl,
-    IntrinsicConstDecl, IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
+    IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDeclNode,
     TraitDeclNode, TypeAliasDecl, UnionDeclNode, VarDeclNode
 };
@@ -550,14 +550,8 @@ implement struct Parser {
             return func;
         }
 
-        // Intrinsic declaration or intrinsic const
+        // Intrinsic function declaration
         if (tok.kind == TokenType::KwIntrinsic) {
-            // Peek ahead: intrinsic const -> IntrinsicConstDecl
-            if (this.peek_at(1).kind == TokenType::KwConst) {
-                const ic: DeclarationNode* = this.parse_intrinsic_const_declaration();
-                if (ic != null && doc != "") { ic.set_documentation(doc_text); }
-                return ic;
-            }
             if (this.peek_at(1).kind == TokenType::KwFunction && this.peek_at(3).kind == TokenType::LAngle) {
                 const gi: FunctionDeclNode* = this.parse_generic_intrinsic_declaration();
                 if (gi != null && doc != "") { gi.set_documentation(doc_text); }
@@ -2657,6 +2651,13 @@ implement struct Parser {
         if (this.check(TokenType::KwFunction)) {
             this.advance(); // consume 'function'
         }
+        // An intrinsic is a function; anything else here (`intrinsic
+        // const`) is refused once, and the rest of it skipped.
+        if (!this.check(TokenType::Identifier)) {
+            this.consume(TokenType::Identifier, "intrinsic name");
+            this.synchronize();
+            return null;
+        }
         const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
         const node: IntrinsicDecl* = IntrinsicDecl::new(name);
@@ -2727,22 +2728,6 @@ implement struct Parser {
         this.consume(TokenType::Semicolon, "';'");
         func.span = this.span_from(start);
         return func;
-    }
-
-    /// Parse an intrinsic const declaration: intrinsic const NAME: Type;
-    parse_intrinsic_const_declaration() -> DeclarationNode* {
-        const start: Token = this.advance(); // consume 'intrinsic'
-        this.advance(); // consume 'const'
-        const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic const name");
-        const ic: IntrinsicConstDecl* = IntrinsicConstDecl::new(this.intern_lexeme(name_tok));
-
-        // Type annotation: : Type
-        if (this.match_tok(TokenType::Colon)) {
-            ic.type_annotation = this.parse_type_annotation();
-        }
-
-        this.consume(TokenType::Semicolon, "';'");
-        return DeclarationNode::of(DeclKind::IntrinsicConst(ic), this.span_from(start));
     }
 
     /// Parse generic type parameters: <T, U, A = DefaultType>
