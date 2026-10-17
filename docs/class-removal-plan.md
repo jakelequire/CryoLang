@@ -1460,10 +1460,12 @@ committed with the change and deleted in the next commit.
   `NodeKind::ImplementationBlock`, has functions of its own
   (`resolve_specialized_impl`, `prune_static_match_arms_in_impl`).  A
   one-off codemod (`scripts/registry-kind-codemod.py`) rewrote the field's
-  reads.  Not a check to lean on: `==` between two different enum types
-  type-checks, so a leftover `entry.kind == NodeKind::...` would have been
-  accepted; every read went through the renamed field, which is what made
-  each one refuse.  verify `--require-identical` 0 moved; `--ast`
+  reads.  At the time `==` between two different enum types type-checked,
+  so a leftover `entry.kind == NodeKind::...` would have been accepted;
+  every read went through the renamed field, which is what made each one
+  refuse.  A comparison of two unrelated enums, or of pointers to two
+  unrelated types, is E0200 now, so the conversions after it can lean on
+  the type check for comparisons too.  verify `--require-identical` 0 moved; `--ast`
   identical (the dump does not read the registry; the control is the
   alias label).
 - `TypeAlias(TypeAliasDecl*)` followed.  The places that hold an alias

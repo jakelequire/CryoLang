@@ -176,6 +176,12 @@ yet is recorded with the change that builds it, not here.
      one change after every declaration kind but classes has converted to
      a payload, not before.  (Dispatch, delegated)
 
+412. **A comparison between unrelated types is refused with E0200:** two
+     values of different enum types, or two pointers neither of which
+     converts to the other (pointers to unrelated structs among them).
+     Built as a change of its own, with a compile-fail test for each.
+     (Jake)
+
 413. **Class declarations are not converted to a declaration payload:** the
      class feature is deleted outright, so a class stays a subclass behind
      the declaration bridge until then.  (Jake)
