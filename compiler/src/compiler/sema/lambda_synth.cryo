@@ -47,7 +47,7 @@ import compiler::ast::expression::{
     CallExprNode, ExpressionNode, IdentifierNode, LambdaExprNode, MemberAccessNode
 };
 import compiler::ast::node::{ ASTNode };
-import compiler::ast::statement::{ BlockStmtNode, DeclStmtNode, StatementNode };
+import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
 import compiler::sema::sema;
 import compiler::sema::sema::{ SemaVisitor };
 import compiler::diag::diagnostic::{ Diagnostic };
@@ -354,7 +354,8 @@ type struct LambdaSynth {
         }
 
         // 4. __call__ body: `{ const cap_i = this.cap_i; <lambda body> }`.
-        mut body_block: BlockStmtNode* = new BlockStmtNode(span);
+        const body_block: Stmt* = Stmt::block(span);
+        const body: BlockStmt* = body_block.as_block();
         const this_ident_sym: SymbolStr = intern_ptr.intern("this");
         const cap_registry: GenericRegistry* = this.ctx.get_generic_registry();
         for (mut i: i64 = 0; i < lambda.captured_names.length; i++) {
@@ -389,17 +390,16 @@ type struct LambdaSynth {
                     && !OwnershipQuery::is_copy(arena_ptr, cap_registry, intern_ptr, cap_ty)) {
                 shadow.set_capture_alias(true);
             }
-            const shadow_stmt: DeclStmtNode* = new DeclStmtNode(shadow as DeclarationNode*, span);
-            body_block.add_statement(shadow_stmt as StatementNode*);
+            body.add_statement(Stmt::decl_stmt(shadow as DeclarationNode*, span));
         }
         if (lambda.body != null) {
-            if (lambda.body.kind == NodeKind::BlockStatement) {
-                const orig_blk: BlockStmtNode* = lambda.body as BlockStmtNode*;
-                for (mut bi: i64 = 0; bi < orig_blk.statements.length; bi++) {
-                    body_block.add_statement(orig_blk.statements[bi]);
+            match (lambda.body.shape) {
+                StmtKind::Block(orig_blk) => {
+                    for (mut bi: i64 = 0; bi < orig_blk.statements.length; bi++) {
+                        body.add_statement(orig_blk.statements[bi]);
+                    }
                 }
-            } else {
-                body_block.add_statement(lambda.body);
+                _ => { body.add_statement(lambda.body); }
             }
         }
         call_fn.set_body(body_block);
@@ -486,7 +486,7 @@ type struct LambdaSynth {
         drop_fn.set_resolved_return_type(this.arena.get_void());
         drop_fn.set_origin_trait(drop_id);
         drop_fn.add_parameter(this.closure_receiver(struct_ref, span));
-        drop_fn.set_body(new BlockStmtNode(span));
+        drop_fn.set_body(Stmt::block(span));
         mut drop_method: MethodNode* = new MethodNode(drop_fn, span);
         drop_fn.def = this.ctx.define_method(struct_decl.def, drop_name, span,
             drop_method as ASTNode*);

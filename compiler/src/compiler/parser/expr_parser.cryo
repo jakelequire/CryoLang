@@ -62,7 +62,7 @@ import compiler::ast::pattern::{
     EnumPattern, LiteralPattern, MatchArmNode, Pattern, PatternKind, RangePattern,
     StaticMatchArmNode
 };
-import compiler::ast::statement::{ BlockStmtNode, ExprStmtNode, MatchStmtNode, StatementNode };
+import compiler::ast::statement::{ MatchStmt, Stmt, StmtKind };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 
@@ -255,20 +255,18 @@ implement struct Parser {
         mut some_arm: MatchArmNode* = new MatchArmNode(op_span);
         some_arm.add_pattern(some_pat);
         const some_ident: IdentifierNode* = new IdentifierNode(bind_name, op_span);
-        const some_stmt:  ExprStmtNode*   = new ExprStmtNode(some_ident as ExpressionNode*, op_span);
-        mut some_block: BlockStmtNode* = new BlockStmtNode(op_span);
-        some_block.add_statement(some_stmt as StatementNode*);
-        some_arm.set_body(some_block as StatementNode*);
+        const some_block: Stmt* = Stmt::block(op_span);
+        some_block.as_block().add_statement(Stmt::expr_stmt(some_ident as ExpressionNode*, op_span));
+        some_arm.set_body(some_block);
         match_expr.add_arm(some_arm);
 
         // None => { b }
         const none_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "None", op_span);
         mut none_arm: MatchArmNode* = new MatchArmNode(op_span);
         none_arm.add_pattern(none_pat);
-        const none_stmt: ExprStmtNode* = new ExprStmtNode(right, right.span);
-        mut none_block: BlockStmtNode* = new BlockStmtNode(right.span);
-        none_block.add_statement(none_stmt as StatementNode*);
-        none_arm.set_body(none_block as StatementNode*);
+        const none_block: Stmt* = Stmt::block(right.span);
+        none_block.as_block().add_statement(Stmt::expr_stmt(right, right.span));
+        none_arm.set_body(none_block);
         match_expr.add_arm(none_arm);
 
         return match_expr as ExpressionNode*;
@@ -1706,7 +1704,7 @@ implement struct Parser {
         // call.  Until the form is properly desugared to `{ return expr; }`,
         // reject it with a clear diagnostic pointing at the braced form.
         if (this.check(TokenType::LBrace)) {
-            const block: BlockStmtNode* = this.parse_inner_block();
+            const block: Stmt* = this.parse_inner_block();
             lambda.set_body(block);
         } else {
             this.report_error(ErrorCode::E0108_EXPECTED_BRACE,
@@ -1716,9 +1714,9 @@ implement struct Parser {
             // E0108 above is the user-facing error.
             const body_expr: ExpressionNode* = this.parse_expression();
             if (body_expr != null) {
-                const expr_stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
-                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
-                block.add_statement(expr_stmt);
+                const expr_stmt: Stmt* = Stmt::expr_stmt(body_expr, body_expr.span);
+                const block: Stmt* = Stmt::block(body_expr.span);
+                block.as_block().add_statement(expr_stmt);
                 lambda.set_body(block);
             }
         }
@@ -2067,14 +2065,14 @@ implement struct Parser {
         this.consume(TokenType::FatArrow, "'=>'");
 
         if (this.check(TokenType::LBrace)) {
-            const block: BlockStmtNode* = this.parse_inner_block();
+            const block: Stmt* = this.parse_inner_block();
             arm.set_body(block);
         } else {
             const body_expr: ExpressionNode* = this.parse_expression();
             if (body_expr != null) {
-                const stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
-                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
-                block.add_statement(stmt);
+                const stmt: Stmt* = Stmt::expr_stmt(body_expr, body_expr.span);
+                const block: Stmt* = Stmt::block(body_expr.span);
+                block.as_block().add_statement(stmt);
                 arm.set_body(block);
             }
         }
@@ -2127,15 +2125,15 @@ implement struct Parser {
         // Body is either a block, which may hold any statement, or a single
         // expression.
         if (this.check(TokenType::LBrace)) {
-            mut block: BlockStmtNode* = this.parse_inner_block();
+            mut block: Stmt* = this.parse_inner_block();
             this.promote_value_block_tail(block);
             arm.set_body(block);
         } else {
             const body_expr: ExpressionNode* = this.parse_expression();
             if (body_expr != null) {
-                const stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
-                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
-                block.add_statement(stmt);
+                const stmt: Stmt* = Stmt::expr_stmt(body_expr, body_expr.span);
+                const block: Stmt* = Stmt::block(body_expr.span);
+                block.as_block().add_statement(stmt);
                 arm.set_body(block);
             }
         }
@@ -2146,7 +2144,7 @@ implement struct Parser {
 
     /// A match-expression arm's braced body is a VALUE block: codegen takes the
     /// arm's value from whatever its LAST statement left behind (the same
-    /// contract `BlockStmtNode.synth_drops` is built around).  Inside that
+    /// contract `BlockStmt.synth_drops` is built around).  Inside that
     /// block, `match` parses in statement position, and the statement lowering
     /// merges no value — so an arm whose tail is a `match` would silently adopt
     /// whichever value that match's last arm happened to emit, regardless of
@@ -2157,16 +2155,32 @@ implement struct Parser {
     /// is a statement, evaluated for effect, and must keep lowering as one.
     /// The unbraced arm form (`p => match (x) { .. }`) already parses as an
     /// expression and never reaches here.
-    promote_value_block_tail(block: BlockStmtNode*) -> void {
-        if (block == null || block.statements.length == 0) { return; }
-        const last: i64 = block.statements.length - 1;
-        const s: StatementNode* = block.statements[last];
-        if (s == null || s.kind != NodeKind::MatchStatement) { return; }
-        const ms: MatchStmtNode* = s as MatchStmtNode*;
-        // Both nodes carry the same components, so this re-wraps rather than
-        // rebuilding: the arms move across by pointer and keep their bindings,
-        // guards and bodies (and their identity, which later passes rely on).
-        mut me: MatchExprNode* = new MatchExprNode(ms.subject, ms.span);
+    promote_value_block_tail(block_stmt: Stmt*) -> void {
+        if (block_stmt == null) { return; }
+        match (block_stmt.shape) {
+            StmtKind::Block(block) => {
+                if (block.statements.length == 0) { return; }
+                const last: i64 = block.statements.length - 1;
+                const s: Stmt* = block.statements[last];
+                if (s == null) { return; }
+                match (s.shape) {
+                    StmtKind::Match(ms) => {
+                        block.statements[last] = this.match_stmt_as_expr(s, ms);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The match statement `s` (payload `ms`) re-formed as an expression
+    /// statement holding the same match.  Both nodes carry the same
+    /// components, so this re-wraps rather than rebuilding: the arms move
+    /// across by pointer and keep their bindings, guards and bodies (and
+    /// their identity, which later passes rely on).
+    match_stmt_as_expr(s: Stmt*, ms: MatchStmt*) -> Stmt* {
+        mut me: MatchExprNode* = new MatchExprNode(ms.subject, s.span);
         for (mut i: i64 = 0; i < ms.arms.length; i++) {
             const a: MatchArmNode* = ms.arms[i];
             // These arms were parsed in STATEMENT context, so their own bodies
@@ -2175,13 +2189,12 @@ implement struct Parser {
             // is what carries the promotion to arbitrary depth.  Idempotent on
             // an arm already parsed in expression context: its tail is an
             // ExpressionStatement by then and no longer matches.
-            if (a != null && a.body != null && a.body.kind == NodeKind::BlockStatement) {
-                this.promote_value_block_tail(a.body as BlockStmtNode*);
+            if (a != null) {
+                this.promote_value_block_tail(a.body);
             }
             me.add_arm(a);
         }
-        block.statements[last] =
-            new ExprStmtNode(me as ExpressionNode*, ms.span) as StatementNode*;
+        return Stmt::expr_stmt(me as ExpressionNode*, s.span);
     }
 
 

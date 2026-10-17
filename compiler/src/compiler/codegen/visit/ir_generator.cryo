@@ -59,10 +59,9 @@ import compiler::ast::expression::{
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, Pattern };
 import compiler::ast::statement::{
-    AsmBlockStmtNode, AsmConstraintKind, AsmDialect, AsmOpDir, AsmOperand, AsmPiece,
-    BlockStmtNode, BreakStmtNode, ContinueStmtNode, DeclStmtNode, DoWhileStmtNode,
-    ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
-    StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
+    AsmBlockStmt, AsmConstraintKind, AsmDialect, AsmOpDir, AsmOperand, AsmPiece, BlockStmt,
+    DeclStmt, DoWhileStmt, ExprStmt, ForStmt, IfStmt, LoopStmt, MatchStmt, ReturnStmt,
+    StaticMatchStmt, Stmt, StmtKind, UnsafeBlockStmt, WhileStmt
 };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{
@@ -228,21 +227,7 @@ type struct IRGeneratorVisitor {
             NodeKind::YieldExpression        => { return this.visit_yield(n as YieldExprNode*); }
             NodeKind::TryExpression          => { return this.visit_try(n as TryExprNode*); }
 
-            NodeKind::BlockStatement         => { return this.visit_block(n as BlockStmtNode*); }
-            NodeKind::UnsafeBlockStatement   => { return this.visit_unsafe_block(n as UnsafeBlockStmtNode*); }
-            NodeKind::AsmBlockStatement      => { return this.visit_asm_block(n as AsmBlockStmtNode*); }
-            NodeKind::ReturnStatement        => { return this.visit_return(n as ReturnStmtNode*); }
-            NodeKind::IfStatement            => { return this.visit_if(n as IfStmtNode*); }
-            NodeKind::WhileStatement         => { return this.visit_while(n as WhileStmtNode*); }
-            NodeKind::DoWhileStatement       => { return this.visit_do_while(n as DoWhileStmtNode*); }
-            NodeKind::ForStatement           => { return this.visit_for(n as ForStmtNode*); }
-            NodeKind::MatchStatement         => { return this.visit_match_stmt(n as MatchStmtNode*); }
-            NodeKind::StaticMatchStatement   => { return this.visit_static_match_stmt(n as StaticMatchStmtNode*); }
-            NodeKind::BreakStatement         => { return this.visit_break(n as BreakStmtNode*); }
-            NodeKind::ContinueStatement      => { return this.visit_continue(n as ContinueStmtNode*); }
-            NodeKind::ExpressionStatement    => { return this.visit_expr_stmt(n as ExprStmtNode*); }
-            NodeKind::DeclarationStatement   => { return this.visit_decl_stmt(n as DeclStmtNode*); }
-            NodeKind::LoopStatement          => { return this.visit_loop(n as LoopStmtNode*); }
+            NodeKind::Statement              => { return this.emit_stmt(n as Stmt*); }
 
             NodeKind::VariableDeclaration    => { return this.visit_var(n as VarDeclNode*); }
             NodeKind::DestructureDeclaration => { return this.visit_destructure(n as DestructureDeclNode*); }
@@ -262,8 +247,29 @@ type struct IRGeneratorVisitor {
                 return Emitted::none();
             }
 
-            NodeKind::Expression | NodeKind::Statement | NodeKind::Declaration
+            NodeKind::Expression | NodeKind::Declaration
             | NodeKind::AsyncExpression | NodeKind::Unknown => { return Emitted::none(); }
+        }
+    }
+
+    /// Emit statement `s` by its kind.
+    emit_stmt(mut &this, s: Stmt*) -> Emitted {
+        match (s.shape) {
+            StmtKind::Block(n)       => { return this.visit_block(s, n); }
+            StmtKind::UnsafeBlock(n) => { return this.visit_unsafe_block(s, n); }
+            StmtKind::Asm(n)         => { return this.visit_asm_block(s, n); }
+            StmtKind::Return(n)      => { return this.visit_return(s, n); }
+            StmtKind::If(n)          => { return this.visit_if(s, n); }
+            StmtKind::While(n)       => { return this.visit_while(s, n); }
+            StmtKind::DoWhile(n)     => { return this.visit_do_while(s, n); }
+            StmtKind::For(n)         => { return this.visit_for(s, n); }
+            StmtKind::Match(n)       => { return this.visit_match_stmt(s, n); }
+            StmtKind::StaticMatch(n) => { return this.visit_static_match_stmt(s, n); }
+            StmtKind::Break          => { return this.visit_break(s); }
+            StmtKind::Continue       => { return this.visit_continue(s); }
+            StmtKind::Expr(n)        => { return this.visit_expr_stmt(s, n); }
+            StmtKind::Decl(n)        => { return this.visit_decl_stmt(s, n); }
+            StmtKind::Loop(n)        => { return this.visit_loop(s, n); }
         }
     }
 
@@ -400,17 +406,17 @@ type struct IRGeneratorVisitor {
 
     // Statement visit overrides
 
-    visit_block(mut &this, node: BlockStmtNode*) -> Emitted {
-        return this.dispatch.generate_block(this,node);
+    visit_block(mut &this, stmt: Stmt*, node: BlockStmt*) -> Emitted {
+        return this.dispatch.generate_block(this, stmt);
     }
 
-    visit_break(mut &this, node: BreakStmtNode*) -> Emitted {
+    visit_break(mut &this, stmt: Stmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         this.cg.flow.codegen_break();
         return out;
     }
 
-    visit_continue(mut &this, node: ContinueStmtNode*) -> Emitted {
+    visit_continue(mut &this, stmt: Stmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         this.cg.flow.codegen_continue();
         return out;
@@ -418,12 +424,12 @@ type struct IRGeneratorVisitor {
 
     /// An expression statement's value is its expression's, loaded: the
     /// value a block-bodied match arm yields.
-    visit_expr_stmt(mut &this, node: ExprStmtNode*) -> Emitted {
+    visit_expr_stmt(mut &this, stmt: Stmt*, node: ExprStmt*) -> Emitted {
         if (node.expression == null) { return Emitted::none(); }
         return Emitted::rvalue(this.dispatch.codegen_rvalue(this,node.expression));
     }
 
-    visit_unsafe_block(mut &this, node: UnsafeBlockStmtNode*) -> Emitted {
+    visit_unsafe_block(mut &this, stmt: Stmt*, node: UnsafeBlockStmt*) -> Emitted {
         return this.dispatch.generate_block(this,node.block);
     }
 
@@ -437,11 +443,11 @@ type struct IRGeneratorVisitor {
     }
 
     /// Lower an `asm { ... }` block to an LLVM inline-asm call (or, at module
-    /// scope, to module-level inline asm).  See AsmBlockStmtNode and the
+    /// scope, to module-level inline asm).  See AsmBlockStmt and the
     /// lowering rules in the plan: operands are numbered outputs-first, the
     /// constraint string is [outputs, inputs, tied-inouts, clobbers], and
     /// direct (register) outputs are stored back after the call.
-    visit_asm_block(mut &this, node: AsmBlockStmtNode*) -> Emitted {
+    visit_asm_block(mut &this, stmt: Stmt*, node: AsmBlockStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         // Arch gating: an `![arch(X, ...)]` block is only emitted when the
         // compile target's arch matches X, so per-arch blocks can sit side
@@ -668,22 +674,22 @@ type struct IRGeneratorVisitor {
 
     // Statement visitors
 
-    visit_return(mut &this, node: ReturnStmtNode*) -> Emitted {
+    visit_return(mut &this, stmt: Stmt*, node: ReturnStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         // Drops attached to the return run *after* the expression value
         // is materialised; the expression may borrow a local that's
-        // about to be dropped.  See ReturnStmtNode.synth_drops and the
-        // ReturnStatement arm in passes/drop_insertion.cryo.
+        // about to be dropped.  See ReturnStmt.synth_drops and the
+        // return arm in passes/drop_insertion.cryo.
         if (node.expression != null) {
             const val: LValue = this.dispatch.codegen_rvalue(this,node.expression);
             for (mut i: i64 = 0; i < node.synth_drops.length; i++) {
-                const d: StatementNode* = node.synth_drops[i];
+                const d: Stmt* = node.synth_drops[i];
                 if (d != null) { this.dispatch_node(d); }
             }
             this.cg.expr_ops.codegen_return(val, true, node.expression.resolved_type);
         } else {
             for (mut i: i64 = 0; i < node.synth_drops.length; i++) {
-                const d: StatementNode* = node.synth_drops[i];
+                const d: Stmt* = node.synth_drops[i];
                 if (d != null) { this.dispatch_node(d); }
             }
             this.cg.expr_ops.codegen_return(LValue::null(), false, TypeRef::invalid());
@@ -691,7 +697,7 @@ type struct IRGeneratorVisitor {
         return out;
     }
 
-    visit_if(mut &this, node: IfStmtNode*) -> Emitted {
+    visit_if(mut &this, stmt: Stmt*, node: IfStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
         const current_fn: LValue = this.get_current_function();
@@ -711,7 +717,7 @@ type struct IRGeneratorVisitor {
         return out;
     }
 
-    visit_while(mut &this, node: WhileStmtNode*) -> Emitted {
+    visit_while(mut &this, stmt: Stmt*, node: WhileStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const current_fn: LValue = this.get_current_function();
         const blocks: LoopBlocks = this.cg.flow.codegen_while_header(current_fn);
@@ -728,12 +734,12 @@ type struct IRGeneratorVisitor {
         return out;
     }
 
-    visit_for(mut &this, node: ForStmtNode*) -> Emitted {
+    visit_for(mut &this, stmt: Stmt*, node: ForStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const current_fn: LValue = this.get_current_function();
         this.cg.values.push_scope();
         if (node.init != null) {
-            this.dispatch.generate_statement(this,node.init as StatementNode*);
+            this.dispatch_node(node.init);
         }
         const blocks: ForBlocks = this.cg.flow.codegen_for_header(current_fn);
         this.cg.builder.build_br(blocks.cond_bb);
@@ -760,7 +766,7 @@ type struct IRGeneratorVisitor {
         return out;
     }
 
-    visit_loop(mut &this, node: LoopStmtNode*) -> Emitted {
+    visit_loop(mut &this, stmt: Stmt*, node: LoopStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const current_fn: LValue = this.get_current_function();
         const blocks: LoopBlocks = this.cg.flow.codegen_loop_header(current_fn);
@@ -800,7 +806,7 @@ type struct IRGeneratorVisitor {
             "no matching pattern (non-exhaustive match)");
     }
 
-    visit_match_stmt(mut &this, node: MatchStmtNode*) -> Emitted {
+    visit_match_stmt(mut &this, stmt: Stmt*, node: MatchStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         if (node.subject == null || node.arms.length == 0) { return out; }
 
@@ -882,11 +888,11 @@ type struct IRGeneratorVisitor {
             // failure unwinds and drops the frame's live locals; the default
             // abort path stays byte-identical.
             if (this.cg.ctx.options.unwinds() && !this.cg.intrinsics.no_runtime) {
-                this.emit_no_match_raise(node.span, &node.unwind_cleanup);
+                this.emit_no_match_raise(stmt.span, &node.unwind_cleanup);
             } else {
                 mut no_ops: [LValue] = [];
                 this.cg.intrinsics.emit_check_sink(MangledName::new("__cryo_panic_no_match"),
-                                                   node.span, &no_ops);
+                                                   stmt.span, &no_ops);
             }
         }
 
@@ -1066,7 +1072,7 @@ type struct IRGeneratorVisitor {
     // `this.patterns` (see `pattern_emitter.cryo`); the match visit()
     // overrides at lines 715 and 3996 delegate through that field.
 
-    visit_decl_stmt(mut &this, node: DeclStmtNode*) -> Emitted {
+    visit_decl_stmt(mut &this, stmt: Stmt*, node: DeclStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         if (node.declaration != null) {
             // The declaration's kind picks `visit_var` or
@@ -1882,7 +1888,7 @@ type struct IRGeneratorVisitor {
 
     /// Static match used as a statement (void arms, e.g. an `Atomic<T>::store`
     /// body). Emit the single live arm's block for effect; ignore any value.
-    visit_static_match_stmt(mut &this, node: StaticMatchStmtNode*) -> Emitted {
+    visit_static_match_stmt(mut &this, stmt: Stmt*, node: StaticMatchStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         if (node.arms.length == 0 || node.arms[0] == null ||
             node.arms[0].body == null) { return out; }
@@ -2193,7 +2199,7 @@ type struct IRGeneratorVisitor {
         return out;
     }
 
-    visit_do_while(mut &this, node: DoWhileStmtNode*) -> Emitted {
+    visit_do_while(mut &this, stmt: Stmt*, node: DoWhileStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const current_fn: LValue = this.get_current_function();
         const blocks: LoopBlocks = this.cg.flow.codegen_do_while_header(current_fn);

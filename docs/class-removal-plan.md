@@ -1318,6 +1318,60 @@ committed with the change and deleted in the next commit.
   chain had a silent default.  That is a finding to record (which kinds
   fell through), not something to silence with `_`.
 
+**Statements: built** (flag day, ruling 385).
+
+- `Stmt` (in `AST/statement.cryo`) is the header, still a class deriving
+  from `ASTNode` for the reason `Pattern` is (section 10); its kind is
+  `shape: StmtKind`, and every statement is built with
+  `NodeKind::Statement`.  `StmtKind` has one variant per kind: `Block`,
+  `UnsafeBlock`, `Asm`, `Return`, `If`, `While`, `DoWhile`, `For`, `Match`,
+  `StaticMatch`, `Break`, `Continue`, `Expr`, `Decl`, `Loop`; `Break` and
+  `Continue` carry no payload.  The 15 per-kind `NodeKind`s are deleted.
+- Each payload is a plain struct with `Allocate` over the AST arena, its
+  `walk_children` inline (the first bridge row's statement entries are
+  gone).  Factories `Stmt::block`, `unsafe_block`, `return_stmt`, `if_stmt`,
+  `while_stmt`, `do_while_stmt`, `for_stmt`, `break_stmt`,
+  `continue_stmt`, `expr_stmt`, `decl_stmt`, `loop_stmt` take the old
+  constructors' parameters; a `match`, `static match` or `asm` statement is
+  built payload first (`MatchStmt::new`, ...) and wrapped, since its arms
+  or operands are added after.
+- A place that holds a statement whose kind is fixed by where it stands (a
+  function's body, the block under `unsafe`, a block being built) holds it
+  as `Stmt*` and reads the block through `Stmt::as_block()`, a checked
+  projection.  `Stmt::outer_span()` widens a block's span over its
+  directives.
+- `Walk::walk_stmt` dispatches on the shape to one hook per kind, each
+  hook given the header and the payload (`walk_if(s, n)`); sema, codegen,
+  the cloner and every ad-hoc walk `match` on the shape.  Casts to a
+  statement class went from 554 in the compiler and 16 in the language
+  server to 21 `as Stmt*` casts from an `ASTNode*` handle (a program item,
+  a `for` initializer), each guarded by `NodeKind::Statement`; the old
+  chains' casts that told a `for` initializer's declaration from a
+  statement became an explicit test of the initializer's kind.
+- Kinds that fell through the old chains' silent defaults are now explicit
+  arms, behaviour unchanged, each commented where it is not obviously
+  right.  The ones that read as defects: the async lowering's walks skip
+  `unsafe` blocks and `static match` arms, so a `return` in an await-free
+  `unsafe` block of an `async function` is refused (bug 0064); the W0001
+  and W0009 lints skip `unsafe` blocks; the generic-call collection in type
+  resolution skips `unsafe` and `do`-`while` bodies; no walk that scans for
+  moves, writes or calls looks into `asm` operands; position lookup does
+  not descend into `asm` operands.
+- A one-off codemod (`scripts/stmt-codemod.py`) renamed `StatementNode` and
+  `BlockStmtNode` to `Stmt`, turned each `new XStmtNode(...)` into its
+  factory, and kept each file's statement import to the names it uses; the
+  per-kind class names were left undefined so the type check pointed at
+  every cast, which was rewritten by hand.
+- **Measured.**  verify `--require-identical`: 0 test and 0 example objects
+  moved.  `--ast` dumps, the parent's compiler against this one, identical
+  over 1,057 files (5.6 GB a side); control: a dumper with the `WhileStmt`
+  label changed differs on all 164 files of `tests/tests/lang`.  Check time
+  x5 interleaved, medians: 8.46 s and 8.46 s; peak 1,526.8 -> 1,533.2 MiB
+  (+0.4%); node allocations +440,802 (one payload per statement but `break`
+  and `continue`), node bytes +7,114,160, arena +7,159,109 (+0.45%).
+  Selfhost fixed point on both hosts; clean build 0 warnings; language
+  server gate 189 checks.
+
 ### Slice 7: the remaining walks and traits
 
 - The ad-hoc walks that are better as `Walk` implementations.
@@ -1585,7 +1639,9 @@ final audit greps for each name listed and expects none.
 
 | piece | where | written in | deleted when |
 |---|---|---|---|
-| `implement class XNode { static walk_children ... }`, one per node class with children | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | each moves inline into its kind's payload struct body (ruling 397) as that category converts (slices 5-6); none left when the last category does |
+| `implement class XNode { static walk_children ... }`, one per node class with children | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | each moves inline into its kind's payload struct body (ruling 397) as that category converts (slices 5-6); none left when the last category does.  Patterns' and statements' are gone. |
 | `Walk::walk_node`'s `match (n.kind)` plus a cast per arm | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | becomes `walk_expr`/`walk_stmt`/... matching on `ExprKind` etc. as each category converts; deleted with `NodeKind` |
 | `Pattern` a class deriving from `ASTNode`, so an `ASTNode*` can hold it; the six `as Pattern*` casts from such handles (cloner, walker, lang-ref settling, three in the language server) | `compiler/src/compiler/AST/pattern.cryo` and the casts' files | slice 5 | the header becomes a struct when the "any node" handle is `Node` (slice 6, `Program` and `Node`); the casts become `Node::Pattern(p)` arms |
 | `Pattern.shape`, the pattern's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/pattern.cryo` | slice 5 | renamed `kind` when the header stops deriving from `ASTNode` |
+| `Stmt` a class deriving from `ASTNode`, so an `ASTNode*` (a program item, a `for` initializer, the editor's node at a position) can hold a statement; the 21 `as Stmt*` casts from such handles, each behind a `NodeKind::Statement` test | `compiler/src/compiler/AST/statement.cryo` and the casts' files | slice 6 (statements) | the header becomes a struct when the "any node" handle is `Node`; the casts become `Node::Stmt(s)` arms |
+| `Stmt.shape`, the statement's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/statement.cryo` | slice 6 (statements) | renamed `kind` when the header stops deriving from `ASTNode` |

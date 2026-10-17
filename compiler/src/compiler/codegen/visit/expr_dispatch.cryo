@@ -24,7 +24,7 @@ import std::ffi::libc;
 import compiler::ast::expression::{
     ArrayAccessNode, ExpressionNode, IdentifierNode, UnaryExprNode
 };
-import compiler::ast::statement::{ BlockStmtNode, StatementNode };
+import compiler::ast::statement::{ BlockStmt, Stmt };
 import compiler::codegen::visit::ir_generator;
 import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
@@ -57,19 +57,20 @@ type struct ExprDispatch {
     /// once the current basic block has a terminator so we don't emit
     /// unreachable IR after an early return.  The block's value is its last
     /// emitted statement's.
-    generate_block(mut &this, visitor: IRGeneratorVisitor*, block: BlockStmtNode*) -> Emitted {
+    generate_block(mut &this, visitor: IRGeneratorVisitor*, block: Stmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         if (block == null) { return out; }
+        const b: BlockStmt* = block.as_block();
         this.cg.values.push_scope();
         cdebug("[IRGen]         block (%lld stmts) at %s:%d:%d\n",
-               block.statements.length, block.span.file,
+               b.statements.length, block.span.file,
                block.span.start_line as i32, block.span.start_col as i32); libc::fflush(null);
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
+        for (mut i: i64 = 0; i < b.statements.length; i++) {
             const current: LBasicBlock = this.cg.builder.get_insert_block();
             if (current.is_valid() && current.has_terminator()) {
                 break;
             }
-            const stmt: StatementNode* = block.statements[i];
+            const stmt: Stmt* = b.statements[i];
             if (stmt != null) {
                 out = this.generate_statement(visitor, stmt);
             }
@@ -81,11 +82,11 @@ type struct ExprDispatch {
         // arm's value is still the block's.  Empty for every non-value block.
         // Skip if the block already terminated (an early exit emitted its own
         // cumulative drops); replaying after a terminator would be unreachable.
-        if (block.synth_drops.length > 0) {
+        if (b.synth_drops.length > 0) {
             const cur: LBasicBlock = this.cg.builder.get_insert_block();
             if (!(cur.is_valid() && cur.has_terminator())) {
-                for (mut i: i64 = 0; i < block.synth_drops.length; i++) {
-                    const d: StatementNode* = block.synth_drops[i];
+                for (mut i: i64 = 0; i < b.synth_drops.length; i++) {
+                    const d: Stmt* = b.synth_drops[i];
                     if (d != null) { this.generate_statement(visitor, d); }
                 }
             }
@@ -95,7 +96,7 @@ type struct ExprDispatch {
     }
 
     /// Emit a statement through the visitor's dispatch on its kind.
-    generate_statement(mut &this, visitor: IRGeneratorVisitor*, stmt: StatementNode*) -> Emitted {
+    generate_statement(mut &this, visitor: IRGeneratorVisitor*, stmt: Stmt*) -> Emitted {
         if (stmt == null) { return Emitted::none(); }
         cdebug("[IRGen]           stmt kind=%s\n", stmt.kind.to_string()); libc::fflush(null);
         return visitor.dispatch_node(stmt);

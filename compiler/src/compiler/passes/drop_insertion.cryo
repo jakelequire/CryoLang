@@ -89,9 +89,7 @@ import compiler::ast::expression::{
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
-    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
-    UnsafeBlockStmtNode, WhileStmtNode
+    BlockStmt, DoWhileStmt, ForStmt, IfStmt, LoopStmt, MatchStmt, Stmt, StmtKind, WhileStmt
 };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
@@ -919,7 +917,7 @@ type struct DropInserter {
         // whole binding, a set of members, or nothing this pass can observe
         // (a taken address).  attach_init_flag and attach_member_flags read
         // the answer.
-        this.collect_init_disqualifiers(func.body as StatementNode*);
+        this.collect_init_disqualifiers(func.body);
         this.reduce_init_places();
 
         this.push_scope();
@@ -981,7 +979,7 @@ type struct DropInserter {
     /// Returns true when the block always diverges on every control-flow
     /// path through it; used by the if/match join to ignore branches
     /// that can't fall through.
-    walk_block(mut &this, block: BlockStmtNode*) -> boolean {
+    walk_block(mut &this, block: Stmt*) -> boolean {
         if (block == null) { return false; }
         this.push_scope();
         const diverges: boolean = this.walk_block_body_impl(block, false);
@@ -1009,7 +1007,7 @@ type struct DropInserter {
     /// still get their cumulative drops via `walk_stmt_into`; that is the
     /// part that makes a droppable local live across `expr?` get freed on
     /// the error path.
-    walk_value_block(mut &this, block: BlockStmtNode*) -> boolean {
+    walk_value_block(mut &this, block: Stmt*) -> boolean {
         if (block == null) { return false; }
         this.push_scope();
         const diverges: boolean = this.walk_block_body_impl(block, true);
@@ -1021,7 +1019,7 @@ type struct DropInserter {
     /// (so a function can register parameters into the same scope as
     /// the body's locals before walking).  Returns true if the block
     /// always diverges.
-    walk_block_body(mut &this, block: BlockStmtNode*) -> boolean {
+    walk_block_body(mut &this, block: Stmt*) -> boolean {
         return this.walk_block_body_impl(block, false);
     }
 
@@ -1029,11 +1027,12 @@ type struct DropInserter {
     /// match-expression arm body; see `walk_value_block` for what that
     /// changes.  For ordinary blocks (`value_block == false`) this is the
     /// original `walk_block_body` behavior unchanged.
-    walk_block_body_impl(mut &this, block: BlockStmtNode*,
+    walk_block_body_impl(mut &this, block_stmt: Stmt*,
                          value_block: boolean) -> boolean {
-        if (block == null) { return false; }
-        const old_stmts: &[StatementNode*] = &block.statements;
-        mut new_stmts: [StatementNode*] = [];
+        if (block_stmt == null) { return false; }
+        const block: BlockStmt* = block_stmt.as_block();
+        const old_stmts: &[Stmt*] = &block.statements;
+        mut new_stmts: [Stmt*] = [];
         mut terminated: boolean = false;
 
         // For a value block, find the index of the arm's value statement:
@@ -1042,8 +1041,9 @@ type struct DropInserter {
         if (value_block) {
             for (mut i: i64 = old_stmts.length - 1; i >= 0; i--) {
                 if (old_stmts[i] != null) {
-                    if (old_stmts[i].kind == NodeKind::ExpressionStatement) {
-                        value_idx = i;
+                    match (old_stmts[i].shape) {
+                        StmtKind::Expr(_) => { value_idx = i; }
+                        _ => {}
                     }
                     break;
                 }
@@ -1051,7 +1051,7 @@ type struct DropInserter {
         }
 
         for (mut i: i64 = 0; i < old_stmts.length; i++) {
-            const stmt: StatementNode* = old_stmts[i];
+            const stmt: Stmt* = old_stmts[i];
             if (stmt == null) { continue; }
             if (terminated) {
                 // Statements after an unconditional divergence are
@@ -1059,17 +1059,19 @@ type struct DropInserter {
                 // emitted its drops and there's no path here.
                 continue;
             }
-            if (i == value_idx) {
-                // The arm's value statement.  Walk its expression in move
-                // context (a yielded bare binding is then marked moved),
-                // and keep the statement in place so codegen still finds
-                // the arm value as the block's last statement.
-                const es: ExprStmtNode* = stmt as ExprStmtNode*;
-                if (es.expression != null) { this.walk_expr_move(es.expression); }
-                new_stmts.push(stmt);
-            } else {
-                const stmt_diverges: boolean = this.walk_stmt_into(stmt, &new_stmts);
-                if (stmt_diverges) { terminated = true; }
+            match (stmt.shape) {
+                StmtKind::Expr(es) if (i == value_idx) => {
+                    // The arm's value statement.  Walk its expression in move
+                    // context (a yielded bare binding is then marked moved),
+                    // and keep the statement in place so codegen still finds
+                    // the arm value as the block's last statement.
+                    if (es.expression != null) { this.walk_expr_move(es.expression); }
+                    new_stmts.push(stmt);
+                }
+                _ => {
+                    const stmt_diverges: boolean = this.walk_stmt_into(stmt, &new_stmts);
+                    if (stmt_diverges) { terminated = true; }
+                }
             }
         }
 
@@ -1086,7 +1088,7 @@ type struct DropInserter {
                 // AFTER the value expression (which may read a local being
                 // dropped).  So stash them on the block; codegen replays them
                 // at block end once the arm value is materialised (see
-                // `generate_block` + `BlockStmtNode.synth_drops`).  A yielded
+                // `generate_block` + `BlockStmt.synth_drops`).  A yielded
                 // local was marked moved by the value statement's move-context
                 // walk above, so `append_top_scope_drops` skips it - no
                 // double-free of the match result.
@@ -1106,7 +1108,7 @@ type struct DropInserter {
     /// Returns true if `stmt` always diverges (any path through the
     /// program reaching this point cannot fall through to the next
     /// statement in the enclosing block).
-    walk_stmt_into(mut &this, stmt: StatementNode*, out: [StatementNode*]*) -> boolean {
+    walk_stmt_into(mut &this, stmt: Stmt*, out: [Stmt*]*) -> boolean {
         const outer_writes: boolean = this.stmt_writes_flags;
         this.stmt_writes_flags = false;
         const d: boolean = this.walk_stmt_kind(stmt, out);
@@ -1114,10 +1116,9 @@ type struct DropInserter {
         return d;
     }
 
-    walk_stmt_kind(mut &this, stmt: StatementNode*, out: [StatementNode*]*) -> boolean {
-        return match (stmt.kind) {
-            NodeKind::ReturnStatement => {
-                const r: ReturnStmtNode* = stmt as ReturnStmtNode*;
+    walk_stmt_kind(mut &this, stmt: Stmt*, out: [Stmt*]*) -> boolean {
+        return match (stmt.shape) {
+            StmtKind::Return(r) => {
                 const ret_snap: i64 = this.snapshot_moves();
                 this.stmt_writes_flags = true;
                 if (r.expression != null) { this.walk_expr_move(r.expression); }
@@ -1136,7 +1137,7 @@ type struct DropInserter {
                 out.push(stmt);
                 true
             }
-            NodeKind::BreakStatement => {
+            StmtKind::Break => {
                 // Drops only the bindings inside the enclosing loop's
                 // scopes.  Bindings declared OUTSIDE the loop survive
                 // the `break` and continue to live in the post-loop
@@ -1145,13 +1146,12 @@ type struct DropInserter {
                 out.push(stmt);
                 true
             }
-            NodeKind::ContinueStatement => {
+            StmtKind::Continue => {
                 this.append_loop_exit_drops(out);
                 out.push(stmt);
                 true
             }
-            NodeKind::ExpressionStatement => {
-                const e: ExprStmtNode* = stmt as ExprStmtNode*;
+            StmtKind::Expr(e) => {
                 this.pend_assign_node = null;
                 const outer_snap: i64 = this.stmt_move_snap;
                 this.stmt_move_snap = this.snapshot_moves();
@@ -1192,10 +1192,9 @@ type struct DropInserter {
                 this.pend_assign_node = null;
                 false
             }
-            NodeKind::DeclarationStatement => {
-                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            StmtKind::Decl(ds) => {
                 mut init_flag: PassLocal = PassLocal::none();
-                mut flag_decls: [StatementNode*] = [];
+                mut flag_decls: [Stmt*] = [];
                 const decl_snap: i64 = this.snapshot_moves();
                 this.stmt_writes_flags = true;
                 if (ds.declaration != null) {
@@ -1230,54 +1229,52 @@ type struct DropInserter {
                 this.stmt_writes_flags = false;
                 out.push(stmt);
                 if (init_flag.is_valid()) {
-                    out.push(this.make_drop_flag_decl(init_flag, ds.span));
+                    out.push(this.make_drop_flag_decl(init_flag, stmt.span));
                 }
                 for (mut fi: i64 = 0; fi < flag_decls.length; fi++) {
                     out.push(flag_decls[fi]);
                 }
-                this.append_move_flag_writes(decl_snap, null, out, ds.span);
+                this.append_move_flag_writes(decl_snap, null, out, stmt.span);
                 false
             }
-            NodeKind::BlockStatement => {
-                const d: boolean = this.walk_block(stmt as BlockStmtNode*);
+            StmtKind::Block(_) => {
+                const d: boolean = this.walk_block(stmt);
                 out.push(stmt);
                 d
             }
-            NodeKind::UnsafeBlockStatement => {
-                const u: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
-                mut d: boolean = false;
-                if (u.block != null) { d = this.walk_block(u.block); }
+            StmtKind::UnsafeBlock(u) => {
+                const d: boolean = this.walk_block(u.block);
                 out.push(stmt);
                 d
             }
-            NodeKind::IfStatement => {
+            StmtKind::If(it) => {
                 // Pass `out` so walk_if can hoist drop-flag declarations
                 // for conditionally-moved bindings BEFORE the if-stmt.
-                const d: boolean = this.walk_if(stmt as IfStmtNode*, out);
+                const d: boolean = this.walk_if(stmt, it, out);
                 out.push(stmt);
                 d
             }
-            NodeKind::WhileStatement => {
-                this.walk_while(stmt as WhileStmtNode*);
+            StmtKind::While(w) => {
+                this.walk_while(w);
                 out.push(stmt);
                 false
             }
-            NodeKind::DoWhileStatement => {
-                this.walk_do_while(stmt as DoWhileStmtNode*);
+            StmtKind::DoWhile(w) => {
+                this.walk_do_while(w);
                 out.push(stmt);
                 false
             }
-            NodeKind::ForStatement => {
-                this.walk_for(stmt as ForStmtNode*);
+            StmtKind::For(f) => {
+                this.walk_for(f);
                 out.push(stmt);
                 false
             }
-            NodeKind::LoopStatement => {
-                this.walk_loop(stmt as LoopStmtNode*);
+            StmtKind::Loop(l) => {
+                this.walk_loop(l);
                 out.push(stmt);
                 false
             }
-            NodeKind::MatchStatement => {
+            StmtKind::Match(m) => {
                 // If the subject is a non-Identifier rvalue of owning type
                 // (e.g. `match (compute()) { ... }`), the temporary holding
                 // the subject value is invisible to the binding/scope-exit
@@ -1288,32 +1285,32 @@ type struct DropInserter {
                 // normal binding path, and the match itself sees an Identifier
                 // subject (engaging consumption tracking + drop-glue
                 // suppression for arms that move the payload out).
-                const m: MatchStmtNode* = stmt as MatchStmtNode*;
-                if (m != null && m.subject != null &&
+                if (m.subject != null &&
                     m.subject.kind != NodeKind::Identifier &&
                     this.type_needs_drop(m.subject.resolved_type)) {
                     this.hoist_match_subject(m, out);
                 }
-                const d: boolean = this.walk_match(m, out);
+                const d: boolean = this.walk_match_arms(stmt, m.subject, m.arms, false, out,
+                                                        &m.unwind_cleanup);
                 out.push(stmt);
                 d
             }
-            NodeKind::StaticMatchStatement => {
+            StmtKind::StaticMatch(sm) => {
                 // Reduced to a single live arm by the monomorphizer; instrument
                 // its block body like a plain block (no subject, no per-arm
                 // consumption/drop-flag machinery).
-                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
                 mut smd: boolean = false;
-                if (sm.arms.length > 0 && sm.arms[0] != null &&
-                    sm.arms[0].body != null &&
-                    sm.arms[0].body.kind == NodeKind::BlockStatement) {
-                    smd = this.walk_block(sm.arms[0].body as BlockStmtNode*);
+                if (sm.arms.length > 0 && sm.arms[0] != null && sm.arms[0].body != null) {
+                    match (sm.arms[0].body.shape) {
+                        StmtKind::Block(_) => { smd = this.walk_block(sm.arms[0].body); }
+                        _ => {}
+                    }
                 }
                 out.push(stmt);
                 smd
             }
-            // Any other shape passes through.
-            _ => {
+            // No binding, no move and no exit to instrument.
+            StmtKind::Asm(_) => {
                 out.push(stmt);
                 false
             }
@@ -1357,8 +1354,8 @@ type struct DropInserter {
 
     // ---- control-flow walks ---------------------------------------------
 
-    walk_if(mut &this, it: IfStmtNode*,
-            out: [StatementNode*]*) -> boolean {
+    walk_if(mut &this, s: Stmt*, it: IfStmt*,
+            out: [Stmt*]*) -> boolean {
         if (it == null) { return false; }
         // The condition runs on every path, so a field moved out in it is an
         // unconditional partial move: walked outside the branch depth, as
@@ -1399,7 +1396,7 @@ type struct DropInserter {
         // empty moved-set, making any then-only move conditional.
         const has_else: boolean = it.else_stmt != null;
         const both_diverge: boolean = then_diverges && has_else && else_diverges;
-        this.merge_branches_if(it, out, snap,
+        this.merge_branches_if(s, it, out, snap,
             then_keys, then_lines, then_gov, then_diverges,
             else_keys, else_lines, else_gov, has_else, else_diverges);
         this.branch_depth -= 1;
@@ -1410,20 +1407,19 @@ type struct DropInserter {
     /// in a synthesized block so the block walker can splice cumulative
     /// drops before it.  Otherwise return the stmt unchanged.  The
     /// parser produces bare statements for `if (c) return;` shapes.
-    wrap_early_exit(mut &this, stmt: StatementNode*) -> StatementNode* {
+    wrap_early_exit(mut &this, stmt: Stmt*) -> Stmt* {
         if (stmt == null) { return stmt; }
-        const k: NodeKind = stmt.kind;
-        if (k != NodeKind::ReturnStatement &&
-            k != NodeKind::BreakStatement  &&
-            k != NodeKind::ContinueStatement) {
-            return stmt;
-        }
-        const block: BlockStmtNode* = new BlockStmtNode(stmt.span);
-        block.statements.push(stmt);
-        return block as StatementNode*;
+        const exits: boolean = match (stmt.shape) {
+            StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue => { true }
+            _ => { false }
+        };
+        if (!exits) { return stmt; }
+        const block: Stmt* = Stmt::block(stmt.span);
+        block.as_block().statements.push(stmt);
+        return block;
     }
 
-    walk_while(mut &this, w: WhileStmtNode*) -> void {
+    walk_while(mut &this, w: WhileStmt*) -> void {
         if (w == null) { return; }
         if (w.condition != null) { this.walk_expr_read(w.condition); }
         // Loops run their body 0+ times.  Any move inside the body
@@ -1446,7 +1442,7 @@ type struct DropInserter {
         this.restore_moves(snap);
     }
 
-    walk_do_while(mut &this, w: DoWhileStmtNode*) -> void {
+    walk_do_while(mut &this, w: DoWhileStmt*) -> void {
         if (w == null) { return; }
         const snap: i64 = this.snapshot_moves();
         this.loop_boundary.push(this.scope_start_idx.length);
@@ -1461,7 +1457,7 @@ type struct DropInserter {
         if (w.condition != null) { this.walk_expr_read(w.condition); }
     }
 
-    walk_for(mut &this, f: ForStmtNode*) -> void {
+    walk_for(mut &this, f: ForStmt*) -> void {
         if (f == null) { return; }
         // The init clause typically declares a loop variable like
         // `mut i: i64 = 0`; its scope is the for-statement, not the
@@ -1489,7 +1485,7 @@ type struct DropInserter {
         this.pop_scope();
     }
 
-    walk_loop(mut &this, l: LoopStmtNode*) -> void {
+    walk_loop(mut &this, l: LoopStmt*) -> void {
         if (l == null) { return; }
         const snap: i64 = this.snapshot_moves();
         this.loop_boundary.push(this.scope_start_idx.length);
@@ -1501,12 +1497,6 @@ type struct DropInserter {
         this.branch_depth -= 1;
         this.loop_boundary.pop();
         this.restore_moves(snap);
-    }
-
-    walk_match(mut &this, m: MatchStmtNode*,
-               out: [StatementNode*]*) -> boolean {
-        if (m == null) { return false; }
-        return this.walk_match_arms(m, m.subject, m.arms, false, out, &m.unwind_cleanup);
     }
 
     /// Walk a match's subject and arms as N independent control-flow
@@ -1608,10 +1598,10 @@ type struct DropInserter {
         return consumed;
     }
 
-    walk_match_arms(mut &this, m: MatchStmtNode*,
+    walk_match_arms(mut &this, m: Stmt*,
                     subject: ExpressionNode*,
                     arms: &[MatchArmNode*], is_expr: boolean,
-                    out: [StatementNode*]*, cleanup_out: [ASTNode*]*) -> boolean {
+                    out: [Stmt*]*, cleanup_out: [ASTNode*]*) -> boolean {
         if (subject != null) { this.walk_expr_read(subject); }
         // `--panic=unwind`: a non-exhaustive match emits a `no_match` guard that
         // raises through `__cryo_panic`; snapshot the frame's live-local drops
@@ -1867,17 +1857,17 @@ type struct DropInserter {
     /// (then/else of an if, body of a while, arm of a match, ...) without
     /// rebuilding a parent statement list.  Returns the divergence flag
     /// of the statement.  Bare early-exit branches should already have
-    /// been wrapped in a synthesized BlockStmtNode by walk_if/etc. via
+    /// been wrapped in a synthesized block by walk_if/etc. via
     /// wrap_early_exit, so by the time we get here the statement is
     /// either a Block or a non-early-exit shape.
-    walk_stmt_in_place(mut &this, stmt: StatementNode*) -> boolean {
+    walk_stmt_in_place(mut &this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        return match (stmt.kind) {
-            NodeKind::BlockStatement => {
-                this.walk_block(stmt as BlockStmtNode*)
+        return match (stmt.shape) {
+            StmtKind::Block(_) => {
+                this.walk_block(stmt)
             }
             _ => {
-                mut throwaway: [StatementNode*] = [];
+                mut throwaway: [Stmt*] = [];
                 this.walk_stmt_into(stmt, &throwaway)
             }
         };
@@ -1887,19 +1877,18 @@ type struct DropInserter {
     /// goes through `walk_value_block` (so the arm's trailing expression
     /// is treated as the yielded value), and a bare un-blocked expression
     /// statement is itself that value, walked in move context.
-    walk_stmt_in_place_value(mut &this, stmt: StatementNode*) -> boolean {
+    walk_stmt_in_place_value(mut &this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        return match (stmt.kind) {
-            NodeKind::BlockStatement => {
-                this.walk_value_block(stmt as BlockStmtNode*)
+        return match (stmt.shape) {
+            StmtKind::Block(_) => {
+                this.walk_value_block(stmt)
             }
-            NodeKind::ExpressionStatement => {
-                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+            StmtKind::Expr(es) => {
                 if (es.expression != null) { this.walk_expr_move(es.expression); }
                 false
             }
             _ => {
-                mut throwaway: [StatementNode*] = [];
+                mut throwaway: [Stmt*] = [];
                 this.walk_stmt_into(stmt, &throwaway)
             }
         };
@@ -1925,8 +1914,8 @@ type struct DropInserter {
     /// state on the moved control-flow path.  A binding moved on both
     /// branches and flag-written on neither is definitely moved, and gets
     /// no flag.
-    merge_branches_if(mut &this, it: IfStmtNode*,
-                       out: [StatementNode*]*, snap: i64,
+    merge_branches_if(mut &this, s: Stmt*, it: IfStmt*,
+                       out: [Stmt*]*, snap: i64,
                        then_keys: [u64], then_lines: [i32], then_gov: [boolean],
                        then_diverges: boolean,
                        else_keys: [u64], else_lines: [i32], else_gov: [boolean],
@@ -1952,7 +1941,7 @@ type struct DropInserter {
             mut tail_gov: [boolean] = [];
             for (mut i: i64 = 0; i < then_gov.length; i++) { tail_gov.push(then_gov[i]); }
             if (!has_else) {
-                this.synth_flags_for_then_only_moves(it, out, &then_keys, &then_lines, &then_gov);
+                this.synth_flags_for_then_only_moves(s, it, out, &then_keys, &then_lines, &then_gov);
                 // Every then-move of an outer binding is flag-written now.
                 for (mut i: i64 = 0; i < then_keys.length; i++) {
                     if (this.binding_in_outer_scope(then_keys[i])) { tail_gov[i] = true; }
@@ -2010,10 +1999,10 @@ type struct DropInserter {
                 if (!gov && this.get_drop_flag(k).is_valid()) {
                     // Moved on both branches, conditionally on one of them.
                     if (!gov_then) {
-                        this.synth_flag_for_branch(it, out, k, then_lines[i], true, true);
+                        this.synth_flag_for_branch(s, it, out, k, then_lines[i], true, true);
                     }
                     if (!gov_else) {
-                        this.synth_flag_for_branch(it, out, k, then_lines[i], false, true);
+                        this.synth_flag_for_branch(s, it, out, k, then_lines[i], false, true);
                     }
                     gov = true;
                 }
@@ -2022,7 +2011,7 @@ type struct DropInserter {
                 def_gov.push(gov);
             } else {
                 // Then-only conditional move.  Flag + flag-set in then.
-                this.synth_flag_for_branch(it, out, k, then_lines[i], true, !gov_then);
+                this.synth_flag_for_branch(s, it, out, k, then_lines[i], true, !gov_then);
                 def_keys.push(k);
                 def_lines.push(then_lines[i]);
                 def_gov.push(true);
@@ -2038,7 +2027,7 @@ type struct DropInserter {
             if (!in_then) {
                 // Else-only conditional move.  Flag + flag-set in else.
                 const gov_else: boolean = this.all_governed(&else_keys, &else_gov, k);
-                this.synth_flag_for_branch(it, out, k, else_lines[j], false, !gov_else);
+                this.synth_flag_for_branch(s, it, out, k, else_lines[j], false, !gov_else);
                 def_keys.push(k);
                 def_lines.push(else_lines[j]);
                 def_gov.push(true);
@@ -2053,8 +2042,8 @@ type struct DropInserter {
     /// branch's body unless `splice` is false (the branch already writes it
     /// on the paths that moved).  Records the binding -> flag mapping so
     /// maybe_append_drop emits a conditional drop later.
-    synth_flag_for_branch(mut &this, it: IfStmtNode*,
-                            out: [StatementNode*]*,
+    synth_flag_for_branch(mut &this, s: Stmt*, it: IfStmt*,
+                            out: [Stmt*]*,
                             binding: u64, move_line: i32,
                             branch_is_then: boolean, splice: boolean) -> void {
         // Already has a flag? Idempotent re-use - just splice the
@@ -2064,14 +2053,14 @@ type struct DropInserter {
             flag = this.fresh_drop_flag(binding);
             // Hoist `mut <flag>: boolean = false;` before the if-stmt.
             // The binding span is the best anchor for diagnostics on the
-            // synthesized local; fall back to it.span if unavailable.
-            const decl_span: SourceSpan = this.binding_span_for(binding, it.span);
+            // synthesized local; fall back to s.span if unavailable.
+            const decl_span: SourceSpan = this.binding_span_for(binding, s.span);
             out.push(this.make_drop_flag_decl(flag, decl_span));
             this.register_drop_flag(binding, flag);
         }
         if (!splice) { return; }
         // Splice `<flag>=true;` at the end of the moving branch.
-        const set_span: SourceSpan = this.line_only_span(move_line, it.span);
+        const set_span: SourceSpan = this.line_only_span(move_line, s.span);
         if (branch_is_then) {
             it.then_stmt = this.splice_flag_set_into_branch(
                 it.then_stmt, flag, set_span);
@@ -2088,8 +2077,8 @@ type struct DropInserter {
     /// includes `key`.  Arms that didn't move it (borrow-only arms,
     /// diverging arms, irrelevant variants) leave the flag at `false`
     /// so the scope-exit conditional drop fires correctly.
-    synth_flag_for_match_arms(mut &this, m: MatchStmtNode*,
-                                out: [StatementNode*]*,
+    synth_flag_for_match_arms(mut &this, m: Stmt*,
+                                out: [Stmt*]*,
                                 move_line: i32,
                                 arms: &[MatchArmNode*], arm_count: i64,
                                 arm_move_keys: &[u64],
@@ -2130,15 +2119,15 @@ type struct DropInserter {
     /// Helper: synthesize drop flags for every outer-scope binding moved
     /// in the then-branch when there's no explicit else.  The implicit
     /// else moves nothing, so every then-move is conditional.
-    synth_flags_for_then_only_moves(mut &this, it: IfStmtNode*,
-                                      out: [StatementNode*]*,
+    synth_flags_for_then_only_moves(mut &this, s: Stmt*, it: IfStmt*,
+                                      out: [Stmt*]*,
                                       then_keys: &[u64],
                                       then_lines: &[i32],
                                       then_gov: &[boolean]) -> void {
         for (mut i: i64 = 0; i < then_keys.length; i++) {
             const k: u64 = then_keys[i];
             if (k == 0 || !this.binding_in_outer_scope(k)) { continue; }
-            this.synth_flag_for_branch(it, out, k, then_lines[i], true,
+            this.synth_flag_for_branch(s, it, out, k, then_lines[i], true,
                 !this.all_governed(then_keys, then_gov, k));
         }
     }
@@ -2205,7 +2194,7 @@ type struct DropInserter {
     /// Append synthetic drops for the top scope's bindings (reverse
     /// declaration order) to `out`.  Skips bindings that have already
     /// been moved on the current path and bindings whose type is Copy.
-    append_top_scope_drops(mut &this, out: [StatementNode*]*) -> void {
+    append_top_scope_drops(mut &this, out: [Stmt*]*) -> void {
         const start: i64 = this.top_scope_start();
         const end:   i64 = this.binding_names.length;
         for (mut i: i64 = end - 1; i >= start; i--) {
@@ -2215,7 +2204,7 @@ type struct DropInserter {
 
     /// Append drops for every live scope down to `min_scope`, innermost
     /// first, reverse declaration order within each scope.
-    append_drops_to_depth(mut &this, out: [StatementNode*]*, min_scope: i64) -> void {
+    append_drops_to_depth(mut &this, out: [Stmt*]*, min_scope: i64) -> void {
         const total_scopes: i64 = this.scope_start_idx.length;
         if (total_scopes == 0 || min_scope >= total_scopes) { return; }
         const stop: i64 = if (min_scope < 0) { 0 } else { min_scope };
@@ -2234,7 +2223,7 @@ type struct DropInserter {
 
     /// Drops for every live scope, innermost first.  Used before
     /// `return`: the function exits, so every scope gets dropped.
-    append_cumulative_drops(mut &this, out: [StatementNode*]*) -> void {
+    append_cumulative_drops(mut &this, out: [Stmt*]*) -> void {
         this.append_drops_to_depth(out, 0);
     }
 
@@ -2247,12 +2236,12 @@ type struct DropInserter {
     /// handle the conditional cases at runtime, identically to the normal-path
     /// drops.  An empty schedule (no live local needs dropping) tells codegen
     /// to emit a plain `call` instead of an `invoke`.  Gated on panic=unwind by
-    /// the caller.  Stored as `ASTNode*` (up-cast from `StatementNode*`) to
+    /// the caller.  Stored as `ASTNode*` (up-cast from `Stmt*`) to
     /// match the node's cycle-avoiding field type.  Shared by every panic
     /// origin: ordinary calls and the synthesized div/no-match/new-overflow
     /// guards.
     snapshot_unwind_cleanup(mut &this, out: [ASTNode*]*) -> void {
-        mut sched: [StatementNode*] = [];
+        mut sched: [Stmt*] = [];
         // In-flight arguments of enclosing calls first - they were constructed
         // most recently (dropped first) and the cumulative pass skips them (they
         // are marked moved), so they must be added explicitly.
@@ -2272,7 +2261,7 @@ type struct DropInserter {
     /// plain `.drop()` with no init/move-flag guard is exact. The binding's
     /// storage is untouched by the pending move (owning aggregates pass by
     /// pointer to the source alloca; the callee never ran), so the drop is safe.
-    append_pending_arg_drops(mut &this, out: [StatementNode*]*) -> void {
+    append_pending_arg_drops(mut &this, out: [Stmt*]*) -> void {
         for (mut i: i64 = this.pending_arg_ids.length - 1; i >= 0; i--) {
             const key: u64 = this.pending_arg_ids[i];
             if (key == 0) { continue; }
@@ -2281,7 +2270,7 @@ type struct DropInserter {
             const local: PassLocal = this.local_of(key);
             if (!local.is_valid()) { continue; }
             const span: SourceSpan = this.binding_span_for(key);
-            const stmt: StatementNode* = this.make_drop_call(local, ty, span);
+            const stmt: Stmt* = this.make_drop_call(local, ty, span);
             if (stmt != null) { out.push(stmt); }
         }
     }
@@ -2319,7 +2308,7 @@ type struct DropInserter {
     /// Drops for scopes inside the current loop body.  Used before
     /// `break`/`continue`: those exit the enclosing loop only, so
     /// bindings declared OUTSIDE the loop must NOT be dropped here.
-    append_loop_exit_drops(mut &this, out: [StatementNode*]*) -> void {
+    append_loop_exit_drops(mut &this, out: [Stmt*]*) -> void {
         if (this.loop_boundary.length == 0) {
             // No enclosing loop; `break`/`continue` outside a loop
             // would be a sema error already; emit nothing.
@@ -2481,14 +2470,14 @@ type struct DropInserter {
     /// `name.drop()` for partially-moved bindings.  Mirrors codegen's
     /// `emit_field_drops`, but emitted as AST so it lowers through the normal
     /// `.drop()` path.
-    append_partial_drops(mut &this, out: [StatementNode*]*, name: PassLocal,
+    append_partial_drops(mut &this, out: [Stmt*]*, name: PassLocal,
                          ty: TypeRef, key: u64, span: SourceSpan) -> void {
         const t: Type* = this.aggregate_type_of(ty);
         if (t == null) {
             // Defensive: partial_move_allowed required an aggregate, so this
             // should be unreachable.  Fall back to the monolithic drop rather
             // than silently leaking every field.
-            const stmt: StatementNode* = this.make_drop_call(name, ty, span);
+            const stmt: Stmt* = this.make_drop_call(name, ty, span);
             if (stmt != null) { out.push(stmt); this.inserted += 1; }
             return;
         }
@@ -2506,7 +2495,7 @@ type struct DropInserter {
             }
             // Moved out: the source no longer owns it - do NOT drop.
             if (this.pm_moved_field(key, t, i)) { continue; }
-            const drop_stmt: StatementNode* = this.make_field_drop_call(
+            const drop_stmt: Stmt* = this.make_field_drop_call(
                 name, ty, f.decl_name().spelling(), i, f.field_type, span);
             out.push(drop_stmt);
             this.inserted += 1;
@@ -2519,7 +2508,7 @@ type struct DropInserter {
     /// types (codegen won't re-run type resolution).
     make_field_drop_call(mut &this, name: PassLocal, ty: TypeRef,
                          field_name: SymbolStr, field_index: i64, field_ty: TypeRef,
-                         span: SourceSpan) -> StatementNode* {
+                         span: SourceSpan) -> Stmt* {
         const ident: IdentifierNode* = this.local_ident(name, ty, span);
         const field_access: MemberAccessNode* = new MemberAccessNode(
             ident as ExpressionNode*, field_name, span, span);
@@ -2532,15 +2521,15 @@ type struct DropInserter {
         const call: CallExprNode* = new CallExprNode(
             drop_access as ExpressionNode*, span);
         this.sema.bind_destructor_call(call);
-        const stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, span);
+        const stmt: Stmt* = Stmt::expr_stmt(call as ExpressionNode*, span);
         field_access.generated = true;
         drop_access.generated = true;
         call.generated = true;
         stmt.generated = true;
-        return stmt as StatementNode*;
+        return stmt;
     }
 
-    maybe_append_drop(mut &this, out: [StatementNode*]*, idx: i64) -> void {
+    maybe_append_drop(mut &this, out: [Stmt*]*, idx: i64) -> void {
         const key:  u64       = this.binding_syms[idx].key();
         const ty:   TypeRef   = this.binding_types[idx];
         const span: SourceSpan = this.binding_spans[idx];
@@ -2553,7 +2542,7 @@ type struct DropInserter {
         if (this.slot_has_members(idx)) {
             // The whole value left the frame; the new owner drops what it got.
             if (this.is_moved_id(key)) { return; }
-            mut mcore: [StatementNode*] = [];
+            mut mcore: [Stmt*] = [];
             this.append_member_drops(&mcore, idx);
             if (mcore.length == 0) { return; }
             const mflag: PassLocal = this.binding_dropflags[idx];
@@ -2574,7 +2563,7 @@ type struct DropInserter {
         // init-flag guard if the binding was only conditionally initialized.
         // An unconditionally-moved binding produces no cleanup at all (its
         // storage left this scope), so init state is moot - return early.
-        mut core: [StatementNode*] = [];
+        mut core: [Stmt*] = [];
         // Conditional move: a drop-flag was hoisted for THIS declaration by
         // a branch-join in this function.  Emit `if (!flag) drop();`
         // regardless of the moved-set state, since the flag is the
@@ -2586,7 +2575,7 @@ type struct DropInserter {
         // each declaration's storage must be governed by its own flag.
         const flag: PassLocal = this.binding_dropflags[idx];
         if (flag.is_valid()) {
-            const cstmt: StatementNode* = this.make_conditional_drop_call(
+            const cstmt: Stmt* = this.make_conditional_drop_call(
                 sym, ty, flag, span);
             if (cstmt != null) { core.push(cstmt); }
         } else if (this.is_moved_id(key)) {
@@ -2598,7 +2587,7 @@ type struct DropInserter {
             // drop flag, so this is mutually exclusive with the branches above.
             this.append_partial_drops(&core, sym, ty, key, span);
         } else {
-            const stmt: StatementNode* = this.make_drop_call(sym, ty, span);
+            const stmt: Stmt* = this.make_drop_call(sym, ty, span);
             if (stmt != null) { core.push(stmt); }
         }
         if (core.length == 0) { return; }
@@ -2749,7 +2738,7 @@ type struct DropInserter {
     /// moved" on the path that had not moved it, and the value was released
     /// twice.
     append_move_flag_writes(mut &this, snapshot: i64, expr: ExpressionNode*,
-                            out: [StatementNode*]*, span: SourceSpan) -> void {
+                            out: [Stmt*]*, span: SourceSpan) -> void {
         mut written: [u64] = [];
         for (mut i: i64 = snapshot; i < this.moved_keys.length; i++) {
             const k: u64 = this.moved_keys[i];
@@ -2795,8 +2784,8 @@ type struct DropInserter {
     ///
     /// The temporary is deliberately NOT registered as a binding: its release
     /// is emitted right here, and a scope-exit drop would be a second one.
-    emit_assign_drop(mut &this, stmt: StatementNode*,
-                     out: [StatementNode*]*) -> void {
+    emit_assign_drop(mut &this, stmt: Stmt*,
+                     out: [Stmt*]*) -> void {
         const span: SourceSpan = stmt.span;
         const ty: TypeRef = this.pend_assign_ty;
         const place: ExpressionNode* = this.build_place_expr(
@@ -2812,19 +2801,19 @@ type struct DropInserter {
         vd.set_sym_id(old.binding);
         vd.set_resolved_type(ty);
         vd.set_initializer(place);
-        const ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
+        const ds: Stmt* = Stmt::decl_stmt(vd as DeclarationNode*, span);
         vd.generated = true;
         ds.generated = true;
-        out.push(ds as StatementNode*);
+        out.push(ds);
 
         out.push(stmt);
 
-        const drop_stmt: StatementNode* = this.make_drop_call(old, ty, span);
+        const drop_stmt: Stmt* = this.make_drop_call(old, ty, span);
         if (drop_stmt == null) { return; }
         if (!this.pend_assign_guard.is_valid()) {
             out.push(drop_stmt);
         } else {
-            mut core: [StatementNode*] = [];
+            mut core: [Stmt*] = [];
             core.push(drop_stmt);
             const guard: PassLocal = this.pend_assign_guard;
             if (this.pend_assign_guard_moved) {
@@ -2864,7 +2853,7 @@ type struct DropInserter {
     /// drop fires at statement end, matching where most systems languages
     /// destroy a discarded temporary.
     emit_discarded_temp_drop(mut &this, expr: ExpressionNode*,
-                              out: [StatementNode*]*, span: SourceSpan) -> void {
+                              out: [Stmt*]*, span: SourceSpan) -> void {
         const ty: TypeRef = expr.resolved_type;
         const tmp: PassLocal = this.mint_local(this.intern.intern(
             fmt::format("__drop_tmp%d", this.discard_seq)));
@@ -2873,11 +2862,11 @@ type struct DropInserter {
         vd.set_sym_id(tmp.binding);
         vd.set_resolved_type(ty);
         vd.set_initializer(expr);
-        const ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
+        const ds: Stmt* = Stmt::decl_stmt(vd as DeclarationNode*, span);
         vd.generated = true;
         ds.generated = true;
-        out.push(ds as StatementNode*);
-        const drop_stmt: StatementNode* = this.make_drop_call(tmp, ty, span);
+        out.push(ds);
+        const drop_stmt: Stmt* = this.make_drop_call(tmp, ty, span);
         if (drop_stmt != null) {
             out.push(drop_stmt);
             this.inserted += 1;
@@ -2891,8 +2880,8 @@ type struct DropInserter {
     /// like any other owning local; and walk_match_arms's consumption
     /// tracking (gated on subject.kind == Identifier) now fires properly,
     /// so an arm that moves the payload out suppresses the subject's glue.
-    hoist_match_subject(mut &this, m: MatchStmtNode*,
-                        out: [StatementNode*]*) -> void {
+    hoist_match_subject(mut &this, m: MatchStmt*,
+                        out: [Stmt*]*) -> void {
         if (m == null || m.subject == null) { return; }
         const span: SourceSpan = m.subject.span;
         const ty: TypeRef = m.subject.resolved_type;
@@ -2909,10 +2898,10 @@ type struct DropInserter {
         vd.set_sym_id(sym);
         vd.set_resolved_type(ty);
         vd.set_initializer(m.subject);
-        const ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
+        const ds: Stmt* = Stmt::decl_stmt(vd as DeclarationNode*, span);
         vd.generated = true;
         ds.generated = true;
-        out.push(ds as StatementNode*);
+        out.push(ds);
         // Register the synthesized binding so scope-exit drop synthesis sees
         // it.  walk_var_decl is the usual entry point but it also walks the
         // initializer - which we just walked - so register directly.
@@ -2964,7 +2953,7 @@ type struct DropInserter {
     /// Build `mut <flag>: boolean = false;` as a DeclStmt.  The boolean
     /// type is looked up via the type arena's primitive bool registry.
     make_drop_flag_decl(mut &this, flag: PassLocal,
-                         span: SourceSpan) -> StatementNode* {
+                         span: SourceSpan) -> Stmt* {
         const lit: LiteralNode* = new LiteralNode("false", LiteralKind::Boolean, span);
         lit.set_resolved_type(this.arena.get_bool());
         const vd: VarDeclNode* = new VarDeclNode(flag.name, span);
@@ -2973,16 +2962,16 @@ type struct DropInserter {
         vd.set_mutable(true);
         vd.set_drop_flag(true);
         vd.set_initializer(lit as ExpressionNode*);
-        const ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
+        const ds: Stmt* = Stmt::decl_stmt(vd as DeclarationNode*, span);
         lit.generated = true;
         vd.generated = true;
         ds.generated = true;
-        return ds as StatementNode*;
+        return ds;
     }
 
     /// Build `<flag> = true;`.
     make_drop_flag_set(mut &this, flag: PassLocal,
-                        span: SourceSpan) -> StatementNode* {
+                        span: SourceSpan) -> Stmt* {
         return this.make_drop_flag_write(flag, true, span);
     }
 
@@ -2990,7 +2979,7 @@ type struct DropInserter {
     /// the bare `=` token.  Drop-flag locals are always `mut` (see
     /// `make_drop_flag_decl`), so this is a legal assignment target.
     make_drop_flag_write(mut &this, flag: PassLocal, value: boolean,
-                         span: SourceSpan) -> StatementNode* {
+                         span: SourceSpan) -> Stmt* {
         const lhs: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const text: string = if (value) { "true" } else { "false" };
         const rhs: LiteralNode* = new LiteralNode(text, LiteralKind::Boolean, span);
@@ -3000,11 +2989,11 @@ type struct DropInserter {
         const assign: BinaryExprNode* = new BinaryExprNode(
             eq_tok, lhs as ExpressionNode*, rhs as ExpressionNode*, span);
         assign.set_resolved_type(this.arena.get_bool());
-        const stmt: ExprStmtNode* = new ExprStmtNode(assign as ExpressionNode*, span);
+        const stmt: Stmt* = Stmt::expr_stmt(assign as ExpressionNode*, span);
         rhs.generated = true;
         assign.generated = true;
         stmt.generated = true;
-        return stmt as StatementNode*;
+        return stmt;
     }
 
     /// Build `if (!<flag>) { <binding>.drop(); }` as an IfStmt.  The
@@ -3013,7 +3002,7 @@ type struct DropInserter {
     /// binding has a registered drop flag (conditional move).
     make_conditional_drop_call(mut &this, binding: PassLocal, ty: TypeRef,
                                  flag: PassLocal,
-                                 span: SourceSpan) -> StatementNode* {
+                                 span: SourceSpan) -> Stmt* {
         // Condition: `!<flag>`
         const flag_ident: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const not_tok: Token = Token::new(TokenType::Exclaim, "!",
@@ -3022,40 +3011,40 @@ type struct DropInserter {
             not_tok, flag_ident as ExpressionNode*, span);
         cond.set_resolved_type(this.arena.get_bool());
         // Body: `{ <binding>.drop(); }`
-        const drop_stmt: StatementNode* = this.make_drop_call(binding, ty, span);
-        if (drop_stmt == null) { return null as StatementNode*; }
-        const body: BlockStmtNode* = new BlockStmtNode(span);
-        body.statements.push(drop_stmt);
-        const if_stmt: IfStmtNode* = new IfStmtNode(
-            cond as ExpressionNode*, body as StatementNode*,
-            null as StatementNode*, span);
+        const drop_stmt: Stmt* = this.make_drop_call(binding, ty, span);
+        if (drop_stmt == null) { return null; }
+        const body: Stmt* = Stmt::block(span);
+        body.as_block().statements.push(drop_stmt);
+        const if_stmt: Stmt* = Stmt::if_stmt(cond as ExpressionNode*, body, null, span);
         cond.generated = true;
         body.generated = true;
         if_stmt.generated = true;
-        return if_stmt as StatementNode*;
+        return if_stmt;
     }
 
     /// Append `<flag>=true;` to a branch body so the scope-exit
     /// conditional drop sees the moved state.  If the branch body is a
-    /// BlockStmt we append directly; otherwise we wrap it in a block
+    /// block we append directly; otherwise we wrap it in a block
     /// (the same trick `wrap_early_exit` uses).  Returns the (possibly
     /// re-wrapped) branch body so the caller can update the if/match
     /// node's pointer.
-    splice_flag_set_into_branch(mut &this, branch: StatementNode*,
+    splice_flag_set_into_branch(mut &this, branch: Stmt*,
                                  flag: PassLocal,
-                                 span: SourceSpan) -> StatementNode* {
+                                 span: SourceSpan) -> Stmt* {
         if (branch == null) { return branch; }
-        const set_stmt: StatementNode* = this.make_drop_flag_set(flag, span);
-        if (branch.kind == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = branch as BlockStmtNode*;
-            blk.statements.push(set_stmt);
-            return branch;
+        const set_stmt: Stmt* = this.make_drop_flag_set(flag, span);
+        match (branch.shape) {
+            StmtKind::Block(b) => {
+                b.statements.push(set_stmt);
+                return branch;
+            }
+            _ => {}
         }
         // Non-block: wrap the original stmt and append the flag-set.
-        const blk: BlockStmtNode* = new BlockStmtNode(span);
-        blk.statements.push(branch);
-        blk.statements.push(set_stmt);
-        return blk as StatementNode*;
+        const blk: Stmt* = Stmt::block(span);
+        blk.as_block().statements.push(branch);
+        blk.as_block().statements.push(set_stmt);
+        return blk;
     }
 
     /// Prepend `<flag>=true;` to the FRONT of a branch body.  Unlike
@@ -3065,21 +3054,23 @@ type struct DropInserter {
     /// flag-set the arm's value.  Front insertion is order-safe because the
     /// flag merely records that the matched subject is consumed on this arm's
     /// path, independent of where in the arm the consumption textually occurs.
-    splice_flag_set_at_front(mut &this, branch: StatementNode*,
+    splice_flag_set_at_front(mut &this, branch: Stmt*,
                              flag: PassLocal,
-                             span: SourceSpan) -> StatementNode* {
+                             span: SourceSpan) -> Stmt* {
         if (branch == null) { return branch; }
-        const set_stmt: StatementNode* = this.make_drop_flag_set(flag, span);
-        if (branch.kind == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = branch as BlockStmtNode*;
-            blk.statements.insert(0, set_stmt);
-            return branch;
+        const set_stmt: Stmt* = this.make_drop_flag_set(flag, span);
+        match (branch.shape) {
+            StmtKind::Block(b) => {
+                b.statements.insert(0, set_stmt);
+                return branch;
+            }
+            _ => {}
         }
         // Non-block: wrap so the flag-set runs before the original stmt.
-        const blk: BlockStmtNode* = new BlockStmtNode(span);
-        blk.statements.push(set_stmt);
-        blk.statements.push(branch);
-        return blk as StatementNode*;
+        const blk: Stmt* = Stmt::block(span);
+        blk.as_block().statements.push(set_stmt);
+        blk.as_block().statements.push(branch);
+        return blk;
     }
 
     /// Allocate a fresh drop flag for `binding`, with a binding of its own.
@@ -3150,7 +3141,7 @@ type struct DropInserter {
     /// and never run the destructor its author wrote.  This is the same rule
     /// `partial_move_allowed` applies to moving a field out of such a type.
     attach_member_flags(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef,
-                        span: SourceSpan, out: [StatementNode*]*) -> boolean {
+                        span: SourceSpan, out: [Stmt*]*) -> boolean {
         const slot: i64 = this.binding_syms.length - 1;
         if (!sym.is_valid() || slot < 0 || this.binding_syms[slot].key() != sym.key()) {
             return false;
@@ -3298,28 +3289,28 @@ type struct DropInserter {
 
     /// Build `<base><chain>.drop();` for member entry `idx`.
     make_member_drop_call(mut &this, base: PassLocal, base_ty: TypeRef,
-                          idx: i64, span: SourceSpan) -> StatementNode* {
+                          idx: i64, span: SourceSpan) -> Stmt* {
         const place: ExpressionNode* = this.build_place_expr(
             base, base_ty, &this.mem_proj_kind, &this.mem_proj_key,
             this.mem_pstart[idx], this.mem_plen[idx], span);
-        if (place == null) { return null as StatementNode*; }
+        if (place == null) { return null; }
         const drop_access: MemberAccessNode* = new MemberAccessNode(
             place, this.drop_sym, span, span);
         const call: CallExprNode* = new CallExprNode(
             drop_access as ExpressionNode*, span);
         this.sema.bind_destructor_call(call);
-        const stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, span);
+        const stmt: Stmt* = Stmt::expr_stmt(call as ExpressionNode*, span);
         drop_access.generated = true;
         call.generated = true;
         stmt.generated = true;
-        return stmt as StatementNode*;
+        return stmt;
     }
 
     /// Emit `if (<flag>) { <member>.drop(); }` for every member of `slot`,
     /// most recently declared first.  Members moved out of the owner are
     /// skipped for the same reason `append_partial_drops` skips them: the
     /// source no longer owns that storage.
-    append_member_drops(mut &this, out: [StatementNode*]*, slot: i64) -> void {
+    append_member_drops(mut &this, out: [Stmt*]*, slot: i64) -> void {
         const base:    PassLocal  = this.local_at(slot);
         const base_ty: TypeRef    = this.binding_types[slot];
         const span:    SourceSpan = this.binding_spans[slot];
@@ -3331,10 +3322,10 @@ type struct DropInserter {
                             this.mem_proj_key[this.mem_pstart[i]])) {
                 continue;
             }
-            const drop_stmt: StatementNode* =
+            const drop_stmt: Stmt* =
                 this.make_member_drop_call(base, base_ty, i, span);
             if (drop_stmt == null) { continue; }
-            mut core: [StatementNode*] = [];
+            mut core: [Stmt*] = [];
             core.push(drop_stmt);
             out.push(this.wrap_in_init_guard(this.mem_flag[i], core, span));
             this.inserted += 1;
@@ -3381,26 +3372,21 @@ type struct DropInserter {
     /// reasoning `init_flag_for_assignment_target` applies on the positive
     /// side.  Treating them as writes would re-introduce the unguarded drop
     /// for every local whose field is incremented after a normal assignment.
-    collect_init_disqualifiers(mut &this, stmt: StatementNode*) -> void {
+    collect_init_disqualifiers(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
-        match (stmt.kind) {
-            NodeKind::BlockStatement => {
-                const b: BlockStmtNode* = stmt as BlockStmtNode*;
+        match (stmt.shape) {
+            StmtKind::Block(b) => {
                 for (mut i: i64 = 0; i < b.statements.length; i++) {
                     this.collect_init_disqualifiers(b.statements[i]);
                 }
             }
-            NodeKind::UnsafeBlockStatement => {
-                const u: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
-                if (u.block != null) {
-                    this.collect_init_disqualifiers(u.block as StatementNode*);
-                }
+            StmtKind::UnsafeBlock(u) => {
+                this.collect_init_disqualifiers(u.block);
             }
-            NodeKind::ExpressionStatement => {
-                this.disq_scan_expr((stmt as ExprStmtNode*).expression);
+            StmtKind::Expr(e) => {
+                this.disq_scan_expr(e.expression);
             }
-            NodeKind::DeclarationStatement => {
-                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            StmtKind::Decl(ds) => {
                 if (ds.declaration != null &&
                     ds.declaration.kind == NodeKind::VariableDeclaration) {
                     this.disq_scan_expr(
@@ -3411,27 +3397,23 @@ type struct DropInserter {
                         (ds.declaration as DestructureDeclNode*).initializer);
                 }
             }
-            NodeKind::ReturnStatement => {
-                this.disq_scan_expr((stmt as ReturnStmtNode*).expression);
+            StmtKind::Return(r) => {
+                this.disq_scan_expr(r.expression);
             }
-            NodeKind::IfStatement => {
-                const it: IfStmtNode* = stmt as IfStmtNode*;
+            StmtKind::If(it) => {
                 this.disq_scan_expr(it.condition);
                 this.collect_init_disqualifiers(it.then_stmt);
                 this.collect_init_disqualifiers(it.else_stmt);
             }
-            NodeKind::WhileStatement => {
-                const w: WhileStmtNode* = stmt as WhileStmtNode*;
+            StmtKind::While(w) => {
                 this.disq_scan_expr(w.condition);
                 this.collect_init_disqualifiers(w.body);
             }
-            NodeKind::DoWhileStatement => {
-                const w: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+            StmtKind::DoWhile(w) => {
                 this.disq_scan_expr(w.condition);
                 this.collect_init_disqualifiers(w.body);
             }
-            NodeKind::ForStatement => {
-                const f: ForStmtNode* = stmt as ForStmtNode*;
+            StmtKind::For(f) => {
                 // f.init is an ASTNode* (usually a `mut i = 0` var decl); only
                 // its initializer can hold a disqualifying use.
                 if (f.init != null &&
@@ -3442,11 +3424,10 @@ type struct DropInserter {
                 this.disq_scan_expr(f.update);
                 this.collect_init_disqualifiers(f.body);
             }
-            NodeKind::LoopStatement => {
-                this.collect_init_disqualifiers((stmt as LoopStmtNode*).body);
+            StmtKind::Loop(l) => {
+                this.collect_init_disqualifiers(l.body);
             }
-            NodeKind::MatchStatement => {
-                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::Match(m) => {
                 this.disq_scan_expr(m.subject);
                 for (mut i: i64 = 0; i < m.arms.length; i++) {
                     if (m.arms[i] != null) {
@@ -3455,15 +3436,15 @@ type struct DropInserter {
                     }
                 }
             }
-            NodeKind::StaticMatchStatement => {
-                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sm) => {
                 for (mut i: i64 = 0; i < sm.arms.length; i++) {
                     if (sm.arms[i] != null) {
                         this.collect_init_disqualifiers(sm.arms[i].body);
                     }
                 }
             }
-            _ => { }
+            // An `asm` operand that writes a local is not scanned.
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => { }
         }
     }
 
@@ -3883,19 +3864,18 @@ type struct DropInserter {
     /// Wrap the cleanup statements `core` in `if (<flag>) { core... }` so they
     /// run only where the binding was initialized.  Guard polarity is the
     /// inverse of `make_conditional_drop_call` (`if (flag)`, not `if (!flag)`).
-    wrap_in_init_guard(mut &this, flag: PassLocal, core: &[StatementNode*],
-                        span: SourceSpan) -> StatementNode* {
+    wrap_in_init_guard(mut &this, flag: PassLocal, core: &[Stmt*],
+                        span: SourceSpan) -> Stmt* {
         const flag_ident: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
-        const body: BlockStmtNode* = new BlockStmtNode(span);
+        const body: Stmt* = Stmt::block(span);
         for (mut i: i64 = 0; i < core.length; i++) {
-            body.statements.push(core[i]);
+            body.as_block().statements.push(core[i]);
         }
-        const if_stmt: IfStmtNode* = new IfStmtNode(
-            flag_ident as ExpressionNode*, body as StatementNode*,
-            null as StatementNode*, span);
+        const if_stmt: Stmt* = Stmt::if_stmt(
+            flag_ident as ExpressionNode*, body, null, span);
         body.generated = true;
         if_stmt.generated = true;
-        return if_stmt as StatementNode*;
+        return if_stmt;
     }
 
     /// Cheap syntactic over-approximation of "this assignment might displace a
@@ -3922,25 +3902,24 @@ type struct DropInserter {
     /// binding was not moved out.  Negative-polarity twin of
     /// `wrap_in_init_guard`; `make_conditional_drop_call` is the single-drop
     /// special case of this shape.
-    wrap_in_move_guard(mut &this, flag: PassLocal, core: &[StatementNode*],
-                       span: SourceSpan) -> StatementNode* {
+    wrap_in_move_guard(mut &this, flag: PassLocal, core: &[Stmt*],
+                       span: SourceSpan) -> Stmt* {
         const flag_ident: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const not_tok: Token = Token::new(TokenType::Exclaim, "!",
             span.start_line as int, span.start_col as int);
         const cond: UnaryExprNode* = new UnaryExprNode(
             not_tok, flag_ident as ExpressionNode*, span);
         cond.set_resolved_type(this.arena.get_bool());
-        const body: BlockStmtNode* = new BlockStmtNode(span);
+        const body: Stmt* = Stmt::block(span);
         for (mut i: i64 = 0; i < core.length; i++) {
-            body.statements.push(core[i]);
+            body.as_block().statements.push(core[i]);
         }
-        const if_stmt: IfStmtNode* = new IfStmtNode(
-            cond as ExpressionNode*, body as StatementNode*,
-            null as StatementNode*, span);
+        const if_stmt: Stmt* = Stmt::if_stmt(
+            cond as ExpressionNode*, body, null, span);
         cond.generated = true;
         body.generated = true;
         if_stmt.generated = true;
-        return if_stmt as StatementNode*;
+        return if_stmt;
     }
 
     /// Block-wrap a braceless control-flow body that assigns a
@@ -3948,22 +3927,24 @@ type struct DropInserter {
     /// synthesized after the assignment lands in a rebuilt statement list
     /// instead of a throwaway (which `walk_stmt_in_place` uses for non-block
     /// bodies).  Blocks already rebuild, so they pass through untouched.
-    wrap_for_init(mut &this, stmt: StatementNode*) -> StatementNode* {
+    wrap_for_init(mut &this, stmt: Stmt*) -> Stmt* {
         if (stmt == null) { return stmt; }
-        if (stmt.kind == NodeKind::BlockStatement) { return stmt; }
+        match (stmt.shape) {
+            StmtKind::Block(_) => { return stmt; }
+            _ => {}
+        }
         if (!this.stmt_assigns_tracked_init(stmt)) { return stmt; }
-        const block: BlockStmtNode* = new BlockStmtNode(stmt.span);
-        block.statements.push(stmt);
-        return block as StatementNode*;
+        const block: Stmt* = Stmt::block(stmt.span);
+        block.as_block().statements.push(stmt);
+        return block;
     }
 
     /// True if `stmt` (recursively) contains a plain assignment to a
     /// conditionally-initialized droppable local currently in scope.
-    stmt_assigns_tracked_init(&this, stmt: StatementNode*) -> boolean {
+    stmt_assigns_tracked_init(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        match (stmt.kind) {
-            NodeKind::ExpressionStatement => {
-                const e: ExprStmtNode* = stmt as ExprStmtNode*;
+        match (stmt.shape) {
+            StmtKind::Expr(e) => {
                 if (this.init_flag_for_assignment_target(e.expression).is_valid()) {
                     return true;
                 }
@@ -3974,37 +3955,27 @@ type struct DropInserter {
                 // depends on.  Wrapping is inert, so answer on the syntax.
                 return this.assignment_may_displace(e.expression);
             }
-            NodeKind::BlockStatement => {
-                const b: BlockStmtNode* = stmt as BlockStmtNode*;
+            StmtKind::Block(b) => {
                 for (mut i: i64 = 0; i < b.statements.length; i++) {
                     if (this.stmt_assigns_tracked_init(b.statements[i])) { return true; }
                 }
                 return false;
             }
-            NodeKind::IfStatement => {
-                const it: IfStmtNode* = stmt as IfStmtNode*;
+            StmtKind::If(it) => {
                 if (this.stmt_assigns_tracked_init(it.then_stmt)) { return true; }
                 return it.else_stmt != null &&
                        this.stmt_assigns_tracked_init(it.else_stmt);
             }
-            NodeKind::WhileStatement => {
-                return this.stmt_assigns_tracked_init((stmt as WhileStmtNode*).body);
+            StmtKind::While(w)   => { return this.stmt_assigns_tracked_init(w.body); }
+            StmtKind::DoWhile(d) => { return this.stmt_assigns_tracked_init(d.body); }
+            StmtKind::For(f)     => { return this.stmt_assigns_tracked_init(f.body); }
+            StmtKind::Loop(l)    => { return this.stmt_assigns_tracked_init(l.body); }
+            StmtKind::UnsafeBlock(u) => {
+                return u.block != null && this.stmt_assigns_tracked_init(u.block);
             }
-            NodeKind::DoWhileStatement => {
-                return this.stmt_assigns_tracked_init((stmt as DoWhileStmtNode*).body);
-            }
-            NodeKind::ForStatement => {
-                return this.stmt_assigns_tracked_init((stmt as ForStmtNode*).body);
-            }
-            NodeKind::LoopStatement => {
-                return this.stmt_assigns_tracked_init((stmt as LoopStmtNode*).body);
-            }
-            NodeKind::UnsafeBlockStatement => {
-                const u: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
-                return u.block != null &&
-                       this.stmt_assigns_tracked_init(u.block as StatementNode*);
-            }
-            _ => { return false; }
+            // A match's arms, and a declaration's initializer, are not looked into.
+            StmtKind::Match(_) | StmtKind::StaticMatch(_) | StmtKind::Decl(_) | StmtKind::Return(_)
+            | StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => { return false; }
         }
     }
 
@@ -4043,17 +4014,17 @@ type struct DropInserter {
     /// unresolved `binding.drop()` would lower to `<unknown>.drop()`
     /// and fail E0156 method lookup.
     make_drop_call(mut &this, name: PassLocal, ty: TypeRef,
-                    span: SourceSpan) -> StatementNode* {
+                    span: SourceSpan) -> Stmt* {
         const ident: IdentifierNode* = this.local_ident(name, ty, span);
         const member: MemberAccessNode* = new MemberAccessNode(
             ident as ExpressionNode*, this.drop_sym, span, span);
         const call: CallExprNode* = new CallExprNode(member as ExpressionNode*, span);
         this.sema.bind_destructor_call(call);
-        const stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, span);
+        const stmt: Stmt* = Stmt::expr_stmt(call as ExpressionNode*, span);
         member.generated = true;
         call.generated = true;
         stmt.generated = true;
-        return stmt as StatementNode*;
+        return stmt;
     }
 
     // ---- expression walks (move tracking on identifiers) -----------------
@@ -4116,7 +4087,7 @@ type struct DropInserter {
                 // match expressions: stdlib uses Option/Result here,
                 // whose payload consumption is tracked via
                 // link_payload, not outer-scope move detection).
-                mut throwaway_out: [StatementNode*] = [];
+                mut throwaway_out: [Stmt*] = [];
                 this.walk_match_arms(null, me.subject, me.arms, true,
                     &throwaway_out, &me.unwind_cleanup);
             }
@@ -4131,10 +4102,13 @@ type struct DropInserter {
                 // aggregate then comes back empty / use-after-free).  Mirrors
                 // how `MatchExpression` arms are walked in expression mode.
                 const sme: StaticMatchExprNode* = expr as StaticMatchExprNode*;
-                if (sme.arms.length > 0 && sme.arms[0] != null &&
-                    sme.arms[0].body != null &&
-                    sme.arms[0].body.kind == NodeKind::BlockStatement) {
-                    const _smd: boolean = this.walk_value_block(sme.arms[0].body as BlockStmtNode*);
+                if (sme.arms.length > 0 && sme.arms[0] != null && sme.arms[0].body != null) {
+                    match (sme.arms[0].body.shape) {
+                        StmtKind::Block(_) => {
+                            const _smd: boolean = this.walk_value_block(sme.arms[0].body);
+                        }
+                        _ => {}
+                    }
                 }
             }
             NodeKind::TryExpression      => {

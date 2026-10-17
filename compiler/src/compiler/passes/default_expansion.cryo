@@ -63,11 +63,7 @@ import compiler::ast::expression::{
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
-import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
-    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
-    UnsafeBlockStmtNode, WhileStmtNode
-};
+import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::types::type_ref::{ TypeRef };
@@ -300,17 +296,7 @@ type struct DefaultExpansionPasses {
                 func.return_type_annotation, reg, scope);
         }
         if (func.has_body()) {
-            DefaultExpansionPasses::rewrite_block(func.body, reg, scope);
-        }
-    }
-
-    /// Walk a block statement, rewriting any annotations inside.
-    static rewrite_block(block: BlockStmtNode*, reg: GenericRegistry*,
-                          scope: ScopeStack*) -> void {
-        if (block == null) { return; }
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            DefaultExpansionPasses::rewrite_body_stmt(
-                block.statements[i], reg, scope);
+            DefaultExpansionPasses::rewrite_body_stmt(func.body, reg, scope);
         }
     }
 
@@ -318,27 +304,22 @@ type struct DefaultExpansionPasses {
     /// can carry annotations directly (variable declarations) or
     /// indirectly via nested expressions (casts, sizeof, struct
     /// literals' field-init values that are themselves expressions).
-    static rewrite_body_stmt(stmt: StatementNode*, reg: GenericRegistry*,
+    static rewrite_body_stmt(stmt: Stmt*, reg: GenericRegistry*,
                               scope: ScopeStack*) -> void {
         if (stmt == null) { return; }
-        const node: ASTNode* = stmt as ASTNode*;
-        match (node.kind) {
-            NodeKind::BlockStatement => {
-                DefaultExpansionPasses::rewrite_block(
-                    stmt as BlockStmtNode*, reg, scope);
-            }
-            NodeKind::UnsafeBlockStatement => {
-                const ub: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
-                if (ub.block != null) {
-                    DefaultExpansionPasses::rewrite_block(ub.block, reg, scope);
+        match (stmt.shape) {
+            StmtKind::Block(b) => {
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    DefaultExpansionPasses::rewrite_body_stmt(b.statements[i], reg, scope);
                 }
             }
-            NodeKind::ExpressionStatement => {
-                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+            StmtKind::UnsafeBlock(ub) => {
+                DefaultExpansionPasses::rewrite_body_stmt(ub.block, reg, scope);
+            }
+            StmtKind::Expr(es) => {
                 DefaultExpansionPasses::rewrite_expr(es.expression, reg, scope);
             }
-            NodeKind::DeclarationStatement => {
-                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            StmtKind::Decl(ds) => {
                 if (ds.declaration != null) {
                     const decl_node: ASTNode* = ds.declaration as ASTNode*;
                     if (decl_node.kind == NodeKind::VariableDeclaration) {
@@ -347,47 +328,29 @@ type struct DefaultExpansionPasses {
                     }
                 }
             }
-            NodeKind::ReturnStatement => {
-                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+            StmtKind::Return(rs) => {
                 if (rs.expression != null) {
                     DefaultExpansionPasses::rewrite_expr(rs.expression, reg, scope);
                 }
             }
-            NodeKind::IfStatement => {
-                const is_: IfStmtNode* = stmt as IfStmtNode*;
+            StmtKind::If(is_) => {
                 DefaultExpansionPasses::rewrite_expr(is_.condition, reg, scope);
-                if (is_.then_stmt != null) {
-                    DefaultExpansionPasses::rewrite_body_stmt(is_.then_stmt, reg, scope);
-                }
-                if (is_.else_stmt != null) {
-                    DefaultExpansionPasses::rewrite_body_stmt(is_.else_stmt, reg, scope);
-                }
+                DefaultExpansionPasses::rewrite_body_stmt(is_.then_stmt, reg, scope);
+                DefaultExpansionPasses::rewrite_body_stmt(is_.else_stmt, reg, scope);
             }
-            NodeKind::WhileStatement => {
-                const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+            StmtKind::While(ws) => {
                 DefaultExpansionPasses::rewrite_expr(ws.condition, reg, scope);
-                if (ws.body != null) {
-                    DefaultExpansionPasses::rewrite_body_stmt(ws.body, reg, scope);
-                }
+                DefaultExpansionPasses::rewrite_body_stmt(ws.body, reg, scope);
             }
-            NodeKind::DoWhileStatement => {
-                const dw: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+            StmtKind::DoWhile(dw) => {
                 DefaultExpansionPasses::rewrite_expr(dw.condition, reg, scope);
-                if (dw.body != null) {
-                    DefaultExpansionPasses::rewrite_body_stmt(dw.body, reg, scope);
-                }
+                DefaultExpansionPasses::rewrite_body_stmt(dw.body, reg, scope);
             }
-            NodeKind::ForStatement => {
-                const fs: ForStmtNode* = stmt as ForStmtNode*;
-                // `init` is ASTNode*; usually a DeclStmt or ExprStmt.
-                if (fs.init != null) {
-                    const init_node: ASTNode* = fs.init;
-                    if (init_node.kind == NodeKind::DeclarationStatement
-                        || init_node.kind == NodeKind::ExpressionStatement
-                        || init_node.kind == NodeKind::BlockStatement) {
-                        DefaultExpansionPasses::rewrite_body_stmt(
-                            fs.init as StatementNode*, reg, scope);
-                    }
+            StmtKind::For(fs) => {
+                // `init` is a variable declaration or an expression, which
+                // are not statements; a statement there is walked as one.
+                if (fs.init != null && fs.init.kind == NodeKind::Statement) {
+                    DefaultExpansionPasses::rewrite_body_stmt(fs.init as Stmt*, reg, scope);
                 }
                 if (fs.condition != null) {
                     DefaultExpansionPasses::rewrite_expr(fs.condition, reg, scope);
@@ -395,18 +358,12 @@ type struct DefaultExpansionPasses {
                 if (fs.update != null) {
                     DefaultExpansionPasses::rewrite_expr(fs.update, reg, scope);
                 }
-                if (fs.body != null) {
-                    DefaultExpansionPasses::rewrite_body_stmt(fs.body, reg, scope);
-                }
+                DefaultExpansionPasses::rewrite_body_stmt(fs.body, reg, scope);
             }
-            NodeKind::LoopStatement => {
-                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
-                if (ls.body != null) {
-                    DefaultExpansionPasses::rewrite_body_stmt(ls.body, reg, scope);
-                }
+            StmtKind::Loop(ls) => {
+                DefaultExpansionPasses::rewrite_body_stmt(ls.body, reg, scope);
             }
-            NodeKind::MatchStatement => {
-                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::Match(ms) => {
                 DefaultExpansionPasses::rewrite_expr(ms.subject, reg, scope);
                 for (mut i: i64 = 0; i < ms.arms.length; i++) {
                     const arm: MatchArmNode* = ms.arms[i];
@@ -414,13 +371,10 @@ type struct DefaultExpansionPasses {
                     if (arm.guard != null) {
                         DefaultExpansionPasses::rewrite_expr(arm.guard, reg, scope);
                     }
-                    if (arm.body != null) {
-                        DefaultExpansionPasses::rewrite_body_stmt(arm.body, reg, scope);
-                    }
+                    DefaultExpansionPasses::rewrite_body_stmt(arm.body, reg, scope);
                 }
             }
-            NodeKind::StaticMatchStatement => {
-                const sms: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sms) => {
                 DefaultExpansionPasses::rewrite_annotation_in_place(sms.scrutinee, reg, scope);
                 for (mut i: i64 = 0; i < sms.arms.length; i++) {
                     const arm: StaticMatchArmNode* = sms.arms[i];
@@ -428,12 +382,10 @@ type struct DefaultExpansionPasses {
                     for (mut p: i64 = 0; p < arm.type_patterns.length; p++) {
                         DefaultExpansionPasses::rewrite_annotation_in_place(arm.type_patterns[p], reg, scope);
                     }
-                    if (arm.body != null) {
-                        DefaultExpansionPasses::rewrite_body_stmt(arm.body, reg, scope);
-                    }
+                    DefaultExpansionPasses::rewrite_body_stmt(arm.body, reg, scope);
                 }
             }
-            _ => {}
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 

@@ -26,11 +26,7 @@ import compiler::ast::expression::{
     TypeofExprNode, UnaryExprNode, YieldExprNode, AlignofExprNode
 };
 import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
-import compiler::ast::statement::{
-    AsmBlockStmtNode, BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
-    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
-    WhileStmtNode
-};
+import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::res::{ DefId };
 import compiler::types::type_ref::{ TypeRef };
@@ -58,7 +54,7 @@ type struct Uses {
     out:  [Use];
     /// The inline assembly blocks written in the module, whose text names
     /// nothing the compiler stamps.
-    asm:  [AsmBlockStmtNode*];
+    asm:  [Stmt*];
 
     /// Every use written in every module of `ctx` naming `target`.
     static of_target(ctx: CompilationContext*, target: &Target, with_decl: boolean) -> [Use] {
@@ -154,9 +150,14 @@ type struct Uses {
         // A local the compiler declares names nothing written, but its
         // initializer can be written code the compiler moved under it (a
         // discarded call's value held for its release).
-        if (n.generated && n.kind == NodeKind::DeclarationStatement) {
-            this.node((n as DeclStmtNode*).declaration as ASTNode*);
-            return;
+        if (n.generated && n.kind == NodeKind::Statement) {
+            match ((n as Stmt*).shape) {
+                StmtKind::Decl(d) => {
+                    this.node(d.declaration as ASTNode*);
+                    return;
+                }
+                _ => {}
+            }
         }
         if (n.generated && n.kind == NodeKind::VariableDeclaration) {
             this.expr((n as VarDeclNode*).initializer, null);
@@ -167,13 +168,7 @@ type struct Uses {
         // walked where it is written.
         if (n.generated && !n.kind.is_expression()) { return; }
         match (n.kind) {
-            NodeKind::AsmBlockStatement => {
-                const a: AsmBlockStmtNode* = n as AsmBlockStmtNode*;
-                for (mut i: i64 = 0; i < a.operands.length; i++) {
-                    this.expr(a.operands[i].expr, null);
-                }
-                if (a.span.file != null && a.span.file.eq(this.file)) { this.asm.push(a); }
-            }
+            NodeKind::Statement => { this.stmt(n as Stmt*); }
             NodeKind::ImportDeclaration => {
                 const imp: ImportDeclNode* = n as ImportDeclNode*;
                 const last: i64 = imp.path_segment_spans.length - 1;
@@ -255,55 +250,60 @@ type struct Uses {
                 for (mut i: i64 = 0; i < d.functions.length; i++) { this.function(d.functions[i], false); }
                 for (mut i: i64 = 0; i < d.globals.length; i++) { this.var_decl(d.globals[i]); }
             }
-            NodeKind::BlockStatement => {
-                const b: BlockStmtNode* = n as BlockStmtNode*;
-                for (mut i: i64 = 0; i < b.statements.length; i++) { this.node(b.statements[i] as ASTNode*); }
-            }
-            NodeKind::UnsafeBlockStatement => { this.node((n as UnsafeBlockStmtNode*).block as ASTNode*); }
-            NodeKind::ReturnStatement => { this.expr((n as ReturnStmtNode*).expression, null); }
-            NodeKind::IfStatement => {
-                const s: IfStmtNode* = n as IfStmtNode*;
-                this.expr(s.condition, null);
-                this.node(s.then_stmt as ASTNode*);
-                this.node(s.else_stmt as ASTNode*);
-            }
-            NodeKind::WhileStatement => {
-                const s: WhileStmtNode* = n as WhileStmtNode*;
-                this.expr(s.condition, null);
-                this.node(s.body as ASTNode*);
-            }
-            NodeKind::DoWhileStatement => {
-                const s: DoWhileStmtNode* = n as DoWhileStmtNode*;
-                this.node(s.body as ASTNode*);
-                this.expr(s.condition, null);
-            }
-            NodeKind::ForStatement => {
-                const s: ForStmtNode* = n as ForStmtNode*;
-                this.node(s.init);
-                this.expr(s.condition, null);
-                this.expr(s.update, null);
-                this.node(s.body as ASTNode*);
-            }
-            NodeKind::MatchStatement => {
-                const s: MatchStmtNode* = n as MatchStmtNode*;
-                this.expr(s.subject, null);
-                this.arms(&s.arms);
-            }
-            NodeKind::StaticMatchStatement => {
-                const s: StaticMatchStmtNode* = n as StaticMatchStmtNode*;
-                this.annotation(s.scrutinee);
-                for (mut i: i64 = 0; i < s.arms.length; i++) {
-                    if (s.arms[i] == null) { continue; }
-                    this.annotations(&s.arms[i].type_patterns);
-                    this.node(s.arms[i].body as ASTNode*);
-                }
-            }
-            NodeKind::ExpressionStatement => { this.expr((n as ExprStmtNode*).expression, null); }
-            NodeKind::DeclarationStatement => { this.node((n as DeclStmtNode*).declaration as ASTNode*); }
-            NodeKind::LoopStatement => { this.node((n as LoopStmtNode*).body as ASTNode*); }
             _ => {
                 if (n.kind.is_expression()) { this.expr(n as ExpressionNode*, null); }
             }
+        }
+    }
+
+    stmt(mut &this, s: Stmt*) -> void {
+        match (s.shape) {
+            StmtKind::Asm(a) => {
+                for (mut i: i64 = 0; i < a.operands.length; i++) {
+                    this.expr(a.operands[i].expr, null);
+                }
+                if (s.span.file != null && s.span.file.eq(this.file)) { this.asm.push(s); }
+            }
+            StmtKind::Block(b) => {
+                for (mut i: i64 = 0; i < b.statements.length; i++) { this.node(b.statements[i] as ASTNode*); }
+            }
+            StmtKind::UnsafeBlock(u) => { this.node(u.block as ASTNode*); }
+            StmtKind::Return(r) => { this.expr(r.expression, null); }
+            StmtKind::If(i) => {
+                this.expr(i.condition, null);
+                this.node(i.then_stmt as ASTNode*);
+                this.node(i.else_stmt as ASTNode*);
+            }
+            StmtKind::While(w) => {
+                this.expr(w.condition, null);
+                this.node(w.body as ASTNode*);
+            }
+            StmtKind::DoWhile(d) => {
+                this.node(d.body as ASTNode*);
+                this.expr(d.condition, null);
+            }
+            StmtKind::For(f) => {
+                this.node(f.init);
+                this.expr(f.condition, null);
+                this.expr(f.update, null);
+                this.node(f.body as ASTNode*);
+            }
+            StmtKind::Match(m) => {
+                this.expr(m.subject, null);
+                this.arms(&m.arms);
+            }
+            StmtKind::StaticMatch(m) => {
+                this.annotation(m.scrutinee);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] == null) { continue; }
+                    this.annotations(&m.arms[i].type_patterns);
+                    this.node(m.arms[i].body as ASTNode*);
+                }
+            }
+            StmtKind::Expr(e) => { this.expr(e.expression, null); }
+            StmtKind::Decl(d) => { this.node(d.declaration as ASTNode*); }
+            StmtKind::Loop(l) => { this.node(l.body as ASTNode*); }
+            StmtKind::Break | StmtKind::Continue => {}
         }
     }
 

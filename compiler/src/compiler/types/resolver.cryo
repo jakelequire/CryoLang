@@ -53,7 +53,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{ ExpressionNode, StructLiteralNode };
 import compiler::ast::node::{ ASTNode };
-import compiler::ast::statement::{ BlockStmtNode, IfStmtNode, ReturnStmtNode, StatementNode };
+import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::diag::source_span::{ SourceSpan };
@@ -1212,42 +1212,27 @@ type struct TypeResolver {
         return this.resolve(result_ann, res_ctx);
     }
 
-    /// First `return <expr>;` expression reachable from `block`, descending
+    /// First `return <expr>;` expression reachable from `stmt`, descending
     /// through nested blocks and `if` branches.  All returns of an
     /// `implement Trait` body must yield the same concrete type, so the first one
     /// is authoritative.
-    find_first_return_expr(&this, block: BlockStmtNode*) -> ExpressionNode* {
-        if (block == null) { return null; }
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            const e: ExpressionNode* =
-                this.find_first_return_expr_in_stmt(block.statements[i]);
-            if (e != null) { return e; }
-        }
-        return null;
-    }
-
-    find_first_return_expr_in_stmt(&this, stmt: StatementNode*) -> ExpressionNode* {
+    find_first_return_expr(&this, stmt: Stmt*) -> ExpressionNode* {
         if (stmt == null) { return null; }
-        const node: ASTNode* = stmt as ASTNode*;
-        match (node.kind) {
-            NodeKind::ReturnStatement => {
-                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+        match (stmt.shape) {
+            StmtKind::Return(rs) => {
                 return rs.expression;
             }
-            NodeKind::BlockStatement => {
-                return this.find_first_return_expr(stmt as BlockStmtNode*);
-            }
-            NodeKind::IfStatement => {
-                const ifs: IfStmtNode* = stmt as IfStmtNode*;
-                if (ifs.then_stmt != null) {
-                    const e: ExpressionNode* =
-                        this.find_first_return_expr_in_stmt(ifs.then_stmt);
+            StmtKind::Block(b) => {
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    const e: ExpressionNode* = this.find_first_return_expr(b.statements[i]);
                     if (e != null) { return e; }
                 }
-                if (ifs.has_else() && ifs.else_stmt != null) {
-                    return this.find_first_return_expr_in_stmt(ifs.else_stmt);
-                }
                 return null;
+            }
+            StmtKind::If(ifs) => {
+                const e: ExpressionNode* = this.find_first_return_expr(ifs.then_stmt);
+                if (e != null) { return e; }
+                return this.find_first_return_expr(ifs.else_stmt);
             }
             _ => { return null; }
         }

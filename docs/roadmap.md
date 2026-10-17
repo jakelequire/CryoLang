@@ -384,6 +384,33 @@ Open: how the six visitors' `visit` overloads become `match` arms without
 a flag day across the whole compiler, and what replaces `ASTNode`'s
 `Allocate` arena when the nodes are enum values.
 
+## Build the compiler with LLVM optimisation, then derive `TypeKind`
+
+Ruling 403.  `Type` carries both a stored `kind: TypeKind` and the payload
+`data: TypeData`, so the kind is said twice.  Deriving it from `data`
+(ruling 390) is right, but the compiler is built at O0, where
+`passes.cryo` runs no IR pipeline, so nothing folds a `match` that yields
+a constant per arm into a table load: every one of the compiler's 1,130
+`kind` reads becomes a jump-table branch, plus a call when not inlined.
+Measured by `cryo check src/main.cryo` on the compiler (five runs,
+medians, all built by a compiler that lowers a `match` on constants to a
+`switch`):
+
+| `kind` | check time |
+|---|---|
+| stored field | 8.60 s |
+| derived | 9.55 s (+11%) |
+| derived, both `kind`s `![inline]` | 9.07 s (+5.5%) |
+| derived, built by a compiler lowering `match` to a compare chain | 10.01 s (+16%) |
+
+Peak memory was unchanged (1,530 MiB).  The steps, in order:
+
+1. Build the compiler with an LLVM pipeline (at least `simplifycfg`,
+   which turns a `switch` yielding constants into a table load), with the
+   selfhost fixed point and the object gates re-baselined on it.
+2. Derive `TypeKind` from `TypeData` and delete the field, measured
+   against the stored field under the optimised build.
+
 ## Trait objects
 
 A pointer or reference to a trait, dispatched through a table of the

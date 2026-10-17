@@ -62,11 +62,7 @@ import compiler::ast::expression::{
 };
 import compiler::ast::node::{ ASTNode, ProgramNode, StaticAssertItem };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
-import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
-    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
-    WhileStmtNode
-};
+import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::edit_distance::{ find_best_candidate };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
@@ -869,26 +865,47 @@ type struct TypeResolutionRunner {
     // Recursive statement walker for variable/expression types
 
     /// Recursively walks a statement, resolving VarDeclNode.type_annotation and
-    /// CastExprNode.target_annotation within function bodies.
+    /// CastExprNode.target_annotation within function bodies.  `stmt` is a
+    /// statement, or a for-loop's initializer.
     resolve_var_types_in_statement(&this, stmt: ASTNode*,
                                    res_ctx: ResolutionContext*) -> void {
         if (stmt == null) { return; }
 
         match (stmt.kind) {
-            NodeKind::BlockStatement => {
-                const block: BlockStmtNode* = stmt as BlockStmtNode*;
+            NodeKind::Statement => {
+                this.resolve_var_types_in_stmt(stmt as Stmt*, res_ctx);
+            }
+            NodeKind::VariableDeclaration => {
+                // Raw VarDeclNode (not wrapped in DeclStmt): produced by
+                // the parser for C-style for-loop initializers: for (mut i: int = 0; ...)
+                const var_node: VarDeclNode* = stmt as VarDeclNode*;
+                if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
+                    const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
+                    if (vtype.is_valid()) {
+                        var_node.resolved_type = vtype;
+                    } else {
+                        // As the DeclStmt path: reported where written,
+                        // recorded if unanswered, left to the walk otherwise.
+                        TypeAnnotation::refused(var_node.type_annotation);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    resolve_var_types_in_stmt(&this, stmt: Stmt*, res_ctx: ResolutionContext*) -> void {
+        if (stmt == null) { return; }
+        match (stmt.shape) {
+            StmtKind::Block(block) => {
                 for (mut i: i64 = 0; i < block.statements.length; i++) {
-                    this.resolve_var_types_in_statement(block.statements[i] as ASTNode*, res_ctx);
+                    this.resolve_var_types_in_stmt(block.statements[i], res_ctx);
                 }
             }
-            NodeKind::UnsafeBlockStatement => {
-                const unsafe_block: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
-                if (unsafe_block.block != null) {
-                    this.resolve_var_types_in_statement(unsafe_block.block as ASTNode*, res_ctx);
-                }
+            StmtKind::UnsafeBlock(unsafe_block) => {
+                this.resolve_var_types_in_stmt(unsafe_block.block, res_ctx);
             }
-            NodeKind::DeclarationStatement => {
-                const decl_stmt: DeclStmtNode* = stmt as DeclStmtNode*;
+            StmtKind::Decl(decl_stmt) => {
                 if (decl_stmt.declaration != null) {
                     const decl: DeclarationNode* = decl_stmt.declaration;
                     if (decl.kind == NodeKind::VariableDeclaration) {
@@ -932,64 +949,38 @@ type struct TypeResolutionRunner {
                     }
                 }
             }
-            NodeKind::VariableDeclaration => {
-                // Raw VarDeclNode (not wrapped in DeclStmtNode): produced by
-                // the parser for C-style for-loop initializers: for (mut i: int = 0; ...)
-                const var_node: VarDeclNode* = stmt as VarDeclNode*;
-                if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
-                    const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
-                    if (vtype.is_valid()) {
-                        var_node.resolved_type = vtype;
-                    } else {
-                        // As the DeclStmt path above: reported where written,
-                        // recorded if unanswered, left to the walk otherwise.
-                        TypeAnnotation::refused(var_node.type_annotation);
-                    }
-                }
+            StmtKind::If(if_stmt) => {
+                this.resolve_var_types_in_stmt(if_stmt.then_stmt, res_ctx);
+                this.resolve_var_types_in_stmt(if_stmt.else_stmt, res_ctx);
             }
-            NodeKind::IfStatement => {
-                const if_stmt: IfStmtNode* = stmt as IfStmtNode*;
-                this.resolve_var_types_in_statement(if_stmt.then_stmt as ASTNode*, res_ctx);
-                if (if_stmt.has_else()) {
-                    this.resolve_var_types_in_statement(if_stmt.else_stmt as ASTNode*, res_ctx);
-                }
+            StmtKind::While(while_stmt) => {
+                this.resolve_var_types_in_stmt(while_stmt.body, res_ctx);
             }
-            NodeKind::WhileStatement => {
-                const while_stmt: WhileStmtNode* = stmt as WhileStmtNode*;
-                this.resolve_var_types_in_statement(while_stmt.body as ASTNode*, res_ctx);
+            StmtKind::DoWhile(do_stmt) => {
+                this.resolve_var_types_in_stmt(do_stmt.body, res_ctx);
             }
-            NodeKind::DoWhileStatement => {
-                const do_stmt: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
-                this.resolve_var_types_in_statement(do_stmt.body as ASTNode*, res_ctx);
-            }
-            NodeKind::ForStatement => {
-                const for_stmt: ForStmtNode* = stmt as ForStmtNode*;
+            StmtKind::For(for_stmt) => {
                 // Resolve init if it's a var declaration
-                if (for_stmt.init != null) {
-                    this.resolve_var_types_in_statement(for_stmt.init, res_ctx);
-                }
-                this.resolve_var_types_in_statement(for_stmt.body as ASTNode*, res_ctx);
+                this.resolve_var_types_in_statement(for_stmt.init, res_ctx);
+                this.resolve_var_types_in_stmt(for_stmt.body, res_ctx);
             }
-            NodeKind::MatchStatement => {
-                const match_stmt: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::Match(match_stmt) => {
                 for (mut i: i64 = 0; i < match_stmt.arms.length; i++) {
                     const arm: MatchArmNode* = match_stmt.arms[i];
-                    if (arm != null && arm.body != null) {
-                        this.resolve_var_types_in_statement(arm.body as ASTNode*, res_ctx);
+                    if (arm != null) {
+                        this.resolve_var_types_in_stmt(arm.body, res_ctx);
                     }
                 }
             }
-            NodeKind::StaticMatchStatement => {
-                const sm_stmt: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sm_stmt) => {
                 for (mut i: i64 = 0; i < sm_stmt.arms.length; i++) {
                     const arm: StaticMatchArmNode* = sm_stmt.arms[i];
-                    if (arm != null && arm.body != null) {
-                        this.resolve_var_types_in_statement(arm.body as ASTNode*, res_ctx);
+                    if (arm != null) {
+                        this.resolve_var_types_in_stmt(arm.body, res_ctx);
                     }
                 }
             }
-            NodeKind::ExpressionStatement => {
-                const expr_stmt: ExprStmtNode* = stmt as ExprStmtNode*;
+            StmtKind::Expr(expr_stmt) => {
                 const _expr: ExpressionNode* = expr_stmt.expression;
                 const _expr_node: ASTNode* = _expr as ASTNode*;
                 if (_expr != null &&
@@ -1004,22 +995,19 @@ type struct TypeResolutionRunner {
                 }
                 this.resolve_var_types_in_expression(_expr, res_ctx);
             }
-            NodeKind::ReturnStatement => {
+            StmtKind::Return(ret_stmt) => {
                 // `return match (...) { ... }` and `return if (...) ...`
                 // both hide var declarations inside their branches, which
-                // need to be traversed for type resolution.  The earlier
-                // no-op comment was wrong; return statements don't have
-                // annotations themselves but their expression subtree does.
-                const ret_stmt: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                // need to be traversed for type resolution.  Return
+                // statements have no annotations themselves but their
+                // expression subtree does.
                 this.resolve_var_types_in_expression(ret_stmt.expression, res_ctx);
             }
-            NodeKind::LoopStatement => {
-                const loop_stmt: LoopStmtNode* = stmt as LoopStmtNode*;
-                this.resolve_var_types_in_statement(loop_stmt.body as ASTNode*, res_ctx);
+            StmtKind::Loop(loop_stmt) => {
+                this.resolve_var_types_in_stmt(loop_stmt.body, res_ctx);
             }
-            _ => {
-                // Other statement kinds (break, continue): no type annotations
-            }
+            // No type annotations.
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
@@ -1122,23 +1110,20 @@ type struct TypeResolutionRunner {
     /// Scan a statement (recursively) for CallExprNodes with generic_args.
     /// For each, resolve the args and register an instantiation in the
     /// GenericRegistry so the Monomorphizer can discover and specialize it.
-    collect_generic_fn_calls_in_stmt(&this, stmt: ASTNode*,
+    collect_generic_fn_calls_in_stmt(&this, stmt: Stmt*,
                                      res_ctx: ResolutionContext*) -> void {
         if (stmt == null) { return; }
 
-        match (stmt.kind) {
-            NodeKind::BlockStatement => {
-                const block: BlockStmtNode* = stmt as BlockStmtNode*;
+        match (stmt.shape) {
+            StmtKind::Block(block) => {
                 for (mut i: i64 = 0; i < block.statements.length; i++) {
-                    this.collect_generic_fn_calls_in_stmt(block.statements[i] as ASTNode*, res_ctx);
+                    this.collect_generic_fn_calls_in_stmt(block.statements[i], res_ctx);
                 }
             }
-            NodeKind::ExpressionStatement => {
-                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+            StmtKind::Expr(es) => {
                 this.collect_generic_fn_calls_in_expr(es.expression, res_ctx);
             }
-            NodeKind::DeclarationStatement => {
-                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            StmtKind::Decl(ds) => {
                 if (ds.declaration != null) {
                     const decl_node: ASTNode* = ds.declaration as ASTNode*;
                     if (decl_node.kind == NodeKind::VariableDeclaration) {
@@ -1154,34 +1139,31 @@ type struct TypeResolutionRunner {
                     }
                 }
             }
-            NodeKind::ReturnStatement => {
-                const ret: ReturnStmtNode* = stmt as ReturnStmtNode*;
-                if (ret.has_expression()) {
+            StmtKind::Return(ret) => {
+                if (ret.expression != null) {
                     this.collect_generic_fn_calls_in_expr(ret.expression, res_ctx);
                 }
             }
-            NodeKind::IfStatement => {
-                const if_stmt: IfStmtNode* = stmt as IfStmtNode*;
+            StmtKind::If(if_stmt) => {
                 this.collect_generic_fn_calls_in_expr(if_stmt.condition, res_ctx);
-                this.collect_generic_fn_calls_in_stmt(if_stmt.then_stmt as ASTNode*, res_ctx);
-                if (if_stmt.has_else()) {
-                    this.collect_generic_fn_calls_in_stmt(if_stmt.else_stmt as ASTNode*, res_ctx);
-                }
+                this.collect_generic_fn_calls_in_stmt(if_stmt.then_stmt, res_ctx);
+                this.collect_generic_fn_calls_in_stmt(if_stmt.else_stmt, res_ctx);
             }
-            NodeKind::WhileStatement => {
-                const w: WhileStmtNode* = stmt as WhileStmtNode*;
+            StmtKind::While(w) => {
                 this.collect_generic_fn_calls_in_expr(w.condition, res_ctx);
-                this.collect_generic_fn_calls_in_stmt(w.body as ASTNode*, res_ctx);
+                this.collect_generic_fn_calls_in_stmt(w.body, res_ctx);
             }
-            NodeKind::ForStatement => {
-                const f: ForStmtNode* = stmt as ForStmtNode*;
-                if (f.init != null) { this.collect_generic_fn_calls_in_stmt(f.init, res_ctx); }
+            StmtKind::For(f) => {
+                // The initializer is scanned only when it is a statement; a
+                // variable declaration or an expression there is not.
+                if (f.init != null && f.init.kind == NodeKind::Statement) {
+                    this.collect_generic_fn_calls_in_stmt(f.init as Stmt*, res_ctx);
+                }
                 if (f.condition != null) { this.collect_generic_fn_calls_in_expr(f.condition, res_ctx); }
                 if (f.update != null) { this.collect_generic_fn_calls_in_expr(f.update, res_ctx); }
-                this.collect_generic_fn_calls_in_stmt(f.body as ASTNode*, res_ctx);
+                this.collect_generic_fn_calls_in_stmt(f.body, res_ctx);
             }
-            NodeKind::MatchStatement => {
-                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::Match(ms) => {
                 this.collect_generic_fn_calls_in_expr(ms.subject, res_ctx);
                 for (mut i: i64 = 0; i < ms.arms.length; i++) {
                     const arm: MatchArmNode* = ms.arms[i];
@@ -1189,26 +1171,21 @@ type struct TypeResolutionRunner {
                     if (arm.guard != null) {
                         this.collect_generic_fn_calls_in_expr(arm.guard, res_ctx);
                     }
-                    if (arm.body != null) {
-                        this.collect_generic_fn_calls_in_stmt(arm.body as ASTNode*, res_ctx);
-                    }
+                    this.collect_generic_fn_calls_in_stmt(arm.body, res_ctx);
                 }
             }
-            NodeKind::StaticMatchStatement => {
-                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sm) => {
                 for (mut i: i64 = 0; i < sm.arms.length; i++) {
                     const arm: StaticMatchArmNode* = sm.arms[i];
                     if (arm == null) { continue; }
-                    if (arm.body != null) {
-                        this.collect_generic_fn_calls_in_stmt(arm.body as ASTNode*, res_ctx);
-                    }
+                    this.collect_generic_fn_calls_in_stmt(arm.body, res_ctx);
                 }
             }
-            NodeKind::LoopStatement => {
-                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
-                this.collect_generic_fn_calls_in_stmt(ls.body as ASTNode*, res_ctx);
+            StmtKind::Loop(ls) => {
+                this.collect_generic_fn_calls_in_stmt(ls.body, res_ctx);
             }
-            _ => {}
+            StmtKind::UnsafeBlock(_) | StmtKind::Asm(_) | StmtKind::DoWhile(_)
+            | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
@@ -3326,7 +3303,7 @@ type struct TypeResolutionPasses {
                 NodeKind::FunctionDeclaration => {
                     const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
                     if (func.body != null && !func.is_generic()) {
-                        runner.collect_generic_fn_calls_in_stmt(func.body as ASTNode*, &runner.res_ctx);
+                        runner.collect_generic_fn_calls_in_stmt(func.body, &runner.res_ctx);
                     }
                 }
                 NodeKind::StructDeclaration => {
@@ -3335,7 +3312,7 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                runner.collect_generic_fn_calls_in_stmt(method.func.body as ASTNode*, &runner.res_ctx);
+                                runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
                             }
                         }
                     }
@@ -3346,7 +3323,7 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                runner.collect_generic_fn_calls_in_stmt(method.func.body as ASTNode*, &runner.res_ctx);
+                                runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
                             }
                         }
                     }
@@ -3357,7 +3334,7 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                runner.collect_generic_fn_calls_in_stmt(method.func.body as ASTNode*, &runner.res_ctx);
+                                runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
                             }
                         }
                     }
@@ -3368,7 +3345,7 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                runner.collect_generic_fn_calls_in_stmt(method.func.body as ASTNode*, &runner.res_ctx);
+                                runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
                             }
                         }
                     }

@@ -52,10 +52,8 @@ import compiler::ast::pattern::{
     DirectiveArg, DirectiveArgKind, DirectiveNode, MatchArmNode, Pattern, StaticMatchArmNode
 };
 import compiler::ast::statement::{
-    AsmBlockStmtNode, AsmConstraintKind, AsmDialect, AsmOpDir, AsmOperand, AsmPiece,
-    BlockStmtNode, BreakStmtNode, ContinueStmtNode, DeclStmtNode, DoWhileStmtNode,
-    ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
-    StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
+    AsmBlockStmt, AsmConstraintKind, AsmDialect, AsmOpDir, AsmOperand, AsmPiece, BlockStmt,
+    MatchStmt, StaticMatchStmt, Stmt, StmtKind
 };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
@@ -91,7 +89,7 @@ implement struct Parser {
     /// statement (for, if, while, etc.).  Unlike parse_block_statement(),
     /// semicolons are optional before '}' (the last expression in the block
     /// is the arm's return value).
-    parse_inner_block() -> BlockStmtNode* {
+    parse_inner_block() -> Stmt* {
         // BRACE_DEPTH_LIMIT: nested blocks (`{{{...}}}`, and the block bodies
         // of nested `if`/`match`/`while`/`for`) recurse through here with no
         // expression-level bracketing for the unary/expr/type guards to catch,
@@ -104,10 +102,11 @@ implement struct Parser {
         if (this.brace_depth > 256) {
             this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
                 "block nesting too deep (recursion limit exceeded)");
-            return new BlockStmtNode(this.current_span());
+            return Stmt::block(this.current_span());
         }
         const bstart: Token = this.advance(); // consume '{'
-        mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(bstart));
+        const block: Stmt* = Stmt::block(this.span_from_token(bstart));
+        const body: BlockStmt* = block.as_block();
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
@@ -128,21 +127,18 @@ implement struct Parser {
             if (this.is_declaration_start() && !is_static_match) {
                 const decl: ASTNode* = this.parse_declaration(false, "");
                 if (decl != null) {
-                    const decl_stmt: DeclStmtNode* = new DeclStmtNode(
-                        decl as DeclarationNode*, decl.span);
-                    block.add_statement(decl_stmt);
+                    body.add_statement(Stmt::decl_stmt(decl as DeclarationNode*, decl.span));
                 }
             } else if (is_static_match || this.is_statement_keyword()) {
-                const stmt: StatementNode* = this.parse_statement();
+                const stmt: Stmt* = this.parse_statement();
                 if (stmt != null) {
-                    block.add_statement(stmt);
+                    body.add_statement(stmt);
                 }
             } else {
                 // Expression: semicolon optional before '}'
                 const expr: ExpressionNode* = this.parse_expression();
                 if (expr != null) {
-                    const stmt: ExprStmtNode* = new ExprStmtNode(expr, expr.span);
-                    block.add_statement(stmt);
+                    body.add_statement(Stmt::expr_stmt(expr, expr.span));
                 }
                 this.match_tok(TokenType::Semicolon);
             }
@@ -255,8 +251,7 @@ implement struct Parser {
             // lowered to LLVM module inline asm.  `pending` (its `![arch]` /
             // `![clobber]`) is lifted into the node.
             if (this.check(TokenType::KwAsm)) {
-                const asm_node: AsmBlockStmtNode* = this.parse_asm_block(pending, true);
-                program.add_statement(asm_node as ASTNode*);
+                program.add_statement(this.parse_asm_block(pending, true));
                 continue;
             }
 
@@ -776,7 +771,7 @@ implement struct Parser {
 
         // Function body or semicolon (forward declaration)
         if (this.check(TokenType::LBrace)) {
-            const body: BlockStmtNode* = this.parse_block_statement();
+            const body: Stmt* = this.parse_block_statement();
             func.set_body(body);
         } else {
             this.consume(TokenType::Semicolon, "';' or '{'");
@@ -1490,7 +1485,7 @@ implement struct Parser {
 
         // Body
         if (this.check(TokenType::LBrace)) {
-            const body: BlockStmtNode* = this.parse_block_statement();
+            const body: Stmt* = this.parse_block_statement();
             func.set_body(body);
         }
 
@@ -1525,7 +1520,7 @@ implement struct Parser {
         }
 
         if (this.check(TokenType::LBrace)) {
-            const body: BlockStmtNode* = this.parse_block_statement();
+            const body: Stmt* = this.parse_block_statement();
             func.set_body(body);
         }
 
@@ -1624,7 +1619,7 @@ implement struct Parser {
 
         // Body or semicolon
         if (this.check(TokenType::LBrace)) {
-            const body: BlockStmtNode* = this.parse_block_statement();
+            const body: Stmt* = this.parse_block_statement();
             func.set_body(body);
         } else {
             this.consume(TokenType::Semicolon, "';' or '{'");
@@ -2714,7 +2709,7 @@ implement struct Parser {
 
         // Optional body
         if (this.check(TokenType::LBrace)) {
-            const body: BlockStmtNode* = this.parse_block_statement();
+            const body: Stmt* = this.parse_block_statement();
             node.set_body(body);
         } else {
             this.consume(TokenType::Semicolon, "';'");
@@ -3105,7 +3100,7 @@ implement struct Parser {
     // Statement Parsing
 
     /// Parse a statement based on the current token.
-    parse_statement() -> StatementNode* {
+    parse_statement() -> Stmt* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_statement() token='%s'", this.current().lexeme);
         if (this.panic_mode || this.is_at_end()) { return null; }
 
@@ -3131,10 +3126,10 @@ implement struct Parser {
                         this.current().lexeme));
                 return null;
             }
-            mut block: BlockStmtNode* = this.parse_block_statement();
+            const block: Stmt* = this.parse_block_statement();
             if (block == null) { return null; }
             for (mut i: i64 = 0; i < pending.length; i++) {
-                block.add_directive(pending[i]);
+                block.as_block().add_directive(pending[i]);
             }
             return block;
         }
@@ -3204,13 +3199,13 @@ implement struct Parser {
             if (this.peek_at(1).kind == TokenType::LBrace) {
                 const dd: DestructureDeclNode* = this.parse_destructure_decl();
                 if (dd != null) {
-                    return new DeclStmtNode(dd, dd.span);
+                    return Stmt::decl_stmt(dd, dd.span);
                 }
                 return null;
             }
             const var_decl: VarDeclNode* = this.parse_variable_declaration();
             if (var_decl != null) {
-                return new DeclStmtNode(var_decl, var_decl.span);
+                return Stmt::decl_stmt(var_decl, var_decl.span);
             }
             return null;
         }
@@ -3219,7 +3214,7 @@ implement struct Parser {
     }
 
     /// Parse a block statement: { statement* }
-    parse_block_statement() -> BlockStmtNode* {
+    parse_block_statement() -> Stmt* {
         // BRACE_DEPTH_LIMIT: see parse_inner_block. Nested block statements
         // (and the bodies of nested if/match/while/for, which route here)
         // recurse with no expression-bracketing token to bound them, so a
@@ -3230,11 +3225,12 @@ implement struct Parser {
         if (this.brace_depth > 256) {
             this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
                 "block nesting too deep (recursion limit exceeded)");
-            return new BlockStmtNode(this.current_span());
+            return Stmt::block(this.current_span());
         }
         const start: Token = this.advance(); // consume '{'
         this.enter_scope();
-        mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(start));
+        const block: Stmt* = Stmt::block(this.span_from_token(start));
+        const body: BlockStmt* = block.as_block();
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
@@ -3257,15 +3253,12 @@ implement struct Parser {
             if (this.is_declaration_start() && !is_static_match) {
                 const decl: ASTNode* = this.parse_declaration(false, doc);
                 if (decl != null) {
-                    // Wrap declaration in a DeclStmtNode if it's a DeclarationNode
-                    // Otherwise it might already be a StatementNode
-                    const decl_stmt: DeclStmtNode* = new DeclStmtNode(decl as DeclarationNode*, decl.span);
-                    block.add_statement(decl_stmt);
+                    body.add_statement(Stmt::decl_stmt(decl as DeclarationNode*, decl.span));
                 }
             } else {
-                const stmt: StatementNode* = this.parse_statement();
+                const stmt: Stmt* = this.parse_statement();
                 if (stmt != null) {
-                    block.add_statement(stmt);
+                    body.add_statement(stmt);
                 }
             }
 
@@ -3284,50 +3277,50 @@ implement struct Parser {
     }
 
     /// Parse an if statement: if (cond) stmt [else stmt]
-    parse_if_statement() -> IfStmtNode* {
+    parse_if_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'if'
         const condition: ExpressionNode* = this.parse_paren_condition();
 
-        const then_stmt: StatementNode* = this.parse_statement_or_block();
+        const then_stmt: Stmt* = this.parse_statement_or_block();
 
-        mut else_stmt: StatementNode* = null;
+        mut else_stmt: Stmt* = null;
         if (this.match_tok(TokenType::KwElse)) {
             else_stmt = this.parse_statement_or_block();
         }
 
         const span: SourceSpan = this.span_from(start);
-        return new IfStmtNode(condition, then_stmt, else_stmt, span);
+        return Stmt::if_stmt(condition, then_stmt, else_stmt, span);
     }
 
     /// Parse a while statement: while (cond) stmt
-    parse_while_statement() -> WhileStmtNode* {
+    parse_while_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'while'
         const condition: ExpressionNode* = this.parse_paren_condition();
 
-        const body: StatementNode* = this.parse_statement_or_block();
-        return new WhileStmtNode(condition, body, this.span_from(start));
+        const body: Stmt* = this.parse_statement_or_block();
+        return Stmt::while_stmt(condition, body, this.span_from(start));
     }
 
     /// Parse a loop statement: loop { body }
-    parse_loop_statement() -> LoopStmtNode* {
+    parse_loop_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'loop'
-        const body: StatementNode* = this.parse_statement_or_block();
-        return new LoopStmtNode(body, this.span_from(start));
+        const body: Stmt* = this.parse_statement_or_block();
+        return Stmt::loop_stmt(body, this.span_from(start));
     }
 
     /// Parse a do-while statement: do stmt while (cond);
-    parse_do_while_statement() -> DoWhileStmtNode* {
+    parse_do_while_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'do'
-        const body: StatementNode* = this.parse_statement_or_block();
+        const body: Stmt* = this.parse_statement_or_block();
         this.consume(TokenType::KwWhile, "'while'");
         const condition: ExpressionNode* = this.parse_paren_condition();
         this.consume(TokenType::Semicolon, "';'");
-        return new DoWhileStmtNode(body, condition, this.span_from(start));
+        return Stmt::do_while_stmt(body, condition, this.span_from(start));
     }
 
     /// Parse a for statement: for (init; cond; update) body
     /// or for-in: for (item in collection) body
-    parse_for_statement() -> StatementNode* {
+    parse_for_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'for'
         // The surrounding `()` are optional: `for (x in it)` and `for x in it`
         // (and the C-style `for init; cond; upd`) are both accepted.  When
@@ -3368,7 +3361,7 @@ implement struct Parser {
                 return this.parse_statement_or_block();
             }
             if (has_paren) { this.consume(TokenType::RParen, "')'"); }
-            const body: StatementNode* = this.parse_statement_or_block();
+            const body: Stmt* = this.parse_statement_or_block();
             const full_span: SourceSpan = this.span_from(start);
             return this.build_for_in_desugar(iter_tok, collection, body, full_span);
         }
@@ -3406,8 +3399,8 @@ implement struct Parser {
             }
         }
 
-        const body: StatementNode* = this.parse_statement_or_block();
-        return new ForStmtNode(init, condition, update, body, this.span_from(start));
+        const body: Stmt* = this.parse_statement_or_block();
+        return Stmt::for_stmt(init, condition, update, body, this.span_from(start));
     }
 
     /// Synthesise the desugaring of `for (x in collection) body` into:
@@ -3433,7 +3426,7 @@ implement struct Parser {
     /// `Some(x)` arm pattern, which already means `break` / `continue` /
     /// `return` inside the body behave like an ordinary `loop`.
     build_for_in_desugar(iter_tok: Token, collection: ExpressionNode*,
-                         body: StatementNode*, full_span: SourceSpan) -> StatementNode* {
+                         body: Stmt*, full_span: SourceSpan) -> Stmt* {
         const iter_span: SourceSpan = this.span_from_token(iter_tok);
         const user_name: SymbolStr  = this.intern_lexeme(iter_tok);
 
@@ -3447,7 +3440,7 @@ implement struct Parser {
         iter_decl.set_mutable(true);
         iter_decl.set_auto(true);                      // type from initializer
         iter_decl.set_initializer(collection);
-        const iter_decl_stmt: DeclStmtNode* = new DeclStmtNode(
+        const iter_decl_stmt: Stmt* = Stmt::decl_stmt(
             iter_decl as DeclarationNode*, full_span);
 
         // `__cryo_for_iter_N.next()` - match scrutinee.  The call is
@@ -3476,50 +3469,53 @@ implement struct Parser {
         // The user's body block becomes the arm body verbatim.  If the
         // body parsed as a non-block statement, wrap it so the arm body
         // is always a block (matches the rest of the parser's invariant).
-        mut some_body: BlockStmtNode* = null;
-        if (body != null && (body as ASTNode*).kind == NodeKind::BlockStatement) {
-            some_body = body as BlockStmtNode*;
+        const some_body: Stmt* = if (body == null) {
+            Stmt::block(full_span)
         } else {
-            some_body = new BlockStmtNode(if (body != null) { body.span } else { full_span });
-            if (body != null) { some_body.add_statement(body); }
-        }
-        some_arm.set_body(some_body as StatementNode*);
+            match (body.shape) {
+                StmtKind::Block(_) => { body }
+                _ => {
+                    const wrap: Stmt* = Stmt::block(body.span);
+                    wrap.as_block().add_statement(body);
+                    wrap
+                }
+            }
+        };
+        some_arm.set_body(some_body);
 
         // `Option::None => { break; }`
         const none_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "None", full_span);
 
         mut none_arm: MatchArmNode* = new MatchArmNode(full_span);
         none_arm.add_pattern(none_pat);
-        mut none_body: BlockStmtNode* = new BlockStmtNode(full_span);
-        none_body.add_statement(new BreakStmtNode(full_span) as StatementNode*);
-        none_arm.set_body(none_body as StatementNode*);
+        const none_body: Stmt* = Stmt::block(full_span);
+        none_body.as_block().add_statement(Stmt::break_stmt(full_span));
+        none_arm.set_body(none_body);
 
         // `match (__cryo_for_iter_N.next()) { Some(x)=>..., None=>... }`
-        mut match_stmt: MatchStmtNode* = new MatchStmtNode(
-            next_call as ExpressionNode*, full_span);
-        match_stmt.add_arm(some_arm);
-        match_stmt.add_arm(none_arm);
+        const arms: MatchStmt* = MatchStmt::new(next_call as ExpressionNode*);
+        arms.add_arm(some_arm);
+        arms.add_arm(none_arm);
 
         // `loop { <match> }`
-        mut loop_body: BlockStmtNode* = new BlockStmtNode(full_span);
-        loop_body.add_statement(match_stmt as StatementNode*);
-        const loop_stmt: LoopStmtNode* = new LoopStmtNode(
-            loop_body as StatementNode*, full_span);
+        const loop_body: Stmt* = Stmt::block(full_span);
+        loop_body.as_block().add_statement(new Stmt(StmtKind::Match(arms), full_span));
+        const loop_stmt: Stmt* = Stmt::loop_stmt(loop_body, full_span);
 
         // `{ <iter_decl_stmt>; <loop_stmt>; }`
-        mut outer: BlockStmtNode* = new BlockStmtNode(full_span);
-        outer.add_statement(iter_decl_stmt as StatementNode*);
-        outer.add_statement(loop_stmt as StatementNode*);
-        return outer as StatementNode*;
+        const outer: Stmt* = Stmt::block(full_span);
+        outer.as_block().add_statement(iter_decl_stmt);
+        outer.as_block().add_statement(loop_stmt);
+        return outer;
     }
 
     /// Parse a match statement: match (expr) { arms }
-    parse_match_statement() -> MatchStmtNode* {
+    parse_match_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'match'
         const subject: ExpressionNode* = this.parse_paren_condition();
         this.consume(TokenType::LBrace, "'{'");
 
-        mut match_stmt: MatchStmtNode* = new MatchStmtNode(subject, this.span_from_token(start));
+        const match_stmt: MatchStmt* = MatchStmt::new(subject);
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
@@ -3541,14 +3537,13 @@ implement struct Parser {
         }
 
         this.consume(TokenType::RBrace, "'}'");
-        match_stmt.span = this.span_from(start);
-        return match_stmt;
+        return new Stmt(StmtKind::Match(match_stmt), this.span_from(start));
     }
 
     /// Parse a static match statement: `static match (Type) { type-arms }`.
     /// Used when arms yield no value. Reuses parse_static_match_arm, whose
     /// arm blocks parse full statements through parse_inner_block.
-    parse_static_match_statement() -> StaticMatchStmtNode* {
+    parse_static_match_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'static'
         this.advance();                      // consume 'match'
         this.consume(TokenType::LParen, "'('");
@@ -3556,8 +3551,7 @@ implement struct Parser {
         this.consume(TokenType::RParen, "')'");
         this.consume(TokenType::LBrace, "'{'");
 
-        mut sm: StaticMatchStmtNode* = new StaticMatchStmtNode(
-            scrutinee, this.span_from_token(start));
+        const sm: StaticMatchStmt* = StaticMatchStmt::new(scrutinee);
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
@@ -3574,8 +3568,7 @@ implement struct Parser {
         }
 
         this.consume(TokenType::RBrace, "'}'");
-        sm.span = this.span_from(start);
-        return sm;
+        return new Stmt(StmtKind::StaticMatch(sm), this.span_from(start));
     }
 
     /// Parse a match arm for statement context: pattern => { body }.
@@ -3592,7 +3585,7 @@ implement struct Parser {
             arm.set_body(this.parse_inner_block());
         } else {
             // Single statement/expression
-            const stmt: StatementNode* = this.parse_statement();
+            const stmt: Stmt* = this.parse_statement();
             if (stmt != null) {
                 arm.set_body(stmt);
             }
@@ -3603,7 +3596,7 @@ implement struct Parser {
     }
 
     /// Parse a return statement: return [expr];
-    parse_return_statement() -> ReturnStmtNode* {
+    parse_return_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'return'
         mut expr: ExpressionNode* = null;
 
@@ -3622,25 +3615,25 @@ implement struct Parser {
                 this.consume(TokenType::Semicolon, "';'");
             }
         }
-        return new ReturnStmtNode(expr, this.span_from(start));
+        return Stmt::return_stmt(expr, this.span_from(start));
     }
 
     /// Parse a break statement: break;
-    parse_break_statement() -> BreakStmtNode* {
+    parse_break_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'break'
         this.consume(TokenType::Semicolon, "';'");
-        return new BreakStmtNode(this.span_from(start));
+        return Stmt::break_stmt(this.span_from(start));
     }
 
     /// Parse a continue statement: continue;
-    parse_continue_statement() -> ContinueStmtNode* {
+    parse_continue_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'continue'
         this.consume(TokenType::Semicolon, "';'");
-        return new ContinueStmtNode(this.span_from(start));
+        return Stmt::continue_stmt(this.span_from(start));
     }
 
     /// Parse an expression statement: expr;
-    parse_expression_statement() -> ExprStmtNode* {
+    parse_expression_statement() -> Stmt* {
         const expr: ExpressionNode* = this.parse_expression();
         if (expr == null) {
             // Try to recover
@@ -3650,14 +3643,14 @@ implement struct Parser {
             return null;
         }
         this.consume(TokenType::Semicolon, "';'");
-        return new ExprStmtNode(expr, expr.span);
+        return Stmt::expr_stmt(expr, expr.span);
     }
 
     /// Parse an unsafe block: unsafe { ... }
-    parse_unsafe_block() -> UnsafeBlockStmtNode* {
+    parse_unsafe_block() -> Stmt* {
         const start: Token = this.advance(); // consume 'unsafe'
-        const block: BlockStmtNode* = this.parse_block_statement();
-        return new UnsafeBlockStmtNode(block, this.span_from(start));
+        const block: Stmt* = this.parse_block_statement();
+        return Stmt::unsafe_block(block, this.span_from(start));
     }
 
     /// Parse an inline-assembly block: `asm { ...raw asm... }`.
@@ -3680,9 +3673,9 @@ implement struct Parser {
     ///   `${x:"rax"}`  pin to a specific register
     ///   `${x:m}`      memory operand (passed by address)
     ///   `${x:i}`      immediate ; `${x:r}` explicit general register
-    parse_asm_block(pending: [DirectiveNode*], is_module: boolean) -> AsmBlockStmtNode* {
+    parse_asm_block(pending: [DirectiveNode*], is_module: boolean) -> Stmt* {
         const start: Token = this.advance(); // consume 'asm'
-        mut node: AsmBlockStmtNode* = new AsmBlockStmtNode(this.span_from_token(start));
+        const node: AsmBlockStmt* = AsmBlockStmt::new();
         node.is_module_level = is_module;
 
         // Lift arch / dialect / clobbers out of the attached directives.
@@ -3861,12 +3854,11 @@ implement struct Parser {
             this.advance();
         }
 
-        node.span = this.span_from(start);
-        return node;
+        return new Stmt(StmtKind::Asm(node), this.span_from(start));
     }
 
     /// Helper: parse a statement that should be a block, or wrap in one.
-    parse_statement_or_block() -> StatementNode* {
+    parse_statement_or_block() -> Stmt* {
         if (this.check(TokenType::LBrace)) {
             return this.parse_block_statement();
         }

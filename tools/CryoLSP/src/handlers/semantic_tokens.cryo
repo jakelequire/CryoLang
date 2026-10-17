@@ -31,8 +31,8 @@ import std::json::value;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast::{ NodeKind };
 import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::statement;
-import compiler::ast::statement::{ DeclStmtNode };
 import compiler::ast::declaration::{ ImportDeclNode, MethodNode, ModuleDeclNode, VarDeclNode };
 import compiler::diag::source_span;
 import compiler::resolver::res::{ DefId, DefKind };
@@ -198,10 +198,7 @@ type struct SemanticTokenizer {
     /// Each segment of an import's path, or of the path a `namespace` or
     /// `public module` declares, is a namespace.
     path_segments(mut &this, stmt: ASTNode*) -> void {
-        mut n: ASTNode* = stmt;
-        if (n != null && n.kind == NodeKind::DeclarationStatement) {
-            n = (n as DeclStmtNode*).declaration as ASTNode*;
-        }
+        const n: ASTNode* = NodeLocator::unwrap_decl_stmt(stmt);
         if (n == null || n.generated) { return; }
         if (n.kind == NodeKind::ImportDeclaration) {
             const imp: ImportDeclNode* = n as ImportDeclNode*;
@@ -309,7 +306,7 @@ type struct SemanticTokenizer {
     // Inline-asm block colouring
     //
     // The parser does NOT keep per-token spans for the assembly body - it
-    // stores a list of reconstructed text `pieces` (see AsmBlockStmtNode).
+    // stores a list of reconstructed text `pieces` (see AsmBlockStmt).
     // So the block's source region is re-scanned straight out of the
     // analysed text with a small asm-aware lexer, emitting tokens in 0-based
     // BYTE coordinates via `emit_raw` (asm is ASCII, so byte == LSP char and
@@ -326,16 +323,23 @@ type struct SemanticTokenizer {
         this.push_token(line0, start_char, length, type_id, modifiers);
     }
 
-    asm_body(mut &this, node: statement::AsmBlockStmtNode*) -> void {
+    /// `node` is an `asm` statement.
+    asm_body(mut &this, node: statement::Stmt*) -> void {
         if (node == null) { return; }
         if (this.line_index == null || this.doc_text == "") { return; }
         const span: source_span::SourceSpan = node.span;
         if (!span.has_location()) { return; }
         if (span.start_line == 0 as u32) { return; }
-        const intel: boolean = match (node.dialect) {
-            statement::AsmDialect::Intel => { true }
-            statement::AsmDialect::ATT   => { false }
-        };
+        mut intel: boolean = false;
+        match (node.shape) {
+            statement::StmtKind::Asm(a) => {
+                intel = match (a.dialect) {
+                    statement::AsmDialect::Intel => { true }
+                    statement::AsmDialect::ATT   => { false }
+                };
+            }
+            _ => { return; }
+        }
         mut ln: u32 = span.start_line - 1 as u32;                 // 0-based
         const last: u32 = if (span.end_line >= span.start_line) {
             span.end_line - 1 as u32

@@ -40,11 +40,7 @@ import compiler::ast::expression::{
     YieldExprNode
 };
 import compiler::ast::node::{ ASTNode };
-import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
-    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
-    UnsafeBlockStmtNode, WhileStmtNode
-};
+import compiler::ast::statement::{ Stmt, StmtKind };
 
 
 /// True when (line, character) falls within `span` inclusive of both
@@ -280,68 +276,8 @@ type struct NodeLocator {
                 return null;
             }
 
-            // -- Statements --
-            NodeKind::BlockStatement => {
-                const s: BlockStmtNode* = node as BlockStmtNode*;
-                return NodeLocator::pick_array_stmt(s.statements, line, character);
-            }
-            NodeKind::UnsafeBlockStatement => {
-                const s: UnsafeBlockStmtNode* = node as UnsafeBlockStmtNode*;
-                return NodeLocator::pick(s.block as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::ReturnStatement => {
-                const s: ReturnStmtNode* = node as ReturnStmtNode*;
-                return NodeLocator::pick(s.expression as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::IfStatement => {
-                const s: IfStmtNode* = node as IfStmtNode*;
-                return NodeLocator::pick(s.condition as ASTNode*, s.then_stmt as ASTNode*,
-                            s.else_stmt as ASTNode*, null, line, character);
-            }
-            NodeKind::WhileStatement => {
-                const s: WhileStmtNode* = node as WhileStmtNode*;
-                return NodeLocator::pick(s.condition as ASTNode*, s.body as ASTNode*, null, null,
-                            line, character);
-            }
-            NodeKind::DoWhileStatement => {
-                const s: DoWhileStmtNode* = node as DoWhileStmtNode*;
-                return NodeLocator::pick(s.body as ASTNode*, s.condition as ASTNode*, null, null,
-                            line, character);
-            }
-            NodeKind::ForStatement => {
-                const s: ForStmtNode* = node as ForStmtNode*;
-                return NodeLocator::pick(s.init, s.condition as ASTNode*,
-                            s.update as ASTNode*, s.body as ASTNode*,
-                            line, character);
-            }
-            NodeKind::LoopStatement => {
-                const s: LoopStmtNode* = node as LoopStmtNode*;
-                return NodeLocator::pick(s.body as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::ExpressionStatement => {
-                const s: ExprStmtNode* = node as ExprStmtNode*;
-                return NodeLocator::pick(s.expression as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::DeclarationStatement => {
-                const s: DeclStmtNode* = node as DeclStmtNode*;
-                return NodeLocator::pick(s.declaration as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::MatchStatement => {
-                const s: MatchStmtNode* = node as MatchStmtNode*;
-                const subj: ASTNode* = NodeLocator::pick_one(s.subject as ASTNode*, line, character);
-                if (subj != null) { return subj; }
-                return NodeLocator::pick_array_arm(s.arms, line, character);
-            }
-            NodeKind::StaticMatchStatement => {
-                const s: StaticMatchStmtNode* = node as StaticMatchStmtNode*;
-                for (mut i: i64 = 0; i < s.arms.length; i++) {
-                    const arm: StaticMatchArmNode* = s.arms[i];
-                    if (arm == null || arm.body == null) { continue; }
-                    const hit: ASTNode* = NodeLocator::pick(arm.body as ASTNode*, null, null, null,
-                                               line, character);
-                    if (hit != null) { return hit; }
-                }
-                return null;
+            NodeKind::Statement => {
+                return NodeLocator::stmt_covering_child(node as Stmt*, line, character);
             }
             NodeKind::MatchArm => {
                 const a: MatchArmNode* = node as MatchArmNode*;
@@ -457,6 +393,66 @@ type struct NodeLocator {
         }
     }
 
+    /// `first_covering_child` for a statement.  An `asm` block's operands
+    /// are not descended into, and `break` / `continue` have no children.
+    static stmt_covering_child(s: Stmt*, line: u32, character: u32) -> ASTNode* {
+        match (s.shape) {
+            StmtKind::Block(n) => {
+                return NodeLocator::pick_array_stmt(n.statements, line, character);
+            }
+            StmtKind::UnsafeBlock(n) => {
+                return NodeLocator::pick(n.block as ASTNode*, null, null, null, line, character);
+            }
+            StmtKind::Return(n) => {
+                return NodeLocator::pick(n.expression as ASTNode*, null, null, null, line, character);
+            }
+            StmtKind::If(n) => {
+                return NodeLocator::pick(n.condition as ASTNode*, n.then_stmt as ASTNode*,
+                            n.else_stmt as ASTNode*, null, line, character);
+            }
+            StmtKind::While(n) => {
+                return NodeLocator::pick(n.condition as ASTNode*, n.body as ASTNode*, null, null,
+                            line, character);
+            }
+            StmtKind::DoWhile(n) => {
+                return NodeLocator::pick(n.body as ASTNode*, n.condition as ASTNode*, null, null,
+                            line, character);
+            }
+            StmtKind::For(n) => {
+                return NodeLocator::pick(n.init, n.condition as ASTNode*,
+                            n.update as ASTNode*, n.body as ASTNode*,
+                            line, character);
+            }
+            StmtKind::Loop(n) => {
+                return NodeLocator::pick(n.body as ASTNode*, null, null, null, line, character);
+            }
+            StmtKind::Expr(n) => {
+                return NodeLocator::pick(n.expression as ASTNode*, null, null, null, line, character);
+            }
+            StmtKind::Decl(n) => {
+                return NodeLocator::pick(n.declaration as ASTNode*, null, null, null, line, character);
+            }
+            StmtKind::Match(n) => {
+                const subj: ASTNode* = NodeLocator::pick_one(n.subject as ASTNode*, line, character);
+                if (subj != null) { return subj; }
+                return NodeLocator::pick_array_arm(n.arms, line, character);
+            }
+            StmtKind::StaticMatch(n) => {
+                for (mut i: i64 = 0; i < n.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = n.arms[i];
+                    if (arm == null || arm.body == null) { continue; }
+                    const hit: ASTNode* = NodeLocator::pick(arm.body as ASTNode*, null, null, null,
+                                               line, character);
+                    if (hit != null) { return hit; }
+                }
+                return null;
+            }
+            StmtKind::Asm(_)   => { return null; }
+            StmtKind::Break    => { return null; }
+            StmtKind::Continue => { return null; }
+        }
+    }
+
     static pick(a: ASTNode*, b: ASTNode*, c: ASTNode*, d: ASTNode*,
                   line: u32, character: u32) -> ASTNode* {
         const ha: ASTNode* = NodeLocator::pick_one(a, line, character);
@@ -490,7 +486,7 @@ type struct NodeLocator {
     /// beside a written one can share its span (a release after a discarded
     /// value), so it is looked through as `pick_one` looks through any node
     /// the compiler wrote, and the walk goes on to the next.
-    static pick_array_stmt(arr: &[StatementNode*], line: u32, character: u32) -> ASTNode* {
+    static pick_array_stmt(arr: &[Stmt*], line: u32, character: u32) -> ASTNode* {
         for (mut i: i64 = 0; i < arr.length; i++) {
             const hit: ASTNode* = NodeLocator::pick_one(arr[i] as ASTNode*, line, character);
             if (hit != null) { return hit; }
@@ -598,15 +594,17 @@ type struct NodeLocator {
         return null;
     }
 
-    /// `ProgramNode.statements` mixes raw decl nodes and `DeclStmtNode`
+    /// `ProgramNode.statements` mixes raw decl nodes and `DeclStmt`
     /// wrappers depending on how the parser shaped that file's top-level
     /// list.  Unwrap so callers can branch on the inner decl's `NodeKind`
     /// directly.
     static unwrap_decl_stmt(node: ASTNode*) -> ASTNode* {
         if (node == null) { return null; }
-        if (node.kind != NodeKind::DeclarationStatement) { return node; }
-        const d: DeclStmtNode* = node as DeclStmtNode*;
-        return d.declaration as ASTNode*;
+        if (node.kind != NodeKind::Statement) { return node; }
+        return match ((node as Stmt*).shape) {
+            StmtKind::Decl(d) => { d.declaration as ASTNode* }
+            _                 => { node }
+        };
     }
 
 }

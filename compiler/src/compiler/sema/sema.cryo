@@ -87,10 +87,9 @@ import compiler::ast::pattern::{
     EnumPattern, MatchArmNode, Pattern, StaticMatchArmNode
 };
 import compiler::ast::statement::{
-    AsmBlockStmtNode, AsmOperand, BlockStmtNode, BreakStmtNode, ContinueStmtNode,
-    DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode,
-    MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
-    WhileStmtNode
+    AsmBlockStmt, AsmOperand, BlockStmt, DeclStmt, DoWhileStmt, ExprStmt, ForStmt, IfStmt,
+    LoopStmt, MatchStmt, ReturnStmt, StaticMatchStmt, Stmt, StmtKind, UnsafeBlockStmt,
+    WhileStmt
 };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::edit_distance::{ find_best_candidate };
@@ -548,9 +547,25 @@ type struct SemaVisitor {
     }
 
     /// Dispatch a statement to the check for its kind.
-    dispatch_stmt(mut &this, stmt: StatementNode*) -> void {
+    dispatch_stmt(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
-        this.dispatch_node(stmt);
+        match (stmt.shape) {
+            StmtKind::Block(_)       => { this.visit_block(stmt); }
+            StmtKind::UnsafeBlock(n) => { this.visit_unsafe_block(stmt, n); }
+            StmtKind::Asm(n)         => { this.visit_asm_block(stmt, n); }
+            StmtKind::Return(n)      => { this.visit_return(stmt, n); }
+            StmtKind::If(n)          => { this.visit_if(stmt, n); }
+            StmtKind::While(n)       => { this.visit_while(stmt, n); }
+            StmtKind::DoWhile(n)     => { this.visit_do_while(stmt, n); }
+            StmtKind::For(n)         => { this.visit_for(stmt, n); }
+            StmtKind::Match(n)       => { this.visit_match_stmt(stmt, n); }
+            StmtKind::StaticMatch(n) => { this.visit_static_match_stmt(stmt, n); }
+            StmtKind::Break          => { this.visit_break(stmt); }
+            StmtKind::Continue       => { this.visit_continue(stmt); }
+            StmtKind::Expr(n)        => { this.visit_expr_stmt(stmt, n); }
+            StmtKind::Decl(n)        => { this.visit_decl_stmt(stmt, n); }
+            StmtKind::Loop(n)        => { this.visit_loop(stmt, n); }
+        }
     }
 
 
@@ -967,21 +982,22 @@ type struct SemaVisitor {
 
     // -- Statement visitors --
 
-    visit_block(mut &this, block: BlockStmtNode*) -> void {
+    visit_block(mut &this, block: Stmt*) -> void {
         if (block == null) { return; }
+        const b: BlockStmt* = block.as_block();
         const save: i64 = this.scopes.save_scope();
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            this.dispatch_stmt(block.statements[i]);
+        for (mut i: i64 = 0; i < b.statements.length; i++) {
+            this.dispatch_stmt(b.statements[i]);
         }
         this.scopes.restore_scope(save);
     }
 
-    visit_expr_stmt(mut &this, node: ExprStmtNode*) -> void {
+    visit_expr_stmt(mut &this, stmt: Stmt*, node: ExprStmt*) -> void {
         this.resolve_expr(node.expression);
     }
 
-    visit_return(mut &this, node: ReturnStmtNode*) -> void {
-        if (node.has_expression()) {
+    visit_return(mut &this, stmt: Stmt*, node: ReturnStmt*) -> void {
+        if (node.expression != null) {
             const saved_expected: TypeRef = this.state.expected_type;
             const declared: TypeRef = this.symbolic.symbolic_narrowed(this.state.return_type);
             if (declared.is_valid()) {
@@ -995,9 +1011,9 @@ type struct SemaVisitor {
                     && this.symbolic.symbolic_judgeable(declared)
                     && this.symbolic.symbolic_judgeable(expr_type)) {
                 this.lambda.refuse_stored_closure(expr_type, declared,
-                    if (node.expression != null) { node.expression.span } else { node.span }, "a returned value");
+                    if (node.expression != null) { node.expression.span } else { stmt.span }, "a returned value");
                 if (!this.checker.can_assign(expr_type, declared)) {
-                    const value_span: SourceSpan = if (node.expression != null) { node.expression.span } else { node.span };
+                    const value_span: SourceSpan = if (node.expression != null) { node.expression.span } else { stmt.span };
                     const ann_span: SourceSpan = annotation_span(this.state.return_type_ann);
                     this.diag.emit_declared_mismatch(
                         ErrorCode::E0200_TYPE_MISMATCH, value_span, declared, this.state.return_type_ann, expr_type,
@@ -1024,31 +1040,36 @@ type struct SemaVisitor {
             want, ty, "a condition must be a `boolean`", SourceSpan::none(), cond);
     }
 
-    visit_if(mut &this, node: IfStmtNode*) -> void {
+    visit_if(mut &this, stmt: Stmt*, node: IfStmt*) -> void {
         this.resolve_condition(node.condition);
         this.dispatch_stmt(node.then_stmt);
-        if (node.has_else()) { this.dispatch_stmt(node.else_stmt); }
+        if (node.else_stmt != null) { this.dispatch_stmt(node.else_stmt); }
     }
 
-    visit_while(mut &this, node: WhileStmtNode*) -> void {
+    visit_while(mut &this, stmt: Stmt*, node: WhileStmt*) -> void {
         this.resolve_condition(node.condition);
         this.state.loop_depth += 1;
         this.dispatch_stmt(node.body);
         this.state.loop_depth -= 1;
     }
 
-    visit_do_while(mut &this, node: DoWhileStmtNode*) -> void {
+    visit_do_while(mut &this, stmt: Stmt*, node: DoWhileStmt*) -> void {
         this.state.loop_depth += 1;
         this.dispatch_stmt(node.body);
         this.state.loop_depth -= 1;
         this.resolve_condition(node.condition);
     }
 
-    visit_for(mut &this, node: ForStmtNode*) -> void {
+    visit_for(mut &this, stmt: Stmt*, node: ForStmt*) -> void {
         const save: i64 = this.scopes.save_scope();
         if (node.init != null) {
-            if (node.init.kind == NodeKind::DeclarationStatement) {
-                this.visit_decl_stmt(node.init as DeclStmtNode*);
+            if (node.init.kind == NodeKind::Statement) {
+                const init_stmt: Stmt* = node.init as Stmt*;
+                match (init_stmt.shape) {
+                    StmtKind::Decl(d) => { this.visit_decl_stmt(init_stmt, d); }
+                    StmtKind::Expr(e) => { this.resolve_expr(e.expression); }
+                    _ => {}
+                }
             } else if (node.init.kind == NodeKind::VariableDeclaration) {
                 const var_node: VarDeclNode* = node.init as VarDeclNode*;
                 if (var_node.type_annotation == null) {
@@ -1069,8 +1090,6 @@ type struct SemaVisitor {
                 // type and checked against it.
                 this.check_var_decl(var_node);
                 this.register_var_decl_local(var_node);
-            } else if (node.init.kind == NodeKind::ExpressionStatement) {
-                this.resolve_expr((node.init as ExprStmtNode*).expression);
             }
         }
         if (node.condition != null) { this.resolve_condition(node.condition); }
@@ -1081,44 +1100,44 @@ type struct SemaVisitor {
         this.scopes.restore_scope(save);
     }
 
-    visit_loop(mut &this, node: LoopStmtNode*) -> void {
+    visit_loop(mut &this, stmt: Stmt*, node: LoopStmt*) -> void {
         this.state.loop_depth += 1;
         this.dispatch_stmt(node.body);
         this.state.loop_depth -= 1;
     }
 
-    visit_break(mut &this, node: BreakStmtNode*) -> void {
+    visit_break(mut &this, stmt: Stmt*) -> void {
         if (this.state.loop_depth == 0) {
             this.ctx.emit_error_at(ErrorCode::E0400_INVALID_BREAK,
-                "`break` outside of a loop", node.span);
+                "`break` outside of a loop", stmt.span);
         }
     }
 
-    visit_continue(mut &this, node: ContinueStmtNode*) -> void {
+    visit_continue(mut &this, stmt: Stmt*) -> void {
         if (this.state.loop_depth == 0) {
             this.ctx.emit_error_at(ErrorCode::E0401_INVALID_CONTINUE,
-                "`continue` outside of a loop", node.span);
+                "`continue` outside of a loop", stmt.span);
         }
     }
 
-    visit_unsafe_block(mut &this, node: UnsafeBlockStmtNode*) -> void {
+    visit_unsafe_block(mut &this, stmt: Stmt*, node: UnsafeBlockStmt*) -> void {
         this.visit_block(node.block);
     }
 
-    visit_asm_block(mut &this, node: AsmBlockStmtNode*) -> void {
+    visit_asm_block(mut &this, stmt: Stmt*, node: AsmBlockStmt*) -> void {
         // A mandatory `![arch(<arch>, <dialect>)]` directive supplies the
         // arch (gating) and dialect; its absence is an error.
         if (node.arch == "") {
             this.ctx.emit_error_at(ErrorCode::E0111_INVALID_SYNTAX,
                 "`asm` block requires an `![arch(<arch>, <dialect>)]` directive above it",
-                node.span);
+                stmt.span);
         }
         // Module-level (naked / global) asm is operand-free.
         if (node.is_module_level) {
             if (node.operands.length > 0) {
                 this.ctx.emit_error_at(ErrorCode::E0111_INVALID_SYNTAX,
                     "module-level `asm` block cannot bind `{...}` operands (naked/global asm only)",
-                    node.span);
+                    stmt.span);
             }
             return;
         }
@@ -1130,7 +1149,7 @@ type struct SemaVisitor {
         }
     }
 
-    visit_match_stmt(mut &this, node: MatchStmtNode*) -> void {
+    visit_match_stmt(mut &this, stmt: Stmt*, node: MatchStmt*) -> void {
         const subject_type: TypeRef = this.resolve_expr(node.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
@@ -1142,17 +1161,17 @@ type struct SemaVisitor {
             if (arm.body != null) { this.dispatch_stmt(arm.body); }
             this.scopes.restore_scope(save);
         }
-        this.patterns.check_match_exhaustive(node.subject, subject_type, node.arms, node.span);
+        this.patterns.check_match_exhaustive(node.subject, subject_type, node.arms, stmt.span);
         this.patterns.check_duplicate_default_arm(node.arms);
         this.patterns.check_literal_patterns(node.arms, subject_type);
     }
 
-    visit_static_match_stmt(mut &this, node: StaticMatchStmtNode*) -> void {
-        if (node == null || node.arms.length == 0) { return; }
+    visit_static_match_stmt(mut &this, stmt: Stmt*, node: StaticMatchStmt*) -> void {
+        if (node.arms.length == 0) { return; }
         if (node.arms.length > 1 && !this.state.in_symbolic_check) {
             this.ctx.emit_error_at(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
                 "`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)",
-                node.span);
+                stmt.span);
         }
         // A concrete (already-pruned) static match has exactly one arm.
         if (this.state.in_symbolic_check && ASTCloner::has_multi_type_arm(&node.arms)) {
@@ -1166,7 +1185,7 @@ type struct SemaVisitor {
         }
     }
 
-    visit_decl_stmt(mut &this, node: DeclStmtNode*) -> void {
+    visit_decl_stmt(mut &this, stmt: Stmt*, node: DeclStmt*) -> void {
         if (node.declaration == null) { return; }
         const decl: ASTNode* = node.declaration;
         if (decl.kind == NodeKind::DestructureDeclaration) {
@@ -1181,7 +1200,7 @@ type struct SemaVisitor {
 
     /// A declaration written at MODULE scope.  It reaches sema as a bare
     /// `VarDeclNode` in the program's statement list, not wrapped in the
-    /// `DeclStmtNode` a body uses, so without this override `accept` found
+    /// `DeclStmt` a body uses, so without this override `accept` found
     /// nothing and a global's initializer was never resolved: no type for
     /// codegen's constant folder to work from (the global then landed on the
     /// zero fallback), and no diagnostic for anything wrong inside it - naming
@@ -1631,21 +1650,7 @@ type struct SemaVisitor {
                 this.resolve_expr(n as ExpressionNode*);
             }
 
-            NodeKind::BlockStatement         => { this.visit_block(n as BlockStmtNode*); }
-            NodeKind::UnsafeBlockStatement   => { this.visit_unsafe_block(n as UnsafeBlockStmtNode*); }
-            NodeKind::AsmBlockStatement      => { this.visit_asm_block(n as AsmBlockStmtNode*); }
-            NodeKind::ReturnStatement        => { this.visit_return(n as ReturnStmtNode*); }
-            NodeKind::IfStatement            => { this.visit_if(n as IfStmtNode*); }
-            NodeKind::WhileStatement         => { this.visit_while(n as WhileStmtNode*); }
-            NodeKind::DoWhileStatement       => { this.visit_do_while(n as DoWhileStmtNode*); }
-            NodeKind::ForStatement           => { this.visit_for(n as ForStmtNode*); }
-            NodeKind::MatchStatement         => { this.visit_match_stmt(n as MatchStmtNode*); }
-            NodeKind::StaticMatchStatement   => { this.visit_static_match_stmt(n as StaticMatchStmtNode*); }
-            NodeKind::BreakStatement         => { this.visit_break(n as BreakStmtNode*); }
-            NodeKind::ContinueStatement      => { this.visit_continue(n as ContinueStmtNode*); }
-            NodeKind::ExpressionStatement    => { this.visit_expr_stmt(n as ExprStmtNode*); }
-            NodeKind::DeclarationStatement   => { this.visit_decl_stmt(n as DeclStmtNode*); }
-            NodeKind::LoopStatement          => { this.visit_loop(n as LoopStmtNode*); }
+            NodeKind::Statement              => { this.dispatch_stmt(n as Stmt*); }
 
             NodeKind::VariableDeclaration    => { this.visit_var(n as VarDeclNode*); }
             NodeKind::DestructureDeclaration => { this.visit_destructure(n as DestructureDeclNode*); }
@@ -1664,7 +1669,7 @@ type struct SemaVisitor {
             | NodeKind::MatchArm | NodeKind::StaticMatchArm | NodeKind::Pattern
             | NodeKind::Directive => { }
 
-            NodeKind::Expression | NodeKind::Statement | NodeKind::Declaration
+            NodeKind::Expression | NodeKind::Declaration
             | NodeKind::AsyncExpression | NodeKind::Unknown => { }
         }
     }
@@ -2999,34 +3004,34 @@ type struct SemaVisitor {
             const save: i64 = this.scopes.save_scope();
             this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
             if (arm.guard != null) { this.resolve_condition(arm.guard); }
-            const body_node: ASTNode* = arm.body as ASTNode*;
-            if (body_node.kind == NodeKind::BlockStatement) {
-                const block: BlockStmtNode* = arm.body as BlockStmtNode*;
-                const last_idx: i64 = block.statements.length - 1;
-                for (mut j: i64 = 0; j < block.statements.length; j++) {
-                    if (j == last_idx && outer_expected.is_valid()) { this.state.expected_type = outer_expected; }
-                    this.dispatch_stmt(block.statements[j]);
-                    if (j == last_idx) { this.state.expected_type = outer_expected; }
-                }
-                if (block.statements.length > 0) {
-                    const last: StatementNode* = block.statements[block.statements.length - 1];
-                    if ((last as ASTNode*).kind == NodeKind::ExpressionStatement) {
-                        const es: ExprStmtNode* = last as ExprStmtNode*;
-                        if (es.expression != null && es.expression.has_resolved_type()) {
-                            const arm_type: TypeRef = es.expression.resolved_type;
-                            if (!result_type.is_valid()) {
-                                result_type = arm_type;
-                                result_span = es.expression.span;
-                            } else {
-                                this.check_branch_agreement(result_type, result_span,
-                                    arm_type, es.expression.span,
-                                    "every arm of a `match` expression must produce the same type");
+            match (arm.body.shape) {
+                StmtKind::Block(block) => {
+                    const last_idx: i64 = block.statements.length - 1;
+                    for (mut j: i64 = 0; j < block.statements.length; j++) {
+                        if (j == last_idx && outer_expected.is_valid()) { this.state.expected_type = outer_expected; }
+                        this.dispatch_stmt(block.statements[j]);
+                        if (j == last_idx) { this.state.expected_type = outer_expected; }
+                    }
+                    if (block.statements.length > 0) {
+                        match (block.statements[block.statements.length - 1].shape) {
+                            StmtKind::Expr(es) => {
+                                if (es.expression != null && es.expression.has_resolved_type()) {
+                                    const arm_type: TypeRef = es.expression.resolved_type;
+                                    if (!result_type.is_valid()) {
+                                        result_type = arm_type;
+                                        result_span = es.expression.span;
+                                    } else {
+                                        this.check_branch_agreement(result_type, result_span,
+                                            arm_type, es.expression.span,
+                                            "every arm of a `match` expression must produce the same type");
+                                    }
+                                }
                             }
+                            _ => {}
                         }
                     }
                 }
-            } else {
-                this.dispatch_stmt(arm.body);
+                _ => { this.dispatch_stmt(arm.body); }
             }
             this.scopes.restore_scope(save);
         }
@@ -3075,23 +3080,31 @@ type struct SemaVisitor {
     walk_static_match_arm(mut &this, scrutinee: TypeAnnotation*, arm: StaticMatchArmNode*,
                           as_value: boolean, outer_expected: TypeRef) -> TypeRef {
         const pattern: TypeAnnotation* = if (arm.type_patterns.length == 1) { arm.type_patterns[0] } else { null };
-        const body: StatementNode* = arm.body;
+        const body: Stmt* = arm.body;
         const depth: u64 = this.state.symbolic_narrow_syms.length as u64;
         const save: i64 = this.narrow_static_match_arm(scrutinee, pattern);
         mut arm_result: TypeRef = TypeRef::invalid();
-        if (as_value && (body as ASTNode*).kind == NodeKind::BlockStatement) {
-            const block: BlockStmtNode* = body as BlockStmtNode*;
-            const last_idx: i64 = block.statements.length - 1;
-            for (mut j: i64 = 0; j < block.statements.length; j++) {
+        const value_block: BlockStmt* = if (as_value) {
+            match (body.shape) {
+                StmtKind::Block(b) => { b }
+                _                  => { null }
+            }
+        } else {
+            null
+        };
+        if (value_block != null) {
+            const last_idx: i64 = value_block.statements.length - 1;
+            for (mut j: i64 = 0; j < value_block.statements.length; j++) {
                 if (j == last_idx && outer_expected.is_valid()) { this.state.expected_type = outer_expected; }
-                this.dispatch_stmt(block.statements[j]);
+                this.dispatch_stmt(value_block.statements[j]);
                 if (j == last_idx) { this.state.expected_type = outer_expected; }
             }
-            if (block.statements.length > 0) {
-                const last: StatementNode* = block.statements[block.statements.length - 1];
-                if ((last as ASTNode*).kind == NodeKind::ExpressionStatement) {
-                    const es: ExprStmtNode* = last as ExprStmtNode*;
-                    if (es.expression != null && es.expression.has_resolved_type()) { arm_result = es.expression.resolved_type; }
+            if (value_block.statements.length > 0) {
+                match (value_block.statements[last_idx].shape) {
+                    StmtKind::Expr(es) => {
+                        if (es.expression != null && es.expression.has_resolved_type()) { arm_result = es.expression.resolved_type; }
+                    }
+                    _ => {}
                 }
             }
         } else {
@@ -3287,10 +3300,9 @@ type struct SemaVisitor {
         ok_arm.add_pattern(ok_node);
         const ok_ident: IdentifierNode* = new IdentifierNode(ok_bind, span);
         ok_ident.set_res(Res::Local(ok_sym));
-        const ok_stmt: ExprStmtNode* = new ExprStmtNode(ok_ident as ExpressionNode*, span);
-        mut ok_block: BlockStmtNode* = new BlockStmtNode(span);
-        ok_block.add_statement(ok_stmt as StatementNode*);
-        ok_arm.set_body(ok_block as StatementNode*);
+        const ok_block: Stmt* = Stmt::block(span);
+        ok_block.as_block().add_statement(Stmt::expr_stmt(ok_ident as ExpressionNode*, span));
+        ok_arm.set_body(ok_block);
         match_expr.add_arm(ok_arm);
 
         const err_node: Pattern* = Pattern::enum_variant(enum_name, err_variant, span);
@@ -3331,10 +3343,9 @@ type struct SemaVisitor {
         }
         mut err_arm: MatchArmNode* = new MatchArmNode(span);
         err_arm.add_pattern(err_node);
-        const ret_stmt: ReturnStmtNode* = new ReturnStmtNode(ret_value, span);
-        mut err_block: BlockStmtNode* = new BlockStmtNode(span);
-        err_block.add_statement(ret_stmt as StatementNode*);
-        err_arm.set_body(err_block as StatementNode*);
+        const err_block: Stmt* = Stmt::block(span);
+        err_block.as_block().add_statement(Stmt::return_stmt(ret_value, span));
+        err_arm.set_body(err_block);
         match_expr.add_arm(err_arm);
         return match_expr;
     }
@@ -4175,15 +4186,16 @@ type struct SemaVisitor {
     check_function_returns(mut &this, func: FunctionDeclNode*) -> void {
         if (func == null || func.body == null) { return; }
         if (!this.return_type_requires_return(func.resolved_return_type)) { return; }
-        if (this.block_always_returns(func.body)) { return; }
+        if (this.stmt_always_returns(func.body)) { return; }
         const fn_name: string = this.intern.resolve(func.name);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0403_MISSING_RETURN,
             fmt::format("function `%s` is declared to return a value but reaches the end of its body without returning", fn_name));
         diag = diag.at(func.span);
         diag = diag.with_note("every control-flow path through the body must end in `return <expr>`, a divergent call (e.g. `panic(...)`), or an infinite `loop { ... }` with no `break`");
         diag = diag.with_note("if a missing path is unreachable, end it with `return <default>` or `panic(\"unreachable\")`");
-        if (func.body.statements.length > 0) {
-            const last: StatementNode* = func.body.statements[func.body.statements.length - 1];
+        const body: BlockStmt* = func.body.as_block();
+        if (body.statements.length > 0) {
+            const last: Stmt* = body.statements[body.statements.length - 1];
             if (last != null && last.span.has_location()) {
                 const anchor: SourceSpan = SourceSpan::new(last.span.file, last.span.end_line, last.span.end_col, last.span.end_line, last.span.end_col);
                 const placeholder: string = this.default_return_expr_for(func.resolved_return_type);
@@ -4220,28 +4232,22 @@ type struct SemaVisitor {
         return true;
     }
 
-    block_always_returns(&this, block: BlockStmtNode*) -> boolean {
-        if (block == null) { return false; }
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            if (this.stmt_always_returns(block.statements[i])) { return true; }
-        }
-        return false;
-    }
-
-    stmt_always_returns(&this, stmt: StatementNode*) -> boolean {
+    stmt_always_returns(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        const node: ASTNode* = stmt as ASTNode*;
-        match (node.kind) {
-            NodeKind::ReturnStatement => { return true; }
-            NodeKind::BlockStatement => { return this.block_always_returns(stmt as BlockStmtNode*); }
-            NodeKind::UnsafeBlockStatement => { return this.block_always_returns((stmt as UnsafeBlockStmtNode*).block); }
-            NodeKind::IfStatement => {
-                const ifs: IfStmtNode* = stmt as IfStmtNode*;
-                if (!ifs.has_else()) { return false; }
+        match (stmt.shape) {
+            StmtKind::Return(_) => { return true; }
+            StmtKind::Block(b) => {
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    if (this.stmt_always_returns(b.statements[i])) { return true; }
+                }
+                return false;
+            }
+            StmtKind::UnsafeBlock(u) => { return this.stmt_always_returns(u.block); }
+            StmtKind::If(ifs) => {
+                if (ifs.else_stmt == null) { return false; }
                 return this.stmt_always_returns(ifs.then_stmt) && this.stmt_always_returns(ifs.else_stmt);
             }
-            NodeKind::MatchStatement => {
-                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::Match(ms) => {
                 if (!this.patterns.match_is_exhaustive(ms.subject, ms.arms)) { return false; }
                 for (mut i: i64 = 0; i < ms.arms.length; i++) {
                     const arm: MatchArmNode* = ms.arms[i];
@@ -4250,61 +4256,54 @@ type struct SemaVisitor {
                 }
                 return true;
             }
-            NodeKind::StaticMatchStatement => {
-                const sms: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sms) => {
                 if (sms.arms.length == 0 || sms.arms[0] == null || sms.arms[0].body == null) { return false; }
                 return this.stmt_always_returns(sms.arms[0].body);
             }
-            NodeKind::LoopStatement => {
-                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
-                const loop_body: BlockStmtNode* = ls.body as BlockStmtNode*;
-                if (!this.block_contains_break(loop_body)) { return true; }
-                return this.block_always_returns(loop_body);
+            StmtKind::Loop(ls) => {
+                if (!this.stmt_contains_break(ls.body)) { return true; }
+                return this.stmt_always_returns(ls.body);
             }
-            NodeKind::DoWhileStatement => { return this.stmt_always_returns((stmt as DoWhileStmtNode*).body); }
-            NodeKind::ExpressionStatement => { return this.expr_is_divergent((stmt as ExprStmtNode*).expression); }
-            _ => {}
+            StmtKind::DoWhile(d) => { return this.stmt_always_returns(d.body); }
+            StmtKind::Expr(e) => { return this.expr_is_divergent(e.expression); }
+            // A `while` or `for` may run its body zero times.
+            StmtKind::While(_) | StmtKind::For(_) => { return false; }
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue | StmtKind::Decl(_) => { return false; }
         }
-        return false;
     }
 
-    block_contains_break(&this, block: BlockStmtNode*) -> boolean {
-        if (block == null) { return false; }
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            if (this.stmt_contains_break(block.statements[i])) { return true; }
-        }
-        return false;
-    }
-
-    stmt_contains_break(&this, stmt: StatementNode*) -> boolean {
+    /// Whether a `break` in `stmt` leaves the loop enclosing it: one inside a
+    /// nested loop leaves that loop instead, so a loop is not searched.
+    stmt_contains_break(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        const node: ASTNode* = stmt as ASTNode*;
-        match (node.kind) {
-            NodeKind::BreakStatement => { return true; }
-            NodeKind::BlockStatement => { return this.block_contains_break(stmt as BlockStmtNode*); }
-            NodeKind::UnsafeBlockStatement => { return this.block_contains_break((stmt as UnsafeBlockStmtNode*).block); }
-            NodeKind::IfStatement => {
-                const ifs: IfStmtNode* = stmt as IfStmtNode*;
-                if (this.stmt_contains_break(ifs.then_stmt)) { return true; }
-                if (ifs.has_else()) { if (this.stmt_contains_break(ifs.else_stmt)) { return true; } }
+        match (stmt.shape) {
+            StmtKind::Break => { return true; }
+            StmtKind::Block(b) => {
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    if (this.stmt_contains_break(b.statements[i])) { return true; }
+                }
                 return false;
             }
-            NodeKind::MatchStatement => {
-                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::UnsafeBlock(u) => { return this.stmt_contains_break(u.block); }
+            StmtKind::If(ifs) => {
+                if (this.stmt_contains_break(ifs.then_stmt)) { return true; }
+                return this.stmt_contains_break(ifs.else_stmt);
+            }
+            StmtKind::Match(ms) => {
                 for (mut i: i64 = 0; i < ms.arms.length; i++) {
                     const arm: MatchArmNode* = ms.arms[i];
                     if (arm != null && this.stmt_contains_break(arm.body)) { return true; }
                 }
                 return false;
             }
-            NodeKind::StaticMatchStatement => {
-                const sms: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sms) => {
                 if (sms.arms.length == 0 || sms.arms[0] == null) { return false; }
                 return this.stmt_contains_break(sms.arms[0].body);
             }
-            _ => {}
+            StmtKind::While(_) | StmtKind::DoWhile(_) | StmtKind::For(_) | StmtKind::Loop(_) => { return false; }
+            StmtKind::Asm(_) | StmtKind::Continue | StmtKind::Return(_) | StmtKind::Expr(_)
+            | StmtKind::Decl(_) => { return false; }
         }
-        return false;
     }
 
     // A call diverges (does not return to the caller) if its resolved

@@ -76,11 +76,7 @@ import compiler::ast::expression::{
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
-import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
-    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
-    UnsafeBlockStmtNode, WhileStmtNode
-};
+import compiler::ast::statement::{ BlockStmt, DeclStmt, Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::resolution_map::{ ResolutionMap };
@@ -216,10 +212,11 @@ type struct DeadCodeChecker {
     /// next non-null statement is unreachable (W0009) - report it once and stop
     /// (everything after is equally dead, and dead bindings need no
     /// unused-warning).
-    check_block(mut &this, block: BlockStmtNode*) -> void {
-        if (block == null) { return; }
+    check_block(mut &this, block_stmt: Stmt*) -> void {
+        if (block_stmt == null) { return; }
+        const block: BlockStmt* = block_stmt.as_block();
         for (mut i: i64 = 0; i < block.statements.length; i++) {
-            const stmt: StatementNode* = block.statements[i];
+            const stmt: Stmt* = block.statements[i];
             if (stmt == null) { continue; }
 
             this.check_local_decl(stmt);
@@ -247,22 +244,26 @@ type struct DeadCodeChecker {
 
     /// A reportable source span for a statement.  A `DeclStmt` wrapper carries
     /// no location of its own; fall back to the declaration it wraps.
-    report_span(&this, stmt: StatementNode*) -> SourceSpan {
+    report_span(&this, stmt: Stmt*) -> SourceSpan {
         if (stmt.span.has_location()) { return stmt.span; }
-        if (stmt.kind == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-            if (ds.declaration != null) { return ds.declaration.span; }
+        match (stmt.shape) {
+            StmtKind::Decl(ds) => {
+                if (ds.declaration != null) { return ds.declaration.span; }
+            }
+            _ => {}
         }
         return stmt.span;
     }
 
     /// If `stmt` declares a plain local binding that is never referenced, warn
     /// (W0001).  Destructuring bindings are exempt (see the module header).
-    check_local_decl(mut &this, stmt: StatementNode*) -> void {
+    check_local_decl(mut &this, stmt: Stmt*) -> void {
         if (!this.body_resolved) { return; }   // unresolved body: `used` is incomplete
-        if (stmt.kind != NodeKind::DeclarationStatement) { return; }
-        const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-        if (ds.declaration == null) { return; }
+        const ds: DeclStmt* = match (stmt.shape) {
+            StmtKind::Decl(d) => { d }
+            _                 => { null }
+        };
+        if (ds == null || ds.declaration == null) { return; }
         if (ds.declaration.kind != NodeKind::VariableDeclaration) { return; }
 
         const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
@@ -283,44 +284,35 @@ type struct DeadCodeChecker {
 
     /// Recurse into a statement's nested blocks so code inside an `if` arm,
     /// loop body, etc. is scanned too.  Does NOT judge divergence.
-    check_stmt(mut &this, stmt: StatementNode*) -> void {
+    check_stmt(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
-        match (stmt.kind) {
-            NodeKind::BlockStatement => {
-                this.check_block(stmt as BlockStmtNode*);
+        match (stmt.shape) {
+            StmtKind::Block(_) => {
+                this.check_block(stmt);
             }
-            NodeKind::IfStatement => {
-                const it: IfStmtNode* = stmt as IfStmtNode*;
-                if (it.then_stmt != null) { this.check_stmt(it.then_stmt); }
-                if (it.else_stmt != null) { this.check_stmt(it.else_stmt); }
+            StmtKind::If(it) => {
+                this.check_stmt(it.then_stmt);
+                this.check_stmt(it.else_stmt);
             }
-            NodeKind::WhileStatement => {
-                this.check_stmt((stmt as WhileStmtNode*).body);
-            }
-            NodeKind::ForStatement => {
-                this.check_stmt((stmt as ForStmtNode*).body);
-            }
-            NodeKind::DoWhileStatement => {
-                this.check_stmt((stmt as DoWhileStmtNode*).body);
-            }
-            NodeKind::LoopStatement => {
-                this.check_stmt((stmt as LoopStmtNode*).body);
-            }
-            NodeKind::MatchStatement => {
-                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::While(w)   => { this.check_stmt(w.body); }
+            StmtKind::For(f)     => { this.check_stmt(f.body); }
+            StmtKind::DoWhile(d) => { this.check_stmt(d.body); }
+            StmtKind::Loop(l)    => { this.check_stmt(l.body); }
+            StmtKind::Match(m) => {
                 for (mut i: i64 = 0; i < m.arms.length; i++) {
                     const arm: MatchArmNode* = m.arms[i];
-                    if (arm != null && arm.body != null) { this.check_stmt(arm.body); }
+                    if (arm != null) { this.check_stmt(arm.body); }
                 }
             }
-            NodeKind::StaticMatchStatement => {
-                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sm) => {
                 for (mut i: i64 = 0; i < sm.arms.length; i++) {
                     const arm: StaticMatchArmNode* = sm.arms[i];
-                    if (arm != null && arm.body != null) { this.check_stmt(arm.body); }
+                    if (arm != null) { this.check_stmt(arm.body); }
                 }
             }
-            _ => {}
+            // An `unsafe` block's statements are not scanned.
+            StmtKind::UnsafeBlock(_) | StmtKind::Asm(_) | StmtKind::Return(_) | StmtKind::Break
+            | StmtKind::Continue | StmtKind::Expr(_) | StmtKind::Decl(_) => {}
         }
     }
 
@@ -329,22 +321,26 @@ type struct DeadCodeChecker {
     /// literal `return`/`break`/`continue` and control structures whose every
     /// branch diverges count.  Everything else is treated as fall-through, so
     /// the lint never fabricates an unreachable warning.
-    stmt_diverges(mut &this, stmt: StatementNode*) -> boolean {
+    stmt_diverges(mut &this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        match (stmt.kind) {
-            NodeKind::ReturnStatement   => { return true; }
-            NodeKind::BreakStatement    => { return true; }
-            NodeKind::ContinueStatement => { return true; }
-            NodeKind::BlockStatement => {
-                return this.block_diverges(stmt as BlockStmtNode*);
+        match (stmt.shape) {
+            StmtKind::Return(_) => { return true; }
+            StmtKind::Break     => { return true; }
+            StmtKind::Continue  => { return true; }
+            StmtKind::Block(block) => {
+                // A block diverges if any statement in it diverges (once one
+                // does, the block cannot complete normally).
+                for (mut i: i64 = 0; i < block.statements.length; i++) {
+                    const s: Stmt* = block.statements[i];
+                    if (s != null && this.stmt_diverges(s)) { return true; }
+                }
+                return false;
             }
-            NodeKind::IfStatement => {
-                const it: IfStmtNode* = stmt as IfStmtNode*;
+            StmtKind::If(it) => {
                 if (it.then_stmt == null || it.else_stmt == null) { return false; }
                 return this.stmt_diverges(it.then_stmt) && this.stmt_diverges(it.else_stmt);
             }
-            NodeKind::MatchStatement => {
-                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::Match(m) => {
                 if (m.arms.length == 0) { return false; }
                 for (mut i: i64 = 0; i < m.arms.length; i++) {
                     const arm: MatchArmNode* = m.arms[i];
@@ -354,19 +350,10 @@ type struct DeadCodeChecker {
                 }
                 return true;
             }
-            _ => { return false; }
+            StmtKind::UnsafeBlock(_) | StmtKind::Asm(_) | StmtKind::While(_) | StmtKind::DoWhile(_)
+            | StmtKind::For(_) | StmtKind::Loop(_) | StmtKind::StaticMatch(_) | StmtKind::Expr(_)
+            | StmtKind::Decl(_) => { return false; }
         }
-    }
-
-    /// A block diverges if any statement in it diverges (once one does, the
-    /// block cannot complete normally).
-    block_diverges(mut &this, block: BlockStmtNode*) -> boolean {
-        if (block == null) { return false; }
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            const stmt: StatementNode* = block.statements[i];
-            if (stmt != null && this.stmt_diverges(stmt)) { return true; }
-        }
-        return false;
     }
 
     // -- Method-usage harvest (for W0002) --
@@ -437,57 +424,53 @@ type struct DeadCodeChecker {
 
     harvest_fn(mut &this, func: FunctionDeclNode*) -> void {
         if (func == null || func.body == null) { return; }
-        this.harvest_stmt(func.body as StatementNode*);
+        this.harvest_stmt(func.body);
     }
 
     /// Fully recurse a statement, harvesting call targets from every
     /// expression and every nested statement.
-    harvest_stmt(mut &this, stmt: StatementNode*) -> void {
+    harvest_stmt(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
-        match (stmt.kind) {
-            NodeKind::BlockStatement => {
-                const b: BlockStmtNode* = stmt as BlockStmtNode*;
+        match (stmt.shape) {
+            StmtKind::Block(b) => {
                 for (mut i: i64 = 0; i < b.statements.length; i++) { this.harvest_stmt(b.statements[i]); }
             }
-            NodeKind::UnsafeBlockStatement => {
-                this.harvest_stmt((stmt as UnsafeBlockStmtNode*).block as StatementNode*);
-            }
-            NodeKind::ReturnStatement     => { this.walk_expr((stmt as ReturnStmtNode*).expression); }
-            NodeKind::ExpressionStatement => { this.walk_expr((stmt as ExprStmtNode*).expression); }
-            NodeKind::DeclarationStatement => {
-                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            StmtKind::UnsafeBlock(u) => { this.harvest_stmt(u.block); }
+            StmtKind::Return(r)      => { this.walk_expr(r.expression); }
+            StmtKind::Expr(e)        => { this.walk_expr(e.expression); }
+            StmtKind::Decl(ds) => {
                 if (ds.declaration != null) { this.harvest_decl(ds.declaration); }
             }
-            NodeKind::VariableDeclaration   => { this.harvest_decl(stmt as DeclarationNode*); }
-            NodeKind::DestructureDeclaration => { this.harvest_decl(stmt as DeclarationNode*); }
-            NodeKind::IfStatement => {
-                const it: IfStmtNode* = stmt as IfStmtNode*;
+            StmtKind::If(it) => {
                 this.walk_expr(it.condition);
                 this.harvest_stmt(it.then_stmt);
                 this.harvest_stmt(it.else_stmt);
             }
-            NodeKind::WhileStatement => {
-                const w: WhileStmtNode* = stmt as WhileStmtNode*;
+            StmtKind::While(w) => {
                 this.walk_expr(w.condition);
                 this.harvest_stmt(w.body);
             }
-            NodeKind::DoWhileStatement => {
-                const d: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+            StmtKind::DoWhile(d) => {
                 this.harvest_stmt(d.body);
                 this.walk_expr(d.condition);
             }
-            NodeKind::ForStatement => {
-                const f: ForStmtNode* = stmt as ForStmtNode*;
-                if (f.init != null) { this.harvest_stmt(f.init as StatementNode*); }
+            StmtKind::For(f) => {
+                // The initializer is a declaration or an expression; an
+                // expression there is not harvested.
+                if (f.init != null) {
+                    if (f.init.kind == NodeKind::VariableDeclaration
+                            || f.init.kind == NodeKind::DestructureDeclaration) {
+                        this.harvest_decl(f.init as DeclarationNode*);
+                    } else if (f.init.kind == NodeKind::Statement) {
+                        this.harvest_stmt(f.init as Stmt*);
+                    }
+                }
                 this.walk_expr(f.condition);
                 this.walk_expr(f.update);
                 this.harvest_stmt(f.body);
             }
-            NodeKind::LoopStatement => {
-                this.harvest_stmt((stmt as LoopStmtNode*).body);
-            }
-            NodeKind::MatchStatement => {
-                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::Loop(l) => { this.harvest_stmt(l.body); }
+            StmtKind::Match(m) => {
                 this.walk_expr(m.subject);
                 for (mut i: i64 = 0; i < m.arms.length; i++) {
                     const arm: MatchArmNode* = m.arms[i];
@@ -496,14 +479,13 @@ type struct DeadCodeChecker {
                     this.harvest_stmt(arm.body);
                 }
             }
-            NodeKind::StaticMatchStatement => {
-                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sm) => {
                 for (mut i: i64 = 0; i < sm.arms.length; i++) {
                     const arm: StaticMatchArmNode* = sm.arms[i];
                     if (arm != null) { this.harvest_stmt(arm.body); }
                 }
             }
-            _ => {}
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 

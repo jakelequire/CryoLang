@@ -71,9 +71,8 @@ import compiler::ast::expression::{
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
-    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
-    UnsafeBlockStmtNode, WhileStmtNode
+    BlockStmt, DeclStmt, DoWhileStmt, ExprStmt, ForStmt, IfStmt, LoopStmt, MatchStmt,
+    ReturnStmt, Stmt, StmtKind, WhileStmt
 };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
@@ -121,7 +120,7 @@ type struct PollSm {
     // accumulated state blocks (index == state value) + a hard-error flag: an
     // unsupported await shape or an illegal cross-suspend local sets ok=false
     // and unwinds the build.
-    blocks:     [BlockStmtNode*];
+    blocks:     [Stmt*];
     ok:         boolean;
 
     // one `fut_k: Option<F_k>` sub-future field per await (pre-order ordinal)
@@ -233,9 +232,9 @@ type struct MintedLocal {
 /// a construct that must keep a suspend conditional (`&&`, `||`, `?:`) gives its
 /// conditional part a fresh one and empties it into a branch block instead.
 type struct HoistPre {
-    stmts: [StatementNode*];
+    stmts: [Stmt*];
 
-    push(mut &this, s: StatementNode*) -> void {
+    push(mut &this, s: Stmt*) -> void {
         if (s != null) { this.stmts.push(s); }
     }
 }
@@ -472,7 +471,7 @@ type struct AsyncLower {
     // and that is what makes the give-away and the later read one binding's
     // move and use rather than two unrelated expressions.
     subst_hoist_sym:  SymbolID;
-    subst_hoist_stmt: StatementNode*;
+    subst_hoist_stmt: Stmt*;
     subst_hoist_seq:  i64;
     // Nonzero inside a position that is only CONDITIONALLY evaluated, or one
     // the state machine will tear apart. A hoist there would be spliced ahead
@@ -918,9 +917,9 @@ type struct AsyncLower {
 
     /// `return Poll::Ready(());` — the terminal return of a `-> void` async fn,
     /// whose `Output` is unit.
-    unit_ready_return(&this, poll_out: TypeRef, span: SourceSpan) -> StatementNode* {
-        return new ReturnStmtNode(
-            this.make_poll_ready(this.unit_value(span), poll_out, span), span) as StatementNode*;
+    unit_ready_return(&this, poll_out: TypeRef, span: SourceSpan) -> Stmt* {
+        return Stmt::return_stmt(
+            this.make_poll_ready(this.unit_value(span), poll_out, span), span);
     }
 
     /// `<scope>::<member>(<value>)` typed `ty` — a synthesized enum-variant
@@ -978,87 +977,76 @@ type struct AsyncLower {
     /// containers arrive with the later state-machine increments. Does NOT descend
     /// into nested function-like bodies (a lambda's returns are its own, and a
     /// lambda is an expression this statement walk never enters).
-    rewrite_returns(mut &this, stmt: StatementNode*, poll_out: TypeRef, span: SourceSpan) -> void {
+    rewrite_returns(mut &this, stmt: Stmt*, poll_out: TypeRef, span: SourceSpan) -> void {
         if (stmt == null) { return; }
-        if (stmt.kind == NodeKind::ReturnStatement) {
-            const ret: ReturnStmtNode* = stmt as ReturnStmtNode*;
-            if (ret.expression != null) {
-                // The returned expression may itself hold a `match` expression
-                // whose arms return; rewrite those before wrapping this one, so
-                // the wrap sees a fully rewritten operand.
-                this.rewrite_returns_expr(ret.expression, poll_out, span);
-                ret.expression = this.make_poll_ready(ret.expression, poll_out, span);
-            } else {
-                // A bare `return;` only type-checks in a `-> void` function, whose
-                // `Output` is unit — so the value `Poll::Ready` carries is `()`.
-                // `poll` returns a value on every path, so the bare form cannot
-                // survive into the generated body.
-                ret.expression = this.make_poll_ready(this.unit_value(span), poll_out, span);
-            }
-            return;
-        }
-        if (stmt.kind == NodeKind::ExpressionStatement) {
-            this.rewrite_returns_expr((stmt as ExprStmtNode*).expression, poll_out, span);
-            return;
-        }
-        if (stmt.kind == NodeKind::DeclarationStatement) {
-            this.rewrite_returns_expr(this.decl_stmt_init(stmt as DeclStmtNode*), poll_out, span);
-            return;
-        }
-        if (stmt.kind == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = stmt as BlockStmtNode*;
-            for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                this.rewrite_returns(blk.statements[i], poll_out, span);
-            }
-            return;
-        }
-        if (stmt.kind == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = stmt as IfStmtNode*;
-            this.rewrite_returns_expr(iff.condition, poll_out, span);
-            this.rewrite_returns(iff.then_stmt, poll_out, span);
-            this.rewrite_returns(iff.else_stmt, poll_out, span);
-            return;
-        }
-        if (stmt.kind == NodeKind::WhileStatement) {
-            const w: WhileStmtNode* = stmt as WhileStmtNode*;
-            this.rewrite_returns_expr(w.condition, poll_out, span);
-            this.rewrite_returns(w.body, poll_out, span);
-            return;
-        }
-        if (stmt.kind == NodeKind::DoWhileStatement) {
-            const d: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
-            this.rewrite_returns(d.body, poll_out, span);
-            this.rewrite_returns_expr(d.condition, poll_out, span);
-            return;
-        }
-        if (stmt.kind == NodeKind::ForStatement) {
-            const f: ForStmtNode* = stmt as ForStmtNode*;
-            if (f.init != null) {
-                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                    this.rewrite_returns_expr((f.init as VarDeclNode*).initializer, poll_out, span);
+        match (stmt.shape) {
+            StmtKind::Return(ret) => {
+                if (ret.expression != null) {
+                    // The returned expression may itself hold a `match` expression
+                    // whose arms return; rewrite those before wrapping this one, so
+                    // the wrap sees a fully rewritten operand.
+                    this.rewrite_returns_expr(ret.expression, poll_out, span);
+                    ret.expression = this.make_poll_ready(ret.expression, poll_out, span);
                 } else {
-                    this.rewrite_returns_expr(f.init as ExpressionNode*, poll_out, span);
+                    // A bare `return;` only type-checks in a `-> void` function, whose
+                    // `Output` is unit — so the value `Poll::Ready` carries is `()`.
+                    // `poll` returns a value on every path, so the bare form cannot
+                    // survive into the generated body.
+                    ret.expression = this.make_poll_ready(this.unit_value(span), poll_out, span);
                 }
             }
-            this.rewrite_returns_expr(f.condition, poll_out, span);
-            this.rewrite_returns(f.body, poll_out, span);
-            this.rewrite_returns_expr(f.update, poll_out, span);
-            return;
-        }
-        if (stmt.kind == NodeKind::LoopStatement) {
-            this.rewrite_returns((stmt as LoopStmtNode*).body, poll_out, span);
-            return;
-        }
-        if (stmt.kind == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = stmt as MatchStmtNode*;
-            this.rewrite_returns_expr(m.subject, poll_out, span);
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                if (m.arms[i] != null) {
-                    this.rewrite_returns_expr(m.arms[i].guard, poll_out, span);
-                    this.rewrite_returns(m.arms[i].body, poll_out, span);
+            StmtKind::Expr(e) => {
+                this.rewrite_returns_expr(e.expression, poll_out, span);
+            }
+            StmtKind::Decl(d) => {
+                this.rewrite_returns_expr(this.decl_stmt_init(d), poll_out, span);
+            }
+            StmtKind::Block(blk) => {
+                for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                    this.rewrite_returns(blk.statements[i], poll_out, span);
                 }
             }
-            return;
+            StmtKind::If(iff) => {
+                this.rewrite_returns_expr(iff.condition, poll_out, span);
+                this.rewrite_returns(iff.then_stmt, poll_out, span);
+                this.rewrite_returns(iff.else_stmt, poll_out, span);
+            }
+            StmtKind::While(w) => {
+                this.rewrite_returns_expr(w.condition, poll_out, span);
+                this.rewrite_returns(w.body, poll_out, span);
+            }
+            StmtKind::DoWhile(d) => {
+                this.rewrite_returns(d.body, poll_out, span);
+                this.rewrite_returns_expr(d.condition, poll_out, span);
+            }
+            StmtKind::For(f) => {
+                if (f.init != null) {
+                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                        this.rewrite_returns_expr((f.init as VarDeclNode*).initializer, poll_out, span);
+                    } else {
+                        this.rewrite_returns_expr(f.init as ExpressionNode*, poll_out, span);
+                    }
+                }
+                this.rewrite_returns_expr(f.condition, poll_out, span);
+                this.rewrite_returns(f.body, poll_out, span);
+                this.rewrite_returns_expr(f.update, poll_out, span);
+            }
+            StmtKind::Loop(l) => {
+                this.rewrite_returns(l.body, poll_out, span);
+            }
+            StmtKind::Match(m) => {
+                this.rewrite_returns_expr(m.subject, poll_out, span);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] != null) {
+                        this.rewrite_returns_expr(m.arms[i].guard, poll_out, span);
+                        this.rewrite_returns(m.arms[i].body, poll_out, span);
+                    }
+                }
+            }
+            // A return inside `unsafe { }` or a `static match` arm is not
+            // rewritten.
+            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
+            | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
@@ -1284,120 +1272,89 @@ type struct AsyncLower {
     /// Count `await`s in a statement, recursing through control-flow containers
     /// so an `await` buried in a nested block/branch/loop is still tallied (and
     /// therefore rejected — Inc 2 lowers only a single straight-line await).
-    stmt_await_count(&this, stmt: StatementNode*) -> i64 {
+    stmt_await_count(&this, stmt: Stmt*) -> i64 {
         if (stmt == null) { return 0; }
-        const k: NodeKind = stmt.kind;
-        if (k == NodeKind::ExpressionStatement) {
-            return this.expr_await_count((stmt as ExprStmtNode*).expression);
-        }
-        if (k == NodeKind::ReturnStatement) {
-            return this.expr_await_count((stmt as ReturnStmtNode*).expression);
-        }
-        if (k == NodeKind::DeclarationStatement) {
-            return this.expr_await_count(this.decl_stmt_init(stmt as DeclStmtNode*));
-        }
-        if (k == NodeKind::BlockStatement) {
-            return this.block_await_count(stmt as BlockStmtNode*);
-        }
-        // Counted so the suspend is SEEN and the function still takes the async
-        // path; `lower_stmt_sm` then rejects it with its own span rather than
-        // letting an unwalked `await` reach codegen with no state to resume.
-        if (k == NodeKind::UnsafeBlockStatement) {
-            return this.block_await_count((stmt as UnsafeBlockStmtNode*).block);
-        }
-        if (k == NodeKind::StaticMatchStatement) {
-            const sms: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
-            mut n: i64 = 0;
-            for (mut i: i64 = 0; i < sms.arms.length; i++) {
-                if (sms.arms[i] != null) { n += this.stmt_await_count(sms.arms[i].body); }
-            }
-            return n;
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = stmt as IfStmtNode*;
-            return this.expr_await_count(iff.condition)
-                 + this.stmt_await_count(iff.then_stmt)
-                 + this.stmt_await_count(iff.else_stmt);
-        }
-        if (k == NodeKind::WhileStatement) {
-            const w: WhileStmtNode* = stmt as WhileStmtNode*;
-            return this.expr_await_count(w.condition) + this.stmt_await_count(w.body);
-        }
-        if (k == NodeKind::DoWhileStatement) {
-            const d: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
-            return this.expr_await_count(d.condition) + this.stmt_await_count(d.body);
-        }
-        if (k == NodeKind::ForStatement) {
-            const f: ForStmtNode* = stmt as ForStmtNode*;
-            mut n: i64 = this.expr_await_count(f.condition) + this.expr_await_count(f.update)
-                       + this.stmt_await_count(f.body);
-            if (f.init != null) {
-                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                    n += this.expr_await_count((f.init as VarDeclNode*).initializer);
-                } else {
-                    n += this.expr_await_count(f.init as ExpressionNode*);
+        match (stmt.shape) {
+            StmtKind::Expr(e)   => { return this.expr_await_count(e.expression); }
+            StmtKind::Return(r) => { return this.expr_await_count(r.expression); }
+            StmtKind::Decl(d)   => { return this.expr_await_count(this.decl_stmt_init(d)); }
+            StmtKind::Block(blk) => {
+                mut n: i64 = 0;
+                for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                    n += this.stmt_await_count(blk.statements[i]);
                 }
+                return n;
             }
-            return n;
-        }
-        if (k == NodeKind::LoopStatement) {
-            return this.stmt_await_count((stmt as LoopStmtNode*).body);
-        }
-        if (k == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = stmt as MatchStmtNode*;
-            // The subject and the guards count too: an `await` left uncounted
-            // anywhere sends the whole function down the no-await path, where
-            // nothing rewrites it and codegen meets it with no state to resume.
-            mut n: i64 = this.expr_await_count(m.subject);
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                if (m.arms[i] != null) {
-                    n += this.expr_await_count(m.arms[i].guard);
-                    n += this.stmt_await_count(m.arms[i].body);
+            // Counted so the suspend is SEEN and the function still takes the async
+            // path; `lower_stmt_sm` then rejects it with its own span rather than
+            // letting an unwalked `await` reach codegen with no state to resume.
+            StmtKind::UnsafeBlock(u) => { return this.stmt_await_count(u.block); }
+            StmtKind::StaticMatch(sms) => {
+                mut n: i64 = 0;
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    if (sms.arms[i] != null) { n += this.stmt_await_count(sms.arms[i].body); }
                 }
+                return n;
             }
-            return n;
+            StmtKind::If(iff) => {
+                return this.expr_await_count(iff.condition)
+                     + this.stmt_await_count(iff.then_stmt)
+                     + this.stmt_await_count(iff.else_stmt);
+            }
+            StmtKind::While(w) => {
+                return this.expr_await_count(w.condition) + this.stmt_await_count(w.body);
+            }
+            StmtKind::DoWhile(d) => {
+                return this.expr_await_count(d.condition) + this.stmt_await_count(d.body);
+            }
+            StmtKind::For(f) => {
+                mut n: i64 = this.expr_await_count(f.condition) + this.expr_await_count(f.update)
+                           + this.stmt_await_count(f.body);
+                if (f.init != null) {
+                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                        n += this.expr_await_count((f.init as VarDeclNode*).initializer);
+                    } else {
+                        n += this.expr_await_count(f.init as ExpressionNode*);
+                    }
+                }
+                return n;
+            }
+            StmtKind::Loop(l) => { return this.stmt_await_count(l.body); }
+            StmtKind::Match(m) => {
+                // The subject and the guards count too: an `await` left uncounted
+                // anywhere sends the whole function down the no-await path, where
+                // nothing rewrites it and codegen meets it with no state to resume.
+                mut n: i64 = this.expr_await_count(m.subject);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] != null) {
+                        n += this.expr_await_count(m.arms[i].guard);
+                        n += this.stmt_await_count(m.arms[i].body);
+                    }
+                }
+                return n;
+            }
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => { return 0; }
         }
-        return 0;
-    }
-
-    block_await_count(&this, blk: BlockStmtNode*) -> i64 {
-        if (blk == null) { return 0; }
-        mut n: i64 = 0;
-        for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            n += this.stmt_await_count(blk.statements[i]);
-        }
-        return n;
     }
 
     /// If `stmt`'s TOP-LEVEL expression is an `await`, return that node; else
     /// null. The three carriers Inc 2 supports: `const/mut x = await e;`,
     /// `return await e;`, and a bare `await e;`. An await nested deeper in an
     /// expression is intentionally not a carrier (the count gate rejects it).
-    stmt_toplevel_await(&this, stmt: StatementNode*) -> AwaitExprNode* {
+    stmt_toplevel_await(&this, stmt: Stmt*) -> AwaitExprNode* {
         if (stmt == null) { return null; }
-        if (stmt.kind == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
-                if (vd.initializer != null && vd.initializer.kind == NodeKind::AwaitExpression) {
-                    return vd.initializer as AwaitExprNode*;
-                }
+        mut e: ExpressionNode* = null;
+        match (stmt.shape) {
+            StmtKind::Decl(_) => {
+                const vd: VarDeclNode* = this.stmt_decl_var(stmt);
+                if (vd != null) { e = vd.initializer; }
             }
-            return null;
+            StmtKind::Return(rs) => { e = rs.expression; }
+            StmtKind::Expr(es)   => { e = es.expression; }
+            _                    => {}
         }
-        if (stmt.kind == NodeKind::ReturnStatement) {
-            const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
-            if (rs.expression != null && rs.expression.kind == NodeKind::AwaitExpression) {
-                return rs.expression as AwaitExprNode*;
-            }
-            return null;
-        }
-        if (stmt.kind == NodeKind::ExpressionStatement) {
-            const es: ExprStmtNode* = stmt as ExprStmtNode*;
-            if (es.expression != null && es.expression.kind == NodeKind::AwaitExpression) {
-                return es.expression as AwaitExprNode*;
-            }
-            return null;
+        if (e != null && e.kind == NodeKind::AwaitExpression) {
+            return e as AwaitExprNode*;
         }
         return null;
     }
@@ -1405,22 +1362,17 @@ type struct AsyncLower {
     /// Replace the top-level `await e` in a carrier statement with `repl` (the
     /// identifier bound to the awaited result). The carrier then runs, on
     /// resume, reading the result instead of the (removed) await.
-    rewrite_carrier_await(&this, stmt: StatementNode*, repl: ExpressionNode*) -> void {
+    rewrite_carrier_await(&this, stmt: Stmt*, repl: ExpressionNode*) -> void {
         if (stmt == null) { return; }
-        if (stmt.kind == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                (ds.declaration as VarDeclNode*).initializer = repl;
+        match (stmt.shape) {
+            StmtKind::Decl(ds) => {
+                if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                    (ds.declaration as VarDeclNode*).initializer = repl;
+                }
             }
-            return;
-        }
-        if (stmt.kind == NodeKind::ReturnStatement) {
-            (stmt as ReturnStmtNode*).expression = repl;
-            return;
-        }
-        if (stmt.kind == NodeKind::ExpressionStatement) {
-            (stmt as ExprStmtNode*).expression = repl;
-            return;
+            StmtKind::Return(rs) => { rs.expression = repl; }
+            StmtKind::Expr(es)   => { es.expression = repl; }
+            _ => {}
         }
     }
 
@@ -1461,7 +1413,7 @@ type struct AsyncLower {
 
     /// Record the declaration `s` makes as a stand-in for binding `key`, and
     /// hand the statement back.
-    stand_in(mut &this, s: StatementNode*, key: SymbolID) -> StatementNode* {
+    stand_in(mut &this, s: Stmt*, key: SymbolID) -> Stmt* {
         const vd: VarDeclNode* = this.stmt_decl_var(s);
         if (vd != null && key.is_valid()) {
             this.stand_ins.push(vd);
@@ -1605,7 +1557,7 @@ type struct AsyncLower {
     /// `<lhs> = <rhs>;` as a statement.  The assignment is typed as the type
     /// check types a written one, its target's type, when both sides are
     /// typed.
-    assign_stmt(&this, lhs: ExpressionNode*, rhs: ExpressionNode*, span: SourceSpan) -> StatementNode* {
+    assign_stmt(&this, lhs: ExpressionNode*, rhs: ExpressionNode*, span: SourceSpan) -> Stmt* {
         const eq: Token = Token::new(TokenType::Equal, "=", span.start_line as int, span.start_col as int);
         mut assign: BinaryExprNode* = new BinaryExprNode(eq, lhs, rhs, span);
         // Typed only when both sides are: a side left for the type check to
@@ -1613,13 +1565,13 @@ type struct AsyncLower {
         if (lhs.has_resolved_type() && rhs != null && rhs.has_resolved_type()) {
             assign.set_resolved_type(lhs.resolved_type);
         }
-        mut es: ExprStmtNode* = new ExprStmtNode(assign as ExpressionNode*, span);
-        return es as StatementNode*;
+        mut es: Stmt* = Stmt::expr_stmt(assign as ExpressionNode*, span);
+        return es;
     }
 
     /// `this.<field> = <rhs>;` as a statement.
     assign_member_stmt(mut &this, struct_ref: TypeRef, field: SymbolStr, field_ty: TypeRef,
-                       rhs: ExpressionNode*, span: SourceSpan) -> StatementNode* {
+                       rhs: ExpressionNode*, span: SourceSpan) -> Stmt* {
         return this.assign_stmt(this.own_field(struct_ref, field, field_ty, span), rhs, span);
     }
 
@@ -1627,22 +1579,22 @@ type struct AsyncLower {
     /// Mirrors the parser's literal-int pattern (`PatternKind::Literal` +
     /// `LiteralKind::Integer`, no type suffix); the `u32` state type is inferred
     /// from the match subject, so the pattern text stays a bare integer.
-    match_arm_int(&this, value: u64, body: BlockStmtNode*, span: SourceSpan) -> MatchArmNode* {
+    match_arm_int(&this, value: u64, body: Stmt*, span: SourceSpan) -> MatchArmNode* {
         const pat: Pattern* = Pattern::literal(
             this.intern.intern(fmt::format("%llu", value)), LiteralKind::Integer, span);
         mut arm: MatchArmNode* = new MatchArmNode(span);
         arm.add_pattern(pat);
-        arm.set_body(body as StatementNode*);
+        arm.set_body(body);
         return arm;
     }
 
     /// A `match` arm `_ => { <body> }` (the wildcard, making the state dispatch
     /// exhaustive over the open `u32` domain).
-    match_arm_wild(&this, body: BlockStmtNode*, span: SourceSpan) -> MatchArmNode* {
+    match_arm_wild(&this, body: Stmt*, span: SourceSpan) -> MatchArmNode* {
         const pat: Pattern* = Pattern::wildcard(span);
         mut arm: MatchArmNode* = new MatchArmNode(span);
         arm.add_pattern(pat);
-        arm.set_body(body as StatementNode*);
+        arm.set_body(body);
         return arm;
     }
 
@@ -1671,7 +1623,7 @@ type struct AsyncLower {
 
     /// Declare a synthetic local nothing needs to name by identity afterwards.
     var_decl_stmt(mut &this, name: SymbolStr, mutable: boolean, ty: TypeRef,
-                  init: ExpressionNode*, span: SourceSpan) -> StatementNode* {
+                  init: ExpressionNode*, span: SourceSpan) -> Stmt* {
         return this.var_decl_stmt_bound(
             name, this.resolver.alloc_synthetic_binding(),
             mutable, ty, init, span);
@@ -1682,14 +1634,14 @@ type struct AsyncLower {
     /// not a later one that reuses the spelling.
     var_decl_stmt_bound(mut &this, name: SymbolStr, sym: SymbolID,
                         mutable: boolean, ty: TypeRef,
-                        init: ExpressionNode*, span: SourceSpan) -> StatementNode* {
+                        init: ExpressionNode*, span: SourceSpan) -> Stmt* {
         mut vd: VarDeclNode* = new VarDeclNode(name, span);
         vd.set_sym_id(sym);
         vd.set_mutable(mutable);
         vd.set_resolved_type(ty);
         vd.set_initializer(init);
-        mut ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
-        return ds as StatementNode*;
+        mut ds: Stmt* = Stmt::decl_stmt(vd as DeclarationNode*, span);
+        return ds;
     }
 
     /// The arg-shadow prelude common to every generated `poll`: `const p =
@@ -1701,7 +1653,7 @@ type struct AsyncLower {
     /// lives in an `Option` slot and is MOVED out with a `take`. The state-machine
     /// path skips those here and lets `carry_params` materialize one per state; a
     /// body with no `await` has no states, so its single poll takes them here.
-    emit_shadow_prelude(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, body: BlockStmtNode*,
+    emit_shadow_prelude(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, body: BlockStmt*,
                         sm: PollSm*, skip_carried: boolean, span: SourceSpan) -> void {
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p: VarDeclNode* = node.parameters[i];
@@ -1724,30 +1676,33 @@ type struct AsyncLower {
             shadow.set_mutable(false);
             shadow.set_resolved_type(slot_ty);
             shadow.set_initializer(access as ExpressionNode*);
-            const shadow_stmt: DeclStmtNode* = new DeclStmtNode(shadow as DeclarationNode*, span);
-            body.add_statement(this.stand_in(shadow_stmt as StatementNode*, p.sym_id));
+            const shadow_stmt: Stmt* = Stmt::decl_stmt(shadow as DeclarationNode*, span);
+            body.add_statement(this.stand_in(shadow_stmt, p.sym_id));
         }
     }
 
     /// No-await body: shadow prelude + the original body with `return E`
     /// rewritten to `return Poll::Ready(E)` (runs to completion in one poll).
     build_poll_body_no_await(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, sm: PollSm*,
-                             poll_out: TypeRef, span: SourceSpan) -> BlockStmtNode* {
-        mut body: BlockStmtNode* = new BlockStmtNode(span);
+                             poll_out: TypeRef, span: SourceSpan) -> Stmt* {
+        const body_stmt: Stmt* = Stmt::block(span);
+        const body: BlockStmt* = body_stmt.as_block();
         this.emit_shadow_prelude(d, node, body, sm, false, span);
-        if (node.body.kind == NodeKind::BlockStatement) {
-            const orig: BlockStmtNode* = node.body as BlockStmtNode*;
-            for (mut bi: i64 = 0; bi < orig.statements.length; bi++) {
-                this.rewrite_returns(orig.statements[bi], poll_out, span);
-                body.add_statement(orig.statements[bi]);
+        match (node.body.shape) {
+            StmtKind::Block(orig) => {
+                for (mut bi: i64 = 0; bi < orig.statements.length; bi++) {
+                    this.rewrite_returns(orig.statements[bi], poll_out, span);
+                    body.add_statement(orig.statements[bi]);
+                }
+                // A void body may end without a `return`, but `poll` may not: give it
+                // the unit completion the source left implicit.
+                if (!this.block_diverges(node.body)) {
+                    body.add_statement(this.unit_ready_return(poll_out, span));
+                }
             }
-            // A void body may end without a `return`, but `poll` may not: give it
-            // the unit completion the source left implicit.
-            if (!this.block_diverges(orig)) {
-                body.add_statement(this.unit_ready_return(poll_out, span));
-            }
+            _ => {}
         }
-        return body;
+        return body_stmt;
     }
 
     // ---- cross-await promotion analysis (Inc 3) ----
@@ -1848,58 +1803,50 @@ type struct AsyncLower {
 
     /// True if `name` is read anywhere in statement `s`, recursing through the
     /// (await-free) control-flow containers a straight-line segment may hold.
-    name_read_in_stmt(&this, s: StatementNode*, key: SymbolID) -> boolean {
+    name_read_in_stmt(&this, s: Stmt*, key: SymbolID) -> boolean {
         if (s == null) { return false; }
-        const k: NodeKind = s.kind;
-        if (k == NodeKind::ExpressionStatement) {
-            return this.name_read_in_expr((s as ExprStmtNode*).expression, key);
-        }
-        if (k == NodeKind::ReturnStatement) {
-            return this.name_read_in_expr((s as ReturnStmtNode*).expression, key);
-        }
-        if (k == NodeKind::DeclarationStatement) {
-            return this.name_read_in_expr(this.decl_stmt_init(s as DeclStmtNode*), key);
-        }
-        if (k == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = s as BlockStmtNode*;
-            for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                if (this.name_read_in_stmt(blk.statements[i], key)) { return true; }
+        match (s.shape) {
+            StmtKind::Expr(e)   => { return this.name_read_in_expr(e.expression, key); }
+            StmtKind::Return(r) => { return this.name_read_in_expr(r.expression, key); }
+            StmtKind::Decl(d)   => { return this.name_read_in_expr(this.decl_stmt_init(d), key); }
+            StmtKind::Block(blk) => {
+                for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                    if (this.name_read_in_stmt(blk.statements[i], key)) { return true; }
+                }
+                return false;
             }
-            return false;
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = s as IfStmtNode*;
-            return this.name_read_in_expr(iff.condition, key)
-                || this.name_read_in_stmt(iff.then_stmt, key)
-                || this.name_read_in_stmt(iff.else_stmt, key);
-        }
-        if (k == NodeKind::WhileStatement) {
-            const w: WhileStmtNode* = s as WhileStmtNode*;
-            return this.name_read_in_expr(w.condition, key) || this.name_read_in_stmt(w.body, key);
-        }
-        if (k == NodeKind::DoWhileStatement) {
-            const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            return this.name_read_in_expr(d.condition, key) || this.name_read_in_stmt(d.body, key);
-        }
-        if (k == NodeKind::ForStatement) {
-            const f: ForStmtNode* = s as ForStmtNode*;
-            if (f.init != null && this.name_read_in_stmt(f.init as StatementNode*, key)) { return true; }
-            return this.name_read_in_expr(f.condition, key)
-                || this.name_read_in_expr(f.update, key)
-                || this.name_read_in_stmt(f.body, key);
-        }
-        if (k == NodeKind::LoopStatement) {
-            return this.name_read_in_stmt((s as LoopStmtNode*).body, key);
-        }
-        if (k == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = s as MatchStmtNode*;
-            if (this.name_read_in_expr(m.subject, key)) { return true; }
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                if (m.arms[i] != null && this.name_read_in_stmt(m.arms[i].body, key)) { return true; }
+            StmtKind::If(iff) => {
+                return this.name_read_in_expr(iff.condition, key)
+                    || this.name_read_in_stmt(iff.then_stmt, key)
+                    || this.name_read_in_stmt(iff.else_stmt, key);
             }
-            return false;
+            StmtKind::While(w) => {
+                return this.name_read_in_expr(w.condition, key) || this.name_read_in_stmt(w.body, key);
+            }
+            StmtKind::DoWhile(d) => {
+                return this.name_read_in_expr(d.condition, key) || this.name_read_in_stmt(d.body, key);
+            }
+            StmtKind::For(f) => {
+                // A declaration or expression initializer is not scanned.
+                if (f.init != null && f.init.kind == NodeKind::Statement
+                        && this.name_read_in_stmt(f.init as Stmt*, key)) {
+                    return true;
+                }
+                return this.name_read_in_expr(f.condition, key)
+                    || this.name_read_in_expr(f.update, key)
+                    || this.name_read_in_stmt(f.body, key);
+            }
+            StmtKind::Loop(l) => { return this.name_read_in_stmt(l.body, key); }
+            StmtKind::Match(m) => {
+                if (this.name_read_in_expr(m.subject, key)) { return true; }
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] != null && this.name_read_in_stmt(m.arms[i].body, key)) { return true; }
+                }
+                return false;
+            }
+            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
+            | StmtKind::Break | StmtKind::Continue => { return false; }
         }
-        return false;
     }
 
     // ---- in-place identifier rewrite (mut cross-state promotion) ----
@@ -2219,10 +2166,13 @@ type struct AsyncLower {
     /// would rewrite a node another state also reads while the declaration only
     /// ever reaches this state's block. At the join a give-away made inside is
     /// abandoned for the same reason, and because it may not have run.
-    subst_nested_stmt(mut &this, s: StatementNode*, key: SymbolID, field: SymbolStr,
+    subst_nested_stmt(mut &this, s: Stmt*, key: SymbolID, field: SymbolStr,
                       struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> void {
         if (s == null) { return; }
-        const absorbs: boolean = (s.kind == NodeKind::BlockStatement);
+        const absorbs: boolean = match (s.shape) {
+            StmtKind::Block(_) => { true }
+            _                  => { false }
+        };
         const saved: SymbolStr = this.subst_hoist_name;
         const saved_sym: SymbolID = this.subst_hoist_sym;
         this.subst_hoist_name = SymbolStr::empty();
@@ -2245,15 +2195,15 @@ type struct AsyncLower {
     /// function again for that block, and without the save the inner walk would
     /// clear the outer statement's pending declaration - which is then never
     /// spliced in, while the mention it feeds has already been rebound to it.
-    subst_stmt_list(mut &this, blk: BlockStmtNode*, from: i64, key: SymbolID,
+    subst_stmt_list(mut &this, blk: BlockStmt*, from: i64, key: SymbolID,
                     field: SymbolStr, struct_ref: TypeRef, ty: TypeRef,
                     span: SourceSpan) -> void {
-        const outer_pending: StatementNode* = this.subst_hoist_stmt;
+        const outer_pending: Stmt* = this.subst_hoist_stmt;
         const saved_can: boolean = this.subst_can_hoist;
-        mut rebuilt: [StatementNode*] = [];
+        mut rebuilt: [Stmt*] = [];
         for (mut i: i64 = 0; i < from; i++) { rebuilt.push(blk.statements[i]); }
         for (mut i: i64 = from; i < blk.statements.length; i++) {
-            const st: StatementNode* = blk.statements[i];
+            const st: Stmt* = blk.statements[i];
             // A statement containing an `await` is torn into several state
             // blocks, so neither a declaration spliced in here nor a local
             // declared earlier is guaranteed to reach the mention. The value
@@ -2281,108 +2231,97 @@ type struct AsyncLower {
     /// Rewrite every read of `name` in statement `s` to `this.<field>`, recursing
     /// through control-flow containers (including await-free nested loops emitted
     /// wholesale). Mutates the statement's expression slots in place.
-    subst_name_stmt(mut &this, s: StatementNode*, key: SymbolID, field: SymbolStr,
+    subst_name_stmt(mut &this, s: Stmt*, key: SymbolID, field: SymbolStr,
                     struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> void {
         if (s == null) { return; }
-        const k: NodeKind = s.kind;
-        if (k == NodeKind::ExpressionStatement) {
-            const es: ExprStmtNode* = s as ExprStmtNode*;
-            es.expression = this.subst_name_expr(es.expression, key, field, struct_ref, ty, span,
-                                                 false);
-            return;
-        }
-        if (k == NodeKind::ReturnStatement) {
-            const rs: ReturnStmtNode* = s as ReturnStmtNode*;
-            // Returning the value hands it to the caller.
-            rs.expression = this.subst_name_expr(rs.expression, key, field, struct_ref, ty, span,
-                                                 true);
-            return;
-        }
-        if (k == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = s as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
-                // Initializing another binding from it moves the value there.
-                vd.initializer = this.subst_name_expr(vd.initializer, key, field, struct_ref,
-                                                     ty, span, true);
+        match (s.shape) {
+            StmtKind::Expr(es) => {
+                es.expression = this.subst_name_expr(es.expression, key, field, struct_ref, ty, span,
+                                                     false);
             }
-            return;
-        }
-        if (k == NodeKind::BlockStatement) {
-            this.subst_stmt_list(s as BlockStmtNode*, 0, key, field, struct_ref, ty, span);
-            return;
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = s as IfStmtNode*;
-            iff.condition = this.subst_name_expr(iff.condition, key, field, struct_ref, ty, span,
-                                                 false);
-            this.subst_nested_stmt(iff.then_stmt, key, field, struct_ref, ty, span);
-            this.subst_nested_stmt(iff.else_stmt, key, field, struct_ref, ty, span);
-            return;
-        }
-        if (k == NodeKind::WhileStatement) {
-            const w: WhileStmtNode* = s as WhileStmtNode*;
-            w.condition = this.subst_name_expr(w.condition, key, field, struct_ref, ty, span, false);
-            this.subst_nested_stmt(w.body, key, field, struct_ref, ty, span);
-            return;
-        }
-        if (k == NodeKind::DoWhileStatement) {
-            const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            d.condition = this.subst_name_expr(d.condition, key, field, struct_ref, ty, span, false);
-            this.subst_nested_stmt(d.body, key, field, struct_ref, ty, span);
-            return;
-        }
-        if (k == NodeKind::ForStatement) {
-            const f: ForStmtNode* = s as ForStmtNode*;
-            if (f.init != null) {
-                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                    const vd: VarDeclNode* = f.init as VarDeclNode*;
+            StmtKind::Return(rs) => {
+                // Returning the value hands it to the caller.
+                rs.expression = this.subst_name_expr(rs.expression, key, field, struct_ref, ty, span,
+                                                     true);
+            }
+            StmtKind::Decl(ds) => {
+                if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                    const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
+                    // Initializing another binding from it moves the value there.
                     vd.initializer = this.subst_name_expr(vd.initializer, key, field, struct_ref,
                                                          ty, span, true);
-                } else {
-                    f.init = this.subst_name_expr(f.init as ExpressionNode*, key, field,
-                                                 struct_ref, ty, span, false) as ASTNode*;
                 }
             }
-            f.condition = this.subst_name_expr(f.condition, key, field, struct_ref, ty, span, false);
-            f.update    = this.subst_name_expr(f.update, key, field, struct_ref, ty, span, false);
-            this.subst_nested_stmt(f.body, key, field, struct_ref, ty, span);
-            return;
-        }
-        if (k == NodeKind::LoopStatement) {
-            this.subst_nested_stmt((s as LoopStmtNode*).body, key, field, struct_ref, ty, span);
-            return;
-        }
-        if (k == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = s as MatchStmtNode*;
-            // As for a match EXPRESSION: an arm binding copies the payload out.
-            m.subject = this.subst_name_expr(m.subject, key, field, struct_ref, ty, span, true);
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                if (m.arms[i] != null) {
-                    this.subst_nested_stmt(m.arms[i].body, key, field, struct_ref, ty, span);
+            StmtKind::Block(b) => {
+                this.subst_stmt_list(b, 0, key, field, struct_ref, ty, span);
+            }
+            StmtKind::If(iff) => {
+                iff.condition = this.subst_name_expr(iff.condition, key, field, struct_ref, ty, span,
+                                                     false);
+                this.subst_nested_stmt(iff.then_stmt, key, field, struct_ref, ty, span);
+                this.subst_nested_stmt(iff.else_stmt, key, field, struct_ref, ty, span);
+            }
+            StmtKind::While(w) => {
+                w.condition = this.subst_name_expr(w.condition, key, field, struct_ref, ty, span, false);
+                this.subst_nested_stmt(w.body, key, field, struct_ref, ty, span);
+            }
+            StmtKind::DoWhile(d) => {
+                d.condition = this.subst_name_expr(d.condition, key, field, struct_ref, ty, span, false);
+                this.subst_nested_stmt(d.body, key, field, struct_ref, ty, span);
+            }
+            StmtKind::For(f) => {
+                if (f.init != null) {
+                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                        const vd: VarDeclNode* = f.init as VarDeclNode*;
+                        vd.initializer = this.subst_name_expr(vd.initializer, key, field, struct_ref,
+                                                             ty, span, true);
+                    } else {
+                        f.init = this.subst_name_expr(f.init as ExpressionNode*, key, field,
+                                                     struct_ref, ty, span, false) as ASTNode*;
+                    }
+                }
+                f.condition = this.subst_name_expr(f.condition, key, field, struct_ref, ty, span, false);
+                f.update    = this.subst_name_expr(f.update, key, field, struct_ref, ty, span, false);
+                this.subst_nested_stmt(f.body, key, field, struct_ref, ty, span);
+            }
+            StmtKind::Loop(l) => {
+                this.subst_nested_stmt(l.body, key, field, struct_ref, ty, span);
+            }
+            StmtKind::Match(m) => {
+                // As for a match EXPRESSION: an arm binding copies the payload out.
+                m.subject = this.subst_name_expr(m.subject, key, field, struct_ref, ty, span, true);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] != null) {
+                        this.subst_nested_stmt(m.arms[i].body, key, field, struct_ref, ty, span);
+                    }
                 }
             }
-            return;
+            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
+            | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
     /// The variable declared by a top-level `const/mut x = …;` statement
     /// (including an `await` carrier `const x = await e;`), or null if the
     /// statement declares no local.
-    stmt_decl_var(&this, s: StatementNode*) -> VarDeclNode* {
-        if (s == null || s.kind != NodeKind::DeclarationStatement) { return null; }
-        const ds: DeclStmtNode* = s as DeclStmtNode*;
-        if (ds.declaration == null || ds.declaration.kind != NodeKind::VariableDeclaration) {
-            return null;
+    stmt_decl_var(&this, s: Stmt*) -> VarDeclNode* {
+        if (s == null) { return null; }
+        match (s.shape) {
+            StmtKind::Decl(ds) => {
+                if (ds.declaration == null || ds.declaration.kind != NodeKind::VariableDeclaration) {
+                    return null;
+                }
+                return ds.declaration as VarDeclNode*;
+            }
+            _ => { return null; }
         }
-        return ds.declaration as VarDeclNode*;
     }
 
     /// The expression a declaration statement evaluates where it stands: a
     /// variable's initializer or a destructure's.  A walker asking what a
     /// statement reads, suspends on or diverges through asks this, so that a
     /// destructure is not a statement it cannot see into.
-    decl_stmt_init(&this, ds: DeclStmtNode*) -> ExpressionNode* {
+    decl_stmt_init(&this, ds: DeclStmt*) -> ExpressionNode* {
         if (ds == null || ds.declaration == null) { return null; }
         if (ds.declaration.kind == NodeKind::VariableDeclaration) {
             return (ds.declaration as VarDeclNode*).initializer;
@@ -2393,7 +2332,7 @@ type struct AsyncLower {
         return null;
     }
 
-    set_decl_stmt_init(&this, ds: DeclStmtNode*, init: ExpressionNode*) -> void {
+    set_decl_stmt_init(&this, ds: DeclStmt*, init: ExpressionNode*) -> void {
         if (ds == null || ds.declaration == null) { return; }
         if (ds.declaration.kind == NodeKind::VariableDeclaration) {
             (ds.declaration as VarDeclNode*).initializer = init;
@@ -2492,7 +2431,7 @@ type struct AsyncLower {
                 if (carried_in) {
                     this.prepend_agg_take(sm.blocks[b], pname, this.resolver.alloc_synthetic_binding(),
                                           pkey, pname, lty, opt_ty, sm.struct_ref, true, span);
-                    this.store_before_suspends(sm, sm.blocks[b] as StatementNode*,
+                    this.store_before_suspends(sm, sm.blocks[b],
                                                pname, opt_ty, pname, pkey, lty, span);
                 } else {
                     local = this.decl_at_first_assignment(sm.blocks[b], pkey, pname, lty, span);
@@ -2504,7 +2443,7 @@ type struct AsyncLower {
                     }
                 }
                 if (handback) {
-                    sm.blocks[b].add_statement(
+                    sm.blocks[b].as_block().add_statement(
                         this.agg_store_stmt(sm, pname, opt_ty, local.name, local.sym, lty, span));
                 }
             }
@@ -2557,24 +2496,25 @@ type struct AsyncLower {
     /// Allocate a fresh empty state block; return its index (== its state value).
     sm_alloc(mut &this, sm: PollSm*) -> i64 {
         const idx: i64 = sm.blocks.length;
-        sm.blocks.push(new BlockStmtNode(sm.span));
+        sm.blocks.push(Stmt::block(sm.span));
         return idx;
     }
 
     /// Append `this.state = <to>;` to state block `from` — a forward edge: the
     /// arm falls off and the enclosing loop re-dispatches the advanced state.
     sm_goto(mut &this, sm: PollSm*, from: i64, to: i64) -> void {
-        sm.blocks[from].add_statement(this.assign_member_stmt(
+        sm.blocks[from].as_block().add_statement(this.assign_member_stmt(
             sm.struct_ref, sm.state_sym, sm.u32_ty, this.u32_lit(to as u64, sm.span), sm.span));
     }
 
     /// Lower every statement of `blk` starting in state `cur`; return the state
     /// execution continues in after the block.
-    lower_block_sm(mut &this, sm: PollSm*, blk: BlockStmtNode*, cur: i64) -> i64 {
+    lower_block_sm(mut &this, sm: PollSm*, blk_stmt: Stmt*, cur: i64) -> i64 {
+        const blk: BlockStmt* = blk_stmt.as_block();
         mut s: i64 = cur;
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             if (!sm.ok) { return s; }
-            const st: StatementNode* = blk.statements[i];
+            const st: Stmt* = blk.statements[i];
             s = this.lower_stmt_sm(sm, st, s);
             // A `return`/`break`/`continue` transfers control off this block; a
             // following statement (unreachable source) would otherwise be emitted
@@ -2586,12 +2526,12 @@ type struct AsyncLower {
 
     /// Lower a branch body (a block, or a bare statement / else-if) starting in
     /// state `entry`; return its end state.
-    lower_branch_sm(mut &this, sm: PollSm*, branch: StatementNode*, entry: i64) -> i64 {
+    lower_branch_sm(mut &this, sm: PollSm*, branch: Stmt*, entry: i64) -> i64 {
         if (branch == null) { return entry; }
-        if (branch.kind == NodeKind::BlockStatement) {
-            return this.lower_block_sm(sm, branch as BlockStmtNode*, entry);
+        match (branch.shape) {
+            StmtKind::Block(_) => { return this.lower_block_sm(sm, branch, entry); }
+            _                  => { return this.lower_stmt_sm(sm, branch, entry); }
         }
-        return this.lower_stmt_sm(sm, branch, entry);
     }
 
     /// Lower a single statement. await-free -> emit as-is (returns wrapped in
@@ -2603,49 +2543,55 @@ type struct AsyncLower {
     /// nested: `hoist_expr` has already lifted it into a statement of its own
     /// ahead of this one. The reduction is what lets a state boundary fall
     /// between statements, which is the only place it can fall.
-    lower_stmt_sm(mut &this, sm: PollSm*, stmt: StatementNode*, cur: i64) -> i64 {
+    lower_stmt_sm(mut &this, sm: PollSm*, stmt: Stmt*, cur: i64) -> i64 {
         if (stmt == null) { return cur; }
-        const k: NodeKind = stmt.kind;
-        if (k == NodeKind::BreakStatement)    { return this.lower_break_sm(sm, cur, stmt.span); }
-        if (k == NodeKind::ContinueStatement) { return this.lower_continue_sm(sm, cur, stmt.span); }
+        match (stmt.shape) {
+            StmtKind::Break    => { return this.lower_break_sm(sm, cur, stmt.span); }
+            StmtKind::Continue => { return this.lower_continue_sm(sm, cur, stmt.span); }
+            _ => {}
+        }
         if (!this.stmt_needs_explode(stmt)) {
             this.rewrite_returns(stmt, sm.poll_out, sm.span);
-            sm.blocks[cur].add_statement(stmt);
+            sm.blocks[cur].as_block().add_statement(stmt);
             return cur;
         }
         const aw: AwaitExprNode* = this.stmt_toplevel_await(stmt);
         if (aw != null) { return this.lower_carrier_sm(sm, stmt, aw, cur); }
-        // A bare `{ … await … }` block is just a nested statement sequence: lower
-        // it into the current state chain (its locals already got their own scope
-        // frame from the pre-flattening alpha-rename).
-        if (k == NodeKind::BlockStatement)   { return this.lower_block_sm(sm, stmt as BlockStmtNode*, cur); }
-        if (k == NodeKind::IfStatement)      { return this.lower_if_sm(sm, stmt as IfStmtNode*, cur); }
-        if (k == NodeKind::WhileStatement)   { return this.lower_while_sm(sm, stmt as WhileStmtNode*, cur); }
-        if (k == NodeKind::DoWhileStatement) { return this.lower_do_while_sm(sm, stmt as DoWhileStmtNode*, cur); }
-        if (k == NodeKind::ForStatement)     { return this.lower_for_sm(sm, stmt as ForStmtNode*, cur); }
-        if (k == NodeKind::LoopStatement)    { return this.lower_loop_sm(sm, stmt as LoopStmtNode*, cur); }
-        if (k == NodeKind::MatchStatement)   { return this.lower_match_sm(sm, stmt as MatchStmtNode*, cur); }
-        // A `static match` arm is chosen by pruning the arms during
-        // monomorphization, which runs after this. Exploding an arm here would
-        // move its body out of the node into flat states, where pruning can no
-        // longer drop the arms this instantiation did not pick — so every arm's
-        // code would reach codegen, narrowed to a type it does not have.
-        if (k == NodeKind::StaticMatchStatement) {
-            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                "async: an `await` inside a `static match` arm is not supported — the arms are selected after the body is lowered, so the suspend cannot be placed; bind it to a `const` ahead of the `static match`",
-                stmt.span);
-            sm.ok = false;
-            return cur;
-        }
-        // An `unsafe` block is a scope, not a control-flow form: exploding it
-        // would spread its statements over states the scope cannot reach, so
-        // the operations it authorises would be checked as safe.
-        if (k == NodeKind::UnsafeBlockStatement) {
-            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                "async: an `await` inside an `unsafe` block is not supported — the block is split at each resume point, so the `unsafe` scope cannot span it; move the `await` ahead of the block",
-                stmt.span);
-            sm.ok = false;
-            return cur;
+        match (stmt.shape) {
+            // A bare `{ … await … }` block is just a nested statement sequence:
+            // lower it into the current state chain (its locals already got their
+            // own scope frame from the pre-flattening alpha-rename).
+            StmtKind::Block(_)   => { return this.lower_block_sm(sm, stmt, cur); }
+            StmtKind::If(n)      => { return this.lower_if_sm(sm, stmt, n, cur); }
+            StmtKind::While(n)   => { return this.lower_while_sm(sm, stmt, n, cur); }
+            StmtKind::DoWhile(n) => { return this.lower_do_while_sm(sm, stmt, n, cur); }
+            StmtKind::For(n)     => { return this.lower_for_sm(sm, stmt, n, cur); }
+            StmtKind::Loop(n)    => { return this.lower_loop_sm(sm, stmt, n, cur); }
+            StmtKind::Match(n)   => { return this.lower_match_sm(sm, stmt, n, cur); }
+            // A `static match` arm is chosen by pruning the arms during
+            // monomorphization, which runs after this. Exploding an arm here would
+            // move its body out of the node into flat states, where pruning can no
+            // longer drop the arms this instantiation did not pick — so every arm's
+            // code would reach codegen, narrowed to a type it does not have.
+            StmtKind::StaticMatch(_) => {
+                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                    "async: an `await` inside a `static match` arm is not supported — the arms are selected after the body is lowered, so the suspend cannot be placed; bind it to a `const` ahead of the `static match`",
+                    stmt.span);
+                sm.ok = false;
+                return cur;
+            }
+            // An `unsafe` block is a scope, not a control-flow form: exploding it
+            // would spread its statements over states the scope cannot reach, so
+            // the operations it authorises would be checked as safe.
+            StmtKind::UnsafeBlock(_) => {
+                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                    "async: an `await` inside an `unsafe` block is not supported — the block is split at each resume point, so the `unsafe` scope cannot span it; move the `await` ahead of the block",
+                    stmt.span);
+                sm.ok = false;
+                return cur;
+            }
+            StmtKind::Expr(_) | StmtKind::Decl(_) | StmtKind::Return(_) | StmtKind::Asm(_)
+            | StmtKind::Break | StmtKind::Continue => {}
         }
         // No `await` here means the statement was exploded for its `break`/
         // `continue` alone, and the only expression form that can hold one is a
@@ -2879,11 +2825,17 @@ type struct AsyncLower {
         // Exactly one `return`, and it must build the struct directly. A second
         // return means the constructed value depends on a path this cannot see.
         mut lit: StructLiteralNode* = null;
-        for (mut i: i64 = 0; i < fd.body.statements.length; i++) {
-            mut s: StatementNode* = fd.body.statements[i];
-            if (s == null || (s as ASTNode*).kind != NodeKind::ReturnStatement) { continue; }
+        const fd_body: BlockStmt* = fd.body.as_block();
+        for (mut i: i64 = 0; i < fd_body.statements.length; i++) {
+            const s: Stmt* = fd_body.statements[i];
+            if (s == null) { continue; }
+            const ret: ReturnStmt* = match (s.shape) {
+                StmtKind::Return(r) => { r }
+                _                   => { null }
+            };
+            if (ret == null) { continue; }
             if (lit != null) { return none; }
-            mut v: ExpressionNode* = (s as ReturnStmtNode*).expression;
+            mut v: ExpressionNode* = ret.expression;
             if (v == null || (v as ASTNode*).kind != NodeKind::StructLiteral) {
                 return none;
             }
@@ -2963,7 +2915,7 @@ type struct AsyncLower {
     /// may be a projection until the body is copied, so no field position
     /// can be found for it here, and none is needed.
     assign_recv_slot_stmt(&this, fut: ExpressionNode*, slot_ty: TypeRef,
-                          rhs: ExpressionNode*, span: SourceSpan) -> StatementNode* {
+                          rhs: ExpressionNode*, span: SourceSpan) -> Stmt* {
         mut m: MemberAccessNode* = new MemberAccessNode(fut, this.recv_sym, span, span);
         m.set_resolved_type(slot_ty);
         m.set_resolved_member(MemberPin::RecvSlot);
@@ -3032,7 +2984,7 @@ type struct AsyncLower {
             if (!recv_ptr_ty.is_valid()) { return false; }
             mut recv_val: ExpressionNode* = fresh;
             if (!via_ptr) { recv_val = this.addr_of(fresh, span); }
-            sm.blocks[resume].add_statement(this.assign_recv_slot_stmt(
+            sm.blocks[resume].as_block().add_statement(this.assign_recv_slot_stmt(
                 base, recv_ptr_ty, recv_val, span));
             return true;
         }
@@ -3089,7 +3041,7 @@ type struct AsyncLower {
     /// `return await e;`, `await e;`): stash the sub-future in `cur`, allocate a
     /// resume state that polls it (suspending on `Pending`, re-entering itself),
     /// and run the carrier there with its `await` replaced by the ready result.
-    lower_carrier_sm(mut &this, sm: PollSm*, stmt: StatementNode*, aw: AwaitExprNode*, cur: i64) -> i64 {
+    lower_carrier_sm(mut &this, sm: PollSm*, stmt: Stmt*, aw: AwaitExprNode*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
         if (aw.operand == null) {
             this.ctx.emit_error_at(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
@@ -3147,7 +3099,7 @@ type struct AsyncLower {
         sm.fut_opt.push(fut_opt);
 
         // In `cur`: build the sub-future lazily, then advance to the resume state.
-        sm.blocks[cur].add_statement(this.assign_member_stmt(sm.struct_ref, fut_sym, fut_opt,
+        sm.blocks[cur].as_block().add_statement(this.assign_member_stmt(sm.struct_ref, fut_sym, fut_opt,
             this.option_some(aw.operand, fut_opt, span), span));
         const resume: i64 = this.sm_alloc(sm);
         this.sm_goto(sm, cur, resume);
@@ -3169,7 +3121,7 @@ type struct AsyncLower {
         mut subp_call: ExpressionNode* = this.method_call0(
             this.own_field(sm.struct_ref, fut_sym, fut_opt, span),
             LangItem::OptionUnwrapPtr, fi_ptr, span);
-        sm.blocks[resume].add_statement(
+        sm.blocks[resume].as_block().add_statement(
             this.var_decl_stmt_bound(subp_sym, subp_id, true, fi_ptr, subp_call, span));
 
         // The sub-future recorded the ADDRESS of its receiver when it was built.
@@ -3199,19 +3151,19 @@ type struct AsyncLower {
         mut poll_call: ExpressionNode* = this.method_call1(
             this.ident_bound(subp_sym, subp_id, fi_ptr, span), LangItem::FuturePoll,
             this.ident_bound(sm.cx_sym, this.poll_cx, sm.ctx_ptr_ty, span), sub_poll_out, span);
-        sm.blocks[resume].add_statement(
+        sm.blocks[resume].as_block().add_statement(
             this.var_decl_stmt_bound(poll_sym, poll_id, true, sub_poll_out, poll_call, span));
 
         // Suspending leaves the sub-future in its field untouched, so both the
         // state it accumulated and its address survive to the next poll.
-        mut pend: BlockStmtNode* = new BlockStmtNode(span);
-        pend.add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
+        mut pend: Stmt* = Stmt::block(span);
+        pend.as_block().add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
             this.u32_lit(resume as u64, span), span));
-        pend.add_statement(new ReturnStmtNode(this.poll_pending(sm.poll_out, span), span) as StatementNode*);
-        sm.blocks[resume].add_statement(new IfStmtNode(
+        pend.as_block().add_statement(Stmt::return_stmt(this.poll_pending(sm.poll_out, span), span));
+        sm.blocks[resume].as_block().add_statement(Stmt::if_stmt(
             this.method_call0(this.ident_bound(poll_sym, poll_id, sub_poll_out, span),
                               LangItem::PollIsPending, this.arena.get_bool(), span),
-            pend as StatementNode*, null, span) as StatementNode*);
+            pend, null, span));
 
         // A completed sub-future is moved out of its field so its destructor runs
         // with this state rather than with the whole state machine — which is
@@ -3222,24 +3174,24 @@ type struct AsyncLower {
         mut done_take: ExpressionNode* = this.method_call0(
             this.own_field(sm.struct_ref, fut_sym, fut_opt, span),
             LangItem::OptionTake, fut_opt, span);
-        sm.blocks[resume].add_statement(this.var_decl_stmt(done_sym, true, fut_opt, done_take, span));
+        sm.blocks[resume].as_block().add_statement(this.var_decl_stmt(done_sym, true, fut_opt, done_take, span));
 
         const await_sym: SymbolStr = this.intern.intern(fmt::format("__await_%lld", k));
         const await_id:  SymbolID  = this.resolver.alloc_synthetic_binding();
-        sm.blocks[resume].add_statement(this.var_decl_stmt_bound(await_sym, await_id, false, ao,
+        sm.blocks[resume].as_block().add_statement(this.var_decl_stmt_bound(await_sym, await_id, false, ao,
             this.method_call0(this.ident_bound(poll_sym, poll_id, sub_poll_out, span),
                               LangItem::PollIntoReady, ao, span), span));
 
         this.rewrite_carrier_await(stmt, this.ident_bound(await_sym, await_id, ao, span));
         this.rewrite_returns(stmt, sm.poll_out, span);
-        sm.blocks[resume].add_statement(stmt);
+        sm.blocks[resume].as_block().add_statement(stmt);
         return resume;
     }
 
     /// Lower an `if`/`else` whose branches contain `await`s: the condition (in
     /// `cur`) dispatches to a per-branch entry state; each branch runs as its own
     /// state sequence and, unless it returns, converges on a shared join state.
-    lower_if_sm(mut &this, sm: PollSm*, iff: IfStmtNode*, cur: i64) -> i64 {
+    lower_if_sm(mut &this, sm: PollSm*, stmt: Stmt*, iff: IfStmt*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
         // The condition is evaluated once, before either branch, so a suspend in
         // it runs as its own states ahead of the dispatch.
@@ -3254,15 +3206,15 @@ type struct AsyncLower {
         // In `at`: evaluate the condition and set the taken branch's entry state
         // (or the join directly when there is no else), then fall off to
         // re-dispatch. Both arms assign, so `at` always advances.
-        mut then_set: BlockStmtNode* = new BlockStmtNode(span);
-        then_set.add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
+        mut then_set: Stmt* = Stmt::block(span);
+        then_set.as_block().add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
             this.u32_lit(then_entry as u64, span), span));
         const else_target: i64 = if (else_entry >= 0) { else_entry } else { join };
-        mut else_set: BlockStmtNode* = new BlockStmtNode(span);
-        else_set.add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
+        mut else_set: Stmt* = Stmt::block(span);
+        else_set.as_block().add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
             this.u32_lit(else_target as u64, span), span));
-        sm.blocks[at].add_statement(new IfStmtNode(hc.expr,
-            then_set as StatementNode*, else_set as StatementNode*, span) as StatementNode*);
+        sm.blocks[at].as_block().add_statement(Stmt::if_stmt(hc.expr,
+            then_set, else_set, span));
 
         // Whether a branch converges on the join is a property of the SOURCE
         // branch (does it end in a `return`/`break`/`continue`?), not of the
@@ -3293,10 +3245,10 @@ type struct AsyncLower {
     /// (`lower_match_chain_sm`). The two produce the same behaviour; the dispatch
     /// is kept for every other match because it costs one state rather than one
     /// per arm.
-    lower_match_sm(mut &this, sm: PollSm*, m: MatchStmtNode*, cur: i64) -> i64 {
+    lower_match_sm(mut &this, sm: PollSm*, stmt: Stmt*, m: MatchStmt*, cur: i64) -> i64 {
         for (mut gi: i64 = 0; gi < m.arms.length; gi++) {
             if (m.arms[gi] != null && this.expr_await_count(m.arms[gi].guard) > 0) {
-                return this.lower_match_chain_sm(sm, m, cur);
+                return this.lower_match_chain_sm(sm, stmt, m, cur);
             }
         }
 
@@ -3310,18 +3262,18 @@ type struct AsyncLower {
         const exhaustive: boolean = this.patterns.match_is_exhaustive(hs.expr, m.arms);
 
         const join: i64 = this.sm_alloc(sm);
-        mut dispatch: MatchStmtNode* = new MatchStmtNode(hs.expr, span);
+        const dispatch: MatchStmt* = MatchStmt::new(hs.expr);
         for (mut ai: i64 = 0; ai < m.arms.length; ai++) {
             const arm: MatchArmNode* = m.arms[ai];
             if (arm == null) { continue; }
 
-            mut cap: BlockStmtNode* = new BlockStmtNode(span);
+            mut cap: Stmt* = Stmt::block(span);
             if (!this.stmt_needs_explode(arm.body)) {
                 // No suspend and no edge into an enclosing exploded loop: run the
                 // arm body (bindings intact) directly in the dispatch arm, then
                 // converge on the join unless the body itself diverges.
                 this.rewrite_returns(arm.body, sm.poll_out, span);
-                cap.add_statement(arm.body);
+                cap.as_block().add_statement(arm.body);
                 if (!this.stmt_diverges(arm.body)) { this.append_goto(cap, sm, join, span); }
             } else {
                 const entry: i64 = this.sm_alloc(sm);
@@ -3338,7 +3290,7 @@ type struct AsyncLower {
                 darm.add_pattern(arm.patterns[pi]);
             }
             if (arm.guard != null) { darm.set_guard(arm.guard); }
-            darm.set_body(cap as StatementNode*);
+            darm.set_body(cap);
             dispatch.add_arm(darm);
         }
         if (!sm.ok) { return cur; }
@@ -3348,12 +3300,12 @@ type struct AsyncLower {
         // the join, or a non-matching subject would fall off the arm and respin
         // the (unchanged) dispatch state forever.
         if (!exhaustive) {
-            mut wblk: BlockStmtNode* = new BlockStmtNode(span);
+            mut wblk: Stmt* = Stmt::block(span);
             this.append_goto(wblk, sm, join, span);
             dispatch.add_arm(this.match_arm_wild(wblk, span));
         }
 
-        sm.blocks[at].add_statement(dispatch as StatementNode*);
+        sm.blocks[at].as_block().add_statement(new Stmt(StmtKind::Match(dispatch), span));
         return join;
     }
 
@@ -3373,7 +3325,7 @@ type struct AsyncLower {
     /// in scope and would break if they were rewritten to fields the arm has not
     /// stored yet.
     capture_arm_bindings(mut &this, sm: PollSm*, arm: MatchArmNode*, subject_type: TypeRef,
-                         entry: i64, cap: BlockStmtNode*, rewrite_guard: boolean,
+                         entry: i64, cap: Stmt*, rewrite_guard: boolean,
                          no_move_out: boolean) -> void {
         const span: SourceSpan = sm.span;
         mut bs: BindingCapture = BindingCapture { syms: [], names: [], tys: [] };
@@ -3445,7 +3397,7 @@ type struct AsyncLower {
                 this.subst_local_sym = blocal.sym;
                 this.subst_name_stmt(arm.body, bkey, blocal.name, sm.struct_ref, bt, span);
                 this.subst_mode = this.subst_to_field();
-                cap.add_statement(this.agg_store_stmt(sm, afield, bopt_ty, bname, bkey, bt, span));
+                cap.as_block().add_statement(this.agg_store_stmt(sm, afield, bopt_ty, bname, bkey, bt, span));
                 this.prepend_agg_take(sm.blocks[entry], blocal.name, blocal.sym, SymbolID::invalid(),
                                       afield, bt, bopt_ty, sm.struct_ref, false, span);
                 sm.prom_field.push(afield);
@@ -3461,7 +3413,7 @@ type struct AsyncLower {
                 arm.guard = this.subst_name_expr(arm.guard, bkey, field,
                                                  sm.struct_ref, bt, span, false);
             }
-            cap.add_statement(this.assign_member_stmt(
+            cap.as_block().add_statement(this.assign_member_stmt(
                 sm.struct_ref, field, bt, this.ident_bound(bname, bkey, bt, span), span));
             sm.prom_field.push(field);
             sm.prom_tys.push(bt);
@@ -3503,7 +3455,7 @@ type struct AsyncLower {
     /// is why an arm binding an aggregate payload is rejected below: a scalar
     /// binding copies out and leaves the subject whole, an owning one does not,
     /// and a later test would then match a moved-from value.
-    lower_match_chain_sm(mut &this, sm: PollSm*, m: MatchStmtNode*, cur: i64) -> i64 {
+    lower_match_chain_sm(mut &this, sm: PollSm*, stmt: Stmt*, m: MatchStmt*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
         const hs: HoistedExpr = this.lower_hoisted(sm, m.subject, cur);
         if (!sm.ok) { return cur; }
@@ -3531,7 +3483,7 @@ type struct AsyncLower {
         const subj_field: SymbolStr = this.mint_temp("__msubj").name;
         mut subj_opt_ty: TypeRef = TypeRef::invalid();
         if (subj_scalar) {
-            sm.blocks[at].add_statement(this.assign_member_stmt(
+            sm.blocks[at].as_block().add_statement(this.assign_member_stmt(
                 sm.struct_ref, subj_field, subject_type, hs.expr, span));
             sm.prom_field.push(subj_field);
             sm.prom_tys.push(subject_type);
@@ -3546,9 +3498,9 @@ type struct AsyncLower {
                 sm.ok = false; return cur;
             }
             const seed: MintedLocal = this.mint_temp("match$subj");
-            sm.blocks[at].add_statement(
+            sm.blocks[at].as_block().add_statement(
                 this.var_decl_stmt_bound(seed.name, seed.sym, false, subject_type, hs.expr, span));
-            sm.blocks[at].add_statement(
+            sm.blocks[at].as_block().add_statement(
                 this.agg_store_stmt(sm, subj_field, subj_opt_ty, seed.name, seed.sym,
                                     subject_type, span));
             sm.prom_field.push(subj_field);
@@ -3583,12 +3535,12 @@ type struct AsyncLower {
             const next: i64 = nexts[ai];
             const guard_suspends: boolean = this.expr_await_count(arm.guard) > 0;
 
-            mut cap: BlockStmtNode* = new BlockStmtNode(span);
+            mut cap: Stmt* = Stmt::block(span);
             if (!guard_suspends && !this.stmt_needs_explode(arm.body)) {
                 // Neither the guard nor the body needs a state: the arm runs
                 // whole inside its own test, exactly as in the dispatch form.
                 this.rewrite_returns(arm.body, sm.poll_out, span);
-                cap.add_statement(arm.body);
+                cap.as_block().add_statement(arm.body);
                 if (!this.stmt_diverges(arm.body)) { this.append_goto(cap, sm, join, span); }
             } else {
                 const entry: i64 = this.sm_alloc(sm);
@@ -3629,7 +3581,7 @@ type struct AsyncLower {
                                       subject_type, subj_opt_ty, sm.struct_ref, false, span);
                 subj_read = this.ident_bound(subj_local.name, subj_local.sym, subject_type, span);
             }
-            mut test: MatchStmtNode* = new MatchStmtNode(subj_read, span);
+            const test: MatchStmt* = MatchStmt::new(subj_read);
             mut darm: MatchArmNode* = new MatchArmNode(span);
             for (mut pi: i64 = 0; pi < arm.patterns.length; pi++) {
                 darm.add_pattern(arm.patterns[pi]);
@@ -3639,7 +3591,7 @@ type struct AsyncLower {
             // subject to the next test, which is the same fall-through the source
             // `match` would have done.
             if (!guard_suspends && arm.guard != null) { darm.set_guard(arm.guard); }
-            darm.set_body(cap as StatementNode*);
+            darm.set_body(cap);
             test.add_arm(darm);
 
             // The fall-through to the next test, but ONLY when this arm can fail
@@ -3649,19 +3601,19 @@ type struct AsyncLower {
             // reaches `next` in that shape.
             mut one: [MatchArmNode*] = [darm];
             if (!this.patterns.match_is_exhaustive(subj_read, one)) {
-                mut miss: BlockStmtNode* = new BlockStmtNode(span);
+                mut miss: Stmt* = Stmt::block(span);
                 this.append_goto(miss, sm, next, span);
                 test.add_arm(this.match_arm_wild(miss, span));
             }
 
-            sm.blocks[tests[ai]].add_statement(test as StatementNode*);
+            sm.blocks[tests[ai]].as_block().add_statement(new Stmt(StmtKind::Match(test), span));
             // Hand the subject back for the next test. No test moves out of it
             // (an aggregate binding is rejected in chain mode), so the value put
             // back is the whole one that was taken. On a path that left the
             // future entirely — an inline arm body that returns — this never
             // runs, which is correct: nothing will look for it again.
             if (!subj_scalar) {
-                sm.blocks[tests[ai]].add_statement(
+                sm.blocks[tests[ai]].as_block().add_statement(
                     this.agg_store_stmt(sm, subj_field, subj_opt_ty, subj_local.name,
                                         subj_local.sym, subject_type, span));
             }
@@ -3678,8 +3630,8 @@ type struct AsyncLower {
     /// Append `this.state = <to>;` to an arbitrary block (not a state-indexed
     /// block, so `sm_goto` does not apply) — the transition that ends a dispatch
     /// arm before the enclosing loop re-dispatches.
-    append_goto(mut &this, blk: BlockStmtNode*, sm: PollSm*, to: i64, span: SourceSpan) -> void {
-        blk.add_statement(this.assign_member_stmt(
+    append_goto(mut &this, blk: Stmt*, sm: PollSm*, to: i64, span: SourceSpan) -> void {
+        blk.as_block().add_statement(this.assign_member_stmt(
             sm.struct_ref, sm.state_sym, sm.u32_ty, this.u32_lit(to as u64, span), span));
     }
 
@@ -3723,14 +3675,14 @@ type struct AsyncLower {
     /// enclosing loop re-dispatches the chosen state.
     emit_cond_dispatch(mut &this, sm: PollSm*, from: i64, cond: ExpressionNode*,
                        t: i64, f: i64, span: SourceSpan) -> void {
-        mut then_set: BlockStmtNode* = new BlockStmtNode(span);
-        then_set.add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
+        mut then_set: Stmt* = Stmt::block(span);
+        then_set.as_block().add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
             this.u32_lit(t as u64, span), span));
-        mut else_set: BlockStmtNode* = new BlockStmtNode(span);
-        else_set.add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
+        mut else_set: Stmt* = Stmt::block(span);
+        else_set.as_block().add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
             this.u32_lit(f as u64, span), span));
-        sm.blocks[from].add_statement(new IfStmtNode(cond,
-            then_set as StatementNode*, else_set as StatementNode*, span) as StatementNode*);
+        sm.blocks[from].as_block().add_statement(Stmt::if_stmt(cond,
+            then_set, else_set, span));
     }
 
     /// `break` -> jump to the innermost exploded loop's after state; `continue`
@@ -3761,7 +3713,7 @@ type struct AsyncLower {
     /// (an infinite loop; `break` exits to the after state, `continue` re-enters
     /// the body). A suspend inside the body splits it into further states; the
     /// back-edge re-dispatches the body from the top each iteration.
-    lower_loop_sm(mut &this, sm: PollSm*, lp: LoopStmtNode*, cur: i64) -> i64 {
+    lower_loop_sm(mut &this, sm: PollSm*, stmt: Stmt*, lp: LoopStmt*, cur: i64) -> i64 {
         const body_entry: i64 = this.sm_alloc(sm);
         const after: i64 = this.sm_alloc(sm);
         this.sm_goto(sm, cur, body_entry);
@@ -3779,7 +3731,7 @@ type struct AsyncLower {
     /// the body entry or the after state), a body sequence, and a back-edge from
     /// the body tail to the header. `continue` re-tests at the header; `break`
     /// exits to after.
-    lower_while_sm(mut &this, sm: PollSm*, w: WhileStmtNode*, cur: i64) -> i64 {
+    lower_while_sm(mut &this, sm: PollSm*, stmt: Stmt*, w: WhileStmt*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
         const header: i64 = this.sm_alloc(sm);
         const body_entry: i64 = this.sm_alloc(sm);
@@ -3801,7 +3753,7 @@ type struct AsyncLower {
     /// `do { body } while (cond)` -> a body-entry state (run unconditionally
     /// first), a tail-test state, and the after state. `continue` jumps to the
     /// tail test; `break` exits to after.
-    lower_do_while_sm(mut &this, sm: PollSm*, d: DoWhileStmtNode*, cur: i64) -> i64 {
+    lower_do_while_sm(mut &this, sm: PollSm*, stmt: Stmt*, d: DoWhileStmt*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
         const body_entry: i64 = this.sm_alloc(sm);
         const cond_state: i64 = this.sm_alloc(sm);
@@ -3824,16 +3776,16 @@ type struct AsyncLower {
     /// state, then a header (test `cond`), a body sequence, an update state, and
     /// the after state. `continue` jumps to the update; `break` exits to after.
     /// A null `cond` means "always enter the body" (an infinite `for (;;)`).
-    lower_for_sm(mut &this, sm: PollSm*, f: ForStmtNode*, cur: i64) -> i64 {
+    lower_for_sm(mut &this, sm: PollSm*, stmt: Stmt*, f: ForStmt*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
         mut s0: i64 = cur;
         if (f.init != null) {
             if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                mut ds: DeclStmtNode* = new DeclStmtNode(f.init as DeclarationNode*, span);
-                s0 = this.lower_stmt_sm(sm, ds as StatementNode*, s0);
+                const ds: Stmt* = Stmt::decl_stmt(f.init as DeclarationNode*, span);
+                s0 = this.lower_stmt_sm(sm, ds, s0);
             } else {
-                mut es: ExprStmtNode* = new ExprStmtNode(f.init as ExpressionNode*, span);
-                s0 = this.lower_stmt_sm(sm, es as StatementNode*, s0);
+                const es: Stmt* = Stmt::expr_stmt(f.init as ExpressionNode*, span);
+                s0 = this.lower_stmt_sm(sm, es, s0);
             }
             if (!sm.ok) { return cur; }
         }
@@ -3862,7 +3814,7 @@ type struct AsyncLower {
             if (!sm.ok) { return cur; }
             update_end = hu.end;
             if (hu.expr != null) {
-                sm.blocks[update_end].add_statement(new ExprStmtNode(hu.expr, span) as StatementNode*);
+                sm.blocks[update_end].as_block().add_statement(Stmt::expr_stmt(hu.expr, span));
             }
         }
         this.sm_goto(sm, update_end, header);
@@ -3896,50 +3848,45 @@ type struct AsyncLower {
     /// of a block) would be unreachable and must be suppressed. Structural over
     /// `return` / `break` / `continue` (all transfer control elsewhere), a
     /// block-tail, a both-arm `if`, and an infinite `loop` (no `break`).
-    stmt_diverges(&this, stmt: StatementNode*) -> boolean {
+    stmt_diverges(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        const k: NodeKind = stmt.kind;
-        if (k == NodeKind::ReturnStatement) { return true; }
-        if (k == NodeKind::BreakStatement || k == NodeKind::ContinueStatement) { return true; }
-        if (k == NodeKind::ExpressionStatement) {
-            return this.expr_diverges((stmt as ExprStmtNode*).expression);
-        }
-        if (k == NodeKind::DeclarationStatement) {
-            return this.expr_diverges(this.decl_stmt_init(stmt as DeclStmtNode*));
-        }
-        if (k == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = stmt as BlockStmtNode*;
-            if (blk.statements.length == 0) { return false; }
-            return this.stmt_diverges(blk.statements[blk.statements.length - 1]);
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = stmt as IfStmtNode*;
-            if (iff.else_stmt == null) { return false; }
-            return this.stmt_diverges(iff.then_stmt) && this.stmt_diverges(iff.else_stmt);
-        }
-        if (k == NodeKind::LoopStatement) {
-            // A `loop {}` exits only via a `break` targeting it; with none, it is
-            // an infinite loop and control never reaches the following statement.
-            return !this.has_free_break((stmt as LoopStmtNode*).body);
-        }
-        if (k == NodeKind::MatchStatement) {
-            // A `match` never falls through only if it is exhaustive (some subject
-            // always matches an arm) AND every arm body itself diverges. A
-            // guarded or partial arm leaves a fall-through path, which
-            // `match_is_exhaustive` accounts for.
-            const m: MatchStmtNode* = stmt as MatchStmtNode*;
-            if (m.arms.length == 0) { return false; }
-            if (!this.patterns.match_is_exhaustive(m.subject, m.arms)) { return false; }
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                if (m.arms[i] == null || !this.stmt_diverges(m.arms[i].body)) { return false; }
+        match (stmt.shape) {
+            StmtKind::Return(_) => { return true; }
+            StmtKind::Break | StmtKind::Continue => { return true; }
+            StmtKind::Expr(e) => { return this.expr_diverges(e.expression); }
+            StmtKind::Decl(d) => { return this.expr_diverges(this.decl_stmt_init(d)); }
+            StmtKind::Block(_) => { return this.block_diverges(stmt); }
+            StmtKind::If(iff) => {
+                if (iff.else_stmt == null) { return false; }
+                return this.stmt_diverges(iff.then_stmt) && this.stmt_diverges(iff.else_stmt);
             }
-            return true;
+            StmtKind::Loop(l) => {
+                // A `loop {}` exits only via a `break` targeting it; with none, it is
+                // an infinite loop and control never reaches the following statement.
+                return !this.has_free_break(l.body);
+            }
+            StmtKind::Match(m) => {
+                // A `match` never falls through only if it is exhaustive (some subject
+                // always matches an arm) AND every arm body itself diverges. A
+                // guarded or partial arm leaves a fall-through path, which
+                // `match_is_exhaustive` accounts for.
+                if (m.arms.length == 0) { return false; }
+                if (!this.patterns.match_is_exhaustive(m.subject, m.arms)) { return false; }
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] == null || !this.stmt_diverges(m.arms[i].body)) { return false; }
+                }
+                return true;
+            }
+            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
+            | StmtKind::While(_) | StmtKind::DoWhile(_) | StmtKind::For(_) => { return false; }
         }
-        return false;
     }
 
-    block_diverges(&this, blk: BlockStmtNode*) -> boolean {
-        if (blk == null || blk.statements.length == 0) { return false; }
+    /// A block diverges when its last statement does.
+    block_diverges(&this, blk_stmt: Stmt*) -> boolean {
+        if (blk_stmt == null) { return false; }
+        const blk: BlockStmt* = blk_stmt.as_block();
+        if (blk.statements.length == 0) { return false; }
         return this.stmt_diverges(blk.statements[blk.statements.length - 1]);
     }
 
@@ -3951,30 +3898,28 @@ type struct AsyncLower {
     /// this same block — a loop carrying no suspension point is not split into
     /// states — so a value given away just before one of them DOES reach the
     /// tail and must not be handed back. Only `return` leaves the block.
-    stmt_returns(&this, stmt: StatementNode*) -> boolean {
+    stmt_returns(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        const k: NodeKind = stmt.kind;
-        if (k == NodeKind::ReturnStatement) { return true; }
-        if (k == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = stmt as BlockStmtNode*;
-            if (blk.statements.length == 0) { return false; }
-            return this.stmt_returns(blk.statements[blk.statements.length - 1]);
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = stmt as IfStmtNode*;
-            if (iff.else_stmt == null) { return false; }
-            return this.stmt_returns(iff.then_stmt) && this.stmt_returns(iff.else_stmt);
-        }
-        if (k == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = stmt as MatchStmtNode*;
-            if (m.arms.length == 0) { return false; }
-            if (!this.patterns.match_is_exhaustive(m.subject, m.arms)) { return false; }
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                if (m.arms[i] == null || !this.stmt_returns(m.arms[i].body)) { return false; }
+        match (stmt.shape) {
+            StmtKind::Return(_) => { return true; }
+            StmtKind::Block(blk) => {
+                if (blk.statements.length == 0) { return false; }
+                return this.stmt_returns(blk.statements[blk.statements.length - 1]);
             }
-            return true;
+            StmtKind::If(iff) => {
+                if (iff.else_stmt == null) { return false; }
+                return this.stmt_returns(iff.then_stmt) && this.stmt_returns(iff.else_stmt);
+            }
+            StmtKind::Match(m) => {
+                if (m.arms.length == 0) { return false; }
+                if (!this.patterns.match_is_exhaustive(m.subject, m.arms)) { return false; }
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] == null || !this.stmt_returns(m.arms[i].body)) { return false; }
+                }
+                return true;
+            }
+            _ => { return false; }
         }
-        return false;
     }
 
     /// An expression yields control to the next statement unless it is a `match`
@@ -4001,43 +3946,42 @@ type struct AsyncLower {
     /// states (its edge cannot stay a native `break`, which would break the
     /// dispatch `loop`/`match`), and — restricted to `break` — whether a `loop {}`
     /// is infinite. Does NOT descend into nested loops (they capture their own).
-    has_free_edge(&this, stmt: StatementNode*, break_only: boolean) -> boolean {
+    has_free_edge(&this, stmt: Stmt*, break_only: boolean) -> boolean {
         if (stmt == null) { return false; }
-        const k: NodeKind = stmt.kind;
-        if (k == NodeKind::BreakStatement) { return true; }
-        if (k == NodeKind::ContinueStatement) { return !break_only; }
-        if (k == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = stmt as BlockStmtNode*;
-            for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                if (this.has_free_edge(blk.statements[i], break_only)) { return true; }
+        match (stmt.shape) {
+            StmtKind::Break    => { return true; }
+            StmtKind::Continue => { return !break_only; }
+            StmtKind::Block(blk) => {
+                for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                    if (this.has_free_edge(blk.statements[i], break_only)) { return true; }
+                }
+                return false;
             }
-            return false;
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = stmt as IfStmtNode*;
-            return this.expr_has_free_edge(iff.condition, break_only)
-                || this.has_free_edge(iff.then_stmt, break_only)
-                || this.has_free_edge(iff.else_stmt, break_only);
-        }
-        if (k == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = stmt as MatchStmtNode*;
-            if (this.expr_has_free_edge(m.subject, break_only)) { return true; }
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                if (m.arms[i] != null && this.has_free_edge(m.arms[i].body, break_only)) { return true; }
+            StmtKind::If(iff) => {
+                return this.expr_has_free_edge(iff.condition, break_only)
+                    || this.has_free_edge(iff.then_stmt, break_only)
+                    || this.has_free_edge(iff.else_stmt, break_only);
             }
-            return false;
+            StmtKind::Match(m) => {
+                if (this.expr_has_free_edge(m.subject, break_only)) { return true; }
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] != null && this.has_free_edge(m.arms[i].body, break_only)) { return true; }
+                }
+                return false;
+            }
+            StmtKind::Expr(e) => { return this.expr_has_free_edge(e.expression, break_only); }
+            StmtKind::Return(r) => { return this.expr_has_free_edge(r.expression, break_only); }
+            StmtKind::Decl(d) => {
+                return this.expr_has_free_edge(this.decl_stmt_init(d), break_only);
+            }
+            // While/For/Loop/DoWhile capture their own break/continue — not free
+            // here.  An edge inside `unsafe { }` or a `static match` arm is not
+            // looked for.
+            StmtKind::While(_) | StmtKind::For(_) | StmtKind::Loop(_) | StmtKind::DoWhile(_)
+            | StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_) => {
+                return false;
+            }
         }
-        if (k == NodeKind::ExpressionStatement) {
-            return this.expr_has_free_edge((stmt as ExprStmtNode*).expression, break_only);
-        }
-        if (k == NodeKind::ReturnStatement) {
-            return this.expr_has_free_edge((stmt as ReturnStmtNode*).expression, break_only);
-        }
-        if (k == NodeKind::DeclarationStatement) {
-            return this.expr_has_free_edge(this.decl_stmt_init(stmt as DeclStmtNode*), break_only);
-        }
-        // While/For/Loop/DoWhile capture their own break/continue — not free here.
-        return false;
     }
 
     /// Expression half of `has_free_edge`: a `match` used as an expression holds
@@ -4110,27 +4054,27 @@ type struct AsyncLower {
         return false;
     }
 
-    has_free_break(&this, stmt: StatementNode*) -> boolean {
+    has_free_break(&this, stmt: Stmt*) -> boolean {
         return this.has_free_edge(stmt, true);
     }
 
-    has_free_break_continue(&this, stmt: StatementNode*) -> boolean {
+    has_free_break_continue(&this, stmt: Stmt*) -> boolean {
         return this.has_free_edge(stmt, false);
     }
 
     /// A statement must be lowered into states (rather than emitted wholesale into
     /// the current state) if it contains an `await` OR a `break`/`continue` that
     /// targets an enclosing exploded loop.
-    stmt_needs_explode(&this, stmt: StatementNode*) -> boolean {
+    stmt_needs_explode(&this, stmt: Stmt*) -> boolean {
         return this.stmt_await_count(stmt) > 0 || this.has_free_break_continue(stmt);
     }
 
     // ---- cross-state local promotion (build-then-scan) ----
 
     /// True if `name` is read in any top-level statement of `blk`.
-    block_reads_name(&this, blk: BlockStmtNode*, key: SymbolID) -> boolean {
-        for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            if (this.name_read_in_stmt(blk.statements[i], key)) { return true; }
+    block_reads_name(&this, blk: Stmt*, key: SymbolID) -> boolean {
+        for (mut i: i64 = 0; i < blk.as_block().statements.length; i++) {
+            if (this.name_read_in_stmt(blk.as_block().statements[i], key)) { return true; }
         }
         return false;
     }
@@ -4145,7 +4089,8 @@ type struct AsyncLower {
     first_use_write(&this) -> i64 { return 2; }
 
     /// How `blk` first touches `name`, scanning in execution order.
-    block_first_use(&this, blk: BlockStmtNode*, key: SymbolID) -> i64 {
+    block_first_use(&this, blk_stmt: Stmt*, key: SymbolID) -> i64 {
+        const blk: BlockStmt* = blk_stmt.as_block();
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             const r: i64 = this.stmt_first_use(blk.statements[i], key);
             if (r != 0) { return r; }
@@ -4153,76 +4098,69 @@ type struct AsyncLower {
         return 0;
     }
 
-    stmt_first_use(&this, s: StatementNode*, key: SymbolID) -> i64 {
+    stmt_first_use(&this, s: Stmt*, key: SymbolID) -> i64 {
         if (s == null) { return 0; }
-        const k: NodeKind = s.kind;
-        if (k == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = s as DeclStmtNode*;
-            // The initializer runs before the binding exists, so a use of it
-            // there is a read.
-            const r: i64 = this.expr_first_use(this.decl_stmt_init(ds), key);
-            if (r != 0) { return r; }
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                if (this.decl_key(ds.declaration as VarDeclNode*).equals(key)) { return 2; }
+        match (s.shape) {
+            StmtKind::Decl(ds) => {
+                // The initializer runs before the binding exists, so a use of it
+                // there is a read.
+                const r: i64 = this.expr_first_use(this.decl_stmt_init(ds), key);
+                if (r != 0) { return r; }
+                if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                    if (this.decl_key(ds.declaration as VarDeclNode*).equals(key)) { return 2; }
+                }
+                return 0;
             }
-            return 0;
-        }
-        if (k == NodeKind::ExpressionStatement) {
-            return this.expr_first_use((s as ExprStmtNode*).expression, key);
-        }
-        if (k == NodeKind::ReturnStatement) {
-            return this.expr_first_use((s as ReturnStmtNode*).expression, key);
-        }
-        if (k == NodeKind::BlockStatement) {
-            return this.block_first_use(s as BlockStmtNode*, key);
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = s as IfStmtNode*;
-            mut r: i64 = this.expr_first_use(iff.condition, key);
-            if (r != 0) { return r; }
-            r = this.stmt_first_use(iff.then_stmt, key);
-            if (r != 0) { return r; }
-            return this.stmt_first_use(iff.else_stmt, key);
-        }
-        if (k == NodeKind::WhileStatement) {
-            const w: WhileStmtNode* = s as WhileStmtNode*;
-            const r: i64 = this.expr_first_use(w.condition, key);
-            if (r != 0) { return r; }
-            return this.stmt_first_use(w.body, key);
-        }
-        if (k == NodeKind::DoWhileStatement) {
-            const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            const r: i64 = this.stmt_first_use(d.body, key);
-            if (r != 0) { return r; }
-            return this.expr_first_use(d.condition, key);
-        }
-        if (k == NodeKind::ForStatement) {
-            const f: ForStmtNode* = s as ForStmtNode*;
-            mut r: i64 = 0;
-            if (f.init != null) { r = this.stmt_first_use(f.init as StatementNode*, key); }
-            if (r != 0) { return r; }
-            r = this.expr_first_use(f.condition, key);
-            if (r != 0) { return r; }
-            r = this.stmt_first_use(f.body, key);
-            if (r != 0) { return r; }
-            return this.expr_first_use(f.update, key);
-        }
-        if (k == NodeKind::LoopStatement) {
-            return this.stmt_first_use((s as LoopStmtNode*).body, key);
-        }
-        if (k == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = s as MatchStmtNode*;
-            const r: i64 = this.expr_first_use(m.subject, key);
-            if (r != 0) { return r; }
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                const a: i64 = this.stmt_first_use(m.arms[i].body, key);
-                if (a != 0) { return a; }
+            StmtKind::Expr(e)   => { return this.expr_first_use(e.expression, key); }
+            StmtKind::Return(r) => { return this.expr_first_use(r.expression, key); }
+            StmtKind::Block(_)  => { return this.block_first_use(s, key); }
+            StmtKind::If(iff) => {
+                mut r: i64 = this.expr_first_use(iff.condition, key);
+                if (r != 0) { return r; }
+                r = this.stmt_first_use(iff.then_stmt, key);
+                if (r != 0) { return r; }
+                return this.stmt_first_use(iff.else_stmt, key);
             }
-            return 0;
+            StmtKind::While(w) => {
+                const r: i64 = this.expr_first_use(w.condition, key);
+                if (r != 0) { return r; }
+                return this.stmt_first_use(w.body, key);
+            }
+            StmtKind::DoWhile(d) => {
+                const r: i64 = this.stmt_first_use(d.body, key);
+                if (r != 0) { return r; }
+                return this.expr_first_use(d.condition, key);
+            }
+            StmtKind::For(f) => {
+                // A declaration or expression initializer is not scanned.
+                mut r: i64 = 0;
+                if (f.init != null && f.init.kind == NodeKind::Statement) {
+                    r = this.stmt_first_use(f.init as Stmt*, key);
+                }
+                if (r != 0) { return r; }
+                r = this.expr_first_use(f.condition, key);
+                if (r != 0) { return r; }
+                r = this.stmt_first_use(f.body, key);
+                if (r != 0) { return r; }
+                return this.expr_first_use(f.update, key);
+            }
+            StmtKind::Loop(l) => { return this.stmt_first_use(l.body, key); }
+            StmtKind::Match(m) => {
+                const r: i64 = this.expr_first_use(m.subject, key);
+                if (r != 0) { return r; }
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    const a: i64 = this.stmt_first_use(m.arms[i].body, key);
+                    if (a != 0) { return a; }
+                }
+                return 0;
+            }
+            // Anything else can only mention the name by reading it.
+            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
+            | StmtKind::Break | StmtKind::Continue => {
+                if (this.name_read_in_stmt(s, key)) { return 1; }
+                return 0;
+            }
         }
-        // Anything else can only mention the name by reading it.
-        if (this.name_read_in_stmt(s, key)) { return 1; }
-        return 0;
     }
 
     expr_first_use(&this, e: ExpressionNode*, key: SymbolID) -> i64 {
@@ -4288,9 +4226,9 @@ type struct AsyncLower {
     /// looks perfectly reachable. Suspends are handled separately by
     /// `store_before_suspends`, which stores BEFORE the `return Poll::Pending`,
     /// so skipping the trailing store loses nothing on that path.
-    needs_handback(&this, blk: BlockStmtNode*, key: SymbolID, lty: TypeRef) -> boolean {
+    needs_handback(&this, blk: Stmt*, key: SymbolID, lty: TypeRef) -> boolean {
         if (this.last_use_consumes(blk, key, lty)) { return false; }
-        return !this.stmt_diverges(blk as StatementNode*);
+        return !this.stmt_diverges(blk);
     }
 
     /// Whether a value of `ty` can be given away at all.
@@ -4364,7 +4302,7 @@ type struct AsyncLower {
         return !t.as_instantiated().has_resolved_type();
     }
 
-    last_use_consumes(&this, blk: BlockStmtNode*, key: SymbolID, lty: TypeRef) -> boolean {
+    last_use_consumes(&this, blk_stmt: Stmt*, key: SymbolID, lty: TypeRef) -> boolean {
         // A copy is not a give-away. Reporting one as such suppresses the
         // hand-back, and the carrier the next state takes from is then empty —
         // `take().unwrap()` on a `None`. This is why the declaring state of
@@ -4372,9 +4310,7 @@ type struct AsyncLower {
         // publish: `is_control(op)` reads a copy and leaves `op` where it was.
         if (!this.carried_can_be_given_away(lty)) { return false; }
         mut kind: i64 = 0;
-        for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            this.mark_last_use_stmt(blk.statements[i], key, &kind);
-        }
+        this.mark_last_use_stmt(blk_stmt, key, &kind);
         return kind == 2;
     }
 
@@ -4389,78 +4325,68 @@ type struct AsyncLower {
     /// is then omitted, the carrier field stays empty, and the next state's
     /// `take().unwrap()` finds a `None`. A branch that falls through is walked
     /// normally, since it does reach the tail.
-    mark_last_use_stmt(&this, s: StatementNode*, key: SymbolID, out: i64*) -> void {
+    mark_last_use_stmt(&this, s: Stmt*, key: SymbolID, out: i64*) -> void {
         if (s == null) { return; }
-        const k: NodeKind = s.kind;
-        if (k == NodeKind::DeclarationStatement) {
-            this.mark_last_use_expr(this.decl_stmt_init(s as DeclStmtNode*), key, true, out);
-            return;
-        }
-        if (k == NodeKind::ExpressionStatement) {
-            this.mark_last_use_expr((s as ExprStmtNode*).expression, key, false, out);
-            return;
-        }
-        if (k == NodeKind::ReturnStatement) {
-            this.mark_last_use_expr((s as ReturnStmtNode*).expression, key, true, out);
-            return;
-        }
-        if (k == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = s as BlockStmtNode*;
-            for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                this.mark_last_use_stmt(blk.statements[i], key, out);
+        match (s.shape) {
+            StmtKind::Decl(d) => {
+                this.mark_last_use_expr(this.decl_stmt_init(d), key, true, out);
             }
-            return;
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = s as IfStmtNode*;
-            this.mark_last_use_expr(iff.condition, key, false, out);
-            // A branch that returns never reaches the state's tail, so it cannot
-            // describe what the state still owns there.
-            if (!this.stmt_returns(iff.then_stmt)) {
-                this.mark_last_use_stmt(iff.then_stmt, key, out);
+            StmtKind::Expr(e) => {
+                this.mark_last_use_expr(e.expression, key, false, out);
             }
-            if (!this.stmt_returns(iff.else_stmt)) {
-                this.mark_last_use_stmt(iff.else_stmt, key, out);
+            StmtKind::Return(r) => {
+                this.mark_last_use_expr(r.expression, key, true, out);
             }
-            return;
-        }
-        if (k == NodeKind::WhileStatement) {
-            const w: WhileStmtNode* = s as WhileStmtNode*;
-            this.mark_last_use_expr(w.condition, key, false, out);
-            this.mark_last_use_stmt(w.body, key, out);
-            return;
-        }
-        if (k == NodeKind::DoWhileStatement) {
-            const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            this.mark_last_use_stmt(d.body, key, out);
-            this.mark_last_use_expr(d.condition, key, false, out);
-            return;
-        }
-        if (k == NodeKind::ForStatement) {
-            const f: ForStmtNode* = s as ForStmtNode*;
-            if (f.init != null) { this.mark_last_use_stmt(f.init as StatementNode*, key, out); }
-            this.mark_last_use_expr(f.condition, key, false, out);
-            this.mark_last_use_stmt(f.body, key, out);
-            this.mark_last_use_expr(f.update, key, false, out);
-            return;
-        }
-        if (k == NodeKind::LoopStatement) {
-            this.mark_last_use_stmt((s as LoopStmtNode*).body, key, out);
-            return;
-        }
-        if (k == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = s as MatchStmtNode*;
-            this.mark_last_use_expr(m.subject, key, true, out);
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                if (m.arms[i] == null) { continue; }
-                // A guard runs before its body and only reads, so a name last
-                // mentioned there is still owned by the state.
-                this.mark_last_use_expr(m.arms[i].guard, key, false, out);
-                if (!this.stmt_returns(m.arms[i].body)) {
-                    this.mark_last_use_stmt(m.arms[i].body, key, out);
+            StmtKind::Block(blk) => {
+                for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                    this.mark_last_use_stmt(blk.statements[i], key, out);
                 }
             }
-            return;
+            StmtKind::If(iff) => {
+                this.mark_last_use_expr(iff.condition, key, false, out);
+                // A branch that returns never reaches the state's tail, so it cannot
+                // describe what the state still owns there.
+                if (!this.stmt_returns(iff.then_stmt)) {
+                    this.mark_last_use_stmt(iff.then_stmt, key, out);
+                }
+                if (!this.stmt_returns(iff.else_stmt)) {
+                    this.mark_last_use_stmt(iff.else_stmt, key, out);
+                }
+            }
+            StmtKind::While(w) => {
+                this.mark_last_use_expr(w.condition, key, false, out);
+                this.mark_last_use_stmt(w.body, key, out);
+            }
+            StmtKind::DoWhile(d) => {
+                this.mark_last_use_stmt(d.body, key, out);
+                this.mark_last_use_expr(d.condition, key, false, out);
+            }
+            StmtKind::For(f) => {
+                // A declaration or expression initializer is not marked.
+                if (f.init != null && f.init.kind == NodeKind::Statement) {
+                    this.mark_last_use_stmt(f.init as Stmt*, key, out);
+                }
+                this.mark_last_use_expr(f.condition, key, false, out);
+                this.mark_last_use_stmt(f.body, key, out);
+                this.mark_last_use_expr(f.update, key, false, out);
+            }
+            StmtKind::Loop(l) => {
+                this.mark_last_use_stmt(l.body, key, out);
+            }
+            StmtKind::Match(m) => {
+                this.mark_last_use_expr(m.subject, key, true, out);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] == null) { continue; }
+                    // A guard runs before its body and only reads, so a name last
+                    // mentioned there is still owned by the state.
+                    this.mark_last_use_expr(m.arms[i].guard, key, false, out);
+                    if (!this.stmt_returns(m.arms[i].body)) {
+                        this.mark_last_use_stmt(m.arms[i].body, key, out);
+                    }
+                }
+            }
+            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
+            | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
@@ -4583,19 +4509,30 @@ type struct AsyncLower {
     /// value, so that expression sits in the match's own position: when the match
     /// result is handed over, an arm yielding the name hands the name over too.
     /// Every other statement in the body is an ordinary statement.
-    mark_last_use_arm(&this, body: StatementNode*, key: SymbolID,
+    mark_last_use_arm(&this, body: Stmt*, key: SymbolID,
                       by_value: boolean, out: i64*) -> void {
         if (body == null) { return; }
-        if (body.kind != NodeKind::BlockStatement) {
+        const blk: BlockStmt* = match (body.shape) {
+            StmtKind::Block(b) => { b }
+            _                  => { null }
+        };
+        if (blk == null) {
             this.mark_last_use_stmt(body, key, out);
             return;
         }
-        const blk: BlockStmtNode* = body as BlockStmtNode*;
         const last: i64 = blk.statements.length - 1;
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            const s: StatementNode* = blk.statements[i];
-            if (i == last && s != null && s.kind == NodeKind::ExpressionStatement) {
-                this.mark_last_use_expr((s as ExprStmtNode*).expression, key, by_value, out);
+            const s: Stmt* = blk.statements[i];
+            const tail: ExprStmt* = if (i == last && s != null) {
+                match (s.shape) {
+                    StmtKind::Expr(e) => { e }
+                    _                 => { null }
+                }
+            } else {
+                null
+            };
+            if (tail != null) {
+                this.mark_last_use_expr(tail.expression, key, by_value, out);
                 continue;
             }
             this.mark_last_use_stmt(s, key, out);
@@ -4622,12 +4559,12 @@ type struct AsyncLower {
     /// through the local returned here, not the binding they passed in.
     /// `shown` is how the binding is spelled where it is written, which the
     /// fresh name is derived from when the binding is not a renamed local.
-    decl_at_first_assignment(mut &this, blk: BlockStmtNode*, key: SymbolID, shown: SymbolStr,
+    decl_at_first_assignment(mut &this, blk_stmt: Stmt*, key: SymbolID, shown: SymbolStr,
                              lty: TypeRef, span: SourceSpan) -> MintedLocal {
-        const i: i64 = this.top_level_assignment_index(blk, key);
+        const blk: BlockStmt* = blk_stmt.as_block();
+        const i: i64 = this.top_level_assignment_index(blk_stmt, key);
         if (i < 0) { return MintedLocal { name: SymbolStr::empty(), sym: SymbolID::invalid() }; }
-        const b: BinaryExprNode* =
-            ((blk.statements[i] as ExprStmtNode*).expression) as BinaryExprNode*;
+        const b: BinaryExprNode* = this.top_level_assignment(blk.statements[i]);
         const sym: SymbolID = this.resolver.alloc_synthetic_binding();
         const fresh: SymbolStr = this.mint_local(this.source_name(key, shown), sym);
         blk.statements[i] = this.var_decl_stmt_bound(fresh, sym, true, lty, b.right, span);
@@ -4646,19 +4583,28 @@ type struct AsyncLower {
         return MintedLocal { name: fresh, sym: sym };
     }
 
+    /// The `<lhs> = <rhs>` statement `s` is, or null for any other statement.
+    top_level_assignment(&this, s: Stmt*) -> BinaryExprNode* {
+        if (s == null) { return null; }
+        const e: ExpressionNode* = match (s.shape) {
+            StmtKind::Expr(es) => { es.expression }
+            _                  => { null }
+        };
+        if (e == null || (e as ASTNode*).kind != NodeKind::BinaryExpression) { return null; }
+        const b: BinaryExprNode* = e as BinaryExprNode*;
+        if (b.op.kind != TokenType::Equal) { return null; }
+        return b;
+    }
+
     /// Index of the state's first `<name> = <expr>;` written at the TOP level of
     /// the state, or -1. Top level is what makes the assignment unconditional:
     /// it runs on every path through the state, so the state really does produce
     /// its own value.
-    top_level_assignment_index(&this, blk: BlockStmtNode*, key: SymbolID) -> i64 {
+    top_level_assignment_index(&this, blk_stmt: Stmt*, key: SymbolID) -> i64 {
+        const blk: BlockStmt* = blk_stmt.as_block();
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            const s: StatementNode* = blk.statements[i];
-            if (s == null || s.kind != NodeKind::ExpressionStatement) { continue; }
-            const e: ExpressionNode* = (s as ExprStmtNode*).expression;
-            if (e == null || (e as ASTNode*).kind != NodeKind::BinaryExpression) { continue; }
-            const b: BinaryExprNode* = e as BinaryExprNode*;
-            if (b.op.kind != TokenType::Equal) { continue; }
-            if (!this.names_binding(b.left, key)) { continue; }
+            const b: BinaryExprNode* = this.top_level_assignment(blk.statements[i]);
+            if (b == null || !this.names_binding(b.left, key)) { continue; }
             return i;
         }
         return -1;
@@ -4675,7 +4621,7 @@ type struct AsyncLower {
     /// instead would give the state a binding nobody wrote on that path, and the
     /// hand-back at the end of the state would publish that garbage into the
     /// carrier field for the next state to take.
-    block_cond_write(&this, blk: BlockStmtNode*, key: SymbolID) -> boolean {
+    block_cond_write(&this, blk: Stmt*, key: SymbolID) -> boolean {
         if (this.block_first_use(blk, key) != this.first_use_write()) { return false; }
         return this.top_level_assignment_index(blk, key) < 0;
     }
@@ -4685,7 +4631,7 @@ type struct AsyncLower {
     /// Built fresh per call: each insertion point needs its own nodes.
     agg_store_stmt(mut &this, sm: PollSm*, field: SymbolStr, opt_ty: TypeRef,
                    name: SymbolStr, key: SymbolID, lty: TypeRef,
-                   span: SourceSpan) -> StatementNode* {
+                   span: SourceSpan) -> Stmt* {
         return this.assign_member_stmt(sm.struct_ref, field, opt_ty,
             this.option_some(this.ident_bound(name, key, lty, span), opt_ty, span), span);
     }
@@ -4697,7 +4643,7 @@ type struct AsyncLower {
     /// runs the destructor twice.  The local declares binding `sym`.
     agg_take_stmt(mut &this, name: SymbolStr, sym: SymbolID, field: SymbolStr, lty: TypeRef,
                   opt_ty: TypeRef, struct_ref: TypeRef, mutable: boolean,
-                  span: SourceSpan) -> StatementNode* {
+                  span: SourceSpan) -> Stmt* {
         mut fld: ExpressionNode* = this.own_field(struct_ref, field, opt_ty, span);
         mut take_call: ExpressionNode* = this.method_call0(fld, LangItem::OptionTake, opt_ty, span);
         mut unwrap_call: ExpressionNode* = this.method_call0(take_call, LangItem::OptionUnwrap, lty, span);
@@ -4713,7 +4659,7 @@ type struct AsyncLower {
     /// init flag and the `Option`'s glue still drops the payload conditionally,
     /// so the future needs no drop of its own.
     agg_bind_ptr_stmt(mut &this, sm: PollSm*, ptr_name: SymbolStr, field: SymbolStr,
-                      opt_ty: TypeRef, lty_ptr: TypeRef, span: SourceSpan) -> StatementNode* {
+                      opt_ty: TypeRef, lty_ptr: TypeRef, span: SourceSpan) -> Stmt* {
         mut fld: ExpressionNode* = this.own_field(
             sm.struct_ref, field, opt_ty, span);
         mut call: ExpressionNode* = this.method_call0(fld, LangItem::OptionUnwrapPtr, lty_ptr, span);
@@ -4732,15 +4678,15 @@ type struct AsyncLower {
     ///
     /// Every state's pointer stands for one binding, `pkey`, which the
     /// substitution's uses of the pointer name.
-    bind_carrier_ptr(mut &this, sm: PollSm*, blk: BlockStmtNode*, at: i64, pnm: SymbolStr,
+    bind_carrier_ptr(mut &this, sm: PollSm*, blk: Stmt*, at: i64, pnm: SymbolStr,
                      pkey: SymbolID, field: SymbolStr, opt_ty: TypeRef, lty_ptr: TypeRef,
                      span: SourceSpan) -> void {
         if (this.block_first_use(blk, pkey) == 0) { return; }
-        mut opened: [StatementNode*] = [];
-        for (mut i: i64 = 0; i < at; i++) { opened.push(blk.statements[i]); }
+        mut opened: [Stmt*] = [];
+        for (mut i: i64 = 0; i < at; i++) { opened.push(blk.as_block().statements[i]); }
         opened.push(this.stand_in(this.agg_bind_ptr_stmt(sm, pnm, field, opt_ty, lty_ptr, span), pkey));
-        for (mut i: i64 = at; i < blk.statements.length; i++) { opened.push(blk.statements[i]); }
-        blk.statements = opened;
+        for (mut i: i64 = at; i < blk.as_block().statements.length; i++) { opened.push(blk.as_block().statements[i]); }
+        blk.as_block().statements = opened;
     }
 
     /// The pointer binding a carried value is reached through, in EVERY state.
@@ -4756,9 +4702,9 @@ type struct AsyncLower {
     }
 
     /// Index of the top-level statement in `blk` that declares `vd`, or -1.
-    decl_stmt_index(&this, blk: BlockStmtNode*, vd: VarDeclNode*) -> i64 {
-        for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            if (this.stmt_decl_var(blk.statements[i]) == vd) { return i; }
+    decl_stmt_index(&this, blk: Stmt*, vd: VarDeclNode*) -> i64 {
+        for (mut i: i64 = 0; i < blk.as_block().statements.length; i++) {
+            if (this.stmt_decl_var(blk.as_block().statements[i]) == vd) { return i; }
         }
         return -1;
     }
@@ -4771,7 +4717,7 @@ type struct AsyncLower {
     /// A carried value whose type has no destructor is COPIED by a by-value use,
     /// so the field must keep its payload and no take is armed: emptying it
     /// would leave every later state's `unwrap_ptr` looking at a `None`.
-    subst_carried_from(mut &this, sm: PollSm*, blk: BlockStmtNode*, from: i64, key: SymbolID,
+    subst_carried_from(mut &this, sm: PollSm*, blk: Stmt*, from: i64, key: SymbolID,
                        ptr_name: SymbolStr, pkey: SymbolID, field: SymbolStr, lty: TypeRef,
                        opt_ty: TypeRef, span: SourceSpan) -> void {
         const saved_mode:   i64       = this.subst_mode;
@@ -4791,7 +4737,7 @@ type struct AsyncLower {
         this.subst_hoist_name = SymbolStr::empty();
         this.subst_hoist_stmt = null;
         this.subst_cond_depth = 0;
-        this.subst_stmt_list(blk, from, key, ptr_name, TypeRef::invalid(), lty, span);
+        this.subst_stmt_list(blk.as_block(), from, key, ptr_name, TypeRef::invalid(), lty, span);
         this.subst_hoist_name = SymbolStr::empty();
         this.subst_hoist_stmt = null;
         this.subst_mode           = saved_mode;
@@ -4819,11 +4765,12 @@ type struct AsyncLower {
     ///
     /// The take declares binding `sym`; when it re-declares a carried value it
     /// stands for that value's binding, `stands_for`.
-    prepend_agg_take(mut &this, blk: BlockStmtNode*, name: SymbolStr, sym: SymbolID,
+    prepend_agg_take(mut &this, blk_stmt: Stmt*, name: SymbolStr, sym: SymbolID,
                      stands_for: SymbolID, field: SymbolStr,
                      lty: TypeRef, opt_ty: TypeRef, struct_ref: TypeRef,
                      mutable: boolean, span: SourceSpan) -> void {
-        mut rebuilt: [StatementNode*] = [this.stand_in(this.agg_take_stmt(name, sym, field, lty,
+        const blk: BlockStmt* = blk_stmt.as_block();
+        mut rebuilt: [Stmt*] = [this.stand_in(this.agg_take_stmt(name, sym, field, lty,
                                                            opt_ty, struct_ref, mutable, span),
                                                        stands_for)];
         for (mut i: i64 = 0; i < blk.statements.length; i++) { rebuilt.push(blk.statements[i]); }
@@ -4835,55 +4782,49 @@ type struct AsyncLower {
     /// the end of the state never runs on that path; without this the next poll
     /// would take an empty field. Only ever applied to states that opened with a
     /// `take`, so the local is in scope at each suspend.
-    store_before_suspends(mut &this, sm: PollSm*, s: StatementNode*, field: SymbolStr,
+    store_before_suspends(mut &this, sm: PollSm*, s: Stmt*, field: SymbolStr,
                           opt_ty: TypeRef, name: SymbolStr, key: SymbolID, lty: TypeRef,
                           span: SourceSpan) -> void {
         if (s == null) { return; }
-        const k: NodeKind = s.kind;
-        if (k == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = s as BlockStmtNode*;
-            mut rebuilt: [StatementNode*] = [];
-            for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                const st: StatementNode* = blk.statements[i];
-                if (this.is_pending_return(st)) {
-                    rebuilt.push(this.agg_store_stmt(sm, field, opt_ty, name, key, lty, span));
-                    rebuilt.push(st);
-                } else {
-                    this.store_before_suspends(sm, st, field, opt_ty, name, key, lty, span);
-                    rebuilt.push(st);
+        match (s.shape) {
+            StmtKind::Block(blk) => {
+                mut rebuilt: [Stmt*] = [];
+                for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                    const st: Stmt* = blk.statements[i];
+                    if (this.is_pending_return(st)) {
+                        rebuilt.push(this.agg_store_stmt(sm, field, opt_ty, name, key, lty, span));
+                        rebuilt.push(st);
+                    } else {
+                        this.store_before_suspends(sm, st, field, opt_ty, name, key, lty, span);
+                        rebuilt.push(st);
+                    }
+                }
+                blk.statements = rebuilt;
+            }
+            StmtKind::If(iff) => {
+                this.store_before_suspends(sm, iff.then_stmt, field, opt_ty, name, key, lty, span);
+                this.store_before_suspends(sm, iff.else_stmt, field, opt_ty, name, key, lty, span);
+            }
+            StmtKind::While(w) => {
+                this.store_before_suspends(sm, w.body, field, opt_ty, name, key, lty, span);
+            }
+            StmtKind::DoWhile(d) => {
+                this.store_before_suspends(sm, d.body, field, opt_ty, name, key, lty, span);
+            }
+            StmtKind::For(f) => {
+                this.store_before_suspends(sm, f.body, field, opt_ty, name, key, lty, span);
+            }
+            StmtKind::Loop(l) => {
+                this.store_before_suspends(sm, l.body, field, opt_ty, name, key, lty, span);
+            }
+            StmtKind::Match(m) => {
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    this.store_before_suspends(sm, m.arms[i].body, field, opt_ty, name, key, lty, span);
                 }
             }
-            blk.statements = rebuilt;
-            return;
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = s as IfStmtNode*;
-            this.store_before_suspends(sm, iff.then_stmt, field, opt_ty, name, key, lty, span);
-            this.store_before_suspends(sm, iff.else_stmt, field, opt_ty, name, key, lty, span);
-            return;
-        }
-        if (k == NodeKind::WhileStatement) {
-            this.store_before_suspends(sm, (s as WhileStmtNode*).body, field, opt_ty, name, key, lty, span);
-            return;
-        }
-        if (k == NodeKind::DoWhileStatement) {
-            this.store_before_suspends(sm, (s as DoWhileStmtNode*).body, field, opt_ty, name, key, lty, span);
-            return;
-        }
-        if (k == NodeKind::ForStatement) {
-            this.store_before_suspends(sm, (s as ForStmtNode*).body, field, opt_ty, name, key, lty, span);
-            return;
-        }
-        if (k == NodeKind::LoopStatement) {
-            this.store_before_suspends(sm, (s as LoopStmtNode*).body, field, opt_ty, name, key, lty, span);
-            return;
-        }
-        if (k == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = s as MatchStmtNode*;
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                this.store_before_suspends(sm, m.arms[i].body, field, opt_ty, name, key, lty, span);
-            }
-            return;
+            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
+            | StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue
+            | StmtKind::Expr(_) | StmtKind::Decl(_) => {}
         }
     }
 
@@ -4905,21 +4846,28 @@ type struct AsyncLower {
         };
     }
 
+    /// The value `return` statement `s` returns; null for any other statement.
+    returned_value(&this, s: Stmt*) -> ExpressionNode* {
+        if (s == null) { return null; }
+        return match (s.shape) {
+            StmtKind::Return(r) => { r.expression }
+            _                   => { null }
+        };
+    }
+
     /// True for the suspend statement the await lowering emits: `return
     /// Poll::Pending`. A user `return` was already rewritten to `Poll::Ready`,
     /// so the variant alone tells them apart.
-    is_pending_return(&this, s: StatementNode*) -> boolean {
-        if (s == null || s.kind != NodeKind::ReturnStatement) { return false; }
-        const e: ExpressionNode* = (s as ReturnStmtNode*).expression;
+    is_pending_return(&this, s: Stmt*) -> boolean {
+        const e: ExpressionNode* = this.returned_value(s);
         if (e == null || (e as ASTNode*).kind != NodeKind::ScopeResolution) { return false; }
         return this.is_poll_variant(e as ScopeResolutionNode*, "Pending");
     }
 
     /// The `Poll::Ready(<value>)` call a completion return carries - the shape
     /// the lowering rewrites every user `return` into - or null.
-    ready_call(&this, s: StatementNode*) -> CallExprNode* {
-        if (s == null || s.kind != NodeKind::ReturnStatement) { return null; }
-        const e: ExpressionNode* = (s as ReturnStmtNode*).expression;
+    ready_call(&this, s: Stmt*) -> CallExprNode* {
+        const e: ExpressionNode* = this.returned_value(s);
         if (e == null || (e as ASTNode*).kind != NodeKind::CallExpression) { return null; }
         const callee: ExpressionNode* = (e as CallExprNode*).callee;
         if (callee == null || (callee as ASTNode*).kind != NodeKind::ScopeResolution) { return null; }
@@ -4951,11 +4899,11 @@ type struct AsyncLower {
     /// drop insertion releases it at the end of the statement, which is where
     /// this wants the destructor to run anyway.
     agg_release_stmt(mut &this, sm: PollSm*, field: SymbolStr, opt_ty: TypeRef,
-                     span: SourceSpan) -> StatementNode* {
+                     span: SourceSpan) -> Stmt* {
         mut fld: ExpressionNode* = this.own_field(
             sm.struct_ref, field, opt_ty, span);
         mut take_call: ExpressionNode* = this.method_call0(fld, LangItem::OptionTake, opt_ty, span);
-        return new ExprStmtNode(take_call, span) as StatementNode*;
+        return Stmt::expr_stmt(take_call, span);
     }
 
     /// Rewrite every completion return inside `s` so each in-place carrier is
@@ -4981,108 +4929,94 @@ type struct AsyncLower {
     ///
     /// All carriers are released in ONE pass rather than one pass each, because
     /// the first pass rewrites the return the next would have matched on.
-    release_before_ready(mut &this, sm: PollSm*, s: StatementNode*,
+    release_before_ready(mut &this, sm: PollSm*, s: Stmt*,
                          fields: &[SymbolStr], opts: &[TypeRef], span: SourceSpan) -> void {
         if (s == null) { return; }
-        const k: NodeKind = s.kind;
-        if (k == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = s as BlockStmtNode*;
-            mut rebuilt: [StatementNode*] = [];
-            for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                const st: StatementNode* = blk.statements[i];
-                mut ready: CallExprNode* = this.ready_call(st);
-                if (ready == null || ready.arguments.length != 1
-                        || ready.arguments[0] == null) {
-                    this.release_before_ready(sm, st, fields, opts, span);
-                    rebuilt.push(st);
-                    continue;
-                }
-                // Only a LITERAL payload may be released ahead of - it names no
-                // storage, so nothing it needs can be freed early. That covers
-                // the unit value a `-> void` async function returns, which is
-                // the case that must not go through the hoist: unit has no type
-                // worth binding a local to.
-                //
-                // Every other payload is hoisted, even one that never mentions a
-                // carrier by name. Asking whether the payload reads a carrier
-                // POINTER is not the same question and gets this wrong: a
-                // pointer derived from the carrier earlier in the function (`p =
-                // owner.conn()`) reads that storage without naming it, and
-                // releasing first left it reading a freed value - measured, the
-                // accessor test returned 2 instead of 3.
-                if ((ready.arguments[0] as ASTNode*).kind == NodeKind::Literal) {
+        match (s.shape) {
+            StmtKind::Block(blk) => {
+                mut rebuilt: [Stmt*] = [];
+                for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                    const st: Stmt* = blk.statements[i];
+                    mut ready: CallExprNode* = this.ready_call(st);
+                    if (ready == null || ready.arguments.length != 1
+                            || ready.arguments[0] == null) {
+                        this.release_before_ready(sm, st, fields, opts, span);
+                        rebuilt.push(st);
+                        continue;
+                    }
+                    // Only a LITERAL payload may be released ahead of - it names no
+                    // storage, so nothing it needs can be freed early. That covers
+                    // the unit value a `-> void` async function returns, which is
+                    // the case that must not go through the hoist: unit has no type
+                    // worth binding a local to.
+                    //
+                    // Every other payload is hoisted, even one that never mentions a
+                    // carrier by name. Asking whether the payload reads a carrier
+                    // POINTER is not the same question and gets this wrong: a
+                    // pointer derived from the carrier earlier in the function (`p =
+                    // owner.conn()`) reads that storage without naming it, and
+                    // releasing first left it reading a freed value - measured, the
+                    // accessor test returned 2 instead of 3.
+                    if ((ready.arguments[0] as ASTNode*).kind == NodeKind::Literal) {
+                        for (mut f: i64 = 0; f < fields.length; f++) {
+                            rebuilt.push(this.agg_release_stmt(sm, fields[f], opts[f], span));
+                        }
+                        rebuilt.push(st);
+                        continue;
+                    }
+                    // A payload that reads a carrier but whose type cannot be
+                    // SPELLED cannot be hoisted, and releasing without hoisting
+                    // would empty the field it reads. Leave such a return alone: the
+                    // value then dies with the future, which is where it died before
+                    // this pass, so the fallback is the previous behaviour and not a
+                    // new hazard. A still-abstract type is the case that matters -
+                    // binding a local to one drops the instantiation and codegen
+                    // then loses an enum payload outright.
+                    const out_ty: TypeRef = ready.arguments[0].resolved_type;
+                    if (!out_ty.is_valid() || this.arena.contains_generic_param(out_ty)
+                            || this.ownership_unreadable(out_ty)) {
+                        rebuilt.push(st);
+                        continue;
+                    }
+                    const rv_id: SymbolID = this.resolver.alloc_synthetic_binding();
+                    const rsym: SymbolStr = this.mint_local(this.intern.intern("__rv"), rv_id);
+                    rebuilt.push(this.var_decl_stmt_bound(rsym, rv_id, true, out_ty,
+                                                          ready.arguments[0], span));
                     for (mut f: i64 = 0; f < fields.length; f++) {
                         rebuilt.push(this.agg_release_stmt(sm, fields[f], opts[f], span));
                     }
+                    ready.arguments[0] = this.ident_bound(rsym, rv_id, out_ty, span);
                     rebuilt.push(st);
-                    continue;
                 }
-                // A payload that reads a carrier but whose type cannot be
-                // SPELLED cannot be hoisted, and releasing without hoisting
-                // would empty the field it reads. Leave such a return alone: the
-                // value then dies with the future, which is where it died before
-                // this pass, so the fallback is the previous behaviour and not a
-                // new hazard. A still-abstract type is the case that matters -
-                // binding a local to one drops the instantiation and codegen
-                // then loses an enum payload outright.
-                const out_ty: TypeRef = ready.arguments[0].resolved_type;
-                if (!out_ty.is_valid() || this.arena.contains_generic_param(out_ty)
-                        || this.ownership_unreadable(out_ty)) {
-                    rebuilt.push(st);
-                    continue;
-                }
-                const rv_id: SymbolID = this.resolver.alloc_synthetic_binding();
-                const rsym: SymbolStr = this.mint_local(this.intern.intern("__rv"), rv_id);
-                rebuilt.push(this.var_decl_stmt_bound(rsym, rv_id, true, out_ty,
-                                                      ready.arguments[0], span));
-                for (mut f: i64 = 0; f < fields.length; f++) {
-                    rebuilt.push(this.agg_release_stmt(sm, fields[f], opts[f], span));
-                }
-                ready.arguments[0] = this.ident_bound(rsym, rv_id, out_ty, span);
-                rebuilt.push(st);
+                blk.statements = rebuilt;
             }
-            blk.statements = rebuilt;
-            return;
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = s as IfStmtNode*;
-            this.release_before_ready(sm, iff.then_stmt, fields, opts, span);
-            this.release_before_ready(sm, iff.else_stmt, fields, opts, span);
-            return;
-        }
-        if (k == NodeKind::WhileStatement) {
-            this.release_before_ready(sm, (s as WhileStmtNode*).body, fields, opts, span);
-            return;
-        }
-        if (k == NodeKind::DoWhileStatement) {
-            this.release_before_ready(sm, (s as DoWhileStmtNode*).body, fields, opts, span);
-            return;
-        }
-        if (k == NodeKind::ForStatement) {
-            this.release_before_ready(sm, (s as ForStmtNode*).body, fields, opts, span);
-            return;
-        }
-        if (k == NodeKind::LoopStatement) {
-            this.release_before_ready(sm, (s as LoopStmtNode*).body, fields, opts, span);
-            return;
-        }
-        if (k == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = s as MatchStmtNode*;
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                this.release_before_ready(sm, m.arms[i].body, fields, opts, span);
+            StmtKind::If(iff) => {
+                this.release_before_ready(sm, iff.then_stmt, fields, opts, span);
+                this.release_before_ready(sm, iff.else_stmt, fields, opts, span);
             }
-            return;
+            StmtKind::While(w)   => { this.release_before_ready(sm, w.body, fields, opts, span); }
+            StmtKind::DoWhile(d) => { this.release_before_ready(sm, d.body, fields, opts, span); }
+            StmtKind::For(f)     => { this.release_before_ready(sm, f.body, fields, opts, span); }
+            StmtKind::Loop(l)    => { this.release_before_ready(sm, l.body, fields, opts, span); }
+            StmtKind::Match(m) => {
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    this.release_before_ready(sm, m.arms[i].body, fields, opts, span);
+                }
+            }
+            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
+            | StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue
+            | StmtKind::Expr(_) | StmtKind::Decl(_) => {}
         }
     }
 
     /// Prepend `const <name> = this.<field>;`, a stand-in for binding `key`, so
     /// the block's reads of a promoted local reach the reloaded value.
-    prepend_load(mut &this, blk: BlockStmtNode*, name: SymbolStr, key: SymbolID,
+    prepend_load(mut &this, blk: Stmt*, name: SymbolStr, key: SymbolID,
                  field: SymbolStr, ty: TypeRef, struct_ref: TypeRef, span: SourceSpan) -> void {
         mut ld: ExpressionNode* = this.own_field(struct_ref, field, ty, span);
-        mut rebuilt: [StatementNode*] = [this.stand_in(this.var_decl_stmt(name, false, ty, ld, span), key)];
-        for (mut i: i64 = 0; i < blk.statements.length; i++) { rebuilt.push(blk.statements[i]); }
-        blk.statements = rebuilt;
+        mut rebuilt: [Stmt*] = [this.stand_in(this.var_decl_stmt(name, false, ty, ld, span), key)];
+        for (mut i: i64 = 0; i < blk.as_block().statements.length; i++) { rebuilt.push(blk.as_block().statements[i]); }
+        blk.as_block().statements = rebuilt;
     }
 
     /// Replace the `mut <name> = <init>;` declaration (located by node identity in
@@ -5092,10 +5026,10 @@ type struct AsyncLower {
     rewrite_mut_decl(mut &this, sm: PollSm*, ds: i64, vd: VarDeclNode*,
                      field: SymbolStr, lty: TypeRef) -> void {
         const span: SourceSpan = sm.span;
-        const blk: BlockStmtNode* = sm.blocks[ds];
-        mut rebuilt: [StatementNode*] = [];
+        const blk: BlockStmt* = sm.blocks[ds].as_block();
+        mut rebuilt: [Stmt*] = [];
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            const s: StatementNode* = blk.statements[i];
+            const s: Stmt* = blk.statements[i];
             if (this.stmt_decl_var(s) == vd) {
                 if (vd.initializer != null) {
                     rebuilt.push(this.assign_member_stmt(sm.struct_ref, field, lty, vd.initializer, span));
@@ -5301,41 +5235,31 @@ type struct AsyncLower {
 
     /// Statement twin of `frame_addr_root_expr`, for the value-block body of a
     /// `match` expression arm.
-    frame_addr_root_stmt(&this, sm: PollSm*, s: StatementNode*) -> IdentifierNode* {
+    frame_addr_root_stmt(&this, sm: PollSm*, s: Stmt*) -> IdentifierNode* {
         if (s == null) { return null; }
-        const k: NodeKind = s.kind;
-        if (k == NodeKind::ExpressionStatement) {
-            return this.frame_addr_root_expr(sm, (s as ExprStmtNode*).expression);
-        }
-        if (k == NodeKind::ReturnStatement) {
-            return this.frame_addr_root_expr(sm, (s as ReturnStmtNode*).expression);
-        }
-        if (k == NodeKind::DeclarationStatement) {
-            return this.frame_addr_root_expr(sm, this.decl_stmt_init(s as DeclStmtNode*));
-        }
-        if (k == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = s as BlockStmtNode*;
-            for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                const r: IdentifierNode* = this.frame_addr_root_stmt(sm, blk.statements[i]);
-                if (r != null) { return r; }
+        match (s.shape) {
+            StmtKind::Expr(e)   => { return this.frame_addr_root_expr(sm, e.expression); }
+            StmtKind::Return(r) => { return this.frame_addr_root_expr(sm, r.expression); }
+            StmtKind::Decl(d)   => { return this.frame_addr_root_expr(sm, this.decl_stmt_init(d)); }
+            StmtKind::Block(blk) => {
+                for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                    const r: IdentifierNode* = this.frame_addr_root_stmt(sm, blk.statements[i]);
+                    if (r != null) { return r; }
+                }
+                return null;
             }
-            return null;
+            _ => { return null; }
         }
-        return null;
     }
 
     /// The frame-resident address root assigned into `name` by a `<name> = <expr>;`
     /// anywhere in `blk`, or the empty symbol. Complements the declaration
     /// initializer: a pointer may be declared null and filled in later.
-    assigned_frame_addr_root(&this, sm: PollSm*, blk: BlockStmtNode*, key: SymbolID) -> IdentifierNode* {
+    assigned_frame_addr_root(&this, sm: PollSm*, blk_stmt: Stmt*, key: SymbolID) -> IdentifierNode* {
+        const blk: BlockStmt* = blk_stmt.as_block();
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            const s: StatementNode* = blk.statements[i];
-            if (s == null || s.kind != NodeKind::ExpressionStatement) { continue; }
-            const e: ExpressionNode* = (s as ExprStmtNode*).expression;
-            if (e == null || (e as ASTNode*).kind != NodeKind::BinaryExpression) { continue; }
-            const b: BinaryExprNode* = e as BinaryExprNode*;
-            if (b.op.kind != TokenType::Equal) { continue; }
-            if (!this.names_binding(b.left, key)) { continue; }
+            const b: BinaryExprNode* = this.top_level_assignment(blk.statements[i]);
+            if (b == null || !this.names_binding(b.left, key)) { continue; }
             const r: IdentifierNode* = this.frame_addr_root_expr(sm, b.right);
             if (r != null) { return r; }
         }
@@ -5410,9 +5334,9 @@ type struct AsyncLower {
         mut inplace_fields: [SymbolStr] = [];
         mut inplace_opts: [TypeRef] = [];
         for (mut b: i64 = 0; b < sm.blocks.length; b++) {
-            const blk: BlockStmtNode* = sm.blocks[b];
-            for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                const vd: VarDeclNode* = this.stmt_decl_var(blk.statements[i]);
+            const blk: Stmt* = sm.blocks[b];
+            for (mut i: i64 = 0; i < blk.as_block().statements.length; i++) {
+                const vd: VarDeclNode* = this.stmt_decl_var(blk.as_block().statements[i]);
                 if (vd != null) { d_keys.push(this.decl_key(vd)); d_states.push(b); d_nodes.push(vd); }
             }
         }
@@ -5555,14 +5479,14 @@ type struct AsyncLower {
                 if (vd.initializer != null) {
                     init_val = this.option_some(vd.initializer, opt_ty, span);
                 }
-                mut rebuilt: [StatementNode*] = [];
-                for (mut i: i64 = 0; i < di; i++) { rebuilt.push(sm.blocks[ds].statements[i]); }
+                mut rebuilt: [Stmt*] = [];
+                for (mut i: i64 = 0; i < di; i++) { rebuilt.push(sm.blocks[ds].as_block().statements[i]); }
                 rebuilt.push(this.assign_member_stmt(sm.struct_ref, afield, opt_ty,
                     init_val, span));
-                for (mut i: i64 = di + 1; i < sm.blocks[ds].statements.length; i++) {
-                    rebuilt.push(sm.blocks[ds].statements[i]);
+                for (mut i: i64 = di + 1; i < sm.blocks[ds].as_block().statements.length; i++) {
+                    rebuilt.push(sm.blocks[ds].as_block().statements[i]);
                 }
-                sm.blocks[ds].statements = rebuilt;
+                sm.blocks[ds].as_block().statements = rebuilt;
                 // An uninitialised declaration leaves the field `None`, so
                 // the pointer can only be bound once the first assignment
                 // has filled it. Asked before substitution rewrites that
@@ -5645,9 +5569,9 @@ type struct AsyncLower {
                     fmt::format("__mut_%lld_%s", ds, this.intern.resolve(nm)));
                 this.rewrite_mut_decl(sm, ds, vd, mfield, lty);
                 for (mut b: i64 = 0; b < sm.blocks.length; b++) {
-                    const blk2: BlockStmtNode* = sm.blocks[b];
-                    for (mut i: i64 = 0; i < blk2.statements.length; i++) {
-                        this.subst_name_stmt(blk2.statements[i], key, mfield, sm.struct_ref, lty, span);
+                    const blk2: Stmt* = sm.blocks[b];
+                    for (mut i: i64 = 0; i < blk2.as_block().statements.length; i++) {
+                        this.subst_name_stmt(blk2.as_block().statements[i], key, mfield, sm.struct_ref, lty, span);
                     }
                 }
                 sm.prom_field.push(mfield);
@@ -5662,7 +5586,7 @@ type struct AsyncLower {
             // reload it at the top of every other block that reads it.
             const field: SymbolStr = this.intern.intern(
                 fmt::format("__cross_%lld_%s", ds, this.intern.resolve(nm)));
-            sm.blocks[ds].add_statement(this.assign_member_stmt(
+            sm.blocks[ds].as_block().add_statement(this.assign_member_stmt(
                 sm.struct_ref, field, lty, this.ident_bound(nm, key, lty, span), span));
             for (mut b: i64 = 0; b < sm.blocks.length; b++) {
                 if (b != ds && this.block_reads_name(sm.blocks[b], key)) {
@@ -5680,7 +5604,7 @@ type struct AsyncLower {
         // rather than leaving it to the future's own drop.
         if (inplace_fields.length > 0) {
             for (mut b: i64 = 0; b < sm.blocks.length; b++) {
-                this.release_before_ready(sm, sm.blocks[b] as StatementNode*,
+                this.release_before_ready(sm, sm.blocks[b],
                                           &inplace_fields, &inplace_opts, span);
             }
         }
@@ -5711,7 +5635,7 @@ type struct AsyncLower {
 
     /// `<local> = <rhs>;`.
     assign_local_stmt(&this, local: MintedLocal, ty: TypeRef, rhs: ExpressionNode*,
-                      span: SourceSpan) -> StatementNode* {
+                      span: SourceSpan) -> Stmt* {
         return this.assign_stmt(this.ident_bound(local.name, local.sym, ty, span), rhs, span);
     }
 
@@ -6029,13 +5953,13 @@ type struct AsyncLower {
 
         mut inner: HoistPre = HoistPre { stmts: [] };
         mut right: ExpressionNode* = this.hoist_expr(b.right, &inner);
-        mut blk: BlockStmtNode* = new BlockStmtNode(span);
-        for (mut i: i64 = 0; i < inner.stmts.length; i++) { blk.add_statement(inner.stmts[i]); }
-        blk.add_statement(this.assign_local_stmt(t, bool_ty, right, span));
+        mut blk: Stmt* = Stmt::block(span);
+        for (mut i: i64 = 0; i < inner.stmts.length; i++) { blk.as_block().add_statement(inner.stmts[i]); }
+        blk.as_block().add_statement(this.assign_local_stmt(t, bool_ty, right, span));
 
         mut test: ExpressionNode* = this.ident_bound(t.name, t.sym, bool_ty, span);
         if (b.op.kind == TokenType::PipePipe) { test = this.not_expr(test, span); }
-        pre.push(new IfStmtNode(test, blk as StatementNode*, null, span) as StatementNode*);
+        pre.push(Stmt::if_stmt(test, blk, null, span));
         return this.ident_bound(t.name, t.sym, bool_ty, span);
     }
 
@@ -6058,10 +5982,10 @@ type struct AsyncLower {
         const tv: MintedLocal = this.mint_temp("__tv");
         pre.push(this.var_decl_stmt_bound(tv.name, tv.sym, true, vty, null, span));
 
-        mut then_blk: BlockStmtNode* = this.hoist_arm_block(then_in, tv, vty, span);
-        mut else_blk: BlockStmtNode* = this.hoist_arm_block(else_in, tv, vty, span);
-        pre.push(new IfStmtNode(cond, then_blk as StatementNode*,
-                                else_blk as StatementNode*, span) as StatementNode*);
+        mut then_blk: Stmt* = this.hoist_arm_block(then_in, tv, vty, span);
+        mut else_blk: Stmt* = this.hoist_arm_block(else_in, tv, vty, span);
+        pre.push(Stmt::if_stmt(cond, then_blk,
+                                else_blk, span));
         return this.ident_bound(tv.name, tv.sym, vty, span);
     }
 
@@ -6088,7 +6012,7 @@ type struct AsyncLower {
         const tv: MintedLocal = this.mint_temp("__mv");
         pre.push(this.var_decl_stmt_bound(tv.name, tv.sym, true, vty, null, span));
 
-        mut ms: MatchStmtNode* = new MatchStmtNode(subject, span);
+        const ms: MatchStmt* = MatchStmt::new(subject);
         for (mut i: i64 = 0; i < me.arms.length; i++) {
             mut arm: MatchArmNode* = me.arms[i];
             if (arm == null) { continue; }
@@ -6096,7 +6020,7 @@ type struct AsyncLower {
             arm.body = this.hoist_branch(arm.body);
             ms.add_arm(arm);
         }
-        pre.push(ms as StatementNode*);
+        pre.push(new Stmt(StmtKind::Match(ms), span));
         return this.ident_bound(tv.name, tv.sym, vty, span);
     }
 
@@ -6104,40 +6028,45 @@ type struct AsyncLower {
     /// `tv` instead of producing it. The value is the block's trailing
     /// expression statement, which is how an arm value is recorded; an arm that
     /// diverges instead has none and is returned untouched.
-    arm_value_to_assign(mut &this, body: StatementNode*, tv: MintedLocal,
-                        vty: TypeRef) -> StatementNode* {
+    arm_value_to_assign(mut &this, body: Stmt*, tv: MintedLocal,
+                        vty: TypeRef) -> Stmt* {
         if (body == null) { return null; }
-        if (body.kind == NodeKind::ExpressionStatement) {
-            const es: ExprStmtNode* = body as ExprStmtNode*;
-            return this.assign_local_stmt(tv, vty, es.expression, body.span);
+        match (body.shape) {
+            StmtKind::Expr(es) => {
+                return this.assign_local_stmt(tv, vty, es.expression, body.span);
+            }
+            StmtKind::Block(blk) => {
+                const n: i64 = blk.statements.length;
+                if (n == 0) { return body; }
+                const last: Stmt* = blk.statements[n - 1];
+                if (last == null) { return body; }
+                match (last.shape) {
+                    StmtKind::Expr(es) => {
+                        blk.statements[n - 1] = this.assign_local_stmt(tv, vty, es.expression, last.span);
+                    }
+                    _ => {}
+                }
+                return body;
+            }
+            _ => { return body; }
         }
-        if (body.kind != NodeKind::BlockStatement) { return body; }
-        mut blk: BlockStmtNode* = body as BlockStmtNode*;
-        const n: i64 = blk.statements.length;
-        if (n == 0) { return body; }
-        const last: StatementNode* = blk.statements[n - 1];
-        if (last == null || last.kind != NodeKind::ExpressionStatement) { return body; }
-        const es: ExprStmtNode* = last as ExprStmtNode*;
-        blk.statements[n - 1] = this.assign_local_stmt(tv, vty, es.expression, last.span);
-        return body;
     }
 
     /// `{ <lifted statements of `value`>; <tv> = <value>; }` — one arm of a
     /// lowered `?:`.
     hoist_arm_block(mut &this, value: ExpressionNode*, tv: MintedLocal, vty: TypeRef,
-                    span: SourceSpan) -> BlockStmtNode* {
+                    span: SourceSpan) -> Stmt* {
         mut inner: HoistPre = HoistPre { stmts: [] };
         mut v: ExpressionNode* = this.hoist_expr(value, &inner);
-        mut blk: BlockStmtNode* = new BlockStmtNode(span);
-        for (mut i: i64 = 0; i < inner.stmts.length; i++) { blk.add_statement(inner.stmts[i]); }
-        blk.add_statement(this.assign_local_stmt(tv, vty, v, span));
+        const blk: Stmt* = Stmt::block(span);
+        for (mut i: i64 = 0; i < inner.stmts.length; i++) { blk.as_block().add_statement(inner.stmts[i]); }
+        blk.as_block().add_statement(this.assign_local_stmt(tv, vty, v, span));
         return blk;
     }
 
     /// Rewrite every statement of `blk` in place, splicing each one's lifted
     /// statements in immediately before it.
-    hoist_block(mut &this, blk: BlockStmtNode*) -> void {
-        if (blk == null) { return; }
+    hoist_block(mut &this, blk: BlockStmt*) -> void {
         mut acc: HoistPre = HoistPre { stmts: [] };
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             this.hoist_stmt(blk.statements[i], &acc);
@@ -6147,78 +6076,84 @@ type struct AsyncLower {
 
     /// A branch body (a block, a bare statement, or an `else if`) rewritten into
     /// a block, so a statement that lifts anything has somewhere to put it.
-    hoist_branch(mut &this, s: StatementNode*) -> StatementNode* {
+    hoist_branch(mut &this, s: Stmt*) -> Stmt* {
         if (s == null) { return null; }
-        if (s.kind == NodeKind::BlockStatement) {
-            this.hoist_block(s as BlockStmtNode*);
-            return s;
+        match (s.shape) {
+            StmtKind::Block(b) => {
+                this.hoist_block(b);
+                return s;
+            }
+            _ => {}
         }
         mut out: HoistPre = HoistPre { stmts: [] };
         this.hoist_stmt(s, &out);
         if (out.stmts.length == 1) { return out.stmts[0]; }
-        mut blk: BlockStmtNode* = new BlockStmtNode(s.span);
-        for (mut i: i64 = 0; i < out.stmts.length; i++) { blk.add_statement(out.stmts[i]); }
-        return blk as StatementNode*;
+        const blk: Stmt* = Stmt::block(s.span);
+        for (mut i: i64 = 0; i < out.stmts.length; i++) { blk.as_block().add_statement(out.stmts[i]); }
+        return blk;
     }
 
     /// Rewrite one statement, appending what it lifts and then the statement
     /// itself to `out`. A statement holding no `await` anywhere is untouched.
-    hoist_stmt(mut &this, s: StatementNode*, out: HoistPre*) -> void {
+    hoist_stmt(mut &this, s: Stmt*, out: HoistPre*) -> void {
         if (s == null) { return; }
         if (this.stmt_await_count(s) == 0 && !this.has_free_break_continue(s)) {
             out.push(s); return;
         }
-        const k: NodeKind = s.kind;
         mut pre: HoistPre = HoistPre { stmts: [] };
 
-        if (k == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = s as DeclStmtNode*;
-            this.set_decl_stmt_init(ds, this.hoist_toplevel(this.decl_stmt_init(ds), &pre));
-        } else if (k == NodeKind::ReturnStatement) {
-            mut rs: ReturnStmtNode* = s as ReturnStmtNode*;
-            rs.expression = this.hoist_toplevel(rs.expression, &pre);
-        } else if (k == NodeKind::ExpressionStatement) {
-            mut es: ExprStmtNode* = s as ExprStmtNode*;
-            es.expression = this.hoist_toplevel(es.expression, &pre);
-        } else if (k == NodeKind::BlockStatement) {
-            this.hoist_block(s as BlockStmtNode*);
-        } else if (k == NodeKind::IfStatement) {
-            mut iff: IfStmtNode* = s as IfStmtNode*;
-            // The condition is evaluated once, before either branch, so its
-            // lifted statements belong ahead of the whole `if`.
-            iff.condition = this.hoist_expr(iff.condition, &pre);
-            iff.then_stmt = this.hoist_branch(iff.then_stmt);
-            iff.else_stmt = this.hoist_branch(iff.else_stmt);
-        } else if (k == NodeKind::MatchStatement) {
-            mut m: MatchStmtNode* = s as MatchStmtNode*;
-            m.subject = this.hoist_expr(m.subject, &pre);
-            for (mut i: i64 = 0; i < m.arms.length; i++) {
-                if (m.arms[i] != null) { m.arms[i].body = this.hoist_branch(m.arms[i].body); }
+        match (s.shape) {
+            StmtKind::Decl(ds) => {
+                this.set_decl_stmt_init(ds, this.hoist_toplevel(this.decl_stmt_init(ds), &pre));
             }
-        } else if (k == NodeKind::LoopStatement) {
-            mut lp: LoopStmtNode* = s as LoopStmtNode*;
-            lp.body = this.hoist_branch(lp.body);
-        } else if (k == NodeKind::WhileStatement) {
-            mut w: WhileStmtNode* = s as WhileStmtNode*;
-            w.body = this.hoist_branch(w.body);
-        } else if (k == NodeKind::DoWhileStatement) {
-            mut dw: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            dw.body = this.hoist_branch(dw.body);
-        } else if (k == NodeKind::ForStatement) {
-            mut f: ForStmtNode* = s as ForStmtNode*;
-            // The initializer runs once, before the loop, so what it lifts
-            // belongs ahead of the whole `for`. The condition and the update run
-            // per iteration and are rewritten during lowering instead, inside
-            // the states `continue` re-enters.
-            if (f.init != null) {
-                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                    mut vd: VarDeclNode* = f.init as VarDeclNode*;
-                    vd.initializer = this.hoist_toplevel(vd.initializer, &pre);
-                } else {
-                    f.init = this.hoist_toplevel(f.init as ExpressionNode*, &pre) as ASTNode*;
+            StmtKind::Return(rs) => {
+                rs.expression = this.hoist_toplevel(rs.expression, &pre);
+            }
+            StmtKind::Expr(es) => {
+                es.expression = this.hoist_toplevel(es.expression, &pre);
+            }
+            StmtKind::Block(b) => {
+                this.hoist_block(b);
+            }
+            StmtKind::If(iff) => {
+                // The condition is evaluated once, before either branch, so its
+                // lifted statements belong ahead of the whole `if`.
+                iff.condition = this.hoist_expr(iff.condition, &pre);
+                iff.then_stmt = this.hoist_branch(iff.then_stmt);
+                iff.else_stmt = this.hoist_branch(iff.else_stmt);
+            }
+            StmtKind::Match(m) => {
+                m.subject = this.hoist_expr(m.subject, &pre);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] != null) { m.arms[i].body = this.hoist_branch(m.arms[i].body); }
                 }
             }
-            f.body = this.hoist_branch(f.body);
+            StmtKind::Loop(lp) => {
+                lp.body = this.hoist_branch(lp.body);
+            }
+            StmtKind::While(w) => {
+                w.body = this.hoist_branch(w.body);
+            }
+            StmtKind::DoWhile(dw) => {
+                dw.body = this.hoist_branch(dw.body);
+            }
+            StmtKind::For(f) => {
+                // The initializer runs once, before the loop, so what it lifts
+                // belongs ahead of the whole `for`. The condition and the update run
+                // per iteration and are rewritten during lowering instead, inside
+                // the states `continue` re-enters.
+                if (f.init != null) {
+                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                        mut vd: VarDeclNode* = f.init as VarDeclNode*;
+                        vd.initializer = this.hoist_toplevel(vd.initializer, &pre);
+                    } else {
+                        f.init = this.hoist_toplevel(f.init as ExpressionNode*, &pre) as ASTNode*;
+                    }
+                }
+                f.body = this.hoist_branch(f.body);
+            }
+            StmtKind::UnsafeBlock(_) | StmtKind::StaticMatch(_) | StmtKind::Asm(_)
+            | StmtKind::Break | StmtKind::Continue => {}
         }
 
         for (mut i: i64 = 0; i < pre.stmts.length; i++) { out.push(pre.stmts[i]); }
@@ -6254,8 +6189,10 @@ type struct AsyncLower {
     /// locals and are indistinguishable from them afterwards.
     hoist_awaits(mut &this, node: FunctionDeclNode*) -> void {
         if (node == null || node.body == null) { return; }
-        if (node.body.kind != NodeKind::BlockStatement) { return; }
-        this.hoist_block(node.body as BlockStmtNode*);
+        match (node.body.shape) {
+            StmtKind::Block(b) => { this.hoist_block(b); }
+            _ => {}
+        }
     }
 
     // ---- pre-lowering local disambiguation (alpha-rename by binding) ----
@@ -6316,26 +6253,31 @@ type struct AsyncLower {
     /// suspend falls between their declaration and their use.  The value is
     /// released exactly as before: `__ds` and each temporary are moved from,
     /// and each field's declaration releases its field at scope exit.
-    split_destructures(mut &this, blk: BlockStmtNode*) -> void {
-        mut out: [StatementNode*] = [];
+    split_destructures(mut &this, blk: BlockStmt*) -> void {
+        mut out: [Stmt*] = [];
         mut split: boolean = false;
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            const s: StatementNode* = blk.statements[i];
-            if (s == null || s.kind != NodeKind::DeclarationStatement) { out.push(s); continue; }
-            const ds: DeclStmtNode* = s as DeclStmtNode*;
+            const s: Stmt* = blk.statements[i];
+            const ds: DeclStmt* = if (s == null) { null } else {
+                match (s.shape) {
+                    StmtKind::Decl(d) => { d }
+                    _                 => { null }
+                }
+            };
+            if (ds == null) { out.push(s); continue; }
             if (ds.declaration == null
                     || ds.declaration.kind != NodeKind::DestructureDeclaration) {
                 out.push(s); continue;
             }
             mut dd: DestructureDeclNode* = ds.declaration as DestructureDeclNode*;
             if (dd.initializer == null || !this.destructure_typed(dd)) { out.push(s); continue; }
-            const span: SourceSpan = (s as ASTNode*).span;
+            const span: SourceSpan = s.span;
             const src: SymbolStr = this.intern.intern("__ds");
             const src_id: SymbolID = this.resolver.alloc_synthetic_binding();
             out.push(this.var_decl_stmt_bound(src, src_id, false, dd.resolved_type,
                                               dd.initializer, span));
             dd.initializer = this.ident_bound(src, src_id, dd.resolved_type, span);
-            mut fields: [StatementNode*] = [];
+            mut fields: [Stmt*] = [];
             for (mut j: i64 = 0; j < dd.bindings.length; j++) {
                 mut b: DestructureBinding = dd.bindings[j];
                 const tmp: SymbolStr = this.intern.intern(
@@ -6371,19 +6313,11 @@ type struct AsyncLower {
     }
 
     /// Walk a block.
-    rn_block(mut &this, map: RenameMap*, blk: BlockStmtNode*) -> void {
-        if (blk == null) { return; }
+    rn_block(mut &this, map: RenameMap*, blk: BlockStmt*) -> void {
         this.split_destructures(blk);
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             this.rn_stmt(map, blk.statements[i]);
         }
-    }
-
-    /// Walk a branch/loop body.
-    rn_scoped(mut &this, map: RenameMap*, s: StatementNode*) -> void {
-        if (s == null) { return; }
-        if (s.kind == NodeKind::BlockStatement) { this.rn_block(map, s as BlockStmtNode*); return; }
-        this.rn_stmt(map, s);
     }
 
     /// Walk a `match`/`match`-expression arm, alpha-renaming its pattern bindings
@@ -6595,72 +6529,55 @@ type struct AsyncLower {
     /// and only within its scope. Covers the control-flow containers an async fn
     /// body uses; an unwalked container leaves a renamed local's use un-renamed
     /// (a loud "not found"), never a silent miscompile.
-    rn_stmt(mut &this, map: RenameMap*, s: StatementNode*) -> void {
+    rn_stmt(mut &this, map: RenameMap*, s: Stmt*) -> void {
         if (s == null) { return; }
-        const k: NodeKind = s.kind;
-        if (k == NodeKind::ExpressionStatement) {
-            this.rn_expr(map, (s as ExprStmtNode*).expression); return;
-        }
-        if (k == NodeKind::ReturnStatement) {
-            this.rn_expr(map, (s as ReturnStmtNode*).expression); return;
-        }
-        if (k == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = s as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                this.rn_var_decl(map, ds.declaration as VarDeclNode*);
-            } else if (ds.declaration != null &&
-                       ds.declaration.kind == NodeKind::DestructureDeclaration) {
-                this.rn_destructure(map, ds.declaration as DestructureDeclNode*);
-            }
-            return;
-        }
-        if (k == NodeKind::BlockStatement) { this.rn_block(map, s as BlockStmtNode*); return; }
-        if (k == NodeKind::UnsafeBlockStatement) {
-            this.rn_block(map, (s as UnsafeBlockStmtNode*).block); return;
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = s as IfStmtNode*;
-            this.rn_expr(map, iff.condition);
-            this.rn_scoped(map, iff.then_stmt);
-            this.rn_scoped(map, iff.else_stmt);
-            return;
-        }
-        if (k == NodeKind::WhileStatement) {
-            const w: WhileStmtNode* = s as WhileStmtNode*;
-            this.rn_expr(map, w.condition);
-            this.rn_scoped(map, w.body);
-            return;
-        }
-        if (k == NodeKind::DoWhileStatement) {
-            const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            this.rn_scoped(map, d.body);
-            this.rn_expr(map, d.condition);
-            return;
-        }
-        if (k == NodeKind::ForStatement) {
-            const f: ForStmtNode* = s as ForStmtNode*;
-            if (f.init != null) {
-                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                    this.rn_var_decl(map, f.init as VarDeclNode*);
-                } else {
-                    this.rn_expr(map, f.init as ExpressionNode*);
+        match (s.shape) {
+            StmtKind::Expr(e)   => { this.rn_expr(map, e.expression); }
+            StmtKind::Return(r) => { this.rn_expr(map, r.expression); }
+            StmtKind::Decl(ds) => {
+                if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                    this.rn_var_decl(map, ds.declaration as VarDeclNode*);
+                } else if (ds.declaration != null &&
+                           ds.declaration.kind == NodeKind::DestructureDeclaration) {
+                    this.rn_destructure(map, ds.declaration as DestructureDeclNode*);
                 }
             }
-            this.rn_expr(map, f.condition);
-            this.rn_expr(map, f.update);
-            this.rn_scoped(map, f.body);
-            return;
+            StmtKind::Block(b)       => { this.rn_block(map, b); }
+            StmtKind::UnsafeBlock(u) => { this.rn_block(map, u.block.as_block()); }
+            StmtKind::If(iff) => {
+                this.rn_expr(map, iff.condition);
+                this.rn_stmt(map, iff.then_stmt);
+                this.rn_stmt(map, iff.else_stmt);
+            }
+            StmtKind::While(w) => {
+                this.rn_expr(map, w.condition);
+                this.rn_stmt(map, w.body);
+            }
+            StmtKind::DoWhile(d) => {
+                this.rn_stmt(map, d.body);
+                this.rn_expr(map, d.condition);
+            }
+            StmtKind::For(f) => {
+                if (f.init != null) {
+                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                        this.rn_var_decl(map, f.init as VarDeclNode*);
+                    } else {
+                        this.rn_expr(map, f.init as ExpressionNode*);
+                    }
+                }
+                this.rn_expr(map, f.condition);
+                this.rn_expr(map, f.update);
+                this.rn_stmt(map, f.body);
+            }
+            StmtKind::Loop(l) => { this.rn_stmt(map, l.body); }
+            StmtKind::Match(m) => {
+                this.rn_expr(map, m.subject);
+                for (mut i: i64 = 0; i < m.arms.length; i++) { this.rn_arm(map, m.arms[i]); }
+            }
+            // Break / Continue / Asm carry no local read or declaration; a
+            // `static match` arm is not walked.
+            StmtKind::Break | StmtKind::Continue | StmtKind::Asm(_) | StmtKind::StaticMatch(_) => {}
         }
-        if (k == NodeKind::LoopStatement) {
-            this.rn_scoped(map, (s as LoopStmtNode*).body); return;
-        }
-        if (k == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = s as MatchStmtNode*;
-            this.rn_expr(map, m.subject);
-            for (mut i: i64 = 0; i < m.arms.length; i++) { this.rn_arm(map, m.arms[i]); }
-            return;
-        }
-        // Break / Continue / Asm carry no local read or declaration.
     }
 
     /// Alpha-rename every local declaration in the async body to a globally-unique
@@ -6671,9 +6588,14 @@ type struct AsyncLower {
     disambiguate_locals(mut &this, node: FunctionDeclNode*) -> void {
         this.frame_locals = [];
         this.frame_local_src = [];
-        if (node.body == null || node.body.kind != NodeKind::BlockStatement) { return; }
-        mut map: RenameMap = RenameMap { syms: [], fresh: [] };
-        this.rn_block(&map, node.body as BlockStmtNode*);
+        if (node.body == null) { return; }
+        match (node.body.shape) {
+            StmtKind::Block(b) => {
+                mut map: RenameMap = RenameMap { syms: [], fresh: [] };
+                this.rn_block(&map, b);
+            }
+            _ => {}
+        }
     }
 
     // ---- post-lowering binding identities ----
@@ -6731,8 +6653,7 @@ type struct AsyncLower {
         this.rb_bind(ctx, this.decl_key(vd), vd.sym_id);
     }
 
-    rb_block(mut &this, ctx: RebindCtx*, blk: BlockStmtNode*) -> void {
-        if (blk == null) { return; }
+    rb_block(mut &this, ctx: RebindCtx*, blk: BlockStmt*) -> void {
         this.rb_enter(ctx);
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             this.rb_stmt(ctx, blk.statements[i]);
@@ -6740,12 +6661,16 @@ type struct AsyncLower {
         this.rb_leave(ctx);
     }
 
-    rb_scoped(mut &this, ctx: RebindCtx*, s: StatementNode*) -> void {
+    rb_scoped(mut &this, ctx: RebindCtx*, s: Stmt*) -> void {
         if (s == null) { return; }
-        if (s.kind == NodeKind::BlockStatement) { this.rb_block(ctx, s as BlockStmtNode*); return; }
-        this.rb_enter(ctx);
-        this.rb_stmt(ctx, s);
-        this.rb_leave(ctx);
+        match (s.shape) {
+            StmtKind::Block(b) => { this.rb_block(ctx, b); }
+            _ => {
+                this.rb_enter(ctx);
+                this.rb_stmt(ctx, s);
+                this.rb_leave(ctx);
+            }
+        }
     }
 
     rb_pattern(mut &this, ctx: RebindCtx*, pat: Pattern*) -> void {
@@ -6901,79 +6826,61 @@ type struct AsyncLower {
         }
     }
 
-    rb_stmt(mut &this, ctx: RebindCtx*, s: StatementNode*) -> void {
+    rb_stmt(mut &this, ctx: RebindCtx*, s: Stmt*) -> void {
         if (s == null) { return; }
-        const k: NodeKind = s.kind;
-        if (k == NodeKind::ExpressionStatement) {
-            this.rb_expr(ctx, (s as ExprStmtNode*).expression); return;
-        }
-        if (k == NodeKind::ReturnStatement) {
-            this.rb_expr(ctx, (s as ReturnStmtNode*).expression); return;
-        }
-        if (k == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = s as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                this.rb_var_decl(ctx, ds.declaration as VarDeclNode*);
-            } else if (ds.declaration != null &&
-                       ds.declaration.kind == NodeKind::DestructureDeclaration) {
-                mut dd: DestructureDeclNode* = ds.declaration as DestructureDeclNode*;
-                this.rb_expr(ctx, dd.initializer);
-                for (mut i: i64 = 0; i < dd.bindings.length; i++) {
-                    if (!dd.bindings[i].sym_id.is_valid()) {
-                        dd.bindings[i].sym_id = this.resolver.alloc_synthetic_binding();
+        match (s.shape) {
+            StmtKind::Expr(e)   => { this.rb_expr(ctx, e.expression); }
+            StmtKind::Return(r) => { this.rb_expr(ctx, r.expression); }
+            StmtKind::Decl(ds) => {
+                if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                    this.rb_var_decl(ctx, ds.declaration as VarDeclNode*);
+                } else if (ds.declaration != null &&
+                           ds.declaration.kind == NodeKind::DestructureDeclaration) {
+                    mut dd: DestructureDeclNode* = ds.declaration as DestructureDeclNode*;
+                    this.rb_expr(ctx, dd.initializer);
+                    for (mut i: i64 = 0; i < dd.bindings.length; i++) {
+                        if (!dd.bindings[i].sym_id.is_valid()) {
+                            dd.bindings[i].sym_id = this.resolver.alloc_synthetic_binding();
+                        }
+                        this.rb_bind(ctx, dd.bindings[i].sym_id, dd.bindings[i].sym_id);
                     }
-                    this.rb_bind(ctx, dd.bindings[i].sym_id, dd.bindings[i].sym_id);
                 }
             }
-            return;
-        }
-        if (k == NodeKind::BlockStatement) { this.rb_block(ctx, s as BlockStmtNode*); return; }
-        if (k == NodeKind::UnsafeBlockStatement) {
-            this.rb_block(ctx, (s as UnsafeBlockStmtNode*).block); return;
-        }
-        if (k == NodeKind::IfStatement) {
-            const iff: IfStmtNode* = s as IfStmtNode*;
-            this.rb_expr(ctx, iff.condition);
-            this.rb_scoped(ctx, iff.then_stmt);
-            this.rb_scoped(ctx, iff.else_stmt);
-            return;
-        }
-        if (k == NodeKind::WhileStatement) {
-            const w: WhileStmtNode* = s as WhileStmtNode*;
-            this.rb_expr(ctx, w.condition);
-            this.rb_scoped(ctx, w.body);
-            return;
-        }
-        if (k == NodeKind::DoWhileStatement) {
-            const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            this.rb_scoped(ctx, d.body);
-            this.rb_expr(ctx, d.condition);
-            return;
-        }
-        if (k == NodeKind::ForStatement) {
-            const f: ForStmtNode* = s as ForStmtNode*;
-            this.rb_enter(ctx);
-            if (f.init != null) {
-                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                    this.rb_var_decl(ctx, f.init as VarDeclNode*);
-                } else {
-                    this.rb_expr(ctx, f.init as ExpressionNode*);
-                }
+            StmtKind::Block(b)       => { this.rb_block(ctx, b); }
+            StmtKind::UnsafeBlock(u) => { this.rb_block(ctx, u.block.as_block()); }
+            StmtKind::If(iff) => {
+                this.rb_expr(ctx, iff.condition);
+                this.rb_scoped(ctx, iff.then_stmt);
+                this.rb_scoped(ctx, iff.else_stmt);
             }
-            this.rb_expr(ctx, f.condition);
-            this.rb_expr(ctx, f.update);
-            this.rb_scoped(ctx, f.body);
-            this.rb_leave(ctx);
-            return;
-        }
-        if (k == NodeKind::LoopStatement) {
-            this.rb_scoped(ctx, (s as LoopStmtNode*).body); return;
-        }
-        if (k == NodeKind::MatchStatement) {
-            const m: MatchStmtNode* = s as MatchStmtNode*;
-            this.rb_expr(ctx, m.subject);
-            for (mut i: i64 = 0; i < m.arms.length; i++) { this.rb_arm(ctx, m.arms[i]); }
-            return;
+            StmtKind::While(w) => {
+                this.rb_expr(ctx, w.condition);
+                this.rb_scoped(ctx, w.body);
+            }
+            StmtKind::DoWhile(d) => {
+                this.rb_scoped(ctx, d.body);
+                this.rb_expr(ctx, d.condition);
+            }
+            StmtKind::For(f) => {
+                this.rb_enter(ctx);
+                if (f.init != null) {
+                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                        this.rb_var_decl(ctx, f.init as VarDeclNode*);
+                    } else {
+                        this.rb_expr(ctx, f.init as ExpressionNode*);
+                    }
+                }
+                this.rb_expr(ctx, f.condition);
+                this.rb_expr(ctx, f.update);
+                this.rb_scoped(ctx, f.body);
+                this.rb_leave(ctx);
+            }
+            StmtKind::Loop(l) => { this.rb_scoped(ctx, l.body); }
+            StmtKind::Match(m) => {
+                this.rb_expr(ctx, m.subject);
+                for (mut i: i64 = 0; i < m.arms.length; i++) { this.rb_arm(ctx, m.arms[i]); }
+            }
+            StmtKind::Break | StmtKind::Continue | StmtKind::Asm(_) | StmtKind::StaticMatch(_) => {}
         }
     }
 
@@ -6999,7 +6906,7 @@ type struct AsyncLower {
     /// unsupported await shape, a body that can fall off its end, or a
     /// `mut`/aggregate/reference held across a suspend. Populates `sm.fut_*` /
     /// `sm.prom_*`, which `lower` consumes to build the struct fields.
-    build_poll_body_sm(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, sm: PollSm*) -> BlockStmtNode* {
+    build_poll_body_sm(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, sm: PollSm*) -> Stmt* {
         const span: SourceSpan = sm.span;
         // Reduce every `await` to one of the three carrier shapes the state
         // machine explodes, so the passes below never meet one nested in an
@@ -7015,10 +6922,10 @@ type struct AsyncLower {
         // body now uses.
         this.collect_frame_names(d, sm, node);
 
-        mut body: BlockStmtNode* = new BlockStmtNode(span);
-        this.emit_shadow_prelude(d, node, body, sm, true, span);
+        mut body: Stmt* = Stmt::block(span);
+        this.emit_shadow_prelude(d, node, body.as_block(), sm, true, span);
 
-        const orig: BlockStmtNode* = node.body as BlockStmtNode*;
+        const orig: Stmt* = node.body;
         const entry: i64 = this.sm_alloc(sm);   // state 0
         const tail: i64 = this.lower_block_sm(sm, orig, entry);
         if (!sm.ok) { return null; }
@@ -7029,7 +6936,7 @@ type struct AsyncLower {
         // appended below. A value-returning body reaching here means the return
         // analysis disagrees with the pre-lowering check, which is a shape this
         // lowering cannot express — report it rather than miscompile.
-        const falls_off: boolean = !this.stmt_diverges(orig as StatementNode*);
+        const falls_off: boolean = !this.stmt_diverges(orig);
         if (falls_off && !sm.unit_output) {
             this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                 "async: an `async function` with `await`s must return on every path; this body can fall off its end without producing its return value",
@@ -7046,22 +6953,22 @@ type struct AsyncLower {
         // to the end of a state, and a `return` placed before those would strand
         // them behind it.
         if (falls_off) {
-            sm.blocks[tail].add_statement(this.unit_ready_return(sm.poll_out, span));
+            sm.blocks[tail].as_block().add_statement(this.unit_ready_return(sm.poll_out, span));
         }
 
         // Assemble `loop { match (this.state) { i => <block i>, _ => Pending } }`.
-        mut dispatch: MatchStmtNode* = new MatchStmtNode(
-            this.own_field(sm.struct_ref, sm.state_sym, sm.u32_ty, span), span);
+        const dispatch: MatchStmt* = MatchStmt::new(
+            this.own_field(sm.struct_ref, sm.state_sym, sm.u32_ty, span));
         for (mut i: i64 = 0; i < sm.blocks.length; i++) {
             dispatch.add_arm(this.match_arm_int(i as u64, sm.blocks[i], span));
         }
-        mut wblk: BlockStmtNode* = new BlockStmtNode(span);
-        wblk.add_statement(new ReturnStmtNode(this.poll_pending(sm.poll_out, span), span) as StatementNode*);
+        mut wblk: Stmt* = Stmt::block(span);
+        wblk.as_block().add_statement(Stmt::return_stmt(this.poll_pending(sm.poll_out, span), span));
         dispatch.add_arm(this.match_arm_wild(wblk, span));
 
-        mut loop_body: BlockStmtNode* = new BlockStmtNode(span);
-        loop_body.add_statement(dispatch as StatementNode*);
-        body.add_statement(new LoopStmtNode(loop_body as StatementNode*, span) as StatementNode*);
+        mut loop_body: Stmt* = Stmt::block(span);
+        loop_body.as_block().add_statement(new Stmt(StmtKind::Match(dispatch), span));
+        body.as_block().add_statement(Stmt::loop_stmt(loop_body, span));
         return body;
     }
 
@@ -7181,7 +7088,7 @@ type struct AsyncLower {
             fwd.push(fwd_use as ExpressionNode*);
         }
 
-        mut body: BlockStmtNode* = new BlockStmtNode(span);
+        mut body: Stmt* = Stmt::block(span);
 
         // `mut ex: Executor = Executor::new();`
         mut ex_scope: ScopeResolutionNode* = new ScopeResolutionNode(
@@ -7194,7 +7101,7 @@ type struct AsyncLower {
         ex_decl.set_mutable(true);
         ex_decl.set_type_annotation(this.make_type_ann(exec_ty, span));
         ex_decl.set_initializer(ex_new as ExpressionNode*);
-        body.add_statement(new DeclStmtNode(ex_decl as DeclarationNode*, span) as StatementNode*);
+        body.as_block().add_statement(Stmt::decl_stmt(ex_decl as DeclarationNode*, span));
 
         // `ex.block_on(main$async(<forwarded>))`.  Nothing name-resolves a
         // synthesized identifier, so the call names the renamed body by the
@@ -7211,10 +7118,10 @@ type struct AsyncLower {
         drive.add_argument(root as ExpressionNode*);
 
         if (returns_void) {
-            body.add_statement(new ExprStmtNode(drive as ExpressionNode*, span) as StatementNode*);
-            body.add_statement(new ReturnStmtNode(
+            body.as_block().add_statement(Stmt::expr_stmt(drive as ExpressionNode*, span));
+            body.as_block().add_statement(Stmt::return_stmt(
                 new LiteralNode("0", LiteralKind::Integer, span) as ExpressionNode*,
-                span) as StatementNode*);
+                span));
         } else {
             // Bound to a local rather than returned directly: the binding's
             // annotation is the expected type that fixes `block_on`'s `O`, which
@@ -7225,11 +7132,11 @@ type struct AsyncLower {
             out_decl.set_mutable(false);
             out_decl.set_type_annotation(this.make_type_ann(i32_ty, span));
             out_decl.set_initializer(drive as ExpressionNode*);
-            body.add_statement(new DeclStmtNode(out_decl as DeclarationNode*, span) as StatementNode*);
+            body.as_block().add_statement(Stmt::decl_stmt(out_decl as DeclarationNode*, span));
             mut out_use: IdentifierNode* = new IdentifierNode(out_sym, span);
             out_use.set_res(Res::Local(out_decl.sym_id));
-            body.add_statement(new ReturnStmtNode(
-                out_use as ExpressionNode*, span) as StatementNode*);
+            body.as_block().add_statement(Stmt::return_stmt(
+                out_use as ExpressionNode*, span));
         }
         wrapper.set_body(body);
         // Name resolution has already run, so the resolution map holds no entry
@@ -7758,12 +7665,16 @@ type struct AsyncLower {
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             if (this.is_receiver_param(node.parameters[i])) { recv_key = node.parameters[i].sym_id; }
         }
-        if (recv_field.is_valid() && node.body.kind == NodeKind::BlockStatement) {
+        const body_is_block: boolean = match (node.body.shape) {
+            StmtKind::Block(_) => { true }
+            _                  => { false }
+        };
+        if (recv_field.is_valid() && body_is_block) {
             this.subst_mode = if (this.pending[pi].recv_ptr) {
                 this.subst_to_local_deref()
             } else { this.subst_to_local() };
             this.subst_local_sym = recv_key;
-            this.subst_name_stmt(node.body as StatementNode*, recv_key, recv_field,
+            this.subst_name_stmt(node.body, recv_key, recv_field,
                                  self_ty, this.pending[pi].recv_ty, span);
             this.subst_mode = this.subst_to_field();
             this.subst_local_sym = SymbolID::invalid();
@@ -7774,9 +7685,10 @@ type struct AsyncLower {
         // recursive builder emits `loop { match (this.state) {…} }`, recording one
         // `fut_k: Option<F_k>` sub-future per await and one field per promoted
         // cross-state scalar local into `sm`.
-        const total_await: i64 = if (node.body.kind == NodeKind::BlockStatement) {
-            this.block_await_count(node.body as BlockStmtNode*)
-        } else { 0 };
+        const total_await: i64 = match (node.body.shape) {
+            StmtKind::Block(_) => { this.stmt_await_count(node.body) }
+            _                  => { 0 }
+        };
 
         // A generic future's own body instantiates types that mention its
         // parameters (`Option<T>`, the `Poll<F::Output>` of a sub-future). None
@@ -7803,7 +7715,7 @@ type struct AsyncLower {
         // has a destructor, so it is needed by a body with no `await` too: such a
         // parameter has to move out of its field on the single poll, and only a
         // slot that can be left empty records that the future no longer owns it.
-        mut body_block: BlockStmtNode* = null;
+        mut body_block: Stmt* = null;
         sm.opt_base = this.lookup_future_type(this.ctx.generic_registry.wellknown(LangItem::Option));
         if (!sm.opt_base.is_valid()
             && (total_await > 0 || this.params_need_carrier(&this.pending[pi], node))) {
@@ -7961,9 +7873,9 @@ type struct AsyncLower {
             ctor_lit.set_generic_args(this.generic_param_anns(this.pending[pi].fut_params, span));
         }
         ctor_lit.set_resolved_type(self_ty);
-        mut ret: ReturnStmtNode* = new ReturnStmtNode(ctor_lit as ExpressionNode*, span);
-        mut new_body: BlockStmtNode* = new BlockStmtNode(span);
-        new_body.add_statement(ret as StatementNode*);
+        mut ret: Stmt* = Stmt::return_stmt(ctor_lit as ExpressionNode*, span);
+        mut new_body: Stmt* = Stmt::block(span);
+        new_body.as_block().add_statement(ret);
 
         node.set_body(new_body);
         node.set_resolved_return_type(self_ty);

@@ -236,6 +236,17 @@ yet is recorded with the change that builds it, not here.
      the node split's memory cost (about 3% of the arena) accepted.
      (Jake)
 
+403. **`Type` keeps its stored `kind` field.**  Deriving it from the
+     payload (ruling 390) waits until the compiler itself is built with
+     LLVM optimisation, which folds a `match` yielding constants into a
+     table load; built unoptimised, the derived read measured 5.5% slower
+     with `![inline]`.  The roadmap carries the two steps.  (Jake)
+
+404. **A method's name read as a field is fixed by a suggestion showing
+     the corrected line** (`t.kind()` under the source line), with no
+     separate plain help line.  This settles the wording ruling 399 left
+     open.  (Jake)
+
 ### 2026-10-15
 
 347. **Fixed-size arrays change syntax with dynamic ones:** `T[N]` is

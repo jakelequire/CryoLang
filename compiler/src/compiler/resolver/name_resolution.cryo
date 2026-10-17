@@ -59,11 +59,7 @@ import compiler::ast::pattern::{
     BindingPattern, ConstantPattern, DirectiveArgKind, DirectiveNode, EnumPattern, MatchArmNode,
     Pattern, PatternKind, StaticMatchArmNode
 };
-import compiler::ast::statement::{
-    AsmBlockStmtNode, AsmOperand, BlockStmtNode, DeclStmtNode, DoWhileStmtNode,
-    ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
-    StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
-};
+import compiler::ast::statement::{ BlockStmt, ForStmt, StaticMatchStmt, Stmt, StmtKind };
 import compiler::ast::walk;
 import compiler::ast::walk::{ Walk };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
@@ -593,10 +589,14 @@ type struct NameResolver {
                     }
                 }
             }
-            NodeKind::DeclarationStatement => {
-                const decl_stmt: DeclStmtNode* = node as DeclStmtNode*;
-                if (decl_stmt.declaration != null) {
-                    this.forward_declare_node(decl_stmt.declaration as ASTNode*);
+            NodeKind::Statement => {
+                match ((node as Stmt*).shape) {
+                    StmtKind::Decl(decl_stmt) => {
+                        if (decl_stmt.declaration != null) {
+                            this.forward_declare_node(decl_stmt.declaration as ASTNode*);
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {
@@ -2366,10 +2366,11 @@ type struct NameResolver {
     }
 
     /// Visit block contents without creating a new scope (caller manages scope).
-    visit_block_contents(mut &this, block: BlockStmtNode*) -> void {
+    visit_block_contents(mut &this, block: Stmt*) -> void {
         if (block == null) { return; }
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            this.walk_node(block.statements[i]);
+        const b: BlockStmt* = block.as_block();
+        for (mut i: i64 = 0; i < b.statements.length; i++) {
+            this.walk_stmt(b.statements[i]);
         }
     }
 
@@ -3770,16 +3771,16 @@ implement trait Walk for struct NameResolver {
         this.stamp_annotation(node.type_ann);
     }
 
-    walk_block(mut &this, node: BlockStmtNode*) -> void {
-        this.resolver.enter_scope(ScopeKind::Block, "<block>", node.span);
-        this.visit_block_contents(node);
+    walk_block(mut &this, s: Stmt*, node: BlockStmt*) -> void {
+        this.resolver.enter_scope(ScopeKind::Block, "<block>", s.span);
+        this.visit_block_contents(s);
         this.resolver.exit_scope();
     }
 
 
-    walk_for(mut &this, node: ForStmtNode*) -> void {
+    walk_for(mut &this, s: Stmt*, node: ForStmt*) -> void {
         // For loops create a scope for the loop variable
-        this.resolver.enter_scope(ScopeKind::Block, "<for>", node.span);
+        this.resolver.enter_scope(ScopeKind::Block, "<for>", s.span);
 
         if (node.init != null) {
             this.walk_node(node.init);
@@ -3825,7 +3826,7 @@ implement trait Walk for struct NameResolver {
         this.resolver.exit_scope();
     }
 
-    walk_static_match_stmt(mut &this, node: StaticMatchStmtNode*) -> void {
+    walk_static_match_stmt(mut &this, s: Stmt*, node: StaticMatchStmt*) -> void {
         this.stamp_annotation(node.scrutinee);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             this.walk_node(node.arms[i]);

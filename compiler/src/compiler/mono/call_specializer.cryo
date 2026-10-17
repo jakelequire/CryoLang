@@ -54,11 +54,7 @@ import compiler::ast::expression::{
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
-import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode,
-    MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
-    WhileStmtNode
-};
+import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::mono::ast_resolver::{ MonoAstResolver };
@@ -245,7 +241,7 @@ type struct MonoCallSpecializer {
         if (func == null || func.body == null) { return; }
         const outer: FunctionDeclNode* = this.current_fn;
         this.current_fn = func;
-        this.walk_block(func.body, res_ctx, subst);
+        this.walk_stmt(func.body, res_ctx, subst);
         this.current_fn = outer;
     }
 
@@ -299,25 +295,14 @@ type struct MonoCallSpecializer {
 
     // -- Body walk: find generic calls, dispatch to the per-call consumers --
 
-    walk_block(mut &this, block: BlockStmtNode*, res_ctx: ResolutionContext*,
-               subst: TypeSubstitution*) -> void {
-        if (block == null) { return; }
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            this.walk_stmt(block.statements[i], res_ctx, subst);
-        }
-    }
-
-    walk_stmt(mut &this, stmt: StatementNode*, res_ctx: ResolutionContext*,
+    walk_stmt(mut &this, stmt: Stmt*, res_ctx: ResolutionContext*,
               subst: TypeSubstitution*) -> void {
         if (stmt == null) { return; }
-        const node: ASTNode* = stmt as ASTNode*;
-        match (node.kind) {
-            NodeKind::ExpressionStatement => {
-                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+        match (stmt.shape) {
+            StmtKind::Expr(es) => {
                 this.walk_expr(es.expression, res_ctx, subst);
             }
-            NodeKind::DeclarationStatement => {
-                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            StmtKind::Decl(ds) => {
                 const inner: DeclarationNode* = ds.declaration;
                 if (inner != null && (inner as ASTNode*).kind == NodeKind::DestructureDeclaration) {
                     this.walk_expr((inner as DestructureDeclNode*).initializer, res_ctx, subst);
@@ -341,44 +326,39 @@ type struct MonoCallSpecializer {
                     }
                 }
             }
-            NodeKind::ReturnStatement => {
-                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+            StmtKind::Return(rs) => {
                 if (rs.expression != null) {
                     this.walk_expr(rs.expression, res_ctx, subst);
                 }
             }
-            NodeKind::BlockStatement => {
-                this.walk_block(stmt as BlockStmtNode*, res_ctx, subst);
+            StmtKind::Block(b) => {
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    this.walk_stmt(b.statements[i], res_ctx, subst);
+                }
             }
-            NodeKind::UnsafeBlockStatement => {
+            StmtKind::UnsafeBlock(ub) => {
                 // `unsafe` marks who is responsible for raw-pointer ownership;
                 // it says nothing about instantiation, so the body specializes
                 // exactly like any other block.  Missing this case left a
                 // generic call reachable ONLY from inside an `unsafe` block
                 // with no specialization enqueued, and codegen then failed to
                 // resolve the bare template name (E0636).
-                this.walk_block((stmt as UnsafeBlockStmtNode*).block, res_ctx, subst);
+                this.walk_stmt(ub.block, res_ctx, subst);
             }
-            NodeKind::IfStatement => {
-                const ifs: IfStmtNode* = stmt as IfStmtNode*;
+            StmtKind::If(ifs) => {
                 this.walk_expr(ifs.condition, res_ctx, subst);
-                if (ifs.then_stmt != null) { this.walk_stmt(ifs.then_stmt, res_ctx, subst); }
-                if (ifs.has_else() && ifs.else_stmt != null) {
-                    this.walk_stmt(ifs.else_stmt, res_ctx, subst);
-                }
+                this.walk_stmt(ifs.then_stmt, res_ctx, subst);
+                this.walk_stmt(ifs.else_stmt, res_ctx, subst);
             }
-            NodeKind::WhileStatement => {
-                const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+            StmtKind::While(ws) => {
                 this.walk_expr(ws.condition, res_ctx, subst);
-                if (ws.body != null) { this.walk_stmt(ws.body, res_ctx, subst); }
+                this.walk_stmt(ws.body, res_ctx, subst);
             }
-            NodeKind::DoWhileStatement => {
-                const dw: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
-                if (dw.body != null) { this.walk_stmt(dw.body, res_ctx, subst); }
+            StmtKind::DoWhile(dw) => {
+                this.walk_stmt(dw.body, res_ctx, subst);
                 this.walk_expr(dw.condition, res_ctx, subst);
             }
-            NodeKind::ForStatement => {
-                const fs: ForStmtNode* = stmt as ForStmtNode*;
+            StmtKind::For(fs) => {
                 // The initializer is a declaration or an expression.
                 if (fs.init != null) {
                     if ((fs.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
@@ -389,32 +369,29 @@ type struct MonoCallSpecializer {
                 }
                 if (fs.condition != null) { this.walk_expr(fs.condition, res_ctx, subst); }
                 if (fs.update != null) { this.walk_expr(fs.update, res_ctx, subst); }
-                if (fs.body != null) { this.walk_stmt(fs.body, res_ctx, subst); }
+                this.walk_stmt(fs.body, res_ctx, subst);
             }
-            NodeKind::LoopStatement => {
-                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
-                if (ls.body != null) { this.walk_stmt(ls.body, res_ctx, subst); }
+            StmtKind::Loop(ls) => {
+                this.walk_stmt(ls.body, res_ctx, subst);
             }
-            NodeKind::MatchStatement => {
-                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::Match(ms) => {
                 this.walk_expr(ms.subject, res_ctx, subst);
                 for (mut i: i64 = 0; i < ms.arms.length; i++) {
                     const arm: MatchArmNode* = ms.arms[i];
                     if (arm == null) { continue; }
                     if (arm.guard != null) { this.walk_expr(arm.guard, res_ctx, subst); }
-                    if (arm.body != null) { this.walk_stmt(arm.body, res_ctx, subst); }
+                    this.walk_stmt(arm.body, res_ctx, subst);
                 }
             }
-            NodeKind::StaticMatchStatement => {
-                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sm) => {
                 for (mut i: i64 = 0; i < sm.arms.length; i++) {
                     const arm: StaticMatchArmNode* = sm.arms[i];
-                    if (arm != null && arm.body != null) {
+                    if (arm != null) {
                         this.walk_stmt(arm.body, res_ctx, subst);
                     }
                 }
             }
-            _ => {}
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
@@ -1158,7 +1135,7 @@ type struct MonoCallSpecializer {
                 && this.ast_resolver != null) {
             mut prune_ctx: ResolutionContext = ResolutionContext::new("");
             if (recv_type.is_valid()) { prune_ctx.set_this_type(recv_type); }
-            this.ast_resolver.prune_static_match_in_block(
+            this.ast_resolver.prune_static_match_in_stmt(
                 spec_method.func.body, &prune_ctx);
         }
 

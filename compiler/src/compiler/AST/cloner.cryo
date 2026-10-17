@@ -43,10 +43,9 @@ import compiler::ast::pattern::{
     LiteralPattern, MatchArmNode, Pattern, PatternKind, RangePattern, StaticMatchArmNode
 };
 import compiler::ast::statement::{
-    AsmBlockStmtNode, AsmOperand, AsmPiece, BlockStmtNode, BreakStmtNode, ContinueStmtNode,
-    DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode,
-    MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
-    WhileStmtNode
+    AsmBlockStmt, AsmOperand, BlockStmt, DeclStmt, DoWhileStmt, ExprStmt, ForStmt, IfStmt,
+    LoopStmt, MatchStmt, ReturnStmt, StaticMatchStmt, Stmt, StmtKind, UnsafeBlockStmt,
+    WhileStmt
 };
 
 type struct ASTCloner {
@@ -144,21 +143,7 @@ type struct ASTCloner {
             NodeKind::YieldExpression           => { return this.visit_yield(n as YieldExprNode*); }
             NodeKind::TryExpression             => { return this.visit_try(n as TryExprNode*); }
 
-            NodeKind::BlockStatement            => { return this.visit_block(n as BlockStmtNode*); }
-            NodeKind::UnsafeBlockStatement      => { return this.visit_unsafe_block(n as UnsafeBlockStmtNode*); }
-            NodeKind::AsmBlockStatement         => { return this.visit_asm_block(n as AsmBlockStmtNode*); }
-            NodeKind::ReturnStatement           => { return this.visit_return(n as ReturnStmtNode*); }
-            NodeKind::IfStatement               => { return this.visit_if(n as IfStmtNode*); }
-            NodeKind::WhileStatement            => { return this.visit_while(n as WhileStmtNode*); }
-            NodeKind::DoWhileStatement          => { return this.visit_do_while(n as DoWhileStmtNode*); }
-            NodeKind::ForStatement              => { return this.visit_for(n as ForStmtNode*); }
-            NodeKind::MatchStatement            => { return this.visit_match_stmt(n as MatchStmtNode*); }
-            NodeKind::StaticMatchStatement      => { return this.visit_static_match_stmt(n as StaticMatchStmtNode*); }
-            NodeKind::BreakStatement            => { return this.visit_break(n as BreakStmtNode*); }
-            NodeKind::ContinueStatement         => { return this.visit_continue(n as ContinueStmtNode*); }
-            NodeKind::ExpressionStatement       => { return this.visit_expr_stmt(n as ExprStmtNode*); }
-            NodeKind::DeclarationStatement      => { return this.visit_decl_stmt(n as DeclStmtNode*); }
-            NodeKind::LoopStatement             => { return this.visit_loop(n as LoopStmtNode*); }
+            NodeKind::Statement                 => { return this.copy_stmt(n as Stmt*); }
 
             NodeKind::VariableDeclaration       => { return this.visit_var(n as VarDeclNode*); }
             NodeKind::DestructureDeclaration    => { return this.visit_destructure(n as DestructureDeclNode*); }
@@ -186,7 +171,7 @@ type struct ASTCloner {
             NodeKind::Pattern                   => { return this.clone_pattern(n as Pattern*); }
 
             // Kinds no node is built with.
-            NodeKind::Expression | NodeKind::Statement
+            NodeKind::Expression
             | NodeKind::Declaration | NodeKind::AsyncExpression | NodeKind::Unknown => { return null; }
         }
     }
@@ -215,10 +200,12 @@ type struct ASTCloner {
         return e;
     }
 
-    /// Clone a statement node (cast wrapper).
-    clone_stmt(mut &this, node: StatementNode*) -> StatementNode* {
+    /// Clone a statement node, marked generated when `node` is.
+    clone_stmt(mut &this, node: Stmt*) -> Stmt* {
         if (node == null) { return null; }
-        return ASTCloner::keep_generated(node, this.dispatch_node(node)) as StatementNode*;
+        const c: Stmt* = this.copy_stmt(node);
+        c.generated = node.generated;
+        return c;
     }
 
     /// Clone a declaration node (cast wrapper).
@@ -661,157 +648,98 @@ type struct ASTCloner {
     }
 
 
-    // Statement visitors
+    // Statements
 
-    visit_block(mut &this, node: BlockStmtNode*) -> ASTNode* {
-        mut c: BlockStmtNode* = new BlockStmtNode(node.span);
-        for (mut i: i64 = 0; i < node.statements.length; i++) {
-            c.add_statement(this.clone_stmt(node.statements[i]));
-        }
-        // ConfigGating runs strictly before any clone-emitting pass
-        // (Monomorphization etc.), so attached_directives on a block
-        // are always empty by the time we reach the cloner.  Skipping
-        // the copy avoids burdening the cloner with directive-graph
-        // walking that would otherwise be dead code.
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_unsafe_block(mut &this, node: UnsafeBlockStmtNode*) -> ASTNode* {
-        const cloned_block: BlockStmtNode* = this.dispatch_node(node.block) as BlockStmtNode*;
-        mut c: UnsafeBlockStmtNode* = new UnsafeBlockStmtNode(cloned_block, node.span);
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_asm_block(mut &this, node: AsmBlockStmtNode*) -> ASTNode* {
-        mut c: AsmBlockStmtNode* = new AsmBlockStmtNode(node.span);
-        c.arch = node.arch;
-        c.dialect = node.dialect;
-        c.is_module_level = node.is_module_level;
-        c.has_error = node.has_error;
-        for (mut i: i64 = 0; i < node.operands.length; i++) {
-            mut op: AsmOperand = node.operands[i].clone();
-            op.expr = this.clone_expr(op.expr);
-            c.add_operand(op);
-        }
-        for (mut i: i64 = 0; i < node.pieces.length; i++) {
-            c.add_piece(node.pieces[i].clone());
-        }
-        for (mut i: i64 = 0; i < node.clobbers.length; i++) {
-            c.add_clobber(node.clobbers[i]);
-        }
-        for (mut i: i64 = 0; i < node.attached_directives.length; i++) {
-            c.add_directive(node.attached_directives[i]);
-        }
-        return c;
-    }
-
-    visit_return(mut &this, node: ReturnStmtNode*) -> ASTNode* {
-        mut c: ReturnStmtNode* = new ReturnStmtNode(
-            this.clone_expr(node.expression), node.span
-        );
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_if(mut &this, node: IfStmtNode*) -> ASTNode* {
-        mut c: IfStmtNode* = new IfStmtNode(
-            this.clone_expr(node.condition),
-            this.clone_stmt(node.then_stmt),
-            this.clone_stmt(node.else_stmt),
-            node.span
-        );
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_while(mut &this, node: WhileStmtNode*) -> ASTNode* {
-        mut c: WhileStmtNode* = new WhileStmtNode(
-            this.clone_expr(node.condition),
-            this.clone_stmt(node.body),
-            node.span
-        );
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_do_while(mut &this, node: DoWhileStmtNode*) -> ASTNode* {
-        mut c: DoWhileStmtNode* = new DoWhileStmtNode(
-            this.clone_stmt(node.body),
-            this.clone_expr(node.condition),
-            node.span
-        );
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_for(mut &this, node: ForStmtNode*) -> ASTNode* {
-        mut c: ForStmtNode* = new ForStmtNode(
-            this.clone_node(node.init),
-            this.clone_expr(node.condition),
-            this.clone_expr(node.update),
-            this.clone_stmt(node.body),
-            node.span
-        );
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_match_stmt(mut &this, node: MatchStmtNode*) -> ASTNode* {
-        mut c: MatchStmtNode* = new MatchStmtNode(
-            this.clone_expr(node.subject), node.span
-        );
-        for (mut i: i64 = 0; i < node.arms.length; i++) {
-            c.add_arm(this.clone_match_arm(node.arms[i]));
-        }
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_static_match_stmt(mut &this, node: StaticMatchStmtNode*) -> ASTNode* {
-        mut c: StaticMatchStmtNode* = new StaticMatchStmtNode(
-            this.clone_type_annotation(node.scrutinee), node.span
-        );
-        for (mut i: i64 = 0; i < node.arms.length; i++) {
-            c.add_arm(this.clone_static_match_arm(node.arms[i]));
-        }
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_break(mut &this, node: BreakStmtNode*) -> ASTNode* {
-        mut c: BreakStmtNode* = new BreakStmtNode(node.span);
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_continue(mut &this, node: ContinueStmtNode*) -> ASTNode* {
-        mut c: ContinueStmtNode* = new ContinueStmtNode(node.span);
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_expr_stmt(mut &this, node: ExprStmtNode*) -> ASTNode* {
-        mut c: ExprStmtNode* = new ExprStmtNode(
-            this.clone_expr(node.expression), node.span
-        );
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_decl_stmt(mut &this, node: DeclStmtNode*) -> ASTNode* {
-        mut c: DeclStmtNode* = new DeclStmtNode(
-            this.clone_decl(node.declaration), node.span
-        );
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_loop(mut &this, node: LoopStmtNode*) -> ASTNode* {
-        mut c: LoopStmtNode* = new LoopStmtNode(
-            this.clone_stmt(node.body), node.span
-        );
+    /// The copy of statement `node`, made for its kind; null for null.  The
+    /// copy is marked generated only by `clone_stmt`.
+    copy_stmt(mut &this, node: Stmt*) -> Stmt* {
+        if (node == null) { return null; }
+        const shape: StmtKind = match (node.shape) {
+            StmtKind::Block(n) => {
+                const b: BlockStmt* = BlockStmt::new();
+                for (mut i: i64 = 0; i < n.statements.length; i++) {
+                    b.add_statement(this.clone_stmt(n.statements[i]));
+                }
+                // ConfigGating runs strictly before any clone-emitting pass
+                // (Monomorphization etc.), so attached_directives on a block
+                // are always empty by the time we reach the cloner.  Skipping
+                // the copy avoids burdening the cloner with directive-graph
+                // walking that would otherwise be dead code.
+                StmtKind::Block(b)
+            }
+            StmtKind::UnsafeBlock(n) => {
+                StmtKind::UnsafeBlock(new UnsafeBlockStmt { block: this.copy_stmt(n.block) })
+            }
+            StmtKind::Asm(n) => {
+                const a: AsmBlockStmt* = AsmBlockStmt::new();
+                a.arch = n.arch;
+                a.dialect = n.dialect;
+                a.is_module_level = n.is_module_level;
+                for (mut i: i64 = 0; i < n.operands.length; i++) {
+                    mut op: AsmOperand = n.operands[i].clone();
+                    op.expr = this.clone_expr(op.expr);
+                    a.add_operand(op);
+                }
+                for (mut i: i64 = 0; i < n.pieces.length; i++) {
+                    a.add_piece(n.pieces[i].clone());
+                }
+                for (mut i: i64 = 0; i < n.clobbers.length; i++) {
+                    a.add_clobber(n.clobbers[i]);
+                }
+                for (mut i: i64 = 0; i < n.attached_directives.length; i++) {
+                    a.add_directive(n.attached_directives[i]);
+                }
+                StmtKind::Asm(a)
+            }
+            StmtKind::Return(n) => {
+                StmtKind::Return(new ReturnStmt { expression: this.clone_expr(n.expression), synth_drops: [] })
+            }
+            StmtKind::If(n) => {
+                StmtKind::If(new IfStmt {
+                    condition: this.clone_expr(n.condition),
+                    then_stmt: this.clone_stmt(n.then_stmt),
+                    else_stmt: this.clone_stmt(n.else_stmt),
+                })
+            }
+            StmtKind::While(n) => {
+                StmtKind::While(new WhileStmt {
+                    condition: this.clone_expr(n.condition), body: this.clone_stmt(n.body),
+                })
+            }
+            StmtKind::DoWhile(n) => {
+                StmtKind::DoWhile(new DoWhileStmt {
+                    body: this.clone_stmt(n.body), condition: this.clone_expr(n.condition),
+                })
+            }
+            StmtKind::For(n) => {
+                StmtKind::For(new ForStmt {
+                    init:      this.clone_node(n.init),
+                    condition: this.clone_expr(n.condition),
+                    update:    this.clone_expr(n.update),
+                    body:      this.clone_stmt(n.body),
+                })
+            }
+            StmtKind::Match(n) => {
+                const m: MatchStmt* = MatchStmt::new(this.clone_expr(n.subject));
+                for (mut i: i64 = 0; i < n.arms.length; i++) {
+                    m.add_arm(this.clone_match_arm(n.arms[i]));
+                }
+                StmtKind::Match(m)
+            }
+            StmtKind::StaticMatch(n) => {
+                const m: StaticMatchStmt* = StaticMatchStmt::new(this.clone_type_annotation(n.scrutinee));
+                for (mut i: i64 = 0; i < n.arms.length; i++) {
+                    m.add_arm(this.clone_static_match_arm(n.arms[i]));
+                }
+                StmtKind::StaticMatch(m)
+            }
+            StmtKind::Break    => { StmtKind::Break }
+            StmtKind::Continue => { StmtKind::Continue }
+            StmtKind::Expr(n)  => { StmtKind::Expr(new ExprStmt { expression: this.clone_expr(n.expression) }) }
+            StmtKind::Decl(n)  => { StmtKind::Decl(new DeclStmt { declaration: this.clone_decl(n.declaration) }) }
+            StmtKind::Loop(n)  => { StmtKind::Loop(new LoopStmt { body: this.clone_stmt(n.body) }) }
+        };
+        const c: Stmt* = new Stmt(shape, node.span);
         c.has_error = node.has_error;
         return c;
     }
@@ -899,7 +827,7 @@ type struct ASTCloner {
             c.set_return_type_annotation(this.clone_type_annotation(node.return_type_annotation));
         }
         if (node.has_body()) {
-            c.set_body(this.dispatch_node(node.body) as BlockStmtNode*);
+            c.set_body(this.copy_stmt(node.body));
         }
         return c;
     }
@@ -937,7 +865,7 @@ type struct ASTCloner {
             c.add_parameter(this.clone_var_decl(node.parameters[i]));
         }
         if (node.has_body()) {
-            c.set_body(this.dispatch_node(node.body) as BlockStmtNode*);
+            c.set_body(this.copy_stmt(node.body));
         }
         // resolved_return_type left as TypeRef::invalid() (constructor default)
         return c;
@@ -1370,7 +1298,7 @@ type struct ASTCloner {
             c.set_return_type_annotation(this.clone_type_annotation(node.return_type_annotation));
         }
         if (node.has_body()) {
-            c.set_body(this.dispatch_node(node.body) as BlockStmtNode*);
+            c.set_body(this.copy_stmt(node.body));
         }
         // resolved_return_type left as TypeRef::invalid() (constructor default)
         return c;
