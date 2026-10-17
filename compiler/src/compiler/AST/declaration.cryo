@@ -1,6 +1,7 @@
 /// AST Declaration Nodes
 ///
-/// DeclarationNode base and all 17 concrete declaration classes.
+//// DeclarationNode base, the declaration classes not yet converted to a
+/// payload, and the payload structs of the kinds that are (`DeclKind`).
 ///
 /// String type convention:
 ///   SymbolStr: identifiers and names that may be looked up (e.g., variable
@@ -38,6 +39,7 @@ import compiler::ast::expression::{ ExpressionNode };
 import compiler::ast::pattern::{ DirectiveArgKind, DirectiveNode };
 import compiler::ast::statement::{ Stmt };
 import compiler::ast::node::{ ASTNode };
+import compiler::codegen::ast_arena::{ cryo_ast_arena_alloc };
 import utils::keyword::{ Keyword };
 
 type class DeclarationNode : ASTNode {
@@ -55,6 +57,11 @@ public:
     /// outside it; `outer_span()` folds them back in.  `none()` when the
     /// declaration carries no modifier.
     modifier_span:       SourceSpan;
+    /// Which declaration this is, for a kind whose fields live in a payload;
+    /// such a declaration is built with `NodeKind::Declaration`.  `Legacy`
+    /// for a kind still declared as a subclass of this header, which its
+    /// own `NodeKind` names.
+    shape:               DeclKind;
 
     DeclarationNode(kind: NodeKind, span: SourceSpan) : ASTNode(kind, span) {
         this.documentation       = "";
@@ -62,6 +69,30 @@ public:
         this.name_span           = SourceSpan::none();
         this.attached_directives = [];
         this.modifier_span       = SourceSpan::none();
+        this.shape               = DeclKind::Legacy;
+    }
+
+    /// A declaration of `shape` at `span`, with the header's defaults.
+    static of(shape: DeclKind, span: SourceSpan) -> DeclarationNode* {
+        const d: DeclarationNode* = new DeclarationNode(NodeKind::Declaration, span);
+        d.shape = shape;
+        return d;
+    }
+
+    /// `n` as a declaration whose kind has a payload; null for any other node.
+    static with_shape(n: ASTNode*) -> DeclarationNode* {
+        if (n == null || n.kind != NodeKind::Declaration) { return null; }
+        return n as DeclarationNode*;
+    }
+
+    /// The module declaration `n` is, or null.
+    static module_of(n: ASTNode*) -> ModuleDecl* {
+        const d: DeclarationNode* = DeclarationNode::with_shape(n);
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Module(m) => { m }
+            _                   => { null }
+        };
     }
 
     has_name_span() -> boolean     { return this.name_span.has_location(); }
@@ -726,24 +757,40 @@ public:
 }
 
 
-type class IntrinsicConstDeclNode : DeclarationNode {
-public:
+/// What a declaration is, for the kinds whose fields live in a payload.
+/// `Legacy` is the bridge for the kinds still declared as a subclass of
+/// `DeclarationNode`; it goes when the last kind converts.
+type enum DeclKind {
+    Legacy;
+    IntrinsicConst(IntrinsicConstDecl*);
+    Module(ModuleDecl*);
+}
+
+
+/// `intrinsic const name: T;`: a constant the compiler supplies.
+type struct IntrinsicConstDecl {
     name:            SymbolStr;
     type_annotation: TypeAnnotation*;
     resolved_type:   TypeRef;
     /// The definition this constant is, stamped by NameDeclaration.
     def:             DefId;
 
-    IntrinsicConstDeclNode(name: SymbolStr, span: SourceSpan)
-        : DeclarationNode(NodeKind::IntrinsicConstDeclaration, span) {
-        this.name            = name;
-        this.type_annotation = null;
-        this.resolved_type   = TypeRef::invalid();
-        this.def             = DefId::invalid();
+    static new(name: SymbolStr) -> IntrinsicConstDecl* {
+        return new IntrinsicConstDecl {
+            name:            name,
+            type_annotation: null,
+            resolved_type:   TypeRef::invalid(),
+            def:             DefId::invalid(),
+        };
     }
 
-    has_resolved_type() -> boolean        { return this.resolved_type.is_valid(); }
-    set_resolved_type(t: TypeRef) -> void { this.resolved_type = t; }
+    has_resolved_type(&this) -> boolean { return this.resolved_type.is_valid(); }
+}
+
+implement trait Allocate for struct IntrinsicConstDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
 }
 
 
@@ -858,8 +905,9 @@ public:
 }
 
 
-type class ModuleDeclNode : DeclarationNode {
-public:
+/// `namespace X::Y;` names the file's own module; `public module X::Y;`
+/// re-exports a sub-module.
+type struct ModuleDecl {
     path:      string;
     is_public: boolean;
 
@@ -870,17 +918,24 @@ public:
     path_segments:      [SymbolStr];
     path_segment_spans: [SourceSpan];
 
-    ModuleDeclNode(path: string, is_public: boolean, span: SourceSpan)
-        : DeclarationNode(NodeKind::ModuleDeclaration, span) {
-        this.path               = path;
-        this.is_public          = is_public;
-        this.path_segments      = [];
-        this.path_segment_spans = [];
+    static new(path: string, is_public: boolean) -> ModuleDecl* {
+        return new ModuleDecl {
+            path:               path,
+            is_public:          is_public,
+            path_segments:      [],
+            path_segment_spans: [],
+        };
     }
 
-    add_path_segment(name: SymbolStr, span: SourceSpan) -> void {
+    add_path_segment(mut &this, name: SymbolStr, span: SourceSpan) -> void {
         this.path_segments.push(name);
         this.path_segment_spans.push(span);
+    }
+}
+
+implement trait Allocate for struct ModuleDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

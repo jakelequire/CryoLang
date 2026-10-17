@@ -1372,6 +1372,44 @@ committed with the change and deleted in the next commit.
   Selfhost fixed point on both hosts; clean build 0 warnings; language
   server gate 189 checks.
 
+**Declarations: the bridge, and two kinds behind it** (ruling 385 A).
+
+- `DeclarationNode` stays a class and gains `shape: DeclKind`.  A kind
+  converted to a payload is built with `NodeKind::Declaration` by
+  `DeclarationNode::of(shape, span)` and dispatched on its shape; a kind
+  not yet converted is still a subclass, built with its own `NodeKind`,
+  and its shape is `DeclKind::Legacy`.  Every `match` on a declaration's
+  shape is exhaustive, so a kind converted later is refused wherever it
+  is not handled; each `Legacy` arm is dead and says so.
+- Converted: `IntrinsicConst(IntrinsicConstDecl*)` and
+  `Module(ModuleDecl*)`; `NodeKind::IntrinsicConstDeclaration` and
+  `NodeKind::ModuleDeclaration` are deleted.  `Walk::walk_decl_shape`
+  hands a converted kind to its hook with the header and the payload;
+  the cloner copies through `copy_decl_shape`; sema and codegen dispatch
+  on the shape (neither kind emits or checks anything).
+  `DeclarationNode::module_of(n)` answers "the module declaration this
+  node is" for the places holding an `ASTNode*` (the parser's namespace
+  scan, three language server handlers).
+  `DirectiveTarget::from_kind(NodeKind)` became `from_node(ASTNode*)`,
+  since a kind is no longer a `NodeKind` alone.
+- `NodeKind::is_declaration` answers true for `Declaration`.  A module
+  declaration was outside its list; the two callers read `name_span`,
+  which the parser never sets on a module declaration, so they answer as
+  before.
+- Not covered by any test: no file of the standard library, tests or
+  examples writes an `intrinsic const`, and reading one emits invalid IR
+  (bug 0065).  The `--ast` comparison was run over a probe that declares
+  and reads one; both compilers' outputs are byte-identical, and a dumper
+  with the `IntrinsicConstDecl` label changed differs on it (and on no
+  file of `tests/tests/lang`, which is how the gap was found).
+- **Measured.**  verify `--require-identical`: 0 objects moved; census,
+  examples, lsp (189), cross, incr, fast OK.  `--ast` identical over 1,057
+  files.  Check time x5 medians 8.48 s and 8.51 s; peak 1,533.9 ->
+  1,537.0 MiB; node bytes +4,270,400, arena +3,310,445 (+0.2%): the
+  16-byte `shape` on every declaration, converted or not, is the bridge's
+  cost until the last kind converts.  Selfhost fixed point on both hosts;
+  clean build 0 warnings.
+
 ### Slice 7: the remaining walks and traits
 
 - The ad-hoc walks that are better as `Walk` implementations.
@@ -1645,3 +1683,5 @@ final audit greps for each name listed and expects none.
 | `Pattern.shape`, the pattern's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/pattern.cryo` | slice 5 | renamed `kind` when the header stops deriving from `ASTNode` |
 | `Stmt` a class deriving from `ASTNode`, so an `ASTNode*` (a program item, a `for` initializer, the editor's node at a position) can hold a statement; the 21 `as Stmt*` casts from such handles, each behind a `NodeKind::Statement` test | `compiler/src/compiler/AST/statement.cryo` and the casts' files | slice 6 (statements) | the header becomes a struct when the "any node" handle is `Node`; the casts become `Node::Stmt(s)` arms |
 | `Stmt.shape`, the statement's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/statement.cryo` | slice 6 (statements) | renamed `kind` when the header stops deriving from `ASTNode` |
+| `DeclKind::Legacy` and every `match` arm for it; `DeclarationNode.shape` on a declaration whose kind is still a subclass; the `NodeKind`-per-kind dispatch for those kinds beside the `NodeKind::Declaration` arms | `compiler/src/compiler/AST/declaration.cryo` and every declaration consumer | slice 6 (declarations, `IntrinsicConst` and `Module`) | when the last declaration kind converts; then `shape` is renamed `kind` with the header's struct |
+| `DeclarationNode::with_shape` and `DeclarationNode::module_of`, and the `as DeclarationNode*` casts behind a `NodeKind::Declaration` test (walker, cloner, sema, codegen, type resolution, name resolution x2, stamp check, directive processing, language server identity) | `compiler/src/compiler/AST/declaration.cryo` and those files | slice 6 (declarations) | the casts become `Node::Decl(d)` arms when the "any node" handle is `Node`; `module_of` then matches on `Node` |

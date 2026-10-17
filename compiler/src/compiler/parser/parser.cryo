@@ -37,10 +37,10 @@ import compiler::resolver::lang_item::{ LangItem };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
-    AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureBinding,
+    AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
     DestructureDeclNode, EnumDeclNode, EnumVariantNode, ExternBlockNode, FieldDeclNode,
     FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDeclNode,
-    IntrinsicConstDeclNode, IntrinsicDeclNode, MethodNode, ModuleDeclNode, ReceiverForm,
+    IntrinsicConstDecl, IntrinsicDeclNode, MethodNode, ModuleDecl, ReceiverForm,
     StructDeclNode,
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
 };
@@ -188,9 +188,8 @@ implement struct Parser {
             NodeKind::ImplementationBlock   => { true }
             NodeKind::ExternBlock           => { true }
             NodeKind::ImportDeclaration     => { true }
-            NodeKind::ModuleDeclaration     => { true }
             NodeKind::IntrinsicDeclaration  => { true }
-            NodeKind::IntrinsicConstDeclaration => { true }
+            NodeKind::Declaration           => { true }
             _                               => { false }
         };
     }
@@ -283,7 +282,7 @@ implement struct Parser {
         program.uses_fstring = this.used_fstring;
 
         // Set the file's namespace from its `namespace X::Y::Z;` line.
-        // The parser converts that line into a `ModuleDeclNode`; the
+        // The parser converts that line into a module declaration; the
         // first such node in the statement list is, by convention, the
         // file's own namespace (subsequent `public module ...;` lines
         // are sub-module re-exports).  Skipping over directive nodes
@@ -293,8 +292,8 @@ implement struct Parser {
             const s: ASTNode* = program.statements[i];
             if (s == null) { continue; }
             if (s.kind == NodeKind::Directive) { continue; }
-            if (s.kind == NodeKind::ModuleDeclaration) {
-                const m: ModuleDeclNode* = s as ModuleDeclNode*;
+            const m: ModuleDecl* = DeclarationNode::module_of(s);
+            if (m != null) {
                 program.set_namespace_name(m.path);
             }
             break;
@@ -350,14 +349,14 @@ implement struct Parser {
         if (tok.kind == TokenType::KwNamespace) {
             const ns: ASTNode* = this.parse_namespace_declaration();
             if (ns != null && doc != "") {
-                (ns as ModuleDeclNode*).set_documentation(doc);
+                (ns as DeclarationNode*).set_documentation(doc);
             }
             return ns;
         }
 
         // Module declaration (public module Foo;)
         if (tok.kind == TokenType::KwPublic && this.peek_at(1).kind == TokenType::KwModule) {
-            const md: ModuleDeclNode* = this.parse_module_declaration();
+            const md: DeclarationNode* = this.parse_module_declaration();
             if (md != null && doc != "") {
                 md.set_documentation(doc);
             }
@@ -560,7 +559,7 @@ implement struct Parser {
         if (tok.kind == TokenType::KwIntrinsic) {
             // Peek ahead: intrinsic const -> IntrinsicConstDecl
             if (this.peek_at(1).kind == TokenType::KwConst) {
-                const ic: IntrinsicConstDeclNode* = this.parse_intrinsic_const_declaration();
+                const ic: DeclarationNode* = this.parse_intrinsic_const_declaration();
                 if (ic != null && doc != "") { ic.set_documentation(doc_text); }
                 return ic;
             }
@@ -2092,17 +2091,16 @@ implement struct Parser {
 
         // Create a module declaration node representing the namespace
         const span: SourceSpan = this.span_from(start);
-        mut node: ModuleDeclNode* = new ModuleDeclNode(
-            qn.display(this.ctx.get_intern_table()), true, span);
+        const m: ModuleDecl* = ModuleDecl::new(qn.display(this.ctx.get_intern_table()), true);
         for (mut i: i64 = 0; i < seg_names.length; i++) {
-            node.add_path_segment(seg_names[i], seg_spans[i]);
+            m.add_path_segment(seg_names[i], seg_spans[i]);
         }
-        return node;
+        return DeclarationNode::of(DeclKind::Module(m), span);
     }
 
     /// Parse a module declaration: public module Name;
     /// Accepts keywords as path segments (e.g., public module collections::string;).
-    parse_module_declaration() -> ModuleDeclNode* {
+    parse_module_declaration() -> DeclarationNode* {
         const start: Token = this.current();
         mut is_public: boolean = false;
         if (this.check(TokenType::KwPublic)) {
@@ -2139,12 +2137,11 @@ implement struct Parser {
 
         this.consume(TokenType::Semicolon, "';'");
         const span: SourceSpan = this.span_from(start);
-        mut node: ModuleDeclNode* = new ModuleDeclNode(
-            qn.display(this.ctx.get_intern_table()), is_public, span);
+        const m: ModuleDecl* = ModuleDecl::new(qn.display(this.ctx.get_intern_table()), is_public);
         for (mut i: i64 = 0; i < seg_names.length; i++) {
-            node.add_path_segment(seg_names[i], seg_spans[i]);
+            m.add_path_segment(seg_names[i], seg_spans[i]);
         }
-        return node;
+        return DeclarationNode::of(DeclKind::Module(m), span);
     }
 
     /// Parse an implementation block. Two shapes:
@@ -2752,21 +2749,19 @@ implement struct Parser {
     }
 
     /// Parse an intrinsic const declaration: intrinsic const NAME: Type;
-    parse_intrinsic_const_declaration() -> IntrinsicConstDeclNode* {
+    parse_intrinsic_const_declaration() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'intrinsic'
         this.advance(); // consume 'const'
         const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic const name");
-        const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: IntrinsicConstDeclNode* = new IntrinsicConstDeclNode(name, this.span_from_token(start));
+        const ic: IntrinsicConstDecl* = IntrinsicConstDecl::new(this.intern_lexeme(name_tok));
 
         // Type annotation: : Type
         if (this.match_tok(TokenType::Colon)) {
-            node.type_annotation = this.parse_type_annotation();
+            ic.type_annotation = this.parse_type_annotation();
         }
 
         this.consume(TokenType::Semicolon, "';'");
-        node.span = this.span_from(start);
-        return node;
+        return DeclarationNode::of(DeclKind::IntrinsicConst(ic), this.span_from(start));
     }
 
     /// Parse generic type parameters: <T, U, A = DefaultType>

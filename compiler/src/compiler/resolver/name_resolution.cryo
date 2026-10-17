@@ -43,7 +43,7 @@ import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDeclNode, EnumDeclNode, EnumVariantNode,
     ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
-    ImportDeclNode, IntrinsicConstDeclNode, IntrinsicDeclNode, MethodNode, StructDeclNode,
+    DeclarationNode, DeclKind, ImportDeclNode, IntrinsicDeclNode, MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -533,14 +533,20 @@ type struct NameResolver {
                 this.resolver.export_symbol(intr_declared);
                 intr_node.def = this.resolver.get_symbol(intr_declared).def;
             }
-            NodeKind::IntrinsicConstDeclaration => {
-                const ic_node: IntrinsicConstDeclNode* = node as IntrinsicConstDeclNode*;
-                const ic_id: SymbolID = this.resolver.alloc_symbol_id();
-                const ic_sym: Symbol = Symbol::constant(ic_id, ic_node.name,
-                    this.resolver.current_scope, ic_node.span, this.resolver.current_module);
-                const declared_id: SymbolID = this.resolver.declare(ic_sym);
-                this.resolver.export_symbol(declared_id);
-                ic_node.def = this.resolver.get_symbol(declared_id).def;
+            NodeKind::Declaration => {
+                const decl: DeclarationNode* = node as DeclarationNode*;
+                match (decl.shape) {
+                    DeclKind::IntrinsicConst(ic_node) => {
+                        const ic_id: SymbolID = this.resolver.alloc_symbol_id();
+                        const ic_sym: Symbol = Symbol::constant(ic_id, ic_node.name,
+                            this.resolver.current_scope, decl.span, this.resolver.current_module);
+                        const declared_id: SymbolID = this.resolver.declare(ic_sym);
+                        this.resolver.export_symbol(declared_id);
+                        ic_node.def = this.resolver.get_symbol(declared_id).def;
+                    }
+                    // A module declaration introduces no name of this module.
+                    DeclKind::Module(_) | DeclKind::Legacy => {}
+                }
             }
             NodeKind::ExternBlock => {
                 const extern_node: ExternBlockNode* = node as ExternBlockNode*;
@@ -620,7 +626,12 @@ type struct NameResolver {
             NodeKind::TypeAliasDeclaration => { (node as TypeAliasDeclNode*).def }
             NodeKind::VariableDeclaration  => { (node as VarDeclNode*).def }
             NodeKind::IntrinsicDeclaration => { (node as IntrinsicDeclNode*).def }
-            NodeKind::IntrinsicConstDeclaration => { (node as IntrinsicConstDeclNode*).def }
+            NodeKind::Declaration => {
+                match ((node as DeclarationNode*).shape) {
+                    DeclKind::IntrinsicConst(ic) => { ic.def }
+                    DeclKind::Module(_) | DeclKind::Legacy => { DefId::invalid() }
+                }
+            }
             _ => { DefId::invalid() }
         };
         this.ctx.decl_index.keep_declaration(d, node);

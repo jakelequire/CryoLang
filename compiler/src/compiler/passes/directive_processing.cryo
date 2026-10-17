@@ -60,7 +60,7 @@ import utils::logger;
 import utils::logger::{ cdebug };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumDeclNode, ExternBlockNode, FieldDeclNode, FunctionDeclNode,
+    ClassDeclNode, DeclarationNode, DeclKind, EnumDeclNode, ExternBlockNode, FieldDeclNode, FunctionDeclNode,
     ImplBlockNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -152,12 +152,12 @@ type enum DirectiveTarget {
 }
 
 implement enum DirectiveTarget {
-    /// Map a declaration's `NodeKind` to the target category a directive
-    /// is attached to.  `ModuleDeclaration` (and a null/absent owner)
-    /// classify as `Module`; anything not in the declaration vocabulary
-    /// falls through to `Other`.
-    static from_kind(k: NodeKind) -> DirectiveTarget {
-        return match (k) {
+    /// Map a declaration to the target category a directive is attached
+    /// to.  A module declaration (and a null/absent owner) classify as
+    /// `Module`; anything not in the declaration vocabulary falls through
+    /// to `Other`.
+    static from_node(n: ASTNode*) -> DirectiveTarget {
+        return match (n.kind) {
             NodeKind::FunctionDeclaration   => { DirectiveTarget::Function }
             NodeKind::MethodDeclaration     => { DirectiveTarget::Method   }
             NodeKind::FieldDeclaration      => { DirectiveTarget::Field    }
@@ -171,7 +171,13 @@ implement enum DirectiveTarget {
             NodeKind::ImplementationBlock   => { DirectiveTarget::Impl     }
             NodeKind::ExternBlock           => { DirectiveTarget::Extern   }
             NodeKind::ImportDeclaration     => { DirectiveTarget::Import   }
-            NodeKind::ModuleDeclaration     => { DirectiveTarget::Module   }
+            NodeKind::Declaration => {
+                match ((n as DeclarationNode*).shape) {
+                    DeclKind::Module(_)         => { DirectiveTarget::Module }
+                    DeclKind::IntrinsicConst(_) => { DirectiveTarget::Other  }
+                    DeclKind::Legacy            => { DirectiveTarget::Other  }
+                }
+            }
             _                               => { DirectiveTarget::Other    }
         };
     }
@@ -1458,7 +1464,7 @@ type struct DirectiveProcessingPasses {
             }
 
             // Attached directives on declarations.
-            const t: DirectiveTarget = DirectiveTarget::from_kind(stmt.kind);
+            const t: DirectiveTarget = DirectiveTarget::from_node(stmt);
             if (t == DirectiveTarget::Other) { continue; }
 
             const decl: DeclarationNode* = stmt as DeclarationNode*;

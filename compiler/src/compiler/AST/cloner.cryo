@@ -25,8 +25,8 @@ import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDeclNode, EnumDeclNode,
     EnumVariantNode, ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode,
-    ImplBlockNode, ImportDeclNode, IntrinsicConstDeclNode, IntrinsicDeclNode, MethodNode,
-    ModuleDeclNode, StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode,
+    DeclKind, ImplBlockNode, ImportDeclNode, IntrinsicConstDecl, IntrinsicDeclNode, MethodNode,
+    ModuleDecl, StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode,
     VarDeclNode
 };
 import compiler::ast::expression::{
@@ -150,9 +150,8 @@ type struct ASTCloner {
             NodeKind::FunctionDeclaration       => { return this.visit_function(n as FunctionDeclNode*); }
             NodeKind::MethodDeclaration         => { return this.visit_method(n as MethodNode*); }
             NodeKind::IntrinsicDeclaration      => { return this.visit_intrinsic(n as IntrinsicDeclNode*); }
-            NodeKind::IntrinsicConstDeclaration => { return this.visit_intrinsic_const(n as IntrinsicConstDeclNode*); }
+            NodeKind::Declaration               => { return this.copy_decl_shape(n as DeclarationNode*); }
             NodeKind::ImportDeclaration         => { return this.visit_import(n as ImportDeclNode*); }
-            NodeKind::ModuleDeclaration         => { return this.visit_module(n as ModuleDeclNode*); }
             NodeKind::StructDeclaration         => { return this.visit_struct(n as StructDeclNode*); }
             NodeKind::UnionDeclaration          => { return this.visit_union(n as UnionDeclNode*); }
             NodeKind::ClassDeclaration          => { return this.visit_class(n as ClassDeclNode*); }
@@ -171,8 +170,7 @@ type struct ASTCloner {
             NodeKind::Pattern                   => { return this.clone_pattern(n as Pattern*); }
 
             // Kinds no node is built with.
-            NodeKind::Expression
-            | NodeKind::Declaration | NodeKind::AsyncExpression | NodeKind::Unknown => { return null; }
+            NodeKind::Expression | NodeKind::AsyncExpression | NodeKind::Unknown => { return null; }
         }
     }
 
@@ -871,14 +869,24 @@ type struct ASTCloner {
         return c;
     }
 
-    visit_intrinsic_const(mut &this, node: IntrinsicConstDeclNode*) -> ASTNode* {
-        mut c: IntrinsicConstDeclNode* = new IntrinsicConstDeclNode(node.name, node.span);
+    /// The copy of a declaration whose kind has a payload.
+    copy_decl_shape(mut &this, node: DeclarationNode*) -> DeclarationNode* {
+        const shape: DeclKind = match (node.shape) {
+            DeclKind::IntrinsicConst(n) => {
+                const ic: IntrinsicConstDecl* = IntrinsicConstDecl::new(n.name);
+                if (n.type_annotation != null) {
+                    ic.type_annotation = n.type_annotation.clone();
+                }
+                // resolved_type left invalid, as `new` leaves it
+                ic.def = n.def;
+                DeclKind::IntrinsicConst(ic)
+            }
+            DeclKind::Module(n) => { DeclKind::Module(ModuleDecl::new(n.path, n.is_public)) }
+            // Built with its own `NodeKind`, which `dispatch_node` copies.
+            DeclKind::Legacy => { unreachable() }
+        };
+        const c: DeclarationNode* = DeclarationNode::of(shape, node.span);
         this.copy_decl_base(node, c);
-        if (node.type_annotation != null) {
-            c.type_annotation = node.type_annotation.clone();
-        }
-        // resolved_type left as TypeRef::invalid() (constructor default)
-        c.def = node.def;
         return c;
     }
 
@@ -895,12 +903,6 @@ type struct ASTCloner {
         c.is_export = node.is_export;
         c.path_entry = node.path_entry;
         c.resolved_module = node.resolved_module;
-        return c;
-    }
-
-    visit_module(mut &this, node: ModuleDeclNode*) -> ASTNode* {
-        mut c: ModuleDeclNode* = new ModuleDeclNode(node.path, node.is_public, node.span);
-        this.copy_decl_base(node, c);
         return c;
     }
 
