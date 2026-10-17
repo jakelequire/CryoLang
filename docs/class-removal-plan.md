@@ -1237,8 +1237,11 @@ large categories.
     enum pattern's stamp unanswered, the parent's compiler checked a match
     over a payload enum as "No errors found."; this one refuses it,
     "E0900: 354 written name(s) left name resolution with no answer;
-    first: enum pattern at src/main.cryo:10:9".  No committed test: the
-    check's test switch plants an identifier only.
+    first: enum pattern at src/main.cryo:10:9".  The committed test came
+    later: the test switch names the kind of slot it plants, and the
+    project `stamp_check_refuses_unanswered_enum_pattern` plants an enum
+    pattern; with the branch's `note` deleted, the identifier project still
+    passed and this one failed.
   - the lang-ref settling answers the `??` and `for` desugarings' patterns
     with the language's `Option`, so a subject of a program's own enum with
     `Some` and `None` variants is refused (E0200), as the spec's `??` is
