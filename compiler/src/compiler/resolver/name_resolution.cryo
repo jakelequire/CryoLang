@@ -42,7 +42,7 @@ import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDeclNode, EnumDeclNode, EnumVariant,
-    ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
+    ExternBlock, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
     DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
 };
@@ -510,6 +510,52 @@ type struct NameResolver {
             NodeKind::Declaration => {
                 const decl: DeclarationNode* = node as DeclarationNode*;
                 match (decl.shape) {
+                    DeclKind::Extern(extern_node) => {
+                        if (extern_node.is_c_import()) {
+                            // A C import: the alias is a binding of this module to a
+                            // module of its own - the resolver's, under the canonical
+                            // namespace the import engine wrote on the block
+                            // (`<mod>::cit`) - and the block's functions are that
+                            // module's declarations.  The alias symbol's qualified
+                            // name IS that namespace, so a scope segment or a type
+                            // spelling bound to it answers `Def(<mod>::cit)` and its
+                            // members resolve through the doors a module's do.  The
+                            // alias is declared in the module writing the import.
+                            const alias: SymbolStr = extern_node.namespace_alias;
+                            const ns_id: SymbolID = this.resolver.alloc_symbol_id();
+                            const ns_sym: Symbol = Symbol::namespace_sym(
+                                ns_id, alias, this.resolver.current_scope,
+                                decl.span, this.resolver.current_module);
+                            this.resolver.declare(ns_sym);
+                            this.resolver.export_symbol(ns_id);
+                            const c_module: ModulePath = extern_node.binding_namespace;
+                            this.ctx.module_graph.bind_c_import_module(
+                                c_module, this.resolver.get_symbol(ns_id).def);
+
+                            const saved_module: ModulePath = this.resolver.current_module_path();
+                            const saved_scope: u64 = this.resolver.get_current_scope_id();
+                            this.resolver.set_module(c_module);
+                            for (mut j: i64 = 0; j < extern_node.functions.length; j++) {
+                                const fn_node: FunctionDeclNode* = extern_node.functions[j];
+                                const fn_sym: SymbolID = this.resolver.declare_function(
+                                    fn_node.name, fn_node.span, true);
+                                this.stamp_function_def(fn_node, fn_sym);
+                                this.resolver.export_symbol(fn_sym);
+                            }
+                            this.resolver.restore_scope(saved_module, saved_scope);
+                        } else {
+                            // Regular extern block: declare functions in current scope
+                            for (mut j: i64 = 0; j < extern_node.functions.length; j++) {
+                                const fn_node: FunctionDeclNode* = extern_node.functions[j];
+                                const sym_id: SymbolID = this.resolver.declare_function(
+                                    fn_node.name, fn_node.span, fn_node.is_public);
+                                this.stamp_function_def(fn_node, sym_id);
+                                if (fn_node.is_public) {
+                                    this.resolver.export_symbol(sym_id);
+                                }
+                            }
+                        }
+                    }
                     DeclKind::Import(_) => {
                         // Deliberately NOT processed here.  An import is
                         // answered from the declaring module's exports, so
@@ -546,53 +592,6 @@ type struct NameResolver {
                     DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
                 }
             }
-            NodeKind::ExternBlock => {
-                const extern_node: ExternBlockNode* = node as ExternBlockNode*;
-                if (extern_node.is_c_import()) {
-                    // A C import: the alias is a binding of this module to a
-                    // module of its own - the resolver's, under the canonical
-                    // namespace the import engine wrote on the block
-                    // (`<mod>::cit`) - and the block's functions are that
-                    // module's declarations.  The alias symbol's qualified
-                    // name IS that namespace, so a scope segment or a type
-                    // spelling bound to it answers `Def(<mod>::cit)` and its
-                    // members resolve through the doors a module's do.  The
-                    // alias is declared in the module writing the import.
-                    const alias: SymbolStr = extern_node.namespace_alias;
-                    const ns_id: SymbolID = this.resolver.alloc_symbol_id();
-                    const ns_sym: Symbol = Symbol::namespace_sym(
-                        ns_id, alias, this.resolver.current_scope,
-                        extern_node.span, this.resolver.current_module);
-                    this.resolver.declare(ns_sym);
-                    this.resolver.export_symbol(ns_id);
-                    const c_module: ModulePath = extern_node.binding_namespace;
-                    this.ctx.module_graph.bind_c_import_module(
-                        c_module, this.resolver.get_symbol(ns_id).def);
-
-                    const saved_module: ModulePath = this.resolver.current_module_path();
-                    const saved_scope: u64 = this.resolver.get_current_scope_id();
-                    this.resolver.set_module(c_module);
-                    for (mut j: i64 = 0; j < extern_node.functions.length; j++) {
-                        const fn_node: FunctionDeclNode* = extern_node.functions[j];
-                        const fn_sym: SymbolID = this.resolver.declare_function(
-                            fn_node.name, fn_node.span, true);
-                        this.stamp_function_def(fn_node, fn_sym);
-                        this.resolver.export_symbol(fn_sym);
-                    }
-                    this.resolver.restore_scope(saved_module, saved_scope);
-                } else {
-                    // Regular extern block: declare functions in current scope
-                    for (mut j: i64 = 0; j < extern_node.functions.length; j++) {
-                        const fn_node: FunctionDeclNode* = extern_node.functions[j];
-                        const sym_id: SymbolID = this.resolver.declare_function(
-                            fn_node.name, fn_node.span, fn_node.is_public);
-                        this.stamp_function_def(fn_node, sym_id);
-                        if (fn_node.is_public) {
-                            this.resolver.export_symbol(sym_id);
-                        }
-                    }
-                }
-            }
             NodeKind::Statement => {
                 match ((node as Stmt*).shape) {
                     StmtKind::Decl(decl_stmt) => {
@@ -627,8 +626,8 @@ type struct NameResolver {
                 match ((node as DeclarationNode*).shape) {
                     DeclKind::Intrinsic(i)       => { i.def }
                     DeclKind::IntrinsicConst(ic) => { ic.def }
-                    DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Variant(_)
-                    | DeclKind::Legacy => { DefId::invalid() }
+                    DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
+                    | DeclKind::Variant(_) | DeclKind::Legacy => { DefId::invalid() }
                 }
             }
             _ => { DefId::invalid() }
@@ -3446,7 +3445,7 @@ implement trait Walk for struct NameResolver {
         this.process_import(d, node);
     }
 
-    walk_extern_block(mut &this, node: ExternBlockNode*) -> void {
+    walk_extern_block(mut &this, d: DeclarationNode*, node: ExternBlock*) -> void {
         // Already forward-declared functions; visit bodies if any.
         for (mut i: i64 = 0; i < node.functions.length; i++) {
             this.walk_node(node.functions[i]);

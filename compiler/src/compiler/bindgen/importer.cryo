@@ -3,7 +3,7 @@
 /// Processes CImport extern blocks: `extern module name := "C" { #include ... }`.
 /// For each `#include`, libclang builds a real translation unit, and a cursor
 /// walk emits a FunctionDeclNode per top-level C function declaration into the
-/// ExternBlockNode - so downstream passes (name resolution, type resolution,
+/// extern block - so downstream passes (name resolution, type resolution,
 /// codegen) treat them identically to hand-written extern functions.
 ///
 /// libclang preprocesses internally, so clang is a hard dependency of
@@ -65,7 +65,7 @@ import std::fs::path::{ Path };
 import std::env;
 import std::core::mem;
 import compiler::ast::declaration::{
-    BindingAccessor, DeclarationNode, DeclKind, EnumDeclNode, EnumVariant, ExternBlockNode,
+    BindingAccessor, DeclarationNode, DeclKind, EnumDeclNode, EnumVariant, ExternBlock,
     FieldDeclNode,
     FunctionDeclNode, ImplBlockNode, MethodNode, ReceiverForm, StructDeclNode,
     TypeAliasDeclNode, UnionDeclNode, VarDeclNode
@@ -179,7 +179,7 @@ type struct ImportReport {
 /// The C-header import engine: one object per translation unit, plus the static
 /// pass entry and path-resolution helpers.
 type struct Importer {
-    extern_node:    ExternBlockNode*;
+    extern_node:    ExternBlock*;
     ctx:            CompilationContext*;
     /// The libclang translation unit, needed by `emit_macro` to tokenize a
     /// macro definition's extent (`clang_tokenize`).
@@ -300,7 +300,8 @@ type struct Importer {
     /// `functions_only` are derived from the extern block; the type mapper is
     /// wired with the same (ctx, namespace), so every declaration and every
     /// reference the engine synthesizes is keyed under `<mod>::alias`.
-    static new(extern_node: ExternBlockNode*, ctx: CompilationContext*, tu: void*) -> Importer {
+    static new(extern_node: ExternBlock*, functions_only: boolean, ctx: CompilationContext*,
+               tu: void*) -> Importer {
         const alias: ModulePath = extern_node.binding_namespace;
         return Importer {
             extern_node:    extern_node,
@@ -308,7 +309,7 @@ type struct Importer {
             tu:             tu,
             count:          0,
             alias:          alias,
-            functions_only: extern_node.has_directive(Keyword::new("functions_only")),
+            functions_only: functions_only,
             seen_names:     [],
             struct_names:   [],
             struct_nodes:   [],
@@ -2201,7 +2202,7 @@ type struct Importer {
         }
     }
 
-    /// Pass entry: walk top-level statements for CImport ExternBlockNodes, and
+    /// Pass entry: walk top-level statements for C-import extern blocks, and
     /// for each resolve its includes and import their C function prototypes.
     static run(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
@@ -2215,10 +2216,11 @@ type struct Importer {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const node: ASTNode* = root.statements[i];
             if (node == null) { continue; }
-            if (node.kind != NodeKind::ExternBlock) { continue; }
-
-            const extern_node: ExternBlockNode* = node as ExternBlockNode*;
-            if (!extern_node.is_c_import()) { continue; }
+            const extern_node: ExternBlock* = DeclarationNode::extern_of(node);
+            if (extern_node == null || !extern_node.is_c_import()) { continue; }
+            // `![functions_only]` is written on the block's declaration.
+            const functions_only: boolean =
+                (node as DeclarationNode*).has_directive(Keyword::new("functions_only"));
 
             // The alias's canonical namespace, decided once and here: the
             // declaring module's (its declared namespace, else the file, the
@@ -2240,7 +2242,7 @@ type struct Importer {
 
                 if (is_system) {
                     const count: i32 =
-                        Importer::import_system_header(include_path, extern_node, ctx);
+                        Importer::import_system_header(include_path, extern_node, functions_only, ctx);
                     total_imported += count;
                     continue;
                 }
@@ -2252,7 +2254,8 @@ type struct Importer {
                     continue;
                 }
 
-                const count: i32 = Importer::import_local_header(resolved, extern_node, ctx);
+                const count: i32 = Importer::import_local_header(resolved, extern_node,
+                                                                 functions_only, ctx);
                 total_imported += count;
             }
 
@@ -2272,21 +2275,21 @@ type struct Importer {
 
     /// Parse a local quoted header (`#include "foo.h"`) from its resolved
     /// path and emit its function prototypes.  Returns the count.
-    static import_local_header(resolved_path_text: string, extern_node: ExternBlockNode*,
-                               ctx: CompilationContext*) -> i32 {
+    static import_local_header(resolved_path_text: string, extern_node: ExternBlock*,
+                               functions_only: boolean, ctx: CompilationContext*) -> i32 {
         const resolved_path: string = resolved_path_text;
         mut no_extra: [u8*] = [];
         return Importer::collect_from_tu(resolved_path as u8*, null, 0,
-                                         &no_extra, resolved_path_text, extern_node, ctx, null, null,
-                                         "c", "");
+                                         &no_extra, resolved_path_text, extern_node,
+                                         functions_only, ctx, null, null, "c", "");
     }
 
     /// Parse an angle-bracket system header (`#include <stdio.h>`) by feeding
     /// a one-line `#include <...>` to libclang as an in-memory unsaved file - 
     /// libclang resolves it against its own system search path.  The header
     /// name is validated to path-safe characters first.
-    static import_system_header(header_text: string, extern_node: ExternBlockNode*,
-                                ctx: CompilationContext*) -> i32 {
+    static import_system_header(header_text: string, extern_node: ExternBlock*,
+                                functions_only: boolean, ctx: CompilationContext*) -> i32 {
         const header: string = header_text;
         if (!Importer::is_safe_header_name(header)) {
             ctx.diagnostics.emit(Diagnostic::error(
@@ -2303,8 +2306,8 @@ type struct Importer {
         };
         mut no_extra: [u8*] = [];
         return Importer::collect_from_tu("cryo_syshdr.c" as u8*, &uf, 1,
-                                         &no_extra, header_text, extern_node, ctx, null, null,
-                                         "c", "");
+                                         &no_extra, header_text, extern_node,
+                                         functions_only, ctx, null, null, "c", "");
     }
 
     /// `clang_getInclusions` trampoline: records each non-system file the TU
@@ -2345,7 +2348,8 @@ type struct Importer {
     /// for the generator's include-graph `.deps` sidecar; null on the inline
     /// path skips the inclusion walk entirely.
     static collect_from_tu(source_filename: u8*, unsaved: CXUnsavedFile*, num_unsaved: u32,
-                           extra_args: &[u8*], label: string, extern_node: ExternBlockNode*,
+                           extra_args: &[u8*], label: string, extern_node: ExternBlock*,
+                           functions_only: boolean,
                            ctx: CompilationContext*, out_report: ImportReport*,
                            out_inputs: [string]*, lang_text: string, cpp_std_text: string) -> i32 {
         const cpp_std: string = cpp_std_text;
@@ -2404,7 +2408,7 @@ type struct Importer {
             return 0;
         }
 
-        mut imp: Importer = Importer::new(extern_node, ctx, tu);
+        mut imp: Importer = Importer::new(extern_node, functions_only, ctx, tu);
         // The vendor generator passes a non-null out_report; the inline
         // `#include` path passes null.  Function-alias wrappers ride this flag.
         imp.is_vendor = out_report != null;

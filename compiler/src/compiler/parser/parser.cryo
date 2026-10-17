@@ -38,7 +38,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
-    DestructureDeclNode, EnumDeclNode, EnumVariant, ExternBlockNode, FieldDeclNode,
+    DestructureDeclNode, EnumDeclNode, EnumVariant, ExternBlock, FieldDeclNode,
     FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDecl,
     IntrinsicConstDecl, IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDeclNode,
@@ -186,7 +186,6 @@ implement struct Parser {
             NodeKind::TypeAliasDeclaration  => { true }
             NodeKind::VariableDeclaration   => { true }
             NodeKind::ImplementationBlock   => { true }
-            NodeKind::ExternBlock           => { true }
             NodeKind::Declaration           => { true }
             _                               => { false }
         };
@@ -400,13 +399,13 @@ implement struct Parser {
         // Extern block, or the C-header import form `extern module name := "C"`.
         if (tok.kind == TokenType::KwExtern) {
             if (this.peek_at(1).kind == TokenType::KwModule) {
-                const cext: ExternBlockNode* = this.parse_extern_module_cimport();
+                const cext: DeclarationNode* = this.parse_extern_module_cimport();
                 if (cext != null && doc != "") {
                     cext.set_documentation(doc);
                 }
                 return cext;
             }
-            const ext: ExternBlockNode* = this.parse_extern_block();
+            const ext: DeclarationNode* = this.parse_extern_block();
             if (ext != null && doc != "") {
                 ext.set_documentation(doc);
             }
@@ -2453,7 +2452,7 @@ implement struct Parser {
     }
 
     /// Parse an extern block: extern "C" { function declarations }
-    parse_extern_block() -> ExternBlockNode* {
+    parse_extern_block() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'extern'
         mut linkage: string = "C";
 
@@ -2463,7 +2462,7 @@ implement struct Parser {
             this.advance();
         }
 
-        mut node: ExternBlockNode* = new ExternBlockNode(linkage, this.span_from_token(start));
+        const node: ExternBlock* = ExternBlock::new(linkage);
 
         this.consume(TokenType::LBrace, "'{'");
 
@@ -2515,14 +2514,13 @@ implement struct Parser {
         }
 
         this.consume(TokenType::RBrace, "'}'");
-        node.span = this.span_from(start);
-        return node;
+        return DeclarationNode::of(DeclKind::Extern(node), this.span_from(start));
     }
 
     /// Parse the CImport form: `extern module name := "C" { #include "..." }`
     /// 'extern' is current. The keyword-led spelling groups with other `extern`
     /// declarations and reuses the existing `module` keyword.
-    parse_extern_module_cimport() -> ExternBlockNode* {
+    parse_extern_module_cimport() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'extern'
         this.advance();                      // consume 'module'
         const alias_tok: Token = this.current();
@@ -2535,8 +2533,8 @@ implement struct Parser {
 
     /// Shared tail for both CImport spellings: with `start` at the leading
     /// `extern` token and the cursor positioned at the linkage string, parse
-    /// `"C" { #include ... }` into a namespace-aliased ExternBlockNode.
-    finish_cimport_block(alias: SymbolStr, start: Token) -> ExternBlockNode* {
+    /// `"C" { #include ... }` into a namespace-aliased extern block.
+    finish_cimport_block(alias: SymbolStr, start: Token) -> DeclarationNode* {
         mut linkage: string = "C";
 
         // Linkage type: "C"
@@ -2545,7 +2543,7 @@ implement struct Parser {
             this.advance();
         }
 
-        mut node: ExternBlockNode* = new ExternBlockNode(linkage, this.span_from_token(start));
+        const node: ExternBlock* = ExternBlock::new(linkage);
         node.set_namespace_alias(alias);
 
         this.consume(TokenType::LBrace, "'{'");
@@ -2608,8 +2606,7 @@ implement struct Parser {
         }
 
         this.consume(TokenType::RBrace, "'}'");
-        node.span = this.span_from(start);
-        return node;
+        return DeclarationNode::of(DeclKind::Extern(node), this.span_from(start));
     }
 
     /// Parse an extern function declaration (no body).
@@ -2650,8 +2647,8 @@ implement struct Parser {
     /// globals, instead of each learning to look inside an extern block.
     static hoist_extern_globals(program: ProgramNode*, node: ASTNode*) -> void {
         if (program == null || node == null) { return; }
-        if (node.kind != NodeKind::ExternBlock) { return; }
-        const blk: ExternBlockNode* = node as ExternBlockNode*;
+        const blk: ExternBlock* = DeclarationNode::extern_of(node);
+        if (blk == null) { return; }
         for (mut i: i64 = 0; i < blk.globals.length; i++) {
             program.add_statement(blk.globals[i] as ASTNode*);
         }

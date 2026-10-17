@@ -1426,6 +1426,19 @@ committed with the change and deleted in the next commit.
   checked and emitted with its enum), and stays one.  Control: a dumper
   with the `EnumVariant` label changed differs on all 164 files of
   `tests/tests/lang`.
+- `Extern(ExternBlock*)` followed (`extern "C" { ... }` and the C-header
+  import form).  The places that scan a program's items for extern blocks
+  (bindgen's pass entry, the parser's global hoisting, directive
+  processing, the language server's outline) ask
+  `DeclarationNode::extern_of`, a bridge helper like `import_of`.  The
+  import engine works on the payload; `![functions_only]`, a directive on
+  the block's declaration, is read where the block is found and passed
+  down to it (the vendor generator's synthesized block carries none).
+  Type and name resolution's extern arms moved into their declaration
+  arms by a one-off codemod (`scripts/extern-codemod.py`).  The cloner
+  copies only the linkage and the functions, as before.  Control: a
+  dumper with the `ExternBlock` label changed differs on all 164 files of
+  `tests/tests/lang`.
 - `NodeKind::is_declaration` answers true for `Declaration`.  A module
   declaration was outside its list; the two callers read `name_span`,
   which the parser never sets on a module declaration, so they answer as
@@ -1718,4 +1731,4 @@ final audit greps for each name listed and expects none.
 | `Stmt` a class deriving from `ASTNode`, so an `ASTNode*` (a program item, a `for` initializer, the editor's node at a position) can hold a statement; the 21 `as Stmt*` casts from such handles, each behind a `NodeKind::Statement` test | `compiler/src/compiler/AST/statement.cryo` and the casts' files | slice 6 (statements) | the header becomes a struct when the "any node" handle is `Node`; the casts become `Node::Stmt(s)` arms |
 | `Stmt.shape`, the statement's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/statement.cryo` | slice 6 (statements) | renamed `kind` when the header stops deriving from `ASTNode` |
 | `DeclKind::Legacy` and every `match` arm for it; `DeclarationNode.shape` on a declaration whose kind is still a subclass; the `NodeKind`-per-kind dispatch for those kinds beside the `NodeKind::Declaration` arms | `compiler/src/compiler/AST/declaration.cryo` and every declaration consumer | slice 6 (declarations, `IntrinsicConst` and `Module`) | when the last declaration kind converts; then `shape` is renamed `kind` with the header's struct |
-| `DeclarationNode::with_shape`, `DeclarationNode::module_of` and `DeclarationNode::import_of` (instance, diagnostics, pass registry x3, language server semantic tokens), and the `as DeclarationNode*` casts behind a `NodeKind::Declaration` test (walker, cloner, sema, codegen, type resolution, name resolution x2, stamp check, directive processing, language server identity) | `compiler/src/compiler/AST/declaration.cryo` and those files | slice 6 (declarations) | the casts become `Node::Decl(d)` arms when the "any node" handle is `Node`; `module_of` and `import_of` then match on `Node` |
+| `DeclarationNode::with_shape`, `DeclarationNode::module_of`, `DeclarationNode::import_of` (instance, diagnostics, pass registry x3, language server semantic tokens) and `DeclarationNode::extern_of` (parser, bindgen, directive processing, language server outline), and the `as DeclarationNode*` casts behind a `NodeKind::Declaration` test (walker, cloner, sema, codegen, type resolution, name resolution x2, stamp check, directive processing, language server identity) | `compiler/src/compiler/AST/declaration.cryo` and those files | slice 6 (declarations) | the casts become `Node::Decl(d)` arms when the "any node" handle is `Node`; `module_of`, `import_of` and `extern_of` then match on `Node` |

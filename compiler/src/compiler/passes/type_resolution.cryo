@@ -50,7 +50,7 @@ import std::fmt;
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDeclNode, EnumDeclNode,
-    EnumVariant, ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode,
+    EnumVariant, FieldDeclNode, FunctionDeclNode, GenericParamNode,
     DeclKind, ImplBlockNode, MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
 };
@@ -2815,119 +2815,118 @@ type struct TypeResolutionPasses {
                         ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def(), &impl_args);
                     sig_count += node.methods.length;
                 }
-                NodeKind::ExternBlock => {
-                    const node: ExternBlockNode* = stmt as ExternBlockNode*;
-                    for (mut j: i64 = 0; j < node.functions.length; j++) {
-                        const fn_node: FunctionDeclNode* = node.functions[j];
-                        runner.resolve_func_signature(fn_node, &runner.res_ctx);
-
-                        if (fn_node.resolved_return_type.is_valid()) {
-                            // Collect resolved param types
-                            mut ext_params: [TypeRef] = [];
-                            for (mut p: i64 = 0; p < fn_node.parameters.length; p++) {
-                                const param: VarDeclNode* = fn_node.parameters[p];
-                                if (param != null && param.resolved_type.is_valid()) {
-                                    ext_params.push(param.resolved_type);
-                                }
-                            }
-
-                            // Create FunctionType in the arena
-                            const func_type_ref: TypeRef = arena.get_function(
-                                fn_node.resolved_return_type, ext_params, fn_node.is_variadic);
-
-                            // The LLVM symbol an extern function resolves to: its
-                            // bare C name, UNLESS a function-level `![symbol("sym")]`
-                            // pins a different linker symbol (the C++ binding
-                            // generator pins the Itanium mangled name).  Read from
-                            // the parsed directive (DirectiveProcessing, which sets
-                            // `has_link_name`, runs LATER than this pass), and
-                            // registered as the DI mangled name so EVERY module - 
-                            // declaring and consuming - emits the same symbol,
-                            // making the override work across the module boundary.
-                            const ext_link_str: string = fn_node.link_directive_symbol();
-                            const ext_link_sym: SymbolStr = if (ext_link_str.length() > 0) {
-                                ctx.intern_table.intern(ext_link_str)
-                            } else {
-                                fn_node.name
-                            };
-
-                            // The declaration is registered under its own key -
-                            // its name under the module that declares it, as
-                            // any free function's: the alias's module for a C
-                            // import (`<mod>::cit::add3`, the namespace the
-                            // alias's stamp names), the writing module for a
-                            // plain extern block - and the C name is its
-                            // SYMBOL, never a key: a bare leaf shared by every
-                            // extern block declaring that C name could only
-                            // hold one of them, and a call pinned by the
-                            // symbol alone could not say which declaration it
-                            // meant.  A call binds the declaration its stamp
-                            // names and is emitted at that declaration's
-                            // signature.
-                            const ext_q_name: SymbolStr = if (node.is_c_import()) {
-                                ctx.qualify_binding_sym(fn_node.name, node.binding_namespace)
-                            } else {
-                                ctx.decl_fn_key(fn_node.name, fn_node.span.file)
-                            };
-                            const ext_leaf: SymbolStr = fn_node.name;
-                            const ext_owner: FamilyOwner = if (node.is_c_import()) {
-                                ctx.module_family(node.binding_namespace)
-                            } else {
-                                ctx.fn_family_of(fn_node.def)
-                            };
-                            // Two extern blocks declaring one C name with
-                            // DIFFERENT Cryo signatures is an ABI hazard the
-                            // program carries whichever one a call names - at
-                            // most one of them matches the C definition - and
-                            // is reported once, at the later declaration.  An
-                            // identical redeclaration (two modules each writing
-                            // the libc prototype they need) shares the interned
-                            // function type and says nothing.
-                            const clash_key: SymbolStr =
-                                ctx.decl_index.extern_symbol_conflict(ext_link_sym, func_type_ref);
-                            if (clash_key.is_valid()) {
-                                const sym_str: string = ctx.intern_table.resolve(fn_node.name);
-                                mut wdiag: Diagnostic = Diagnostic::warning(
-                                    ErrorCode::W0011_DUPLICATE_EXTERN_SYMBOL,
-                                    fmt::format("extern C symbol `%s` is declared in more than one extern block with different signatures; a call binds the declaration it names, and at most one of them matches the C definition",
-                                        sym_str));
-                                wdiag = wdiag.at_with_label(fn_node.span,
-                                    "duplicate extern declaration here");
-                                wdiag = wdiag.help(fmt::format("also declared as `%s`; make the two signatures agree, or remove one",
-                                    ctx.intern_table.resolve(clash_key)));
-                                ctx.emit_diagnostic(wdiag);
-                            }
-                            // The LLVM symbol is written on the overload entry
-                            // as well as the key's slot: codegen resolves a
-                            // pinned declaration through the entry registered
-                            // under it, an extern's as any other function's.
-                            fn_node.set_overload_entry(ctx.decl_index.register_function_signature(
-                                ext_owner, ext_leaf, fn_node.resolved_return_type, func_type_ref,
-                                ctx.intern_table, arena, ext_link_sym,
-                                if (fn_node.has_name_span()) { fn_node.name_span } else { fn_node.span },
-                                fn_node.def, fn_node as ASTNode*));
-                            ctx.decl_index.note_extern_symbol(ext_link_sym, ext_q_name, func_type_ref);
-                            // Whether this IS a C function the compiler checks
-                            // calls to (the C `printf`) is decided by the
-                            // identity, claimed where it is registered.
-                            ctx.generic_registry.claim_wellknown(fn_node.def, ctx.intern_table);
-                            // An imported function is a declaration of this
-                            // module and takes its written visibility, as a
-                            // free function does: a `private` one is not
-                            // callable by qualified path from another module.
-                            // A C import's prototypes are its alias module's
-                            // public declarations - the alias exists to be
-                            // reached through, and the name layer declares
-                            // them so - whatever the block's text wrote.
-                            ctx.decl_index.set_decl_visibility(fn_node.def,
-                                node.is_c_import() || fn_node.is_public);
-                        }
-                    }
-                    sig_count += node.functions.length;
-                }
                 NodeKind::Declaration => {
                     const decl: DeclarationNode* = stmt as DeclarationNode*;
                     match (decl.shape) {
+                        DeclKind::Extern(node) => {
+                            for (mut j: i64 = 0; j < node.functions.length; j++) {
+                                const fn_node: FunctionDeclNode* = node.functions[j];
+                                runner.resolve_func_signature(fn_node, &runner.res_ctx);
+
+                                if (fn_node.resolved_return_type.is_valid()) {
+                                    // Collect resolved param types
+                                    mut ext_params: [TypeRef] = [];
+                                    for (mut p: i64 = 0; p < fn_node.parameters.length; p++) {
+                                        const param: VarDeclNode* = fn_node.parameters[p];
+                                        if (param != null && param.resolved_type.is_valid()) {
+                                            ext_params.push(param.resolved_type);
+                                        }
+                                    }
+
+                                    // Create FunctionType in the arena
+                                    const func_type_ref: TypeRef = arena.get_function(
+                                        fn_node.resolved_return_type, ext_params, fn_node.is_variadic);
+
+                                    // The LLVM symbol an extern function resolves to: its
+                                    // bare C name, UNLESS a function-level `![symbol("sym")]`
+                                    // pins a different linker symbol (the C++ binding
+                                    // generator pins the Itanium mangled name).  Read from
+                                    // the parsed directive (DirectiveProcessing, which sets
+                                    // `has_link_name`, runs LATER than this pass), and
+                                    // registered as the DI mangled name so EVERY module - 
+                                    // declaring and consuming - emits the same symbol,
+                                    // making the override work across the module boundary.
+                                    const ext_link_str: string = fn_node.link_directive_symbol();
+                                    const ext_link_sym: SymbolStr = if (ext_link_str.length() > 0) {
+                                        ctx.intern_table.intern(ext_link_str)
+                                    } else {
+                                        fn_node.name
+                                    };
+
+                                    // The declaration is registered under its own key -
+                                    // its name under the module that declares it, as
+                                    // any free function's: the alias's module for a C
+                                    // import (`<mod>::cit::add3`, the namespace the
+                                    // alias's stamp names), the writing module for a
+                                    // plain extern block - and the C name is its
+                                    // SYMBOL, never a key: a bare leaf shared by every
+                                    // extern block declaring that C name could only
+                                    // hold one of them, and a call pinned by the
+                                    // symbol alone could not say which declaration it
+                                    // meant.  A call binds the declaration its stamp
+                                    // names and is emitted at that declaration's
+                                    // signature.
+                                    const ext_q_name: SymbolStr = if (node.is_c_import()) {
+                                        ctx.qualify_binding_sym(fn_node.name, node.binding_namespace)
+                                    } else {
+                                        ctx.decl_fn_key(fn_node.name, fn_node.span.file)
+                                    };
+                                    const ext_leaf: SymbolStr = fn_node.name;
+                                    const ext_owner: FamilyOwner = if (node.is_c_import()) {
+                                        ctx.module_family(node.binding_namespace)
+                                    } else {
+                                        ctx.fn_family_of(fn_node.def)
+                                    };
+                                    // Two extern blocks declaring one C name with
+                                    // DIFFERENT Cryo signatures is an ABI hazard the
+                                    // program carries whichever one a call names - at
+                                    // most one of them matches the C definition - and
+                                    // is reported once, at the later declaration.  An
+                                    // identical redeclaration (two modules each writing
+                                    // the libc prototype they need) shares the interned
+                                    // function type and says nothing.
+                                    const clash_key: SymbolStr =
+                                        ctx.decl_index.extern_symbol_conflict(ext_link_sym, func_type_ref);
+                                    if (clash_key.is_valid()) {
+                                        const sym_str: string = ctx.intern_table.resolve(fn_node.name);
+                                        mut wdiag: Diagnostic = Diagnostic::warning(
+                                            ErrorCode::W0011_DUPLICATE_EXTERN_SYMBOL,
+                                            fmt::format("extern C symbol `%s` is declared in more than one extern block with different signatures; a call binds the declaration it names, and at most one of them matches the C definition",
+                                                sym_str));
+                                        wdiag = wdiag.at_with_label(fn_node.span,
+                                            "duplicate extern declaration here");
+                                        wdiag = wdiag.help(fmt::format("also declared as `%s`; make the two signatures agree, or remove one",
+                                            ctx.intern_table.resolve(clash_key)));
+                                        ctx.emit_diagnostic(wdiag);
+                                    }
+                                    // The LLVM symbol is written on the overload entry
+                                    // as well as the key's slot: codegen resolves a
+                                    // pinned declaration through the entry registered
+                                    // under it, an extern's as any other function's.
+                                    fn_node.set_overload_entry(ctx.decl_index.register_function_signature(
+                                        ext_owner, ext_leaf, fn_node.resolved_return_type, func_type_ref,
+                                        ctx.intern_table, arena, ext_link_sym,
+                                        if (fn_node.has_name_span()) { fn_node.name_span } else { fn_node.span },
+                                        fn_node.def, fn_node as ASTNode*));
+                                    ctx.decl_index.note_extern_symbol(ext_link_sym, ext_q_name, func_type_ref);
+                                    // Whether this IS a C function the compiler checks
+                                    // calls to (the C `printf`) is decided by the
+                                    // identity, claimed where it is registered.
+                                    ctx.generic_registry.claim_wellknown(fn_node.def, ctx.intern_table);
+                                    // An imported function is a declaration of this
+                                    // module and takes its written visibility, as a
+                                    // free function does: a `private` one is not
+                                    // callable by qualified path from another module.
+                                    // A C import's prototypes are its alias module's
+                                    // public declarations - the alias exists to be
+                                    // reached through, and the name layer declares
+                                    // them so - whatever the block's text wrote.
+                                    ctx.decl_index.set_decl_visibility(fn_node.def,
+                                        node.is_c_import() || fn_node.is_public);
+                                }
+                            }
+                            sig_count += node.functions.length;
+                        }
                         DeclKind::Intrinsic(node) => {
                             // Resolve parameter types
                             for (mut j: i64 = 0; j < node.parameters.length; j++) {

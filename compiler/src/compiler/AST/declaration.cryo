@@ -106,6 +106,16 @@ public:
         };
     }
 
+    /// The extern block `n` is, or null.
+    static extern_of(n: ASTNode*) -> ExternBlock* {
+        const d: DeclarationNode* = DeclarationNode::with_shape(n);
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Extern(e) => { e }
+            _                   => { null }
+        };
+    }
+
     /// The import (or export) declaration `n` is, or null.
     static import_of(n: ASTNode*) -> ImportDecl* {
         const d: DeclarationNode* = DeclarationNode::with_shape(n);
@@ -169,7 +179,7 @@ public:
     /// absent/malformed.  Read directly from the attached (parsed) directive so
     /// the override is available in TypeResolution/DI/sema - which all run BEFORE
     /// DirectiveProcessing interprets directives into `link_name`.  Block-level
-    /// `![link("lib")]` (a library name) lives on the ExternBlockNode and means
+    /// `![link("lib")]` (a library name) lives on the extern block and means
     /// something different (the library to link), so it is never consulted here.
     link_directive_symbol(&this) -> string {
         const d: DirectiveNode* = this.find_directive(Keyword::new("symbol"));
@@ -746,6 +756,7 @@ public:
 /// `DeclarationNode`; it goes when the last kind converts.
 type enum DeclKind {
     Legacy;
+    Extern(ExternBlock*);
     Import(ImportDecl*);
     Intrinsic(IntrinsicDecl*);
     IntrinsicConst(IntrinsicConstDecl*);
@@ -1854,15 +1865,16 @@ public:
 }
 
 
-type class ExternBlockNode : DeclarationNode {
-public:
+/// `extern "C" { ... }`, and the C-header import form
+/// `extern module name := "C" { #include ... }`.
+type struct ExternBlock {
     linkage_type:    string;
     namespace_alias: SymbolStr;
     /// The canonical namespace of a C-import block's alias: the declaring
     /// module's, with the alias under it (`<mod>::cit`).  The alias is a
     /// binding of the module that wrote it - two modules each writing
-    /// `extern module libc as cit;` get two namespaces, as two `extern crate
-    /// x as y` do - and every declaration the block brings in (its
+    /// `extern module libc as cit;` get two namespaces - and every
+    /// declaration the block brings in (its
     /// functions, and the types and constants the import engine
     /// synthesizes, through their `binding_namespace`) is keyed under this
     /// one.  Written once, by the import engine, before any name is
@@ -1883,15 +1895,23 @@ public:
     /// extern block would be the same rule written several times.
     globals:         [VarDeclNode*];
 
-    ExternBlockNode(linkage_type: string, span: SourceSpan)
-        : DeclarationNode(NodeKind::ExternBlock, span) {
-        this.linkage_type    = linkage_type;
-        this.namespace_alias = SymbolStr::empty();
-        this.binding_namespace = ModulePath::none();
-        this.include_paths   = [];
-        this.include_is_system = [];
-        this.functions       = [];
-        this.globals         = [];
+    static new(linkage_type: string) -> ExternBlock* {
+        return new ExternBlock {
+            linkage_type:      linkage_type,
+            namespace_alias:   SymbolStr::empty(),
+            binding_namespace: ModulePath::none(),
+            include_paths:     [],
+            include_is_system: [],
+            functions:         [],
+            globals:           [],
+        };
+    }
+
+    static walk_children<V>(n: ExternBlock*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.functions.length; i++) {
+            v.walk_decl(n.functions[i] as DeclarationNode*);
+        }
+        for (mut i: i64 = 0; i < n.globals.length; i++) { v.walk_decl(n.globals[i] as DeclarationNode*); }
     }
 
     /// Record an imported global declared inside this block.
@@ -1924,6 +1944,12 @@ public:
 
     add_function(mut &this, func: FunctionDeclNode*) -> void {
         this.functions.push(func);
+    }
+}
+
+implement trait Allocate for struct ExternBlock {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
