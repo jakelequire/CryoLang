@@ -59,7 +59,7 @@ import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{ InstantiatedType };
-import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::type_base::{ Type };
@@ -148,7 +148,7 @@ type struct SpecializationPasses {
                     const node: StructDeclNode* = stmt as StructDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::StructDeclaration, node.def, registry, arena, ctx);
+                            stmt, TemplateKind::Struct, node.def, registry, arena, ctx);
                     }
                     // Static generic methods on non-generic structs (e.g.
                     // `Layout::array<T>`) need their own template entries;
@@ -172,7 +172,7 @@ type struct SpecializationPasses {
                     const node: UnionDeclNode* = stmt as UnionDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::UnionDeclaration, node.def, registry, arena, ctx);
+                            stmt, TemplateKind::Union, node.def, registry, arena, ctx);
                     }
                     if (!node.is_generic()) {
                         SpecializationPasses::register_static_method_templates(node.methods,
@@ -185,14 +185,14 @@ type struct SpecializationPasses {
                     const node: EnumDeclNode* = stmt as EnumDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::EnumDeclaration, node.def, registry, arena, ctx);
+                            stmt, TemplateKind::Enum, node.def, registry, arena, ctx);
                     }
                 }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::ClassDeclaration, node.def, registry, arena, ctx);
+                            stmt, TemplateKind::Class, node.def, registry, arena, ctx);
                     }
                     if (!node.is_generic()) {
                         SpecializationPasses::register_static_method_templates(node.methods,
@@ -205,21 +205,21 @@ type struct SpecializationPasses {
                     const node: FunctionDeclNode* = stmt as FunctionDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::FunctionDeclaration, node.def, registry, arena, ctx);
+                            stmt, TemplateKind::Function, node.def, registry, arena, ctx);
                     }
                 }
                 NodeKind::TraitDeclaration => {
                     const node: TraitDeclNode* = stmt as TraitDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::TraitDeclaration, node.def, registry, arena, ctx);
+                            stmt, TemplateKind::Trait, node.def, registry, arena, ctx);
                     }
                 }
                 NodeKind::TypeAliasDeclaration => {
                     const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.alias_name, node.generic_params,
-                            stmt, NodeKind::TypeAliasDeclaration, node.def, registry, arena, ctx);
+                            stmt, TemplateKind::TypeAlias, node.def, registry, arena, ctx);
                     }
                 }
                 NodeKind::ImplementationBlock => {
@@ -760,7 +760,7 @@ type struct SpecializationPasses {
     ///
     /// `name` and `generic_params` are the common fields every generic
     /// declaration shares.  `ast_node` is the original declaration cast to
-    /// ASTNode*.  `node_kind` identifies which declaration type it is.
+    /// ASTNode*.  `kind` is which declaration it is.
     /// `def` is the id the declaration was stamped with - by the
     /// type-declaration stage for a type, by the name layer for a function -
     /// and its canonical name is the registry's key.  A type's base type is
@@ -768,7 +768,7 @@ type struct SpecializationPasses {
     /// unstamped declaration is a missed stamp, recorded, and registers
     /// nothing: no second key is derived for it from the name and the file.
     static register_generic_template(name: SymbolStr, generic_params: &[GenericParamNode*],
-                                       ast_node: ASTNode*, node_kind: NodeKind,
+                                       ast_node: ASTNode*, kind: TemplateKind,
                                        def: DefId,
                                        registry: GenericRegistry*, arena: TypeArena*,
                                        ctx: CompilationContext*) -> void {
@@ -779,8 +779,8 @@ type struct SpecializationPasses {
             return;
         }
         const qualified_sym: SymbolStr = ctx.defs.path_of(def).spelling();
-        LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering %s template '%s'",
-            node_kind.to_string(), ctx.resolve_str(name));
+        LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering template '%s'",
+            ctx.resolve_str(name));
 
         // Use the shared utility for arena TypeRef creation (single source of truth)
         const refs: [TypeRef] = TypeResolutionPasses::create_generic_param_types(
@@ -796,7 +796,7 @@ type struct SpecializationPasses {
         }
 
         mut base_type: TypeRef = TypeRef::invalid();
-        if (node_kind == NodeKind::FunctionDeclaration) {
+        if (kind == TemplateKind::Function) {
             // Generic functions have no arena type, but they need a TypeID so
             // the GenericRegistry can track instantiations (e.g., identity<int>).
             // Use a FunctionTemplate placeholder instead of a fake StructType.
@@ -810,7 +810,7 @@ type struct SpecializationPasses {
         const entry: TemplateEntry = TemplateEntry::new(
             name, qualified_sym, def, ctx.current_module(),
             param_names, param_syms, param_types,
-            ast_node, node_kind,
+            ast_node, kind,
             base_type
         );
         registry.register_template(entry);
@@ -867,7 +867,7 @@ type struct SpecializationPasses {
             const entry: TemplateEntry = TemplateEntry::new(
                 m.func.name, qualified_sym, m.func.def, written_in,
                 param_names, param_syms, param_types,
-                m.func as ASTNode*, NodeKind::FunctionDeclaration,
+                m.func as ASTNode*, TemplateKind::Function,
                 base_type
             );
             registry.register_template(entry);

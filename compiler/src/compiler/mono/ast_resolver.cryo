@@ -29,7 +29,7 @@ import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::resolver::{ intern_table, symbol_str };
 import compiler::mono::{ state, trait_specializer };
 import compiler::types::generic_registry;
-import compiler::types::generic_registry::{ TemplateEntry };
+import compiler::types::generic_registry::{ TemplateKind };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
@@ -90,124 +90,119 @@ type struct MonoAstResolver {
 
     /// Walk the specialized AST and resolve all type annotations into concrete
     /// TypeRefs.
-    resolve_specialized_ast(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
-                            entry: TemplateEntry*, subst: TypeSubstitution*,
+    ///
+    /// A bare leaf in this clone carries the stamp it was given in the file
+    /// that WROTE it, and the MANGLED SPEC NAMES the substituter writes into
+    /// the clone carry a `pre_resolved` TypeRef that `TypeResolver::resolve`
+    /// returns before it consults the context, so the context holds only the
+    /// bindings and `This`.
+    resolve_specialized_ast(mut &this, ast_node: ASTNode*, kind: TemplateKind,
                             this_type: TypeRef) -> void {
         if (ast_node == null || this.type_resolver == null) { return; }
-
-        // A bare leaf in this clone carries the stamp it was given in the file
-        // that WROTE it, and the MANGLED SPEC NAMES the substituter writes into
-        // the clone carry a `pre_resolved` TypeRef that `TypeResolver::resolve`
-        // returns before it consults the context, so the context holds only
-        // the bindings and `This`.
         mut res_ctx: ResolutionContext = ResolutionContext::new("");
 
-        match (node_kind) {
-            NodeKind::StructDeclaration => {
+        match (kind) {
+            TemplateKind::Struct => {
                 const decl: StructDeclNode* = ast_node as StructDeclNode*;
-                if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
                 this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
-            NodeKind::UnionDeclaration => {
+            TemplateKind::Union => {
                 const decl: UnionDeclNode* = ast_node as UnionDeclNode*;
-                if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
                 this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
-            NodeKind::ClassDeclaration => {
+            TemplateKind::Class => {
                 const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
-                if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
                 this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
-            NodeKind::EnumDeclaration => {
+            TemplateKind::Enum => {
                 // Enum variants use SymbolStr names; resolution handled in
                 // populate_enum_variants via name lookup.
             }
-            NodeKind::FunctionDeclaration => {
-                const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
-                if (decl == null) { return; }
+            TemplateKind::Function => {
                 // Free functions have no `this`.
-                this.resolve_func_and_body(decl, &res_ctx, TypeRef::invalid());
+                this.resolve_func_and_body(ast_node as FunctionDeclNode*, &res_ctx, TypeRef::invalid());
             }
-            NodeKind::ImplementationBlock => {
-                const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
-                if (decl == null) { return; }
-                // Bounds-violating impls/methods were already stripped pre-clone
-                // by filter_bounds_violating_* in specialize_with_entry.
-                //
-                // First derive any impl-introduced generic the Self type doesn't
-                // determine (e.g. `A` in `implement<I, A> Iterator<A> for TakeN<I>
-                // where I: Iterator<A>`) from the where-bounds, then bind the trait's
-                // outer generic params to the impl's concrete trait args, so cloned
-                // default-method bodies resolve their inner element names concretely.
-                this.trait_spec.derive_impl_where_generics(decl, subst, &res_ctx);
-                this.trait_spec.bind_trait_args_for_spec_impl(decl, &res_ctx);
-                // Persist the concrete trait-element bindings onto the spec'd impl
-                // (self-returning defaults are instantiated lazily and re-seed these).
-                this.trait_spec.cache_derived_trait_params(decl, &res_ctx);
-                // Drop conditionally-bounded trait defaults (`min`/`max` with
-                // `where This::Item: Ord`) whose concrete Item does not satisfy
-                // the bound for THIS monomorphization (e.g. `EnumerateIter`'s
-                // `Pair` Item is not `Ord`) - before their bodies are resolved,
-                // so `.compare()` on a non-`Ord` element never reaches type check.
-                this.trait_spec.filter_projection_bound_methods(decl, this_type);
-                // Rewrite where-bound-derived generics (`A`) inside the impl's method
-                // BODIES so a struct literal `Pair<A, A>{..}` becomes concrete before
-                // body resolution.  Run before resolve_methods.
-                this.trait_spec.substitute_derived_params_in_method_bodies(decl);
-                this.resolve_methods(decl.methods, &res_ctx, this_type);
-            }
-            _ => {}
+            TemplateKind::Trait => {}
+            TemplateKind::TypeAlias => {}
         }
+    }
+
+    /// Resolve a specialization's `implement` block under `subst`, the
+    /// block's own parameters bound through its head.
+    resolve_specialized_impl(mut &this, decl: ImplBlockNode*, subst: TypeSubstitution*,
+                             this_type: TypeRef) -> void {
+        if (decl == null || this.type_resolver == null) { return; }
+        mut res_ctx: ResolutionContext = ResolutionContext::new("");
+        // Bounds-violating impls/methods were already stripped pre-clone
+        // by filter_bounds_violating_* in specialize_with_entry.
+        //
+        // First derive any impl-introduced generic the Self type doesn't
+        // determine (e.g. `A` in `implement<I, A> Iterator<A> for TakeN<I>
+        // where I: Iterator<A>`) from the where-bounds, then bind the trait's
+        // outer generic params to the impl's concrete trait args, so cloned
+        // default-method bodies resolve their inner element names concretely.
+        this.trait_spec.derive_impl_where_generics(decl, subst, &res_ctx);
+        this.trait_spec.bind_trait_args_for_spec_impl(decl, &res_ctx);
+        // Persist the concrete trait-element bindings onto the spec'd impl
+        // (self-returning defaults are instantiated lazily and re-seed these).
+        this.trait_spec.cache_derived_trait_params(decl, &res_ctx);
+        // Drop conditionally-bounded trait defaults (`min`/`max` with
+        // `where This::Item: Ord`) whose concrete Item does not satisfy
+        // the bound for THIS monomorphization (e.g. `EnumerateIter`'s
+        // `Pair` Item is not `Ord`) - before their bodies are resolved,
+        // so `.compare()` on a non-`Ord` element never reaches type check.
+        this.trait_spec.filter_projection_bound_methods(decl, this_type);
+        // Rewrite where-bound-derived generics (`A`) inside the impl's method
+        // BODIES so a struct literal `Pair<A, A>{..}` becomes concrete before
+        // body resolution.  Run before resolve_methods.
+        this.trait_spec.substitute_derived_params_in_method_bodies(decl);
+        this.resolve_methods(decl.methods, &res_ctx, this_type);
     }
 
     // ---- static match arm pruning (compile-time type dispatch) -----------
 
     /// Entry point: prune `static match` arms throughout a freshly-substituted
     /// specialized AST.  Reduces each static match to its single live arm.
-    prune_static_match_arms(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
-                            entry: TemplateEntry*, subst: TypeSubstitution*) -> void {
+    ///
+    /// Scoped per body, not per template.  Both kinds of name a `static
+    /// match` resolves - the arm patterns the author wrote and the scrutinee
+    /// the substituter rewrote to the concrete binding - were written
+    /// wherever the BODY was, and a cloned trait default's body lives in the
+    /// trait's file while the template names the implementing type's module.
+    /// The same walk reached through `prune_static_match_in_stmt` from the
+    /// call specializer is scoped that way too.
+    prune_static_match_arms(mut &this, ast_node: ASTNode*, kind: TemplateKind) -> void {
         if (ast_node == null || this.type_resolver == null) { return; }
         mut res_ctx: ResolutionContext = ResolutionContext::new("");
-        // Scoped per body below, not here.  Both kinds of name a `static match`
-        // resolves - the arm patterns the author wrote and the scrutinee the
-        // substituter rewrote to the concrete binding - were written wherever
-        // the BODY was, and a cloned trait default's body lives in the trait's
-        // file while `entry` names the implementing type's module.  The same
-        // walk reached through `prune_static_match_in_stmt` from the call
-        // specializer is scoped that way already; this entry is the one that
-        // was not, so the two disagreed about the same question.
-
-        match (node_kind) {
-            NodeKind::StructDeclaration => {
-                const decl: StructDeclNode* = ast_node as StructDeclNode*;
-                if (decl == null) { return; }
-                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+        match (kind) {
+            TemplateKind::Struct => {
+                this.prune_static_match_in_methods((ast_node as StructDeclNode*).methods, &res_ctx);
             }
-            NodeKind::UnionDeclaration => {
-                const decl: UnionDeclNode* = ast_node as UnionDeclNode*;
-                if (decl == null) { return; }
-                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+            TemplateKind::Union => {
+                this.prune_static_match_in_methods((ast_node as UnionDeclNode*).methods, &res_ctx);
             }
-            NodeKind::ClassDeclaration => {
-                const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
-                if (decl == null) { return; }
-                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+            TemplateKind::Class => {
+                this.prune_static_match_in_methods((ast_node as ClassDeclNode*).methods, &res_ctx);
             }
-            NodeKind::FunctionDeclaration => {
+            TemplateKind::Function => {
                 const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
-                if (decl == null || decl.body == null) { return; }
+                if (decl.body == null) { return; }
                 this.prune_static_match_in_stmt(decl.body, &res_ctx);
             }
-            NodeKind::ImplementationBlock => {
-                const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
-                if (decl == null) { return; }
-                this.prune_static_match_in_methods(decl.methods, &res_ctx);
-            }
-            _ => {}
+            TemplateKind::Enum => {}
+            TemplateKind::Trait => {}
+            TemplateKind::TypeAlias => {}
         }
+    }
+
+    /// `prune_static_match_arms` for a specialization's `implement` block.
+    prune_static_match_arms_in_impl(mut &this, decl: ImplBlockNode*) -> void {
+        if (decl == null || this.type_resolver == null) { return; }
+        mut res_ctx: ResolutionContext = ResolutionContext::new("");
+        this.prune_static_match_in_methods(decl.methods, &res_ctx);
     }
 
     prune_static_match_in_methods(mut &this, methods: &[MethodNode*],

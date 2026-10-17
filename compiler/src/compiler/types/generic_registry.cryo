@@ -19,7 +19,7 @@
 namespace compiler::types::generic_registry;
 
 import compiler::ast;
-import compiler::ast::{ declaration, node, NodeKind };
+import compiler::ast::{ declaration, node };
 import compiler::types;
 import compiler::types::{ generic, type_base, arena, type_ref };
 import compiler::resolver::symbol_str;
@@ -59,6 +59,19 @@ import compiler::module_graph::{ ModulePath };
 
 // TemplateEntry: Metadata for a single generic declaration
 
+/// What a template declares: which declaration its `ast_node` is, and so
+/// how it is specialized.  The registry's own answer, independent of how
+/// the syntax tree spells a declaration's kind.
+type enum TemplateKind {
+    Function;
+    Struct;
+    Union;
+    Class;
+    Enum;
+    Trait;
+    TypeAlias;
+}
+
 /// All information needed to specialize a single generic type or function.
 type struct TemplateEntry {
     private name:   SymbolStr;           // Unqualified: "Array"
@@ -83,7 +96,7 @@ type struct TemplateEntry {
     param_types:    [TypeRef];          // The GenericParamType of each parameter
     param_count:    i64;
     ast_node:       ASTNode*;           // Original generic declaration
-    node_kind:      NodeKind;
+    kind:           TemplateKind;
     base_type:      TypeRef;            // The uninstantiated generic type in arena
     impl_blocks:    [ImplBlockNode*];   // Associated impl blocks
     // True when this is a free-function template whose bare leaf name also
@@ -97,7 +110,7 @@ type struct TemplateEntry {
     /// Create a new template entry.
     static new(name: SymbolStr, qualified_name: SymbolStr, def: DefId, declared_in: ModulePath,
                param_names: [SymbolStr], param_syms: [SymbolID], param_types: [TypeRef],
-               ast_node: ASTNode*, node_kind: NodeKind,
+               ast_node: ASTNode*, kind: TemplateKind,
                base_type: TypeRef) -> TemplateEntry {
         const param_count_val: i64 = param_names.length;
         return TemplateEntry {
@@ -110,7 +123,7 @@ type struct TemplateEntry {
             param_types:    param_types,
             param_count:    param_count_val,
             ast_node:       ast_node,
-            node_kind:      node_kind,
+            kind:           kind,
             base_type:      base_type,
             impl_blocks:    [],
             module_disambig: false,
@@ -134,12 +147,14 @@ type struct TemplateEntry {
     /// template's bounds being its declaration's.
     declared_where_bounds(&this) -> [ast::TraitBound]* {
         if (this.ast_node == null) { return null; }
-        return match (this.node_kind) {
-            NodeKind::StructDeclaration => { &(this.ast_node as StructDeclNode*).where_bounds }
-            NodeKind::UnionDeclaration  => { &(this.ast_node as UnionDeclNode*).where_bounds }
-            NodeKind::ClassDeclaration  => { &(this.ast_node as ClassDeclNode*).where_bounds }
-            NodeKind::EnumDeclaration   => { &(this.ast_node as EnumDeclNode*).where_bounds }
-            _                           => { null }
+        return match (this.kind) {
+            TemplateKind::Struct    => { &(this.ast_node as StructDeclNode*).where_bounds }
+            TemplateKind::Union     => { &(this.ast_node as UnionDeclNode*).where_bounds }
+            TemplateKind::Class     => { &(this.ast_node as ClassDeclNode*).where_bounds }
+            TemplateKind::Enum      => { &(this.ast_node as EnumDeclNode*).where_bounds }
+            TemplateKind::Function  => { null }
+            TemplateKind::Trait     => { null }
+            TemplateKind::TypeAlias => { null }
         };
     }
 
@@ -185,36 +200,35 @@ type struct TemplateEntry {
     /// carry generic params (or null ast_node).
     get_generic_params(&this) -> [GenericParamNode*] {
         if (this.ast_node == null) { return []; }
-        return match (this.node_kind) {
-            NodeKind::StructDeclaration => {
+        return match (this.kind) {
+            TemplateKind::Struct => {
                 const decl: StructDeclNode* = this.ast_node as StructDeclNode*;
                 decl.generic_params
             }
-            NodeKind::UnionDeclaration => {
+            TemplateKind::Union => {
                 const decl: UnionDeclNode* = this.ast_node as UnionDeclNode*;
                 decl.generic_params
             }
-            NodeKind::ClassDeclaration => {
+            TemplateKind::Class => {
                 const decl: ClassDeclNode* = this.ast_node as ClassDeclNode*;
                 decl.generic_params
             }
-            NodeKind::EnumDeclaration => {
+            TemplateKind::Enum => {
                 const decl: EnumDeclNode* = this.ast_node as EnumDeclNode*;
                 decl.generic_params
             }
-            NodeKind::FunctionDeclaration => {
+            TemplateKind::Function => {
                 const decl: FunctionDeclNode* = this.ast_node as FunctionDeclNode*;
                 decl.generic_params
             }
-            NodeKind::TraitDeclaration => {
+            TemplateKind::Trait => {
                 const decl: TraitDeclNode* = this.ast_node as TraitDeclNode*;
                 decl.generic_params
             }
-            NodeKind::TypeAliasDeclaration => {
+            TemplateKind::TypeAlias => {
                 const decl: TypeAliasDeclNode* = this.ast_node as TypeAliasDeclNode*;
                 decl.generic_params
             }
-            _ => { [] }
         };
     }
 }
@@ -438,7 +452,7 @@ type struct GenericRegistry {
         if (this.disambig_finalized) { return; }
         this.disambig_finalized = true;
         for (mut i: i64 = 0; i < this.entries.length; i += 1) {
-            if (this.entries[i].node_kind != NodeKind::FunctionDeclaration) {
+            if (this.entries[i].kind != TemplateKind::Function) {
                 continue;
             }
             // Free function only: a static method's qualified name carries an
@@ -446,7 +460,7 @@ type struct GenericRegistry {
             if (!this.is_free_function(&this.entries[i])) { continue; }
             if (this.entries[i].module_disambig) { continue; }
             for (mut j: i64 = i + 1; j < this.entries.length; j += 1) {
-                if (this.entries[j].node_kind != NodeKind::FunctionDeclaration) {
+                if (this.entries[j].kind != TemplateKind::Function) {
                     continue;
                 }
                 if (!this.is_free_function(&this.entries[j])) { continue; }

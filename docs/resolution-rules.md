@@ -153,6 +153,23 @@ yet is recorded with the change that builds it, not here.
      project object is likewise the implementer's call if it blocks the
      work, and otherwise stays as it is.  (Dispatch, delegated)
 
+408. **A `break` or `continue` inside an `unsafe` block or a `static
+     match` arm that leaves a loop containing an `await` stays refused
+     with E0600,** as built; the edge is not lowered.  (Dispatch,
+     delegated)
+
+409. **The generic registry records each template's kind as a kind of its
+     own** (`TemplateKind`: function, struct, union, class, enum, trait,
+     type alias) rather than the declaration's `NodeKind`, converted in a
+     change of its own that moves no compiled output, before any type
+     declaration converts to a payload.  (Dispatch, delegated)
+
+410. **The cloner's uncopied fields on intrinsics, imports and extern
+     blocks are low priority:** how often each of those kinds is cloned is
+     counted first; if any is, every field is copied and a test added; if
+     none is, that is recorded and the defect stays open.  (Dispatch,
+     delegated)
+
 ### 2026-10-16
 
 379. **A fixed-size array does not convert implicitly to a dynamic `[T]`:**

@@ -103,7 +103,7 @@ import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{ AssocProjectionType, GenericParamType, InstantiatedType };
-import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::inference::{ InferCtx };
@@ -1186,7 +1186,7 @@ type struct CallResolver {
             }
             if (call.generic_args.length > 0) {
                 const spec_tmpl: TemplateEntry* = this.spelling_template(ident.res);
-                if (spec_tmpl != null && spec_tmpl.node_kind == NodeKind::FunctionDeclaration) {
+                if (spec_tmpl != null && spec_tmpl.kind == TemplateKind::Function) {
                     // A function template's instance: its placeholder with
                     // the written arguments.
                     const inst: TypeRef = this.resolve_generic_scope_type(
@@ -1536,7 +1536,7 @@ type struct CallResolver {
         // records; measured at 0 over the corpus before the door went in.
         const r: Res = ident.res.require("call_resolver:free-call template");
         const t: TemplateEntry* = this.lookup_scope_template(r);
-        if (t == null || t.node_kind != NodeKind::FunctionDeclaration) { return null; }
+        if (t == null || t.kind != TemplateKind::Function) { return null; }
         const entries: [OverloadId] = this.family_entries(r.def_id());
         mut fits: FunctionDeclNode* = null;
         mut count: i64 = 0;
@@ -1550,7 +1550,7 @@ type struct CallResolver {
         }
         if (count != 1) { return null; }
         const chosen: TemplateEntry* = this.ctx.generic_registry.template_of(fits.def);
-        if (chosen == null || chosen.node_kind != NodeKind::FunctionDeclaration) { return null; }
+        if (chosen == null || chosen.kind != TemplateKind::Function) { return null; }
         return chosen;
     }
 
@@ -1806,7 +1806,7 @@ type struct CallResolver {
     /// single constructor taking that many arguments, or a type parameter
     /// stays unbound.
     instance_from_constructor_args(mut &this, call: CallExprNode*, tmpl: TemplateEntry*, ty: TypeRef) -> TypeRef {
-        if (tmpl.node_kind != NodeKind::ClassDeclaration || tmpl.ast_node == null) { return ty; }
+        if (tmpl.kind != TemplateKind::Class || tmpl.ast_node == null) { return ty; }
         if (tmpl.param_types.length == 0) { return ty; }
         const cd: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
         mut ctor: FunctionDeclNode* = null;
@@ -2296,7 +2296,7 @@ type struct CallResolver {
         if (call == null || scope == null) { return; }
         if (call.resolved_type_args.length > 0) { return; }
         const entry: TemplateEntry* = this.find_static_method_template(scope, call);
-        if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) { return; }
+        if (entry == null || entry.kind != TemplateKind::Function) { return; }
         if (entry.param_types.length == 0) { return; }
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
         if (tmpl == null) { return; }
@@ -3271,7 +3271,7 @@ type struct CallResolver {
                 continue;
             }
             const t: TemplateEntry* = this.ctx.generic_registry.template_of(f.def);
-            if (t == null || t.node_kind != NodeKind::FunctionDeclaration) { continue; }
+            if (t == null || t.kind != TemplateKind::Function) { continue; }
             if (!this.template_fits(t, call, null, arg_types)) { continue; }
             // A generic whose where-clause the arguments fail does not
             // accept them.
@@ -3432,7 +3432,7 @@ type struct CallResolver {
         // is one instance of it, whose template and type arguments are kept
         // on the node for monomorphization to pin.
         const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of(callee);
-        if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) {
+        if (tmpl != null && tmpl.kind == TemplateKind::Function) {
             if (scope.resolved_callee.is_some()) { return ft; }
             mut args: [TypeRef] = [];
             const inst_ty: TypeRef = this.generic_value_type(tmpl, &tmpl.param_types, ft, &scope.generic_args,
@@ -5865,7 +5865,7 @@ type struct CallResolver {
             const sig: TypeRef = this.ctx.decl_index.entry_signature(family[i]);
             if (!sig.is_valid()) { continue; }
             const tm: TemplateEntry* = this.ctx.generic_registry.template_of(f.def);
-            if (tm == null || tm.node_kind != NodeKind::FunctionDeclaration) {
+            if (tm == null || tm.kind != TemplateKind::Function) {
                 if (written.length == 0 && expected.is_valid() && sig.equals(expected)) {
                     fits.push(family[i]);
                     example = sig;
@@ -6096,7 +6096,7 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
         // A function's where-clause holds for the instance, as for a call.
-        if (entry.node_kind == NodeKind::FunctionDeclaration && entry.ast_node != null
+        if (entry.kind == TemplateKind::Function && entry.ast_node != null
                 && !this.check_call_where_bounds(span, entry.ast_node as FunctionDeclNode*, &entry.param_syms, &bindings)) {
             return TypeRef::invalid();
         }
@@ -6363,8 +6363,8 @@ type struct CallResolver {
         if (!base.is_valid()) { base = found; }
         const owner_entry: TemplateEntry* = this.ctx.generic_registry.template_of_type(base);
         if (owner_entry == null || owner_entry.param_types.length == 0) { return TypeRef::invalid(); }
-        if (owner_entry.node_kind != NodeKind::StructDeclaration && owner_entry.node_kind != NodeKind::UnionDeclaration
-                && owner_entry.node_kind != NodeKind::ClassDeclaration) { return TypeRef::invalid(); }
+        if (owner_entry.kind != TemplateKind::Struct && owner_entry.kind != TemplateKind::Union
+                && owner_entry.kind != TemplateKind::Class) { return TypeRef::invalid(); }
         const entries: [OverloadId] = this.member_entries(FamilyOwner::Type(base), scope.member_name);
         if (entries.length != 1) { return TypeRef::invalid(); }
         const m: MethodNode* = this.ctx.decl_index.entry_method(entries[0]);
@@ -7378,7 +7378,7 @@ type struct CallResolver {
         const m: MethodNode* = this.ctx.decl_index.entry_method(e);
         if (m == null || m.func == null || !m.is_static || m.func.generic_params.length == 0) { return null; }
         const t: TemplateEntry* = this.ctx.generic_registry.template_of(m.func.def);
-        if (t == null || t.node_kind != NodeKind::FunctionDeclaration) { return null; }
+        if (t == null || t.kind != TemplateKind::Function) { return null; }
         return t;
     }
 
@@ -7405,7 +7405,7 @@ type struct CallResolver {
         // module function.  The owner of a static method is always a nominal type.
         if (!this.scope_names_a_type(scope)) { return TypeRef::invalid(); }
         const entry: TemplateEntry* = this.find_static_method_template(scope, call);
-        if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) {
+        if (entry == null || entry.kind != TemplateKind::Function) {
             return TypeRef::invalid();
         }
         if (entry.param_types.length == 0) { return TypeRef::invalid(); }
@@ -7517,8 +7517,8 @@ type struct CallResolver {
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
         if (tmpl.param_types.length == 0) { return TypeRef::invalid(); }
 
-        if (tmpl.node_kind != NodeKind::StructDeclaration && tmpl.node_kind != NodeKind::UnionDeclaration
-                && tmpl.node_kind != NodeKind::ClassDeclaration) { return TypeRef::invalid(); }
+        if (tmpl.kind != TemplateKind::Struct && tmpl.kind != TemplateKind::Union
+                && tmpl.kind != TemplateKind::Class) { return TypeRef::invalid(); }
 
         // The method the path names, wherever the owner's method is written -
         // its declaration or an impl block of the template - static or taking
@@ -7726,8 +7726,8 @@ type struct CallResolver {
             this.resolve_scope_owner_template(scope);
         if (tmpl == null || tmpl.ast_node == null) { return; }
         if (tmpl.param_types.length == 0) { return; }
-        if (tmpl.node_kind != NodeKind::StructDeclaration && tmpl.node_kind != NodeKind::UnionDeclaration
-                && tmpl.node_kind != NodeKind::ClassDeclaration) { return; }
+        if (tmpl.kind != TemplateKind::Struct && tmpl.kind != TemplateKind::Union
+                && tmpl.kind != TemplateKind::Class) { return; }
         this.record_template_static(call, scope, this.scope_owner_type(scope));
         const func: FunctionDeclNode* = this.ctx.decl_index.method_func_of(call.template_method);
         if (func == null || func.generic_params.length > 0) { return; }
@@ -7744,9 +7744,9 @@ type struct CallResolver {
         if (tmpl.param_types.length == 0) { return TypeRef::invalid(); }
         const empty_methods: [MethodNode*] = [];
         mut methods: &[MethodNode*] = &empty_methods;
-        if (tmpl.node_kind == NodeKind::StructDeclaration) { methods = &(tmpl.ast_node as StructDeclNode*).methods; }
-        else if (tmpl.node_kind == NodeKind::UnionDeclaration) { methods = &(tmpl.ast_node as UnionDeclNode*).methods; }
-        else if (tmpl.node_kind == NodeKind::ClassDeclaration) { methods = &(tmpl.ast_node as ClassDeclNode*).methods; }
+        if (tmpl.kind == TemplateKind::Struct) { methods = &(tmpl.ast_node as StructDeclNode*).methods; }
+        else if (tmpl.kind == TemplateKind::Union) { methods = &(tmpl.ast_node as UnionDeclNode*).methods; }
+        else if (tmpl.kind == TemplateKind::Class) { methods = &(tmpl.ast_node as ClassDeclNode*).methods; }
         else { return TypeRef::invalid(); }
         mut found_count: i64 = 0;
         mut abstract_ret: TypeRef = TypeRef::invalid();
@@ -8408,7 +8408,7 @@ type struct CallResolver {
         mut is_fn_template: boolean = false;
         mut tmpl: TemplateEntry* = null;
         tmpl = this.ctx.generic_registry.template_of(callee);
-        if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
+        if (tmpl != null && tmpl.kind == TemplateKind::Function) { is_fn_template = true; }
         if (is_fn_template && call != null) {
             call.set_resolved_template(tmpl.base_type);
             // The instance the call is pinned to, else the one its turbofish

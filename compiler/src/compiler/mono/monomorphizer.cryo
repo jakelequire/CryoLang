@@ -65,7 +65,7 @@ import compiler::module_graph::{ ModulePath };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ ArrayType };
 import compiler::types::generic::{ InstantiatedType };
-import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
@@ -417,7 +417,7 @@ type struct Monomorphizer {
         // A function's copy is the instance it was made for: what a call to
         // the instance is pinned by, and what its registration files the
         // copy's entry under.
-        if (entry.node_kind == NodeKind::FunctionDeclaration && result.specialized_ast != null
+        if (entry.kind == TemplateKind::Function && result.specialized_ast != null
                 && result.specialized_ast.kind == NodeKind::FunctionDeclaration) {
             (result.specialized_ast as declaration::FunctionDeclNode*).instance = request.generic_type;
         }
@@ -447,13 +447,14 @@ type struct Monomorphizer {
         mut target_kind: TypeKind = TypeKind::Struct;
         mut is_named: boolean = true;
         mut is_union_kind: boolean = false;
-        match (entry.node_kind) {
-            NodeKind::StructDeclaration   => { target_kind = TypeKind::Struct; }
-            NodeKind::UnionDeclaration    => { target_kind = TypeKind::Struct; is_union_kind = true; }
-            NodeKind::EnumDeclaration     => { target_kind = TypeKind::Enum; }
-            NodeKind::ClassDeclaration    => { target_kind = TypeKind::Class; }
-            NodeKind::FunctionDeclaration => { is_named = false; }
-            _                             => { target_kind = TypeKind::Struct; }
+        match (entry.kind) {
+            TemplateKind::Struct    => { target_kind = TypeKind::Struct; }
+            TemplateKind::Union     => { target_kind = TypeKind::Struct; is_union_kind = true; }
+            TemplateKind::Enum      => { target_kind = TypeKind::Enum; }
+            TemplateKind::Class     => { target_kind = TypeKind::Class; }
+            TemplateKind::Function  => { is_named = false; }
+            TemplateKind::Trait     => { target_kind = TypeKind::Struct; }
+            TemplateKind::TypeAlias => { target_kind = TypeKind::Struct; }
         }
 
         // Human-readable display name ("Pair<i32, string>"), computed from the
@@ -581,17 +582,18 @@ type struct Monomorphizer {
         }
         // Compile-time `static match` arm pruning.  Runs AFTER substitution but
         // BEFORE resolve_specialized_ast, so dead arms are removed first.
-        this.ast_resolver.prune_static_match_arms(result.specialized_ast, entry.node_kind, entry, &subst);
+        this.ast_resolver.prune_static_match_arms(result.specialized_ast, entry.kind);
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
-            this.ast_resolver.prune_static_match_arms(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst);
+            this.ast_resolver.prune_static_match_arms_in_impl(kept_impl_asts[ri] as declaration::ImplBlockNode*);
         }
-        this.ast_resolver.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry, &subst, this_type_for_methods);
+        this.ast_resolver.resolve_specialized_ast(result.specialized_ast, entry.kind, this_type_for_methods);
         // An impl block is resolved under its own parameters, bound through
         // its head, not under the template's.
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
             mut head: TypeSubstitution = this.trait_spec.head_bindings(
                 kept_impl_asts[ri] as declaration::ImplBlockNode*, &request.type_args);
-            this.ast_resolver.resolve_specialized_ast(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &head, this_type_for_methods);
+            this.ast_resolver.resolve_specialized_impl(
+                kept_impl_asts[ri] as declaration::ImplBlockNode*, &head, this_type_for_methods);
         }
 
         // A specialized TYPE is a declaration this pass writes, and it is
@@ -685,7 +687,7 @@ type struct Monomorphizer {
                 this.arena.swap_wrapper_to_concrete(concrete_type, qualified_spec_sym,
                     entry.declared_in, target_kind, is_union_kind, display_name);
             }
-            this.type_populator.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst, entry, &walk_impls);
+            this.type_populator.populate_concrete_type(concrete_type, result.specialized_ast, &subst, entry, &walk_impls);
 
             if (!swap_path) {
                 const inst_t: Type* = this.arena.lookup(request.generic_type);
@@ -696,7 +698,7 @@ type struct Monomorphizer {
                     this.arena.set_type_generic_origin(concrete_type, request.generic_type);
                 }
             }
-        } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
+        } else if (entry.kind == TemplateKind::Function) {
             // Function templates don't create named arena types, but still get a
             // concrete FunctionType so the InstantiatedType has a valid resolved_type.
             // (No generic origin: a FunctionType is not an aggregate and carries
@@ -755,7 +757,7 @@ type struct Monomorphizer {
         if (concrete_type.is_valid()) {
             this.state.nested_visited = [];
             this.state.request_nested_instantiations(concrete_type);
-        } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
+        } else if (entry.kind == TemplateKind::Function) {
             // Walk the SIGNATURE's param/return types for nested instantiations.
             // The checked accessor is deliberate: this path is only meaningful
             // for a FunctionType, and reading `resolved_type` raw would happily
@@ -774,26 +776,29 @@ type struct Monomorphizer {
 
     create_concrete_type(mut &this, entry: TemplateEntry*, spec_name: SymbolStr,
                          subst: TypeSubstitution*) -> TypeRef {
-        return match (entry.node_kind) {
-            NodeKind::StructDeclaration => {
+        return match (entry.kind) {
+            TemplateKind::Struct => {
                 this.arena.create_struct(spec_name, entry.declared_in)
             }
-            NodeKind::UnionDeclaration => {
+            TemplateKind::Union => {
                 this.arena.create_union(spec_name, entry.declared_in)
             }
-            NodeKind::EnumDeclaration => {
+            TemplateKind::Enum => {
                 this.arena.create_enum(spec_name, entry.declared_in)
             }
-            NodeKind::ClassDeclaration => {
+            TemplateKind::Class => {
                 this.arena.create_class(spec_name, entry.declared_in)
             }
-            NodeKind::FunctionDeclaration => {
+            TemplateKind::Function => {
                 // Generic functions don't create arena types; they just produce
                 // specialized AST declarations.  Return invalid so
                 // specialize_with_entry skips type population.
                 TypeRef::invalid()
             }
-            _ => {
+            TemplateKind::Trait => {
+                this.arena.create_struct(spec_name, entry.declared_in)
+            }
+            TemplateKind::TypeAlias => {
                 this.arena.create_struct(spec_name, entry.declared_in)
             }
         };
@@ -821,12 +826,14 @@ type struct Monomorphizer {
         // bounds are checked at its call, and nothing else has one.
         const none: [TraitBound] = [];
         mut bounds: &[TraitBound] = &none;
-        match (entry.node_kind) {
-            NodeKind::StructDeclaration => { bounds = &(entry.ast_node as declaration::StructDeclNode*).where_bounds; }
-            NodeKind::UnionDeclaration  => { bounds = &(entry.ast_node as declaration::UnionDeclNode*).where_bounds; }
-            NodeKind::ClassDeclaration  => { bounds = &(entry.ast_node as declaration::ClassDeclNode*).where_bounds; }
-            NodeKind::EnumDeclaration   => { bounds = &(entry.ast_node as declaration::EnumDeclNode*).where_bounds; }
-            _ => { return true; }
+        match (entry.kind) {
+            TemplateKind::Struct    => { bounds = &(entry.ast_node as declaration::StructDeclNode*).where_bounds; }
+            TemplateKind::Union     => { bounds = &(entry.ast_node as declaration::UnionDeclNode*).where_bounds; }
+            TemplateKind::Class     => { bounds = &(entry.ast_node as declaration::ClassDeclNode*).where_bounds; }
+            TemplateKind::Enum      => { bounds = &(entry.ast_node as declaration::EnumDeclNode*).where_bounds; }
+            TemplateKind::Function  => { return true; }
+            TemplateKind::Trait     => { return true; }
+            TemplateKind::TypeAlias => { return true; }
         }
         mut concrete: TypeRef = TypeRef::invalid();
         const tref: TraitRef* = this.trait_checker.unsatisfied_trait_ref(bounds, subst, &concrete);

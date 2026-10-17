@@ -1448,12 +1448,25 @@ committed with the change and deleted in the next commit.
   for the spans they report at.  Control: a dumper with the
   `DestructureDecl` label changed differs on all 164 files of
   `tests/tests/lang`.
-- Left: the type declarations and functions.  `TypeAlias` is the
-  smallest, but the generic registry records a template's kind as its
-  `NodeKind` (`TypeAliasDeclaration`, `StructDeclaration`, ...) and mono
-  dispatches on it, so before any type declaration converts the registry
-  needs a kind of its own (a `TemplateKind` the entry carries), proven
-  identical on its own.
+- The generic registry recorded a template's kind as its `NodeKind`
+  (`TypeAliasDeclaration`, `StructDeclaration`, ...) and mono dispatched
+  on it, so no type declaration could convert while that held.  The entry
+  now carries a `TemplateKind` of its own (function, struct, union,
+  class, enum, trait, type alias), set where the template is registered;
+  every dispatch on it is an exhaustive `match`, the old chains' silent
+  defaults written out (a trait or alias template gets a struct-shaped
+  arena type, as it did).  Specializing an `implement` block, which the
+  monomorphizer used to feed through the same dispatchers under
+  `NodeKind::ImplementationBlock`, has functions of its own
+  (`resolve_specialized_impl`, `prune_static_match_arms_in_impl`).  A
+  one-off codemod (`scripts/registry-kind-codemod.py`) rewrote the field's
+  reads.  Not a check to lean on: `==` between two different enum types
+  type-checks, so a leftover `entry.kind == NodeKind::...` would have been
+  accepted; every read went through the renamed field, which is what made
+  each one refuse.  verify `--require-identical` 0 moved; `--ast`
+  identical (the dump does not read the registry; the control is the
+  alias label).
+- Left: the type declarations and functions.
 - `NodeKind::is_declaration` answers true for `Declaration`.  A module
   declaration was outside its list; the two callers read `name_span`,
   which the parser never sets on a module declaration, so they answer as
