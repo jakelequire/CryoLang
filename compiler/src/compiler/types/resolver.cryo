@@ -49,7 +49,7 @@ import compiler::types::user_defined::{ TypeAliasType };
 import std::fmt;
 import compiler::ast::declaration::{
     DeclarationNode, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlockNode, MethodNode,
-    TraitDeclNode, TypeAliasDecl, VarDeclNode
+    TraitDecl, TypeAliasDecl, VarDeclNode
 };
 import compiler::ast::expression::{ ExpressionNode, StructLiteralNode };
 import compiler::ast::node::{ ASTNode };
@@ -417,7 +417,7 @@ type struct TypeResolver {
 
         match (*proj.base) {
             TypeAnnotation::ThisType(_tt) => {
-                const owner_decl: TraitDeclNode* = if (this.generic_registry == null) { null } else {
+                const owner_decl: TraitDecl* = if (this.generic_registry == null) { null } else {
                     this.generic_registry.get_trait_decl(proj.owner_trait) };
                 if (owner_decl != null) {
                     const b: TypeRef = ctx.lookup_assoc_binding(
@@ -468,7 +468,7 @@ type struct TypeResolver {
     /// asks by the leaf again.
     project_member(&this, base_ty: TypeRef, member: SymbolStr,
                    owning_trait: TypeRef, ctx: ResolutionContext*) -> TypeRef {
-        const owner: TraitDeclNode* = this.trait_decl_of(owning_trait);
+        const owner: TraitDecl* = this.trait_decl_of(owning_trait);
         const slot: i64 = if (owner == null) { -1 } else { owner.assoc_type_index(member) };
         if (slot >= 0) { return this.project_slot(base_ty, owning_trait, slot); }
         // The source names no trait, or the trait declares no such type: the
@@ -484,7 +484,7 @@ type struct TypeResolver {
     project_slot(&this, base_ty: TypeRef, owning_trait: TypeRef, slot: i64) -> TypeRef {
         const bt: Type* = this.arena.lookup(base_ty);
         if (bt == null) { return TypeRef::invalid(); }
-        const owner: TraitDeclNode* = this.trait_decl_of(owning_trait);
+        const owner: TraitDecl* = this.trait_decl_of(owning_trait);
         if (owner == null || slot < 0 || slot >= owner.assoc_types.length || owner.assoc_types[slot] == null) {
             return TypeRef::invalid();
         }
@@ -502,7 +502,7 @@ type struct TypeResolver {
 
     /// The registered declaration of the trait `trait_ty`, or null when it
     /// names none.
-    trait_decl_of(&this, trait_ty: TypeRef) -> TraitDeclNode* {
+    trait_decl_of(&this, trait_ty: TypeRef) -> TraitDecl* {
         if (this.generic_registry == null || this.decl_index == null) { return null; }
         return this.generic_registry.get_trait_decl(this.decl_index.def_of(trait_ty, this.arena));
     }
@@ -512,7 +512,7 @@ type struct TypeResolver {
     /// is invalid (the projection names no trait) or names no registered
     /// trait.
     concrete_projection(&this, base_ty: TypeRef, slot: i64, owning_trait: TypeRef) -> TypeRef {
-        const owner: TraitDeclNode* = this.trait_decl_of(owning_trait);
+        const owner: TraitDecl* = this.trait_decl_of(owning_trait);
         mut rc: ResolutionContext = ResolutionContext::new("");
         return this.resolve_concrete_member(base_ty, slot, owner, &rc);
     }
@@ -638,7 +638,7 @@ type struct TypeResolver {
     /// declaring something of that name was meant is not a question a
     /// search can settle.  Invalid when nothing applies.
     resolve_concrete_member(&this, base_ty_in: TypeRef, slot: i64,
-                            owner: TraitDeclNode*, ctx: ResolutionContext*) -> TypeRef {
+                            owner: TraitDecl*, ctx: ResolutionContext*) -> TypeRef {
         if (this.generic_registry == null) { return TypeRef::invalid(); }
         // The base is used directly whether it is a pre-mono InstantiatedType
         // wrapper or a post-mono concrete spec: `carries_impl_key` asks the
@@ -663,7 +663,7 @@ type struct TypeResolver {
         }
 
         for (mut i: i64 = 0; i < this.generic_registry.trait_decl_nodes.length; i++) {
-            const tdecl: TraitDeclNode* = this.generic_registry.trait_decl_nodes[i];
+            const tdecl: TraitDecl* = this.generic_registry.trait_decl_nodes[i];
             if (tdecl != owner) { continue; }
             const assoc_pos: i64 = slot;
             if (assoc_pos < 0 || assoc_pos >= tdecl.assoc_types.length) { continue; }
@@ -740,7 +740,7 @@ type struct TypeResolver {
         const traits: [DefId] = this.generic_registry.trait_and_supertraits(trait_def);
         mut found: DefId = DefId::invalid();
         for (mut i: i64 = 0; i < traits.length; i++) {
-            const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(traits[i]);
+            const tdecl: TraitDecl* = this.generic_registry.get_trait_decl(traits[i]);
             if (tdecl == null || tdecl.assoc_type_index(member) < 0) { continue; }
             if (found.is_valid() && !found.equals(traits[i])) { return TypeRef::invalid(); }
             found = traits[i];
@@ -763,7 +763,7 @@ type struct TypeResolver {
         const impl_node: ImplBlockNode* =
             this.generic_registry.template_head_for(trait_id, subject, this.intern_table);
         if (impl_node == null) { return out; }
-        const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(trait_id);
+        const tdecl: TraitDecl* = this.generic_registry.get_trait_decl(trait_id);
         if (tdecl == null) { return out; }
         // `ann` is the impl block's own text; its scope is the file that
         // block is written in, never the subject's or the asker's.
@@ -811,7 +811,7 @@ type struct TypeResolver {
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                const tdecl: TraitDeclNode* =
+                const tdecl: TraitDecl* =
                     this.generic_registry.get_trait_decl(tr.definition());
                 if (tdecl == null) { continue; }
                 const ngp: i64 = tdecl.generic_params.length;
@@ -928,7 +928,7 @@ type struct TypeResolver {
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(tr.definition());
+                const tdecl: TraitDecl* = this.generic_registry.get_trait_decl(tr.definition());
                 if (tdecl == null) { continue; }
                 const ngp: i64 = tdecl.generic_params.length;
                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {

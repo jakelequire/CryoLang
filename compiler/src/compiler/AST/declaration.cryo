@@ -166,6 +166,16 @@ public:
         };
     }
 
+    /// The trait declaration `n` is, or null.
+    static trait_of(n: ASTNode*) -> TraitDecl* {
+        const d: DeclarationNode* = DeclarationNode::with_shape(n);
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Trait(t) => { t }
+            _                  => { null }
+        };
+    }
+
     /// The import (or export) declaration `n` is, or null.
     static import_of(n: ASTNode*) -> ImportDecl* {
         const d: DeclarationNode* = DeclarationNode::with_shape(n);
@@ -833,6 +843,7 @@ type enum DeclKind {
     Import(ImportDecl*);
     Intrinsic(IntrinsicDecl*);
     Module(ModuleDecl*);
+    Trait(TraitDecl*);
     TypeAlias(TypeAliasDecl*);
     Variant(EnumVariant*);
 }
@@ -1335,7 +1346,7 @@ public:
 /// An associated-type member declared inside a trait body: `type Item;` or
 /// `type Item: Copy + Clone;`. `bounds` holds the declaration-site trait
 /// constraints (empty for an unbounded `type Item;`). Stored on
-/// `TraitDeclNode.assoc_types`; bound concretely per-impl (see ImplBlockNode's
+/// `TraitDecl.assoc_types`; bound concretely per-impl (see ImplBlockNode's
 /// assoc bindings) and projected via `TypeAnnotation::Projection`.
 type struct AssocTypeDeclNode {
     name:   SymbolStr;
@@ -1343,8 +1354,8 @@ type struct AssocTypeDeclNode {
     span:   SourceSpan;
 }
 
-type class TraitDeclNode : DeclarationNode {
-public:
+/// `type trait Name<T> : Bases { methods; type Item; }`
+type struct TraitDecl {
     name:           SymbolStr;
     generic_params: [DeclarationNode*];
     methods:        [FunctionDeclNode*];
@@ -1366,34 +1377,19 @@ public:
     /// resolver walked.
     sym_id:            SymbolID;
 
-    TraitDeclNode(name: SymbolStr, span: SourceSpan)
-        : DeclarationNode(NodeKind::TraitDeclaration, span) {
-        this.name           = name;
-        this.generic_params = [];
-        this.methods        = [];
-        this.base_traits    = [];
-        this.assoc_types    = [];
-        this.def            = DefId::invalid();
-        this.sym_id         = SymbolID::invalid();
+    static new(name: SymbolStr) -> TraitDecl* {
+        return new TraitDecl {
+            name:           name,
+            generic_params: [],
+            methods:        [],
+            base_traits:    [],
+            assoc_types:    [],
+            def:            DefId::invalid(),
+            sym_id:         SymbolID::invalid(),
+        };
     }
 
-    is_generic() -> boolean { return this.generic_params.length > 0; }
-
-    add_generic_param(param: DeclarationNode*) -> void {
-        this.generic_params.push(param);
-    }
-
-    add_method(method: FunctionDeclNode*) -> void {
-        this.methods.push(method);
-    }
-
-    add_base_trait(base: TraitRef) -> void {
-        this.base_traits.push(base);
-    }
-
-    add_assoc_type(decl: AssocTypeDeclNode*) -> void {
-        this.assoc_types.push(decl);
-    }
+    is_generic(&this) -> boolean { return this.generic_params.length > 0; }
 
     /// An associated type is named by its leaf where a
     /// projection is written (`I::Item`, `This::Item`), where an
@@ -1417,6 +1413,16 @@ public:
     /// its associated types.
     slot_count(&this) -> i64 {
         return this.generic_params.length + this.assoc_types.length;
+    }
+
+    static walk_children<V>(n: TraitDecl*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.methods.length; i++) { v.walk_decl(n.methods[i] as DeclarationNode*); }
+    }
+}
+
+implement trait Allocate for struct TraitDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -1878,7 +1884,7 @@ public:
     /// naming no associated type of the trait stays unplaced - the trait may
     /// still gain the type it names (an `async` method's future is declared
     /// on the trait by a later desugar).
-    assoc_binding_at(mut &this, tdecl: TraitDeclNode*, slot: i64) -> TypeAnnotation* {
+    assoc_binding_at(mut &this, tdecl: TraitDecl*, slot: i64) -> TypeAnnotation* {
         if (tdecl == null || slot < 0) { return null; }
         for (mut i: i64 = 0; i < this.assoc_binding_slots.length; i++) {
             if (this.assoc_binding_slots[i] < 0 && this.assoc_binding_names[i].is_valid()) {
@@ -1898,7 +1904,7 @@ public:
     /// in either of the two places the language allows.  Reading the header
     /// alone left a body-bound impl with no answer, so an adapter over it
     /// (`TakeIter<Count>`) derived nothing and was never specialized.
-    trait_slot_annotation(mut &this, tdecl: TraitDeclNode*, slot: i64) -> TypeAnnotation* {
+    trait_slot_annotation(mut &this, tdecl: TraitDecl*, slot: i64) -> TypeAnnotation* {
         if (tdecl == null || slot < 0) { return null; }
         if (this.trait_annotation != null) {
             match (*this.trait_annotation) {

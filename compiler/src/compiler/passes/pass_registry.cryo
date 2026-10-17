@@ -59,7 +59,7 @@ import compiler::artifacts::{ ASTOutput, TokenStream };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, ImplBlockNode, ImportDecl,
     MethodNode, StructDeclNode,
-    TraitDeclNode, UnionDeclNode
+    TraitDecl, UnionDeclNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::compilation_context::{ CompilationContext, LangRef, SourceOverride };
@@ -700,13 +700,10 @@ type struct PassRegistry {
                     const n: ClassDeclNode* = stmt as ClassDeclNode*;
                     def = n.def; leaf = n.name; tspan = n.span;
                 }
-                NodeKind::TraitDeclaration => {
-                    const n: TraitDeclNode* = stmt as TraitDeclNode*;
-                    def = n.def; leaf = n.name; tspan = n.span;
-                }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
                         DeclKind::Enum(n)      => { def = n.def; leaf = n.name; tspan = stmt.span; }
+                        DeclKind::Trait(n)     => { def = n.def; leaf = n.name; tspan = stmt.span; }
                         DeclKind::TypeAlias(n) => { def = n.def; leaf = n.alias_name; tspan = stmt.span; }
                         // No other kind with a payload declares a type.
                         DeclKind::Import(_) | DeclKind::Intrinsic(_)
@@ -780,27 +777,26 @@ type struct PassRegistry {
                     ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
                     type_count++;
                 }
-                NodeKind::TraitDeclaration => {
-                    const node: TraitDeclNode* = stmt as TraitDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, ModulePath::none(), node.span.file);
-                    const trait_ref: TypeRef =
-                        arena.create_trait(qualified_sym, ctx.declaring_module(node.def));
-                    // A trait carries no visibility modifier: public.
-                    ctx.decl_index.register_type(node.def, trait_ref, true);
-                    // Whether this IS the language's `Drop`/`Copy`/`Add`/... is
-                    // decided by the identity, and claimed here, where the identity
-                    // is first minted: an ownership query of a module resolved
-                    // before this trait's asks by the identity and must find it.
-                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                    for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
-                        if (node.methods[mi] != null) {
-                            ctx.generic_registry.claim_wellknown(node.methods[mi].def, ctx.intern_table);
-                        }
-                    }
-                    type_count++;
-                }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Trait(node) => {
+                            const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, ModulePath::none(), stmt.span.file);
+                            const trait_ref: TypeRef =
+                                arena.create_trait(qualified_sym, ctx.declaring_module(node.def));
+                            // A trait carries no visibility modifier: public.
+                            ctx.decl_index.register_type(node.def, trait_ref, true);
+                            // Whether this IS the language's `Drop`/`Copy`/`Add`/... is
+                            // decided by the identity, and claimed here, where the identity
+                            // is first minted: an ownership query of a module resolved
+                            // before this trait's asks by the identity and must find it.
+                            ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+                            for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
+                                if (node.methods[mi] != null) {
+                                    ctx.generic_registry.claim_wellknown(node.methods[mi].def, ctx.intern_table);
+                                }
+                            }
+                            type_count++;
+                        }
                         DeclKind::Enum(node) => {
                             const _intern2: InternTable* = ctx.get_intern_table();
                             const _dbg2: string = _intern2.resolve(node.name);

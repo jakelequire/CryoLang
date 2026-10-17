@@ -45,7 +45,7 @@ import compiler::resolver::intern_table;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, FunctionDeclNode, GenericParamDecl,
-    ImplBlockNode, MethodNode, StructDeclNode, TraitDeclNode, UnionDeclNode
+    ImplBlockNode, MethodNode, StructDeclNode, TraitDecl, UnionDeclNode
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::types::arena::{ TypeArena };
@@ -221,7 +221,7 @@ type struct TemplateEntry {
                 decl.generic_params
             }
             TemplateKind::Trait => {
-                const decl: TraitDeclNode* = this.ast_node as TraitDeclNode*;
+                const decl: TraitDecl* = DeclarationNode::trait_of(this.ast_node);
                 decl.generic_params
             }
             TemplateKind::TypeAlias => {
@@ -352,7 +352,7 @@ type struct GenericRegistry {
     // is the position in `trait_decl_nodes` by the definition's slot in the
     // definition table, -1 for a definition that is no registered trait.
     trait_decl_slots:   [i64];
-    trait_decl_nodes:   [TraitDeclNode*];
+    trait_decl_nodes:   [TraitDecl*];
     // The identity each node was registered under, positionally aligned with
     // `trait_decl_nodes`. A node's own `name` is its written leaf, so a scan
     // that finds a node by walking cannot hand its caller a key this table
@@ -1193,7 +1193,7 @@ type struct GenericRegistry {
     /// Register a trait declaration's AST under the trait's definition, so
     /// default-method synthesis can find it cross-module when an impl block
     /// names the trait.  Registering one definition again replaces its node.
-    register_trait_decl(mut &this, name: DefId, node: TraitDeclNode*) -> void {
+    register_trait_decl(mut &this, name: DefId, node: TraitDecl*) -> void {
         if (node == null || !name.is_valid()) { return; }
         const existing: i64 = this.trait_decl_position(name);
         if (existing >= 0) {
@@ -1219,7 +1219,7 @@ type struct GenericRegistry {
     /// Look up a trait declaration's AST by the trait's definition. Returns
     /// null when no such trait was registered.  Two traits written under one
     /// path are two definitions, so they stay distinct.
-    get_trait_decl(&this, name: DefId) -> TraitDeclNode* {
+    get_trait_decl(&this, name: DefId) -> TraitDecl* {
         const at: i64 = this.trait_decl_position(name);
         if (at < 0) { return null; }
         return this.trait_decl_nodes[at];
@@ -1235,7 +1235,7 @@ type struct GenericRegistry {
     /// Answers the first declared method of the name, or -1 when the trait
     /// (asked by identity) declares none.
     trait_item_slot(&this, trait_def: DefId, leaf: SymbolStr) -> i64 {
-        const decl: TraitDeclNode* = this.get_trait_decl(trait_def);
+        const decl: TraitDecl* = this.get_trait_decl(trait_def);
         if (decl == null) { return -1; }
         for (mut i: i64 = 0; i < decl.methods.length; i++) {
             const m: FunctionDeclNode* = decl.methods[i];
@@ -1300,7 +1300,7 @@ type struct GenericRegistry {
     /// (`trait_item_slot`), or invalid when there is no such method or its
     /// return was never resolved.  Asked by identity and position.
     trait_item_return(&this, trait_def: DefId, slot: i64) -> TypeRef {
-        const decl: TraitDeclNode* = this.get_trait_decl(trait_def);
+        const decl: TraitDecl* = this.get_trait_decl(trait_def);
         if (slot < 0 || decl == null || slot >= decl.methods.length) { return TypeRef::invalid(); }
         const m: FunctionDeclNode* = decl.methods[slot];
         if (m == null || !m.has_resolved_return_type()) { return TypeRef::invalid(); }
@@ -1313,7 +1313,7 @@ type struct GenericRegistry {
     /// names it.
     trait_item_position(&this, d: DefId) -> i64 {
         if (!d.is_valid()) { return -1; }
-        const decl: TraitDeclNode* = this.get_trait_decl(this.arena.defs.parent_of(d));
+        const decl: TraitDecl* = this.get_trait_decl(this.arena.defs.parent_of(d));
         if (decl == null) { return -1; }
         for (mut i: i64 = 0; i < decl.methods.length; i++) {
             if (decl.methods[i] != null && decl.methods[i].def.equals(d)) { return i; }
@@ -1344,7 +1344,7 @@ type struct GenericRegistry {
     /// so it never takes a position.
     fill_trait_item_table(&this, block: ImplBlockNode*) -> void {
         const trait_def: DefId = TypeAnnotation::trait_def(block.trait_annotation);
-        const decl: TraitDeclNode* = this.get_trait_decl(trait_def);
+        const decl: TraitDecl* = this.get_trait_decl(trait_def);
         if (decl == null) { return; }
         for (mut ti: i64 = 0; ti < decl.methods.length; ti++) { block.trait_item_methods.push(-1); }
         for (mut mi: i64 = 0; mi < block.methods.length; mi++) {
@@ -1367,7 +1367,7 @@ type struct GenericRegistry {
         out.push(trait_def);
         mut next: i64 = 0;
         while (next < out.length) {
-            const decl: TraitDeclNode* = this.get_trait_decl(out[next]);
+            const decl: TraitDecl* = this.get_trait_decl(out[next]);
             next += 1;
             if (decl == null) { continue; }
             for (mut i: i64 = 0; i < decl.base_traits.length; i++) {
@@ -1431,7 +1431,7 @@ type struct GenericRegistry {
 
     /// The declaration of the trait that claimed `item`, or null when no such
     /// trait is in this program's module graph.
-    lang_trait_decl(&this, item: LangItem) -> TraitDeclNode* {
+    lang_trait_decl(&this, item: LangItem) -> TraitDecl* {
         return this.get_trait_decl(this.wellknown(item));
     }
 
@@ -1445,7 +1445,7 @@ type struct GenericRegistry {
     find_trait_defining_method(&this, method_name: SymbolStr) -> DeclName {
         if (!method_name.is_valid()) { return DeclName::empty(); }
         for (mut i: i64 = 0; i < this.trait_decl_nodes.length; i++) {
-            const td: TraitDeclNode* = this.trait_decl_nodes[i];
+            const td: TraitDecl* = this.trait_decl_nodes[i];
             if (td == null) { continue; }
             if (this.trait_item_slot(this.trait_decl_keys[i], method_name) >= 0) {
                 // The registration key, not `td.name`: the node's own name

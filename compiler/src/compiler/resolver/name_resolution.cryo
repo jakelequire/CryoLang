@@ -44,7 +44,7 @@ import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDecl, EnumDecl, EnumVariant,
     ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlockNode,
     DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDeclNode,
-    TraitDeclNode, TypeAliasDecl, UnionDeclNode, VarDeclNode
+    TraitDecl, TypeAliasDecl, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
@@ -437,18 +437,6 @@ type struct NameResolver {
                     }
                 }
             }
-            NodeKind::TraitDeclaration => {
-                const trait_node: TraitDeclNode* = node as TraitDeclNode*;
-                const sym_id: SymbolID = this.resolver.declare_type(
-                    trait_node.name, trait_node.span, true);
-                trait_node.sym_id = sym_id;
-                trait_node.def = this.type_def_of(sym_id);
-                this.resolver.export_symbol(sym_id);
-                // Registered here, before any module's names are resolved, so
-                // a projection written in any of them can ask which
-                // associated types the trait declares.
-                this.ctx.generic_registry.register_trait_decl(trait_node.def, trait_node);
-            }
             NodeKind::VariableDeclaration => {
                 const var_node: VarDeclNode* = node as VarDeclNode*;
                 // A C-imported global (binding_namespace set) is a
@@ -554,6 +542,17 @@ type struct NameResolver {
                         this.resolver.export_symbol(intr_declared);
                         intr_node.def = this.resolver.get_symbol(intr_declared).def;
                     }
+                    DeclKind::Trait(trait_node) => {
+                        const sym_id: SymbolID = this.resolver.declare_type(
+                            trait_node.name, decl.span, true);
+                        trait_node.sym_id = sym_id;
+                        trait_node.def = this.type_def_of(sym_id);
+                        this.resolver.export_symbol(sym_id);
+                        // Registered here, before any module's names are resolved, so
+                        // a projection written in any of them can ask which
+                        // associated types the trait declares.
+                        this.ctx.generic_registry.register_trait_decl(trait_node.def, trait_node);
+                    }
                     DeclKind::Enum(enum_node) => {
                         if (!enum_node.binding_namespace.is_valid()) {
                             const sym_id: SymbolID = this.resolver.declare_type(
@@ -615,11 +614,11 @@ type struct NameResolver {
             NodeKind::StructDeclaration    => { (node as StructDeclNode*).def }
             NodeKind::UnionDeclaration     => { (node as UnionDeclNode*).def }
             NodeKind::ClassDeclaration     => { (node as ClassDeclNode*).def }
-            NodeKind::TraitDeclaration     => { (node as TraitDeclNode*).def }
             NodeKind::VariableDeclaration  => { (node as VarDeclNode*).def }
             NodeKind::Declaration => {
                 match ((node as DeclarationNode*).shape) {
                     DeclKind::Intrinsic(i)       => { i.def }
+                    DeclKind::Trait(t)           => { t.def }
                     DeclKind::TypeAlias(a)       => { a.def }
                     DeclKind::Enum(e)            => { e.def }
                     DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
@@ -2260,7 +2259,7 @@ type struct NameResolver {
     /// impl, a type's own body) or the trait it stands for declares no
     /// associated type `Member` (E0203).
     check_this_projection(&this, pj: ProjectionAnnotation*) -> void {
-        const tdecl: TraitDeclNode* = if (pj.owner_trait.is_valid()) {
+        const tdecl: TraitDecl* = if (pj.owner_trait.is_valid()) {
             this.ctx.generic_registry.get_trait_decl(pj.owner_trait)
         } else {
             null
@@ -2272,7 +2271,7 @@ type struct NameResolver {
         if (tdecl != null) {
             const traits: [DefId] = this.ctx.generic_registry.trait_and_supertraits(pj.owner_trait);
             for (mut t: i64 = 0; t < traits.length; t++) {
-                const td: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(traits[t]);
+                const td: TraitDecl* = this.ctx.generic_registry.get_trait_decl(traits[t]);
                 if (td == null || td.assoc_type_index(pj.member) < 0) { continue; }
                 if (found.is_valid() && !found.equals(traits[t])) { ambiguous = true; }
                 found = traits[t];
@@ -2327,7 +2326,7 @@ type struct NameResolver {
             for (mut b: i64 = 0; b < bounds.length; b++) {
                 const traits: [DefId] = this.ctx.generic_registry.trait_and_supertraits(bounds[b]);
                 for (mut t: i64 = 0; t < traits.length; t++) {
-                    const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(traits[t]);
+                    const tdecl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(traits[t]);
                     if (tdecl == null || tdecl.assoc_type_index(member_sym) < 0) { continue; }
                     if (found.is_valid() && !found.equals(traits[t])) { ambiguous = true; }
                     found = traits[t];
@@ -3219,9 +3218,9 @@ implement trait Walk for struct NameResolver {
         this.resolver.exit_scope();
     }
 
-    walk_trait(mut &this, node: TraitDeclNode*) -> void {
+    walk_trait(mut &this, d: DeclarationNode*, node: TraitDecl*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] visit(TraitDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
-        this.resolver.enter_scope(ScopeKind::Trait, this.resolver.intern_table.resolve(node.name), node.span);
+        this.resolver.enter_scope(ScopeKind::Trait, this.resolver.intern_table.resolve(node.name), d.span);
         const outer_trait: DefId = this.this_trait;
         this.this_trait = match (this.bare_name_res(node.sym_id)) {
             ResSlot::Answered(r) => { r.def_id() }

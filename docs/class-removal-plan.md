@@ -1536,6 +1536,25 @@ committed with the change and deleted in the next commit.
   `match (... .shape)` naming `DeclKind`, whose control is that it finds
   the nine projections), so every dispatch that needed an enum arm was
   refused by the type check.
+- `Trait(TraitDecl*)` followed.  Every dispatch that had a
+  `NodeKind::TraitDeclaration` arm has a `DeclKind::Trait` arm in its
+  `NodeKind::Declaration` match; where the dispatch had none (dead-code,
+  drop-insertion and move-check walks, type resolution's body walk), the
+  new `Declaration` arm is an exhaustive match on the shape.  The generic
+  registry keeps a trait's payload (`register_trait_decl`, `get_trait_decl`,
+  `lang_trait_decl` answer `TraitDecl*`); the places that hold a trait as
+  an `ASTNode*` with no dispatch of their own (the registry's template
+  parameters, the monomorphizer's definition stamp, and the language
+  server's code lens, identity and rename) ask `DeclarationNode::trait_of`.
+  A trait's signature resolution moved into
+  `TypeResolutionPasses::trait_signatures`.  The language server is
+  compiled by the LSP gate, not by `cryo check` of the compiler: two of
+  its exhaustive matches (completion's declared type, members' type
+  walk) were found by a scan of every shape `match` naming
+  `DeclKind::Legacy` but not the new kind - the type check of the
+  compiler alone reported none of them.  A one-off codemod
+  (`scripts/trait-codemod.py`) rewrote the casts, the `kind` tests and
+  the type's spelling.
 - The cloner's partial copies of an intrinsic, an import and an extern
   block are never exercised: an assertion in each of the three arms
   passed verify whole (tests, examples, the language server and the cross
@@ -1543,7 +1562,7 @@ committed with the change and deleted in the next commit.
   in the variant arm fires at once.  The cloner is entered only through a
   template, an impl block, an async parameter and a lambda, and none
   holds those kinds.
-- Left: structs, unions, traits, implement blocks, functions, methods and
+- Left: structs, unions, implement blocks, functions, methods and
   variables.  Class declarations are not converted: slice 9 deletes the
   feature, so `ClassDeclNode` stays a subclass behind the bridge (its
   `NodeKind::ClassDeclaration` arms and `as ClassDeclNode*` casts are
@@ -1840,4 +1859,4 @@ final audit greps for each name listed and expects none.
 | `Stmt` a class deriving from `ASTNode`, so an `ASTNode*` (a program item, a `for` initializer, the editor's node at a position) can hold a statement; the 21 `as Stmt*` casts from such handles, each behind a `NodeKind::Statement` test | `compiler/src/compiler/AST/statement.cryo` and the casts' files | slice 6 (statements) | the header becomes a struct when the "any node" handle is `Node`; the casts become `Node::Stmt(s)` arms |
 | `Stmt.shape`, the statement's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/statement.cryo` | slice 6 (statements) | renamed `kind` when the header stops deriving from `ASTNode` |
 | `DeclKind::Legacy` and every `match` arm for it; `DeclarationNode.shape` on a declaration whose kind is still a subclass; the `NodeKind`-per-kind dispatch for those kinds beside the `NodeKind::Declaration` arms | `compiler/src/compiler/AST/declaration.cryo` and every declaration consumer | slice 6 (declarations, `IntrinsicConst` and `Module`) | when slice 9 deletes the class, the one kind never converted; then `shape` is renamed `kind` with the header's struct |
-| `DeclarationNode::with_shape` (dead code, language server identity), `DeclarationNode::module_of` (parser, language server definition and semantic tokens x2), `DeclarationNode::import_of` (instance, diagnostics x2, pass registry x2, language server semantic tokens), `DeclarationNode::extern_of` (parser, bindgen importer, directive processing), `DeclarationNode::alias_of` (generic registry, type resolver, name resolution x2, bindgen generator x4 and importer, monomorphizer, type resolution) and `DeclarationNode::enum_of` (generic registry x2, type resolver, monomorphizer x3, type populator, sema x2, parser, bindgen generator x4 and importer, specialization, directive processing x2, type resolution, name resolution, language server code lens, completion, identity and members), and the `as DeclarationNode*` casts behind a `NodeKind::Declaration` test (walker, cloner, sema, codegen, type resolution, name resolution x2, stamp check, directive processing, language server identity) | `compiler/src/compiler/AST/declaration.cryo` and those files | slice 6 (declarations) | the casts become `Node::Decl(d)` arms when the "any node" handle is `Node`; `module_of`, `import_of`, `extern_of`, `alias_of` and `enum_of` then match on `Node` |
+| `DeclarationNode::with_shape` (dead code, language server identity), `DeclarationNode::module_of` (parser, language server definition and semantic tokens x2), `DeclarationNode::import_of` (instance, diagnostics x2, pass registry x2, language server semantic tokens), `DeclarationNode::extern_of` (parser, bindgen importer, directive processing), `DeclarationNode::alias_of` (generic registry, type resolver, name resolution x2, bindgen generator x4 and importer, monomorphizer, type resolution) and `DeclarationNode::enum_of` (generic registry x2, type resolver, monomorphizer x3, type populator, sema x2, parser, bindgen generator x4 and importer, specialization, directive processing x2, type resolution, name resolution, language server code lens, completion, identity and members), `DeclarationNode::trait_of` (generic registry, monomorphizer, language server code lens, identity and rename), and the `as DeclarationNode*` casts behind a `NodeKind::Declaration` test (walker, cloner, sema, codegen, type resolution x2, name resolution x2, stamp check, directive processing, dead code x2, drop insertion, move check, language server identity) | `compiler/src/compiler/AST/declaration.cryo` and those files | slice 6 (declarations) | the casts become `Node::Decl(d)` arms when the "any node" handle is `Node`; `module_of`, `import_of`, `extern_of`, `alias_of`, `enum_of` and `trait_of` then match on `Node` |

@@ -52,7 +52,7 @@ import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDecl, EnumDecl,
     EnumVariant, FieldDecl, FunctionDeclNode, GenericParamDecl,
     DeclKind, ImplBlockNode, MethodNode, StructDeclNode,
-    TraitDeclNode, TypeAliasDecl, UnionDeclNode, VarDeclNode
+    TraitDecl, TypeAliasDecl, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     AlignofExprNode, ArrayAccessNode, BinaryExprNode, CallExprNode, CastExprNode,
@@ -202,7 +202,7 @@ type struct TypeResolutionRunner {
         if (gen == null || gen.args.length == 0) { return; }
         const trait_id: DefId = TypeAnnotation::trait_def(trait_ann);
         if (!trait_id.is_valid()) { return; }
-        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_id);
+        const trait_decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(trait_id);
         if (trait_decl == null) { return; }
 
         const ngp: i64   = trait_decl.generic_params.length;
@@ -271,7 +271,7 @@ type struct TypeResolutionRunner {
         if (trait_ann == null) { return; }
         const trait_id: DefId = TypeAnnotation::trait_def(trait_ann);
         if (!trait_id.is_valid()) { return; }
-        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_id);
+        const trait_decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(trait_id);
         if (trait_decl == null) { return; }
         // Only traits with associated types are subject to these checks.
         if (trait_decl.assoc_types.length == 0) { return; }
@@ -350,7 +350,7 @@ type struct TypeResolutionRunner {
         if (impl_node.spec_owner.is_valid()) { return; }
         const trait_id: DefId = TypeAnnotation::trait_def(impl_node.trait_annotation);
         if (!trait_id.is_valid()) { return; }
-        const decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_id);
+        const decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(trait_id);
         if (decl == null) { return; }
         const owner: TypeRef = this.ctx.decl_index.impl_owner(impl_node, "type_resolution/impl conformance");
         if (!owner.is_valid()) { return; }
@@ -2075,7 +2075,7 @@ type struct TypeResolutionPasses {
     /// Such a binding is added by the sema-time async lowering (which mints the
     /// future struct), long after E0309 runs, so the check has to recognise it
     /// as satisfied here rather than demanding the user write it.
-    static impl_binds_assoc_via_async(impl_node: ImplBlockNode*, trait_decl: TraitDeclNode*,
+    static impl_binds_assoc_via_async(impl_node: ImplBlockNode*, trait_decl: TraitDecl*,
                                       slot: i64, ctx: CompilationContext*) -> boolean {
         if (impl_node == null || trait_decl == null || ctx == null) { return false; }
         for (mut ti: i64 = 0; ti < trait_decl.methods.length; ti++) {
@@ -2119,7 +2119,7 @@ type struct TypeResolutionPasses {
     /// needs the declaration (the async lowering's receiver-refresh decision)
     /// reads it off the projection rather than scanning traits by the method's
     /// leaf, which answers the first trait declaring that leaf, async or not.
-    static desugar_async_trait_methods(node: TraitDeclNode*, ctx: CompilationContext*,
+    static desugar_async_trait_methods(node: TraitDecl*, ctx: CompilationContext*,
                                        arena: TypeArena*, trait_ref: TypeRef) -> void {
         if (node == null || ctx == null || arena == null) { return; }
         const this_ty: TypeRef = arena.this_placeholder(ctx.intern("This"));
@@ -2142,7 +2142,7 @@ type struct TypeResolutionPasses {
                     bounds: [],
                     span:   func.span,
                 };
-                node.add_assoc_type(adecl);
+                node.assoc_types.push(adecl);
                 slot = node.assoc_types.length - 1;
             }
             // The name is made here and nowhere else: the method carries its
@@ -2204,7 +2204,7 @@ type struct TypeResolutionPasses {
     /// monomorphization. `args_ref` is the impl's trait-arg annotations.
     static default_method_applies_to_impl(tfunc: FunctionDeclNode*,
                                           impl_node: ImplBlockNode*,
-                                          trait_decl: TraitDeclNode*,
+                                          trait_decl: TraitDecl*,
                                           args_ref: &[TypeAnnotation*],
                                           ctx: CompilationContext*) -> boolean {
         if (tfunc == null || impl_node == null || trait_decl == null) { return true; }
@@ -2338,7 +2338,7 @@ type struct TypeResolutionPasses {
             for (mut j: i64 = 0; j < wb.trait_refs.length; j++) {
                 const tr: TraitRef* = &wb.trait_refs[j];
                 if (tr.path.length == 0) { continue; }
-                const decl: TraitDeclNode* = ctx.generic_registry.get_trait_decl(tr.definition());
+                const decl: TraitDecl* = ctx.generic_registry.get_trait_decl(tr.definition());
                 if (decl == null) { continue; }
                 const slot: i64 = decl.assoc_type_index(member);
                 if (slot < 0) { continue; }
@@ -2481,7 +2481,7 @@ type struct TypeResolutionPasses {
             impl_node.trait_annotation);
         if (!trait_name.is_valid()) { return 0; }
 
-        const trait_decl: TraitDeclNode* = ctx.generic_registry.get_trait_decl(trait_name);
+        const trait_decl: TraitDecl* = ctx.generic_registry.get_trait_decl(trait_name);
         if (trait_decl == null) { return 0; }
 
         // Quick scan: is there at least one default-bodied trait method
@@ -2614,6 +2614,78 @@ type struct TypeResolutionPasses {
 
     // Pass 1: FunctionSignature (order 7)
 
+    /// A trait's method signatures, resolved and recorded on its arena type;
+    /// answers how many it has.
+    static trait_signatures(runner: mut &TypeResolutionRunner, node: TraitDecl*,
+                            ctx: CompilationContext*, arena: TypeArena*) -> i64 {
+        mut trait_ctx: ResolutionContext = runner.make_generic_context(
+            node.generic_params, &runner.res_ctx);
+        runner.resolve_trait_method_signatures(node.methods, &trait_ctx);
+        // Final for traits: `run_type_resolution` re-resolves impl
+        // and inline method signatures, but not a trait's own.
+        // Before the async desugar below, so an `async` method is
+        // judged on the Output its annotation spells rather than on
+        // the future projection that replaces it.
+        runner.emit_trait_method_signature_diagnostics(node.methods);
+        // Rewrite each `async` method's resolved return to its
+        // implicit `This::<Method>Fut` projection AFTER the ordinary
+        // resolution, so callers see the future type while the
+        // annotation still spells the Output for impl-side lowering.
+        // Must precede the `required_methods` population below,
+        // which snapshots these signatures onto the TraitType.
+        const tr_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/trait populate");
+        TypeResolutionPasses::desugar_async_trait_methods(node, ctx, arena, tr_ref);
+
+        // Populate the TraitType's required_methods array so the
+        // bound-aware-dispatch path in sema can read trait method
+        // signatures off the arena type. Without this, every
+        // bounded-parameter receiver call has to fall back to
+        // brittle name-only lookups in the DeclarationIndex.
+        const tr_t: Type* = if (tr_ref.is_valid()) {
+            arena.lookup(tr_ref)
+        } else { null };
+        if (tr_t != null && tr_t.kind == TypeKind::Trait) {
+            mut tr_type: TraitType* = tr_t.as_trait();
+            // Register associated-type members (`type Item;`) so the
+            // projection resolver and the positional-sugar desugar
+            // can see which member names this trait declares and how
+            // many it has.
+            for (mut ai: i64 = 0; ai < node.assoc_types.length; ai++) {
+                const adecl: AssocTypeDeclNode* = node.assoc_types[ai];
+                if (adecl != null) { tr_type.add_assoc_type(adecl.name); }
+            }
+            // `MethodInfo.param_types` is by contract the NON-SELF
+            // parameters, which is what every reader matches against
+            // an argument count. Keeping the receiver here made an
+            // instance trait method look like it took one parameter
+            // too many, so a call on a bounded or where-bounded
+            // receiver found no signature and left its arguments
+            // unclassified. Same receiver spellings the struct and
+            // class method tables filter on.
+            for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
+                const tfunc: FunctionDeclNode* = node.methods[mi];
+                if (tfunc == null) { continue; }
+                mut param_types: [TypeRef] = [];
+                for (mut p: i64 = 0; p < tfunc.parameters.length; p++) {
+                    const param: VarDeclNode* = tfunc.parameters[p];
+                    if (param == null) { continue; }
+                    if (param.is_receiver()) { continue; }
+                    if (param.resolved_type.is_valid()) {
+                        param_types.push(param.resolved_type);
+                    }
+                }
+                const fn_ty: TypeRef = arena.get_function(
+                    tfunc.resolved_return_type, param_types,
+                    tfunc.is_variadic);
+                mut info: MethodInfo = MethodInfo::new(
+                    tfunc.name, fn_ty, true, tfunc.is_static);
+                info.param_types = param_types;
+                tr_type.add_required_method(info);
+            }
+        }
+        return node.methods.length;
+    }
+
     /// Resolves function parameter types and return types for all top-level
     /// and method declarations.  Makes function signatures available for
     /// template registration and later type checking.
@@ -2710,75 +2782,6 @@ type struct TypeResolutionPasses {
                     runner.resolve_method_signatures(node.methods, &class_ctx, class_owner, node.def, &class_args);
                     sig_count += node.methods.length;
                 }
-                NodeKind::TraitDeclaration => {
-                    const node: TraitDeclNode* = stmt as TraitDeclNode*;
-                    mut trait_ctx: ResolutionContext = runner.make_generic_context(
-                        node.generic_params, &runner.res_ctx);
-                    runner.resolve_trait_method_signatures(node.methods, &trait_ctx);
-                    // Final for traits: `run_type_resolution` re-resolves impl
-                    // and inline method signatures, but not a trait's own.
-                    // Before the async desugar below, so an `async` method is
-                    // judged on the Output its annotation spells rather than on
-                    // the future projection that replaces it.
-                    runner.emit_trait_method_signature_diagnostics(node.methods);
-                    // Rewrite each `async` method's resolved return to its
-                    // implicit `This::<Method>Fut` projection AFTER the ordinary
-                    // resolution, so callers see the future type while the
-                    // annotation still spells the Output for impl-side lowering.
-                    // Must precede the `required_methods` population below,
-                    // which snapshots these signatures onto the TraitType.
-                    const tr_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/trait populate");
-                    TypeResolutionPasses::desugar_async_trait_methods(node, ctx, arena, tr_ref);
-                    sig_count += node.methods.length;
-
-                    // Populate the TraitType's required_methods array so the
-                    // bound-aware-dispatch path in sema can read trait method
-                    // signatures off the arena type. Without this, every
-                    // bounded-parameter receiver call has to fall back to
-                    // brittle name-only lookups in the DeclarationIndex.
-                    const tr_t: Type* = if (tr_ref.is_valid()) {
-                        arena.lookup(tr_ref)
-                    } else { null };
-                    if (tr_t != null && tr_t.kind == TypeKind::Trait) {
-                        mut tr_type: TraitType* = tr_t.as_trait();
-                        // Register associated-type members (`type Item;`) so the
-                        // projection resolver and the positional-sugar desugar
-                        // can see which member names this trait declares and how
-                        // many it has.
-                        for (mut ai: i64 = 0; ai < node.assoc_types.length; ai++) {
-                            const adecl: AssocTypeDeclNode* = node.assoc_types[ai];
-                            if (adecl != null) { tr_type.add_assoc_type(adecl.name); }
-                        }
-                        // `MethodInfo.param_types` is by contract the NON-SELF
-                        // parameters, which is what every reader matches against
-                        // an argument count. Keeping the receiver here made an
-                        // instance trait method look like it took one parameter
-                        // too many, so a call on a bounded or where-bounded
-                        // receiver found no signature and left its arguments
-                        // unclassified. Same receiver spellings the struct and
-                        // class method tables filter on.
-                        for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
-                            const tfunc: FunctionDeclNode* = node.methods[mi];
-                            if (tfunc == null) { continue; }
-                            mut param_types: [TypeRef] = [];
-                            for (mut p: i64 = 0; p < tfunc.parameters.length; p++) {
-                                const param: VarDeclNode* = tfunc.parameters[p];
-                                if (param == null) { continue; }
-                                if (param.is_receiver()) { continue; }
-                                if (param.resolved_type.is_valid()) {
-                                    param_types.push(param.resolved_type);
-                                }
-                            }
-                            const fn_ty: TypeRef = arena.get_function(
-                                tfunc.resolved_return_type, param_types,
-                                tfunc.is_variadic);
-                            mut info: MethodInfo = MethodInfo::new(
-                                tfunc.name, fn_ty, true, tfunc.is_static);
-                            info.param_types = param_types;
-                            tr_type.add_required_method(info);
-                        }
-                    }
-                }
                 NodeKind::ImplementationBlock => {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
 
@@ -2829,6 +2832,9 @@ type struct TypeResolutionPasses {
                 NodeKind::Declaration => {
                     const decl: DeclarationNode* = stmt as DeclarationNode*;
                     match (decl.shape) {
+                        DeclKind::Trait(node) => {
+                            sig_count += TypeResolutionPasses::trait_signatures(&runner, node, ctx, arena);
+                        }
                         DeclKind::Extern(node) => {
                             for (mut j: i64 = 0; j < node.functions.length; j++) {
                                 const fn_node: FunctionDeclNode* = node.functions[j];
@@ -3240,19 +3246,26 @@ type struct TypeResolutionPasses {
                         }
                     }
                 }
-                NodeKind::TraitDeclaration => {
-                    const node: TraitDeclNode* = stmt as TraitDeclNode*;
-                    if (!node.is_generic()) {
-                        for (mut j: i64 = 0; j < node.methods.length; j++) {
-                            const func: FunctionDeclNode* = node.methods[j];
-                            if (func != null && func.body != null) {
-                                mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                    func.generic_params, &runner.res_ctx);
-                                runner.resolve_var_types_in_statement(
-                                    func.body as ASTNode*, &m_ctx);
-                                body_count++;
+                NodeKind::Declaration => {
+                    match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Trait(node) => {
+                            if (!node.is_generic()) {
+                                for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                    const func: FunctionDeclNode* = node.methods[j];
+                                    if (func != null && func.body != null) {
+                                        mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                            func.generic_params, &runner.res_ctx);
+                                        runner.resolve_var_types_in_statement(
+                                            func.body as ASTNode*, &m_ctx);
+                                        body_count++;
+                                    }
+                                }
                             }
                         }
+                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+                        | DeclKind::Variant(_) | DeclKind::Legacy => {}
                     }
                 }
                 NodeKind::ImplementationBlock => {

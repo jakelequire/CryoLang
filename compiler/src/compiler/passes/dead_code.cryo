@@ -64,8 +64,8 @@ import std::collections::hashmap;
 import std::collections::hashmap::{ HashMap };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, FunctionDeclNode, ImplBlockNode,
-    MethodNode, StructDeclNode, TraitDeclNode, UnionDeclNode, VarDeclNode
+    ClassDeclNode, DeclarationNode, DeclKind, FunctionDeclNode, ImplBlockNode,
+    MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode, CallExprNode,
@@ -107,7 +107,7 @@ type struct DeadCodeChecker {
     /// references are present in `used`.  W0001 (unused local) is only sound
     /// when this holds.  It is FALSE for trait *default* method bodies - the
     /// resolver declares trait methods "as signatures only" (see
-    /// visit(TraitDeclNode)) and never resolves their bodies - and for mono
+    /// visit(TraitDecl)) and never resolves their bodies - and for mono
     /// specialization clones, which are not independently resolved (their
     /// resolved template, walked separately, is where a genuine dead local
     /// surfaces).  W0009 (unreachable) is structural and stays enabled either
@@ -163,13 +163,21 @@ type struct DeadCodeChecker {
                 NodeKind::ImplementationBlock => {
                     this.check_methods((stmt as ImplBlockNode*).methods);
                 }
-                NodeKind::TraitDeclaration => {
-                    // Trait default method bodies are not name-resolved
-                    // (signatures only), so W0001 would false-positive on every
-                    // local; run structural W0009 only (body_resolved = false).
-                    const td: TraitDeclNode* = stmt as TraitDeclNode*;
-                    for (mut j: i64 = 0; j < td.methods.length; j++) {
-                        this.check_fn(td.methods[j], false);
+                NodeKind::Declaration => {
+                    match ((stmt as DeclarationNode*).shape) {
+                        // Trait default method bodies are not name-resolved
+                        // (signatures only), so W0001 would false-positive on
+                        // every local; run structural W0009 only
+                        // (body_resolved = false).
+                        DeclKind::Trait(td) => {
+                            for (mut j: i64 = 0; j < td.methods.length; j++) {
+                                this.check_fn(td.methods[j], false);
+                            }
+                        }
+                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+                        | DeclKind::Variant(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -405,9 +413,16 @@ type struct DeadCodeChecker {
                 NodeKind::UnionDeclaration    => { this.harvest_methods((stmt as UnionDeclNode*).methods); }
                 NodeKind::ClassDeclaration    => { this.harvest_methods((stmt as ClassDeclNode*).methods); }
                 NodeKind::ImplementationBlock => { this.harvest_methods((stmt as ImplBlockNode*).methods); }
-                NodeKind::TraitDeclaration => {
-                    const td: TraitDeclNode* = stmt as TraitDeclNode*;
-                    for (mut j: i64 = 0; j < td.methods.length; j++) { this.harvest_fn(td.methods[j]); }
+                NodeKind::Declaration => {
+                    match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Trait(td) => {
+                            for (mut j: i64 = 0; j < td.methods.length; j++) { this.harvest_fn(td.methods[j]); }
+                        }
+                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+                        | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                    }
                 }
                 _ => {}
             }

@@ -42,7 +42,7 @@ import compiler::ast::declaration::{
     FunctionDeclNode, GenericParamDecl, ImplBlockNode, ImportDecl,
     IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDeclNode,
-    TraitDeclNode, TypeAliasDecl, UnionDeclNode, VarDeclNode
+    TraitDecl, TypeAliasDecl, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     CallExprNode, ExpressionNode, IdentifierNode, MemberAccessNode
@@ -181,7 +181,6 @@ implement struct Parser {
             NodeKind::StructDeclaration     => { true }
             NodeKind::UnionDeclaration      => { true }
             NodeKind::ClassDeclaration      => { true }
-            NodeKind::TraitDeclaration      => { true }
             NodeKind::VariableDeclaration   => { true }
             NodeKind::ImplementationBlock   => { true }
             NodeKind::Declaration           => { true }
@@ -528,7 +527,7 @@ implement struct Parser {
                 return ed;
             }
             if (next.kind == TokenType::KwTrait) {
-                const td: TraitDeclNode* = this.parse_trait_declaration();
+                const td: DeclarationNode* = this.parse_trait_declaration();
                 if (td != null && doc != "") { td.set_documentation(doc_text); }
                 return td;
             }
@@ -1747,21 +1746,22 @@ implement struct Parser {
     }
 
     /// Parse a trait declaration: type trait Name<T> [: Base] { methods }
-    parse_trait_declaration() -> TraitDeclNode* {
+    parse_trait_declaration() -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_trait_declaration()");
         const start: Token = this.advance(); // consume 'type'
         this.advance(); // consume 'trait'
 
         const name_tok: Token = this.consume(TokenType::Identifier, "trait name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: TraitDeclNode* = new TraitDeclNode(name, this.span_from_token(start));
+        const tr: TraitDecl* = TraitDecl::new(name);
+        mut node: DeclarationNode* = DeclarationNode::of(DeclKind::Trait(tr), this.span_from_token(start));
         node.set_name_span(this.span_from_token(name_tok));
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
             const gen_params: [DeclarationNode*] = this.parse_generic_params(false);
             for (mut i: i64 = 0; i < gen_params.length; i++) {
-                node.add_generic_param(gen_params[i]);
+                tr.generic_params.push(gen_params[i]);
             }
         }
 
@@ -1769,7 +1769,7 @@ implement struct Parser {
         // `: Trait1, path::Trait2<T>`
         if (this.match_tok(TokenType::Colon)) {
             while (true) {
-                node.add_base_trait(this.parse_trait_ref());
+                tr.base_traits.push(this.parse_trait_ref());
                 if (!this.match_tok(TokenType::Comma)) { break; }
             }
         }
@@ -1790,7 +1790,7 @@ implement struct Parser {
             // and would otherwise be taken as a (keyword-named) method head.
             if (this.check(TokenType::KwType)) {
                 const assoc: AssocTypeDeclNode* = this.parse_assoc_type_decl();
-                if (assoc != null) { node.add_assoc_type(assoc); }
+                if (assoc != null) { tr.assoc_types.push(assoc); }
                 continue;
             }
 
@@ -1814,7 +1814,7 @@ implement struct Parser {
                     if (is_static) { func.set_static(true); }
                     if (trait_mods.is_async) { func.set_async(true); }
                     this.give_receiver(func, is_static);
-                    node.add_method(func);
+                    tr.methods.push(func);
                 }
             } else {
                 this.error_unexpected();
