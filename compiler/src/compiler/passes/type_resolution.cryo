@@ -51,7 +51,7 @@ import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDeclNode, EnumDeclNode,
     EnumVariantNode, ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode,
-    DeclKind, ImplBlockNode, IntrinsicDeclNode, MethodNode, StructDeclNode,
+    DeclKind, ImplBlockNode, MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -2925,67 +2925,66 @@ type struct TypeResolutionPasses {
                     }
                     sig_count += node.functions.length;
                 }
-                NodeKind::IntrinsicDeclaration => {
-                    const node: IntrinsicDeclNode* = stmt as IntrinsicDeclNode*;
-                    // Resolve parameter types
-                    for (mut j: i64 = 0; j < node.parameters.length; j++) {
-                        const param: VarDeclNode* = node.parameters[j];
-                        if (param != null && param.type_annotation != null &&
-                            !param.resolved_type.is_valid()) {
-                            const ptype: TypeRef = resolver.resolve(param.type_annotation, &runner.res_ctx);
-                            if (ptype.is_valid()) {
-                                param.resolved_type = ptype;
-                            }
-                        }
-                    }
-                    // Resolve return type and register in DeclarationIndex
-                    if (node.return_type_annotation != null && !node.has_resolved_return_type()) {
-                        const rtype: TypeRef = resolver.resolve(node.return_type_annotation, &runner.res_ctx);
-                        if (rtype.is_valid()) {
-                            node.set_resolved_return_type(rtype);
-                        }
-                    }
-
-                    if (node.has_resolved_return_type()) {
-                        // Build FunctionType for full signature.
-                        mut i_param_types: [TypeRef] = [];
-                        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
-                            const ip: VarDeclNode* = node.parameters[pi];
-                            if (ip.resolved_type.is_valid()) {
-                                i_param_types.push(ip.resolved_type);
-                            }
-                        }
-                        const i_func_type_ref: TypeRef = arena.get_function(
-                            node.resolved_return_type, i_param_types, node.is_variadic);
-
-                        // Register in its module's family so cross-module
-                        // externs pick up intrinsics.
-                        // Intrinsics use C linkage; their LLVM symbol is the
-                        // bare function name, not the qualified/mangled form.
-                        const i_entry: OverloadId = ctx.decl_index.register_function_signature(
-                            ctx.fn_family_of(node.def), node.name, node.resolved_return_type, i_func_type_ref, ctx.intern_table, arena,
-                            node.name, node.span, node.def, node as ASTNode*);
-
-                        // The ENTRY carries the intrinsic's kind, read from
-                        // the declaration's own name here, the one place a
-                        // spelling decides it: codegen's inline decision reads
-                        // the kind off the pin.  Its leaf is a key nowhere: a
-                        // bare `malloc` with no declaration in scope is an
-                        // error, and the intrinsic is reached as
-                        // `intrinsics::malloc` like every declaration.
-                        ctx.decl_index.mark_intrinsic(i_entry,
-                            IntrinsicKind::from_name(ctx.intern_table.resolve(node.name)));
-                        // Intrinsics are always public (IntrinsicDeclNode
-                        // carries no visibility); record it explicitly so
-                        // the verdict is stated rather than inherited from
-                        // `is_candidate_public`'s permissive default.
-                        ctx.decl_index.set_decl_visibility(node.def, true);
-                    }
-                    sig_count++;
-                }
                 NodeKind::Declaration => {
                     const decl: DeclarationNode* = stmt as DeclarationNode*;
                     match (decl.shape) {
+                        DeclKind::Intrinsic(node) => {
+                            // Resolve parameter types
+                            for (mut j: i64 = 0; j < node.parameters.length; j++) {
+                                const param: VarDeclNode* = node.parameters[j];
+                                if (param != null && param.type_annotation != null &&
+                                    !param.resolved_type.is_valid()) {
+                                    const ptype: TypeRef = resolver.resolve(param.type_annotation, &runner.res_ctx);
+                                    if (ptype.is_valid()) {
+                                        param.resolved_type = ptype;
+                                    }
+                                }
+                            }
+                            // Resolve return type and register in DeclarationIndex
+                            if (node.return_type_annotation != null && !node.resolved_return_type.is_valid()) {
+                                const rtype: TypeRef = resolver.resolve(node.return_type_annotation, &runner.res_ctx);
+                                if (rtype.is_valid()) {
+                                    node.resolved_return_type = rtype;
+                                }
+                            }
+
+                            if (node.resolved_return_type.is_valid()) {
+                                // Build FunctionType for full signature.
+                                mut i_param_types: [TypeRef] = [];
+                                for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+                                    const ip: VarDeclNode* = node.parameters[pi];
+                                    if (ip.resolved_type.is_valid()) {
+                                        i_param_types.push(ip.resolved_type);
+                                    }
+                                }
+                                const i_func_type_ref: TypeRef = arena.get_function(
+                                    node.resolved_return_type, i_param_types, node.is_variadic);
+
+                                // Register in its module's family so cross-module
+                                // externs pick up intrinsics.
+                                // Intrinsics use C linkage; their LLVM symbol is the
+                                // bare function name, not the qualified/mangled form.
+                                const i_entry: OverloadId = ctx.decl_index.register_function_signature(
+                                    ctx.fn_family_of(node.def), node.name, node.resolved_return_type, i_func_type_ref, ctx.intern_table, arena,
+                                    node.name, decl.span, node.def, decl as ASTNode*);
+
+                                // The ENTRY carries the intrinsic's kind, read from
+                                // the declaration's own name here, the one place a
+                                // spelling decides it: codegen's inline decision reads
+                                // the kind off the pin.  Its leaf is a key nowhere: a
+                                // bare `malloc` with no declaration in scope is an
+                                // error, and the intrinsic is reached as
+                                // `intrinsics::malloc` like every declaration.
+                                ctx.decl_index.mark_intrinsic(i_entry,
+                                    IntrinsicKind::from_name(ctx.intern_table.resolve(node.name)));
+                                // Intrinsics are always public (an intrinsic
+                                // carries no visibility); record it explicitly so
+                                // the verdict is stated rather than inherited from
+                                // `is_candidate_public`'s permissive default.
+                                ctx.decl_index.set_decl_visibility(node.def, true);
+                            }
+                            sig_count++;
+                        }
                         DeclKind::IntrinsicConst(ic_node) => {
                             if (ic_node.type_annotation != null && !ic_node.has_resolved_type()) {
                                 const ic_type: TypeRef = resolver.resolve(ic_node.type_annotation, &runner.res_ctx);

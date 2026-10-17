@@ -51,8 +51,8 @@ import compiler::resolver::lang_item::{ LangItem };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, EnumDeclNode, ExternBlockNode, FunctionDeclNode, ImplBlockNode,
-    IntrinsicDeclNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
+    ClassDeclNode, DeclarationNode, DeclKind, EnumDeclNode, ExternBlockNode, FunctionDeclNode,
+    ImplBlockNode, IntrinsicDecl, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::lex::{ TokenType };
@@ -331,8 +331,11 @@ type struct DeclarationEmitter {
                 NodeKind::FunctionDeclaration => {
                     this.declare_function(stmt as FunctionDeclNode*);
                 }
-                NodeKind::IntrinsicDeclaration => {
-                    this.declare_intrinsic(stmt as IntrinsicDeclNode*);
+                NodeKind::Declaration => {
+                    match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Intrinsic(n) => { this.declare_intrinsic(n); }
+                        DeclKind::IntrinsicConst(_) | DeclKind::Module(_) | DeclKind::Legacy => {}
+                    }
                 }
                 NodeKind::ExternBlock => {
                     this.declare_extern_block(stmt as ExternBlockNode*);
@@ -1225,19 +1228,15 @@ type struct DeclarationEmitter {
 
     /// Declare an intrinsic function (e.g., malloc, printf, strlen).
     /// Intrinsics use C linkage: bare name, no namespace qualification.
-    declare_intrinsic(mut &this, node: IntrinsicDeclNode*) -> void {
+    declare_intrinsic(mut &this, node: IntrinsicDecl*) -> void {
         const intern: InternTable* = this.get_intern();
         const name_str: string = intern.resolve(node.name);
 
         // Route the LLVM function-type through the ABI seam.  Intrinsics
         // are flat C signatures with no receiver, so the seam handles
         // them directly without any pre-lowering.
-        const ret_ref: TypeRef = if (node.has_resolved_return_type()) {
-            node.resolved_return_type
-        } else {
-            TypeRef::invalid()
-        };
-        const param_count: u32 = CodegenUtil::fixed_param_count_intrinsic(node);
+        const ret_ref: TypeRef = node.resolved_return_type;
+        const param_count: u32 = node.fixed_param_count();
         mut params: [TypeRef] = [];
         for (mut i: u32 = 0; i < param_count; i++) {
             const param: VarDeclNode* = node.parameters[i];

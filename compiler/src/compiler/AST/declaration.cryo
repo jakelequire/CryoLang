@@ -1,6 +1,6 @@
 /// AST Declaration Nodes
 ///
-//// DeclarationNode base, the declaration classes not yet converted to a
+/// DeclarationNode base, the declaration classes not yet converted to a
 /// payload, and the payload structs of the kinds that are (`DeclKind`).
 ///
 /// String type convention:
@@ -39,6 +39,7 @@ import compiler::ast::expression::{ ExpressionNode };
 import compiler::ast::pattern::{ DirectiveArgKind, DirectiveNode };
 import compiler::ast::statement::{ Stmt };
 import compiler::ast::node::{ ASTNode };
+import compiler::ast::walk::{ Walk };
 import compiler::codegen::ast_arena::{ cryo_ast_arena_alloc };
 import utils::keyword::{ Keyword };
 
@@ -720,50 +721,66 @@ public:
 }
 
 
-type class IntrinsicDeclNode : DeclarationNode {
-public:
-    name:                    SymbolStr;
-    /// The definition this declaration is, stamped by the name layer when
-    /// it declares the intrinsic, as a function's is.
-    def:                     DefId;
-    parameters:              [VarDeclNode*];
-    body:                    Stmt*;
-    resolved_return_type:    TypeRef;
-    return_type_annotation:  TypeAnnotation*;
-    is_variadic:             boolean;
-
-    IntrinsicDeclNode(name: SymbolStr, span: SourceSpan)
-        : DeclarationNode(NodeKind::IntrinsicDeclaration, span) {
-        this.name                    = name;
-        this.def                     = DefId::invalid();
-        this.parameters              = [];
-        this.body                    = null;
-        this.resolved_return_type    = TypeRef::invalid();
-        this.return_type_annotation  = null;
-        this.is_variadic             = false;
-    }
-
-    has_body() -> boolean                 { return this.body != null; }
-    has_resolved_return_type() -> boolean { return this.resolved_return_type.is_valid(); }
-
-    add_parameter(param: VarDeclNode*) -> void {
-        this.parameters.push(param);
-    }
-
-    set_body(b: Stmt*) -> void                          { this.body = b; }
-    set_resolved_return_type(t: TypeRef) -> void                 { this.resolved_return_type = t; }
-    set_return_type_annotation(a: TypeAnnotation*) -> void       { this.return_type_annotation = a; }
-    set_variadic(v: boolean) -> void                             { this.is_variadic = v; }
-}
-
-
 /// What a declaration is, for the kinds whose fields live in a payload.
 /// `Legacy` is the bridge for the kinds still declared as a subclass of
 /// `DeclarationNode`; it goes when the last kind converts.
 type enum DeclKind {
     Legacy;
+    Intrinsic(IntrinsicDecl*);
     IntrinsicConst(IntrinsicConstDecl*);
     Module(ModuleDecl*);
+}
+
+
+/// `intrinsic name(params) -> T;`: a function the compiler supplies.
+type struct IntrinsicDecl {
+    name:                   SymbolStr;
+    /// The definition this declaration is, stamped by the name layer when
+    /// it declares the intrinsic, as a function's is.
+    def:                    DefId;
+    parameters:             [VarDeclNode*];
+    body:                   Stmt*;
+    resolved_return_type:   TypeRef;
+    return_type_annotation: TypeAnnotation*;
+    is_variadic:            boolean;
+
+    static new(name: SymbolStr) -> IntrinsicDecl* {
+        return new IntrinsicDecl {
+            name:                   name,
+            def:                    DefId::invalid(),
+            parameters:             [],
+            body:                   null,
+            resolved_return_type:   TypeRef::invalid(),
+            return_type_annotation: null,
+            is_variadic:            false,
+        };
+    }
+
+    /// The parameters an LLVM function type takes: a variadic intrinsic's
+    /// trailing untyped parameter stands for the variadic arguments.
+    fixed_param_count(&this) -> u32 {
+        mut count: u32 = this.parameters.length as u32;
+        if (this.is_variadic && count > 0) {
+            const last: VarDeclNode* = this.parameters[count - 1];
+            if (last.type_annotation == null) {
+                count -= 1;
+            }
+        }
+        return count;
+    }
+
+    static walk_children<V>(n: IntrinsicDecl*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.parameters.length; i++) {
+            v.walk_decl(n.parameters[i] as DeclarationNode*);
+        }
+        v.walk_stmt(n.body);
+    }
+}
+
+implement trait Allocate for struct IntrinsicDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
 }
 
 

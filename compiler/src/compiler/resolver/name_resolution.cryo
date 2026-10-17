@@ -43,7 +43,7 @@ import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDeclNode, EnumDeclNode, EnumVariantNode,
     ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
-    DeclarationNode, DeclKind, ImportDeclNode, IntrinsicDeclNode, MethodNode, StructDeclNode,
+    DeclarationNode, DeclKind, ImportDeclNode, IntrinsicDecl, MethodNode, StructDeclNode,
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -514,28 +514,24 @@ type struct NameResolver {
                 // whatever happens to have been declared so far.  It is done on
                 // the walk instead, by which point every module has declared.
             }
-            NodeKind::IntrinsicDeclaration => {
-                const intr_node: IntrinsicDeclNode* = node as IntrinsicDeclNode*;
-                const id: SymbolID = this.resolver.alloc_symbol_id();
-                // `intr_node.name` is already an interned SymbolStr; use it
-                // directly (re-`intern`-ing a SymbolStr passed the 4-byte
-                // handle where a `string` was expected - a latent mismatch).
-                const sym_name: SymbolStr = intr_node.name;
-                // The declaring module is the symbol's canonical prefix: a
-                // bare call of an intrinsic from the module that declares it
-                // is stamped `Def(<module>::<leaf>)`, and that is the key the
-                // declaration index registers the intrinsic's signature under.
-                // A placeholder here stamps a name nothing is registered
-                // under, and the call is refused as unknown.
-                const sym: Symbol = Symbol::intrinsic(id, sym_name,
-                    this.resolver.current_scope, intr_node.span, this.resolver.current_module);
-                const intr_declared: SymbolID = this.resolver.declare(sym);
-                this.resolver.export_symbol(intr_declared);
-                intr_node.def = this.resolver.get_symbol(intr_declared).def;
-            }
             NodeKind::Declaration => {
                 const decl: DeclarationNode* = node as DeclarationNode*;
                 match (decl.shape) {
+                    DeclKind::Intrinsic(intr_node) => {
+                        const id: SymbolID = this.resolver.alloc_symbol_id();
+                        // The declaring module is the symbol's canonical
+                        // prefix: a bare call of an intrinsic from the module
+                        // that declares it is stamped `Def(<module>::<leaf>)`,
+                        // and that is the key the declaration index registers
+                        // the intrinsic's signature under.  A placeholder here
+                        // stamps a name nothing is registered under, and the
+                        // call is refused as unknown.
+                        const sym: Symbol = Symbol::intrinsic(id, intr_node.name,
+                            this.resolver.current_scope, decl.span, this.resolver.current_module);
+                        const intr_declared: SymbolID = this.resolver.declare(sym);
+                        this.resolver.export_symbol(intr_declared);
+                        intr_node.def = this.resolver.get_symbol(intr_declared).def;
+                    }
                     DeclKind::IntrinsicConst(ic_node) => {
                         const ic_id: SymbolID = this.resolver.alloc_symbol_id();
                         const ic_sym: Symbol = Symbol::constant(ic_id, ic_node.name,
@@ -625,9 +621,9 @@ type struct NameResolver {
             NodeKind::TraitDeclaration     => { (node as TraitDeclNode*).def }
             NodeKind::TypeAliasDeclaration => { (node as TypeAliasDeclNode*).def }
             NodeKind::VariableDeclaration  => { (node as VarDeclNode*).def }
-            NodeKind::IntrinsicDeclaration => { (node as IntrinsicDeclNode*).def }
             NodeKind::Declaration => {
                 match ((node as DeclarationNode*).shape) {
+                    DeclKind::Intrinsic(i)       => { i.def }
                     DeclKind::IntrinsicConst(ic) => { ic.def }
                     DeclKind::Module(_) | DeclKind::Legacy => { DefId::invalid() }
                 }
@@ -3454,7 +3450,7 @@ implement trait Walk for struct NameResolver {
         }
     }
 
-    walk_intrinsic(mut &this, node: IntrinsicDeclNode*) -> void {
+    walk_intrinsic(mut &this, d: DeclarationNode*, node: IntrinsicDecl*) -> void {
         // Already forward-declared.  The signature's annotations are stamped
         // here as a function's are: a primitive (`void*`, `u32*`) is a
         // written name the name layer answers, not a token that needs no
@@ -3463,8 +3459,8 @@ implement trait Walk for struct NameResolver {
             this.stamp_annotation(node.parameters[pi].type_annotation);
         }
         this.stamp_annotation(node.return_type_annotation);
-        if (node.has_body()) {
-            this.resolver.enter_scope(ScopeKind::Function, this.resolver.intern_table.resolve(node.name), node.span);
+        if (node.body != null) {
+            this.resolver.enter_scope(ScopeKind::Function, this.resolver.intern_table.resolve(node.name), d.span);
             for (mut i: i64 = 0; i < node.parameters.length; i++) {
                 const param: VarDeclNode* = node.parameters[i];
                 const param_sym: SymbolID = this.resolver.declare_parameter(param.name, param.span);

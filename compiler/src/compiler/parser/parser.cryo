@@ -40,7 +40,7 @@ import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
     DestructureDeclNode, EnumDeclNode, EnumVariantNode, ExternBlockNode, FieldDeclNode,
     FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDeclNode,
-    IntrinsicConstDecl, IntrinsicDeclNode, MethodNode, ModuleDecl, ReceiverForm,
+    IntrinsicConstDecl, IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDeclNode,
     TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
 };
@@ -188,7 +188,6 @@ implement struct Parser {
             NodeKind::ImplementationBlock   => { true }
             NodeKind::ExternBlock           => { true }
             NodeKind::ImportDeclaration     => { true }
-            NodeKind::IntrinsicDeclaration  => { true }
             NodeKind::Declaration           => { true }
             _                               => { false }
         };
@@ -568,7 +567,7 @@ implement struct Parser {
                 if (gi != null && doc != "") { gi.set_documentation(doc_text); }
                 return gi;
             }
-            const intr: IntrinsicDeclNode* = this.parse_intrinsic_declaration();
+            const intr: DeclarationNode* = this.parse_intrinsic_declaration();
             if (intr != null && doc != "") { intr.set_documentation(doc_text); }
             return intr;
         }
@@ -2667,7 +2666,7 @@ implement struct Parser {
     /// Parse an intrinsic declaration:
     ///   intrinsic name(params) -> RetType { body }
     ///   intrinsic function name(params) -> RetType;    (stdlib form)
-    parse_intrinsic_declaration() -> IntrinsicDeclNode* {
+    parse_intrinsic_declaration() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'intrinsic'
         // Allow optional 'function' keyword: intrinsic function malloc(...)
         if (this.check(TokenType::KwFunction)) {
@@ -2675,7 +2674,7 @@ implement struct Parser {
         }
         const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: IntrinsicDeclNode* = new IntrinsicDeclNode(name, this.span_from_token(start));
+        const node: IntrinsicDecl* = IntrinsicDecl::new(name);
 
         // Parameter list
         this.consume(TokenType::LParen, "'('");
@@ -2686,34 +2685,31 @@ implement struct Parser {
                 // Detect variadic marker: the `args...` param has no type
                 // annotation (parse_parameter returns it early on `...`).
                 if (p.type_annotation == null && i == params.length - 1) {
-                    node.set_variadic(true);
+                    node.is_variadic = true;
                 } else {
-                    node.add_parameter(p);
+                    node.parameters.push(p);
                 }
             }
         }
         if (this.pending_bare_variadic) {
-            node.set_variadic(true);
+            node.is_variadic = true;
             this.pending_bare_variadic = false;
         }
         this.consume(TokenType::RParen, "')'");
 
         // Optional return type
         if (this.match_tok(TokenType::Arrow)) {
-            const ret_ann: TypeAnnotation* = this.parse_type_annotation();
-            node.set_return_type_annotation(ret_ann);
+            node.return_type_annotation = this.parse_type_annotation();
         }
 
         // Optional body
         if (this.check(TokenType::LBrace)) {
-            const body: Stmt* = this.parse_block_statement();
-            node.set_body(body);
+            node.body = this.parse_block_statement();
         } else {
             this.consume(TokenType::Semicolon, "';'");
         }
 
-        node.span = this.span_from(start);
-        return node;
+        return DeclarationNode::of(DeclKind::Intrinsic(node), this.span_from(start));
     }
 
     /// Parse a generic intrinsic declaration:

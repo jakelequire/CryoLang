@@ -1394,6 +1394,16 @@ committed with the change and deleted in the next commit.
   scan, three language server handlers).
   `DirectiveTarget::from_kind(NodeKind)` became `from_node(ASTNode*)`,
   since a kind is no longer a `NodeKind` alone.
+- `Intrinsic(IntrinsicDecl*)` followed (`intrinsic function name(...)`; the
+  generic form is a `FunctionDeclNode` and stays one).  Its walk is inline
+  in the payload, `CodegenUtil::fixed_param_count_intrinsic` became the
+  payload's `fixed_param_count`, and the declaration index holds the
+  header for it.  The only file declaring intrinsics is
+  `stdlib/core/intrinsics.cryo`, which `cryo check --ast` refuses alone;
+  the comparison sees the kind through `stdlib/core/marker.cryo`, whose
+  dump carries 71 of them (a dumper with the label changed differs there).
+  The cloner copies an intrinsic's parameters and body but not its
+  definition, return annotation or variadic flag, as it did before.
 - `NodeKind::is_declaration` answers true for `Declaration`.  A module
   declaration was outside its list; the two callers read `name_span`,
   which the parser never sets on a module declaration, so they answer as
