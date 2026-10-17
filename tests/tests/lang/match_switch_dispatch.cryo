@@ -1,0 +1,117 @@
+// A `match` whose arms test constants dispatches through a `switch`, in runs
+// that end at a guarded arm and at a catch-all; an arm that is not a constant
+// (a range, a payload test) is tested on its own between runs.  Each case
+// below is one of the places where a switch could pick a different arm than
+// testing the arms in order would: a value repeated in a later arm, a guard
+// that fails and must go on to later arms naming the same value, a guarded
+// catch-all, and a run that resumes after a non-constant arm.
+![config(testing)]
+namespace CryoTests::Tests::Lang::MatchSwitchDispatch;
+
+import std::test;
+import std::core::result;
+import std::core::result::{ Result };
+import std::test::assert::{ expect_eq };
+import std::test::error::{ TestError };
+
+type enum Color { Red; Green; Blue; Black; White; }
+
+type enum Shape { Circle(i32); Square(i32); Pair(i32, i32); Empty; }
+
+function color_code(c: Color) -> i32 {
+    return match (c) {
+        Color::Red                 => { 1 }
+        Color::Green               => { 2 }
+        Color::Blue | Color::Black => { 3 }
+        Color::Red                 => { 99 }
+        _                          => { 4 }
+    };
+}
+
+// A failed guard goes on to the later arms, one of which names the same
+// variant again.
+function shape_code(s: Shape, lim: i32) -> i32 {
+    match (s) {
+        Shape::Circle(r) if (r > lim) => { return 100 + r; }
+        Shape::Square(x)              => { return 200 + x; }
+        Shape::Circle(r)              => { return 300 + r; }
+        Shape::Pair(1, b)             => { return 400 + b; }
+        Shape::Pair(a, _)             => { return 500 + a; }
+        Shape::Empty                  => { return 0; }
+    }
+}
+
+// A guarded catch-all in the middle: its failure reaches the arms after it.
+function number_code(n: i64) -> i32 {
+    return match (n) {
+        1              => { 10 }
+        2 | 3          => { 20 }
+        x if (x > 100) => { 30 }
+        4              => { 40 }
+        1              => { 99 }
+        _              => { 50 }
+    };
+}
+
+// A range between two runs of constants.
+function char_code(c: char) -> i32 {
+    return match (c) {
+        '0'      => { 0 }
+        '1'      => { 1 }
+        'a'..'f' => { 10 }
+        'x'      => { 20 }
+        'a'      => { 99 }
+        _        => { -1 }
+    };
+}
+
+function bool_code(b: boolean) -> i32 {
+    return match (b) {
+        true  => { 1 }
+        false => { 0 }
+    };
+}
+
+![test]
+function repeated_value_takes_the_first_arm() -> Result<(), TestError> {
+    expect_eq(color_code(Color::Red), 1)?;
+    expect_eq(color_code(Color::Green), 2)?;
+    expect_eq(color_code(Color::Blue), 3)?;
+    expect_eq(color_code(Color::Black), 3)?;
+    return expect_eq(color_code(Color::White), 4);
+}
+
+![test]
+function failed_guard_reaches_later_arms() -> Result<(), TestError> {
+    expect_eq(shape_code(Shape::Circle(5), 3), 105)?;
+    expect_eq(shape_code(Shape::Circle(2), 3), 302)?;
+    expect_eq(shape_code(Shape::Square(4), 3), 204)?;
+    expect_eq(shape_code(Shape::Pair(1, 7), 3), 407)?;
+    expect_eq(shape_code(Shape::Pair(2, 7), 3), 502)?;
+    return expect_eq(shape_code(Shape::Empty, 3), 0);
+}
+
+![test]
+function guarded_catch_all_falls_through() -> Result<(), TestError> {
+    expect_eq(number_code(1), 10)?;
+    expect_eq(number_code(3), 20)?;
+    expect_eq(number_code(500), 30)?;
+    expect_eq(number_code(4), 40)?;
+    return expect_eq(number_code(7), 50);
+}
+
+![test]
+function run_resumes_after_a_range() -> Result<(), TestError> {
+    expect_eq(char_code('0'), 0)?;
+    expect_eq(char_code('1'), 1)?;
+    expect_eq(char_code('a'), 10)?;
+    expect_eq(char_code('c'), 10)?;
+    expect_eq(char_code('x'), 20)?;
+    return expect_eq(char_code('z'), -1);
+}
+
+![test]
+function boolean_subject() -> Result<(), TestError> {
+    expect_eq(bool_code(true), 1)?;
+    return expect_eq(bool_code(false), 0);
+}

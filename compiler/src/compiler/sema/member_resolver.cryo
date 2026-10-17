@@ -22,7 +22,7 @@ import compiler::ast::{ declaration, expression, MemberPin, node, NodeKind, Type
 import compiler::lex;
 import compiler::lex::{ Token, TokenType };
 import compiler::diag;
-import compiler::diag::{ diagnostic, ErrorCode, source_span };
+import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::{
@@ -43,6 +43,7 @@ import compiler::sema::sema;
 import compiler::sema::sema::{ SemaVisitor };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::suggestion::{ Applicability, Suggestion };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res::{ DefId, FamilyOwner };
@@ -212,23 +213,30 @@ type struct MemberResolver {
         // Method lookup with inheritance, from the *dereferenced* receiver symbol.
         const type_sym: SymbolStr = this.types.lookup_type_sym(walk_ty);
         if (type_sym.is_valid()) {
+            const type_name: string = this.intern.resolve(type_sym);
             const method_ret: TypeRef =
                 this.method_return_through_door(walk_ty, member);
             if (method_ret.is_valid()) {
-                this.enforce_method_visibility(obj_type, member.member, acc_span);
-                return method_ret;
+                this.report_method_read(member, type_name, acc_span);
+                return TypeRef::invalid();
             }
 
             // Deref coercion: the receiver has no such field or method, but if it
             // implements `Deref<Target>`, retry the lookup on the pointee - `b.field`
-            // / `b.method()` on a `Box<Foo>` becomes `(*b.deref()).field` - repeating
-            // while the pointee is itself a `Deref` type (bounded).  Because
-            // `*(b.deref())` is a place, coerced access serves reads, writes, and
-            // method receivers uniformly, and codegen needs nothing new.
+            // on a `Box<Foo>` becomes `(*b.deref()).field` - repeating while the
+            // pointee is itself a `Deref` type (bounded).  Because `*(b.deref())`
+            // is a place, coerced access serves reads and writes uniformly, and
+            // codegen needs nothing new.  The pointee answering with a method
+            // (no field pinned) is the same misreading as above.
             const coerced: TypeRef = this.try_deref_coercion(visitor, member);
-            if (coerced.is_valid()) { return coerced; }
+            if (coerced.is_valid()) {
+                if (!member.resolved_member.is_some()) {
+                    this.report_method_read(member, type_name, acc_span);
+                    return TypeRef::invalid();
+                }
+                return coerced;
+            }
 
-            const type_name: string = this.intern.resolve(type_sym);
             const member_name: string = this.intern.resolve(member.member);
             const m_span: SourceSpan = if (member.member_span.has_location()) {
                 member.member_span
@@ -245,6 +253,21 @@ type struct MemberResolver {
         }
 
         return TypeRef::invalid();
+    }
+
+    /// `obj.m` read as a value where `m` names a method of the receiver's
+    /// type and no field: a method is reached only by calling it, so the
+    /// read names nothing a value can be taken from.
+    report_method_read(mut &this, member: MemberAccessNode*, type_name: string,
+                       span: SourceSpan) -> void {
+        const name: string = this.intern.resolve(member.member);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0204_UNDEFINED_FIELD,
+            fmt::format("no field `%s` on type `%s`", name, type_name));
+        d = d.at_with_label(span, "a method, not a field");
+        d = d.suggest(Suggestion::single(span, fmt::format("%s()", name),
+            fmt::format("`%s` is a method; call it", name), Applicability::MaybeIncorrect));
+        this.ctx.emit_diagnostic(d);
     }
 
     /// A field read whose receiver is a type parameter of the body being

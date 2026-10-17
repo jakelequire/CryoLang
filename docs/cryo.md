@@ -1531,6 +1531,8 @@ type struct Rect {
 
 The receiver shape is part of the signature, so a caller knows whether a method borrows or consumes the receiver without reading the body.
 
+A method is reached only by calling it.  `r.area` with no call, where `area` is a method and no field has that name, names no value and is refused (E0204), with a suggestion to write `r.area()`.
+
 #### Struct-destructuring bindings
 
 A `const`/`mut` binding may use a **destructuring pattern** - `{ field, field, ... }` with a type annotation naming the struct - to move a struct's fields out into individually named locals. Each field is moved into a like-named local (field order need not match the declaration). This is the idiomatic companion to a consuming (`this`) receiver: binding the fields marks the receiver as *fully consumed*, so its automatic drop is suppressed and the fields can be handed off without a double free. Any bound field you don't move onward is dropped normally at the end of scope.

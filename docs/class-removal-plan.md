@@ -1169,12 +1169,21 @@ verify was identical and `cryo check` on the compiler went from 8.01 s to
 `![inline]` (the inline copies took: no call to `kind` was left in the
 callers' objects).  The cost is the `match` itself: a project build runs no
 LLVM pipeline, and code generation lowers a `match` on a tag to a chain of
-compares, not a `switch`, so each read walks up to 25 compares.  The field
-stays until that is answered (open question in the session's report).  The
+compares, not a `switch`, so each read walks up to 25 compares.  The
 reads were found by deleting the field and the method together, so the
 type check refused each one (E0204); with a method named `kind` in place,
-a read written `t.kind` passes the type check and only code generation
-refuses it, one module at a time (logged as a bug).
+a read written `t.kind` passed the type check and only code generation
+refused it, one module at a time (since refused by the type check).
+
+With a `match` on constants lowered to a `switch`, the same conversion
+(1,130 reads, the codemod rerun) was measured again, interleaved x5, each
+compiler built by the switch-lowering compiler: stored field 8.60 s,
+derived 9.55 s (+11%), derived with both `kind` methods `![inline]` 9.07 s
+(+5.5%); the derivation built by the compare-chain compiler, 10.01 s.  The
+switch took about a third of the cost.  The rest is the jump through the
+table on every read and, without the attribute, two calls: the compiler
+is built at O0, so nothing turns the `match` into a table load.  The field
+stays until that is answered (open question in the session's report).
 
 ### Slice 5: patterns (the pilot for node conversion)
 
