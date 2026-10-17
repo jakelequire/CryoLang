@@ -26,7 +26,7 @@ import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDeclNode,
     EnumVariant, ExternBlock, FieldDeclNode, FunctionDeclNode, GenericParamNode,
     DeclKind, ImplBlockNode, ImportDecl, IntrinsicConstDecl, IntrinsicDecl, MethodNode,
-    ModuleDecl, StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode,
+    ModuleDecl, StructDeclNode, TraitDeclNode, TypeAliasDecl, UnionDeclNode,
     VarDeclNode
 };
 import compiler::ast::expression::{
@@ -153,7 +153,6 @@ type struct ASTCloner {
             NodeKind::UnionDeclaration          => { return this.visit_union(n as UnionDeclNode*); }
             NodeKind::ClassDeclaration          => { return this.visit_class(n as ClassDeclNode*); }
             NodeKind::TraitDeclaration          => { return this.visit_trait(n as TraitDeclNode*); }
-            NodeKind::TypeAliasDeclaration      => { return this.visit_type_alias(n as TypeAliasDeclNode*); }
             NodeKind::EnumDeclaration           => { return this.visit_enum(n as EnumDeclNode*); }
             NodeKind::ImplementationBlock       => { return this.visit_impl(n as ImplBlockNode*); }
             NodeKind::FieldDeclaration          => { return this.visit_field(n as FieldDeclNode*); }
@@ -898,6 +897,19 @@ type struct ASTCloner {
                 DeclKind::IntrinsicConst(ic)
             }
             DeclKind::Module(n) => { DeclKind::Module(ModuleDecl::new(n.path, n.is_public)) }
+            DeclKind::TypeAlias(n) => {
+                // The definition is stamped on the copy by whoever places it;
+                // the binding namespace and the resolved target are left as
+                // `new` leaves them.
+                const c: TypeAliasDecl* = TypeAliasDecl::new(n.alias_name);
+                for (mut i: i64 = 0; i < n.generic_params.length; i++) {
+                    c.generic_params.push(this.clone_generic_param(n.generic_params[i]));
+                }
+                if (n.target_annotation != null) {
+                    c.target_annotation = this.clone_type_annotation(n.target_annotation);
+                }
+                DeclKind::TypeAlias(c)
+            }
             DeclKind::Variant(n) => {
                 const c: EnumVariant* = EnumVariant::new(n.name);
                 // Deep-clone type annotations (not shallow copy)
@@ -1024,19 +1036,6 @@ type struct ASTCloner {
             c.add_base_trait(node.base_traits[i].clone());
         }
         c.sym_id      = node.sym_id;
-        return c;
-    }
-
-    visit_type_alias(mut &this, node: TypeAliasDeclNode*) -> ASTNode* {
-        mut c: TypeAliasDeclNode* = new TypeAliasDeclNode(node.alias_name, node.span);
-        this.copy_decl_base(node, c);
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
-        }
-        if (node.target_annotation != null) {
-            c.set_target_annotation(this.clone_type_annotation(node.target_annotation));
-        }
-        // resolved_target left as TypeRef::invalid() (constructor default)
         return c;
     }
 

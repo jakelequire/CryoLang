@@ -44,7 +44,7 @@ import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDecl, EnumDeclNode, EnumVariant,
     ExternBlock, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
     DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDeclNode,
-    TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+    TraitDeclNode, TypeAliasDecl, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
@@ -461,19 +461,6 @@ type struct NameResolver {
                 // associated types the trait declares.
                 this.ctx.generic_registry.register_trait_decl(trait_node.def, trait_node);
             }
-            NodeKind::TypeAliasDeclaration => {
-                const alias_node: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
-                this.ctx.note_alias_decl(node);
-                if (!alias_node.binding_namespace.is_valid()) {
-                    const sym_id: SymbolID = this.resolver.declare_type(
-                        alias_node.alias_name, alias_node.span, true);
-                    alias_node.def = this.type_def_of(sym_id);
-                    this.resolver.export_symbol(sym_id);
-                } else {
-                    alias_node.def = this.type_def_of(this.declare_c_imported(
-                        alias_node.binding_namespace, alias_node.alias_name, alias_node.span));
-                }
-            }
             NodeKind::VariableDeclaration => {
                 const var_node: VarDeclNode* = node as VarDeclNode*;
                 // A C-imported global (binding_namespace set) is a
@@ -587,6 +574,18 @@ type struct NameResolver {
                         this.resolver.export_symbol(declared_id);
                         ic_node.def = this.resolver.get_symbol(declared_id).def;
                     }
+                    DeclKind::TypeAlias(alias_node) => {
+                        this.ctx.note_alias_decl(node);
+                        if (!alias_node.binding_namespace.is_valid()) {
+                            const sym_id: SymbolID = this.resolver.declare_type(
+                                alias_node.alias_name, decl.span, true);
+                            alias_node.def = this.type_def_of(sym_id);
+                            this.resolver.export_symbol(sym_id);
+                        } else {
+                            alias_node.def = this.type_def_of(this.declare_c_imported(
+                                alias_node.binding_namespace, alias_node.alias_name, decl.span));
+                        }
+                    }
                     // A module declaration introduces no name of this module.
                     // A variant is declared with its enum; a destructure's
                     // locals where the walk meets them.
@@ -622,12 +621,12 @@ type struct NameResolver {
             NodeKind::EnumDeclaration      => { (node as EnumDeclNode*).def }
             NodeKind::ClassDeclaration     => { (node as ClassDeclNode*).def }
             NodeKind::TraitDeclaration     => { (node as TraitDeclNode*).def }
-            NodeKind::TypeAliasDeclaration => { (node as TypeAliasDeclNode*).def }
             NodeKind::VariableDeclaration  => { (node as VarDeclNode*).def }
             NodeKind::Declaration => {
                 match ((node as DeclarationNode*).shape) {
                     DeclKind::Intrinsic(i)       => { i.def }
                     DeclKind::IntrinsicConst(ic) => { ic.def }
+                    DeclKind::TypeAlias(a)       => { a.def }
                     DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
                     | DeclKind::Variant(_) | DeclKind::Destructure(_) | DeclKind::Legacy => {
                         DefId::invalid()
@@ -3423,13 +3422,13 @@ implement trait Walk for struct NameResolver {
         }
     }
 
-    walk_type_alias(mut &this, node: TypeAliasDeclNode*) -> void {
+    walk_type_alias(mut &this, d: DeclarationNode*, node: TypeAliasDecl*) -> void {
         // Already forward-declared.  The alias's own parameters are in
         // scope for its target, as a struct's are for its fields; the target
         // is the alias's definition, so the alias's own name is no
         // suggestion for a name inside it.
         this.resolver.enter_scope(ScopeKind::TypeBody,
-            this.resolver.intern_table.resolve(node.alias_name), node.span);
+            this.resolver.intern_table.resolve(node.alias_name), d.span);
         this.declare_generics(node.generic_params);
         this.defining_type = node.alias_name;
         this.stamp_annotation(node.target_annotation);
@@ -4006,7 +4005,8 @@ type struct NameDeclarationPass {
         if (node.kind == NodeKind::StructDeclaration)    { return (node as StructDeclNode*).def; }
         if (node.kind == NodeKind::UnionDeclaration)     { return (node as UnionDeclNode*).def; }
         if (node.kind == NodeKind::EnumDeclaration)      { return (node as EnumDeclNode*).def; }
-        if (node.kind == NodeKind::TypeAliasDeclaration) { return (node as TypeAliasDeclNode*).def; }
+        const alias: TypeAliasDecl* = DeclarationNode::alias_of(node);
+        if (alias != null) { return alias.def; }
         return DefId::invalid();
     }
 }
@@ -4029,7 +4029,7 @@ type struct NameResolutionPass {
     static settle_alias_paths(ctx: CompilationContext*) -> void {
         for (mut i: i64 = 0; i < ctx.alias_paths.length; i++) {
             const node: ScopeResolutionNode* = ctx.alias_paths[i].node as ScopeResolutionNode*;
-            mut alias: TypeAliasDeclNode* = NameResolutionPass::alias_decl(ctx, node.scope_res.pending_alias());
+            mut alias: TypeAliasDecl* = NameResolutionPass::alias_decl(ctx, node.scope_res.pending_alias());
             mut answer: Res = Res::TypeRelative(ResBase::Def(node.scope_res.pending_alias()), 1);
             if (alias != null && alias.generic_params.length == 0 && node.scope_generic_args.length > 0) {
                 NameResolutionPass::refuse_alias_type_args(ctx, node);
@@ -4121,10 +4121,10 @@ type struct NameResolutionPass {
     }
 
     /// The alias declared as `d`, or null when `d` is not one.
-    static alias_decl(ctx: CompilationContext*, d: DefId) -> TypeAliasDeclNode* {
+    static alias_decl(ctx: CompilationContext*, d: DefId) -> TypeAliasDecl* {
         if (!d.is_valid()) { return null; }
         for (mut i: i64 = 0; i < ctx.alias_decls.length; i++) {
-            const a: TypeAliasDeclNode* = ctx.alias_decls[i].node as TypeAliasDeclNode*;
+            const a: TypeAliasDecl* = DeclarationNode::alias_of(ctx.alias_decls[i].node);
             if (a.def.equals(d)) { return a; }
         }
         return null;

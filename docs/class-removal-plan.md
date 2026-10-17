@@ -1466,6 +1466,26 @@ committed with the change and deleted in the next commit.
   each one refuse.  verify `--require-identical` 0 moved; `--ast`
   identical (the dump does not read the registry; the control is the
   alias label).
+- `TypeAlias(TypeAliasDecl*)` followed.  The places that hold an alias
+  as an `ASTNode*` without a dispatch of their own (the generic
+  registry's template node, the context's alias list, bindgen's
+  generator and importer, the monomorphizer's definition stamp, the
+  type-declaration and template registration scans, type resolution's
+  alias phase, default expansion) ask `DeclarationNode::alias_of`, a
+  bridge helper like `extern_of`.  Name resolution declares an alias in
+  its `DeclKind::TypeAlias` arm, as it did in the `NodeKind` arm, at the
+  header's span.  The cloner copies the name, the parameters and the
+  target, and leaves the definition for whoever places the copy, as
+  before.  Only six dumps of the population carry an alias (a refused
+  negative file prints none), so the comparison also ran over a probe
+  declaring every alias form that compiles (documented, alias of an
+  alias, generic, of an instantiation used through a path, of an enum,
+  of a function type, of a pointer, of `Option`): identical, and a dumper
+  with the `TypeAliasDecl` label changed differs on it.  The probe found
+  three refusals of valid alias uses, the same on the parent: a call
+  through a function-type alias, an operator on a call returning an
+  alias, and a struct literal through a generic alias reported as a
+  mismatch instead of E0233.
 - Left: the type declarations and functions.
 - `NodeKind::is_declaration` answers true for `Declaration`.  A module
   declaration was outside its list; the two callers read `name_span`,
@@ -1759,4 +1779,4 @@ final audit greps for each name listed and expects none.
 | `Stmt` a class deriving from `ASTNode`, so an `ASTNode*` (a program item, a `for` initializer, the editor's node at a position) can hold a statement; the 21 `as Stmt*` casts from such handles, each behind a `NodeKind::Statement` test | `compiler/src/compiler/AST/statement.cryo` and the casts' files | slice 6 (statements) | the header becomes a struct when the "any node" handle is `Node`; the casts become `Node::Stmt(s)` arms |
 | `Stmt.shape`, the statement's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/statement.cryo` | slice 6 (statements) | renamed `kind` when the header stops deriving from `ASTNode` |
 | `DeclKind::Legacy` and every `match` arm for it; `DeclarationNode.shape` on a declaration whose kind is still a subclass; the `NodeKind`-per-kind dispatch for those kinds beside the `NodeKind::Declaration` arms | `compiler/src/compiler/AST/declaration.cryo` and every declaration consumer | slice 6 (declarations, `IntrinsicConst` and `Module`) | when the last declaration kind converts; then `shape` is renamed `kind` with the header's struct |
-| `DeclarationNode::with_shape`, `DeclarationNode::module_of`, `DeclarationNode::import_of` (instance, diagnostics, pass registry x3, language server semantic tokens) and `DeclarationNode::extern_of` (parser, bindgen, directive processing, language server outline), and the `as DeclarationNode*` casts behind a `NodeKind::Declaration` test (walker, cloner, sema, codegen, type resolution, name resolution x2, stamp check, directive processing, language server identity) | `compiler/src/compiler/AST/declaration.cryo` and those files | slice 6 (declarations) | the casts become `Node::Decl(d)` arms when the "any node" handle is `Node`; `module_of`, `import_of` and `extern_of` then match on `Node` |
+| `DeclarationNode::with_shape`, `DeclarationNode::module_of`, `DeclarationNode::import_of` (instance, diagnostics, pass registry x3, language server semantic tokens), `DeclarationNode::extern_of` (parser, bindgen, directive processing, language server outline) and `DeclarationNode::alias_of` (generic registry, type resolver, name resolution x2, bindgen generator x2 and importer, monomorphizer, pass registry x2, specialization, type resolution, default expansion), and the `as DeclarationNode*` casts behind a `NodeKind::Declaration` test (walker, cloner, sema, codegen, type resolution, name resolution x2, stamp check, directive processing, language server identity) | `compiler/src/compiler/AST/declaration.cryo` and those files | slice 6 (declarations) | the casts become `Node::Decl(d)` arms when the "any node" handle is `Node`; `module_of`, `import_of`, `extern_of` and `alias_of` then match on `Node` |
