@@ -12,7 +12,7 @@
 # So the archive's own reason for existing was ungated.  It ships a stdlib and
 # the runtime tier archives because without them, in build-release.sh's own
 # words, the compiler "cannot link ANY program" - it fails on an undefined
-# `__cryo_panic_at` - and a missing hosted CORE tier is worse than that: the link
+# `__cryo_panic` - and a missing hosted CORE tier is worse than that: the link
 # quietly omits `-Wl,-e,__cryo_entry` and the program goes back to starting at
 # crt0. Neither shows up in `--version`.
 #
@@ -49,7 +49,7 @@ CRYO="${STAGE}/bin/${EXE}"
 [ -f "$CRYO" ] || fail "no compiler at ${CRYO}"
 [ -d "${STAGE}/stdlib" ] || fail "the archive ships no stdlib/; nothing could compile"
 ls "${STAGE}"/lib/cryo/*/libcryort-*.a >/dev/null 2>&1 \
-    || fail "the archive ships no runtime tier archives; every link would fail on __cryo_panic_at"
+    || fail "the archive ships no runtime tier archives; every link would fail on __cryo_panic"
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/app/src"

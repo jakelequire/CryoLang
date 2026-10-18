@@ -182,7 +182,7 @@ def make_stages():
     return [
         # ------------------------------------------------------------------
         # Round 0: runtime tiers.  Every stage from stage-2 on emits a call to
-        # the external `__cryo_panic_at`, so LINKING those compilers needs a panic
+        # the external `__cryo_panic`, so LINKING those compilers needs a panic
         # tier archive; without this round the chain dies at stage-2 on an
         # undefined symbol.  Built by the pin (the only compiler that exists
         # yet) into `.bin/<triple>`, so this chain's archives and the windows
@@ -564,7 +564,7 @@ def make_windows_stages(runner: list, env: dict) -> list:
     sl, cm = ROOT / "stdlib", ROOT / "compiler"
     rt = ROOT / "runtime"
     # Runtime tiers first, for the same reason as the Linux chain: stage-2
-    # onwards link against `__cryo_panic_at`.  Built with the WINDOWS boot
+    # onwards link against `__cryo_panic`.  Built with the WINDOWS boot
     # compiler into `.bin/<its triple>`, so this chain's archives and the Linux
     # chain's occupy different directories and neither has to re-establish its
     # own after the other has run.

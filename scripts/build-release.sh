@@ -111,10 +111,10 @@ stage_runtime_tiers() {
     # $1 = staging dir, $2 = target triple to build the tiers for.
     #
     # HARD requirement, not an extra: codegen emits a call to the external
-    # `__cryo_panic_at` for every panic, and the definition comes from a panic tier
+    # `__cryo_panic` for every panic, and the definition comes from a panic tier
     # archive on the link line.  A distribution without these archives produces a
     # compiler that cannot link ANY program - it fails on an undefined
-    # `__cryo_panic_at`.  They go in lib/cryo/<triple>/, which is the
+    # `__cryo_panic`.  They go in lib/cryo/<triple>/, which is the
     # `<bindir>/../lib/cryo` candidate the tier locator already searches, under
     # the per-triple subdirectory it prefers.
     #

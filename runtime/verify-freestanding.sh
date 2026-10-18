@@ -5,7 +5,7 @@
 #
 #   core   — a user `main` returning N, linked against libcryort-core.a alone,
 #            exits with N (the entry round-trips main's return as exit code).
-#   panic  — a user `main` calling __cryo_panic_at, linked against the panic-abort
+#   panic  — a user `main` calling __cryo_panic, linked against the panic-abort
 #            tier + core, prints "panicked at ..." to stderr and exits 101.
 #
 #   Linux:   ELF, `-nostartfiles -nostdlib -static -Wl,--gc-sections`, entry `_start`, syscalls.
@@ -105,11 +105,11 @@ cat > "$WORK/panic.cryo" <<'APP'
 namespace RtVerifyApp;
 type struct Location { file: string; line: u32; column: u32; function: string; }
 extern "C" {
-    function __cryo_panic_at(msg: string, loc: Location*) -> never;
+    function __cryo_panic(msg: string, loc: Location*) -> never;
 }
 function main() -> int {
     mut loc: Location = Location { file: "verify.cryo", line: 42, column: 5, function: "RtVerifyApp::main" };
-    __cryo_panic_at("boom", &loc);
+    __cryo_panic("boom", &loc);
     return 0;
 }
 APP
@@ -291,7 +291,7 @@ APP
 # --- Linux -----------------------------------------------------------------
 run_linux() {
     # Hosted tier rebuilt too: the wipe takes it with the freestanding ones, and
-    # every hosted link needs it to resolve `__cryo_panic_at`.
+    # every hosted link needs it to resolve `__cryo_panic`.
     ( cd "$RT_DIR" && rm -rf .bin && "$CRYO" build >/dev/null )
     ( cd "$RT_DIR/hosted" && "$CRYO" build >/dev/null )
     local core_a="$RT_DIR/.bin/libcryort-core.a"
@@ -383,7 +383,7 @@ run_windows() {
     fi
     local tgt="x86_64-pc-windows-gnu"
     # The `rm -rf .bin` also removes the hosted abort tier, which lives in the
-    # same directory and which every HOSTED link needs to resolve `__cryo_panic_at`.
+    # same directory and which every HOSTED link needs to resolve `__cryo_panic`.
     # Rebuild it alongside so this gate leaves a tree that can still link an
     # ordinary program, not just a freestanding one.
     ( cd "$RT_DIR" && rm -rf .bin && "$CRYO" build --target="$tgt" --no-incremental >/dev/null )

@@ -1,15 +1,15 @@
 ///! runtime/panic/abort — the abort panic strategy.
 ///!
-///! Defines the panic funnel `__cryo_panic_at` (see `../../abi/lang_items.def`):
+///! Defines the panic funnel `__cryo_panic` (see `../../abi/lang_items.def`):
 ///! write "panicked at <file>:<line>:<column> in <function>: <msg>" to stderr,
 ///! then terminate (exit code 101). This tier is the abort strategy; the
 ///! `panic/unwind` tier defines the same symbol to unwind instead, chosen at
 ///! link time — callers never change.
 ///!
 ///! The four check handlers take raw operands plus a `Location`, format their
-///! own message into a stack buffer, and funnel through `__cryo_panic_at`.
+///! own message into a stack buffer, and funnel through `__cryo_panic`.
 ///! Nothing here assumes the abort strategy beyond the funnel it calls, so the
-///! unwind tier can redefine `__cryo_panic_at` unchanged.
+///! unwind tier can redefine `__cryo_panic` unchanged.
 ///!
 ///! Write/format/exit primitives come from the shared `CryoRt::Sys` module.
 ///!
@@ -26,9 +26,16 @@ import CryoRt::Sys;
 /// The single panic sink. Prints the report (`Sys::write_panic_report`) and
 /// terminates. `![no_mangle]` makes the source name the emitted symbol.
 ![no_mangle]
-function __cryo_panic_at(msg: string, loc: Sys::Location*) -> never {
+function __cryo_panic(msg: string, loc: Sys::Location*) -> never {
     Sys::write_panic_report(msg, loc);
     Sys::rt_exit(101);
+}
+
+/// The funnel's previous name, which a compiler built before the rename still
+/// calls.  Deleted once the pin emits `__cryo_panic`.
+![no_mangle]
+function __cryo_panic_at(msg: string, loc: Sys::Location*) -> never {
+    __cryo_panic(msg, loc);
 }
 
 // --- Unwind-surface stubs ---------------------------------------------------
@@ -96,7 +103,7 @@ function __cryo_panic_bounds_check(loc: Sys::Location*, index: u64, len: u64) ->
     Sys::append_cstr(&buf[0], &pos, " out of bounds for length ");
     Sys::append_u64(&buf[0], &pos, len);
     buf[pos] = 0;
-    __cryo_panic_at(&buf[0] as string, loc);
+    __cryo_panic(&buf[0] as string, loc);
 }
 
 /// Arithmetic overflow. `op` is a raw operation code (mapping pinned later);
@@ -112,17 +119,17 @@ function __cryo_panic_overflow(loc: Sys::Location*, op: u32, lhs: u64, rhs: u64)
     Sys::append_cstr(&buf[0], &pos, ", ");
     Sys::append_u64(&buf[0], &pos, rhs);
     buf[pos] = 0;
-    __cryo_panic_at(&buf[0] as string, loc);
+    __cryo_panic(&buf[0] as string, loc);
 }
 
 /// Division or remainder by zero (also the `INT_MIN / -1` case).
 ![no_mangle]
 function __cryo_panic_div_zero(loc: Sys::Location*) -> never {
-    __cryo_panic_at("attempt to divide by zero", loc);
+    __cryo_panic("attempt to divide by zero", loc);
 }
 
 /// Fell through a non-exhaustive match with no arm for the scrutinee.
 ![no_mangle]
 function __cryo_panic_no_match(loc: Sys::Location*) -> never {
-    __cryo_panic_at("no matching pattern (non-exhaustive match)", loc);
+    __cryo_panic("no matching pattern (non-exhaustive match)", loc);
 }
