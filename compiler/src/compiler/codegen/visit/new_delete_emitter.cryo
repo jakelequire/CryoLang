@@ -39,7 +39,7 @@ import std::collections::pair;
 import std::collections::pair::{ Pair };
 import std::fmt;
 import compiler::ast::expression::{
-    CallExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
+    CallExprNode, DeleteExpr, ExpressionNode, FieldInit, IdentifierNode,
     MemberAccessNode, NewExprNode, StructLiteralNode, UnaryExprNode
 };
 import compiler::lex;
@@ -481,8 +481,9 @@ type struct NewDeleteEmitter {
 
     // delete ptr
 
-    emit_delete(mut &this, visitor: IRGeneratorVisitor*, node: DeleteExprNode*) -> Emitted {
+    emit_delete(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: DeleteExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
+        const span: SourceSpan = e.span;
         // `delete ptr` is the manual-memory dual of an end-of-scope drop:
         //   1. Release the pointee as a scope exit releases a value of its
         //      type: its destructor, if it has one, then its owned fields.
@@ -517,7 +518,7 @@ type struct NewDeleteEmitter {
         if (pointee.is_valid()) {
             const alloc_block: ImplBlock* = this.allocator_of(pointee);
             if (alloc_block != null) {
-                release_fn = this.allocator_method(alloc_block, LangItem::AllocateRelease, node.span);
+                release_fn = this.allocator_method(alloc_block, LangItem::AllocateRelease, span);
                 if (!release_fn.is_valid()) {
                     out.value = LValue::null();
                     out.is_lvalue = false;
@@ -565,23 +566,23 @@ type struct NewDeleteEmitter {
             this.cg.values.bind_transient(recv_bind, slot);
 
             const drop_sym: SymbolStr = intern_ptr.intern("drop");
-            mut recv: IdentifierNode* = new IdentifierNode(recv_sym, node.span);
+            mut recv: IdentifierNode* = new IdentifierNode(recv_sym, span);
             recv.set_res(Res::Local(recv_bind));
             recv.set_resolved_type(node.operand.resolved_type);
             const deref_tok: Token = Token::new(TokenType::Star, "*",
-                node.span.start_line as int, node.span.start_col as int);
+                span.start_line as int, span.start_col as int);
             mut target: UnaryExprNode* = new UnaryExprNode(
-                deref_tok, recv as ExpressionNode*, node.span);
+                deref_tok, recv as ExpressionNode*, span);
             target.is_synthetic = true;
             target.set_resolved_type(pointee);
             mut member: MemberAccessNode* = new MemberAccessNode(
-                target as ExpressionNode*, drop_sym, node.span, node.span);
+                target as ExpressionNode*, drop_sym, span, span);
             member.set_resolved_type(TypeRef::invalid());
             mut call: CallExprNode* = new CallExprNode(
-                member as ExpressionNode*, node.span);
+                member as ExpressionNode*, span);
             this.cg.bind_destructor_call(call);
             mut stmt: Stmt* = Stmt::expr_stmt(
-                call as ExpressionNode*, node.span);
+                call as ExpressionNode*, span);
             visitor.dispatch_node(stmt);
 
             this.cg.values.remove(recv_bind);
@@ -614,7 +615,7 @@ type struct NewDeleteEmitter {
                 LType::const_int(LType::i64(), del_align, false), TypeRef::invalid()));
             this.cg.expr_ops.codegen_call(release_fn, rel_ty, rel_args, "");
         } else {
-            this.cg.expr_ops.emit_raw_dealloc(ptr, del_align, node.span);
+            this.cg.expr_ops.emit_raw_dealloc(ptr, del_align, span);
         }
         out.value = LValue::null();
         out.is_lvalue = false;
