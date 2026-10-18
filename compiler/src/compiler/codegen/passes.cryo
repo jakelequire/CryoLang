@@ -104,11 +104,10 @@ type struct LinkerConfig {
     ///     the cryo compiler itself needs (libLLVM-20 is C++); ordinary
     ///     cryo programs don't reference it but the symbol set is a no-op
     ///     so keeping it on the host line costs nothing.
-    ///   - x86_64 windows-gnu: `x86_64-w64-mingw32-gcc -lm`, `.exe` suffix,
-    ///     archive no.  mingw-w64 ships its own libc/libm equivalents; no
-    ///     C++ runtime to pull in for cross-compiled cryo programs (the
-    ///     compiler binary itself isn't cross-compilable yet - it links
-    ///     libLLVM, which has no Windows-gnu shim in this checkout).
+    ///   - x86_64 windows-gnu: the driver `windows_gnu_link_driver` names
+    ///     (clang + lld on a POSIX host), `-lm`, `.exe` suffix, archive no.
+    ///     mingw-w64 ships its own libc/libm equivalents; no C++ runtime to
+    ///     pull in for cross-compiled cryo programs.
     ///   - anything else (aarch64, riscv, windows-msvc, ...): unsupported;
     ///     `run_linking` falls back to the object-files-only bailout that
     ///     prints a manual-link hint.
@@ -130,7 +129,7 @@ type struct LinkerConfig {
                 && triple.contains("gnu")
                 && triple.contains("x86_64")) {
             return LinkerConfig {
-                driver:             CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc"),
+                driver:             LinkerConfig::windows_gnu_link_driver(),
                 // `-lws2_32` for std::net (Winsock) and `-lntdll` for the
                 // async reactor (its readiness backend polls `\Device\Afd`
                 // through the NT layer); mingw auto-links neither, the way it
@@ -181,6 +180,23 @@ type struct LinkerConfig {
             use_stdlib_archive: true,
             supported:          true,
         };
+    }
+
+    /// The driver a build for x86_64 windows-gnu links with when that is
+    /// not the host.  A POSIX-hosted compiler drives clang at the mingw
+    /// target with lld: binutils-mingw-w64's GNU ld (2.41 on Ubuntu 24.04)
+    /// places a base relocation over every thread-local's section-relative
+    /// offset, so once the loader moves the image the program faults on its
+    /// first thread-local access, and lld does not.  `CRYO_CC` overrides
+    /// either (`pick_link_driver`).
+    ![target(unix)]
+    static windows_gnu_link_driver() -> string {
+        return CodegenPasses::pick_link_driver("clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld");
+    }
+
+    ![target(windows)]
+    static windows_gnu_link_driver() -> string {
+        return CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc");
     }
 
     ![target(windows)]

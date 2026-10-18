@@ -4247,7 +4247,7 @@ target_triple = ""                  # cross-compile triple; empty => build for h
 stdlib_root   = ""                  # project-pinned stdlib root (see section 24.3)
 ```
 
-`target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`; for triples without a known toolchain (aarch64, riscv, windows-msvc, ...) the host link step is skipped and the object files are left for a manual link. The CLI `--target=TRIPLE` overrides it.
+`target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`: from a Linux host with `clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld` over the mingw-w64 sysroot (binutils' GNU ld for mingw relocates thread-local offsets, so a program it links faults on its first thread-local access once Windows moves the image), and the environment variable `CRYO_CC` names another driver; for triples without a known toolchain (aarch64, riscv, windows-msvc, ...) the host link step is skipped and the object files are left for a manual link. The CLI `--target=TRIPLE` overrides it.
 
 ### 24.2 `[compiler]`
 
