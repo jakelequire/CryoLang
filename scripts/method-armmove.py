@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
-"""Move each `NodeKind::FunctionDeclaration` arm into its match's
+"""Move each `NodeKind::MethodDeclaration` arm into its match's
 `Declaration` arm.
 
-One-off, for the function conversion: a function is built with
+One-off, for the method conversion (the method form of the function
+conversion's `fn-armmove.py`): a method is built with
 `NodeKind::Declaration` now, so an arm for its old kind is refused.  For
-each `file:line` given (the line an arm `NodeKind::FunctionDeclaration =>
-{` opens on), the arm is cut out and its body becomes the first arm,
-`DeclKind::Function(_) => { ... }`, of the `match (... .shape)` inside the
-same match's `NodeKind::Declaration` arm, re-indented to it.  The body is
-unchanged: it still reaches the function through the node it matched on,
-which is the declaration.  A match with no such `Declaration` arm is
-reported and left for a hand edit.
+each `file:line` given (the line an arm `NodeKind::MethodDeclaration =>`
+opens on - alone, or first in a `|` group of kinds sharing one body), the
+arm's body becomes the first arm, `DeclKind::Method(_) => { ... }`, of the
+`match (... .shape)` inside the same match's `NodeKind::Declaration` arm,
+re-indented to it, and the kind is cut from the old arm (the whole arm
+when it was alone).  The body is unchanged: it still reaches the method
+through the node it matched on, which is the declaration.  A match with
+no such `Declaration` arm is reported and left for a hand edit.
 
-usage: python scripts/fn-armmove.py FILE:LINE...   (paths relative to cwd)
+With `--noop`, each `file:line` is instead the line a `match (... .shape)`
+opens on that the type check calls non-exhaustive, in a match whose old
+`_` arm a method fell to and did nothing: `DeclKind::Method(_)` is added to
+the arm naming `DeclKind::Legacy`, when that arm's body is one of the no-op
+bodies (`{}`, `{ }`, `{ continue; }`, `{ DefId::invalid() }`).  Which
+matches qualify was read off each one's outer default by hand.
+
+usage: python scripts/method-armmove.py [--noop] FILE:LINE...   (paths relative to cwd)
 """
 import re
 import sys
@@ -35,30 +44,56 @@ def line_start(src, i):
     return src.rfind("\n", 0, i) + 1
 
 
+noop = "--noop" in sys.argv[1:]
 sites = {}
 for arg in sys.argv[1:]:
+    if arg == "--noop":
+        continue
     path, line = arg.rsplit(":", 1)
     sites.setdefault(path, []).append(int(line))
+
+NOOP_BODY = re.compile(r"\{\s*(?:continue;|DefId::invalid\(\))?\s*\}")
+
+if noop:
+    for path, lines in sites.items():
+        with open(path, encoding="utf-8", newline="") as h:
+            src = h.read()
+        for line in sorted(lines, reverse=True):
+            starts = [0]
+            for m in re.finditer("\n", src):
+                starts.append(m.end())
+            at = starts[line - 1]
+            o = src.find("{", src.find("match", at))
+            e = block_end(src, o)
+            k = src.find("DeclKind::Legacy", o, e)
+            arrow = src.find("=>", k, e) if k >= 0 else -1
+            body = re.compile(r"\s*(\{[^{}]*\})").match(src, arrow + 2) if arrow >= 0 else None
+            if not body or not NOOP_BODY.fullmatch(body.group(1)) or "DeclKind::Method" in src[o:e]:
+                print(f"{path}:{line}: Legacy arm is not a no-op here, left for hand edit")
+                continue
+            src = src[:k] + "DeclKind::Method(_) | " + src[k:]
+            print(f"{path}:{line}: no-op Method arm")
+        with open(path, "w", encoding="utf-8", newline="") as h:
+            h.write(src)
+    sys.exit(0)
 
 for path, lines in sites.items():
     with open(path, encoding="utf-8", newline="") as h:
         src = h.read()
     nl = "\r\n" if "\r\n" in src else "\n"
-    # bottom-up so earlier offsets stay valid
     for line in sorted(lines, reverse=True):
         starts = [0]
         for m in re.finditer("\n", src):
             starts.append(m.end())
         at = starts[line - 1]
-        m = re.compile(r"[ \t]*NodeKind::FunctionDeclaration\s*=>\s*\{").match(src, at)
+        m = re.compile(r"[ \t]*NodeKind::MethodDeclaration\s*=>\s*\{").match(src, at)
         if not m:
-            print(f"{path}:{line}: no arm here")
+            print(f"{path}:{line}: not a lone arm here, left for hand edit")
             continue
         arm_ind = re.match(r"[ \t]*", src[at:]).group(0)
         ob = m.end() - 1
         cb = block_end(src, ob)
         body = src[ob:cb + 1]
-        # the enclosing match: the nearest `match (` above whose block holds the arm
         k = at
         enclosing = None
         while True:
@@ -87,10 +122,8 @@ for path, lines in sites.items():
         shift = len(inner_ind) - len(arm_ind)
         moved_lines = body.split(nl)
         moved = [moved_lines[0]] + [(" " * shift + l) if l.strip() else l for l in moved_lines[1:]]
-        new_arm = inner_ind + "DeclKind::Function(_) => " + nl.join(moved) + nl
+        new_arm = inner_ind + "DeclKind::Method(_) => " + nl.join(moved) + nl
         ins = line_start(src, first.end() - 1)
-        # cut the old arm (with its line), then insert (the insertion point
-        # is below the cut only if the Declaration arm follows it)
         cut_from = at
         cut_to = cb + 1
         if src[cut_to:cut_to + len(nl)] == nl:

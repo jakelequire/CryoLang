@@ -17,7 +17,7 @@ import compiler::ast::{ NodeKind };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, FunctionDecl, ImplBlock, MethodNode,
+    ClassDeclNode, DeclarationNode, DeclKind, FunctionDecl, ImplBlock, MethodDecl,
     StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::diag::source_span::{ SourceSpan };
@@ -92,8 +92,9 @@ type struct Outline {
         if (DeclarationNode::fn_of(n) != null && DeclarationNode::fn_of(n).is_specialization) {
             return false;
         }
-        if (n.kind == NodeKind::MethodDeclaration) {
-            const m: MethodNode* = n as MethodNode*;
+        if (DeclarationNode::method_of(n) != null) {
+            const m_decl: DeclarationNode* = DeclarationNode::with_shape(n);
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m.func != null && DeclarationNode::fn_of(m.func).is_specialization) { return false; }
         }
         return n.span.file.eq(this.file);
@@ -175,7 +176,7 @@ type struct Outline {
                     DeclKind::Import(_) | DeclKind::Intrinsic(_)
                     | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
                     | DeclKind::TypeAlias(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
-                    | DeclKind::Variable(_) | DeclKind::Function(_) | DeclKind::Legacy => { }
+                    | DeclKind::Variable(_) | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                 }
             }
             _ => { }
@@ -211,6 +212,7 @@ type struct Outline {
             NodeKind::ClassDeclaration     => { 5 }
             NodeKind::Declaration          => {
                 match ((n as DeclarationNode*).shape) {
+                    DeclKind::Method(_) => { 6 }
                     DeclKind::Function(_) => { 12 }
                     DeclKind::Trait(_)     => { 11 }
                     DeclKind::TypeAlias(_) => { 26 }
@@ -230,7 +232,6 @@ type struct Outline {
                     | DeclKind::Destructure(_) | DeclKind::GenericParam(_) | DeclKind::Legacy => { 0 }
                 }
             }
-            NodeKind::MethodDeclaration    => { 6 }
             _                              => { 0 }
         };
     }
@@ -242,6 +243,12 @@ type struct Outline {
             NodeKind::ClassDeclaration     => { return this.text((n as ClassDeclNode*).name); }
             NodeKind::Declaration          => {
                 match ((n as DeclarationNode*).shape) {
+                    DeclKind::Method(_) => {
+                        const m_decl: DeclarationNode* = DeclarationNode::with_shape(n);
+                        const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+                        if (m.func == null) { return ""; }
+                        return this.text(DeclarationNode::fn_of(m.func).name);
+                    }
                     DeclKind::Function(_) => { return this.text(DeclarationNode::fn_of(n).name); }
                     DeclKind::Trait(t)     => { return this.text(t.name); }
                     DeclKind::TypeAlias(a) => { return this.text(a.alias_name); }
@@ -258,11 +265,6 @@ type struct Outline {
                     | DeclKind::Destructure(_) | DeclKind::GenericParam(_) | DeclKind::Legacy => { return ""; }
                 }
             }
-            NodeKind::MethodDeclaration    => {
-                const m: MethodNode* = n as MethodNode*;
-                if (m.func == null) { return ""; }
-                return this.text(DeclarationNode::fn_of(m.func).name);
-            }
             _                              => { return ""; }
         }
     }
@@ -275,8 +277,9 @@ type struct Outline {
     /// Where a declaration's name is written; its whole span when it has
     /// no name.
     name_span(&this, n: ASTNode*) -> SourceSpan {
-        if (n.kind == NodeKind::MethodDeclaration) {
-            const m: MethodNode* = n as MethodNode*;
+        if (DeclarationNode::method_of(n) != null) {
+            const m_decl: DeclarationNode* = DeclarationNode::with_shape(n);
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m.func != null && m.func.name_span.start_line != 0) { return m.func.name_span; }
             return n.span;
         }
@@ -297,8 +300,9 @@ type struct Outline {
     whole_span(&this, n: ASTNode*) -> SourceSpan {
         mut s: SourceSpan = n.span;
         Outline::widen(&s, this.name_span(n));
-        if (n.kind == NodeKind::MethodDeclaration) {
-            const m: MethodNode* = n as MethodNode*;
+        if (DeclarationNode::method_of(n) != null) {
+            const m_decl: DeclarationNode* = DeclarationNode::with_shape(n);
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m.func != null && DeclarationNode::fn_of(m.func).body != null) { Outline::widen(&s, DeclarationNode::fn_of(m.func).body.span); }
         } else if (DeclarationNode::fn_of(n) != null) {
             const f_decl: DeclarationNode* = DeclarationNode::with_shape(n);

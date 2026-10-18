@@ -51,7 +51,7 @@ import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDecl, EnumDecl,
     EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl,
-    DeclKind, ImplBlock, MethodNode, StructDecl,
+    DeclKind, ImplBlock, MethodDecl, StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -403,7 +403,8 @@ type struct TypeResolutionRunner {
         }
 
         for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
-            const m: MethodNode* = impl_node.methods[mi];
+            const m_decl: DeclarationNode* = impl_node.methods[mi];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null || DeclarationNode::fn_of(m.func).is_synth_default || m.spec_of != null) { continue; }
             const name: string = intern.resolve(DeclarationNode::fn_of(m.func).name);
             const slot: i64 = this.ctx.generic_registry.trait_item_slot(trait_id, DeclarationNode::fn_of(m.func).name);
@@ -427,14 +428,15 @@ type struct TypeResolutionRunner {
                                     this.arena.create_generic_param(fg.sym_id, fg.name, gi as u64));
                 }
             }
-            this.check_method_conformance(tm_decl, m, &terms, name, trait_name);
+            this.check_method_conformance(tm_decl, m_decl, &terms, name, trait_name);
         }
     }
 
     /// One written method `m` against the trait's declaration `tm` of it,
     /// read in `terms` (above).
-    check_method_conformance(&this, tm_decl: DeclarationNode*, m: MethodNode*, terms: &ImplTerms,
+    check_method_conformance(&this, tm_decl: DeclarationNode*, m_decl: DeclarationNode*, terms: &ImplTerms,
                              name: string, trait_name: string) -> void {
+        const m: MethodDecl* = DeclarationNode::method_of(m_decl);
         const tm: FunctionDecl* = DeclarationNode::fn_of(tm_decl);
         const f_decl: DeclarationNode* = m.func;
         const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
@@ -788,9 +790,10 @@ type struct TypeResolutionRunner {
     }
 
     /// `emit_signature_diagnostics` over a struct/union/class/impl method list.
-    emit_method_signature_diagnostics(&this, methods: &[MethodNode*]) -> void {
+    emit_method_signature_diagnostics(&this, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
+            const method_decl: DeclarationNode* = methods[i];
+            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null) { continue; }
             this.emit_signature_diagnostics(method.func);
         }
@@ -825,10 +828,10 @@ type struct TypeResolutionRunner {
         }
     }
 
-    /// Resolves all method signatures ([MethodNode*]) on a struct/class/impl.
+    /// Resolves all method signatures ([DeclarationNode*]) on a struct/class/impl.
     /// `owner_type` lets the resolver back-fill `this`/`&this` resolved_type
     /// (the parser leaves the receiver param's type unset).
-    resolve_method_signatures(&this, methods: &[MethodNode*],
+    resolve_method_signatures(&this, methods: &[DeclarationNode*],
                               res_ctx: ResolutionContext*,
                               owner_type: TypeRef,
                               owner_def: DefId,
@@ -870,7 +873,7 @@ type struct TypeResolutionRunner {
     /// so the receiver back-fill in `Resolver::resolve_method_signatures`
     /// runs.  Idempotent for already-resolved return/param types.
     resolve_inline_method_signatures(&this, owner: DefId,
-                                     methods: &[MethodNode*],
+                                     methods: &[DeclarationNode*],
                                      generic_params: &[DeclarationNode*],
                                      res_ctx: ResolutionContext*) -> void {
         const owner_ty: TypeRef = this.ctx.decl_index.type_of_def(owner);
@@ -1417,7 +1420,7 @@ type struct TypeResolutionPasses {
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
                         | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
-                        | DeclKind::Function(_) | DeclKind::Legacy => { }
+                        | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                     }
                 }
                 _ => { }
@@ -1510,7 +1513,7 @@ type struct TypeResolutionPasses {
                     DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                     | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                     | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
             }
             _ => {}
@@ -1559,7 +1562,8 @@ type struct TypeResolutionPasses {
                 // from the registry's bare leaf key.
                 node.trait_def = ot_def;
                 for (mut omi: i64 = 0; omi < node.methods.length; omi++) {
-                    const om: MethodNode* = node.methods[omi];
+                    const om_decl: DeclarationNode* = node.methods[omi];
+                    const om: MethodDecl* = DeclarationNode::method_of(om_decl);
                     if (om != null && om.func != null) {
                         DeclarationNode::fn_of(om.func).set_origin_trait(ot_def);
                     }
@@ -1674,7 +1678,7 @@ type struct TypeResolutionPasses {
     // When an impl block names a trait and the trait declares a default body
     // for some method, the impl inherits that default unless it overrides.
     // This helper clones every default-bodied trait method that the impl
-    // doesn't override and adds it as a MethodNode on the impl. The clone
+    // doesn't override and adds it as a MethodDecl on the impl. The clone
     // goes through the rest of FunctionSignature/TypeResolution/Sema in the
     // same loop, picking up the impl's `this_type` (= owner_type) so any
     // `This` annotations in the body resolve to the impl target.
@@ -2123,7 +2127,8 @@ type struct TypeResolutionPasses {
             // (its position among the trait's methods, by the trait-method door)
             const item: i64 = ctx.generic_registry.trait_item_slot(trait_decl.def, tfunc.name);
             for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
-                const m: MethodNode* = impl_node.methods[mi];
+                const m_decl: DeclarationNode* = impl_node.methods[mi];
+                const m: MethodDecl* = DeclarationNode::method_of(m_decl);
                 if (m == null || m.func == null) { continue; }
                 if (item >= 0 && ctx.generic_registry.trait_item_slot(trait_decl.def, DeclarationNode::fn_of(m.func).name) == item && DeclarationNode::fn_of(m.func).is_async) { return true; }
             }
@@ -2630,9 +2635,10 @@ type struct TypeResolutionPasses {
             TypeResolutionPasses::rewrite_default_method_signature(
                 cloned_decl, impl_node.target_type, impl_node.target_args,
                 trait_param_syms, args_ref, this_home_span, impl_node.res);
-            mut method: MethodNode* = new MethodNode(cloned_decl, cloned_decl.span);
+            mut method: MethodDecl* = MethodDecl::new(cloned_decl);
+            const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), cloned_decl.span);
             method.set_static(cloned.is_static);
-            impl_node.methods.push(method);
+            impl_node.methods.push(method_decl);
             synthesized += 1;
         }
 
@@ -2700,7 +2706,8 @@ type struct TypeResolutionPasses {
         // (resolve_method_overload) can pick the right overload for struct
         // methods; structs are dispatched statically rather than via vtable.
         for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
-            const mnode: MethodNode* = node.methods[jm];
+            const mnode_decl: DeclarationNode* = node.methods[jm];
+            const mnode: MethodDecl* = DeclarationNode::method_of(mnode_decl);
             if (mnode == null || mnode.func == null) { continue; }
             const fn_node_decl: DeclarationNode* = mnode.func;
             const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
@@ -2723,7 +2730,7 @@ type struct TypeResolutionPasses {
                 is_virtual:    mnode.is_virtual,
                 is_override:   mnode.is_override,
                 param_types:   ptypes,
-                ast_node:      mnode as void*,
+                ast_node:      mnode_decl as void*,
             };
             st.add_method(minfo);
         }
@@ -2753,7 +2760,8 @@ type struct TypeResolutionPasses {
         const tgt_t: Type* = arena.lookup(tgt);
         if (tgt_t == null) { return; }
         for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
-            const mnode: MethodNode* = node.methods[mi];
+            const mnode_decl: DeclarationNode* = node.methods[mi];
+            const mnode: MethodDecl* = DeclarationNode::method_of(mnode_decl);
             if (mnode == null || mnode.func == null) { continue; }
             const fn_node_decl: DeclarationNode* = mnode.func;
             const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
@@ -2785,7 +2793,7 @@ type struct TypeResolutionPasses {
                     is_virtual:    mnode.is_virtual,
                     is_override:   mnode.is_override,
                     param_types:   ptypes,
-                    ast_node:      mnode as void*,
+                    ast_node:      mnode_decl as void*,
                 };
                 if (tgt_t.kind == TypeKind::Struct) {
                     mut tst: StructType* = tgt_t.as_struct();
@@ -2842,7 +2850,8 @@ type struct TypeResolutionPasses {
         st.set_fields(field_infos);
 
         for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
-            const mnode: MethodNode* = node.methods[jm];
+            const mnode_decl: DeclarationNode* = node.methods[jm];
+            const mnode: MethodDecl* = DeclarationNode::method_of(mnode_decl);
             if (mnode == null || mnode.func == null) { continue; }
             const fn_node_decl: DeclarationNode* = mnode.func;
             const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
@@ -2865,7 +2874,7 @@ type struct TypeResolutionPasses {
                 is_virtual:    mnode.is_virtual,
                 is_override:   mnode.is_override,
                 param_types:   ptypes,
-                ast_node:      mnode as void*,
+                ast_node:      mnode_decl as void*,
             };
             st.add_method(minfo);
         }
@@ -2887,7 +2896,8 @@ type struct TypeResolutionPasses {
         cdebug("[FuncSig] impl block: target='%s' methods.length=%lld node=%p\n",
                _tgt, node.methods.length, node);
         for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
-            const _m: MethodNode* = node.methods[mi];
+            const _m_decl: DeclarationNode* = node.methods[mi];
+            const _m: MethodDecl* = DeclarationNode::method_of(_m_decl);
             if (_m == null) {
                 cdebug("[FuncSig]   method[%lld]=NULL\n", mi);
             } else {
@@ -3270,7 +3280,7 @@ type struct TypeResolutionPasses {
                         DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Variant(_)
                         | DeclKind::Destructure(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
                         | DeclKind::GenericParam(_) | DeclKind::Enum(_) | DeclKind::Variable(_)
-                        | DeclKind::Legacy => {}
+                        | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {
@@ -3446,7 +3456,7 @@ type struct TypeResolutionPasses {
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
                         | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
-                        | DeclKind::Function(_) | DeclKind::Legacy => {}
+                        | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {
@@ -3472,7 +3482,8 @@ type struct TypeResolutionPasses {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (!node.is_generic()) {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
-                            const method: MethodNode* = node.methods[j];
+                            const method_decl: DeclarationNode* = node.methods[j];
+                            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                             if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                 mut m_ctx: ResolutionContext = runner.make_generic_context(
                                     DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
@@ -3496,7 +3507,8 @@ type struct TypeResolutionPasses {
                         DeclKind::Struct(node) => {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method: MethodNode* = node.methods[j];
+                                    const method_decl: DeclarationNode* = node.methods[j];
+                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                                     if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                         // Method-level generics (`Layout::array<T>(n)`)
                                         // must be in scope when the walker reaches a
@@ -3516,7 +3528,8 @@ type struct TypeResolutionPasses {
                         DeclKind::Union(node) => {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method: MethodNode* = node.methods[j];
+                                    const method_decl: DeclarationNode* = node.methods[j];
+                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                                     if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                         mut m_ctx: ResolutionContext = runner.make_generic_context(
                                             DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
@@ -3559,7 +3572,8 @@ type struct TypeResolutionPasses {
                                     node.generic_params, &runner.res_ctx);
                                 runner.bind_trait_args_for_impl(node, &impl_ctx);
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method: MethodNode* = node.methods[j];
+                                    const method_decl: DeclarationNode* = node.methods[j];
+                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                                     if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                         mut m_ctx: ResolutionContext = runner.make_generic_context(
                                             DeclarationNode::fn_of(method.func).generic_params, &impl_ctx);
@@ -3573,7 +3587,7 @@ type struct TypeResolutionPasses {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -3597,7 +3611,8 @@ type struct TypeResolutionPasses {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (!node.is_generic()) {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
-                            const method: MethodNode* = node.methods[j];
+                            const method_decl: DeclarationNode* = node.methods[j];
+                            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                             if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                 runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
                             }
@@ -3616,7 +3631,8 @@ type struct TypeResolutionPasses {
                         DeclKind::Impl(node) => {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method: MethodNode* = node.methods[j];
+                                    const method_decl: DeclarationNode* = node.methods[j];
+                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                                     if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                         runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
                                     }
@@ -3626,7 +3642,8 @@ type struct TypeResolutionPasses {
                         DeclKind::Struct(node) => {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method: MethodNode* = node.methods[j];
+                                    const method_decl: DeclarationNode* = node.methods[j];
+                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                                     if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                         runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
                                     }
@@ -3636,7 +3653,8 @@ type struct TypeResolutionPasses {
                         DeclKind::Union(node) => {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method: MethodNode* = node.methods[j];
+                                    const method_decl: DeclarationNode* = node.methods[j];
+                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                                     if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                         runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
                                     }
@@ -3646,7 +3664,7 @@ type struct TypeResolutionPasses {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -3853,7 +3871,8 @@ type struct TypeResolutionPasses {
                     // vtable pointer and polymorphic calls never dispatch
                     // through one.
                     for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
-                        const mnode: MethodNode* = node.methods[jm];
+                        const mnode_decl: DeclarationNode* = node.methods[jm];
+                        const mnode: MethodDecl* = DeclarationNode::method_of(mnode_decl);
                         if (mnode == null || mnode.func == null) { continue; }
                         const fn_node_decl: DeclarationNode* = mnode.func;
                         const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
@@ -3881,7 +3900,7 @@ type struct TypeResolutionPasses {
                             is_virtual:    mnode.is_virtual,
                             is_override:   mnode.is_override,
                             param_types:   ptypes,
-                            ast_node:      mnode as void*,
+                            ast_node:      mnode_decl as void*,
                         };
                         ct.add_method(minfo);
                         const dbg_cname: string = ctx.intern_table.resolve(node.name);
@@ -3946,7 +3965,7 @@ type struct TypeResolutionPasses {
                         | DeclKind::GenericParam(_) | DeclKind::Import(_) | DeclKind::Intrinsic(_)
                         | DeclKind::Module(_) | DeclKind::Trait(_) | DeclKind::TypeAlias(_)
                         | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Function(_)
-                        | DeclKind::Legacy => { continue; }
+                        | DeclKind::Method(_) | DeclKind::Legacy => { continue; }
                     }
                     const node: EnumDecl* = DeclarationNode::enum_of(stmt);
 

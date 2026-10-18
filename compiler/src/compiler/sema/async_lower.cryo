@@ -58,7 +58,7 @@ import compiler::types::generic::{
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, DestructureBinding, DestructureDecl, FieldDecl, FunctionDecl,
-    GenericParamDecl, ImplBlock, MethodNode, ReceiverForm, StructDecl, TraitDecl,
+    GenericParamDecl, ImplBlock, MethodDecl, ReceiverForm, StructDecl, TraitDecl,
     VarDecl
 };
 import compiler::ast::expression::{
@@ -276,7 +276,7 @@ type struct BindingCapture {
 /// receiver, which the body reads as a bare `this`.
 type struct AsyncOwner {
     /// Null for a free function.
-    method:       MethodNode*;
+    method:       DeclarationNode*;
     /// The owner type as the method body sees `this`: the type itself, or
     /// the template instantiated over its own parameters for a generic
     /// owner.
@@ -341,7 +341,7 @@ type struct AsyncDecl {
     // Null when this is a free function. Non-null makes `lower` capture the
     // receiver and skip the free-function overload rebuild, which a method has
     // no counterpart to.
-    method:      MethodNode*;
+    method:      DeclarationNode*;
     // The future field holding the receiver, invalid when there is none (a
     // free function or a `static` method). Named with a `$` so no user field
     // can collide with it.
@@ -368,7 +368,7 @@ type struct AsyncDecl {
     struct_decl: DeclarationNode*;
     impl_node:   DeclarationNode*;
     poll_fn:     DeclarationNode*;
-    poll_method: MethodNode*;
+    poll_method: DeclarationNode*;
 }
 
 type struct AsyncLower {
@@ -7326,8 +7326,8 @@ type struct AsyncLower {
     /// the generic parameters the owner contributes to the future, and the
     /// declaration-index keys the method's signature is registered under.
     declare_method(mut &this, owner: AsyncOwner) -> boolean {
-        if (owner.method == null || owner.method.func == null) { return false; }
-        return this.declare_in(owner.method.func, owner);
+        if (owner.method == null || DeclarationNode::method_of(owner.method).func == null) { return false; }
+        return this.declare_in(DeclarationNode::method_of(owner.method).func, owner);
     }
 
     declare_in(mut &this, node_decl: DeclarationNode*, owner: AsyncOwner) -> boolean {
@@ -7426,7 +7426,7 @@ type struct AsyncLower {
         // written or synthesized by the parser.
         mut recv_field: SymbolStr = SymbolStr::empty();
         mut recv_ptr: boolean = false;
-        if (owner.method != null && !owner.method.is_static && owner.ty.is_valid()) {
+        if (owner.method != null && !DeclarationNode::method_of(owner.method).is_static && owner.ty.is_valid()) {
             mut recv: VarDecl* = null;
             for (mut i: i64 = 0; i < node.parameters.length; i++) {
                 const p: VarDecl* = DeclarationNode::var_of(node.parameters[i]);
@@ -7557,9 +7557,10 @@ type struct AsyncLower {
         }
         poll_fn.add_parameter(cx_param_decl);
 
-        mut poll_method: MethodNode* = new MethodNode(poll_fn_decl, span);
+        mut poll_method: MethodDecl* = MethodDecl::new(poll_fn_decl);
+        const poll_method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(poll_method), span);
         poll_fn.def = this.ctx.define_method(fut_def, poll_fn.name, span,
-            poll_method as ASTNode*);
+            poll_method_decl as ASTNode*);
         poll_method.set_visibility(Visibility::Public);
         poll_method.set_static(false);
         poll_method.set_sink(false);
@@ -7579,7 +7580,7 @@ type struct AsyncLower {
                 is_virtual:    false,
                 is_override:   false,
                 param_types:   poll_param_types,
-                ast_node:      poll_method as void*,
+                ast_node:      poll_method_decl as void*,
             };
             st.add_method(minfo);
         }
@@ -7600,7 +7601,7 @@ type struct AsyncLower {
         impl_node.trait_annotation = new TypeAnnotation::Generic(gen);
         impl_node.trait_def = future_id;
         impl_node.add_assoc_binding(this.intern.intern("Output"), this.output_type_ann(&d, span));
-        impl_node.methods.push(poll_method);
+        impl_node.methods.push(poll_method_decl);
         if (generic) {
             for (mut gi: i64 = 0; gi < d.fut_params.length; gi++) {
                 impl_node.generic_params.push(d.fut_params[gi]);
@@ -7617,7 +7618,7 @@ type struct AsyncLower {
         this.bind_async_trait_assoc(&owner, node_decl, this.future_type_ann(&d, span));
 
         // Register the struct's method + trait impl.
-        mut method_arr: [MethodNode*] = [poll_method];
+        mut method_arr: [DeclarationNode*] = [poll_method_decl];
         this.ctx.decl_index.register_methods(
             struct_ref, method_arr, this.intern, this.arena, "async/future poll");
 
@@ -7645,7 +7646,7 @@ type struct AsyncLower {
         }
 
         d.poll_fn     = poll_fn_decl;
-        d.poll_method = poll_method;
+        d.poll_method = poll_method_decl;
         this.pending.push(d);
         if (generic) { this.arena.set_symbolic_no_demand(saved_no_demand); }
         return true;
@@ -7672,7 +7673,7 @@ type struct AsyncLower {
     /// under — a name is not unique across overloads. Mutated in place:
     /// `add_method` appends, so re-adding would leave two entries and make
     /// overload resolution depend on which one it reached first.
-    rebuild_method_info(mut &this, owner_ty: TypeRef, m: MethodNode*,
+    rebuild_method_info(mut &this, owner_ty: TypeRef, m_decl: DeclarationNode*,
                         node_decl: DeclarationNode*) -> void {
         const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         const t: Type* = this.arena.lookup(owner_ty);
@@ -7683,7 +7684,7 @@ type struct AsyncLower {
         if (t.kind == TypeKind::Struct) {
             mut st: StructType* = t.as_struct();
             for (mut i: i64 = 0; i < st.methods.length; i++) {
-                if (st.methods[i].ast_node != (m as void*)) { continue; }
+                if (st.methods[i].ast_node != (m_decl as void*)) { continue; }
                 st.methods[i].function_type = fn_ty;
                 return;
             }
@@ -7692,7 +7693,7 @@ type struct AsyncLower {
         if (t.kind == TypeKind::Class) {
             mut ct: ClassType* = t.as_class();
             for (mut i: i64 = 0; i < ct.methods.length; i++) {
-                if (ct.methods[i].ast_node != (m as void*)) { continue; }
+                if (ct.methods[i].ast_node != (m_decl as void*)) { continue; }
                 ct.methods[i].function_type = fn_ty;
                 return;
             }
@@ -7715,7 +7716,7 @@ type struct AsyncLower {
         const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         this.rebuild_method_info(owner.ty, owner.method, node_decl);
 
-        mut arr: [MethodNode*] = [owner.method];
+        mut arr: [DeclarationNode*] = [owner.method];
         this.ctx.decl_index.retire_entry(node.overload_entry);
         // A method written in an implement block returns a future generic
         // in the block's parameters; stored in the owner's, as the block's
@@ -7799,7 +7800,8 @@ type struct AsyncLower {
         const impl:      DeclarationNode*  = this.pending[pi].impl_node;
         const poll_fn_decl: DeclarationNode* = this.pending[pi].poll_fn;
         mut poll_fn:     FunctionDecl* = DeclarationNode::fn_of(poll_fn_decl);
-        const method:      MethodNode* = this.pending[pi].method;
+        const method_decl: DeclarationNode* = this.pending[pi].method;
+        const method:      MethodDecl* = DeclarationNode::method_of(method_decl);
         const recv_field:  SymbolStr   = this.pending[pi].recv_field;
         const span: SourceSpan = node_decl.span;
 

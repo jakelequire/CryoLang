@@ -52,7 +52,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDecl,
-    ImplBlock, IntrinsicDecl, MethodNode, StructDecl, UnionDecl, VarDecl
+    ImplBlock, IntrinsicDecl, MethodDecl, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::lex::{ TokenType };
@@ -246,7 +246,7 @@ type struct DeclarationEmitter {
                         | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
                         | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
                         | DeclKind::GenericParam(_) | DeclKind::Trait(_) | DeclKind::Variable(_)
-                        | DeclKind::Function(_) | DeclKind::Legacy => {}
+                        | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -347,7 +347,7 @@ type struct DeclarationEmitter {
                         DeclKind::Import(_) | DeclKind::Module(_)
                         | DeclKind::Variant(_) | DeclKind::Destructure(_) | DeclKind::TypeAlias(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Enum(_)
-                        | DeclKind::Trait(_) | DeclKind::Legacy => {}
+                        | DeclKind::Trait(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
                 }
                 NodeKind::ClassDeclaration => {
@@ -819,7 +819,8 @@ type struct DeclarationEmitter {
                 // must come from further up the chain, or the caller's
                 // `!impl.is_valid()` bail drops the whole vtable.
                 if (m.ast_node != null) {
-                    const mnode_ck: MethodNode* = m.ast_node as MethodNode*;
+                    const mnode_ck_decl: DeclarationNode* = DeclarationNode::with_shape(m.ast_node);
+                    const mnode_ck: MethodDecl* = DeclarationNode::method_of(mnode_ck_decl);
                     if (mnode_ck != null && mnode_ck.func != null && !DeclarationNode::fn_of(mnode_ck.func).has_body()) {
                         continue;
                     }
@@ -832,7 +833,8 @@ type struct DeclarationEmitter {
                 // is the slot's own.
                 mut slot_entry: OverloadId = OverloadId::invalid();
                 if (m.ast_node != null) {
-                    const smn: MethodNode* = m.ast_node as MethodNode*;
+                    const smn_decl: DeclarationNode* = DeclarationNode::with_shape(m.ast_node);
+                    const smn: MethodDecl* = DeclarationNode::method_of(smn_decl);
                     if (smn != null && smn.func != null) { slot_entry = DeclarationNode::fn_of(smn.func).overload_entry; }
                 }
                 return this.resolver.resolve_pinned(CalleePin::Decl(slot_entry));
@@ -921,14 +923,16 @@ type struct DeclarationEmitter {
     /// The LLVM symbol of a method's declaration: its registered entry's.
     /// Empty for a method the index never registered, which is then not
     /// emitted.
-    method_symbol(&this, node: MethodNode*) -> SymbolStr {
+    method_symbol(&this, node_decl: DeclarationNode*) -> SymbolStr {
+        const node: MethodDecl* = DeclarationNode::method_of(node_decl);
         return this.ctx.decl_index.entry_symbol(DeclarationNode::fn_of(node.func).overload_entry).spelling();
     }
 
     /// Declare a method.  Methods get a `this` pointer as the first parameter.
     /// `owner` is the type the method is on: an impl head's owner or a
     /// declaration's own type, never re-derived from a name here.
-    declare_method(mut &this, node: MethodNode*, owner: TypeRef) -> void {
+    declare_method(mut &this, node_decl: DeclarationNode*, owner: TypeRef) -> void {
+        const node: MethodDecl* = DeclarationNode::method_of(node_decl);
         const func_decl: DeclarationNode* = node.func;
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return; }
@@ -950,7 +954,7 @@ type struct DeclarationEmitter {
 
         // The symbol is the registered entry's: registration computed it
         // once from this node, and every caller's pin names the same entry.
-        const mangled_sym: SymbolStr = this.method_symbol(node);
+        const mangled_sym: SymbolStr = this.method_symbol(node_decl);
         if (!mangled_sym.is_valid()) { return; }
         // `![symbol("sym")]` overrides the LLVM symbol name ONLY (the C++ binding
         // generator uses it to pin a non-virtual C++ method to its mangled
@@ -2089,7 +2093,8 @@ type struct DeclarationEmitter {
 
     /// Generate function prologue for a method.  Prepends `this` parameter binding.
     /// `owner` as in `declare_method`; its display name serves the diagnostics.
-    codegen_method_prologue(mut &this, node: MethodNode*, owner: TypeRef) -> LValue {
+    codegen_method_prologue(mut &this, node_decl: DeclarationNode*, owner: TypeRef) -> LValue {
+        const node: MethodDecl* = DeclarationNode::method_of(node_decl);
         const func_decl: DeclarationNode* = node.func;
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return LValue::null(); }
@@ -2102,7 +2107,7 @@ type struct DeclarationEmitter {
 
         // The body attaches to the function `declare_method` made, held
         // under the entry's symbol - the one place both read it from.
-        const mangled_sym: SymbolStr = this.method_symbol(node);
+        const mangled_sym: SymbolStr = this.method_symbol(node_decl);
         const fn_val: LValue = this.functions.get(mangled_sym);
         if (!fn_val.is_valid()) {
             // declare_method should have produced an LLVM declare for this

@@ -43,7 +43,7 @@ import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDecl, EnumDecl, EnumVariant,
     ExternBlock, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock,
-    DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDecl,
+    DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodDecl, StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -90,7 +90,7 @@ type struct NameResolver {
     /// The method whose base-constructor initializer list is still unresolved,
     /// set while descending into its function so the list can be resolved in
     /// the parameter scope that only the function visitor opens.
-    pending_base_ctor: MethodNode*;
+    pending_base_ctor: DeclarationNode*;
     /// The identifier a call being visited names as its callee, while that
     /// callee is visited: an unbound one is refused as a function that does
     /// not exist rather than as a value.
@@ -315,7 +315,7 @@ type struct NameResolver {
 
     /// Register the method `func` as a definition of `owner` - the type it
     /// is declared on or the trait declaring it - and stamp it on the
-    /// declaration, `decl` being the node the method is (a `MethodNode`, or
+    /// declaration, `decl` being the node the method is (a `MethodDecl`, or
     /// a trait's own `FunctionDecl`).  An owner the head could not name
     /// registers nothing: the head's own error has been reported.
     define_method(&this, owner: DefId, func_decl: DeclarationNode*, decl: ASTNode*) -> DefId {
@@ -327,11 +327,12 @@ type struct NameResolver {
 
     /// Register every method written in a type's body as a definition of
     /// the type `owner`.
-    define_body_methods(&this, owner: DefId, methods: &[MethodNode*]) -> void {
+    define_body_methods(&this, owner: DefId, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
+            const method_decl: DeclarationNode* = methods[i];
+            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null) { continue; }
-            this.define_method(owner, method.func, method as ASTNode*);
+            this.define_method(owner, method.func, method_decl as ASTNode*);
         }
     }
 
@@ -367,7 +368,7 @@ type struct NameResolver {
     /// Whether a class declares a constructor of its own.
     static declares_constructor(cd: ClassDeclNode*) -> boolean {
         for (mut i: i64 = 0; i < cd.methods.length; i++) {
-            if (cd.methods[i] != null && cd.methods[i].is_constructor) { return true; }
+            if (cd.methods[i] != null && DeclarationNode::method_of(cd.methods[i]).is_constructor) { return true; }
         }
         return false;
     }
@@ -594,7 +595,7 @@ type struct NameResolver {
                     // walk meets them.
                     DeclKind::Module(_) | DeclKind::Impl(_) | DeclKind::Variant(_) | DeclKind::Field(_)
                     | DeclKind::GenericParam(_)
-                    | DeclKind::Destructure(_) | DeclKind::Legacy => {}
+                    | DeclKind::Destructure(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
             }
             NodeKind::Statement => {
@@ -633,7 +634,7 @@ type struct NameResolver {
                     DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
                     | DeclKind::Variant(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
                     | DeclKind::Impl(_) | DeclKind::Destructure(_) | DeclKind::Function(_)
-                    | DeclKind::Legacy => {
+                    | DeclKind::Method(_) | DeclKind::Legacy => {
                         DefId::invalid()
                     }
                 }
@@ -3030,8 +3031,9 @@ implement trait Walk for struct NameResolver {
         // arguments; name resolution was the only pass that did not, so a path
         // written in one reached codegen with nothing recorded.
         if (this.pending_base_ctor != null
-                && this.pending_base_ctor.func == node_decl) {
-            const owner: MethodNode* = this.pending_base_ctor;
+                && DeclarationNode::method_of(this.pending_base_ctor).func == node_decl) {
+            const owner_decl: DeclarationNode* = this.pending_base_ctor;
+            const owner: MethodDecl* = DeclarationNode::method_of(owner_decl);
             // Cleared for the descent: an argument containing a lambda or a
             // nested constructor call must not re-enter this branch and resolve
             // the same list a second time.
@@ -3039,7 +3041,7 @@ implement trait Walk for struct NameResolver {
             for (mut i: i64 = 0; i < owner.base_ctor_args.length; i++) {
                 this.walk_node(owner.base_ctor_args[i]);
             }
-            this.pending_base_ctor = owner;
+            this.pending_base_ctor = owner_decl;
         }
 
         // Visit body
@@ -3050,7 +3052,7 @@ implement trait Walk for struct NameResolver {
         this.resolver.exit_scope();
     }
 
-    walk_method(mut &this, node: MethodNode*) -> void {
+    walk_method(mut &this, node_decl: DeclarationNode*, node: MethodDecl*) -> void {
         if (node.func != null) {
             // A base-constructor initializer list is written outside the body
             // but evaluated inside it: `: Base(kind, span)` reads the
@@ -3058,7 +3060,7 @@ implement trait Walk for struct NameResolver {
             // in scope.  Handed to the function visitor rather than walked here
             // because that is the one place the parameter scope is open, and
             // opening a second one would put the same names in two scopes.
-            this.pending_base_ctor = node;
+            this.pending_base_ctor = node_decl;
             this.walk_node(node.func);
             this.pending_base_ctor = null;
         }
@@ -3362,15 +3364,16 @@ implement trait Walk for struct NameResolver {
         // the trait's definition, the implementation's is the type's.
         const method_owner: DefId = this.impl_owner_def(node);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            const method: MethodNode* = node.methods[i];
+            const method_decl: DeclarationNode* = node.methods[i];
+            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method.func != null) {
                 const is_public: boolean =
                     method.visibility == Visibility::Public;
                 this.resolver.declare_method(
                     DeclarationNode::fn_of(method.func).name, method.func.span, is_public,
-                    this.define_method(method_owner, method.func, method as ASTNode*));
+                    this.define_method(method_owner, method.func, method_decl as ASTNode*));
             }
-            this.walk_node(method);
+            this.walk_node(method_decl);
         }
 
         this.this_trait = outer_trait;

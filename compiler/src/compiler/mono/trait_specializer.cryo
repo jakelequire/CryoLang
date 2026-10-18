@@ -29,7 +29,7 @@ import std::alloc::allocator;
 import std::core::mem::{ swap };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, FunctionDecl, DeclarationNode, GenericParamDecl, ImplBlock, MethodNode,
+    ClassDeclNode, FunctionDecl, DeclarationNode, GenericParamDecl, ImplBlock, MethodDecl,
     StructDecl, TraitDecl, UnionDecl
 };
 import compiler::ast::node::{ ASTNode };
@@ -214,7 +214,8 @@ type struct MonoTraitSpecializer {
             DefId::invalid(), empty_sym,
             psyms, TypeRef::invalid());
         for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
-            const method: MethodNode* = decl.methods[mi];
+            const method_decl: DeclarationNode* = decl.methods[mi];
+            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null) { continue; }
             if (DeclarationNode::fn_of(method.func).is_self_returning_default
                     || DeclarationNode::fn_of(method.func).is_lazy_self_growing) { continue; }
@@ -290,15 +291,15 @@ type struct MonoTraitSpecializer {
         // gives the field the filtered buffer and drops the old one via the local.
         if (DeclarationNode::struct_of(ast_node) != null) {
             const decl: StructDecl* = DeclarationNode::struct_of(ast_node);
-            mut filtered: [MethodNode*] = this.filter_methods(decl.methods, subst);
+            mut filtered: [DeclarationNode*] = this.filter_methods(decl.methods, subst);
             swap(&decl.methods, &filtered);
         } else if (DeclarationNode::union_of(ast_node) != null) {
             const decl: UnionDecl* = DeclarationNode::union_of(ast_node);
-            mut filtered: [MethodNode*] = this.filter_methods(decl.methods, subst);
+            mut filtered: [DeclarationNode*] = this.filter_methods(decl.methods, subst);
             swap(&decl.methods, &filtered);
         } else if (ast_node.kind == NodeKind::ClassDeclaration) {
             const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
-            mut filtered: [MethodNode*] = this.filter_methods(decl.methods, subst);
+            mut filtered: [DeclarationNode*] = this.filter_methods(decl.methods, subst);
             swap(&decl.methods, &filtered);
         }
     }
@@ -329,7 +330,7 @@ type struct MonoTraitSpecializer {
             if (!this.bounds_satisfied(impl_node.where_bounds, &head)) {
                 continue;
             }
-            mut impl_filtered: [MethodNode*] = this.filter_methods(impl_node.methods, &head);
+            mut impl_filtered: [DeclarationNode*] = this.filter_methods(impl_node.methods, &head);
             swap(&impl_node.methods, &impl_filtered);
             kept.push(impl_ast);
         }
@@ -347,16 +348,17 @@ type struct MonoTraitSpecializer {
     }
 
     /// Keep only methods whose per-method where-bounds are satisfied by `subst`.
-    filter_methods(&this, methods: &[MethodNode*],
-                    subst: TypeSubstitution*) -> [MethodNode*] {
-        mut kept: [MethodNode*] = [];
+    filter_methods(&this, methods: &[DeclarationNode*],
+                    subst: TypeSubstitution*) -> [DeclarationNode*] {
+        mut kept: [DeclarationNode*] = [];
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
             if (!this.method_bounds_satisfied(m.func, subst)) {
                 continue;
             }
-            kept.push(m);
+            kept.push(m_decl);
         }
         return kept;
     }
@@ -387,7 +389,8 @@ type struct MonoTraitSpecializer {
         // Fast path: nothing to do unless some method carries a projection bound.
         mut any: boolean = false;
         for (mut i: i64 = 0; i < decl.methods.length; i++) {
-            const m: MethodNode* = decl.methods[i];
+            const m_decl: DeclarationNode* = decl.methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m != null && m.func != null && this.func_has_projection_bound(m.func)) {
                 any = true;
                 break;
@@ -395,12 +398,13 @@ type struct MonoTraitSpecializer {
         }
         if (!any) { return; }
 
-        mut kept: [MethodNode*] = [];
+        mut kept: [DeclarationNode*] = [];
         for (mut i: i64 = 0; i < decl.methods.length; i++) {
-            const m: MethodNode* = decl.methods[i];
-            if (m == null || m.func == null) { kept.push(m); continue; }
+            const m_decl: DeclarationNode* = decl.methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+            if (m == null || m.func == null) { kept.push(m_decl); continue; }
             if (this.method_projection_bounds_hold(m.func, this_type)) {
-                kept.push(m);
+                kept.push(m_decl);
             }
         }
         // Swap-relocate the owning array (see `filter_bounds_violating_methods`).

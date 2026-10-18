@@ -40,7 +40,7 @@ import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
     DestructureDecl, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
     FunctionDecl, GenericParamDecl, ImplBlock, ImportDecl,
-    IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
+    IntrinsicDecl, MethodDecl, ModuleDecl, ReceiverForm,
     StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
@@ -925,9 +925,10 @@ implement struct Parser {
 
     /// `give_receiver` over every method of a type body or an impl block, once
     /// each method's `static` is known.
-    give_receivers(methods: &[MethodNode*]) -> void {
+    give_receivers(methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m != null) { this.give_receiver(m.func, m.is_static); }
         }
     }
@@ -1277,7 +1278,8 @@ implement struct Parser {
             // Constructor: ClassName(params) { body }
             if (this.check(TokenType::Identifier) && this.current().lexeme == this.current_type_name &&
                 this.peek_at(1).kind == TokenType::LParen) {
-                const method: MethodNode* = this.parse_constructor(member_visibility);
+                const method_decl: DeclarationNode* = this.parse_constructor(member_visibility);
+                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                 if (method != null) {
                     // A constructor runs to completion at a fixed point in an
                     // object's lifetime: it has no caller that could hold and
@@ -1288,21 +1290,22 @@ implement struct Parser {
                             "a constructor cannot be `async`: it must produce a fully initialized object before any caller can observe it, so there is nothing to suspend into",
                             member_modifier_span);
                     }
-                    if (doc != "") { method.set_documentation(doc); }
+                    if (doc != "") { method_decl.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
+                        method_decl.add_directive(pending_dirs[pi]);
                     }
-                    method.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.methods.push(method); }
-                    if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.methods.push(method); }
+                    method_decl.note_modifier_span(member_modifier_span);
+                    if (struct_node != null) { struct_node.methods.push(method_decl); }
+                    if (class_node != null) { class_node.add_method(method_decl); }
+                    if (union_node != null) { union_node.methods.push(method_decl); }
                 }
                 continue;
             }
 
             // Destructor: ~ClassName() { body }
             if (this.check(TokenType::Tilde)) {
-                const method: MethodNode* = this.parse_destructor(member_visibility);
+                const method_decl: DeclarationNode* = this.parse_destructor(member_visibility);
+                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                 if (method != null) {
                     // A destructor is called by drop insertion at scope exit,
                     // from contexts that have no executor and cannot wait.
@@ -1311,65 +1314,65 @@ implement struct Parser {
                             "a destructor cannot be `async`: it is called by drop insertion at scope exit, where there is no executor to poll a future",
                             member_modifier_span);
                     }
-                    if (doc != "") { method.set_documentation(doc); }
+                    if (doc != "") { method_decl.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
+                        method_decl.add_directive(pending_dirs[pi]);
                     }
-                    method.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.methods.push(method); }
-                    if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.methods.push(method); }
+                    method_decl.note_modifier_span(member_modifier_span);
+                    if (struct_node != null) { struct_node.methods.push(method_decl); }
+                    if (class_node != null) { class_node.add_method(method_decl); }
+                    if (union_node != null) { union_node.methods.push(method_decl); }
                 }
                 continue;
             }
 
             // Static method or static field
             if (this.check(TokenType::KwStatic)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(
+                const method_decl: DeclarationNode* = this.parse_method_with_modifiers(
                     member_visibility, true, false, false, member_is_async);
-                if (method != null) {
-                    if (doc != "") { method.set_documentation(doc); }
+                if (method_decl != null) {
+                    if (doc != "") { method_decl.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
+                        method_decl.add_directive(pending_dirs[pi]);
                     }
-                    method.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.methods.push(method); }
-                    if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.methods.push(method); }
+                    method_decl.note_modifier_span(member_modifier_span);
+                    if (struct_node != null) { struct_node.methods.push(method_decl); }
+                    if (class_node != null) { class_node.add_method(method_decl); }
+                    if (union_node != null) { union_node.methods.push(method_decl); }
                 }
                 continue;
             }
 
             // Virtual method
             if (this.check(TokenType::KwVirtual)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(
+                const method_decl: DeclarationNode* = this.parse_method_with_modifiers(
                     member_visibility, false, true, false, member_is_async);
-                if (method != null) {
-                    if (doc != "") { method.set_documentation(doc); }
+                if (method_decl != null) {
+                    if (doc != "") { method_decl.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
+                        method_decl.add_directive(pending_dirs[pi]);
                     }
-                    method.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.methods.push(method); }
-                    if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.methods.push(method); }
+                    method_decl.note_modifier_span(member_modifier_span);
+                    if (struct_node != null) { struct_node.methods.push(method_decl); }
+                    if (class_node != null) { class_node.add_method(method_decl); }
+                    if (union_node != null) { union_node.methods.push(method_decl); }
                 }
                 continue;
             }
 
             // Override method
             if (this.check(TokenType::KwOverride)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(
+                const method_decl: DeclarationNode* = this.parse_method_with_modifiers(
                     member_visibility, false, false, true, member_is_async);
-                if (method != null) {
-                    if (doc != "") { method.set_documentation(doc); }
+                if (method_decl != null) {
+                    if (doc != "") { method_decl.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
+                        method_decl.add_directive(pending_dirs[pi]);
                     }
-                    method.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.methods.push(method); }
-                    if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.methods.push(method); }
+                    method_decl.note_modifier_span(member_modifier_span);
+                    if (struct_node != null) { struct_node.methods.push(method_decl); }
+                    if (class_node != null) { class_node.add_method(method_decl); }
+                    if (union_node != null) { union_node.methods.push(method_decl); }
                 }
                 continue;
             }
@@ -1389,17 +1392,18 @@ implement struct Parser {
                 // Method pattern: name ( or name < (generic method)
                 const next: Token = this.peek_at(1);
                 if (next.kind == TokenType::LParen || next.kind == TokenType::LAngle) {
-                    const method: MethodNode* = this.parse_method(member_visibility);
+                    const method_decl: DeclarationNode* = this.parse_method(member_visibility);
+                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                     if (method != null) {
                         if (member_is_async && method.func != null) { DeclarationNode::fn_of(method.func).set_async(true); }
-                        if (doc != "") { method.set_documentation(doc); }
+                        if (doc != "") { method_decl.set_documentation(doc); }
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                            method.add_directive(pending_dirs[pi]);
+                            method_decl.add_directive(pending_dirs[pi]);
                         }
-                        method.note_modifier_span(member_modifier_span);
-                        if (struct_node != null) { struct_node.methods.push(method); }
-                        if (class_node != null) { class_node.add_method(method); }
-                        if (union_node != null) { union_node.methods.push(method); }
+                        method_decl.note_modifier_span(member_modifier_span);
+                        if (struct_node != null) { struct_node.methods.push(method_decl); }
+                        if (class_node != null) { class_node.add_method(method_decl); }
+                        if (union_node != null) { union_node.methods.push(method_decl); }
                     }
                 } else if (this.check(TokenType::Identifier)
                            || next.kind == TokenType::Colon) {
@@ -1440,7 +1444,7 @@ implement struct Parser {
     }
 
     /// Parse a constructor: ClassName(params) [: BaseClass(args)] { body }
-    parse_constructor(visibility: Visibility) -> MethodNode* {
+    parse_constructor(visibility: Visibility) -> DeclarationNode* {
         const start: Token = this.current();
         const name_tok: Token = this.advance(); // consume class name
         const name: SymbolStr = this.intern_lexeme(name_tok);
@@ -1451,7 +1455,8 @@ implement struct Parser {
 
         this.parse_function_param_list_into(func_decl);
 
-        mut method: MethodNode* = new MethodNode(func_decl, this.span_from_token(start));
+        mut method: MethodDecl* = MethodDecl::new(func_decl);
+        const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), this.span_from_token(start));
         method.set_constructor(true);
         method.set_visibility(visibility);
 
@@ -1482,12 +1487,12 @@ implement struct Parser {
             func.set_body(body);
         }
 
-        method.span = this.span_from(start);
-        return method;
+        method_decl.span = this.span_from(start);
+        return method_decl;
     }
 
     /// Parse a destructor: ~ClassName() { body }
-    parse_destructor(visibility: Visibility) -> MethodNode* {
+    parse_destructor(visibility: Visibility) -> DeclarationNode* {
         const start: Token = this.advance(); // consume '~'
         const name_tok: Token = this.advance(); // consume class name
         const name: SymbolStr = this.ctx.intern("~" + name_tok.lexeme);
@@ -1498,7 +1503,8 @@ implement struct Parser {
         this.consume(TokenType::LParen, "'('");
         this.consume(TokenType::RParen, "')'");
 
-        mut method: MethodNode* = new MethodNode(func_decl, this.span_from_token(start));
+        mut method: MethodDecl* = MethodDecl::new(func_decl);
+        const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), this.span_from_token(start));
         method.set_destructor(true);
         method.set_visibility(visibility);
 
@@ -1508,8 +1514,8 @@ implement struct Parser {
                 this.advance();
                 method.set_default_destructor(true);
                 this.consume(TokenType::Semicolon, "';'");
-                method.span = this.span_from(start);
-                return method;
+                method_decl.span = this.span_from(start);
+                return method_decl;
             }
         }
 
@@ -1518,8 +1524,8 @@ implement struct Parser {
             func.set_body(body);
         }
 
-        method.span = this.span_from(start);
-        return method;
+        method_decl.span = this.span_from(start);
+        return method_decl;
     }
 
     /// True when the current token is a method MODIFIER keyword rather than a
@@ -1560,22 +1566,23 @@ implement struct Parser {
     /// cannot share a vtable slot) instead of leaving a parse error on `async`.
     parse_method_with_modifiers(visibility: Visibility, is_static: boolean,
                                  is_virtual: boolean, is_override: boolean,
-                                 is_async: boolean) -> MethodNode* {
+                                 is_async: boolean) -> DeclarationNode* {
         this.advance(); // consume modifier keyword
         const extra: MethodModifiers = this.consume_method_modifiers(SourceSpan::none());
 
-        const method: MethodNode* = this.parse_method(visibility);
+        const method_decl: DeclarationNode* = this.parse_method(visibility);
+        const method: MethodDecl* = DeclarationNode::method_of(method_decl);
         if (method != null) {
             if (is_static || extra.is_static) { method.set_static(true); }
             if (is_virtual) { method.set_virtual(true); }
             if (is_override) { method.set_override(true); }
             if ((is_async || extra.is_async) && method.func != null) { DeclarationNode::fn_of(method.func).set_async(true); }
         }
-        return method;
+        return method_decl;
     }
 
     /// Parse a method: name<T>(params) -> RetType { body }
-    parse_method(visibility: Visibility) -> MethodNode* {
+    parse_method(visibility: Visibility) -> DeclarationNode* {
         const start: Token = this.current();
         const name_tok: Token = this.advance(); // consume method name
         const name: SymbolStr = this.intern_lexeme(name_tok);
@@ -1609,7 +1616,8 @@ implement struct Parser {
             }
         }
 
-        mut method: MethodNode* = new MethodNode(func_decl, this.span_from_token(start));
+        mut method: MethodDecl* = MethodDecl::new(func_decl);
+        const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), this.span_from_token(start));
         method.set_visibility(visibility);
 
         // Body or semicolon
@@ -1620,8 +1628,8 @@ implement struct Parser {
             this.consume(TokenType::Semicolon, "';' or '{'");
         }
 
-        method.span = this.span_from(start);
-        return method;
+        method_decl.span = this.span_from(start);
+        return method_decl;
     }
 
     /// Parse a field declaration: name: Type [= default];
@@ -2428,16 +2436,17 @@ implement struct Parser {
                 is_static = mods.is_static;
                 modifier_span = mods.span;
 
-                const method: MethodNode* = this.parse_method(vis);
+                const method_decl: DeclarationNode* = this.parse_method(vis);
+                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                 if (method != null) {
                     if (is_static) { method.set_static(true); }
                     if (mods.is_async && method.func != null) { DeclarationNode::fn_of(method.func).set_async(true); }
-                    if (doc != "") { method.set_documentation(doc); }
+                    if (doc != "") { method_decl.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
+                        method_decl.add_directive(pending_dirs[pi]);
                     }
-                    method.note_modifier_span(modifier_span);
-                    node.methods.push(method);
+                    method_decl.note_modifier_span(modifier_span);
+                    node.methods.push(method_decl);
                 }
             } else {
                 this.error_unexpected();

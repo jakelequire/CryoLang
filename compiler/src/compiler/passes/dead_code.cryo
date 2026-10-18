@@ -65,7 +65,7 @@ import std::collections::hashmap::{ HashMap };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, FunctionDecl, ImplBlock,
-    MethodNode, StructDecl, UnionDecl, VarDecl
+    MethodDecl, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode, CallExprNode,
@@ -171,7 +171,7 @@ type struct DeadCodeChecker {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -179,9 +179,10 @@ type struct DeadCodeChecker {
         }
     }
 
-    check_methods(mut &this, methods: &[MethodNode*]) -> void {
+    check_methods(mut &this, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
             this.check_fn(m.func, this.is_body_resolved(m.func));
         }
@@ -369,8 +370,9 @@ type struct DeadCodeChecker {
     mark_call_target(mut &this, node: ASTNode*) -> void {
         if (node == null) { return; }
         mut key: u64 = 0;
-        if (node.kind == NodeKind::MethodDeclaration) {
-            const mn: MethodNode* = node as MethodNode*;
+        if (DeclarationNode::method_of(node) != null) {
+            const mn_decl: DeclarationNode* = DeclarationNode::with_shape(node);
+            const mn: MethodDecl* = DeclarationNode::method_of(mn_decl);
             if (mn.func == null) { return; }
             key = ResolutionMap::make_key(mn.func.span);
         } else if (DeclarationNode::fn_of(node) != null) {
@@ -418,7 +420,7 @@ type struct DeadCodeChecker {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -426,9 +428,10 @@ type struct DeadCodeChecker {
         }
     }
 
-    harvest_methods(mut &this, methods: &[MethodNode*]) -> void {
+    harvest_methods(mut &this, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
             this.harvest_fn(m.func);
         }
@@ -631,7 +634,7 @@ type struct DeadCodeChecker {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -639,11 +642,12 @@ type struct DeadCodeChecker {
         }
     }
 
-    report_methods(mut &this, methods: &[MethodNode*]) -> void {
+    report_methods(mut &this, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
-            this.report_method(m);
+            this.report_method(m_decl);
         }
     }
 
@@ -673,12 +677,13 @@ type struct DeadCodeChecker {
         this.ctx.emit_diagnostic(diag);
     }
 
-    report_method(mut &this, m: MethodNode*) -> void {
+    report_method(mut &this, m_decl: DeclarationNode*) -> void {
+        const m: MethodDecl* = DeclarationNode::method_of(m_decl);
         const f_decl: DeclarationNode* = m.func;
         const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         if (f == null || f.body == null) { return; }          // abstract / no body
         // Only private methods.  A method's symbol visibility derives from
-        // `MethodNode.visibility` (see name_resolution), which defaults Public,
+        // `MethodDecl.visibility` (see name_resolution), which defaults Public,
         // so anything not explicitly private is conservatively left alone.
         match (m.visibility) {
             Visibility::Private => {}

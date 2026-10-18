@@ -61,7 +61,7 @@ import utils::logger::{ cdebug };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDecl,
-    ImplBlock, MethodNode, StructDecl, UnionDecl, VarDecl
+    ImplBlock, MethodDecl, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ DirectiveArg, DirectiveArgKind, DirectiveNode };
@@ -158,10 +158,10 @@ implement enum DirectiveTarget {
     /// to `Other`.
     static from_node(n: ASTNode*) -> DirectiveTarget {
         return match (n.kind) {
-            NodeKind::MethodDeclaration     => { DirectiveTarget::Method   }
             NodeKind::ClassDeclaration      => { DirectiveTarget::Class    }
             NodeKind::Declaration => {
                 match ((n as DeclarationNode*).shape) {
+                    DeclKind::Method(_) => { DirectiveTarget::Method   }
                     DeclKind::Function(_) => { DirectiveTarget::Function }
                     DeclKind::Enum(_)           => { DirectiveTarget::Enum   }
                     DeclKind::Extern(_)         => { DirectiveTarget::Extern }
@@ -320,7 +320,7 @@ type struct DirectiveProcessingPasses {
             }
 
             // `![sink]`: zero args; method-target only.  Static-method
-            // and missing-receiver checks need the MethodNode and its
+            // and missing-receiver checks need the MethodDecl and its
             // FunctionDecl, so they live in the per-decl loop in
             // run_directive_processing where we already have the decl pointer.
             "sink" => {
@@ -1077,7 +1077,7 @@ type struct DirectiveProcessingPasses {
     /// Currently:
     ///   ![inline]         -> sets FunctionDecl.is_inline = true
     ///   ![noinline]       -> sets FunctionDecl.is_noinline = true
-    ///   ![sink]           -> sets MethodNode.is_sink = true
+    ///   ![sink]           -> sets MethodDecl.is_sink = true
     ///   ![repr(C|packed|transparent)] -> sets repr_* flags on struct/class/enum decl
     ///   ![align(N)]       -> sets min_alignment on struct/class/enum decl
     static apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
@@ -1240,8 +1240,9 @@ type struct DirectiveProcessingPasses {
             return;
         }
 
-        if (decl.kind == NodeKind::MethodDeclaration) {
-            const m: MethodNode* = decl as MethodNode*;
+        if (DeclarationNode::method_of(decl) != null) {
+            const m_decl: DeclarationNode* = DeclarationNode::with_shape(decl);
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (name.eq("sink")) {
                 // Reject placement on a static method: static methods have
                 // no receiver, so "consumes the receiver" is meaningless.
@@ -1535,14 +1536,14 @@ type struct DirectiveProcessingPasses {
 
             // Descend into method lists on structs/classes/impls.  The
             // top-level loop above only sees the container; per-method
-            // directives like `![sink]` live on each MethodNode
+            // directives like `![sink]` live on each MethodDecl
             // and must be validated + applied here.  Methods on traits
-            // are [DeclarationNode*] (no MethodNode wrapper) and don't
+            // are [DeclarationNode*] (no MethodDecl wrapper) and don't
             // currently carry directives; if that changes, fold them in.
             // Borrow the decl's method array - aliasing it into an owning local
             // would free the decl node's buffer when the local drops.
-            const empty_methods: [MethodNode*] = [];
-            mut method_list: &[MethodNode*] = &empty_methods;
+            const empty_methods: [DeclarationNode*] = [];
+            mut method_list: &[DeclarationNode*] = &empty_methods;
             if (DeclarationNode::struct_of(decl) != null) {
                 const sn: StructDecl* = DeclarationNode::struct_of(decl);
                 method_list = &sn.methods;
@@ -1557,19 +1558,20 @@ type struct DirectiveProcessingPasses {
                 method_list = &ib.methods;
             }
             for (mut mi: i64 = 0; mi < method_list.length; mi++) {
-                const m: MethodNode* = method_list[mi];
+                const m_decl: DeclarationNode* = method_list[mi];
+                const m: MethodDecl* = DeclarationNode::method_of(m_decl);
                 if (m == null) { continue; }
-                const m_count: i64 = m.attached_directives.length;
+                const m_count: i64 = m_decl.attached_directives.length;
                 if (m_count == 0) { continue; }
                 for (mut mj: i64 = 0; mj < m_count; mj++) {
-                    const md: DirectiveNode* = m.attached_directives[mj];
+                    const md: DirectiveNode* = m_decl.attached_directives[mj];
                     if (md == null) { continue; }
                     DirectiveProcessingPasses::validate_builtin(ctx, md, DirectiveTarget::Method);
-                    DirectiveProcessingPasses::apply_effects(ctx, md, m as DeclarationNode*);
+                    DirectiveProcessingPasses::apply_effects(ctx, md, m_decl as DeclarationNode*);
                     const m_rec: DirectiveRecord = DirectiveRecord {
                         kind: md.directive_kind,
                         node: md,
-                        decl: m as DeclarationNode*,
+                        decl: m_decl as DeclarationNode*,
                         qualified_name: SymbolStr::empty(),
                         span: md.span,
                     };
@@ -1711,7 +1713,7 @@ type struct DirectiveProcessingPasses {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -1722,9 +1724,10 @@ type struct DirectiveProcessingPasses {
     /// Register each `![implicit]` static method of `methods` as a
     /// converter.  Instance methods are skipped: a converter needs no
     /// receiver.
-    static register_converter_methods(ctx: CompilationContext*, methods: &[MethodNode*]) -> void {
+    static register_converter_methods(ctx: CompilationContext*, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
             if (!m.is_static) { continue; }
             DirectiveProcessingPasses::register_converter_fn(ctx, m.func);
@@ -1839,7 +1842,7 @@ type struct DirectiveProcessingPasses {
                         | DeclKind::GenericParam(_) | DeclKind::Impl(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
                         | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
-                        | DeclKind::Function(_) | DeclKind::Legacy => { }
+                        | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                     }
                 }
                 _ => { }

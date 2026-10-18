@@ -206,6 +206,16 @@ public:
         };
     }
 
+    /// The method `n` is, or null.
+    static method_of(n: ASTNode*) -> MethodDecl* {
+        const d: DeclarationNode* = DeclarationNode::with_shape(n);
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Method(m) => { m }
+            _                   => { null }
+        };
+    }
+
     /// The function `n` is, or null.
     static fn_of(n: ASTNode*) -> FunctionDecl* {
         const d: DeclarationNode* = DeclarationNode::with_shape(n);
@@ -771,8 +781,9 @@ type struct FunctionDecl {
     /// `![caller_location]`.
     static caller_located(decl: ASTNode*) -> boolean {
         if (decl == null) { return false; }
-        if (decl.kind == NodeKind::MethodDeclaration) {
-            const m: MethodNode* = decl as MethodNode*;
+        if (DeclarationNode::method_of(decl) != null) {
+            const m_decl: DeclarationNode* = DeclarationNode::with_shape(decl);
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             return m.func != null && DeclarationNode::fn_of(m.func).is_caller_located;
         }
         if (DeclarationNode::fn_of(decl) != null) {
@@ -824,11 +835,9 @@ implement trait Allocate for struct FunctionDecl {
 }
 
 
-/// Method node uses composition: holds the function's declaration (shape
-/// `DeclKind::Function`) for the signature and body, plus method-specific
-/// flags.
-type class MethodNode : DeclarationNode {
-public:
+/// A method: the function's declaration (shape `DeclKind::Function`) for
+/// the signature and body, plus the method's own flags.
+type struct MethodDecl {
     func:                  DeclarationNode*;
     visibility:            Visibility;
     is_constructor:        boolean;
@@ -850,47 +859,52 @@ public:
     /// or copied from a trait default.  A copy of the block holding the
     /// template does not carry it: a clone is the same method, not an
     /// instance of it.
-    spec_of:               MethodNode*;
+    spec_of:               DeclarationNode*;
 
-    MethodNode(func: DeclarationNode*, span: SourceSpan)
-        : DeclarationNode(NodeKind::MethodDeclaration, span) {
-        this.func                  = func;
-        this.spec_of               = null;
-        this.visibility            = Visibility::Public;
-        this.is_constructor        = false;
-        this.is_destructor         = false;
-        this.is_static             = false;
-        this.is_default_destructor = false;
-        this.is_virtual            = false;
-        this.is_override           = false;
-        this.is_sink               = false;
-        this.base_ctor_name        = SymbolStr::empty();
-        this.base_ctor_args        = [];
+    static new(func: DeclarationNode*) -> MethodDecl* {
+        return new MethodDecl {
+            func:                  func,
+            visibility:            Visibility::Public,
+            is_constructor:        false,
+            is_destructor:         false,
+            is_static:             false,
+            is_default_destructor: false,
+            is_virtual:            false,
+            is_override:           false,
+            is_sink:               false,
+            base_ctor_name:        SymbolStr::empty(),
+            base_ctor_args:        [],
+            spec_of:               null,
+        };
     }
 
-    has_base_ctor() -> boolean { return this.base_ctor_name.is_valid(); }
+    has_base_ctor(&this) -> boolean { return this.base_ctor_name.is_valid(); }
 
-    set_visibility(v: Visibility) -> void       { this.visibility = v; }
-    set_constructor(v: boolean) -> void         { this.is_constructor = v; }
-    set_destructor(v: boolean) -> void          { this.is_destructor = v; }
-    set_static(v: boolean) -> void              { this.is_static = v; }
-    set_default_destructor(v: boolean) -> void  { this.is_default_destructor = v; }
-    set_virtual(v: boolean) -> void             { this.is_virtual = v; }
-    set_override(v: boolean) -> void            { this.is_override = v; }
-    set_sink(v: boolean) -> void                { this.is_sink = v; }
-    set_base_ctor_name(name: SymbolStr) -> void  { this.base_ctor_name = name; }
+    set_visibility(mut &this, v: Visibility) -> void       { this.visibility = v; }
+    set_constructor(mut &this, v: boolean) -> void         { this.is_constructor = v; }
+    set_destructor(mut &this, v: boolean) -> void          { this.is_destructor = v; }
+    set_static(mut &this, v: boolean) -> void              { this.is_static = v; }
+    set_default_destructor(mut &this, v: boolean) -> void  { this.is_default_destructor = v; }
+    set_virtual(mut &this, v: boolean) -> void             { this.is_virtual = v; }
+    set_override(mut &this, v: boolean) -> void            { this.is_override = v; }
+    set_sink(mut &this, v: boolean) -> void                { this.is_sink = v; }
+    set_base_ctor_name(mut &this, name: SymbolStr) -> void { this.base_ctor_name = name; }
 
-    add_base_ctor_arg(arg: ExpressionNode*) -> void {
+    add_base_ctor_arg(mut &this, arg: ExpressionNode*) -> void {
         this.base_ctor_args.push(arg);
+    }
+
+    static walk_children<V>(n: MethodDecl*, v: mut &V) -> void where V: Walk {
+        v.walk_decl(n.func);
     }
 
     /// Whether the very method `m` is one of the methods `decl` holds: a
     /// struct's, union's or class's own, or an impl block's.  Compared by
     /// identity, never by name.
-    static is_method_of(m: MethodNode*, decl: ASTNode*) -> boolean {
+    static is_method_of(m: DeclarationNode*, decl: ASTNode*) -> boolean {
         if (decl == null) { return false; }
-        const empty: [MethodNode*] = [];
-        mut methods: &[MethodNode*] = &empty;
+        const empty: [DeclarationNode*] = [];
+        mut methods: &[DeclarationNode*] = &empty;
         if (DeclarationNode::struct_of(decl) != null) {
             methods = &(DeclarationNode::struct_of(decl)).methods;
         } else if (DeclarationNode::union_of(decl) != null) {
@@ -904,6 +918,12 @@ public:
             if (methods[k] == m) { return true; }
         }
         return false;
+    }
+}
+
+implement trait Allocate for struct MethodDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -922,6 +942,7 @@ type enum DeclKind {
     Impl(ImplBlock*);
     Import(ImportDecl*);
     Intrinsic(IntrinsicDecl*);
+    Method(MethodDecl*);
     Module(ModuleDecl*);
     Struct(StructDecl*);
     Trait(TraitDecl*);
@@ -1181,7 +1202,7 @@ type struct StructDecl {
     /// Each a declaration whose shape is `DeclKind::Field`, read through
     /// `DeclarationNode::field_of`.
     fields:         [DeclarationNode*];
-    methods:        [MethodNode*];
+    methods:        [DeclarationNode*];
     /// Synthesized field accessors for a C-imported union/bitfield blob (set
     /// only by the bindgen engine; rendered only by the vendor serializer).
     binding_accessors: [BindingAccessor];
@@ -1271,7 +1292,7 @@ type struct UnionDecl {
     /// Each a declaration whose shape is `DeclKind::Field`, read through
     /// `DeclarationNode::field_of`.
     fields:         [DeclarationNode*];
-    methods:        [MethodNode*];
+    methods:        [DeclarationNode*];
     /// Layout attributes - see StructDecl for the full description.
     repr_c:           boolean;
     repr_packed:      boolean;
@@ -1330,7 +1351,7 @@ public:
     /// Each a declaration whose shape is `DeclKind::Field`, read through
     /// `DeclarationNode::field_of`.
     fields:         [DeclarationNode*];
-    methods:        [MethodNode*];
+    methods:        [DeclarationNode*];
     base_class:     SymbolStr;
     /// What `base_class` refers to, stamped by NameResolution from the scope
     /// ENCLOSING the class - the class body would shadow the base's own name.
@@ -1391,8 +1412,8 @@ public:
         this.fields.push(field);
     }
 
-    add_method(method: MethodNode*) -> void {
-        this.methods.push(method);
+    add_method(method_decl: DeclarationNode*) -> void {
+        this.methods.push(method_decl);
     }
 
     /// The span is taken with the name so a base cannot be recorded without
@@ -1710,7 +1731,7 @@ type struct ImplBlock {
     /// `Range`, which would drop the args and mis-resolve.  Empty for
     /// non-generic targets and inherent impls.
     target_args:    [TypeAnnotation*];
-    methods:        [MethodNode*];
+    methods:        [DeclarationNode*];
     /// The trait's methods as this block provides them, by position: entry
     /// `s` is the index in `methods` of the method that answers the trait's
     /// `s`-th declared method - written here, or the copy of its default -
@@ -1804,7 +1825,7 @@ type struct ImplBlock {
 
     /// The method this block provides for its trait's `slot`-th declared
     /// method, or null when it provides none or the table is not filled.
-    trait_item_method(&this, slot: i64) -> MethodNode* {
+    trait_item_method(&this, slot: i64) -> DeclarationNode* {
         if (slot < 0 || slot >= this.trait_item_methods.length) { return null; }
         const at: i64 = this.trait_item_methods[slot];
         if (at < 0 || at >= this.methods.length) { return null; }

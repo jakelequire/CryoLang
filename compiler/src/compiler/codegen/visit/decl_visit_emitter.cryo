@@ -37,7 +37,7 @@ import std::collections::pair::{ Pair };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, FunctionDecl, ImplBlock, MethodNode, StructDecl,
+    ClassDeclNode, FunctionDecl, ImplBlock, MethodDecl, StructDecl,
     UnionDecl, DeclarationNode, VarDecl
 };
 import compiler::ast::expression::{ ExpressionNode };
@@ -237,7 +237,8 @@ type struct DeclVisitEmitter {
         this.state.current_impl_target = this.cg.ctx.decl_index.impl_owner(node, "codegen/impl bodies");
 
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            const m: MethodNode* = node.methods[i];
+            const m_decl: DeclarationNode* = node.methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             const mfunc_decl: DeclarationNode* = m.func;
             const mfunc: FunctionDecl* = DeclarationNode::fn_of(mfunc_decl);
             if (mfunc != null) {
@@ -246,7 +247,7 @@ type struct DeclVisitEmitter {
                        i, mname, m.is_static as i32,
                        mfunc.generic_params.length, mfunc.body as void*); libc::fflush(null);
             }
-            this.generate_method_body(visitor, m, null);
+            this.generate_method_body(visitor, m_decl, null);
             cdebug("[IRGen]     method[%lld] done\n", i); libc::fflush(null);
         }
 
@@ -260,8 +261,9 @@ type struct DeclVisitEmitter {
     /// no class - a struct, a union, an `implement` block.  A constructor's
     /// `: Base(args)` names that base and nothing else, so the class's answer
     /// is the constructor's.
-    generate_method_body(mut &this, visitor: IRGeneratorVisitor*, node: MethodNode*,
+    generate_method_body(mut &this, visitor: IRGeneratorVisitor*, node_decl: DeclarationNode*,
                          base: ResSlot*) -> void {
+        const node: MethodDecl* = DeclarationNode::method_of(node_decl);
         const func_decl: DeclarationNode* = node.func;
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
@@ -273,7 +275,7 @@ type struct DeclVisitEmitter {
         if (func.is_self_returning_default || func.is_lazy_self_growing) { return; }
 
         cdebug("[IRGen]       method prologue...\n"); libc::fflush(null);
-        const fn_val: LValue = this.cg.decl.codegen_method_prologue(node, this.state.current_impl_target);
+        const fn_val: LValue = this.cg.decl.codegen_method_prologue(node_decl, this.state.current_impl_target);
         if (!fn_val.is_valid()) {
             cdebug("[IRGen]       method prologue FAILED\n"); libc::fflush(null);
             return;
@@ -286,7 +288,7 @@ type struct DeclVisitEmitter {
         // after storing its params into locals, and downstream uses of inherited
         // fields read garbage.
         if (node.is_constructor && node.has_base_ctor()) {
-            this.emit_base_ctor_call(visitor, node, fn_val, base);
+            this.emit_base_ctor_call(visitor, node_decl, fn_val, base);
         }
 
         cdebug("[IRGen]       method body block...\n"); libc::fflush(null);
@@ -312,8 +314,9 @@ type struct DeclVisitEmitter {
     /// constructor with `: BaseClass(args)` initialisation.  `this` (the LLVM
     /// param 0 of the enclosing constructor) is passed as the receiver, and
     /// `node.base_ctor_args` are codegen'd as rvalues for the remaining args.
-    emit_base_ctor_call(mut &this, visitor: IRGeneratorVisitor*, node: MethodNode*, fn_val: LValue,
+    emit_base_ctor_call(mut &this, visitor: IRGeneratorVisitor*, node_decl: DeclarationNode*, fn_val: LValue,
                         base: ResSlot*) -> void {
+        const node: MethodDecl* = DeclarationNode::method_of(node_decl);
         const intern: InternTable* = this.cg.get_intern();
         const ctx_ptr: CompilationContext* = this.cg.ctx;
 

@@ -69,7 +69,7 @@ import compiler::passes::type_resolution::{ TypeResolutionPasses, TypeResolution
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
-    FunctionDecl, GenericParamDecl, ImplBlock, MethodNode,
+    FunctionDecl, GenericParamDecl, ImplBlock, MethodDecl,
     StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -392,7 +392,7 @@ type struct SemaVisitor {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => { }
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                     }
                 }
                 _ => { }
@@ -412,13 +412,14 @@ type struct SemaVisitor {
     /// is one (null otherwise); a trait impl uses it to bind the trait's
     /// implicit `<Method>Fut` associated type to the future each method
     /// lowers to.
-    declare_async_methods(mut &this, methods: &[MethodNode*],
+    declare_async_methods(mut &this, methods: &[DeclarationNode*],
                           owner_params: &[DeclarationNode*],
                           owner_ty: TypeRef, written: SymbolStr,
                           impl_decl: DeclarationNode*) -> void {
         if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, written); return; }
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null || DeclarationNode::fn_of(m.func).body == null) { continue; }
             if (!DeclarationNode::fn_of(m.func).is_async) { continue; }
             // Each override lowers to its OWN future struct, so they return
@@ -433,7 +434,7 @@ type struct SemaVisitor {
                 continue;
             }
             mut own: AsyncOwner = AsyncOwner {
-                method: m,
+                method: m_decl,
                 ty: this.async_owner_instance(owner_ty, owner_params),
                 decl: owner_ty,
                 written: written,
@@ -451,10 +452,11 @@ type struct SemaVisitor {
     /// undeclared reaches `lower` with no pending record, and that fallback
     /// declares it as a FREE function — where the body's `this` would silently
     /// resolve to the generated future instead of the receiver.
-    reject_undeclarable_async(mut &this, methods: &[MethodNode*], written: SymbolStr) -> void {
+    reject_undeclarable_async(mut &this, methods: &[DeclarationNode*], written: SymbolStr) -> void {
         const owner: string = if (written.is_valid()) { this.intern.resolve(written) } else { "?" };
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null || !DeclarationNode::fn_of(m.func).is_async) { continue; }
             this.ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
                 fmt::format("cannot resolve the owner type `%s` of `async` method `%s`, so its future cannot be declared",
@@ -719,9 +721,10 @@ type struct SemaVisitor {
     }
 
     /// Type-check all method bodies in a type or impl block.
-    visit_methods(mut &this, methods: &[MethodNode*], owner_type: TypeRef) -> void {
+    visit_methods(mut &this, methods: &[DeclarationNode*], owner_type: TypeRef) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
+            const method_decl: DeclarationNode* = methods[i];
+            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null || DeclarationNode::fn_of(method.func).body == null) { continue; }
             if (DeclarationNode::fn_of(method.func).is_generic()) {
                 const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
@@ -908,7 +911,7 @@ type struct SemaVisitor {
     /// Walk every method body of a GENERIC owner symbolically.  A method on a
     /// generic owner reaches sema only here, so this is also where an `async` one
     /// is lowered, off the types the walk leaves on its body.
-    symbolic_check_owner_methods(mut &this, methods: &[MethodNode*], owner_type: TypeRef,
+    symbolic_check_owner_methods(mut &this, methods: &[DeclarationNode*], owner_type: TypeRef,
                                  owner_params: &[DeclarationNode*]) -> void {
         const saved_owner_generic: boolean = this.state.symbolic_owner_is_generic;
         mut saved_owner_nodes: [DeclarationNode*] = [];
@@ -922,7 +925,8 @@ type struct SemaVisitor {
         this.state.symbolic_owner_param_nodes = onodes;
         this.state.symbolic_owner_is_generic  = true;
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
+            const method_decl: DeclarationNode* = methods[i];
+            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null || DeclarationNode::fn_of(method.func).body == null) { continue; }
             const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
             // A method on a GENERIC owner reaches sema only here, whether or not
@@ -1673,8 +1677,7 @@ type struct SemaVisitor {
 
             NodeKind::ClassDeclaration       => { this.visit_class(n as ClassDeclNode*); }
 
-            NodeKind::MethodDeclaration
-            | NodeKind::MatchArm | NodeKind::StaticMatchArm | NodeKind::Pattern
+            NodeKind::MatchArm | NodeKind::StaticMatchArm | NodeKind::Pattern
             | NodeKind::Directive => { }
 
             NodeKind::Declaration => {
@@ -1687,8 +1690,9 @@ type struct SemaVisitor {
                     DeclKind::Union(u)        => { this.visit_union(u); }
                     DeclKind::Struct(s)       => { this.visit_struct(s); }
                     DeclKind::Impl(ib)        => { this.visit_impl(d, ib); }
-                    // None of these has a check.
-                    DeclKind::Import(_) | DeclKind::Intrinsic(_)
+                    // None of these has a check here; a method is checked
+                    // with its owner.
+                    DeclKind::Method(_) | DeclKind::Import(_) | DeclKind::Intrinsic(_)
                     | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Extern(_)
                     | DeclKind::TypeAlias(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
                     | DeclKind::Enum(_) => { }
@@ -3802,7 +3806,8 @@ type struct SemaVisitor {
     /// owner's, whose value is one instance's (`generic_owner_method_value`).
     scope_receiver_method_type(mut &this, m: MethodInfo*) -> TypeRef {
         if (m == null || m.is_static || m.ast_node == null) { return TypeRef::invalid(); }
-        const node: MethodNode* = m.ast_node as MethodNode*;
+        const node_decl: DeclarationNode* = DeclarationNode::with_shape(m.ast_node);
+        const node: MethodDecl* = DeclarationNode::method_of(node_decl);
         if (node.func == null || DeclarationNode::fn_of(node.func).parameters.length == 0) { return TypeRef::invalid(); }
         const recv_decl: DeclarationNode* = DeclarationNode::fn_of(node.func).parameters[0];
         const recv: VarDecl* = DeclarationNode::var_of(recv_decl);

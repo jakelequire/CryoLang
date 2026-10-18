@@ -25,7 +25,7 @@ import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDecl,
     EnumVariant, ExternBlock, FieldDecl, FunctionDecl, GenericParamDecl,
-    DeclKind, ImplBlock, ImportDecl, IntrinsicDecl, MethodNode,
+    DeclKind, ImplBlock, ImportDecl, IntrinsicDecl, MethodDecl,
     ModuleDecl, StructDecl, TraitDecl, TypeAliasDecl, UnionDecl,
     VarDecl
 };
@@ -145,7 +145,6 @@ type struct ASTCloner {
 
             NodeKind::Statement                 => { return this.copy_stmt(n as Stmt*); }
 
-            NodeKind::MethodDeclaration         => { return this.visit_method(n as MethodNode*); }
             NodeKind::Declaration               => { return this.copy_decl_shape(n as DeclarationNode*); }
             NodeKind::ClassDeclaration          => { return this.visit_class(n as ClassDeclNode*); }
 
@@ -730,9 +729,10 @@ type struct ASTCloner {
 
     // Declaration visitors
 
-    visit_method(mut &this, node: MethodNode*) -> ASTNode* {
-        mut c: MethodNode* = new MethodNode(this.clone_func_decl(node.func), node.span);
-        this.copy_decl_base(node, c);
+    /// The payload of a method's copy; the generic method it specializes is
+    /// not carried (a copy is the same method, not an instance of it).
+    copy_method(mut &this, node: MethodDecl*) -> MethodDecl* {
+        mut c: MethodDecl* = MethodDecl::new(this.clone_func_decl(node.func));
         c.visibility            = node.visibility;
         c.is_constructor        = node.is_constructor;
         c.is_destructor         = node.is_destructor;
@@ -911,7 +911,7 @@ type struct ASTCloner {
                     c.fields.push(this.copy_decl_shape(n.fields[i]));
                 }
                 for (mut i: i64 = 0; i < n.methods.length; i++) {
-                    c.methods.push(this.dispatch_node(n.methods[i]) as MethodNode*);
+                    c.methods.push(DeclarationNode::with_shape(this.dispatch_node(n.methods[i])));
                 }
                 DeclKind::Union(c)
             }
@@ -939,7 +939,7 @@ type struct ASTCloner {
                     c.fields.push(this.copy_decl_shape(n.fields[i]));
                 }
                 for (mut i: i64 = 0; i < n.methods.length; i++) {
-                    c.methods.push(this.dispatch_node(n.methods[i]) as MethodNode*);
+                    c.methods.push(DeclarationNode::with_shape(this.dispatch_node(n.methods[i])));
                 }
                 // Bindgen-only blob accessors (shallow: shares the value_type
                 // annotation pointers, as elsewhere in cloning).  Empty for every
@@ -995,7 +995,7 @@ type struct ASTCloner {
                     c.assoc_binding_annotations.push(this.clone_type_annotation(n.assoc_binding_annotations[i]));
                 }
                 for (mut i: i64 = 0; i < n.methods.length; i++) {
-                    c.methods.push(this.dispatch_node(n.methods[i]) as MethodNode*);
+                    c.methods.push(DeclarationNode::with_shape(this.dispatch_node(n.methods[i])));
                 }
                 DeclKind::Impl(c)
             }
@@ -1016,6 +1016,7 @@ type struct ASTCloner {
                 const skip_gp: boolean = this.consume_skip_generics();
                 DeclKind::Function(this.copy_function(n, name, skip_gp))
             }
+            DeclKind::Method(n) => { DeclKind::Method(this.copy_method(n)) }
             DeclKind::Variable(n) => {
                 const c: VarDecl* = this.copy_var(n);
                 // A local declaration's decided type is carried, and a copy's
@@ -1058,7 +1059,7 @@ type struct ASTCloner {
             c.add_field(this.copy_decl_shape(node.fields[i]));
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            c.add_method(this.dispatch_node(node.methods[i]) as MethodNode*);
+            c.add_method(DeclarationNode::with_shape(this.dispatch_node(node.methods[i])));
         }
         return c;
     }

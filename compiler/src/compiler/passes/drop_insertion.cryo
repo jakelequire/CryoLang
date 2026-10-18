@@ -77,7 +77,7 @@ import compiler::intrinsic_kind::{ IntrinsicKind };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl,
-    DeclKind, FunctionDecl, ImplBlock, MethodNode, StructDecl,
+    DeclKind, FunctionDecl, ImplBlock, MethodDecl, StructDecl,
     UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -860,23 +860,25 @@ type struct DropInserter {
                     DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                     | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                     | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                    | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                    | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
             }
             _ => {}
         }
     }
 
-    walk_methods(mut &this, methods: &[MethodNode*]) -> void {
+    walk_methods(mut &this, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
-            this.walk_function(m.func, m);
+            this.walk_function(m.func, m_decl);
         }
     }
 
     walk_function(mut &this, func_decl: DeclarationNode*,
-                  owner_method: MethodNode*) -> void {
+                  owner_method_decl: DeclarationNode*) -> void {
+        const owner_method: MethodDecl* = DeclarationNode::method_of(owner_method_decl);
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         if (func.is_generic()) { return; }
@@ -960,7 +962,7 @@ type struct DropInserter {
         }
         // A base-class constructor initializer (`MyCtor(...) : Base(arg, ...)`)
         // runs before the body and consumes its arguments into the base
-        // subobject.  The init list lives on the owning MethodNode (null for
+        // subobject.  The init list lives on the owning MethodDecl (null for
         // free functions / trait methods).  Walk each arg in move context so a
         // by-value owning param forwarded to the base (e.g.
         // `Derived(tokens) : Base(tokens)`) is marked moved here -
@@ -4240,9 +4242,10 @@ type struct DropInserter {
             // owner's template body, which is never emitted.  `MoveCheck`
             // asks the same pin, so the two passes agree by construction.
             mut consumes: boolean = false;
-            const m: MethodNode* = this.ctx.decl_index.entry_method(c.resolved_callee.decl_entry());
+            const m_decl: DeclarationNode* = this.ctx.decl_index.entry_method(c.resolved_callee.decl_entry());
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m != null) {
-                consumes = OwnershipQuery::method_consumes_receiver(this.arena, this.intern, m);
+                consumes = OwnershipQuery::method_consumes_receiver(this.arena, this.intern, m_decl);
             }
             if (consumes && ma.object != null) {
                 this.walk_expr_move(ma.object);
