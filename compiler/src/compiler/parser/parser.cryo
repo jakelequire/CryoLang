@@ -39,7 +39,7 @@ import std::fmt;
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
     DestructureDecl, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
-    FunctionDeclNode, GenericParamDecl, ImplBlock, ImportDecl,
+    FunctionDecl, GenericParamDecl, ImplBlock, ImportDecl,
     IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
@@ -177,7 +177,6 @@ implement struct Parser {
     static is_attachable_decl(node: ASTNode*) -> boolean {
         if (node == null) { return false; }
         return match (node.kind) {
-            NodeKind::FunctionDeclaration   => { true }
             NodeKind::ClassDeclaration      => { true }
             NodeKind::Declaration           => { true }
             _                               => { false }
@@ -448,11 +447,12 @@ implement struct Parser {
 
         // Function declaration
         if (tok.kind == TokenType::KwFunction) {
-            const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
+            const func_decl: DeclarationNode* = this.parse_function_declaration(is_public);
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func != null && doc != "") {
-                func.set_documentation(doc_text);
+                func_decl.set_documentation(doc_text);
             }
-            return func;
+            return func_decl;
         }
 
         // `async function` - an async fn is parsed as an ordinary function
@@ -461,13 +461,14 @@ implement struct Parser {
         if (tok.kind == TokenType::KwAsync && this.peek_at(1).kind == TokenType::KwFunction) {
             const async_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'async'
-            const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
+            const func_decl: DeclarationNode* = this.parse_function_declaration(is_public);
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func != null) {
                 func.set_async(true);
-                func.note_modifier_span(async_span);
-                if (doc != "") { func.set_documentation(doc_text); }
+                func_decl.note_modifier_span(async_span);
+                if (doc != "") { func_decl.set_documentation(doc_text); }
             }
-            return func;
+            return func_decl;
         }
 
         // Variable declaration: const or mut.  If the next-after token is `{`
@@ -536,21 +537,23 @@ implement struct Parser {
         if (tok.kind == TokenType::KwStatic && this.peek_at(1).kind == TokenType::KwFunction) {
             const static_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'static'
-            const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
+            const func_decl: DeclarationNode* = this.parse_function_declaration(is_public);
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func != null) {
                 func.set_static(true);
-                func.note_modifier_span(static_span);
-                if (doc != "") { func.set_documentation(doc_text); }
+                func_decl.note_modifier_span(static_span);
+                if (doc != "") { func_decl.set_documentation(doc_text); }
             }
-            return func;
+            return func_decl;
         }
 
         // Intrinsic function declaration
         if (tok.kind == TokenType::KwIntrinsic) {
             if (this.peek_at(1).kind == TokenType::KwFunction && this.peek_at(3).kind == TokenType::LAngle) {
-                const gi: FunctionDeclNode* = this.parse_generic_intrinsic_declaration();
-                if (gi != null && doc != "") { gi.set_documentation(doc_text); }
-                return gi;
+                const gi_decl: DeclarationNode* = this.parse_generic_intrinsic_declaration();
+                const gi: FunctionDecl* = DeclarationNode::fn_of(gi_decl);
+                if (gi != null && doc != "") { gi_decl.set_documentation(doc_text); }
+                return gi_decl;
             }
             const intr: DeclarationNode* = this.parse_intrinsic_declaration();
             if (intr != null && doc != "") { intr.set_documentation(doc_text); }
@@ -708,7 +711,7 @@ implement struct Parser {
     /// Parse a function declaration: `function name<T>(params) -> RetType { body }`.
     /// The leading `function` keyword is optional: trait bodies use the
     /// keyword-less `name(params) -> RetType;` form for declarations.
-    parse_function_declaration(is_public: boolean) -> FunctionDeclNode* {
+    parse_function_declaration(is_public: boolean) -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_function_declaration()");
         const start: Token = this.current();
         if (this.check(TokenType::KwFunction)) {
@@ -722,9 +725,10 @@ implement struct Parser {
             name_tok = this.consume(TokenType::Identifier, "function name");
         }
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
+        mut func: FunctionDecl* = FunctionDecl::new(name);
+        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
         func.set_public(is_public);
-        func.set_name_span(this.span_from_token(name_tok));
+        func_decl.set_name_span(this.span_from_token(name_tok));
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
@@ -734,7 +738,7 @@ implement struct Parser {
             }
         }
 
-        this.parse_function_param_list_into(func);
+        this.parse_function_param_list_into(func_decl);
 
         // Optional return type
         if (this.match_tok(TokenType::Arrow)) {
@@ -758,8 +762,8 @@ implement struct Parser {
             this.consume(TokenType::Semicolon, "';' or '{'");
         }
 
-        func.span = this.span_from(start);
-        return func;
+        func_decl.span = this.span_from(start);
+        return func_decl;
     }
 
     /// Emit E0359 for `protected` (block or inline form) used inside a struct.
@@ -786,7 +790,8 @@ implement struct Parser {
     /// (`...`) and named (`name...`) variadic markers. Shared by free-fn,
     /// method, and constructor parsing so the variadic-detection rules don't
     /// drift across the three sites.
-    parse_function_param_list_into(func: FunctionDeclNode*) -> void {
+    parse_function_param_list_into(func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         this.consume(TokenType::LParen, "'('");
         if (!this.check(TokenType::RParen)) {
             const params: [DeclarationNode*] = this.parse_parameter_list();
@@ -901,12 +906,13 @@ implement struct Parser {
     /// instead of a case every later stage re-derives.  Its span is zero-width
     /// at the method's name: a report about it points at the method, and it
     /// covers no written text.
-    give_receiver(func: FunctionDeclNode*, is_static: boolean) -> void {
+    give_receiver(func_decl: DeclarationNode*, is_static: boolean) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || is_static) { return; }
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             if (DeclarationNode::var_of(func.parameters[i]).is_receiver()) { return; }
         }
-        const at: SourceSpan = if (func.name_span.has_location()) { func.name_span } else { func.span };
+        const at: SourceSpan = if (func_decl.name_span.has_location()) { func_decl.name_span } else { func_decl.span };
         const span: SourceSpan = SourceSpan::new(at.file, at.start_line, at.start_col,
                                                  at.start_line, at.start_col);
         mut param: VarDecl* = VarDecl::new(this.ctx.intern("&this"));
@@ -1385,7 +1391,7 @@ implement struct Parser {
                 if (next.kind == TokenType::LParen || next.kind == TokenType::LAngle) {
                     const method: MethodNode* = this.parse_method(member_visibility);
                     if (method != null) {
-                        if (member_is_async && method.func != null) { method.func.set_async(true); }
+                        if (member_is_async && method.func != null) { DeclarationNode::fn_of(method.func).set_async(true); }
                         if (doc != "") { method.set_documentation(doc); }
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                             method.add_directive(pending_dirs[pi]);
@@ -1440,11 +1446,12 @@ implement struct Parser {
         const name: SymbolStr = this.intern_lexeme(name_tok);
 
         // Parse as function declaration
-        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
+        mut func: FunctionDecl* = FunctionDecl::new(name);
+        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
 
-        this.parse_function_param_list_into(func);
+        this.parse_function_param_list_into(func_decl);
 
-        mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
+        mut method: MethodNode* = new MethodNode(func_decl, this.span_from_token(start));
         method.set_constructor(true);
         method.set_visibility(visibility);
 
@@ -1485,12 +1492,13 @@ implement struct Parser {
         const name_tok: Token = this.advance(); // consume class name
         const name: SymbolStr = this.ctx.intern("~" + name_tok.lexeme);
 
-        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
+        mut func: FunctionDecl* = FunctionDecl::new(name);
+        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
 
         this.consume(TokenType::LParen, "'('");
         this.consume(TokenType::RParen, "')'");
 
-        mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
+        mut method: MethodNode* = new MethodNode(func_decl, this.span_from_token(start));
         method.set_destructor(true);
         method.set_visibility(visibility);
 
@@ -1561,7 +1569,7 @@ implement struct Parser {
             if (is_static || extra.is_static) { method.set_static(true); }
             if (is_virtual) { method.set_virtual(true); }
             if (is_override) { method.set_override(true); }
-            if ((is_async || extra.is_async) && method.func != null) { method.func.set_async(true); }
+            if ((is_async || extra.is_async) && method.func != null) { DeclarationNode::fn_of(method.func).set_async(true); }
         }
         return method;
     }
@@ -1572,8 +1580,9 @@ implement struct Parser {
         const name_tok: Token = this.advance(); // consume method name
         const name: SymbolStr = this.intern_lexeme(name_tok);
 
-        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
-        func.set_name_span(this.span_from_token(name_tok));
+        mut func: FunctionDecl* = FunctionDecl::new(name);
+        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
+        func_decl.set_name_span(this.span_from_token(name_tok));
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
@@ -1583,7 +1592,7 @@ implement struct Parser {
             }
         }
 
-        this.parse_function_param_list_into(func);
+        this.parse_function_param_list_into(func_decl);
 
         // Optional return type
         if (this.match_tok(TokenType::Arrow)) {
@@ -1600,7 +1609,7 @@ implement struct Parser {
             }
         }
 
-        mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
+        mut method: MethodNode* = new MethodNode(func_decl, this.span_from_token(start));
         method.set_visibility(visibility);
 
         // Body or semicolon
@@ -1811,12 +1820,13 @@ implement struct Parser {
             const head: TokenType = this.current().kind;
             if (head == TokenType::Identifier || head == TokenType::KwFunction
                 || head.is_keyword()) {
-                const func: FunctionDeclNode* = this.parse_function_declaration(false);
+                const func_decl: DeclarationNode* = this.parse_function_declaration(false);
+                const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
                 if (func != null) {
                     if (is_static) { func.set_static(true); }
                     if (trait_mods.is_async) { func.set_async(true); }
-                    this.give_receiver(func, is_static);
-                    tr.methods.push(func);
+                    this.give_receiver(func_decl, is_static);
+                    tr.methods.push(func_decl);
                 }
             } else {
                 this.error_unexpected();
@@ -2421,7 +2431,7 @@ implement struct Parser {
                 const method: MethodNode* = this.parse_method(vis);
                 if (method != null) {
                     if (is_static) { method.set_static(true); }
-                    if (mods.is_async && method.func != null) { method.func.set_async(true); }
+                    if (mods.is_async && method.func != null) { DeclarationNode::fn_of(method.func).set_async(true); }
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
@@ -2483,12 +2493,13 @@ implement struct Parser {
                 ext_public = false;
             }
             if (this.check(TokenType::KwFunction)) {
-                const func: FunctionDeclNode* = this.parse_extern_function(ext_public);
+                const func_decl: DeclarationNode* = this.parse_extern_function(ext_public);
+                const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
                 if (func != null) {
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        func.add_directive(pending_dirs[pi]);
+                        func_decl.add_directive(pending_dirs[pi]);
                     }
-                    node.add_function(func);
+                    node.add_function(func_decl);
                 }
             } else if (this.check(TokenType::KwMut) || this.check(TokenType::KwConst)) {
                 const gvar: DeclarationNode* = this.parse_extern_global();
@@ -2601,9 +2612,9 @@ implement struct Parser {
     }
 
     /// Parse an extern function declaration (no body).
-    parse_extern_function(is_public: boolean) -> FunctionDeclNode* {
-        const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
-        return func;
+    parse_extern_function(is_public: boolean) -> DeclarationNode* {
+        const func_decl: DeclarationNode* = this.parse_function_declaration(is_public);
+        return func_decl;
     }
 
     /// Parse an imported global inside an `extern "C"` block:
@@ -2707,12 +2718,13 @@ implement struct Parser {
     ///   intrinsic function name<T, ..>(params) -> RetType where .. ;
     /// It is a generic function with no body, and is typed and specialized
     /// as one; its entries carry the kind its name lowers as.
-    parse_generic_intrinsic_declaration() -> FunctionDeclNode* {
+    parse_generic_intrinsic_declaration() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'intrinsic'
         this.advance(); // consume 'function'
         const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic name");
-        mut func: FunctionDeclNode* = new FunctionDeclNode(this.intern_lexeme(name_tok), this.span_from_token(start));
-        func.set_name_span(this.span_from_token(name_tok));
+        mut func: FunctionDecl* = FunctionDecl::new(this.intern_lexeme(name_tok));
+        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
+        func_decl.set_name_span(this.span_from_token(name_tok));
         func.set_intrinsic(true);
         // Reachable from every module, as every intrinsic declaration is.
         func.set_public(true);
@@ -2720,7 +2732,7 @@ implement struct Parser {
         for (mut i: i64 = 0; i < gen_params.length; i++) {
             func.add_generic_param(gen_params[i]);
         }
-        this.parse_function_param_list_into(func);
+        this.parse_function_param_list_into(func_decl);
         if (this.match_tok(TokenType::Arrow)) {
             func.set_return_type_annotation(this.parse_type_annotation());
         }
@@ -2731,8 +2743,8 @@ implement struct Parser {
             }
         }
         this.consume(TokenType::Semicolon, "';'");
-        func.span = this.span_from(start);
-        return func;
+        func_decl.span = this.span_from(start);
+        return func_decl;
     }
 
     /// Parse generic type parameters: <T, U, A = DefaultType>

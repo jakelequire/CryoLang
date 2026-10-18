@@ -2,7 +2,7 @@
 ///
 /// Processes CImport extern blocks: `extern module name := "C" { #include ... }`.
 /// For each `#include`, libclang builds a real translation unit, and a cursor
-/// walk emits a FunctionDeclNode per top-level C function declaration into the
+/// walk emits a FunctionDecl per top-level C function declaration into the
 /// extern block - so downstream passes (name resolution, type resolution,
 /// codegen) treat them identically to hand-written extern functions.
 ///
@@ -67,7 +67,7 @@ import std::core::mem;
 import compiler::ast::declaration::{
     BindingAccessor, DeclarationNode, DeclKind, EnumDecl, EnumVariant, ExternBlock,
     FieldDecl,
-    FunctionDeclNode, ImplBlock, MethodNode, ReceiverForm, StructDecl,
+    FunctionDecl, ImplBlock, MethodNode, ReceiverForm, StructDecl,
     TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -353,7 +353,7 @@ type struct Importer {
     // `(CXCursor, CXCursor, void*) -> i32`).  Each casts its `client: void*`
     // back to the live `Importer` and delegates to an instance method.
 
-    /// Top-level visitor.  Emits a FunctionDeclNode per top-level FunctionDecl,
+    /// Top-level visitor.  Emits a FunctionDecl per top-level FunctionDecl,
     /// and (unless `functions_only`) typedef/struct/union/enum/macro decls.
     /// System-header decls are filtered out (`is_in_system_header`) so a header's
     /// own `#include <stddef.h>` does not drag glibc's ~100 internal typedefs
@@ -574,12 +574,13 @@ type struct Importer {
         this.emit_top_level(vnode_decl as ASTNode*);
     }
 
-    /// Emit one FunctionDeclNode for a C function prototype.
+    /// Emit one FunctionDecl for a C function prototype.
     emit_function(mut &this, cursor: CXCursor) -> void {
         const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         const nargs: i32 = clang::clang_Cursor_getNumArguments(cursor);
 
-        mut func: FunctionDeclNode* = new FunctionDeclNode(name_sym, SourceSpan::none());
+        mut func: FunctionDecl* = FunctionDecl::new(name_sym);
+        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), SourceSpan::none());
         func.return_type_annotation = this.types.map(clang::clang_getCursorResultType(cursor));
 
         mut params: [DeclarationNode*] = [];
@@ -616,7 +617,7 @@ type struct Importer {
             func.has_link_name = true;
         }
 
-        this.extern_node.add_function(func);
+        this.extern_node.add_function(func_decl);
         this.count = this.count + 1;
     }
 
@@ -788,8 +789,8 @@ type struct Importer {
         }
 
         const is_static: boolean = cursor.is_static_method();
-        mut func: FunctionDeclNode* = new FunctionDeclNode(
-            cursor.intern_spelling(this.ctx), SourceSpan::none());
+        mut func: FunctionDecl* = FunctionDecl::new(cursor.intern_spelling(this.ctx));
+        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), SourceSpan::none());
         func.return_type_annotation = this.types.map(clang::clang_getCursorResultType(cursor));
         func.is_public = true;
         func.is_static = is_static;
@@ -822,7 +823,7 @@ type struct Importer {
         func.is_variadic =
             clang::clang_isFunctionTypeVariadic(clang::clang_getCursorType(cursor)) != 0;
 
-        mut method: MethodNode* = new MethodNode(func, SourceSpan::none());
+        mut method: MethodNode* = new MethodNode(func_decl, SourceSpan::none());
         method.set_visibility(Visibility::Public);
         method.set_static(is_static);
         impl.methods.push(method);
@@ -1784,7 +1785,7 @@ type struct Importer {
     is_bound_function(&this, name: string) -> boolean {
         const sym: SymbolStr = this.ctx.intern_table.intern(name);
         for (mut i: i64 = 0; i < this.extern_node.functions.length; i++) {
-            if (this.extern_node.functions[i].name.equals(sym)) { return true; }
+            if (DeclarationNode::fn_of(this.extern_node.functions[i]).name.equals(sym)) { return true; }
         }
         return false;
     }
@@ -1843,9 +1844,10 @@ type struct Importer {
         // `is_vendor`).  A variadic target can't be forwarded (no way to pass a
         // C `...` through), so it's left for the caller to report.
         if (this.is_vendor) {
-            const target_fn: FunctionDeclNode* = this.find_function(tsym);
+            const target_fn_decl: DeclarationNode* = this.find_function(tsym);
+            const target_fn: FunctionDecl* = DeclarationNode::fn_of(target_fn_decl);
             if (target_fn != null && !target_fn.is_variadic) {
-                this.emit_forwarding_wrapper(name_sym, target_fn);
+                this.emit_forwarding_wrapper(name_sym, target_fn_decl);
                 return true;
             }
         }
@@ -1854,9 +1856,9 @@ type struct Importer {
     }
 
     /// The bound extern function named `sym`, or null.
-    find_function(&this, sym: SymbolStr) -> FunctionDeclNode* {
+    find_function(&this, sym: SymbolStr) -> DeclarationNode* {
         for (mut i: i64 = 0; i < this.extern_node.functions.length; i++) {
-            if (this.extern_node.functions[i].name.equals(sym)) {
+            if (DeclarationNode::fn_of(this.extern_node.functions[i]).name.equals(sym)) {
                 return this.extern_node.functions[i];
             }
         }
@@ -1871,8 +1873,10 @@ type struct Importer {
     /// `argN`); the call forwards them positionally.  A `void` target uses an
     /// expression statement instead of a return.  Top-level decls are public by
     /// default, so the wrapper is visible as `<Ns>::<alias>` with no modifier.
-    emit_forwarding_wrapper(mut &this, alias_name: SymbolStr, target_fn: FunctionDeclNode*) -> void {
-        mut wrapper: FunctionDeclNode* = new FunctionDeclNode(alias_name, SourceSpan::none());
+    emit_forwarding_wrapper(mut &this, alias_name: SymbolStr, target_fn_decl: DeclarationNode*) -> void {
+        const target_fn: FunctionDecl* = DeclarationNode::fn_of(target_fn_decl);
+        mut wrapper: FunctionDecl* = FunctionDecl::new(alias_name);
+        const wrapper_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(wrapper), SourceSpan::none());
         wrapper.is_public = true;
         wrapper.return_type_annotation = target_fn.return_type_annotation;
 
@@ -1908,7 +1912,7 @@ type struct Importer {
         wrapper.body = block;
 
         this.seen_names.push(alias_name);
-        this.emit_top_level(wrapper as ASTNode*);
+        this.emit_top_level(wrapper_decl as ASTNode*);
     }
 
     /// True if `ann` denotes `void` (null, or the `void` primitive).
@@ -2344,7 +2348,7 @@ type struct Importer {
     }
 
     /// Build a libclang TU (forcing C with `-x c`), walk its top-level
-    /// cursors, and emit FunctionDeclNodes.
+    /// cursors, and emit function declarations.
     /// `unsaved`/`num_unsaved` carry an in-memory buffer for system headers
     /// (null/0 for a real file).  Returns the number of functions emitted.
     /// `out_report` (when non-null) accumulates this TU's skipped/approximated

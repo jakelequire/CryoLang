@@ -45,7 +45,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
-    FunctionDeclNode, ImplBlock, MethodNode, StructDecl, UnionDecl, VarDecl
+    FunctionDecl, ImplBlock, MethodNode, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     CalleePin,
@@ -229,7 +229,6 @@ type struct IRGeneratorVisitor {
 
             NodeKind::Statement              => { return this.emit_stmt(n as Stmt*); }
 
-            NodeKind::FunctionDeclaration    => { return this.visit_function(n as FunctionDeclNode*); }
             NodeKind::ClassDeclaration       => { return this.visit_class(n as ClassDeclNode*); }
 
             NodeKind::Program | NodeKind::MethodDeclaration
@@ -240,6 +239,7 @@ type struct IRGeneratorVisitor {
 
             NodeKind::Declaration => {
                 match ((n as DeclarationNode*).shape) {
+                    DeclKind::Function(_) => { return this.visit_function(DeclarationNode::with_shape(n)); }
                     DeclKind::Variable(v) => { return this.visit_var(n as DeclarationNode*, v); }
                     DeclKind::Destructure(dd) => { return this.visit_destructure(dd); }
                     DeclKind::Union(u) => { return this.visit_union(u); }
@@ -324,7 +324,7 @@ type struct IRGeneratorVisitor {
         for (mut i: i64 = 0; i < stmts.length; i++) {
             const stmt: ASTNode* = stmts[i];
             if (stmt == null) { continue; }
-            // Top-level dispatch: the visit methods for FunctionDeclNode /
+            // Top-level dispatch: the visit methods for FunctionDecl /
             // ImplBlock / StructDecl / ClassDeclNode handle their own
             // emission.  A kind with none (TypeAlias, Enum, Trait, Namespace,
             // Import, etc.) emits nothing.
@@ -357,8 +357,8 @@ type struct IRGeneratorVisitor {
                         this.state.current_impl_target = body.owner;
                         this.decl_visit.generate_method_body(this, d as MethodNode*, body.base);
                         this.state.current_impl_target = TypeRef::invalid();
-                    } else if (d != null && d.kind == NodeKind::FunctionDeclaration) {
-                        this.decl_visit.generate_function_body(this, d as FunctionDeclNode*);
+                    } else if (d != null && DeclarationNode::fn_of(d) != null) {
+                        this.decl_visit.generate_function_body(this, DeclarationNode::with_shape(d));
                     }
                     const fn_val: LValue = this.cg.functions.get(di.entry_symbol(id).spelling());
                     fn_val.set_linkage(LLinkage::AvailableExternally);
@@ -377,9 +377,9 @@ type struct IRGeneratorVisitor {
     // `generate_impl_block`, `generate_method_body`,
     // `emit_base_ctor_call`).
 
-    visit_function(mut &this, node: FunctionDeclNode*) -> Emitted {
+    visit_function(mut &this, node_decl: DeclarationNode*) -> Emitted {
         mut out: Emitted = Emitted::none();
-        this.decl_visit.emit_function_decl(this, node);
+        this.decl_visit.emit_function_decl(this, node_decl);
         return out;
     }
 

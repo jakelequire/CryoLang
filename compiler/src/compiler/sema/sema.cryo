@@ -69,7 +69,7 @@ import compiler::passes::type_resolution::{ TypeResolutionPasses, TypeResolution
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
-    FunctionDeclNode, GenericParamDecl, ImplBlock, MethodNode,
+    FunctionDecl, GenericParamDecl, ImplBlock, MethodNode,
     StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -352,17 +352,6 @@ type struct SemaVisitor {
             const stmt: ASTNode* = node.statements[i];
             if (stmt == null) { continue; }
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                    // A lowered one has already had `is_async` cleared.
-                    if (f.is_async && f.body != null) {
-                        // `async function main` is renamed out of the entry-point
-                        // slot first, so the future `declare` registers is keyed
-                        // to the renamed function and not to `main`.
-                        this.async_lower.desugar_async_main(f);
-                        this.async_lower.declare(f);
-                    }
-                }
                 // A declaration's owner is its own registered type and the
                 // key it registered under, both off the stamp.
                 NodeKind::ClassDeclaration => {
@@ -372,6 +361,18 @@ type struct SemaVisitor {
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Function(_) => {
+                            const f_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
+                            // A lowered one has already had `is_async` cleared.
+                            if (f.is_async && f.body != null) {
+                                // `async function main` is renamed out of the entry-point
+                                // slot first, so the future `declare` registers is keyed
+                                // to the renamed function and not to `main`.
+                                this.async_lower.desugar_async_main(f_decl);
+                                this.async_lower.declare(f_decl);
+                            }
+                        }
                         DeclKind::Impl(ib) => {
                             // The head's owner, off the stamp; the written
                             // target is what a refusal names.
@@ -418,8 +419,8 @@ type struct SemaVisitor {
         if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, written); return; }
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
-            if (m == null || m.func == null || m.func.body == null) { continue; }
-            if (!m.func.is_async) { continue; }
+            if (m == null || m.func == null || DeclarationNode::fn_of(m.func).body == null) { continue; }
+            if (!DeclarationNode::fn_of(m.func).is_async) { continue; }
             // Each override lowers to its OWN future struct, so they return
             // different types and cannot share a vtable slot. Clearing the flag
             // keeps the method compiling as an ordinary one instead of raising a
@@ -428,7 +429,7 @@ type struct SemaVisitor {
                 this.ctx.emit_error_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
                     "a `virtual` or `override` method cannot be `async`: each implementation returns its own future type, so the overrides have no common return type to dispatch through",
                     m.func.span);
-                m.func.set_async(false);
+                DeclarationNode::fn_of(m.func).set_async(false);
                 continue;
             }
             mut own: AsyncOwner = AsyncOwner {
@@ -454,12 +455,12 @@ type struct SemaVisitor {
         const owner: string = if (written.is_valid()) { this.intern.resolve(written) } else { "?" };
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
-            if (m == null || m.func == null || !m.func.is_async) { continue; }
+            if (m == null || m.func == null || !DeclarationNode::fn_of(m.func).is_async) { continue; }
             this.ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
                 fmt::format("cannot resolve the owner type `%s` of `async` method `%s`, so its future cannot be declared",
-                       owner, this.intern.resolve(m.func.name)),
+                       owner, this.intern.resolve(DeclarationNode::fn_of(m.func).name)),
                 m.func.span);
-            m.func.set_async(false);
+            DeclarationNode::fn_of(m.func).set_async(false);
         }
     }
 
@@ -578,7 +579,8 @@ type struct SemaVisitor {
 
     // -- Declaration visitors --
 
-    visit_function(mut &this, node: FunctionDeclNode*) -> void {
+    visit_function(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node.body == null) { return; }
         if (node.is_generic()) {
             // A generic body is typed by the symbolic walk, against abstract
@@ -587,21 +589,21 @@ type struct SemaVisitor {
             // future it produces is generic in the same parameters, so the
             // monomorphizer specializes it from the same demand that specializes
             // the function.
-            this.symbolic_check_body(node, TypeRef::invalid(), TypeRef::invalid());
+            this.symbolic_check_body(node_decl, TypeRef::invalid(), TypeRef::invalid());
             if (node.is_async) {
-                this.async_lower.lower(node);
+                this.async_lower.lower(node_decl);
             }
             return;
         }
-        this.enter_function(node, TypeRef::invalid());
+        this.enter_function(node_decl, TypeRef::invalid());
         this.visit_block(node.body);
         this.state.body_count += 1;
-        this.check_function_returns(node);
-        this.check_opaque_return_item(node);
+        this.check_function_returns(node_decl);
+        this.check_opaque_return_item(node_decl);
         // Lower an `async function` into a Future state machine AFTER its body is
         // typed against the declared Output type. The generic case returned above.
         if (node.is_async) {
-            this.async_lower.lower(node);
+            this.async_lower.lower(node_decl);
         }
     }
 
@@ -641,7 +643,8 @@ type struct SemaVisitor {
         const saved_trait: TypeRef = this.state.symbolic_trait;
         this.state.symbolic_trait = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:TraitDecl");
         for (mut j: i64 = 0; j < node.methods.length; j++) {
-            const func: FunctionDeclNode* = node.methods[j];
+            const func_decl: DeclarationNode* = node.methods[j];
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func == null || func.body == null) { continue; }
             // Every default method is walked SYMBOLICALLY: its receiver `This` is
             // abstract whether or not the method has type parameters of its own,
@@ -650,7 +653,7 @@ type struct SemaVisitor {
             // leaves every such call, and everything bound from it, untyped.
             // A generic default also needs it for `static match (T)`, whose arms
             // are deferred to monomorphization instead of tripping E0645.
-            this.symbolic_check_body(func, this_placeholder, this_placeholder);
+            this.symbolic_check_body(func_decl, this_placeholder, this_placeholder);
         }
         this.state.symbolic_trait = saved_trait;
     }
@@ -719,8 +722,8 @@ type struct SemaVisitor {
     visit_methods(mut &this, methods: &[MethodNode*], owner_type: TypeRef) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
-            if (method == null || method.func == null || method.func.body == null) { continue; }
-            if (method.func.is_generic()) {
+            if (method == null || method.func == null || DeclarationNode::fn_of(method.func).body == null) { continue; }
+            if (DeclarationNode::fn_of(method.func).is_generic()) {
                 const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
                 // Same shape as the free-function case: the walk types the body,
                 // and an `async` one's state machine is then built from what it
@@ -730,7 +733,7 @@ type struct SemaVisitor {
                 const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
                 this.symbolic_check_body(method.func, sym_this, owner_type);
                 this.async_lower.end_body_check(method.func, displaced);
-                if (method.func.is_async) {
+                if (DeclarationNode::fn_of(method.func).is_async) {
                     this.async_lower.lower(method.func);
                 }
                 continue;
@@ -746,7 +749,7 @@ type struct SemaVisitor {
             // specialization's copy of such a method is that clone's source
             // and is never emitted; its body is not substituted, so after
             // monomorphization it is not walked, like a generic template.
-            if (method.func.is_self_returning_default || method.func.is_lazy_self_growing) {
+            if (DeclarationNode::fn_of(method.func).is_self_returning_default || DeclarationNode::fn_of(method.func).is_lazy_self_growing) {
                 const lazy_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
                 this.symbolic_check_body(method.func, lazy_this, owner_type);
                 continue;
@@ -764,15 +767,15 @@ type struct SemaVisitor {
                     this.resolve_expr(method.base_ctor_args[k]);
                 }
             }
-            this.visit_block(method.func.body);
+            this.visit_block(DeclarationNode::fn_of(method.func).body);
             this.state.body_count += 1;
             if (!method.is_constructor && !method.is_destructor) {
                 this.check_function_returns(method.func);
             }
             this.async_lower.end_body_check(method.func, displaced);
             // Lower AFTER the body is typed against the declared Output type,
-            // exactly as `visit(FunctionDeclNode*)` does for a free function.
-            if (method.func.is_async) { this.async_lower.lower(method.func); }
+            // exactly as `visit(FunctionDecl*)` does for a free function.
+            if (DeclarationNode::fn_of(method.func).is_async) { this.async_lower.lower(method.func); }
             this.state.current_owner_type = saved_owner;
         }
     }
@@ -827,16 +830,17 @@ type struct SemaVisitor {
     /// `async function` builds its state machine out of these very types. So the
     /// walk before monomorphization is unconditional; it is not a diagnostic
     /// add-on to be switched off.
-    symbolic_check_body(mut &this, func: FunctionDeclNode*, this_type: TypeRef,
+    symbolic_check_body(mut &this, func_decl: DeclarationNode*, this_type: TypeRef,
                         owner_type: TypeRef) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         const sink: DiagnosticSink* = this.ctx.diagnostics;
         if (sink == null) { return; }
         const snap: DiagnosticSnapshot = sink.snapshot();
         const saved_owner:    TypeRef = this.state.current_owner_type;
         const saved_symbolic: boolean = this.state.in_symbolic_check;
-        const saved_cur_func: FunctionDeclNode* = this.state.symbolic_current_func;
-        this.state.symbolic_current_func = func;
+        const saved_cur_func_decl: DeclarationNode* = this.state.symbolic_current_func;
+        this.state.symbolic_current_func = func_decl;
         mut saved_method_nodes: [DeclarationNode*] = [];
         swap(&this.state.symbolic_method_param_nodes, &saved_method_nodes);
         this.state.current_owner_type = owner_type;
@@ -855,17 +859,17 @@ type struct SemaVisitor {
         mut eff_this: TypeRef = this_type;
         if (this_type.is_valid() && owner_type.is_valid() && this_type.equals(owner_type)) {
             eff_this = this.symbolic.symbolic_owner_instance(owner_type);
-            const written: TypeRef = this.written_receiver_type(func);
+            const written: TypeRef = this.written_receiver_type(func_decl);
             if (written.is_valid()) { eff_this = written; }
         }
-        this.enter_function(func, eff_this);
+        this.enter_function(func_decl, eff_this);
         this.visit_block(func.body);
 
         if (ar != null) { ar.set_symbolic_no_demand(saved_no_demand); }
         swap(&this.state.symbolic_method_param_nodes, &saved_method_nodes);
         this.state.in_symbolic_check  = saved_symbolic;
         this.state.current_owner_type = saved_owner;
-        this.state.symbolic_current_func = saved_cur_func;
+        this.state.symbolic_current_func = saved_cur_func_decl;
         this.state.symbolic_bodies_walked += 1;
         this.state.symbolic_total_would_emit += sink.errors_since(snap) as i64;
     }
@@ -874,7 +878,8 @@ type struct SemaVisitor {
     /// with a type of its own (`only_i32(this: &Wrapper<i32>)`), seen through
     /// the reference; invalid for a receiver written `this` or `&this`, which
     /// is the owner with its own parameters.
-    written_receiver_type(&this, func: FunctionDeclNode*) -> TypeRef {
+    written_receiver_type(&this, func_decl: DeclarationNode*) -> TypeRef {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const p_decl: DeclarationNode* = func.parameters[i];
             const p: VarDecl* = DeclarationNode::var_of(p_decl);
@@ -918,7 +923,7 @@ type struct SemaVisitor {
         this.state.symbolic_owner_is_generic  = true;
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
-            if (method == null || method.func == null || method.func.body == null) { continue; }
+            if (method == null || method.func == null || DeclarationNode::fn_of(method.func).body == null) { continue; }
             const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
             // A method on a GENERIC owner reaches sema only here, whether or not
             // it has generic parameters of its own — so this is where an `async`
@@ -926,7 +931,7 @@ type struct SemaVisitor {
             const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
             this.symbolic_check_body(method.func, sym_this, owner_type);
             this.async_lower.end_body_check(method.func, displaced);
-            if (method.func.is_async) {
+            if (DeclarationNode::fn_of(method.func).is_async) {
                 this.async_lower.lower(method.func);
             }
         }
@@ -944,18 +949,19 @@ type struct SemaVisitor {
         return ResolutionContext::new("");
     }
 
-    enter_function(mut &this, func: FunctionDeclNode*, fn_this_type: TypeRef) -> void {
+    enter_function(mut &this, func_decl: DeclarationNode*, fn_this_type: TypeRef) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         this.scopes.reset();
         this.state.return_type     = func.resolved_return_type;
         this.state.return_type_ann = func.return_type_annotation;
         // Provenance for the body's annotations, from the declaration's own
         // span rather than from wherever the walk happens to be standing.
-        this.state.async_poll_output = this.async_poll_output_of(func);
+        this.state.async_poll_output = this.async_poll_output_of(func_decl);
         this.state.this_type       = fn_this_type;
         this.state.this_is_mut = false;
         this.state.this_is_by_ref = false;
         this.state.receiver_sym = SymbolID::invalid();
-        this.state.current_func = func;
+        this.state.current_func = func_decl;
         this.state.in_lambda_depth     = 0;
         this.state.current_lambda      = null;
 
@@ -1665,7 +1671,6 @@ type struct SemaVisitor {
 
             NodeKind::Statement              => { this.dispatch_stmt(n as Stmt*); }
 
-            NodeKind::FunctionDeclaration    => { this.visit_function(n as FunctionDeclNode*); }
             NodeKind::ClassDeclaration       => { this.visit_class(n as ClassDeclNode*); }
 
             NodeKind::MethodDeclaration
@@ -1675,6 +1680,7 @@ type struct SemaVisitor {
             NodeKind::Declaration => {
                 const d: DeclarationNode* = n as DeclarationNode*;
                 match (d.shape) {
+                    DeclKind::Function(_) => { this.visit_function(DeclarationNode::with_shape(n)); }
                     DeclKind::Destructure(dd) => { this.visit_destructure(d, dd); }
                     DeclKind::Variable(v)     => { this.visit_var(d, v); }
                     DeclKind::Trait(t)        => { this.visit_trait(t); }
@@ -1826,7 +1832,8 @@ type struct SemaVisitor {
             this.ctx.decl_index.def_of(ap.owning_trait, this.ctx.type_arena));
         if (tdecl == null || tdecl.generic_params.length > 0) { return TypeRef::invalid(); }
         for (mut i: i64 = 0; i < tdecl.methods.length; i++) {
-            const f: FunctionDeclNode* = tdecl.methods[i];
+            const f_decl: DeclarationNode* = tdecl.methods[i];
+            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
             if (f == null || !f.is_async || f.async_fut_slot != ap.slot) { continue; }
             if (f.return_type_annotation == null) { return TypeRef::invalid(); }
             mut rc: ResolutionContext = ResolutionContext::new("");
@@ -1895,7 +1902,7 @@ type struct SemaVisitor {
             if (refused) { return TypeRef::invalid(); }
             if (chosen.is_valid()) {
                 const decl: ASTNode* = this.ctx.decl_index.entry_decl(chosen);
-                def_id = (decl as FunctionDeclNode*).def;
+                def_id = DeclarationNode::fn_of(decl).def;
                 func_ty = this.ctx.decl_index.entry_signature(chosen);
             }
             this.calls.enforce_value_ref_visibility(def_id, ident.span);
@@ -3224,7 +3231,8 @@ type struct SemaVisitor {
     /// the three marks `declare` puts on the generated method (a synthesized
     /// body, `Future`'s `poll`), never by shape alone: a hand-written
     /// `-> Poll<Result<..>>` is a real function and keeps the ordinary rule.
-    async_poll_output_of(&this, func: FunctionDeclNode*) -> TypeRef {
+    async_poll_output_of(&this, func_decl: DeclarationNode*) -> TypeRef {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return TypeRef::invalid(); }
         if (!func.is_synthesized_body) { return TypeRef::invalid(); }
         // `origin_trait` is the trait's identity, so the comparison is against
@@ -3795,14 +3803,14 @@ type struct SemaVisitor {
     scope_receiver_method_type(mut &this, m: MethodInfo*) -> TypeRef {
         if (m == null || m.is_static || m.ast_node == null) { return TypeRef::invalid(); }
         const node: MethodNode* = m.ast_node as MethodNode*;
-        if (node.func == null || node.func.parameters.length == 0) { return TypeRef::invalid(); }
-        const recv_decl: DeclarationNode* = node.func.parameters[0];
+        if (node.func == null || DeclarationNode::fn_of(node.func).parameters.length == 0) { return TypeRef::invalid(); }
+        const recv_decl: DeclarationNode* = DeclarationNode::fn_of(node.func).parameters[0];
         const recv: VarDecl* = DeclarationNode::var_of(recv_decl);
         if (recv == null || !recv.is_receiver() || !recv.resolved_type.is_valid()) { return TypeRef::invalid(); }
         const sig: Type* = this.arena.lookup(m.function_type);
         if (sig == null || sig.kind != TypeKind::Function) { return TypeRef::invalid(); }
         const ft: FunctionType* = sig.as_function();
-        if (node.func.generic_params.length > 0) { return TypeRef::invalid(); }
+        if (DeclarationNode::fn_of(node.func).generic_params.length > 0) { return TypeRef::invalid(); }
         mut params: [TypeRef] = [recv.resolved_type];
         for (mut i: i64 = 0; i < ft.param_types.length; i++) { params.push(ft.param_types[i]); }
         const value_ft: TypeRef = this.arena.get_function(ft.return_type, &params, ft.is_variadic);
@@ -4200,14 +4208,15 @@ type struct SemaVisitor {
 
     // -- Control-flow / all-paths-return analysis --
 
-    check_function_returns(mut &this, func: FunctionDeclNode*) -> void {
+    check_function_returns(mut &this, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         if (!this.return_type_requires_return(func.resolved_return_type)) { return; }
         if (this.stmt_always_returns(func.body)) { return; }
         const fn_name: string = this.intern.resolve(func.name);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0403_MISSING_RETURN,
             fmt::format("function `%s` is declared to return a value but reaches the end of its body without returning", fn_name));
-        diag = diag.at(func.span);
+        diag = diag.at(func_decl.span);
         diag = diag.with_note("every control-flow path through the body must end in `return <expr>`, a divergent call (e.g. `panic(...)`), or an infinite `loop { ... }` with no `break`");
         diag = diag.with_note("if a missing path is unreachable, end it with `return <default>` or `panic(\"unreachable\")`");
         const body: BlockStmt* = func.body.as_block();
@@ -4599,7 +4608,8 @@ type struct SemaVisitor {
         this.ctx.emit_diagnostic(diag);
     }
 
-    check_opaque_return_item(mut &this, func: FunctionDeclNode*) -> void {
+    check_opaque_return_item(mut &this, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.return_type_annotation == null) { return; }
         if (!func.resolved_return_type.is_valid()) { return; }
         mut imp: ImplTraitAnnotation* = null;

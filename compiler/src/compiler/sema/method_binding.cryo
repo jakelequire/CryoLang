@@ -36,7 +36,7 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::{ state, type_utils, symbolic_checker, helpers };
 import std::fmt;
 import compiler::ast::declaration::{
-    AssocTypeDeclNode, ClassDeclNode, FunctionDeclNode, DeclarationNode, GenericParamDecl, ImplBlock,
+    AssocTypeDeclNode, ClassDeclNode, FunctionDecl, DeclarationNode, GenericParamDecl, ImplBlock,
     MethodNode, StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -215,9 +215,9 @@ type struct MethodBinding {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null || m.is_static) { continue; }
             if (!DeclarationIndex::holds_method(&named, m)) { continue; }
-            if (m.func.generic_params.length > 0) { return TypeRef::invalid(); }
+            if (DeclarationNode::fn_of(m.func).generic_params.length > 0) { return TypeRef::invalid(); }
             found_count += 1;
-            abstract_ret = m.func.resolved_return_type;
+            abstract_ret = DeclarationNode::fn_of(m.func).resolved_return_type;
         }
 
         // An impl block's or an enum's method: the one the selection chose,
@@ -225,7 +225,7 @@ type struct MethodBinding {
         // A call the selection chose nothing for has no return to read.
         if (found_count == 0 && chosen != null && chosen.func != null) {
             const ret: TypeRef = this.types.canonicalize_method_return(
-                this.ctx.decl_index.entry_owner_return(chosen.func.overload_entry));
+                this.ctx.decl_index.entry_owner_return(DeclarationNode::fn_of(chosen.func).overload_entry));
             if (ret.is_valid()) {
                 abstract_ret = ret;
                 found_count = 1;
@@ -284,7 +284,7 @@ type struct MethodBinding {
         if (!proj.member.is_valid()) { return TypeRef::invalid(); }
         mut out: TypeRef = TypeRef::invalid();
         if (this.state.symbolic_current_func != null) {
-            out = this.scan_projection_bounds(&this.state.symbolic_current_func.trait_bounds, proj,
+            out = this.scan_projection_bounds(&DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds, proj,
                 method_name, recv, true, dir);
         }
         if (this.state.symbolic_impl_node != null) {
@@ -370,7 +370,7 @@ type struct MethodBinding {
         }
         mut out: TypeRef = TypeRef::invalid();
         if (this.state.symbolic_current_func != null) {
-            out = this.scan_param_bounds(&this.state.symbolic_current_func.trait_bounds, param, method_name,
+            out = this.scan_param_bounds(&DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds, param, method_name,
                 recv, TypeRef::invalid(), true, dir);
         }
         if (this.state.symbolic_impl_node != null) {
@@ -399,7 +399,8 @@ type struct MethodBinding {
     /// the trait has no parameters of its own, or no bound on `param_ty`
     /// itself names it.
     bound_method_params(mut &this, param_ty: TypeRef, trait_def: DefId,
-                        func: FunctionDeclNode*) -> [TypeRef] {
+                        func_decl: DeclarationNode*) -> [TypeRef] {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         mut out: [TypeRef] = [];
         if (func == null) { return out; }
         const pt: Type* = this.arena.lookup(param_ty);
@@ -425,7 +426,7 @@ type struct MethodBinding {
     /// asks them.  Null when none does.
     param_bound_naming(&this, param: GenericParamType*, trait_def: DefId) -> TraitRef* {
         if (this.state.symbolic_current_func != null) {
-            const r: TraitRef* = MethodBinding::bound_ref_in(&this.state.symbolic_current_func.trait_bounds, param, trait_def);
+            const r: TraitRef* = MethodBinding::bound_ref_in(&DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds, param, trait_def);
             if (r != null) { return r; }
         }
         if (this.state.symbolic_impl_node != null) {
@@ -471,7 +472,8 @@ type struct MethodBinding {
     /// copy of a trait default, an `async` lowering's `poll` - is skipped:
     /// its source is walked, with its own bounds, where it is written.
     receiver_type_param(&this, recv_type: TypeRef) -> GenericParamType* {
-        const func: FunctionDeclNode* = this.state.symbolic_current_func;
+        const func_decl: DeclarationNode* = this.state.symbolic_current_func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.is_synth_default || func.is_synthesized_body) { return null; }
         mut t: Type* = this.arena.lookup(recv_type);
         mut depth: i32 = 0;
@@ -494,7 +496,8 @@ type struct MethodBinding {
     /// Whether a bound in scope of the body being walked names `param`: the
     /// function's `where` clause, the impl's, or the owner declaration's.
     param_is_bounded(&this, param: GenericParamType*) -> boolean {
-        const func: FunctionDeclNode* = this.state.symbolic_current_func;
+        const func_decl: DeclarationNode* = this.state.symbolic_current_func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func != null && MethodBinding::bounds_name_param(&func.trait_bounds, param)) { return true; }
         if (this.state.symbolic_impl_node != null
             && MethodBinding::bounds_name_param(&this.state.symbolic_impl_node.where_bounds, param)) {
@@ -509,7 +512,8 @@ type struct MethodBinding {
     /// the trait `trait_def`: names it, or names a trait it is a supertrait
     /// of.  Compared by identity.
     param_bounded_by(&this, param: GenericParamType*, trait_def: DefId) -> boolean {
-        const func: FunctionDeclNode* = this.state.symbolic_current_func;
+        const func_decl: DeclarationNode* = this.state.symbolic_current_func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func != null && this.bounds_give(&func.trait_bounds, param, trait_def)) { return true; }
         if (this.state.symbolic_impl_node != null
             && this.bounds_give(&this.state.symbolic_impl_node.where_bounds, param, trait_def)) {
@@ -523,7 +527,8 @@ type struct MethodBinding {
     /// `param` itself.
     param_bound_traits(&this, param: GenericParamType*) -> [DefId] {
         mut out: [DefId] = [];
-        const func: FunctionDeclNode* = this.state.symbolic_current_func;
+        const func_decl: DeclarationNode* = this.state.symbolic_current_func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func != null) { MethodBinding::push_bound_traits(&func.trait_bounds, param, &out); }
         if (this.state.symbolic_impl_node != null) {
             MethodBinding::push_bound_traits(&this.state.symbolic_impl_node.where_bounds, param, &out);
@@ -646,7 +651,8 @@ type struct MethodBinding {
     /// is the receiver's type.
     default_copy_bound_return(mut &this, recv_type: TypeRef, method_name: SymbolStr,
                               dir: BoundDirection*) -> TypeRef {
-        const func: FunctionDeclNode* = this.state.current_func;
+        const func_decl: DeclarationNode* = this.state.current_func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || !func.is_synth_default || func.trait_bounds.length == 0) { return TypeRef::invalid(); }
         if (!this.state.this_type.is_valid()) { return TypeRef::invalid(); }
         const recv: TypeRef = this.peel_all_indirection(recv_type);
@@ -741,7 +747,7 @@ type struct MethodBinding {
         if (param == null) { return []; }
         if (this.state.symbolic_current_func != null) {
             const r: [TypeRef] = this.scan_param_bound_param_types(
-                &this.state.symbolic_current_func.trait_bounds, param, method_name, arg_count);
+                &DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds, param, method_name, arg_count);
             if (r.length > 0) { return r; }
         }
         if (this.state.symbolic_impl_node != null) {
@@ -1055,9 +1061,10 @@ type struct MethodBinding {
             const tdecl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(dimpl.trait_def);
             if (tdecl == null) { continue; }
             // The trait's default-bodied method of this name, if projection-bounded.
-            const mfunc: FunctionDeclNode* = this.ctx.generic_registry.trait_method_by_leaf(dimpl.trait_def, method_name);
+            const mfunc_decl: DeclarationNode* = this.ctx.generic_registry.trait_method_by_leaf(dimpl.trait_def, method_name);
+            const mfunc: FunctionDecl* = DeclarationNode::fn_of(mfunc_decl);
             if (mfunc == null || !mfunc.has_body()) { continue; }
-            if (this.projection_bound_fails(mfunc, dimpl, tdecl)) { return true; }
+            if (this.projection_bound_fails(mfunc_decl, dimpl, tdecl)) { return true; }
         }
         return false;
     }
@@ -1065,8 +1072,9 @@ type struct MethodBinding {
     /// Whether any projection-subject where-bound on `mfunc` has a CONCRETE Item
     /// (drawn from `impl_node`'s positional trait args) that fails the bound
     /// trait. Symbolic Item (a projection, or an impl generic param) -> false.
-    projection_bound_fails(&this, mfunc: FunctionDeclNode*, impl_node: ImplBlock*,
+    projection_bound_fails(&this, mfunc_decl: DeclarationNode*, impl_node: ImplBlock*,
                            tdecl: TraitDecl*) -> boolean {
+        const mfunc: FunctionDecl* = DeclarationNode::fn_of(mfunc_decl);
         if (mfunc == null || impl_node == null || tdecl == null) { return false; }
         if (impl_node.trait_annotation == null) { return false; }
         // The impl's positional trait-arg annotations.
@@ -1193,16 +1201,16 @@ type struct MethodBinding {
         // the impl's parameters), which this context does not bind.
         if (owner_ast == null) {
             const im: MethodNode* = if (chosen != null && chosen.func != null
-                    && !chosen.func.origin_trait.is_valid()
-                    && chosen.func.generic_params.length == member.generic_args.length) {
+                    && !DeclarationNode::fn_of(chosen.func).origin_trait.is_valid()
+                    && DeclarationNode::fn_of(chosen.func).generic_params.length == member.generic_args.length) {
                 chosen
             } else { null };
             if (im != null && im.func != null
-                    && im.func.return_type_annotation != null) {
+                    && DeclarationNode::fn_of(im.func).return_type_annotation != null) {
                 mut imp_ctx: ResolutionContext = ResolutionContext::new("");
                 this.symbolic.symbolic_bind_params(&imp_ctx);
-                for (mut i: i64 = 0; i < im.func.generic_params.length; i++) {
-                    const gp_decl: DeclarationNode* = im.func.generic_params[i];
+                for (mut i: i64 = 0; i < DeclarationNode::fn_of(im.func).generic_params.length; i++) {
+                    const gp_decl: DeclarationNode* = DeclarationNode::fn_of(im.func).generic_params[i];
                     const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                     if (gp == null) { continue; }
                     const ar: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &imp_ctx);
@@ -1210,7 +1218,7 @@ type struct MethodBinding {
                     imp_ctx.add_binding(gp.sym_id, gp.name, ar);
                 }
                 const ir: TypeRef = this.ctx.type_resolver.resolve(
-                    im.func.return_type_annotation, &imp_ctx);
+                    DeclarationNode::fn_of(im.func).return_type_annotation, &imp_ctx);
                 if (ir.is_valid()) { return ir; }
             }
         }
@@ -1243,7 +1251,7 @@ type struct MethodBinding {
         for (mut k: i64 = 0; k < named.length; k++) {
             const m: MethodNode* = named[k];
             if (m == null || m.func == null) { continue; }
-            if (m.func.generic_params.length != member.generic_args.length) { continue; }
+            if (DeclarationNode::fn_of(m.func).generic_params.length != member.generic_args.length) { continue; }
             found = m;
             break;
         }
@@ -1266,7 +1274,7 @@ type struct MethodBinding {
             }
         }
         if (found == null) { return fallback; }
-        const ret_ann: TypeAnnotation* = found.func.return_type_annotation;
+        const ret_ann: TypeAnnotation* = DeclarationNode::fn_of(found.func).return_type_annotation;
         if (ret_ann == null) { return fallback; }
 
         mut res_ctx: ResolutionContext = ResolutionContext::new("");
@@ -1287,8 +1295,8 @@ type struct MethodBinding {
         // The explicit args are the caller's spelling; in a generic body they
         // may name its parameters, bound after the owner's so those win.
         this.symbolic.symbolic_bind_params(&res_ctx);
-        for (mut i: i64 = 0; i < found.func.generic_params.length; i++) {
-            const gp_decl: DeclarationNode* = found.func.generic_params[i];
+        for (mut i: i64 = 0; i < DeclarationNode::fn_of(found.func).generic_params.length; i++) {
+            const gp_decl: DeclarationNode* = DeclarationNode::fn_of(found.func).generic_params[i];
             const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { continue; }
             const arg_ref: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &res_ctx);
@@ -1313,7 +1321,7 @@ type struct MethodBinding {
             const block: ImplBlock* = DeclarationNode::impl_of(blocks[i]);
             const m: MethodNode* = this.ctx.generic_registry.impl_method_by_leaf(block, method_name);
             if (m == null || m.func == null) { continue; }
-            if (m.func.generic_params.length != n_generic_args) { continue; }
+            if (DeclarationNode::fn_of(m.func).generic_params.length != n_generic_args) { continue; }
             *out_impl = block;
             return m;
         }
@@ -1327,7 +1335,7 @@ type struct MethodBinding {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null) { continue; }
             if (!DeclarationIndex::holds_method(named, m)) { continue; }
-            if (m.func.generic_params.length == 0) { continue; }
+            if (DeclarationNode::fn_of(m.func).generic_params.length == 0) { continue; }
             return m;
         }
         return null;
@@ -1336,15 +1344,16 @@ type struct MethodBinding {
     /// Generic trait DEFAULT method `method_name` of any trait the receiver's
     /// base implements (`map<B>`/`fold<Acc>` on `Iterator`), not yet cloned into
     /// the impl block pre-mono, answered by the trait-method door.  Returns
-    /// the trait decl's FunctionDeclNode, or null.
+    /// the trait decl's FunctionDecl, or null.
     find_generic_trait_default(mut &this, recv_type: TypeRef,
-                               method_name: SymbolStr) -> FunctionDeclNode* {
+                               method_name: SymbolStr) -> DeclarationNode* {
         const blocks: [DeclarationNode*] = this.ctx.generic_registry.template_trait_impls_of(recv_type, this.intern);
         for (mut i: i64 = 0; i < blocks.length; i++) {
-            const f: FunctionDeclNode* = this.ctx.generic_registry.trait_method_by_leaf(
+            const f_decl: DeclarationNode* = this.ctx.generic_registry.trait_method_by_leaf(
                 DeclarationNode::impl_of(blocks[i]).trait_def, method_name);
+            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
             if (f == null || f.generic_params.length == 0) { continue; }
-            return f;
+            return f_decl;
         }
         return null;
     }
@@ -1366,7 +1375,7 @@ type struct MethodBinding {
             const impl_node: ImplBlock* = DeclarationNode::impl_of(blocks[i]);
             if (only_trait.is_valid() && !impl_node.trait_def.equals(only_trait)) { continue; }
             const m: MethodNode* = this.ctx.generic_registry.impl_method_by_leaf(impl_node, method_name);
-            if (m == null || m.func == null || m.func.generic_params.length == 0) { continue; }
+            if (m == null || m.func == null || DeclarationNode::fn_of(m.func).generic_params.length == 0) { continue; }
             *out_impl = impl_node;
             return m;
         }
@@ -1380,7 +1389,7 @@ type struct MethodBinding {
     /// abstract receiver; `*out_func` is null when nothing is found.
     find_generic_method_on_receiver_bounds(mut &this, recv_type: TypeRef,
                                            member: MemberAccessNode*,
-                                           out_func: FunctionDeclNode**) -> ResolutionContext {
+                                           out_func: DeclarationNode**) -> ResolutionContext {
         *out_func = null;
         mut rc: ResolutionContext = ResolutionContext::new("");
         if (!this.state.in_symbolic_check)      { return rc; }
@@ -1419,8 +1428,8 @@ type struct MethodBinding {
             }
         }
         if (this.state.symbolic_current_func != null) {
-            for (mut wi: i64 = 0; wi < this.state.symbolic_current_func.trait_bounds.length; wi++) {
-                const wb: TraitBound* = &this.state.symbolic_current_func.trait_bounds[wi];
+            for (mut wi: i64 = 0; wi < DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds.length; wi++) {
+                const wb: TraitBound* = &DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds[wi];
                 if (!gpt.declared_by(wb.subject_sym)) { continue; }
                 for (mut ti: i64 = 0; ti < wb.trait_refs.length; ti++) {
                     const tr: TraitRef* = &wb.trait_refs[ti];
@@ -1429,17 +1438,18 @@ type struct MethodBinding {
                 }
             }
         }
-        mut found: FunctionDeclNode* = null;
+        mut found: DeclarationNode* = null;
         for (mut i: i64 = 0; i < bound_leaves.length && found == null; i++) {
             const td: TraitDecl* = this.ctx.generic_registry.get_trait_decl(bound_leaves[i]);
             if (td == null) { continue; }
             const slot: i64 = this.ctx.generic_registry.trait_item_slot(bound_leaves[i], member.member);
             for (mut k: i64 = 0; k < td.methods.length; k++) {
-                const f: FunctionDeclNode* = td.methods[k];
+                const f_decl: DeclarationNode* = td.methods[k];
+                const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
                 if (f == null) { continue; }
                 if (!(slot >= 0 && this.ctx.generic_registry.trait_item_slot(bound_leaves[i], f.name) == slot)) { continue; }
                 if (f.generic_params.length == 0) { continue; }
-                found = f;
+                found = f_decl;
                 break;
             }
         }
@@ -1464,11 +1474,11 @@ type struct MethodBinding {
                                    member: MemberAccessNode*, call: CallExprNode*) -> void {
         if (call == null || member == null) { return; }
         if (!this.state.in_symbolic_check)  { return; }
-        mut orig_func: FunctionDeclNode* = null;
+        mut orig_func: DeclarationNode* = null;
         mut owner_ctx: ResolutionContext =
             this.find_generic_method_on_receiver_bounds(recv_type, member, &orig_func);
         if (orig_func == null) { return; }
-        const n_method_params: i64 = orig_func.generic_params.length;
+        const n_method_params: i64 = DeclarationNode::fn_of(orig_func).generic_params.length;
         mut bindings: [TypeRef] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
         if (bindings.length != n_method_params) { return; }
         call.set_resolved_type_args(bindings);
@@ -1494,11 +1504,12 @@ type struct MethodBinding {
         if (call.resolved_type_args.length > 0) { return; }
         // The template's method the selection chose names the method; the
         // owner's methods are asked by name only for a call it did not bind.
-        const orig_func: FunctionDeclNode* = if (chosen != null && chosen.func != null) {
+        const orig_func_decl: DeclarationNode* = if (chosen != null && chosen.func != null) {
             chosen.func
         } else {
             this.symbolic.symbolic_find_owner_method(recv_type, member.member)
         };
+        const orig_func: FunctionDecl* = DeclarationNode::fn_of(orig_func_decl);
         if (orig_func == null) { return; }
         const n_method_params: i64 = orig_func.generic_params.length;
         if (n_method_params == 0) { return; }
@@ -1512,7 +1523,7 @@ type struct MethodBinding {
         // what it answers is the owner's module, which parts company with the
         // declaring file whenever the method is a trait default (declared in the
         // trait's file) or sits in an `implement` block outside the owner's module.
-        mut bindings: [TypeRef] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
+        mut bindings: [TypeRef] = this.solve_method_bindings(orig_func_decl, &owner_ctx, member, call);
         if (bindings.length != n_method_params) { return; }
         call.set_resolved_type_args(bindings);
     }
@@ -1528,8 +1539,8 @@ type struct MethodBinding {
                        out_site: ASTNode**) -> MethodNode* {
         const own: ASTNode* = this.method_site(chosen, tmpl, recv_type);
         if (own != null) { *out_site = own; return chosen; }
-        if (chosen.func.def.is_valid() || !chosen.func.copy_of.is_valid()) { return null; }
-        const decl: ASTNode* = this.ctx.decl_index.method_decl_of(chosen.func.copy_of);
+        if (DeclarationNode::fn_of(chosen.func).def.is_valid() || !DeclarationNode::fn_of(chosen.func).copy_of.is_valid()) { return null; }
+        const decl: ASTNode* = this.ctx.decl_index.method_decl_of(DeclarationNode::fn_of(chosen.func).copy_of);
         if (decl == null || decl.kind != NodeKind::MethodDeclaration) { return null; }
         const written: MethodNode* = decl as MethodNode*;
         const site: ASTNode* = this.method_site(written, tmpl, recv_type);
@@ -1564,10 +1575,10 @@ type struct MethodBinding {
 
     /// Locate the generic method targeted by `member` on `recv_type` and build the
     /// owner-binding context (receiver type params -> concrete args, plus `This`).
-    /// Writes the method's FunctionDeclNode through `out_func` (null when nothing
+    /// Writes the method's FunctionDecl through `out_func` (null when nothing
     /// to infer).  Shared by `resolve_generic_method_return` + `stash_method_call_bindings`.
     find_generic_method_for_call(mut &this, mut recv_type: TypeRef, member: MemberAccessNode*,
-                                 chosen: MethodNode*, out_func: FunctionDeclNode**) -> ResolutionContext {
+                                 chosen: MethodNode*, out_func: DeclarationNode**) -> ResolutionContext {
         *out_func = null;
         mut owner_ctx: ResolutionContext = ResolutionContext::new("");
         if (member == null)                    { return owner_ctx; }
@@ -1637,13 +1648,13 @@ type struct MethodBinding {
         // block whose parameters it is written in, are found by identity, and
         // no store below is asked for the member's name.
         mut by_identity: boolean = false;
-        mut chosen_func: FunctionDeclNode* = null;
-        if (chosen != null && chosen.func != null && chosen.func.generic_params.length > 0) {
+        mut chosen_func: DeclarationNode* = null;
+        if (chosen != null && chosen.func != null && DeclarationNode::fn_of(chosen.func).generic_params.length > 0) {
             by_identity = true;
             mut site: ASTNode* = null;
             found = this.chosen_declaration(chosen, tmpl, recv_type, &site);
             if (found == null) {
-                const d: DefId = if (chosen.func.def.is_valid()) { chosen.func.def } else { chosen.func.copy_of };
+                const d: DefId = if (DeclarationNode::fn_of(chosen.func).def.is_valid()) { DeclarationNode::fn_of(chosen.func).def } else { DeclarationNode::fn_of(chosen.func).copy_of };
                 chosen_func = this.ctx.decl_index.method_func_of(d);
             } else if (DeclarationNode::impl_of(site) != null) {
                 owner_params = &(DeclarationNode::impl_of(site)).generic_params;
@@ -1731,7 +1742,7 @@ type struct MethodBinding {
                 owner_params = &trait_impl_block.generic_params;
             }
         }
-        mut orig_func: FunctionDeclNode* = null;
+        mut orig_func: DeclarationNode* = null;
         if (found != null) {
             orig_func = found.func;
         } else if (by_identity) {
@@ -1740,7 +1751,7 @@ type struct MethodBinding {
             orig_func = this.find_generic_trait_default(recv_type, member.member);
         }
         if (orig_func == null) { return owner_ctx; }
-        if (orig_func.generic_params.length == 0) { return owner_ctx; }
+        if (DeclarationNode::fn_of(orig_func).generic_params.length == 0) { return owner_ctx; }
 
         // The annotations resolved through this context (and through the clones
         // every caller makes of it) are `orig_func`'s own, so their scope is the
@@ -1814,20 +1825,21 @@ type struct MethodBinding {
     /// recovery + polymorphic-literal adoption, mirroring the free-fn path).
     /// Returns the bindings in declaration order, or `[]`
     /// when any stays unbound/abstract (caller defers to mono).
-    solve_method_bindings(mut &this, orig_func: FunctionDeclNode*,
+    solve_method_bindings(mut &this, orig_func_decl: DeclarationNode*,
                           owner_ctx: ResolutionContext*, member: MemberAccessNode*,
                           call: CallExprNode*) -> [TypeRef] {
         if (member == null) { return []; }
-        return this.solve_method_bindings_at(orig_func, owner_ctx, &member.generic_args, call, 0);
+        return this.solve_method_bindings_at(orig_func_decl, owner_ctx, &member.generic_args, call, 0);
     }
 
     /// `solve_method_bindings` for a call whose method arguments start at
     /// `first_arg` - 0 for `recv.m(args)`, 1 for a path call
     /// `Owner::m(recv, args)`, whose receiver is its first argument - with
     /// the turbofish `generic_args` the call wrote for the method.
-    solve_method_bindings_at(mut &this, orig_func: FunctionDeclNode*,
+    solve_method_bindings_at(mut &this, orig_func_decl: DeclarationNode*,
                              owner_ctx: ResolutionContext*, generic_args: &[TypeAnnotation*],
                              call: CallExprNode*, first_arg: i64) -> [TypeRef] {
+        const orig_func: FunctionDecl* = DeclarationNode::fn_of(orig_func_decl);
         if (orig_func == null || call == null) { return []; }
         if (call.arguments.length < first_arg) { return []; }
         const n_method_params: i64 = orig_func.generic_params.length;
@@ -1978,11 +1990,11 @@ type struct MethodBinding {
     stash_method_call_bindings(mut &this, recv_type: TypeRef,
                                member: MemberAccessNode*, call: CallExprNode*, chosen: MethodNode*) -> void {
         if (call == null || member == null) { return; }
-        mut orig_func: FunctionDeclNode* = null;
+        mut orig_func: DeclarationNode* = null;
         mut owner_ctx: ResolutionContext =
             this.find_generic_method_for_call(recv_type, member, chosen, &orig_func);
         if (orig_func == null) { return; }
-        const n_method_params: i64 = orig_func.generic_params.length;
+        const n_method_params: i64 = DeclarationNode::fn_of(orig_func).generic_params.length;
         mut bindings: [TypeRef] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
         if (bindings.length != n_method_params) { return; }
         call.set_resolved_type_args(bindings);
@@ -1997,20 +2009,20 @@ type struct MethodBinding {
     resolve_generic_method_return(mut &this, recv_type: TypeRef, member: MemberAccessNode*,
                                   call: CallExprNode*, chosen: MethodNode*, fallback: TypeRef) -> TypeRef {
         if (call == null || member == null) { return fallback; }
-        mut orig_func: FunctionDeclNode* = null;
+        mut orig_func: DeclarationNode* = null;
         mut owner_ctx: ResolutionContext =
             this.find_generic_method_for_call(recv_type, member, chosen, &orig_func);
         if (orig_func == null) { return fallback; }
-        const ret_ann: TypeAnnotation* = orig_func.return_type_annotation;
+        const ret_ann: TypeAnnotation* = DeclarationNode::fn_of(orig_func).return_type_annotation;
         if (ret_ann == null) { return fallback; }
-        const n_method_params: i64 = orig_func.generic_params.length;
+        const n_method_params: i64 = DeclarationNode::fn_of(orig_func).generic_params.length;
 
         mut method_bindings: [TypeRef] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
         if (method_bindings.length != n_method_params) { return fallback; }
 
         mut ret_ctx: ResolutionContext = owner_ctx.clone();
         for (mut i: i64 = 0; i < n_method_params; i++) {
-            const gp_decl: DeclarationNode* = orig_func.generic_params[i];
+            const gp_decl: DeclarationNode* = DeclarationNode::fn_of(orig_func).generic_params[i];
             const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { return fallback; }
             ret_ctx.add_binding(gp.sym_id, gp.name, method_bindings[i]);
@@ -2206,7 +2218,7 @@ type struct MethodBinding {
             break;
         }
         if (found_method == null || found_impl == null) { return TypeRef::invalid(); }
-        const ret_ann: TypeAnnotation* = found_method.func.return_type_annotation;
+        const ret_ann: TypeAnnotation* = DeclarationNode::fn_of(found_method.func).return_type_annotation;
         if (ret_ann == null) { return TypeRef::invalid(); }
 
         mut rc: ResolutionContext = ResolutionContext::new("");

@@ -37,7 +37,7 @@ import std::collections::hashmap::{ HashMap, HashMapIter };
 import std::fmt;
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
-    DeclarationNode, DeclKind, FieldDecl, FunctionDeclNode, ImplBlock, MethodNode, ReceiverForm,
+    DeclarationNode, DeclKind, FieldDecl, FunctionDecl, ImplBlock, MethodNode, ReceiverForm,
     StructDecl, VarDecl
 };
 import compiler::resolver::lang_item;
@@ -342,11 +342,12 @@ type struct LambdaSynth {
             st.set_fields(infos);
         }
 
-        // 3. `__call__` FunctionDeclNode: the closure struct by reference, then
+        // 3. `__call__` FunctionDecl: the closure struct by reference, then
         // the lambda's own parameters.
         const call_name: SymbolStr = intern_ptr.intern("__call__");
-        mut call_fn: FunctionDeclNode* = new FunctionDeclNode(call_name, span);
-        call_fn.written_in = FunctionDeclNode::written_in_of(this.state.current_func);
+        mut call_fn: FunctionDecl* = FunctionDecl::new(call_name);
+        const call_fn_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(call_fn), span);
+        call_fn.written_in = FunctionDecl::written_in_of(this.state.current_func);
         call_fn.set_resolved_return_type(lambda.return_type);
         const call_recv_decl: DeclarationNode* = this.closure_receiver(struct_ref, span);
         const call_recv: VarDecl* = DeclarationNode::var_of(call_recv_decl);
@@ -408,7 +409,7 @@ type struct LambdaSynth {
         call_fn.set_body(body_block);
 
         // 5. MethodNode + attach.
-        mut method: MethodNode* = new MethodNode(call_fn, span);
+        mut method: MethodNode* = new MethodNode(call_fn_decl, span);
         call_fn.def = ctx_ptr.define_method(closure_def, call_fn.name, span,
             method as ASTNode*);
         method.set_visibility(Visibility::Public);
@@ -486,12 +487,13 @@ type struct LambdaSynth {
         if (!drop_id.is_valid()) { return null; }
 
         const drop_name: SymbolStr = this.intern.intern("drop");
-        mut drop_fn: FunctionDeclNode* = new FunctionDeclNode(drop_name, span);
+        mut drop_fn: FunctionDecl* = FunctionDecl::new(drop_name);
+        const drop_fn_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(drop_fn), span);
         drop_fn.set_resolved_return_type(this.arena.get_void());
         drop_fn.set_origin_trait(drop_id);
         drop_fn.add_parameter(this.closure_receiver(struct_ref, span));
         drop_fn.set_body(Stmt::block(span));
-        mut drop_method: MethodNode* = new MethodNode(drop_fn, span);
+        mut drop_method: MethodNode* = new MethodNode(drop_fn_decl, span);
         drop_fn.def = this.ctx.define_method(struct_decl.def, drop_name, span,
             drop_method as ASTNode*);
         drop_method.set_visibility(Visibility::Public);
@@ -620,7 +622,8 @@ type struct LambdaSynth {
         // which segfaults at the indirect call.  Reject cleanly here, BEFORE
         // the `generic_args`/`resolved_callee` early returns below, so an
         // explicit `f<T>(closure)` call is caught as well as an inferred one.
-        const stamped_fn: FunctionDeclNode* = this.top_level_function_of(callee_def);
+        const stamped_fn_decl: DeclarationNode* = this.top_level_function_of(callee_def);
+        const stamped_fn: FunctionDecl* = DeclarationNode::fn_of(stamped_fn_decl);
         if (this.call_has_closure_struct_arg(call)) {
             if (stamped_fn != null && stamped_fn.is_generic()) {
                 this.reject_closure_struct_args_in_non_free_call(
@@ -638,9 +641,10 @@ type struct LambdaSynth {
         const callee_fn_ref: TypeRef = this.ctx.decl_index.entry_signature(selected);
         if (!callee_fn_ref.is_valid()) { return; }
         const selected_decl: ASTNode* = this.ctx.decl_index.entry_decl(selected);
-        const orig_func: FunctionDeclNode* =
-            if (selected_decl == null || selected_decl.kind != NodeKind::FunctionDeclaration) { null } else {
-                this.top_level_function_of((selected_decl as FunctionDeclNode*).def) };
+        const orig_func_decl: DeclarationNode* =
+            if (selected_decl == null || DeclarationNode::fn_of(selected_decl) == null) { null } else {
+                this.top_level_function_of(DeclarationNode::fn_of(selected_decl).def) };
+        const orig_func: FunctionDecl* = DeclarationNode::fn_of(orig_func_decl);
 
         const ft_raw: Type* = this.arena.lookup(callee_fn_ref);
         if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return; }
@@ -683,10 +687,11 @@ type struct LambdaSynth {
         if (orig_func.body == null) { return; }
 
         mut cloner: ASTCloner = ASTCloner::new();
-        const cloned_node: ASTNode* = cloner.clone_node(orig_func as ASTNode*);
+        const cloned_node: ASTNode* = cloner.clone_node(orig_func_decl as ASTNode*);
         if (cloned_node == null) { return; }
-        if (cloned_node.kind != NodeKind::FunctionDeclaration) { return; }
-        mut spec_func: FunctionDeclNode* = cloned_node as FunctionDeclNode*;
+        if (DeclarationNode::fn_of(cloned_node) == null) { return; }
+        const spec_func_decl: DeclarationNode* = DeclarationNode::with_shape(cloned_node);
+        mut spec_func: FunctionDecl* = DeclarationNode::fn_of(spec_func_decl);
 
         for (mut i: i64 = 0; i < spec_func.parameters.length; i++) {
             const p_decl: DeclarationNode* = spec_func.parameters[i];
@@ -710,7 +715,7 @@ type struct LambdaSynth {
         spec_func.set_name(spec_name);
 
         if (this.ctx.artifacts.ast.root != null) {
-            this.ctx.artifacts.ast.root.add_statement(spec_func as ASTNode*);
+            this.ctx.artifacts.ast.root.add_statement(spec_func_decl as ASTNode*);
         }
 
         // The specialization is a copy of `orig_func`: registered in no
@@ -725,7 +730,7 @@ type struct LambdaSynth {
             spec_func.resolved_return_type, spec_param_types, false);
         const entry: OverloadId = this.ctx.decl_index.register_copy_signature(
             this.ctx.copy_module_family(orig_func.def), spec_name, spec_func.resolved_return_type, spec_ft,
-            this.intern, this.arena, spec_func.span, spec_func as ASTNode*);
+            this.intern, this.arena, spec_func_decl.span, spec_func_decl as ASTNode*);
         spec_func.set_overload_entry(entry);
         call.set_resolved_callee(CalleePin::Decl(entry));
         this.state.add_closure_spec(def_slot, rec_pos, rec_types, entry);
@@ -734,15 +739,16 @@ type struct LambdaSynth {
     /// The top-level function of this root that declares the definition `d`,
     /// or null - a function declared in another module, or a definition no
     /// function declares.
-    top_level_function_of(&this, d: DefId) -> FunctionDeclNode* {
+    top_level_function_of(&this, d: DefId) -> DeclarationNode* {
         if (this.ctx.artifacts.ast.root == null) { return null; }
         const stmts: &[ASTNode*] = &this.ctx.artifacts.ast.root.statements;
         for (mut i: i64 = 0; i < stmts.length; i++) {
             const s: ASTNode* = stmts[i];
             if (s == null) { continue; }
-            if (s.kind != NodeKind::FunctionDeclaration) { continue; }
-            const fn: FunctionDeclNode* = s as FunctionDeclNode*;
-            if (fn.def.equals(d)) { return fn; }
+            if (DeclarationNode::fn_of(s) == null) { continue; }
+            const fn_decl: DeclarationNode* = DeclarationNode::with_shape(s);
+            const fn: FunctionDecl* = DeclarationNode::fn_of(fn_decl);
+            if (fn.def.equals(d)) { return fn_decl; }
         }
         return null;
     }

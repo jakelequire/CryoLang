@@ -32,7 +32,7 @@ import compiler::types::generic_registry;
 import compiler::types::generic_registry::{ TemplateKind };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, FunctionDeclNode, GenericParamDecl, ImplBlock,
+    ClassDeclNode, DeclarationNode, FunctionDecl, GenericParamDecl, ImplBlock,
     MethodNode, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -123,7 +123,7 @@ type struct MonoAstResolver {
             }
             TemplateKind::Function => {
                 // Free functions have no `this`.
-                this.resolve_func_and_body(ast_node as FunctionDeclNode*, &res_ctx, TypeRef::invalid());
+                this.resolve_func_and_body(DeclarationNode::with_shape(ast_node), &res_ctx, TypeRef::invalid());
             }
             TemplateKind::Trait => {}
             TemplateKind::TypeAlias => {}
@@ -188,7 +188,8 @@ type struct MonoAstResolver {
                 this.prune_static_match_in_methods((ast_node as ClassDeclNode*).methods, &res_ctx);
             }
             TemplateKind::Function => {
-                const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
+                const decl_decl: DeclarationNode* = DeclarationNode::with_shape(ast_node);
+                const decl: FunctionDecl* = DeclarationNode::fn_of(decl_decl);
                 if (decl.body == null) { return; }
                 this.prune_static_match_in_stmt(decl.body, &res_ctx);
             }
@@ -217,9 +218,9 @@ type struct MonoAstResolver {
             // params are bound (`String<A>` -> `A = GlobalAlloc`); the method's
             // own `T` is still unbound, so resolving a method-level scrutinee
             // would fail (E0900).  Skip them; the per-call path handles them.
-            if (method.func.is_generic()) { continue; }
-            if (method.func.body != null) {
-                this.prune_static_match_in_stmt(method.func.body, res_ctx);
+            if (DeclarationNode::fn_of(method.func).is_generic()) { continue; }
+            if (DeclarationNode::fn_of(method.func).body != null) {
+                this.prune_static_match_in_stmt(DeclarationNode::fn_of(method.func).body, res_ctx);
             }
         }
     }
@@ -487,8 +488,8 @@ type struct MonoAstResolver {
             // `This`) AND self-growing inherent methods (`as_ref -> Option<T*>`)
             // are instantiated lazily at call sites, never eagerly - eager
             // resolution here would fire the return-type tower discovery below.
-            if (method.func.is_self_returning_default
-                    || method.func.is_lazy_self_growing) { continue; }
+            if (DeclarationNode::fn_of(method.func).is_self_returning_default
+                    || DeclarationNode::fn_of(method.func).is_lazy_self_growing) { continue; }
             // Static methods don't take `this`; pass invalid.
             const m_this: TypeRef = if (method.is_static) {
                 TypeRef::invalid()
@@ -498,10 +499,10 @@ type struct MonoAstResolver {
             // If the method has its own generic params (e.g. `hash<H>`), bind them
             // in a per-method resolution context before signature resolution so the
             // Reference branch builds `Reference(GenericParam_H)` not `Reference(invalid)`.
-            if (method.func.is_generic()) {
+            if (DeclarationNode::fn_of(method.func).is_generic()) {
                 mut method_ctx: ResolutionContext = res_ctx.clone();
-                for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
-                    const gp_decl: DeclarationNode* = method.func.generic_params[j];
+                for (mut j: i64 = 0; j < DeclarationNode::fn_of(method.func).generic_params.length; j++) {
+                    const gp_decl: DeclarationNode* = DeclarationNode::fn_of(method.func).generic_params[j];
                     const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                     if (gp == null) { continue; }
                     const gp_ref: TypeRef = this.arena.create_generic_param(
@@ -524,8 +525,9 @@ type struct MonoAstResolver {
     /// the substituter before this runs, so a parameter left in one names a
     /// declaration the clone cannot see, and there is no second context to
     /// try it under.
-    resolve_func_and_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*,
+    resolve_func_and_body(mut &this, func_decl: DeclarationNode*, res_ctx: ResolutionContext*,
                           this_type: TypeRef) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         // Spec'd method clones have their `&this` parameter annotated as
         // `Reference(ThisType)`; thread `this_type` onto a per-call copy of the
         // context so `&this` resolves to `Reference(<spec'd_owner>)`.
@@ -533,7 +535,7 @@ type struct MonoAstResolver {
         if (this_type.is_valid()) {
             sig_ctx.set_this_type(this_type);
         }
-        this.type_resolver.resolve_func_signature(func, &sig_ctx);
+        this.type_resolver.resolve_func_signature(func_decl, &sig_ctx);
 
         // Back-fill `&this` / `this` parameters when they have no explicit
         // annotation (the parser leaves `type_annotation` null on the implicit

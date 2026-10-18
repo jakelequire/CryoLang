@@ -50,7 +50,7 @@ import std::fmt;
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDecl, EnumDecl,
-    EnumVariant, FieldDecl, FunctionDeclNode, GenericParamDecl,
+    EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl,
     DeclKind, ImplBlock, MethodNode, StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
@@ -393,7 +393,8 @@ type struct TypeResolutionRunner {
         }
 
         for (mut ti: i64 = 0; ti < decl.methods.length; ti++) {
-            const tm: FunctionDeclNode* = decl.methods[ti];
+            const tm_decl: DeclarationNode* = decl.methods[ti];
+            const tm: FunctionDecl* = DeclarationNode::fn_of(tm_decl);
             if (tm == null || tm.has_body()) { continue; }
             if (this.ctx.generic_registry.writes_trait_item(impl_node, trait_id, ti)) { continue; }
             this.report_conformance(head_span,
@@ -403,9 +404,9 @@ type struct TypeResolutionRunner {
 
         for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
             const m: MethodNode* = impl_node.methods[mi];
-            if (m == null || m.func == null || m.func.is_synth_default || m.spec_of != null) { continue; }
-            const name: string = intern.resolve(m.func.name);
-            const slot: i64 = this.ctx.generic_registry.trait_item_slot(trait_id, m.func.name);
+            if (m == null || m.func == null || DeclarationNode::fn_of(m.func).is_synth_default || m.spec_of != null) { continue; }
+            const name: string = intern.resolve(DeclarationNode::fn_of(m.func).name);
+            const slot: i64 = this.ctx.generic_registry.trait_item_slot(trait_id, DeclarationNode::fn_of(m.func).name);
             if (slot < 0) {
                 this.report_conformance(m.func.span,
                     fmt::format("`%s` is not a method of trait `%s`", name, trait_name));
@@ -413,43 +414,46 @@ type struct TypeResolutionRunner {
             }
             // A method's own parameters are mapped by position; each
             // declaration's are distinct types, so one map serves every method.
-            const tm: FunctionDeclNode* = decl.methods[slot];
-            if (tm.generic_params.length == m.func.generic_params.length) {
+            const tm_decl: DeclarationNode* = decl.methods[slot];
+            const tm: FunctionDecl* = DeclarationNode::fn_of(tm_decl);
+            if (tm.generic_params.length == DeclarationNode::fn_of(m.func).generic_params.length) {
                 for (mut gi: i64 = 0; gi < tm.generic_params.length; gi++) {
                     const tg_decl: DeclarationNode* = tm.generic_params[gi];
                     const tg: GenericParamDecl* = DeclarationNode::generic_param_of(tg_decl);
-                    const fg_decl: DeclarationNode* = m.func.generic_params[gi];
+                    const fg_decl: DeclarationNode* = DeclarationNode::fn_of(m.func).generic_params[gi];
                     const fg: GenericParamDecl* = DeclarationNode::generic_param_of(fg_decl);
                     if (tg == null || fg == null) { continue; }
                     terms.subst.add(this.arena.create_generic_param(tg.sym_id, tg.name, gi as u64),
                                     this.arena.create_generic_param(fg.sym_id, fg.name, gi as u64));
                 }
             }
-            this.check_method_conformance(tm, m, &terms, name, trait_name);
+            this.check_method_conformance(tm_decl, m, &terms, name, trait_name);
         }
     }
 
     /// One written method `m` against the trait's declaration `tm` of it,
     /// read in `terms` (above).
-    check_method_conformance(&this, tm: FunctionDeclNode*, m: MethodNode*, terms: &ImplTerms,
+    check_method_conformance(&this, tm_decl: DeclarationNode*, m: MethodNode*, terms: &ImplTerms,
                              name: string, trait_name: string) -> void {
-        const f: FunctionDeclNode* = m.func;
+        const tm: FunctionDecl* = DeclarationNode::fn_of(tm_decl);
+        const f_decl: DeclarationNode* = m.func;
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         if (tm.is_static != m.is_static) {
             const want: string = if (tm.is_static) { "is static" } else { "takes a receiver" };
             const have: string = if (m.is_static) { "is static" } else { "takes a receiver" };
-            this.report_conformance(f.span,
+            this.report_conformance(f_decl.span,
                 fmt::format("`%s` %s in trait `%s`, but %s here", name, want, trait_name, have));
             return;
         }
         if (tm.generic_params.length != f.generic_params.length) {
-            this.report_conformance(f.span,
+            this.report_conformance(f_decl.span,
                 fmt::format("`%s` has %lld type parameter(s) in trait `%s`, but %lld here",
                     name, tm.generic_params.length, trait_name, f.generic_params.length));
             return;
         }
 
-        const trecv: DeclarationNode* = TypeResolutionRunner::receiver_of(tm);
-        const frecv: DeclarationNode* = TypeResolutionRunner::receiver_of(f);
+        const trecv: DeclarationNode* = TypeResolutionRunner::receiver_of(tm_decl);
+        const frecv: DeclarationNode* = TypeResolutionRunner::receiver_of(f_decl);
         if (trecv != null && frecv != null) {
             const tform: string = TypeResolutionRunner::receiver_spelling(DeclarationNode::var_of(trecv));
             const fform: string = TypeResolutionRunner::receiver_spelling(DeclarationNode::var_of(frecv));
@@ -460,17 +464,17 @@ type struct TypeResolutionRunner {
             }
         }
 
-        const tcount: i64 = TypeResolutionRunner::value_param_count(tm);
-        const fcount: i64 = TypeResolutionRunner::value_param_count(f);
+        const tcount: i64 = TypeResolutionRunner::value_param_count(tm_decl);
+        const fcount: i64 = TypeResolutionRunner::value_param_count(f_decl);
         if (tcount != fcount) {
-            this.report_conformance(f.span,
+            this.report_conformance(f_decl.span,
                 fmt::format("`%s` takes %lld parameter(s) in trait `%s`, but %lld here",
                     name, tcount, trait_name, fcount));
             return;
         }
         for (mut pi: i64 = 0; pi < tcount; pi++) {
-            const tp: VarDecl* = DeclarationNode::var_of(TypeResolutionRunner::value_param_at(tm, pi));
-            const fp_decl: DeclarationNode* = TypeResolutionRunner::value_param_at(f, pi);
+            const tp: VarDecl* = DeclarationNode::var_of(TypeResolutionRunner::value_param_at(tm_decl, pi));
+            const fp_decl: DeclarationNode* = TypeResolutionRunner::value_param_at(f_decl, pi);
             const fp: VarDecl* = DeclarationNode::var_of(fp_decl);
             if (this.same_type(tp.resolved_type, fp.resolved_type, terms, true)) { continue; }
             this.report_conformance(fp_decl.span,
@@ -482,7 +486,7 @@ type struct TypeResolutionRunner {
         // a projection and the implementation's lowering builds later.
         if (tm.is_async || f.is_async) {
             if (tm.is_async != f.is_async) {
-                this.report_conformance(f.span,
+                this.report_conformance(f_decl.span,
                         fmt::format("`%s` is %s in trait `%s`, but %s here", name,
                         if (tm.is_async) { "async" } else { "not async" }, trait_name,
                         if (f.is_async) { "async" } else { "not async" }));
@@ -490,7 +494,7 @@ type struct TypeResolutionRunner {
             return;
         }
         if (!this.same_type(tm.resolved_return_type, f.resolved_return_type, terms, true)) {
-            this.report_conformance(f.span,
+            this.report_conformance(f_decl.span,
                 fmt::format("`%s` returns `%s` in trait `%s`, but `%s` here",
                     name, this.shown_type(tm.resolved_return_type), trait_name,
                     this.shown_type(f.resolved_return_type)));
@@ -613,7 +617,8 @@ type struct TypeResolutionRunner {
         return if (t != null) { this.arena.format_display(t) } else { "?" };
     }
 
-    static receiver_of(f: FunctionDeclNode*) -> DeclarationNode* {
+    static receiver_of(f_decl: DeclarationNode*) -> DeclarationNode* {
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
             const p_decl: DeclarationNode* = f.parameters[i];
             const p: VarDecl* = DeclarationNode::var_of(p_decl);
@@ -622,7 +627,8 @@ type struct TypeResolutionRunner {
         return null;
     }
 
-    static value_param_count(f: FunctionDeclNode*) -> i64 {
+    static value_param_count(f_decl: DeclarationNode*) -> i64 {
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         mut n: i64 = 0;
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
             const p_decl: DeclarationNode* = f.parameters[i];
@@ -633,7 +639,8 @@ type struct TypeResolutionRunner {
     }
 
     /// The `k`-th parameter after the receiver.
-    static value_param_at(f: FunctionDeclNode*, k: i64) -> DeclarationNode* {
+    static value_param_at(f_decl: DeclarationNode*, k: i64) -> DeclarationNode* {
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         mut n: i64 = 0;
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
             const p_decl: DeclarationNode* = f.parameters[i];
@@ -727,16 +734,17 @@ type struct TypeResolutionRunner {
     // Signature and field resolution helpers
 
     /// Resolves the return type annotation and all parameter type annotations
-    /// on a FunctionDeclNode.  Delegates core resolution to TypeResolver, then
+    /// on a FunctionDecl.  Delegates core resolution to TypeResolver, then
     /// emits diagnostics and writes back to the Resolver's symbol table.
-    resolve_func_signature(&this, func: FunctionDeclNode*,
+    resolve_func_signature(&this, func_decl: DeclarationNode*,
                            res_ctx: ResolutionContext*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return; }
 
         // Core resolution (return type + param types)
-        this.resolver.resolve_func_signature(func, res_ctx);
+        this.resolver.resolve_func_signature(func_decl, res_ctx);
 
-        this.emit_signature_diagnostics(func);
+        this.emit_signature_diagnostics(func_decl);
     }
 
     /// Reports a signature whose return or parameter annotation did not
@@ -750,12 +758,13 @@ type struct TypeResolutionRunner {
     /// runs before the owner type exists in the arena, and a later one repairs
     /// what that missed), so reporting from the resolution helper itself would
     /// report the first pass's misses as errors.
-    emit_signature_diagnostics(&this, func: FunctionDeclNode*) -> void {
+    emit_signature_diagnostics(&this, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return; }
 
         if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
             this.emit_undefined_type(func.return_type_annotation,
-                "return type", this.ctx.resolve_str(func.name), func.span);
+                "return type", this.ctx.resolve_str(func.name), func_decl.span);
         }
 
         // Sema reads param types directly from the AST node (param.resolved_type)
@@ -789,11 +798,12 @@ type struct TypeResolutionRunner {
 
     /// `emit_signature_diagnostics` over a trait's method list.
     emit_trait_method_signature_diagnostics(&this,
-                                            methods: &[FunctionDeclNode*]) -> void {
+                                            methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const func: FunctionDeclNode* = methods[i];
+            const func_decl: DeclarationNode* = methods[i];
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func == null) { continue; }
-            this.emit_signature_diagnostics(func);
+            this.emit_signature_diagnostics(func_decl);
         }
     }
 
@@ -869,8 +879,8 @@ type struct TypeResolutionRunner {
         this.resolver.resolve_method_signatures(methods, res_ctx, owner_ty, owner, &args);
     }
 
-    /// Resolves all function signatures ([FunctionDeclNode*]) on a trait.
-    resolve_trait_method_signatures(&this, methods: &[FunctionDeclNode*],
+    /// Resolves all function signatures ([DeclarationNode*]) on a trait.
+    resolve_trait_method_signatures(&this, methods: &[DeclarationNode*],
                                     res_ctx: ResolutionContext*) -> void {
         this.resolver.resolve_trait_method_signatures(methods, res_ctx);
     }
@@ -1406,7 +1416,8 @@ type struct TypeResolutionPasses {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => { }
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
+                        | DeclKind::Function(_) | DeclKind::Legacy => { }
                     }
                 }
                 _ => { }
@@ -1418,73 +1429,74 @@ type struct TypeResolutionPasses {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
                 ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register class methods"), node.methods, ctx.intern_table, arena, "type_resolution/register class methods");
             }
-            NodeKind::FunctionDeclaration => {
-                const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                // A signature the name layer refused registers nothing: with
-                // the refused parameter dropped it would be a different
-                // function's, and with no return type it cannot be mangled.
-                // The refusal is recorded on the definition so a call to it
-                // finds a declaration and reports nothing.
-                if (decl_index::DeclarationIndex::signature_is_refused(func)) {
-                    ctx.defs.record_signature_refused(func.def);
-                } else if (func.resolved_return_type.is_valid()) {
-                    // Collect resolved param types from AST
-                    mut param_types: [TypeRef] = [];
-                    for (mut p: i64 = 0; p < func.parameters.length; p++) {
-                        const param_decl: DeclarationNode* = func.parameters[p];
-                        const param: VarDecl* = DeclarationNode::var_of(param_decl);
-                        if (param != null && param.resolved_type.is_valid()) {
-                            param_types.push(param.resolved_type);
-                        }
-                    }
-
-                    // Create a FunctionType in the arena (deduplicated)
-                    const func_type_ref: TypeRef = arena.get_function(
-                        func.resolved_return_type, param_types, func.is_variadic);
-
-                    // A declaration is registered in its own family - its
-                    // module and the name it is written with.  A copy (a
-                    // monomorphized instance) is registered in none: a call
-                    // reaches it by its instance, and its symbol is mangled
-                    // under the module of the definition it copies.
-                    const decl_span: SourceSpan = if (func.has_name_span()) { func.name_span } else { func.span };
-                    const entry: OverloadId = if (!func.def.is_valid() && func.copy_of.is_valid()) {
-                        ctx.decl_index.register_copy_signature(
-                            ctx.copy_module_family(func.copy_of), func.name, func.resolved_return_type,
-                            func_type_ref, ctx.intern_table, arena, decl_span, func as ASTNode*)
-                    } else {
-                        ctx.decl_index.register_function_signature(
-                            ctx.fn_family_of(func.def), func.name, func.resolved_return_type, func_type_ref,
-                            ctx.intern_table, arena, SymbolStr::empty(), decl_span,
-                            if (is_source_decl) { func.def } else { DefId::invalid() }, func as ASTNode*)
-                    };
-                    func.set_overload_entry(entry);
-                    // A generic intrinsic's entries lower as its kind: the
-                    // declaration's, and each specialization's, which is the
-                    // entry a call to it is pinned to.
-                    if (func.is_intrinsic) {
-                        // A specialization's name is minted; its kind is
-                        // the declaration's it is a copy of.
-                        ctx.decl_index.mark_intrinsic(entry, if (func.copy_of.is_valid()) {
-                            ctx.decl_index.entry_intrinsic_kind(ctx.decl_index.entry_of_def(func.copy_of))
-                        } else {
-                            IntrinsicKind::from_name(ctx.intern_table.resolve(func.name))
-                        });
-                    }
-                    // Whether this IS a function generated code calls - the
-                    // allocator, the entry point's `set_args` - is decided by
-                    // the identity, claimed where it is registered.  The
-                    // identity is the one the name layer stamped on the
-                    // declaration when it bound the function.
-                    ctx.generic_registry.claim_wellknown(func.def, ctx.intern_table);
-
-                    ctx.decl_index.set_decl_visibility(func.def, func.is_public);
-                    // A free function's instance is answered by its entry.
-                    ctx.decl_index.record_instance(func.instance, entry);
-                }
-            }
             NodeKind::Declaration => {
                 match ((stmt as DeclarationNode*).shape) {
+                    DeclKind::Function(_) => {
+                        const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+                        // A signature the name layer refused registers nothing: with
+                        // the refused parameter dropped it would be a different
+                        // function's, and with no return type it cannot be mangled.
+                        // The refusal is recorded on the definition so a call to it
+                        // finds a declaration and reports nothing.
+                        if (decl_index::DeclarationIndex::signature_is_refused(func_decl)) {
+                            ctx.defs.record_signature_refused(func.def);
+                        } else if (func.resolved_return_type.is_valid()) {
+                            // Collect resolved param types from AST
+                            mut param_types: [TypeRef] = [];
+                            for (mut p: i64 = 0; p < func.parameters.length; p++) {
+                                const param_decl: DeclarationNode* = func.parameters[p];
+                                const param: VarDecl* = DeclarationNode::var_of(param_decl);
+                                if (param != null && param.resolved_type.is_valid()) {
+                                    param_types.push(param.resolved_type);
+                                }
+                            }
+
+                            // Create a FunctionType in the arena (deduplicated)
+                            const func_type_ref: TypeRef = arena.get_function(
+                                func.resolved_return_type, param_types, func.is_variadic);
+
+                            // A declaration is registered in its own family - its
+                            // module and the name it is written with.  A copy (a
+                            // monomorphized instance) is registered in none: a call
+                            // reaches it by its instance, and its symbol is mangled
+                            // under the module of the definition it copies.
+                            const decl_span: SourceSpan = if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span };
+                            const entry: OverloadId = if (!func.def.is_valid() && func.copy_of.is_valid()) {
+                                ctx.decl_index.register_copy_signature(
+                                    ctx.copy_module_family(func.copy_of), func.name, func.resolved_return_type,
+                                    func_type_ref, ctx.intern_table, arena, decl_span, func_decl as ASTNode*)
+                            } else {
+                                ctx.decl_index.register_function_signature(
+                                    ctx.fn_family_of(func.def), func.name, func.resolved_return_type, func_type_ref,
+                                    ctx.intern_table, arena, SymbolStr::empty(), decl_span,
+                                    if (is_source_decl) { func.def } else { DefId::invalid() }, func_decl as ASTNode*)
+                            };
+                            func.set_overload_entry(entry);
+                            // A generic intrinsic's entries lower as its kind: the
+                            // declaration's, and each specialization's, which is the
+                            // entry a call to it is pinned to.
+                            if (func.is_intrinsic) {
+                                // A specialization's name is minted; its kind is
+                                // the declaration's it is a copy of.
+                                ctx.decl_index.mark_intrinsic(entry, if (func.copy_of.is_valid()) {
+                                    ctx.decl_index.entry_intrinsic_kind(ctx.decl_index.entry_of_def(func.copy_of))
+                                } else {
+                                    IntrinsicKind::from_name(ctx.intern_table.resolve(func.name))
+                                });
+                            }
+                            // Whether this IS a function generated code calls - the
+                            // allocator, the entry point's `set_args` - is decided by
+                            // the identity, claimed where it is registered.  The
+                            // identity is the one the name layer stamped on the
+                            // declaration when it bound the function.
+                            ctx.generic_registry.claim_wellknown(func.def, ctx.intern_table);
+
+                            ctx.decl_index.set_decl_visibility(func.def, func.is_public);
+                            // A free function's instance is answered by its entry.
+                            ctx.decl_index.record_instance(func.instance, entry);
+                        }
+                    }
                     DeclKind::Struct(node) => {
                         ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register struct methods"), node.methods, ctx.intern_table, arena, "type_resolution/register struct methods");
                     }
@@ -1527,7 +1539,7 @@ type struct TypeResolutionPasses {
         // another trait implemented for the same type.  Without this,
         // `implement trait A for T { foo() }` and `implement trait B for T {
         // foo() }` mangle to the same symbol and collide at link time (see
-        // FunctionDeclNode.origin_trait and
+        // FunctionDecl.origin_trait and
         // MangledName::for_method_or_trait_impl).  This is the single stamping
         // chokepoint: it runs for both the type-resolution path and the
         // specialization injected-decl path (which routes spec'd impl blocks
@@ -1549,7 +1561,7 @@ type struct TypeResolutionPasses {
                 for (mut omi: i64 = 0; omi < node.methods.length; omi++) {
                     const om: MethodNode* = node.methods[omi];
                     if (om != null && om.func != null) {
-                        om.func.set_origin_trait(ot_def);
+                        DeclarationNode::fn_of(om.func).set_origin_trait(ot_def);
                     }
                 }
             }
@@ -1854,13 +1866,14 @@ type struct TypeResolutionPasses {
     /// param -> the impl's corresponding trait arg.  Consolidated into one
     /// entry point so the caller makes a single call; the return type is
     /// handled before the param loop so the loop is the trailing statement.
-    static rewrite_default_method_signature(cloned: FunctionDeclNode*,
+    static rewrite_default_method_signature(cloned_decl: DeclarationNode*,
                                             target: SymbolStr,
                                             target_args: &[TypeAnnotation*],
                                             param_syms: &[SymbolID],
                                             arg_anns: &[TypeAnnotation*],
                                             home_span: SourceSpan,
                                             home_res: ResSlot) -> void {
+        const cloned: FunctionDecl* = DeclarationNode::fn_of(cloned_decl);
         if (cloned == null) { return; }
         const ret_ann: TypeAnnotation* = cloned.return_type_annotation;
         if (ret_ann != null) {
@@ -2063,7 +2076,7 @@ type struct TypeResolutionPasses {
     /// `_`-separated word is capitalised and the separators dropped, so the name
     /// reads as an ordinary Cryo type and cannot collide with the method name.
     /// Minted ONCE, by `desugar_async_trait_methods`, which records its
-    /// position on the method (`FunctionDeclNode.async_fut_slot`) for every
+    /// position on the method (`FunctionDecl.async_fut_slot`) for every
     /// later reader.
     /// Case-mapped through explicit alphabet tables rather than char arithmetic:
     /// `CharType` is 4 bytes here while the stdlib treats a char as 1, so
@@ -2100,7 +2113,8 @@ type struct TypeResolutionPasses {
                                       slot: i64, ctx: CompilationContext*) -> boolean {
         if (impl_node == null || trait_decl == null || ctx == null) { return false; }
         for (mut ti: i64 = 0; ti < trait_decl.methods.length; ti++) {
-            const tfunc: FunctionDeclNode* = trait_decl.methods[ti];
+            const tfunc_decl: DeclarationNode* = trait_decl.methods[ti];
+            const tfunc: FunctionDecl* = DeclarationNode::fn_of(tfunc_decl);
             if (tfunc == null || !tfunc.is_async) { continue; }
             // The associated type the desugar recorded on the method; not
             // minted again from the leaf.
@@ -2111,7 +2125,7 @@ type struct TypeResolutionPasses {
             for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
                 const m: MethodNode* = impl_node.methods[mi];
                 if (m == null || m.func == null) { continue; }
-                if (item >= 0 && ctx.generic_registry.trait_item_slot(trait_decl.def, m.func.name) == item && m.func.is_async) { return true; }
+                if (item >= 0 && ctx.generic_registry.trait_item_slot(trait_decl.def, DeclarationNode::fn_of(m.func).name) == item && DeclarationNode::fn_of(m.func).is_async) { return true; }
             }
             // ...or inherits the trait's default body, which
             // `synthesize_default_trait_methods` clones in as an `async` method.
@@ -2146,7 +2160,8 @@ type struct TypeResolutionPasses {
         const this_ty: TypeRef = arena.this_placeholder(ctx.intern("This"));
         if (!this_ty.is_valid()) { return; }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            const func: FunctionDeclNode* = node.methods[i];
+            const func_decl: DeclarationNode* = node.methods[i];
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func == null || !func.is_async) { continue; }
             const assoc: SymbolStr =
                 TypeResolutionPasses::async_fut_assoc_name(ctx, func.name);
@@ -2161,7 +2176,7 @@ type struct TypeResolutionPasses {
                 *adecl = AssocTypeDeclNode {
                     name:   assoc,
                     bounds: [],
-                    span:   func.span,
+                    span:   func_decl.span,
                 };
                 node.assoc_types.push(adecl);
                 slot = node.assoc_types.length - 1;
@@ -2223,11 +2238,12 @@ type struct TypeResolutionPasses {
     /// param (`A`), or an `I::Item` projection - is undecidable here and kept;
     /// its applicability is settled at the trait-level symbolic pass or per
     /// monomorphization. `args_ref` is the impl's trait-arg annotations.
-    static default_method_applies_to_impl(tfunc: FunctionDeclNode*,
+    static default_method_applies_to_impl(tfunc_decl: DeclarationNode*,
                                           impl_node: ImplBlock*,
                                           trait_decl: TraitDecl*,
                                           args_ref: &[TypeAnnotation*],
                                           ctx: CompilationContext*) -> boolean {
+        const tfunc: FunctionDecl* = DeclarationNode::fn_of(tfunc_decl);
         if (tfunc == null || impl_node == null || trait_decl == null) { return true; }
         for (mut bi: i64 = 0; bi < tfunc.trait_bounds.length; bi++) {
             const b: TraitBound* = &tfunc.trait_bounds[bi];
@@ -2510,7 +2526,8 @@ type struct TypeResolutionPasses {
         // any allocation.  Most stdlib trait impls hit this path.
         mut needs_synthesis: boolean = false;
         for (mut ti: i64 = 0; ti < trait_decl.methods.length; ti++) {
-            const tfunc: FunctionDeclNode* = trait_decl.methods[ti];
+            const tfunc_decl: DeclarationNode* = trait_decl.methods[ti];
+            const tfunc: FunctionDecl* = DeclarationNode::fn_of(tfunc_decl);
             if (tfunc == null) { continue; }
             if (!tfunc.has_body()) { continue; }
             const overridden: boolean =
@@ -2559,7 +2576,8 @@ type struct TypeResolutionPasses {
         mut synthesized: i64 = 0;
 
         for (mut ti: i64 = 0; ti < trait_decl.methods.length; ti++) {
-            const tfunc: FunctionDeclNode* = trait_decl.methods[ti];
+            const tfunc_decl: DeclarationNode* = trait_decl.methods[ti];
+            const tfunc: FunctionDecl* = DeclarationNode::fn_of(tfunc_decl);
             if (tfunc == null) { continue; }
             if (!tfunc.has_body()) { continue; }
 
@@ -2576,11 +2594,12 @@ type struct TypeResolutionPasses {
             // (a param `A`, or an `I::Item` projection) are kept and decided
             // later.
             if (!TypeResolutionPasses::default_method_applies_to_impl(
-                    tfunc, impl_node, trait_decl, args_ref, ctx)) {
+                    tfunc_decl, impl_node, trait_decl, args_ref, ctx)) {
                 continue;
             }
 
-            const cloned: FunctionDeclNode* = cloner.clone_func_decl(tfunc);
+            const cloned_decl: DeclarationNode* = cloner.clone_func_decl(tfunc_decl);
+            const cloned: FunctionDecl* = DeclarationNode::fn_of(cloned_decl);
             if (cloned == null) { continue; }
             cloned.set_synth_default(true);
             // A default whose return mentions `This` (e.g. combinators
@@ -2609,9 +2628,9 @@ type struct TypeResolutionPasses {
                     impl_decl.span
                 };
             TypeResolutionPasses::rewrite_default_method_signature(
-                cloned, impl_node.target_type, impl_node.target_args,
+                cloned_decl, impl_node.target_type, impl_node.target_args,
                 trait_param_syms, args_ref, this_home_span, impl_node.res);
-            mut method: MethodNode* = new MethodNode(cloned, cloned.span);
+            mut method: MethodNode* = new MethodNode(cloned_decl, cloned_decl.span);
             method.set_static(cloned.is_static);
             impl_node.methods.push(method);
             synthesized += 1;
@@ -2683,7 +2702,8 @@ type struct TypeResolutionPasses {
         for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
             const mnode: MethodNode* = node.methods[jm];
             if (mnode == null || mnode.func == null) { continue; }
-            const fn_node: FunctionDeclNode* = mnode.func;
+            const fn_node_decl: DeclarationNode* = mnode.func;
+            const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
             mut ptypes: [TypeRef] = [];
             for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
                 const pp_decl: DeclarationNode* = fn_node.parameters[pi];
@@ -2735,7 +2755,8 @@ type struct TypeResolutionPasses {
         for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
             const mnode: MethodNode* = node.methods[mi];
             if (mnode == null || mnode.func == null) { continue; }
-            const fn_node: FunctionDeclNode* = mnode.func;
+            const fn_node_decl: DeclarationNode* = mnode.func;
+            const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
             mut ptypes: [TypeRef] = [];
             for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
                 const pp_decl: DeclarationNode* = fn_node.parameters[pi];
@@ -2823,7 +2844,8 @@ type struct TypeResolutionPasses {
         for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
             const mnode: MethodNode* = node.methods[jm];
             if (mnode == null || mnode.func == null) { continue; }
-            const fn_node: FunctionDeclNode* = mnode.func;
+            const fn_node_decl: DeclarationNode* = mnode.func;
+            const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
             mut ptypes: [TypeRef] = [];
             for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
                 const pp_decl: DeclarationNode* = fn_node.parameters[pi];
@@ -2945,7 +2967,8 @@ type struct TypeResolutionPasses {
             // unclassified. Same receiver spellings the struct and
             // class method tables filter on.
             for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
-                const tfunc: FunctionDeclNode* = node.methods[mi];
+                const tfunc_decl: DeclarationNode* = node.methods[mi];
+                const tfunc: FunctionDecl* = DeclarationNode::fn_of(tfunc_decl);
                 if (tfunc == null) { continue; }
                 mut param_types: [TypeRef] = [];
                 for (mut p: i64 = 0; p < tfunc.parameters.length; p++) {
@@ -3012,33 +3035,6 @@ type struct TypeResolutionPasses {
             cdebug("[FuncSig] stmt[%lld] kind=%d\n", i, stmt.kind as i32);
 
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                    mut func_ctx: ResolutionContext = runner.make_generic_context(
-                        func.generic_params, &runner.res_ctx);
-                    runner.resolve_func_signature(func, &func_ctx);
-                    sig_count++;
-
-                    if (func.resolved_return_type.is_valid()) {
-                        mut fparams: [TypeRef] = [];
-                        for (mut p: i64 = 0; p < func.parameters.length; p++) {
-                            const fp_decl: DeclarationNode* = func.parameters[p];
-                            const fp: VarDecl* = DeclarationNode::var_of(fp_decl);
-                            if (fp != null && fp.resolved_type.is_valid()) {
-                                fparams.push(fp.resolved_type);
-                            }
-                        }
-                        const fsig: TypeRef = arena.get_function(
-                            func.resolved_return_type, fparams, func.is_variadic);
-                        if (TypeResolutionPasses::signature_repeats(&seen_fn_names, &seen_fn_types,
-                                                                    func.name, fsig.key())) {
-                            ctx.emit_error_at(ErrorCode::E0206_REDEFINED_FUNCTION,
-                                fmt::format("function `%s` is defined multiple times with the same signature",
-                                    ctx.resolve_str(func.name)),
-                                func.span);
-                        }
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     mut class_ctx: ResolutionContext = runner.make_generic_context(
@@ -3051,6 +3047,34 @@ type struct TypeResolutionPasses {
                 NodeKind::Declaration => {
                     const decl: DeclarationNode* = stmt as DeclarationNode*;
                     match (decl.shape) {
+                        DeclKind::Function(_) => {
+                            const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+                            mut func_ctx: ResolutionContext = runner.make_generic_context(
+                                func.generic_params, &runner.res_ctx);
+                            runner.resolve_func_signature(func_decl, &func_ctx);
+                            sig_count++;
+
+                            if (func.resolved_return_type.is_valid()) {
+                                mut fparams: [TypeRef] = [];
+                                for (mut p: i64 = 0; p < func.parameters.length; p++) {
+                                    const fp_decl: DeclarationNode* = func.parameters[p];
+                                    const fp: VarDecl* = DeclarationNode::var_of(fp_decl);
+                                    if (fp != null && fp.resolved_type.is_valid()) {
+                                        fparams.push(fp.resolved_type);
+                                    }
+                                }
+                                const fsig: TypeRef = arena.get_function(
+                                    func.resolved_return_type, fparams, func.is_variadic);
+                                if (TypeResolutionPasses::signature_repeats(&seen_fn_names, &seen_fn_types,
+                                                                            func.name, fsig.key())) {
+                                    ctx.emit_error_at(ErrorCode::E0206_REDEFINED_FUNCTION,
+                                        fmt::format("function `%s` is defined multiple times with the same signature",
+                                            ctx.resolve_str(func.name)),
+                                        func_decl.span);
+                                }
+                            }
+                        }
                         DeclKind::Trait(node) => {
                             sig_count += TypeResolutionPasses::trait_signatures(&runner, node, ctx, arena);
                         }
@@ -3075,8 +3099,9 @@ type struct TypeResolutionPasses {
                         }
                         DeclKind::Extern(node) => {
                             for (mut j: i64 = 0; j < node.functions.length; j++) {
-                                const fn_node: FunctionDeclNode* = node.functions[j];
-                                runner.resolve_func_signature(fn_node, &runner.res_ctx);
+                                const fn_node_decl: DeclarationNode* = node.functions[j];
+                                const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
+                                runner.resolve_func_signature(fn_node_decl, &runner.res_ctx);
 
                                 if (fn_node.resolved_return_type.is_valid()) {
                                     // Collect resolved param types
@@ -3102,7 +3127,7 @@ type struct TypeResolutionPasses {
                                     // registered as the DI mangled name so EVERY module - 
                                     // declaring and consuming - emits the same symbol,
                                     // making the override work across the module boundary.
-                                    const ext_link_str: string = fn_node.link_directive_symbol();
+                                    const ext_link_str: string = fn_node_decl.link_directive_symbol();
                                     const ext_link_sym: SymbolStr = if (ext_link_str.length() > 0) {
                                         ctx.intern_table.intern(ext_link_str)
                                     } else {
@@ -3125,7 +3150,7 @@ type struct TypeResolutionPasses {
                                     const ext_q_name: SymbolStr = if (node.is_c_import()) {
                                         ctx.qualify_binding_sym(fn_node.name, node.binding_namespace)
                                     } else {
-                                        ctx.decl_fn_key(fn_node.name, fn_node.span.file)
+                                        ctx.decl_fn_key(fn_node.name, fn_node_decl.span.file)
                                     };
                                     const ext_leaf: SymbolStr = fn_node.name;
                                     const ext_owner: FamilyOwner = if (node.is_c_import()) {
@@ -3149,7 +3174,7 @@ type struct TypeResolutionPasses {
                                             ErrorCode::W0011_DUPLICATE_EXTERN_SYMBOL,
                                             fmt::format("extern C symbol `%s` is declared in more than one extern block with different signatures; a call binds the declaration it names, and at most one of them matches the C definition",
                                                 sym_str));
-                                        wdiag = wdiag.at_with_label(fn_node.span,
+                                        wdiag = wdiag.at_with_label(fn_node_decl.span,
                                             "duplicate extern declaration here");
                                         wdiag = wdiag.help(fmt::format("also declared as `%s`; make the two signatures agree, or remove one",
                                             ctx.intern_table.resolve(clash_key)));
@@ -3162,8 +3187,8 @@ type struct TypeResolutionPasses {
                                     fn_node.set_overload_entry(ctx.decl_index.register_function_signature(
                                         ext_owner, ext_leaf, fn_node.resolved_return_type, func_type_ref,
                                         ctx.intern_table, arena, ext_link_sym,
-                                        if (fn_node.has_name_span()) { fn_node.name_span } else { fn_node.span },
-                                        fn_node.def, fn_node as ASTNode*));
+                                        if (fn_node_decl.has_name_span()) { fn_node_decl.name_span } else { fn_node_decl.span },
+                                        fn_node.def, fn_node_decl as ASTNode*));
                                     ctx.decl_index.note_extern_symbol(ext_link_sym, ext_q_name, func_type_ref);
                                     // Whether this IS a C function the compiler checks
                                     // calls to (the C `printf`) is decided by the
@@ -3420,7 +3445,8 @@ type struct TypeResolutionPasses {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
+                        | DeclKind::Function(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {
@@ -3442,23 +3468,16 @@ type struct TypeResolutionPasses {
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                    if (func.body != null && !func.is_generic()) {
-                        runner.resolve_var_types_in_statement(func.body as ASTNode*, &runner.res_ctx);
-                        body_count++;
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (!node.is_generic()) {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
-                            if (method != null && method.func != null && method.func.body != null) {
+                            if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                 mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                    method.func.generic_params, &runner.res_ctx);
+                                    DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
                                 runner.resolve_var_types_in_statement(
-                                    method.func.body as ASTNode*, &m_ctx);
+                                    DeclarationNode::fn_of(method.func).body as ASTNode*, &m_ctx);
                                 body_count++;
                             }
                         }
@@ -3466,11 +3485,19 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Function(_) => {
+                            const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+                            if (func.body != null && !func.is_generic()) {
+                                runner.resolve_var_types_in_statement(func.body as ASTNode*, &runner.res_ctx);
+                                body_count++;
+                            }
+                        }
                         DeclKind::Struct(node) => {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
                                     const method: MethodNode* = node.methods[j];
-                                    if (method != null && method.func != null && method.func.body != null) {
+                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                         // Method-level generics (`Layout::array<T>(n)`)
                                         // must be in scope when the walker reaches a
                                         // `mut x: T = ...` body annotation; without
@@ -3478,9 +3505,9 @@ type struct TypeResolutionPasses {
                                         // and `emit_undefined_type` fires E0203 on a
                                         // perfectly legal generic param.
                                         mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                            method.func.generic_params, &runner.res_ctx);
+                                            DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
                                         runner.resolve_var_types_in_statement(
-                                            method.func.body as ASTNode*, &m_ctx);
+                                            DeclarationNode::fn_of(method.func).body as ASTNode*, &m_ctx);
                                         body_count++;
                                     }
                                 }
@@ -3490,11 +3517,11 @@ type struct TypeResolutionPasses {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
                                     const method: MethodNode* = node.methods[j];
-                                    if (method != null && method.func != null && method.func.body != null) {
+                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                         mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                            method.func.generic_params, &runner.res_ctx);
+                                            DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
                                         runner.resolve_var_types_in_statement(
-                                            method.func.body as ASTNode*, &m_ctx);
+                                            DeclarationNode::fn_of(method.func).body as ASTNode*, &m_ctx);
                                         body_count++;
                                     }
                                 }
@@ -3503,7 +3530,8 @@ type struct TypeResolutionPasses {
                         DeclKind::Trait(node) => {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const func: FunctionDeclNode* = node.methods[j];
+                                    const func_decl: DeclarationNode* = node.methods[j];
+                                    const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
                                     if (func != null && func.body != null) {
                                         mut m_ctx: ResolutionContext = runner.make_generic_context(
                                             func.generic_params, &runner.res_ctx);
@@ -3532,11 +3560,11 @@ type struct TypeResolutionPasses {
                                 runner.bind_trait_args_for_impl(node, &impl_ctx);
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
                                     const method: MethodNode* = node.methods[j];
-                                    if (method != null && method.func != null && method.func.body != null) {
+                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                         mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                            method.func.generic_params, &impl_ctx);
+                                            DeclarationNode::fn_of(method.func).generic_params, &impl_ctx);
                                         runner.resolve_var_types_in_statement(
-                                            method.func.body as ASTNode*, &m_ctx);
+                                            DeclarationNode::fn_of(method.func).body as ASTNode*, &m_ctx);
                                         body_count++;
                                     }
                                 }
@@ -3565,31 +3593,32 @@ type struct TypeResolutionPasses {
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                    if (func.body != null && !func.is_generic()) {
-                        runner.collect_generic_fn_calls_in_stmt(func.body, &runner.res_ctx);
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (!node.is_generic()) {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
-                            if (method != null && method.func != null && method.func.body != null) {
-                                runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
+                            if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                                runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
                             }
                         }
                     }
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Function(_) => {
+                            const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+                            if (func.body != null && !func.is_generic()) {
+                                runner.collect_generic_fn_calls_in_stmt(func.body, &runner.res_ctx);
+                            }
+                        }
                         DeclKind::Impl(node) => {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
                                     const method: MethodNode* = node.methods[j];
-                                    if (method != null && method.func != null && method.func.body != null) {
-                                        runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
+                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                                        runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
                                     }
                                 }
                             }
@@ -3598,8 +3627,8 @@ type struct TypeResolutionPasses {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
                                     const method: MethodNode* = node.methods[j];
-                                    if (method != null && method.func != null && method.func.body != null) {
-                                        runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
+                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                                        runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
                                     }
                                 }
                             }
@@ -3608,8 +3637,8 @@ type struct TypeResolutionPasses {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
                                     const method: MethodNode* = node.methods[j];
-                                    if (method != null && method.func != null && method.func.body != null) {
-                                        runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
+                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                                        runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
                                     }
                                 }
                             }
@@ -3826,7 +3855,8 @@ type struct TypeResolutionPasses {
                     for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
                         const mnode: MethodNode* = node.methods[jm];
                         if (mnode == null || mnode.func == null) { continue; }
-                        const fn_node: FunctionDeclNode* = mnode.func;
+                        const fn_node_decl: DeclarationNode* = mnode.func;
+                        const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
                         // Build the canonical parameter-type list: skip
                         // self params (`&this` / `this`).  These are the
                         // overload discriminator for vtable slot identity
@@ -3915,7 +3945,8 @@ type struct TypeResolutionPasses {
                         DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Field(_)
                         | DeclKind::GenericParam(_) | DeclKind::Import(_) | DeclKind::Intrinsic(_)
                         | DeclKind::Module(_) | DeclKind::Trait(_) | DeclKind::TypeAlias(_)
-                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => { continue; }
+                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Function(_)
+                        | DeclKind::Legacy => { continue; }
                     }
                     const node: EnumDecl* = DeclarationNode::enum_of(stmt);
 

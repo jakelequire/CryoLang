@@ -18,7 +18,7 @@ namespace compiler::decl_index;
 import compiler::ast::{ NodeKind, TypeAnnotation };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::declaration;
-import compiler::ast::declaration::{ FunctionDeclNode, ImplBlock, MethodNode, DeclarationNode, VarDecl };
+import compiler::ast::declaration::{ FunctionDecl, ImplBlock, MethodNode, DeclarationNode, VarDecl };
 import compiler::types;
 import compiler::types::{ arena, compound, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
@@ -254,7 +254,7 @@ type struct DeclarationIndex {
 
     // The definition's slot in `defs` -> the declaration it was registered
     // for: a method's `MethodNode`, a trait's declared method's
-    // `FunctionDeclNode`, a type's, function's or global's own node; null
+    // `FunctionDecl`, a type's, function's or global's own node; null
     // for a slot registered with no node (a module, a primitive, an
     // instance).
     declarations:   [ASTNode*];
@@ -328,7 +328,7 @@ type struct DeclarationIndex {
     overload_func_span:    [SourceSpan]; // where the entry's declaration is written
     overload_func_decl:    [ASTNode*];   // the declaration the entry was first
                                       // registered for: a method's MethodNode,
-                                      // a function's FunctionDeclNode; null for
+                                      // a function's FunctionDecl; null for
                                       // an entry registered with no node
     overload_func_trait:   [DefId];     // SymbolStr.id of the trait a trait-impl
                                       // method implements, else 0: an inherent
@@ -627,7 +627,7 @@ public:
     }
 
     /// The declaration entry `id` was registered for - a method's
-    /// `MethodNode`, a function's `FunctionDeclNode` - or null for an
+    /// `MethodNode`, a function's `FunctionDecl` - or null for an
     /// invalid id or an entry registered with no node.
     entry_decl(&this, id: OverloadId) -> ASTNode* {
         if (!id.is_valid()) { return null; }
@@ -803,11 +803,11 @@ public:
     /// The function of the method definition `d`: a type's or an
     /// implementation's method, or a trait's declared method, which is
     /// registered as the function itself.  Null when `d` names no method.
-    method_func_of(&this, d: DefId) -> FunctionDeclNode* {
+    method_func_of(&this, d: DefId) -> DeclarationNode* {
         const decl: ASTNode* = this.method_decl_of(d);
         if (decl == null) { return null; }
         if (decl.kind == NodeKind::MethodDeclaration) { return (decl as MethodNode*).func; }
-        if (decl.kind == NodeKind::FunctionDeclaration) { return decl as FunctionDeclNode*; }
+        if (DeclarationNode::fn_of(decl) != null) { return DeclarationNode::with_shape(decl); }
         return null;
     }
 
@@ -828,17 +828,17 @@ public:
     /// a copy (a trait default placed here, a monomorphized clone) and is
     /// not checked.
     check_method_def(&this, owner: TypeRef, method: MethodNode*, intern: InternTable*) -> void {
-        const d: DefId = method.func.def;
+        const d: DefId = DeclarationNode::fn_of(method.func).def;
         if (!d.is_valid()) { return; }
         if (this.defs.kind_of(d) == DefKind::Method
                 && this.defs.parent_of(d).equals(this.registered_def(owner))
-                && this.defs.leaf_of(d).spelling().equals(method.func.name)
+                && this.defs.leaf_of(d).spelling().equals(DeclarationNode::fn_of(method.func).name)
                 && this.method_decl_of(d) == method as ASTNode*) {
             return;
         }
         panic(fmt::format(
             "internal compiler error: method `%s` is registered on `%s`, and its definition says it is `%s` of `%s`",
-            intern.resolve(method.func.name), intern.shown(this.family_owner_path(FamilyOwner::Type(owner))),
+            intern.resolve(DeclarationNode::fn_of(method.func).name), intern.shown(this.family_owner_path(FamilyOwner::Type(owner))),
             intern.shown(this.defs.leaf_of(d)),
             intern.shown(this.family_owner_path(FamilyOwner::Def(this.defs.parent_of(d))))), intrinsics::location());
     }
@@ -1098,12 +1098,13 @@ public:
             // lazily at call sites and the concrete spec is registered there
             // (`register_spec_method_in_di`).  Mangling the unresolved
             // template here would hit an invalid TypeRef and ICE.
-            if (method.func.is_self_returning_default) { continue; }
-            const func: FunctionDeclNode* = method.func;
+            if (DeclarationNode::fn_of(method.func).is_self_returning_default) { continue; }
+            const func_decl: DeclarationNode* = method.func;
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
 
             // A signature the name layer refused registers nothing under
             // the key - a call finds the refusal there and stays silent.
-            if (DeclarationIndex::signature_is_refused(func)) {
+            if (DeclarationIndex::signature_is_refused(func_decl)) {
                 this.mark_method_signature_refused(owner, func.name);
                 continue;
             }
@@ -1161,9 +1162,9 @@ public:
             // codegen vtable-resolution path (see method_receiver_kind).
             const type_qname: QualifiedName = QualifiedName::from_symbol(type_sym);
             const receiver_kind: ReceiverKind = DeclarationIndex::method_receiver_kind(
-                func, method.is_static, intern);
+                func_decl, method.is_static, intern);
             const method_param_refs: [TypeRef] = DeclarationIndex::method_non_receiver_params(
-                func, intern);
+                func_decl, intern);
             const method_sym: SymbolStr = func.name;
             const mangled_base: MangledName = MangledName::for_method_or_trait_impl(
                 intern, arena, type_qname, this.defs.path_of(func.origin_trait).spelling(), trait_args,
@@ -1193,7 +1194,7 @@ public:
             // symbol and signature registration wrote, and mangles nothing.
             const entry: OverloadId = this.keep_def_entry(func.def, this.register_signature(
                 FamilyOwner::Type(owner), func.name, func_type_ref, ret, eff_mangled, func.origin_trait,
-                if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*));
+                if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span }, method as ASTNode*));
             func.set_overload_entry(entry);
             // A constructor's family is its type's: `Node(1)` and `new
             // Node(1)` name the type, and its constructors are asked by it.
@@ -1210,7 +1211,7 @@ public:
             // its own type arguments, an instance this table does not hold,
             // whether or not its symbol carries those arguments.
             const instance: boolean = method.spec_of != null && method.spec_of.func != null
-                && method.spec_of.func.generic_params.length > 0;
+                && DeclarationNode::fn_of(method.spec_of.func).generic_params.length > 0;
             if (func.copy_of.is_valid() && func.spec_type_args.length == 0 && !instance && entry.is_valid()) {
                 this.copy_entries.insert(this.copy_key(owner, func.copy_of), entry);
             }
@@ -1234,8 +1235,9 @@ public:
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
-            const func: FunctionDeclNode* = method.func;
-            if (DeclarationIndex::signature_is_refused(func)) { continue; }
+            const func_decl: DeclarationNode* = method.func;
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+            if (DeclarationIndex::signature_is_refused(func_decl)) { continue; }
             const slot: FamilySlot = this.family_slot(FamilyOwner::Template(template), func.name);
             if (slot.is_none()) { continue; }
             mut registered: boolean = false;
@@ -1261,7 +1263,7 @@ public:
             };
             const id: OverloadId = this.file_entry(slot, func_type_ref, func.resolved_return_type,
                 SymbolStr::empty(), func.origin_trait,
-                if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*);
+                if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span }, method as ASTNode*);
             const positions: [u32]* = this.overload_index.get_or_insert(slot, []);
             (*positions).push(this.slot_of(id) as u32);
         }
@@ -1590,7 +1592,8 @@ public:
     /// `refused` reads the annotation's stamp through `require`, which a
     /// synthesized declaration's annotation may not carry.  A `this`
     /// receiver has no annotation and is never refused.
-    static signature_is_refused(func: FunctionDeclNode*) -> boolean {
+    static signature_is_refused(func_decl: DeclarationNode*) -> boolean {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return false; }
         if (!func.resolved_return_type.is_valid()
                 && TypeAnnotation::refused(func.return_type_annotation)) { return true; }
@@ -1665,8 +1668,9 @@ public:
     ///   `mut &this`      -> MutRef          (encoded as $m)
     ///   `this` (by value)-> None            (regular first param)
     ///   static method    -> None
-    static method_receiver_kind(func: FunctionDeclNode*, is_static: boolean,
+    static method_receiver_kind(func_decl: DeclarationNode*, is_static: boolean,
                                   intern: InternTable*) -> ReceiverKind {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (is_static || func == null) { return ReceiverKind::None; }
 
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
@@ -1689,8 +1693,9 @@ public:
     /// Collect the non-receiver parameter TypeRefs for use with the
     /// `for_method` mangler.  Strips out `&this` (always a marker) but
     /// keeps `this` (since its by-value form is encoded as a regular param).
-    static method_non_receiver_params(func: FunctionDeclNode*,
+    static method_non_receiver_params(func_decl: DeclarationNode*,
                                         intern: InternTable*) -> [TypeRef] {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         mut out: [TypeRef] = [];
         if (func == null) { return out; }
 

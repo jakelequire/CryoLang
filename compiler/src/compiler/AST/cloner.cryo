@@ -24,7 +24,7 @@ import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDecl,
-    EnumVariant, ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl,
+    EnumVariant, ExternBlock, FieldDecl, FunctionDecl, GenericParamDecl,
     DeclKind, ImplBlock, ImportDecl, IntrinsicDecl, MethodNode,
     ModuleDecl, StructDecl, TraitDecl, TypeAliasDecl, UnionDecl,
     VarDecl
@@ -50,7 +50,7 @@ import compiler::ast::statement::{
 
 type struct ASTCloner {
     /// One-shot specialization name applied at the first decl-level visit
-    /// (StructDecl / ClassDeclNode / EnumDecl / FunctionDeclNode).
+    /// (StructDecl / ClassDeclNode / EnumDecl / FunctionDecl).
     /// `consume_spec_name()` reads and clears it so child decls keep their
     /// own names.
     spec_name: SymbolStr;
@@ -145,7 +145,6 @@ type struct ASTCloner {
 
             NodeKind::Statement                 => { return this.copy_stmt(n as Stmt*); }
 
-            NodeKind::FunctionDeclaration       => { return this.visit_function(n as FunctionDeclNode*); }
             NodeKind::MethodDeclaration         => { return this.visit_method(n as MethodNode*); }
             NodeKind::Declaration               => { return this.copy_decl_shape(n as DeclarationNode*); }
             NodeKind::ClassDeclaration          => { return this.visit_class(n as ClassDeclNode*); }
@@ -731,63 +730,8 @@ type struct ASTCloner {
 
     // Declaration visitors
 
-    visit_function(mut &this, node: FunctionDeclNode*) -> ASTNode* {
-        const name: SymbolStr = this.consume_spec_name(node.name);
-        const skip_gp: boolean = this.consume_skip_generics();
-        mut c: FunctionDeclNode* = new FunctionDeclNode(name, node.span);
-        this.copy_decl_base(node, c);
-        c.is_public   = node.is_public;
-        c.is_static   = node.is_static;
-        c.is_async    = node.is_async;
-        c.is_inline   = node.is_inline;
-        c.is_noinline = node.is_noinline;
-        c.is_caller_located = node.is_caller_located;
-        c.written_in  = node.written_in;
-        c.is_variadic = node.is_variadic;
-        c.is_synthesized_body = node.is_synthesized_body;
-        c.is_synth_default = node.is_synth_default;
-        c.is_intrinsic = node.is_intrinsic;
-        c.is_self_returning_default = node.is_self_returning_default;
-        c.is_lazy_self_growing = node.is_lazy_self_growing;
-        c.link_name     = node.link_name;
-        c.has_link_name = node.has_link_name;
-        // Preserve the originating trait so a SPECIALIZED generic trait
-        // method (e.g. `Str::Debug::fmt<String>` cloned from `fmt<W>`)
-        // mangles with its trait and doesn't collide with the same-named
-        // method of another trait on the same type (`Str::Display::fmt`).
-        // Without this the two specs share one symbol and dispatch silently
-        // resolves to whichever was emitted, breaking Debug.
-        c.set_origin_trait(node.origin_trait);
-        c.set_async_fut_slot(node.async_fut_slot);
-        // A copy stands for the definition its source is, or for the one
-        // its source already stood for.
-        c.copy_of = if (node.def.is_valid()) { node.def } else { node.copy_of };
-        for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            c.add_parameter(this.clone_var_decl(node.parameters[i]));
-        }
-        if (!skip_gp) {
-            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
-            }
-        }
-        // A copy owns its bounds as it owns its parameters: a bound's
-        // projection subject caches what it resolved to in its own
-        // signature's context, which is not the source's.
-        for (mut i: i64 = 0; i < node.trait_bounds.length; i++) {
-            c.add_trait_bound(node.trait_bounds[i].clone());
-        }
-        if (node.return_type_annotation != null) {
-            c.set_return_type_annotation(this.clone_type_annotation(node.return_type_annotation));
-        }
-        if (node.has_body()) {
-            c.set_body(this.copy_stmt(node.body));
-        }
-        return c;
-    }
-
     visit_method(mut &this, node: MethodNode*) -> ASTNode* {
-        const cloned_func: FunctionDeclNode* = this.clone_func_decl(node.func);
-        mut c: MethodNode* = new MethodNode(cloned_func, node.span);
+        mut c: MethodNode* = new MethodNode(this.clone_func_decl(node.func), node.span);
         this.copy_decl_base(node, c);
         c.visibility            = node.visibility;
         c.is_constructor        = node.is_constructor;
@@ -1065,6 +1009,13 @@ type struct ASTCloner {
                 c.has_value      = n.has_value;
                 DeclKind::Variant(c)
             }
+            DeclKind::Function(n) => {
+                // A specialization's copy is named for its instance and drops
+                // the parameters it is specialized over.
+                const name: SymbolStr = this.consume_spec_name(n.name);
+                const skip_gp: boolean = this.consume_skip_generics();
+                DeclKind::Function(this.copy_function(n, name, skip_gp))
+            }
             DeclKind::Variable(n) => {
                 const c: VarDecl* = this.copy_var(n);
                 // A local declaration's decided type is carried, and a copy's
@@ -1249,10 +1200,20 @@ type struct ASTCloner {
         return c;
     }
 
-    /// Clone a FunctionDeclNode.
-    clone_func_decl(mut &this, node: FunctionDeclNode*) -> FunctionDeclNode* {
-        mut c: FunctionDeclNode* = new FunctionDeclNode(node.name, node.span);
-        this.copy_decl_base(node, c);
+    /// Clone a function's declaration as it is: its name, and its generic
+    /// parameters.
+    clone_func_decl(mut &this, node_decl: DeclarationNode*) -> DeclarationNode* {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
+        const c_decl: DeclarationNode* = DeclarationNode::of(
+            DeclKind::Function(this.copy_function(node, node.name, false)), node_decl.span);
+        this.copy_decl_base(node_decl, c_decl);
+        return c_decl;
+    }
+
+    /// The payload of a function's copy named `name`, with no generic
+    /// parameters when `skip_gp`; its resolved return type is left invalid.
+    copy_function(mut &this, node: FunctionDecl*, name: SymbolStr, skip_gp: boolean) -> FunctionDecl* {
+        mut c: FunctionDecl* = FunctionDecl::new(name);
         c.is_public   = node.is_public;
         c.is_static   = node.is_static;
         c.is_async    = node.is_async;
@@ -1282,8 +1243,10 @@ type struct ASTCloner {
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             c.add_parameter(this.clone_var_decl(node.parameters[i]));
         }
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
+        if (!skip_gp) {
+            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
+            }
         }
         // A copy owns its bounds as it owns its parameters: a bound's
         // projection subject caches what it resolved to in its own

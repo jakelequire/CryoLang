@@ -60,7 +60,7 @@ import std::collections::str::{ Str };
 import std::core::mem;
 import compiler::ast::declaration::{
     BindingAccessor, DeclarationNode, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
-    FunctionDeclNode, ImplBlock, MethodNode, StructDecl, TypeAliasDecl,
+    FunctionDecl, ImplBlock, MethodNode, StructDecl, TypeAliasDecl,
     UnionDecl, VarDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -184,7 +184,8 @@ type struct BindingSerializer {
                 s.render_extern_global(ext_globals[gi]);
             }
             for (mut i: i64 = 0; i < extern_node.functions.length; i++) {
-                const fnode: FunctionDeclNode* = extern_node.functions[i];
+                const fnode_decl: DeclarationNode* = extern_node.functions[i];
+                const fnode: FunctionDecl* = DeclarationNode::fn_of(fnode_decl);
                 const fnm: string = s.ctx.intern_table.resolve(fnode.name);
                 const sym: string = if (fnode.has_link_name) { fnode.link_name } else { fnm };
                 mut dup_at: i64 = -1;
@@ -208,7 +209,7 @@ type struct BindingSerializer {
                         }
                         seen_fn.push(alias);
                         seen_sym.push(sym);
-                        s.render_function_named(fnode, alias, sym);
+                        s.render_function_named(fnode_decl, alias, sym);
                         if (report != null) {
                             report.approx(fmt::format(
                                 "function `%s` renamed to `%s` (C++ overload or cross-namespace leaf collision; binds `%s`)",
@@ -219,7 +220,7 @@ type struct BindingSerializer {
                 }
                 seen_fn.push(fnm);
                 seen_sym.push(sym);
-                s.render_function(fnode);
+                s.render_function(fnode_decl);
             }
             s.out.push("}\n");
         }
@@ -228,7 +229,6 @@ type struct BindingSerializer {
 
     /// The declared name of a top-level decl node (for dedup), or "".
     static decl_name(ctx: CompilationContext*, node: ASTNode*) -> string {
-        const k: NodeKind = node.kind;
         if (DeclarationNode::struct_of(node) != null) {
             return ctx.intern_table.resolve((DeclarationNode::struct_of(node)).name);
         } else if (DeclarationNode::union_of(node) != null) {
@@ -239,8 +239,8 @@ type struct BindingSerializer {
             return ctx.intern_table.resolve(DeclarationNode::alias_of(node).alias_name);
         } else if (DeclarationNode::var_of(node) != null) {
             return ctx.intern_table.resolve((DeclarationNode::var_of(node)).name);
-        } else if (k == NodeKind::FunctionDeclaration) {
-            return ctx.intern_table.resolve((node as FunctionDeclNode*).name);
+        } else if (DeclarationNode::fn_of(node) != null) {
+            return ctx.intern_table.resolve(DeclarationNode::fn_of(node).name);
         } else if (DeclarationNode::impl_of(node) != null) {
             // A synthetic key so an impl block isn't dropped by the empty-name
             // skip, and so a class re-visited across headers dedups by target.
@@ -251,7 +251,6 @@ type struct BindingSerializer {
     }
 
     render_decl(mut &this, node: ASTNode*) -> void {
-        const k: NodeKind = node.kind;
         if (DeclarationNode::struct_of(node) != null) {
             this.render_struct(DeclarationNode::struct_of(node));
         } else if (DeclarationNode::union_of(node) != null) {
@@ -262,10 +261,10 @@ type struct BindingSerializer {
             this.render_alias(DeclarationNode::alias_of(node));
         } else if (DeclarationNode::var_of(node) != null) {
             this.render_const(DeclarationNode::var_of(node));
-        } else if (k == NodeKind::FunctionDeclaration) {
+        } else if (DeclarationNode::fn_of(node) != null) {
             // A bodied top-level function in `root.statements` is a function-alias
             // forwarding wrapper (the extern prototypes live in `extern_node`).
-            this.render_wrapper_function(node as FunctionDeclNode*);
+            this.render_wrapper_function(DeclarationNode::with_shape(node));
         } else if (DeclarationNode::impl_of(node) != null) {
             // A C++ class's bound methods (direct mangled binding).
             this.render_impl(DeclarationNode::impl_of(node));
@@ -522,20 +521,22 @@ type struct BindingSerializer {
         return lit.value;
     }
 
-    render_function(mut &this, node: FunctionDeclNode*) -> void {
+    render_function(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         // C++ free/namespace function: pin its mangled linker symbol.  C
         // functions have no link override, so `sym` is empty for them.
         const nm: string = this.ctx.intern_table.resolve(node.name);
         const sym: string = if (node.has_link_name) { node.link_name } else { "" };
-        this.render_function_named(node, nm, sym);
+        this.render_function_named(node_decl, nm, sym);
     }
 
     /// Emit an extern `function` prototype for `node` under `disp_name`, pinning
     /// `symbol` as its linker name when non-empty.  Shared by the 1:1 emit and the
     /// collision disambiguator, which renders a distinct same-leaf overload under a
     /// suffixed alias with its true (mangled or bare-C) symbol pinned.
-    render_function_named(mut &this, node: FunctionDeclNode*,
+    render_function_named(mut &this, node_decl: DeclarationNode*,
                           disp_name: string, symbol: string) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (symbol.length() > 0) {
             this.out.push(fmt::format("    ![symbol(\"%s\")]\n", symbol));
         }
@@ -562,7 +563,8 @@ type struct BindingSerializer {
     /// a single statement the importer built - a `return TARGET(args)` (or, for a
     /// `void` target, a bare `TARGET(args)`).  Top-level functions are public by
     /// default, so no modifier is emitted; the file's `namespace` qualifies it.
-    render_wrapper_function(mut &this, node: FunctionDeclNode*) -> void {
+    render_wrapper_function(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         // Signature (param names keyword-escaped, matching the call args below).
         mut s: string = fmt::format("function %s(", this.ctx.intern_table.resolve(node.name));
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
@@ -615,7 +617,8 @@ type struct BindingSerializer {
 
     /// Render one bound C++ method: `![symbol("sym")] public [static] name(recv, params) -> Ret;`.
     render_method(mut &this, m: MethodNode*) -> void {
-        const func: FunctionDeclNode* = m.func;
+        const func_decl: DeclarationNode* = m.func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func.has_link_name) {
             this.out.push(fmt::format("    ![symbol(\"%s\")]\n", func.link_name));
         }

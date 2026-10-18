@@ -26,7 +26,7 @@ import utils::logger::{ cdebug };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
-    DeclarationNode, DeclKind, FunctionDeclNode, GenericParamDecl, ImplBlock,
+    DeclarationNode, DeclKind, FunctionDecl, GenericParamDecl, ImplBlock,
     ImportDecl, IntrinsicDecl,
     MethodNode, StructDecl, TraitDecl, TypeAliasDecl, UnionDecl,
     VarDecl
@@ -93,7 +93,6 @@ type struct ASTValidator {
 
     validate_top_level(mut &this, node: ASTNode*) -> void {
         match (node.kind) {
-            NodeKind::FunctionDeclaration   => { this.validate_function(node as FunctionDeclNode*); }
             NodeKind::ClassDeclaration      => { this.validate_class(node as ClassDeclNode*); }
             NodeKind::Statement             => {
                 match ((node as Stmt*).shape) {
@@ -108,6 +107,7 @@ type struct ASTValidator {
             NodeKind::Declaration           => {
                 const d: DeclarationNode* = node as DeclarationNode*;
                 match (d.shape) {
+                    DeclKind::Function(_) => { this.validate_function(DeclarationNode::with_shape(node)); }
                     DeclKind::Enum(n)      => { this.validate_enum(d, n); }
                     DeclKind::Extern(n)    => { this.validate_extern_block(d, n); }
                     DeclKind::Import(n)    => { this.validate_import(d, n); }
@@ -134,10 +134,11 @@ type struct ASTValidator {
 
     // Declaration validators
 
-    validate_function(mut &this, func: FunctionDeclNode*) -> void {
+    validate_function(mut &this, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (!func.name.is_valid()) {
             this.emit(ErrorCode::E0051_MISSING_FUNCTION_NAME,
-                "function declaration has no name", func.span);
+                "function declaration has no name", func_decl.span);
         }
 
         // Validate parameters
@@ -146,11 +147,11 @@ type struct ASTValidator {
                 this.emit(ErrorCode::E0053_NULL_PARAMETER,
                     fmt::format("null parameter at index %lld in function '%s'",
                         i, this.ctx.resolve_str(func.name)),
-                    func.span);
+                    func_decl.span);
             }
         }
 
-        this.validate_generic_params(func.generic_params, func.span,
+        this.validate_generic_params(func.generic_params, func_decl.span,
             this.ctx.resolve_str(func.name));
 
         // Validate body (if present); null body is valid for extern/forward decls

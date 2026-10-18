@@ -17,7 +17,7 @@ import compiler::ast::{ NodeKind };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, FunctionDeclNode, ImplBlock, MethodNode,
+    ClassDeclNode, DeclarationNode, DeclKind, FunctionDecl, ImplBlock, MethodNode,
     StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::diag::source_span::{ SourceSpan };
@@ -89,12 +89,12 @@ type struct Outline {
     /// another file, or a monomorphized function, is not.
     written_here(&this, n: ASTNode*) -> boolean {
         if (n == null || n.span.start_line == 0 || n.span.file == null) { return false; }
-        if (n.kind == NodeKind::FunctionDeclaration && (n as FunctionDeclNode*).is_specialization) {
+        if (DeclarationNode::fn_of(n) != null && DeclarationNode::fn_of(n).is_specialization) {
             return false;
         }
         if (n.kind == NodeKind::MethodDeclaration) {
             const m: MethodNode* = n as MethodNode*;
-            if (m.func != null && m.func.is_specialization) { return false; }
+            if (m.func != null && DeclarationNode::fn_of(m.func).is_specialization) { return false; }
         }
         return n.span.file.eq(this.file);
     }
@@ -175,7 +175,7 @@ type struct Outline {
                     DeclKind::Import(_) | DeclKind::Intrinsic(_)
                     | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
                     | DeclKind::TypeAlias(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
-                    | DeclKind::Variable(_) | DeclKind::Legacy => { }
+                    | DeclKind::Variable(_) | DeclKind::Function(_) | DeclKind::Legacy => { }
                 }
             }
             _ => { }
@@ -209,9 +209,9 @@ type struct Outline {
     static kind_of(n: ASTNode*) -> i64 {
         return match (n.kind) {
             NodeKind::ClassDeclaration     => { 5 }
-            NodeKind::FunctionDeclaration  => { 12 }
             NodeKind::Declaration          => {
                 match ((n as DeclarationNode*).shape) {
+                    DeclKind::Function(_) => { 12 }
                     DeclKind::Trait(_)     => { 11 }
                     DeclKind::TypeAlias(_) => { 26 }
                     DeclKind::Enum(_)      => { 10 }
@@ -240,9 +240,9 @@ type struct Outline {
     name_of(&this, n: ASTNode*) -> string {
         match (n.kind) {
             NodeKind::ClassDeclaration     => { return this.text((n as ClassDeclNode*).name); }
-            NodeKind::FunctionDeclaration  => { return this.text((n as FunctionDeclNode*).name); }
             NodeKind::Declaration          => {
                 match ((n as DeclarationNode*).shape) {
+                    DeclKind::Function(_) => { return this.text(DeclarationNode::fn_of(n).name); }
                     DeclKind::Trait(t)     => { return this.text(t.name); }
                     DeclKind::TypeAlias(a) => { return this.text(a.alias_name); }
                     DeclKind::Enum(e)      => { return this.text(e.name); }
@@ -261,7 +261,7 @@ type struct Outline {
             NodeKind::MethodDeclaration    => {
                 const m: MethodNode* = n as MethodNode*;
                 if (m.func == null) { return ""; }
-                return this.text(m.func.name);
+                return this.text(DeclarationNode::fn_of(m.func).name);
             }
             _                              => { return ""; }
         }
@@ -299,9 +299,10 @@ type struct Outline {
         Outline::widen(&s, this.name_span(n));
         if (n.kind == NodeKind::MethodDeclaration) {
             const m: MethodNode* = n as MethodNode*;
-            if (m.func != null && m.func.body != null) { Outline::widen(&s, m.func.body.span); }
-        } else if (n.kind == NodeKind::FunctionDeclaration) {
-            const f: FunctionDeclNode* = n as FunctionDeclNode*;
+            if (m.func != null && DeclarationNode::fn_of(m.func).body != null) { Outline::widen(&s, DeclarationNode::fn_of(m.func).body.span); }
+        } else if (DeclarationNode::fn_of(n) != null) {
+            const f_decl: DeclarationNode* = DeclarationNode::with_shape(n);
+            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
             if (f.body != null) { Outline::widen(&s, f.body.span); }
         }
         return s;

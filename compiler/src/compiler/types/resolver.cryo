@@ -48,7 +48,7 @@ import compiler::types::user_defined;
 import compiler::types::user_defined::{ TypeAliasType };
 import std::fmt;
 import compiler::ast::declaration::{
-    DeclarationNode, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlock, MethodNode,
+    DeclarationNode, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock, MethodNode,
     TraitDecl, TypeAliasDecl, VarDecl
 };
 import compiler::ast::expression::{ ExpressionNode, StructLiteralNode };
@@ -1073,10 +1073,11 @@ type struct TypeResolver {
     // Batch resolution helpers (shared by TypeResolution & Monomorphizer)
 
     /// Resolve a function's return type and parameter type annotations.
-    /// Sets resolved_return_type on the FunctionDeclNode and resolved_type
+    /// Sets resolved_return_type on the FunctionDecl and resolved_type
     /// on each parameter VarDecl.
-    resolve_func_signature(&this, func: FunctionDeclNode*,
+    resolve_func_signature(&this, func_decl: DeclarationNode*,
                            res_ctx: ResolutionContext*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return; }
         const _fname: string = this.intern_table.resolve(func.name);
         cdebug("[ResFuncSig] enter func=%p '%s' params=%lld body=%p ret_ann=%p\n",
@@ -1097,7 +1098,7 @@ type struct TypeResolver {
                 // both non-generic methods (concrete body) and generic
                 // templates / specializations (body already substituted by
                 // the time the spec path re-enters this function).
-                this.infer_impl_trait_return(func, res_ctx);
+                this.infer_impl_trait_return(func_decl, res_ctx);
             }
         }
         // Default to void if no return type annotation was provided.
@@ -1151,8 +1152,9 @@ type struct TypeResolver {
     /// (`return SomeIter<T> { ... }`), which covers every collection iterator
     /// entry point; other shapes leave the return unresolved (a clear
     /// downstream error rather than a silent miscompile).
-    infer_impl_trait_return(&this, func: FunctionDeclNode*,
+    infer_impl_trait_return(&this, func_decl: DeclarationNode*,
                             res_ctx: ResolutionContext*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.return_type_annotation == null) { return; }
         mut imp: ImplTraitAnnotation* = null;
         match (*func.return_type_annotation) {
@@ -1279,14 +1281,14 @@ type struct TypeResolver {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
 
-            const _mname: string = this.intern_table.resolve(method.func.name);
-            cdebug("[ResMthSig]   [%lld] method='%s' generic=%d\n", i, _mname, method.func.is_generic() as i32);
+            const _mname: string = this.intern_table.resolve(DeclarationNode::fn_of(method.func).name);
+            cdebug("[ResMthSig]   [%lld] method='%s' generic=%d\n", i, _mname, DeclarationNode::fn_of(method.func).is_generic() as i32);
 
             // If the method itself is generic, bind its own params
-            if (method.func.is_generic()) {
+            if (DeclarationNode::fn_of(method.func).is_generic()) {
                 mut method_ctx: ResolutionContext = res_ctx.clone();
-                for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
-                    const gp_decl: DeclarationNode* = method.func.generic_params[j];
+                for (mut j: i64 = 0; j < DeclarationNode::fn_of(method.func).generic_params.length; j++) {
+                    const gp_decl: DeclarationNode* = DeclarationNode::fn_of(method.func).generic_params[j];
                     const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
                     method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
@@ -1316,17 +1318,17 @@ type struct TypeResolver {
             // is often invalid at this pass (the receiver is back-filled later),
             // so a TypeRef-identity check would silently never fire.
             if (owner_def.is_valid()
-                    && !method.func.is_generic()
+                    && !DeclarationNode::fn_of(method.func).is_generic()
                     && !method.is_static
-                    && !method.func.is_self_returning_default
-                    && !method.func.is_lazy_self_growing) {
+                    && !DeclarationNode::fn_of(method.func).is_self_returning_default
+                    && !DeclarationNode::fn_of(method.func).is_lazy_self_growing) {
                 const owner_base: TypeRef = this.decl_index.type_of_def(owner_def);
-                mut grows: boolean = method.func.resolved_return_type.is_valid()
+                mut grows: boolean = DeclarationNode::fn_of(method.func).resolved_return_type.is_valid()
                     && this.arena.is_self_growing_instantiation(
-                           method.func.resolved_return_type, owner_base);
+                           DeclarationNode::fn_of(method.func).resolved_return_type, owner_base);
                 if (!grows) {
-                    for (mut gp: i64 = 0; gp < method.func.parameters.length; gp++) {
-                        const gparam_decl: DeclarationNode* = method.func.parameters[gp];
+                    for (mut gp: i64 = 0; gp < DeclarationNode::fn_of(method.func).parameters.length; gp++) {
+                        const gparam_decl: DeclarationNode* = DeclarationNode::fn_of(method.func).parameters[gp];
                         const gparam: VarDecl* = DeclarationNode::var_of(gparam_decl);
                         if (gparam == null || !gparam.resolved_type.is_valid()) { continue; }
                         // Skip the receiver: `&this`/`this` is the owner itself,
@@ -1340,7 +1342,7 @@ type struct TypeResolver {
                     }
                 }
                 if (grows) {
-                    method.func.set_lazy_self_growing(true);
+                    DeclarationNode::fn_of(method.func).set_lazy_self_growing(true);
                 }
             }
 
@@ -1350,8 +1352,8 @@ type struct TypeResolver {
             // `&this` resolves to a Pointer to owner; bare `this` resolves
             // to owner directly.
             if (method.is_static || !owner_type.is_valid()) { continue; }
-            for (mut p: i64 = 0; p < method.func.parameters.length; p++) {
-                const param_decl: DeclarationNode* = method.func.parameters[p];
+            for (mut p: i64 = 0; p < DeclarationNode::fn_of(method.func).parameters.length; p++) {
+                const param_decl: DeclarationNode* = DeclarationNode::fn_of(method.func).parameters[p];
                 const param: VarDecl* = DeclarationNode::var_of(param_decl);
                 if (param == null || param.resolved_type.is_valid()) { continue; }
                 if (param.is_value_receiver()) {
@@ -1433,14 +1435,14 @@ type struct TypeResolver {
         return this.generic_registry.instantiate(owner_type, filled);
     }
 
-    /// Resolve all function signatures ([FunctionDeclNode*]) on a trait.
+    /// Resolve all function signatures ([DeclarationNode*]) on a trait.
     ///
     /// Inside a trait body, `This` is a symbolic placeholder for the type
     /// that future impls will bind. We give it a stable identity by
     /// synthesizing a deduplicated GenericParam("This", sentinel-index);
     /// this lets `&This` parameters and `-> This` returns resolve to a real
     /// TypeRef that downstream substitution can rewrite per-impl.
-    resolve_trait_method_signatures(&this, methods: &[FunctionDeclNode*],
+    resolve_trait_method_signatures(&this, methods: &[DeclarationNode*],
                                     res_ctx: ResolutionContext*) -> void {
         if (!res_ctx.this_type.is_valid()) {
             const this_name: SymbolStr = this.intern_table.intern("This");
@@ -1450,7 +1452,8 @@ type struct TypeResolver {
         }
 
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const func: FunctionDeclNode* = methods[i];
+            const func_decl: DeclarationNode* = methods[i];
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func == null) { continue; }
 
             if (func.is_generic()) {
@@ -1461,9 +1464,9 @@ type struct TypeResolver {
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
                     method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
-                this.resolve_func_signature(func, &method_ctx);
+                this.resolve_func_signature(func_decl, &method_ctx);
             } else {
-                this.resolve_func_signature(func, res_ctx);
+                this.resolve_func_signature(func_decl, res_ctx);
             }
         }
     }

@@ -42,7 +42,7 @@ import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDecl, EnumDecl, EnumVariant,
-    ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlock,
+    ExternBlock, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock,
     DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
@@ -298,9 +298,10 @@ type struct NameResolver {
     /// Stamp a function declaration with the definition it is: the id every
     /// reference to the function resolves to (`Res::Def` off the same
     /// symbol), so the declaration and its uses agree by construction.
-    stamp_function_def(&this, fn_node: FunctionDeclNode*, sym_id: SymbolID) -> void {
+    stamp_function_def(&this, fn_node_decl: DeclarationNode*, sym_id: SymbolID) -> void {
+        const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
         fn_node.def = this.resolver.get_symbol(sym_id).def;
-        this.ctx.decl_index.keep_declaration(fn_node.def, fn_node as ASTNode*);
+        this.ctx.decl_index.keep_declaration(fn_node.def, fn_node_decl as ASTNode*);
     }
 
     /// The definition a type declaration's binding was registered as, for
@@ -315,11 +316,12 @@ type struct NameResolver {
     /// Register the method `func` as a definition of `owner` - the type it
     /// is declared on or the trait declaring it - and stamp it on the
     /// declaration, `decl` being the node the method is (a `MethodNode`, or
-    /// a trait's own `FunctionDeclNode`).  An owner the head could not name
+    /// a trait's own `FunctionDecl`).  An owner the head could not name
     /// registers nothing: the head's own error has been reported.
-    define_method(&this, owner: DefId, func: FunctionDeclNode*, decl: ASTNode*) -> DefId {
+    define_method(&this, owner: DefId, func_decl: DeclarationNode*, decl: ASTNode*) -> DefId {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (!owner.is_valid()) { return DefId::invalid(); }
-        func.def = this.ctx.define_method(owner, func.name, func.span, decl);
+        func.def = this.ctx.define_method(owner, func.name, func_decl.span, decl);
         return func.def;
     }
 
@@ -407,15 +409,6 @@ type struct NameResolver {
 
     forward_declare_node(mut &this, node: ASTNode*) -> void {
         match (node.kind) {
-            NodeKind::FunctionDeclaration => {
-                const fn_node: FunctionDeclNode* = node as FunctionDeclNode*;
-                const sym_id: SymbolID = this.resolver.declare_function(
-                    fn_node.name, fn_node.span, fn_node.is_public);
-                this.stamp_function_def(fn_node, sym_id);
-                if (fn_node.is_public) {
-                    this.resolver.export_symbol(sym_id);
-                }
-            }
             NodeKind::ClassDeclaration => {
                 const class_node: ClassDeclNode* = node as ClassDeclNode*;
                 const sym_id: SymbolID = this.resolver.declare_type(
@@ -437,6 +430,16 @@ type struct NameResolver {
             NodeKind::Declaration => {
                 const decl: DeclarationNode* = node as DeclarationNode*;
                 match (decl.shape) {
+                    DeclKind::Function(_) => {
+                        const fn_node_decl: DeclarationNode* = DeclarationNode::with_shape(node);
+                        const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
+                        const sym_id: SymbolID = this.resolver.declare_function(
+                            fn_node.name, fn_node_decl.span, fn_node.is_public);
+                        this.stamp_function_def(fn_node_decl, sym_id);
+                        if (fn_node.is_public) {
+                            this.resolver.export_symbol(sym_id);
+                        }
+                    }
                     DeclKind::Variable(var_node) => { this.forward_declare_var(decl, var_node); }
                     DeclKind::Extern(extern_node) => {
                         if (extern_node.is_c_import()) {
@@ -464,20 +467,22 @@ type struct NameResolver {
                             const saved_scope: u64 = this.resolver.get_current_scope_id();
                             this.resolver.set_module(c_module);
                             for (mut j: i64 = 0; j < extern_node.functions.length; j++) {
-                                const fn_node: FunctionDeclNode* = extern_node.functions[j];
+                                const fn_node_decl: DeclarationNode* = extern_node.functions[j];
+                                const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
                                 const fn_sym: SymbolID = this.resolver.declare_function(
-                                    fn_node.name, fn_node.span, true);
-                                this.stamp_function_def(fn_node, fn_sym);
+                                    fn_node.name, fn_node_decl.span, true);
+                                this.stamp_function_def(fn_node_decl, fn_sym);
                                 this.resolver.export_symbol(fn_sym);
                             }
                             this.resolver.restore_scope(saved_module, saved_scope);
                         } else {
                             // Regular extern block: declare functions in current scope
                             for (mut j: i64 = 0; j < extern_node.functions.length; j++) {
-                                const fn_node: FunctionDeclNode* = extern_node.functions[j];
+                                const fn_node_decl: DeclarationNode* = extern_node.functions[j];
+                                const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
                                 const sym_id: SymbolID = this.resolver.declare_function(
-                                    fn_node.name, fn_node.span, fn_node.is_public);
-                                this.stamp_function_def(fn_node, sym_id);
+                                    fn_node.name, fn_node_decl.span, fn_node.is_public);
+                                this.stamp_function_def(fn_node_decl, sym_id);
                                 if (fn_node.is_public) {
                                     this.resolver.export_symbol(sym_id);
                                 }
@@ -627,7 +632,8 @@ type struct NameResolver {
                     DeclKind::Struct(s)          => { s.def }
                     DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
                     | DeclKind::Variant(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
-                    | DeclKind::Impl(_) | DeclKind::Destructure(_) | DeclKind::Legacy => {
+                    | DeclKind::Impl(_) | DeclKind::Destructure(_) | DeclKind::Function(_)
+                    | DeclKind::Legacy => {
                         DefId::invalid()
                     }
                 }
@@ -835,7 +841,8 @@ type struct NameResolver {
 
 
     /// Whether parameter `i` repeats the name of an earlier parameter.
-    static repeats_parameter(node: FunctionDeclNode*, i: i64) -> boolean {
+    static repeats_parameter(node_decl: DeclarationNode*, i: i64) -> boolean {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         for (mut j: i64 = 0; j < i; j++) {
             if (DeclarationNode::var_of(node.parameters[j]).name.id
                     == DeclarationNode::var_of(node.parameters[i]).name.id) {
@@ -856,11 +863,12 @@ type struct NameResolver {
     /// What a function's scope spans: its first token to the end of its
     /// body, so `Resolver::scope_at` finds the scope at a position in the
     /// parameters or the body.  A method's own span covers only its name.
-    static function_extent(node: FunctionDeclNode*) -> SourceSpan {
-        if (node.body == null) { return node.span; }
+    static function_extent(node_decl: DeclarationNode*) -> SourceSpan {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
+        if (node.body == null) { return node_decl.span; }
         const b: SourceSpan = node.body.span;
-        if (b.start_line == 0) { return node.span; }
-        return SourceSpan::new(node.span.file, node.span.start_line, node.span.start_col,
+        if (b.start_line == 0) { return node_decl.span; }
+        return SourceSpan::new(node_decl.span.file, node_decl.span.start_line, node_decl.span.start_col,
             b.end_line, b.end_col);
     }
 
@@ -2973,12 +2981,12 @@ implement trait Walk for struct NameResolver {
     }
 
     // -- Declarations --
-    walk_function(mut &this, node: FunctionDeclNode*) -> void {
+    walk_function(mut &this, node_decl: DeclarationNode*, node: FunctionDecl*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] visit(FunctionDecl) name='%s' generics=%d",
             this.resolver.intern_table.resolve(node.name), node.generic_params.length);
         // Enter function scope
         this.resolver.enter_scope(ScopeKind::Function, this.resolver.intern_table.resolve(node.name),
-            NameResolver::function_extent(node));
+            NameResolver::function_extent(node_decl));
 
         // Declare generic params
         this.declare_generics(node.generic_params);
@@ -2993,7 +3001,7 @@ implement trait Walk for struct NameResolver {
             // Scan only prior parameters (rather than `current_scope_has`) so a
             // value parameter sharing a generic param's name is not falsely
             // flagged.
-            if (NameResolver::repeats_parameter(node, i)) {
+            if (NameResolver::repeats_parameter(node_decl, i)) {
                 this.ctx.emit_error_at(
                     ErrorCode::E0205_REDEFINED_SYMBOL,
                     fmt::format("the parameter `%s` is already declared in this function",
@@ -3022,7 +3030,7 @@ implement trait Walk for struct NameResolver {
         // arguments; name resolution was the only pass that did not, so a path
         // written in one reached codegen with nothing recorded.
         if (this.pending_base_ctor != null
-                && this.pending_base_ctor.func == node) {
+                && this.pending_base_ctor.func == node_decl) {
             const owner: MethodNode* = this.pending_base_ctor;
             // Cleared for the descent: an argument containing a lambda or a
             // nested constructor call must not re-enter this branch and resolve
@@ -3260,9 +3268,10 @@ implement trait Walk for struct NameResolver {
         // Every signature is declared before any body is walked, so a default
         // body may call a sibling method declared after it.
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            const method: FunctionDeclNode* = node.methods[i];
-            this.resolver.declare_method(method.name, method.span, true,
-                this.define_method(this.this_trait, method, method as ASTNode*));
+            const method_decl: DeclarationNode* = node.methods[i];
+            const method: FunctionDecl* = DeclarationNode::fn_of(method_decl);
+            this.resolver.declare_method(method.name, method_decl.span, true,
+                this.define_method(this.this_trait, method_decl, method_decl as ASTNode*));
         }
 
         // A default body is source written in THIS file, and is the only place
@@ -3271,7 +3280,7 @@ implement trait Walk for struct NameResolver {
         // implementor's, not the trait's.  Skipping it here leaves every path
         // it spells to be re-derived from wherever the compiler is standing at
         // instantiation time.  A method with no default has no body, and
-        // `visit(FunctionDeclNode*)` already walks one only when it exists.
+        // `visit(FunctionDecl*)` already walks one only when it exists.
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.walk_node(node.methods[i]);
         }
@@ -3358,7 +3367,7 @@ implement trait Walk for struct NameResolver {
                 const is_public: boolean =
                     method.visibility == Visibility::Public;
                 this.resolver.declare_method(
-                    method.func.name, method.func.span, is_public,
+                    DeclarationNode::fn_of(method.func).name, method.func.span, is_public,
                     this.define_method(method_owner, method.func, method as ASTNode*));
             }
             this.walk_node(method);

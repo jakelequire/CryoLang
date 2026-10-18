@@ -17,7 +17,7 @@ import compiler::decl_index::{ DeclarationIndex, InlineBody };
 import compiler::ast::{ node, declaration, NodeKind };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, FunctionDeclNode, ImplBlock, MethodNode,
+    ClassDeclNode, DeclarationNode, DeclKind, FunctionDecl, ImplBlock, MethodNode,
     StructDecl, UnionDecl
 };
 import compiler::resolver::res;
@@ -38,11 +38,11 @@ implement struct InlineBodies {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    if (InlineBodies::is_inline_body(stmt as FunctionDeclNode*)) { return true; }
-                }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Function(_) => {
+                            if (InlineBodies::is_inline_body(DeclarationNode::with_shape(stmt))) { return true; }
+                        }
                         DeclKind::Impl(ib) => {
                             if (InlineBodies::any_inline(ib.methods)) { return true; }
                         }
@@ -78,15 +78,16 @@ implement struct InlineBodies {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                    if (f.generic_params.length == 0 && InlineBodies::is_inline_body(f)) {
-                        di.record_inline_body(f.overload_entry,
-                            InlineBody { owner: TypeRef::invalid(), base: null });
-                    }
-                }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Function(_) => {
+                            const f_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
+                            if (f.generic_params.length == 0 && InlineBodies::is_inline_body(f_decl)) {
+                                di.record_inline_body(f.overload_entry,
+                                    InlineBody { owner: TypeRef::invalid(), base: null });
+                            }
+                        }
                         DeclKind::Impl(ib) => {
                             if (ib.generic_params.length > 0) { continue; }
                             if (ctx.generic_registry.template_of(ib.target_def()) != null) { continue; }
@@ -123,10 +124,11 @@ implement struct InlineBodies {
         for (mut j: i64 = 0; j < methods.length; j++) {
             const m: MethodNode* = methods[j];
             if (m == null || m.func == null) { continue; }
-            const f: FunctionDeclNode* = m.func;
+            const f_decl: DeclarationNode* = m.func;
+            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
             if (f.generic_params.length > 0) { continue; }
             if (f.is_self_returning_default || f.is_lazy_self_growing) { continue; }
-            if (!InlineBodies::is_inline_body(f)) { continue; }
+            if (!InlineBodies::is_inline_body(f_decl)) { continue; }
             di.record_inline_body(f.overload_entry, InlineBody { owner: owner, base: base });
         }
     }
@@ -139,7 +141,8 @@ implement struct InlineBodies {
         return false;
     }
 
-    static is_inline_body(f: FunctionDeclNode*) -> boolean {
+    static is_inline_body(f_decl: DeclarationNode*) -> boolean {
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         return f != null && f.is_inline && f.body != null;
     }
 }

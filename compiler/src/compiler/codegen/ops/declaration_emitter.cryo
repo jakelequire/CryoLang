@@ -51,7 +51,7 @@ import compiler::resolver::lang_item::{ LangItem };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDeclNode,
+    ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDecl,
     ImplBlock, IntrinsicDecl, MethodNode, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -246,7 +246,7 @@ type struct DeclarationEmitter {
                         | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
                         | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
                         | DeclKind::GenericParam(_) | DeclKind::Trait(_) | DeclKind::Variable(_)
-                        | DeclKind::Legacy => {}
+                        | DeclKind::Function(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -329,11 +329,11 @@ type struct DeclarationEmitter {
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    this.declare_function(stmt as FunctionDeclNode*);
-                }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Function(_) => {
+                            this.declare_function(DeclarationNode::with_shape(stmt));
+                        }
                         DeclKind::Intrinsic(n) => { this.declare_intrinsic(n); }
                         DeclKind::Extern(n)    => { this.declare_extern_block(n); }
                         DeclKind::Union(n)     => { this.declare_union_methods(n); }
@@ -387,8 +387,9 @@ type struct DeclarationEmitter {
     ///
     /// `main` is exempt: it is the C entry point, must be strong, and is never a
     /// specialization anyway (the guard only documents the invariant).
-    apply_spec_linkage(mut &this, fn_val: LValue, node: FunctionDeclNode*,
+    apply_spec_linkage(mut &this, fn_val: LValue, node_decl: DeclarationNode*,
                        fn_name: MangledName, is_program_main: boolean) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node == null || is_program_main) { return; }
         if (!node.is_specialization || !fn_val.is_valid()) { return; }
         fn_val.set_linkage(LLinkage::WeakODR);
@@ -403,8 +404,9 @@ type struct DeclarationEmitter {
     /// consistent.  `fn_name` is the emitted LLVM symbol (used to key the weak
     /// COMDAT).  Caller gates on the presence of a body: these only apply to
     /// definitions, never bodyless externs.
-    apply_directive_effects(mut &this, fn_val: LValue, node: FunctionDeclNode*,
+    apply_directive_effects(mut &this, fn_val: LValue, node_decl: DeclarationNode*,
                             fn_name: MangledName) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node == null || !fn_val.is_valid()) { return; }
         // `![weak]`: weak definition (WeakAny) so a strong definition in
         // another object overrides it - the user-overridable runtime symbols
@@ -435,11 +437,13 @@ type struct DeclarationEmitter {
     /// made and never to a same-name neighbour; and registration is the one
     /// place the symbol is computed, so a declaration the index never
     /// registered has no symbol here and is not emitted.
-    free_function_symbol(&this, node: FunctionDeclNode*) -> SymbolStr {
+    free_function_symbol(&this, node_decl: DeclarationNode*) -> SymbolStr {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         return this.ctx.decl_index.entry_symbol(node.overload_entry).spelling();
     }
 
-    declare_function(mut &this, node: FunctionDeclNode*) -> void {
+    declare_function(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         // Skip generic templates, and a generic intrinsic's specializations:
         // an intrinsic has no symbol, its calls are rewritten before codegen.
         if (node.generic_params.length > 0 || node.is_intrinsic) {
@@ -448,7 +452,7 @@ type struct DeclarationEmitter {
 
         const ctx_ptr: CompilationContext* = this.ctx;
         const intern: InternTable* = ctx_ptr.intern_table;
-        const mangled_sym: SymbolStr = this.free_function_symbol(node);
+        const mangled_sym: SymbolStr = this.free_function_symbol(node_decl);
         // The C ABI entry point must be named `main` verbatim; the C
         // runtime's _start references the unmangled symbol.  Override the
         // mangled name for the program's entry point - the function the name
@@ -492,7 +496,7 @@ type struct DeclarationEmitter {
         // (sret on returns, byval on params), so the produced LLVM
         // signature looks like `void f(ptr sret(%T), ptr byval(%P), ...)`.
         // Phase 1/2 attribute attachment happens just below.
-        const param_count: u32 = CodegenUtil::fixed_param_count(node);
+        const param_count: u32 = CodegenUtil::fixed_param_count(node_decl);
 
         mut fn_type:    LType         = LType::null();
         mut sret_pointee: LType       = LType::null();   // null => no sret
@@ -519,7 +523,7 @@ type struct DeclarationEmitter {
             // This widening is not expressible in the ABI seam (it adds
             // synthetic parameters not in the source signature), so it
             // stays open-coded here.  `envp` shares argv's `char**` type.
-            const ret_ty: LType = this.map_return_type(node);
+            const ret_ty: LType = this.map_return_type(node_decl);
             if (!ret_ty.is_valid()) { return; }
             const argv_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
             const buf: void* = libc::malloc(3 * 8);
@@ -560,7 +564,7 @@ type struct DeclarationEmitter {
 
         // Add the function to the LLVM module.
         const fn_val: LValue = this.llvm_module.add_function(MangledName::new(fn_name), fn_type);
-        this.apply_spec_linkage(fn_val, node, MangledName::new(fn_name), is_program_main);
+        this.apply_spec_linkage(fn_val, node_decl, MangledName::new(fn_name), is_program_main);
 
         // `--panic=unwind`: `fn_val` is now `__cryo_user_main`; synthesize the
         // `main` wrapper that catches an uncaught panic at the root (see
@@ -622,7 +626,7 @@ type struct DeclarationEmitter {
                 this.abi.apply_frame_pointer_attribute(fn_val);
             }
             // `![weak]` / `![naked]` / `![section]` linkage-and-placement.
-            this.apply_directive_effects(fn_val, node, MangledName::new(fn_name));
+            this.apply_directive_effects(fn_val, node_decl, MangledName::new(fn_name));
         }
 
         // Held under the Cryo symbol, which is what a caller's pin names.
@@ -816,7 +820,7 @@ type struct DeclarationEmitter {
                 // `!impl.is_valid()` bail drops the whole vtable.
                 if (m.ast_node != null) {
                     const mnode_ck: MethodNode* = m.ast_node as MethodNode*;
-                    if (mnode_ck != null && mnode_ck.func != null && !mnode_ck.func.has_body()) {
+                    if (mnode_ck != null && mnode_ck.func != null && !DeclarationNode::fn_of(mnode_ck.func).has_body()) {
                         continue;
                     }
                 }
@@ -829,7 +833,7 @@ type struct DeclarationEmitter {
                 mut slot_entry: OverloadId = OverloadId::invalid();
                 if (m.ast_node != null) {
                     const smn: MethodNode* = m.ast_node as MethodNode*;
-                    if (smn != null && smn.func != null) { slot_entry = smn.func.overload_entry; }
+                    if (smn != null && smn.func != null) { slot_entry = DeclarationNode::fn_of(smn.func).overload_entry; }
                 }
                 return this.resolver.resolve_pinned(CalleePin::Decl(slot_entry));
             }
@@ -918,14 +922,15 @@ type struct DeclarationEmitter {
     /// Empty for a method the index never registered, which is then not
     /// emitted.
     method_symbol(&this, node: MethodNode*) -> SymbolStr {
-        return this.ctx.decl_index.entry_symbol(node.func.overload_entry).spelling();
+        return this.ctx.decl_index.entry_symbol(DeclarationNode::fn_of(node.func).overload_entry).spelling();
     }
 
     /// Declare a method.  Methods get a `this` pointer as the first parameter.
     /// `owner` is the type the method is on: an impl head's owner or a
     /// declaration's own type, never re-derived from a name here.
     declare_method(mut &this, node: MethodNode*, owner: TypeRef) -> void {
-        const func: FunctionDeclNode* = node.func;
+        const func_decl: DeclarationNode* = node.func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return; }
 
         // Skip generic methods.
@@ -1022,7 +1027,7 @@ type struct DeclarationEmitter {
         // existing param.
         // For variadic methods (`args...`), skip the trailing name-only param;
         // LLVM's `...` marker covers it.
-        const fixed_user_count: u32 = CodegenUtil::fixed_param_count(func);
+        const fixed_user_count: u32 = CodegenUtil::fixed_param_count(func_decl);
         mut user_param_count: u32 = 0;
         for (mut pc: u32 = 0; pc < fixed_user_count; pc++) {
             const pp_decl: DeclarationNode* = func.parameters[pc];
@@ -1202,7 +1207,7 @@ type struct DeclarationEmitter {
         }
 
         // `![inline]` / `![noinline]` on a method: mirror the free-function
-        // path.  The flags live on the wrapped FunctionDeclNode (`func`),
+        // path.  The flags live on the wrapped FunctionDecl (`func`),
         // set by directive_processing.  Gate on a body so bodyless declares
         // don't carry a dead attribute.
         if (func.body != null) {
@@ -1216,7 +1221,7 @@ type struct DeclarationEmitter {
                 this.abi.apply_frame_pointer_attribute(fn_val);
             }
             // `![weak]` / `![section]` on a method (naked is function-only).
-            this.apply_directive_effects(fn_val, func, MangledName::new(fn_name));
+            this.apply_directive_effects(fn_val, func_decl, MangledName::new(fn_name));
         }
 
         // Held under the Cryo symbol: the key every pin and the body's own
@@ -1267,11 +1272,12 @@ type struct DeclarationEmitter {
         const intern: InternTable* = ctx_ptr.intern_table;
 
         for (mut i: i64 = 0; i < node.functions.length; i++) {
-            const func: FunctionDeclNode* = node.functions[i];
+            const func_decl: DeclarationNode* = node.functions[i];
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func == null) { continue; }
 
             const name_str: string = intern.resolve(func.name);
-            const param_count: u32 = CodegenUtil::fixed_param_count(func);
+            const param_count: u32 = CodegenUtil::fixed_param_count(func_decl);
 
             // Route the extern declaration through the Phase 1 + 2 + 3
             // extern-C seam so the LLVM function type matches the SysV
@@ -1291,7 +1297,7 @@ type struct DeclarationEmitter {
             if (!plan.llvm_fn_type.is_valid()) {
                 this.diag.emit_warning_at_span(ErrorCode::E0643_RETURN_TYPE_ERROR,
                     fmt::format("codegen: extern function '%s': failed to classify signature", name_str),
-                    func.span);
+                    func_decl.span);
                 continue;
             }
             const fn_type: LType = plan.llvm_fn_type;
@@ -1603,9 +1609,10 @@ type struct DeclarationEmitter {
     /// Enter the body of `func`, defined as `fn_val`: record its name for the
     /// `Location`s made in it, and for a `![caller_location]` body the last
     /// parameter, the address of its caller's `Location`.
-    open_caller_site(mut &this, fn_val: LValue, func: FunctionDeclNode*) -> void {
+    open_caller_site(mut &this, fn_val: LValue, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         this.intrinsics.open_function(this.ctx.intern_table.shown(
-            this.ctx.defs.path_of(FunctionDeclNode::written_in_of(func))));
+            this.ctx.defs.path_of(FunctionDecl::written_in_of(func_decl))));
         this.caller_location = LValue::null();
         if (!func.is_caller_located) { return; }
         const n: u32 = llvm::LLVMCountParams(fn_val.raw);
@@ -1619,7 +1626,8 @@ type struct DeclarationEmitter {
     /// location. No-op unless `-g`. The subroutine type carries no
     /// parameter list (sufficient for function-level file:line backtraces;
     /// per-argument types and per-statement line granularity are follow-ups).
-    emit_debug_subprogram(mut &this, fn_val: LValue, node: FunctionDeclNode*) -> void {
+    emit_debug_subprogram(mut &this, fn_val: LValue, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         const ctx_ptr: CompilationContext* = this.ctx;
         if (!this.debug_info.is_on()) { return; }
         if (!fn_val.is_valid()) { return; }
@@ -1627,7 +1635,7 @@ type struct DeclarationEmitter {
         const dib:  void* = this.debug_info.builder;
         const file: void* = this.debug_info.file;
 
-        mut line: u32 = node.span.start_line;
+        mut line: u32 = node_decl.span.start_line;
         if (line == 0) { line = 1; }
 
         // Idempotent: if `fn_val` already carries a DISubprogram, REUSE it. A
@@ -1650,7 +1658,7 @@ type struct DeclarationEmitter {
             // methods are distinguishable in a backtrace, rather than the bare
             // leaf name - and the module the linkage name below mangles, which
             // for a specialization is the template's, not the one emitting it.
-            const disp_sym: SymbolStr = ctx_ptr.decl_fn_key(node.name, node.span.file);
+            const disp_sym: SymbolStr = ctx_ptr.decl_fn_key(node.name, node_decl.span.file);
             const name: string = this.resolve(disp_sym);
             const name_len: u64 = name.length();
 
@@ -1679,7 +1687,7 @@ type struct DeclarationEmitter {
             llvm::LLVMSetSubprogram(fn_val.raw, sp);
         }
 
-        mut col: u32 = node.span.start_col;
+        mut col: u32 = node_decl.span.start_col;
         if (col == 0) { col = 1; }
         // Debug metadata is context-scoped; build it in the same per-target
         // context as the module/builder (LContext::current()), not the global
@@ -1698,13 +1706,14 @@ type struct DeclarationEmitter {
     /// exists.  The caller caps the entry block with `unreachable` after
     /// emitting the asm (inline asm is not a terminator; the asm performs the
     /// real control transfer).
-    codegen_naked_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
-        const fn_val: LValue = this.functions.get(this.free_function_symbol(node));
+    codegen_naked_prologue(mut &this, node_decl: DeclarationNode*) -> LValue {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
+        const fn_val: LValue = this.functions.get(this.free_function_symbol(node_decl));
         if (!fn_val.is_valid()) {
             const fname: string = this.resolve(node.name);
             this.diag.emit_warning_at_span(ErrorCode::E0606_FUNCTION_GENERATION_ERROR,
                 fmt::format("codegen: naked function '%s' has no LLVM declaration in this module; body skipped.", fname),
-                node.span);
+                node_decl.span);
             return LValue::null();
         }
         const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
@@ -1712,10 +1721,11 @@ type struct DeclarationEmitter {
         return fn_val;
     }
 
-    codegen_function_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
+    codegen_function_prologue(mut &this, node_decl: DeclarationNode*) -> LValue {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         // The body attaches to the function `declare_function` made for THIS
         // signature, held under the symbol both derive the same way.
-        const mangled_sym: SymbolStr = this.free_function_symbol(node);
+        const mangled_sym: SymbolStr = this.free_function_symbol(node_decl);
         const fn_val: LValue = this.functions.get(mangled_sym);
         if (!fn_val.is_valid()) {
             // IRGeneration's declare-functions phase should have produced a
@@ -1727,7 +1737,7 @@ type struct DeclarationEmitter {
             const fname: string = this.resolve(node.name);
             this.diag.emit_warning_at_span(ErrorCode::E0606_FUNCTION_GENERATION_ERROR,
                 fmt::format("codegen: function '%s' has no LLVM declaration in this module; body skipped (the declare-functions phase should have produced one). Calls to this function will fail at link time.", fname),
-                node.span);
+                node_decl.span);
             return LValue::null();
         }
 
@@ -1739,8 +1749,8 @@ type struct DeclarationEmitter {
         // whole body inherit a !dbg location (the verifier requires one on
         // inlinable calls in a function that carries debug info). No-op
         // unless `-g`.
-        this.emit_debug_subprogram(fn_val, node);
-        this.open_caller_site(fn_val, node);
+        this.emit_debug_subprogram(fn_val, node_decl);
+        this.open_caller_site(fn_val, node_decl);
 
         // Create allocas for each parameter and store the incoming value.
         this.values.push_scope();
@@ -1752,7 +1762,7 @@ type struct DeclarationEmitter {
         const is_sret_fn: boolean = this.abi.sret_pointee_of(fn_val).is_valid();
         mut llvm_idx: u32 = if (is_sret_fn) { 1 } else { 0 } as u32;
 
-        const fixed_count: u32 = CodegenUtil::fixed_param_count(node);
+        const fixed_count: u32 = CodegenUtil::fixed_param_count(node_decl);
         for (mut i: u32 = 0; i < fixed_count; i++) {
             const param_decl: DeclarationNode* = node.parameters[i];
             const param: VarDecl* = DeclarationNode::var_of(param_decl);
@@ -1764,7 +1774,7 @@ type struct DeclarationEmitter {
                 this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
                     fmt::format("codegen: function '%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this function will fail at link time.",
                         fname, param_name),
-                    if (param != null) { param_decl.span } else { node.span });
+                    if (param != null) { param_decl.span } else { node_decl.span });
                 this.values.pop_scope();
                 return LValue::null();
             }
@@ -1838,7 +1848,7 @@ type struct DeclarationEmitter {
         // a v* variant (vsprintf, vfprintf, etc.).  Without this the `args`
         // identifier has no LLVM value and every forwarding call codegens
         // with a null operand.
-        const va_param: VarDecl* = CodegenUtil::variadic_param(node);
+        const va_param: VarDecl* = CodegenUtil::variadic_param(node_decl);
         if (va_param != null) {
             this.expr_ops.emit_va_start_for_variadic(fn_val, va_param.name, va_param.sym_id);
         } else {
@@ -1854,7 +1864,7 @@ type struct DeclarationEmitter {
         // Suppressed under `no_runtime`: main's signature was NOT widened
         // (no argc/argv/envp), so there are no synthetic params to publish,
         // and `std::env` is not linked in a freestanding build.
-        if (node.def.is_valid() && node.def.equals(this.ctx.entry_fn) && CodegenUtil::fixed_param_count(node) == 0
+        if (node.def.is_valid() && node.def.equals(this.ctx.entry_fn) && CodegenUtil::fixed_param_count(node_decl) == 0
             && !this.ctx.options.freestanding()) {
             this.emit_set_args_call(fn_val);
             this.emit_set_env_call(fn_val);
@@ -2008,7 +2018,8 @@ type struct DeclarationEmitter {
     /// side already does when it emits `unreachable` after a `never`-returning
     /// call.  Without this the block stays unterminated and the body validator
     /// discards the whole function.
-    codegen_function_epilogue(mut &this, node: FunctionDeclNode*) -> void {
+    codegen_function_epilogue(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         const current_bb: LBasicBlock = this.builder.get_insert_block();
         if (current_bb.is_valid() && !current_bb.has_terminator()) {
             const ret_ty: TypeRef = node.resolved_return_type;
@@ -2079,7 +2090,8 @@ type struct DeclarationEmitter {
     /// Generate function prologue for a method.  Prepends `this` parameter binding.
     /// `owner` as in `declare_method`; its display name serves the diagnostics.
     codegen_method_prologue(mut &this, node: MethodNode*, owner: TypeRef) -> LValue {
-        const func: FunctionDeclNode* = node.func;
+        const func_decl: DeclarationNode* = node.func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return LValue::null(); }
 
         const intern: InternTable* = this.get_intern();
@@ -2104,13 +2116,13 @@ type struct DeclarationEmitter {
             this.diag.emit_warning_at_span(ErrorCode::E0619_METHOD_GENERATION_ERROR,
                 fmt::format("codegen: method '%s::%s' has no LLVM declaration in this module; body skipped (declare_method should have produced one). Calls to this method will fail at link time.",
                     type_str, method_str),
-                func.span);
+                func_decl.span);
             return LValue::null();
         }
 
         const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
         this.builder.position_at_end(entry_bb);
-        this.open_caller_site(fn_val, func);
+        this.open_caller_site(fn_val, func_decl);
 
         this.values.push_scope();
 
@@ -2162,7 +2174,7 @@ type struct DeclarationEmitter {
                 const ms: string = this.resolve(func.name);
                 this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                     fmt::format("codegen: method '%s::%s': the owner has no type", type_str, ms),
-                    func.span);
+                    func_decl.span);
                 this.values.pop_scope();
                 return LValue::null();
             }
@@ -2198,7 +2210,7 @@ type struct DeclarationEmitter {
                     this.diag.emit_warning_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
                         fmt::format("codegen: method '%s::%s': could not lower the by-value `this` type to LLVM; body skipped. Calls to this method will fail at link time.",
                             type_str, method_str),
-                        func.span);
+                        func_decl.span);
                     this.values.pop_scope();
                     return LValue::null();
                 }
@@ -2257,7 +2269,7 @@ type struct DeclarationEmitter {
         // method uses (we already handled it above).  Cap iteration at the
         // fixed-param count so a trailing `args...` bucket doesn't try to pull
         // an LLVM param that doesn't exist.
-        const fixed_count: u32 = CodegenUtil::fixed_param_count(func);
+        const fixed_count: u32 = CodegenUtil::fixed_param_count(func_decl);
         for (mut i: u32 = 0; i < fixed_count; i++) {
             const param_decl: DeclarationNode* = func.parameters[i];
             const param: VarDecl* = DeclarationNode::var_of(param_decl);
@@ -2272,7 +2284,7 @@ type struct DeclarationEmitter {
                 this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
                     fmt::format("codegen: method '%s::%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this method will fail at link time.",
                         type_str, method_str, param_name),
-                    if (param != null) { param_decl.span } else { func.span });
+                    if (param != null) { param_decl.span } else { func_decl.span });
                 this.values.pop_scope();
                 return LValue::null();
             }
@@ -2330,7 +2342,8 @@ type struct DeclarationEmitter {
     }
 
     /// Map a function's return type to an LLVMType.
-    map_return_type(mut &this, node: FunctionDeclNode*) -> LType {
+    map_return_type(mut &this, node_decl: DeclarationNode*) -> LType {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node.resolved_return_type.is_invalid()) {
             return LType::void_type();
         }

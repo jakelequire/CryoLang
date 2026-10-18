@@ -37,7 +37,7 @@ import std::collections::pair::{ Pair };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, FunctionDeclNode, ImplBlock, MethodNode, StructDecl,
+    ClassDeclNode, FunctionDecl, ImplBlock, MethodNode, StructDecl,
     UnionDecl, DeclarationNode, VarDecl
 };
 import compiler::ast::expression::{ ExpressionNode };
@@ -76,7 +76,8 @@ type struct DeclVisitEmitter {
 
     // visit() entry points (called by ir_generator.cryo's overrides)
 
-    emit_function_decl(mut &this, visitor: IRGeneratorVisitor*, node: FunctionDeclNode*) -> void {
+    emit_function_decl(mut &this, visitor: IRGeneratorVisitor*, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node == null) { return; }
         if (node.generic_params.length > 0) { return; }
         if (node.body == null) { return; }
@@ -91,7 +92,7 @@ type struct DeclVisitEmitter {
             return;
         }
         cdebug("[IRGen]   func body: %s\n", fn_name); libc::fflush(null);
-        this.generate_function_body(visitor, node);
+        this.generate_function_body(visitor, node_decl);
         cdebug("[IRGen]   func done\n"); libc::fflush(null);
     }
 
@@ -156,20 +157,21 @@ type struct DeclVisitEmitter {
     // method body without re-entering the visit dispatch for the wrapper.
 
     /// Generate a function body: prologue, block walk, epilogue, validate.
-    generate_function_body(mut &this, visitor: IRGeneratorVisitor*, node: FunctionDeclNode*) -> void {
+    generate_function_body(mut &this, visitor: IRGeneratorVisitor*, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         // `![naked]`: no prologue/epilogue.  Open the entry block, emit the
         // body (a single `asm { }` block - the directive validator guaranteed
         // this shape), then cap with `unreachable`: inline asm is not a
         // terminator, and the asm itself performs the real control transfer
         // (`ret`, a tail `jmp`, or a syscall that never returns).
         if (node.is_naked) {
-            const nfn: LValue = this.cg.decl.codegen_naked_prologue(node);
+            const nfn: LValue = this.cg.decl.codegen_naked_prologue(node_decl);
             if (!nfn.is_valid()) { return; }
             this.dispatch.generate_block(visitor, node.body);
             this.cg.builder.build_unreachable();
             return;
         }
-        const fn_val: LValue = this.cg.decl.codegen_function_prologue(node);
+        const fn_val: LValue = this.cg.decl.codegen_function_prologue(node_decl);
         if (!fn_val.is_valid()) {
             cdebug("[IRGen]     func prologue failed\n"); libc::fflush(null);
             return;
@@ -177,7 +179,7 @@ type struct DeclVisitEmitter {
         cdebug("[IRGen]     func prologue ok, generating block...\n"); libc::fflush(null);
         this.dispatch.generate_block(visitor,node.body);
         cdebug("[IRGen]     func block done, epilogue...\n"); libc::fflush(null);
-        this.cg.decl.codegen_function_epilogue(node);
+        this.cg.decl.codegen_function_epilogue(node_decl);
 
         // DWARF: clear the current debug location at the end of the body so
         // it can't leak into the next function or into subprogram-less code
@@ -193,7 +195,7 @@ type struct DeclVisitEmitter {
         // `undefined reference` from the linker.
         if (!this.cg.diag.is_function_body_valid(fn_val)) {
             const fname: string = this.cg.resolve(node.name);
-            this.cg.diag.report_invalid_function_body(fn_val, fname, node.span);
+            this.cg.diag.report_invalid_function_body(fn_val, fname, node_decl.span);
         }
     }
 
@@ -236,7 +238,8 @@ type struct DeclVisitEmitter {
 
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const m: MethodNode* = node.methods[i];
-            const mfunc: FunctionDeclNode* = m.func;
+            const mfunc_decl: DeclarationNode* = m.func;
+            const mfunc: FunctionDecl* = DeclarationNode::fn_of(mfunc_decl);
             if (mfunc != null) {
                 const mname: string = this.cg.resolve(mfunc.name);
                 cdebug("[IRGen]     method[%lld]: %s (static=%d, generic=%lld, body=%p)\n",
@@ -259,7 +262,8 @@ type struct DeclVisitEmitter {
     /// is the constructor's.
     generate_method_body(mut &this, visitor: IRGeneratorVisitor*, node: MethodNode*,
                          base: ResSlot*) -> void {
-        const func: FunctionDeclNode* = node.func;
+        const func_decl: DeclarationNode* = node.func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         if (func.generic_params.length > 0) { return; }
         // Self-returning trait-default templates (combinators) and self-growing
@@ -288,7 +292,7 @@ type struct DeclVisitEmitter {
         cdebug("[IRGen]       method body block...\n"); libc::fflush(null);
         this.dispatch.generate_block(visitor,func.body);
         cdebug("[IRGen]       method body done, epilogue...\n"); libc::fflush(null);
-        this.cg.decl.codegen_function_epilogue(func);
+        this.cg.decl.codegen_function_epilogue(func_decl);
 
         if (!this.cg.diag.is_function_body_valid(fn_val)) {
             const target_str: string = if (this.state.current_impl_target.is_valid()) {
@@ -300,7 +304,7 @@ type struct DeclVisitEmitter {
             } else {
                 method_str
             };
-            this.cg.diag.report_invalid_function_body(fn_val, pretty, func.span);
+            this.cg.diag.report_invalid_function_body(fn_val, pretty, func_decl.span);
         }
     }
 

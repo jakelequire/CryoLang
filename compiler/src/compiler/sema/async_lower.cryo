@@ -57,7 +57,7 @@ import compiler::types::generic::{
 };
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
-    DeclarationNode, DeclKind, DestructureBinding, DestructureDecl, FieldDecl, FunctionDeclNode,
+    DeclarationNode, DeclKind, DestructureBinding, DestructureDecl, FieldDecl, FunctionDecl,
     GenericParamDecl, ImplBlock, MethodNode, ReceiverForm, StructDecl, TraitDecl,
     VarDecl
 };
@@ -320,7 +320,7 @@ type struct AsyncOwner {
 /// `ok` is false when `declare` failed; the record is still kept so `lower`
 /// knows not to retry and re-report.
 type struct AsyncDecl {
-    node:        FunctionDeclNode*;
+    node:        DeclarationNode*;
     ok:          boolean;
 
     q_name:      SymbolStr;
@@ -367,7 +367,7 @@ type struct AsyncDecl {
     // the nodes the program holds.
     struct_decl: DeclarationNode*;
     impl_node:   DeclarationNode*;
-    poll_fn:     FunctionDeclNode*;
+    poll_fn:     DeclarationNode*;
     poll_method: MethodNode*;
 }
 
@@ -547,8 +547,9 @@ type struct AsyncLower {
     /// that type is swapped back in here and out again by `end_body_check`.
     ///
     /// Invalid (and a no-op) for anything that is not a pending `async` method.
-    begin_body_check(mut &this, node: FunctionDeclNode*) -> TypeRef {
-        const i: i64 = this.pending_index(node);
+    begin_body_check(mut &this, node_decl: DeclarationNode*) -> TypeRef {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
+        const i: i64 = this.pending_index(node_decl);
         if (i < 0 || !this.pending[i].ok || this.pending[i].method == null) {
             return TypeRef::invalid();
         }
@@ -558,13 +559,14 @@ type struct AsyncLower {
     }
 
     /// Undo `begin_body_check`. `displaced` invalid means it was a no-op.
-    end_body_check(mut &this, node: FunctionDeclNode*, displaced: TypeRef) -> void {
+    end_body_check(mut &this, node_decl: DeclarationNode*, displaced: TypeRef) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (!displaced.is_valid()) { return; }
         node.set_resolved_return_type(displaced);
     }
 
     /// Index of `node`'s pending record, or -1.
-    pending_index(&this, node: FunctionDeclNode*) -> i64 {
+    pending_index(&this, node: DeclarationNode*) -> i64 {
         for (mut i: i64 = 0; i < this.pending.length; i++) {
             if (this.pending[i].node == node) { return i; }
         }
@@ -770,8 +772,9 @@ type struct AsyncLower {
     /// the impl wins — a hand-written `implement trait AsyncRead<MyFut>` stays
     /// authoritative. No-op unless this method belongs to a trait impl whose trait
     /// declares that associated type.
-    bind_async_trait_assoc(mut &this, owner: AsyncOwner*, node: FunctionDeclNode*,
+    bind_async_trait_assoc(mut &this, owner: AsyncOwner*, node_decl: DeclarationNode*,
                            fut_ann: TypeAnnotation*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (owner == null || node == null || fut_ann == null) { return; }
         const impl_node: ImplBlock* = DeclarationNode::impl_of(owner.impl_decl);
         if (impl_node == null || !impl_node.is_trait_impl()) { return; }
@@ -786,7 +789,8 @@ type struct AsyncLower {
         mut slot: i64 = -1;
         const item: i64 = this.ctx.generic_registry.trait_item_slot(leaf, node.name);
         for (mut i: i64 = 0; i < tdecl.methods.length; i++) {
-            const tf: FunctionDeclNode* = tdecl.methods[i];
+            const tf_decl: DeclarationNode* = tdecl.methods[i];
+            const tf: FunctionDecl* = DeclarationNode::fn_of(tf_decl);
             if (tf != null && tf.is_async && item >= 0 && this.ctx.generic_registry.trait_item_slot(leaf, tf.name) == item) { slot = tf.async_fut_slot; break; }
         }
         if (slot < 0) { return; }
@@ -1665,8 +1669,9 @@ type struct AsyncLower {
     /// lives in an `Option` slot and is MOVED out with a `take`. The state-machine
     /// path skips those here and lets `carry_params` materialize one per state; a
     /// body with no `await` has no states, so its single poll takes them here.
-    emit_shadow_prelude(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, body: BlockStmt*,
+    emit_shadow_prelude(mut &this, d: AsyncDecl*, node_decl: DeclarationNode*, body: BlockStmt*,
                         sm: PollSm*, skip_carried: boolean, span: SourceSpan) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p_decl: DeclarationNode* = node.parameters[i];
             const p: VarDecl* = DeclarationNode::var_of(p_decl);
@@ -1697,11 +1702,12 @@ type struct AsyncLower {
 
     /// No-await body: shadow prelude + the original body with `return E`
     /// rewritten to `return Poll::Ready(E)` (runs to completion in one poll).
-    build_poll_body_no_await(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, sm: PollSm*,
+    build_poll_body_no_await(mut &this, d: AsyncDecl*, node_decl: DeclarationNode*, sm: PollSm*,
                              poll_out: TypeRef, span: SourceSpan) -> Stmt* {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         const body_stmt: Stmt* = Stmt::block(span);
         const body: BlockStmt* = body_stmt.as_block();
-        this.emit_shadow_prelude(d, node, body, sm, false, span);
+        this.emit_shadow_prelude(d, node_decl, body, sm, false, span);
         match (node.body.shape) {
             StmtKind::Block(orig) => {
                 for (mut bi: i64 = 0; bi < orig.statements.length; bi++) {
@@ -2393,7 +2399,8 @@ type struct AsyncLower {
     /// True when any by-value parameter has a destructor, and so has to MOVE out
     /// of its field on entry to `poll` rather than be copied out of it. Such a
     /// parameter needs an `Option` slot whether or not the body ever suspends.
-    params_need_carrier(&this, d: AsyncDecl*, node: FunctionDeclNode*) -> boolean {
+    params_need_carrier(&this, d: AsyncDecl*, node_decl: DeclarationNode*) -> boolean {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p_decl: DeclarationNode* = node.parameters[i];
             const p: VarDecl* = DeclarationNode::var_of(p_decl);
@@ -2430,7 +2437,8 @@ type struct AsyncLower {
     /// a state that only assigns it gets an empty binding to fill. Identical to
     /// how an aggregate local is carried across a suspend, except that the
     /// constructor — not a declaring state — put the first value in the slot.
-    carry_params(mut &this, d: AsyncDecl*, sm: PollSm*, node: FunctionDeclNode*) -> void {
+    carry_params(mut &this, d: AsyncDecl*, sm: PollSm*, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         const span: SourceSpan = sm.span;
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p_decl: DeclarationNode* = node.parameters[i];
@@ -2758,7 +2766,8 @@ type struct AsyncLower {
         // the associated type the trait's declaration of the method carries.
         const item: i64 = this.ctx.generic_registry.trait_item_slot(trait_def, mname);
         for (mut i: i64 = 0; i < tdecl.methods.length; i++) {
-            const f: FunctionDeclNode* = tdecl.methods[i];
+            const f_decl: DeclarationNode* = tdecl.methods[i];
+            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
             if (f == null || !f.is_async || !(item >= 0 && this.ctx.generic_registry.trait_item_slot(trait_def, f.name) == item)) { continue; }
             if (f.async_fut_slot < 0 || ap.slot != f.async_fut_slot) { continue; }
             for (mut j: i64 = 0; j < f.parameters.length; j++) {
@@ -2858,7 +2867,8 @@ type struct AsyncLower {
         if (te == null || te.kind != TemplateKind::Function) {
             return none;
         }
-        const fd: FunctionDeclNode* = te.ast_node as FunctionDeclNode*;
+        const fd_decl: DeclarationNode* = DeclarationNode::with_shape(te.ast_node);
+        const fd: FunctionDecl* = DeclarationNode::fn_of(fd_decl);
         if (fd == null || fd.body == null) { return none; }
         if (argi < 0 || argi >= fd.parameters.length) { return none; }
         // A receiver parameter would shift argument numbering against the
@@ -5159,7 +5169,8 @@ type struct AsyncLower {
     /// (re-bound by the shadow prelude on entry to every poll) and every local
     /// and `match`-arm binding (recorded by `disambiguate_locals` as it renames
     /// them).  Must run after that rename, which is what records them.
-    collect_frame_names(mut &this, d: AsyncDecl*, sm: PollSm*, node: FunctionDeclNode*) -> void {
+    collect_frame_names(mut &this, d: AsyncDecl*, sm: PollSm*, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p_decl: DeclarationNode* = node.parameters[i];
             const p: VarDecl* = DeclarationNode::var_of(p_decl);
@@ -6308,7 +6319,8 @@ type struct AsyncLower {
     /// Runs before `disambiguate_locals`, so the temporaries it introduces go
     /// through the same alpha-rename and frame registration as the body's own
     /// locals and are indistinguishable from them afterwards.
-    hoist_awaits(mut &this, node: FunctionDeclNode*) -> void {
+    hoist_awaits(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node == null || node.body == null) { return; }
         match (node.body.shape) {
             StmtKind::Block(b) => { this.hoist_block(b); }
@@ -6706,7 +6718,8 @@ type struct AsyncLower {
     /// alone: their uses keep their spelling and reach the shadow prelude
     /// (`const <param> = this.<param>`), so a local that shadows a parameter
     /// no longer collides with it once the body is flattened.
-    disambiguate_locals(mut &this, node: FunctionDeclNode*) -> void {
+    disambiguate_locals(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         this.frame_locals = [];
         this.frame_local_src = [];
         if (node.body == null) { return; }
@@ -7012,7 +7025,8 @@ type struct AsyncLower {
     /// Give every local use in `poll_fn`'s finished body the binding its scope
     /// declares.  The parameters (the receiver and `cx`) are the outermost
     /// scope.
-    rebind_poll_locals(mut &this, poll_fn: FunctionDeclNode*) -> void {
+    rebind_poll_locals(mut &this, poll_fn_decl: DeclarationNode*) -> void {
+        const poll_fn: FunctionDecl* = DeclarationNode::fn_of(poll_fn_decl);
         if (poll_fn == null || poll_fn.body == null) { return; }
         mut ctx: RebindCtx = RebindCtx { keys: [], syms: [], marks: [] };
         this.rb_enter(&ctx);
@@ -7032,24 +7046,25 @@ type struct AsyncLower {
     /// unsupported await shape, a body that can fall off its end, or a
     /// `mut`/aggregate/reference held across a suspend. Populates `sm.fut_*` /
     /// `sm.prom_*`, which `lower` consumes to build the struct fields.
-    build_poll_body_sm(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, sm: PollSm*) -> Stmt* {
+    build_poll_body_sm(mut &this, d: AsyncDecl*, node_decl: DeclarationNode*, sm: PollSm*) -> Stmt* {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         const span: SourceSpan = sm.span;
         // Reduce every `await` to one of the three carrier shapes the state
         // machine explodes, so the passes below never meet one nested in an
         // expression. First, because the temporaries it introduces have to go
         // through the rename and frame registration that follow.
-        this.hoist_awaits(node);
+        this.hoist_awaits(node_decl);
         // Make every local's name globally unique BEFORE flattening, so the
         // by-name cross-state promotion below cannot conflate a promoted local
         // with a same-named parameter or a sibling-scope local.
-        this.disambiguate_locals(node);
+        this.disambiguate_locals(node_decl);
         // Records what the frame owns, which the address-of checks below test
         // places against. Must follow the rename: it registers the names the
         // body now uses.
-        this.collect_frame_names(d, sm, node);
+        this.collect_frame_names(d, sm, node_decl);
 
         mut body: Stmt* = Stmt::block(span);
-        this.emit_shadow_prelude(d, node, body.as_block(), sm, true, span);
+        this.emit_shadow_prelude(d, node_decl, body.as_block(), sm, true, span);
 
         const orig: Stmt* = node.body;
         const entry: i64 = this.sm_alloc(sm);   // state 0
@@ -7072,7 +7087,7 @@ type struct AsyncLower {
 
         this.promote_cross_state(sm);
         if (!sm.ok) { return null; }
-        this.carry_params(d, sm, node);
+        this.carry_params(d, sm, node_decl);
         if (!sm.ok) { return null; }
 
         // Appended AFTER the two carry passes: both append their hand-back stores
@@ -7132,7 +7147,8 @@ type struct AsyncLower {
     /// MUST run before `declare`, which registers the future under whatever name
     /// the node carries; renaming afterwards would leave that registration keyed
     /// to `main`. False (nothing rewritten) when `node` is not an `async main`.
-    desugar_async_main(mut &this, node: FunctionDeclNode*) -> boolean {
+    desugar_async_main(mut &this, node_decl: DeclarationNode*) -> boolean {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node == null || node.body == null || !node.is_async) { return false; }
         if (!node.def.is_valid() || !node.def.equals(this.ctx.entry_fn)) { return false; }
 
@@ -7151,14 +7167,14 @@ type struct AsyncLower {
         if (!exec_ty.is_valid()) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
                 "`async function main` is driven by an `Executor`; add `import std::future;`",
-                node.span);
+                node_decl.span);
             return false;
         }
 
         if (node.generic_params.length > 0) {
             this.ctx.emit_error_at(ErrorCode::E0365_INVALID_ASYNC_MAIN,
                 "`async function main` cannot be generic: the entry point is called with no type arguments",
-                node.span);
+                node_decl.span);
             return false;
         }
 
@@ -7171,11 +7187,11 @@ type struct AsyncLower {
             this.ctx.emit_error_at(ErrorCode::E0365_INVALID_ASYNC_MAIN,
                 fmt::format("`async function main` must return `i32` or `void`; found `%s`",
                        this.arena.resolve_display_name(declared)),
-                node.span);
+                node_decl.span);
             return false;
         }
 
-        const span: SourceSpan = node.span;
+        const span: SourceSpan = node_decl.span;
         const inner_sym: SymbolStr = this.intern.intern("main$async");
         const ex_sym: SymbolStr = this.intern.intern("ex");
         const main_sym: SymbolStr = node.name;
@@ -7189,7 +7205,8 @@ type struct AsyncLower {
         const main_def: DefId = node.def;
         node.def = inner_def;
 
-        mut wrapper: FunctionDeclNode* = new FunctionDeclNode(main_sym, span);
+        mut wrapper: FunctionDecl* = FunctionDecl::new(main_sym);
+        const wrapper_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(wrapper), span);
         wrapper.def = main_def;
         wrapper.set_resolved_return_type(i32_ty);
         wrapper.set_return_type_annotation(this.make_type_ann(i32_ty, span));
@@ -7275,14 +7292,14 @@ type struct AsyncLower {
         wrapper.set_synthesized_body(true);
 
         if (this.ctx.artifacts.ast.root != null) {
-            this.ctx.artifacts.ast.root.add_statement(wrapper as ASTNode*);
+            this.ctx.artifacts.ast.root.add_statement(wrapper_decl as ASTNode*);
         }
         // The index still holds the pre-rewrite `main` — the async function's
         // DECLARED signature, which no definition answers to any more. Retiring
         // it leaves the synthesized entry point the only `main` a caller or
         // codegen can resolve.
         this.ctx.decl_index.retire_entry(node.overload_entry);
-        TypeResolutionPasses::register_decl_in_index(wrapper as ASTNode*, this.ctx, true);
+        TypeResolutionPasses::register_decl_in_index(wrapper_decl as ASTNode*, this.ctx, true);
         return true;
     }
 
@@ -7301,8 +7318,8 @@ type struct AsyncLower {
     ///
     /// False (with a diagnostic) if the future types are not in scope. The record
     /// is kept either way, so `lower` neither retries nor re-reports.
-    declare(mut &this, node: FunctionDeclNode*) -> boolean {
-        return this.declare_in(node, AsyncOwner::free());
+    declare(mut &this, node_decl: DeclarationNode*) -> boolean {
+        return this.declare_in(node_decl, AsyncOwner::free());
     }
 
     /// `declare` for an `async` METHOD. `owner` supplies the receiver's type,
@@ -7313,9 +7330,10 @@ type struct AsyncLower {
         return this.declare_in(owner.method.func, owner);
     }
 
-    declare_in(mut &this, node: FunctionDeclNode*, owner: AsyncOwner) -> boolean {
+    declare_in(mut &this, node_decl: DeclarationNode*, owner: AsyncOwner) -> boolean {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node == null || node.body == null) { return false; }
-        const existing: i64 = this.pending_index(node);
+        const existing: i64 = this.pending_index(node_decl);
         if (existing >= 0) { return this.pending[existing].ok; }
 
         const declared_ref: TypeRef = node.resolved_return_type;
@@ -7329,7 +7347,7 @@ type struct AsyncLower {
             this.arena.get_unit()
         } else { declared_ref };
 
-        const span: SourceSpan = node.span;
+        const span: SourceSpan = node_decl.span;
 
         // Absent from the PROGRAM, not merely from this module's imports: the
         // names below are canonical, so the only way they miss is that nothing
@@ -7339,9 +7357,9 @@ type struct AsyncLower {
         if (!poll_base.is_valid() || !ctx_ref.is_valid()) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
                 "an `async function` requires the future types in scope; add `import std::future;`",
-                node.span);
+                node_decl.span);
             this.pending.push(AsyncDecl {
-                node: node, ok: false,
+                node: node_decl, ok: false,
                 q_name: SymbolStr::empty(),
                 struct_ref: TypeRef::invalid(), self_ty: TypeRef::invalid(),
                 generic: false, fut_params: [],
@@ -7371,7 +7389,7 @@ type struct AsyncLower {
         // it; anything else is the function's own file.  The counter in
         // `mint_bare` is per module, so the module is what keeps one
         // trait's fifteen implementations' futures apart.
-        const mint_file: string = if (owner.impl_decl != null) { owner.impl_decl.span.file } else { node.span.file };
+        const mint_file: string = if (owner.impl_decl != null) { owner.impl_decl.span.file } else { node_decl.span.file };
         const fut_def: DefId = this.ctx.register_in_module(
             this.ctx.module_of_file(mint_file), bare, DefKind::Type, span);
         const q_name: SymbolStr = this.ctx.defs.path_of(fut_def).spelling();
@@ -7416,7 +7434,7 @@ type struct AsyncLower {
             }
             if (recv == null) {
                 this.ctx.ice_at("an instance method reached the async lowering with no receiver parameter",
-                                node.span);
+                                node_decl.span);
             } else {
                 recv_ptr = recv.is_ref_receiver();
                 if (!recv.resolved_type.is_valid()) {
@@ -7482,7 +7500,7 @@ type struct AsyncLower {
         // The record is completed in place below: the annotation builders read
         // `generic` / `q_name` / `self_ty` off it, so it has to exist first.
         mut d: AsyncDecl = AsyncDecl {
-            node: node, ok: true,
+            node: node_decl, ok: true,
             q_name: q_name,
             struct_ref: struct_ref, self_ty: self_ty, generic: generic,
             fut_params: fut_params,
@@ -7504,8 +7522,9 @@ type struct AsyncLower {
         const future_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Future);
 
         // `poll`'s signature, whose body `lower` supplies.
-        mut poll_fn: FunctionDeclNode* = new FunctionDeclNode(this.intern.intern("poll"), span);
-        poll_fn.written_in = FunctionDeclNode::written_in_of(node);
+        mut poll_fn: FunctionDecl* = FunctionDecl::new(this.intern.intern("poll"));
+        const poll_fn_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(poll_fn), span);
+        poll_fn.written_in = FunctionDecl::written_in_of(node_decl);
         poll_fn.set_resolved_return_type(poll_out);
         poll_fn.set_origin_trait(future_id);
         // The body is built in `lower`, long after name resolution: its shadow
@@ -7538,7 +7557,7 @@ type struct AsyncLower {
         }
         poll_fn.add_parameter(cx_param_decl);
 
-        mut poll_method: MethodNode* = new MethodNode(poll_fn, span);
+        mut poll_method: MethodNode* = new MethodNode(poll_fn_decl, span);
         poll_fn.def = this.ctx.define_method(fut_def, poll_fn.name, span,
             poll_method as ASTNode*);
         poll_method.set_visibility(Visibility::Public);
@@ -7595,7 +7614,7 @@ type struct AsyncLower {
             this.ctx.generic_registry.register_impl_block(impl_node.target_def(), impl_decl);
         }
         d.impl_node = impl_decl;
-        this.bind_async_trait_assoc(&owner, node, this.future_type_ann(&d, span));
+        this.bind_async_trait_assoc(&owner, node_decl, this.future_type_ann(&d, span));
 
         // Register the struct's method + trait impl.
         mut method_arr: [MethodNode*] = [poll_method];
@@ -7609,7 +7628,7 @@ type struct AsyncLower {
         // Repoint callers at the future type.
         node.set_resolved_return_type(self_ty);
         if (owner.method != null) {
-            this.repoint_method(&owner, node);
+            this.repoint_method(&owner, node_decl);
             // A method's callers read the NODE, so the future type STAYS on it;
             // `begin_body_check` lends the declared type back for the body walk.
         } else {
@@ -7621,11 +7640,11 @@ type struct AsyncLower {
             // goes back afterwards, because the body is still typed and
             // `check_function_returns`-checked against it.
             this.ctx.decl_index.retire_entry(node.overload_entry);
-            TypeResolutionPasses::register_decl_in_index(node as ASTNode*, this.ctx, true);
+            TypeResolutionPasses::register_decl_in_index(node_decl as ASTNode*, this.ctx, true);
             node.set_resolved_return_type(declared_ref);
         }
 
-        d.poll_fn     = poll_fn;
+        d.poll_fn     = poll_fn_decl;
         d.poll_method = poll_method;
         this.pending.push(d);
         if (generic) { this.arena.set_symbolic_no_demand(saved_no_demand); }
@@ -7634,7 +7653,8 @@ type struct AsyncLower {
 
     /// The method's parameter types with the receiver excluded — the shape both
     /// the owner's `MethodInfo` and the declaration index are built from.
-    method_param_types(&this, node: FunctionDeclNode*) -> [TypeRef] {
+    method_param_types(&this, node_decl: DeclarationNode*) -> [TypeRef] {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         mut ptypes: [TypeRef] = [];
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p_decl: DeclarationNode* = node.parameters[i];
@@ -7653,11 +7673,12 @@ type struct AsyncLower {
     /// `add_method` appends, so re-adding would leave two entries and make
     /// overload resolution depend on which one it reached first.
     rebuild_method_info(mut &this, owner_ty: TypeRef, m: MethodNode*,
-                        node: FunctionDeclNode*) -> void {
+                        node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         const t: Type* = this.arena.lookup(owner_ty);
         if (t == null) { return; }
         const fn_ty: TypeRef = this.arena.get_function(
-            node.resolved_return_type, this.method_param_types(node), node.is_variadic);
+            node.resolved_return_type, this.method_param_types(node_decl), node.is_variadic);
         // A union is a StructType with `is_union`, so Struct covers it too.
         if (t.kind == TypeKind::Struct) {
             mut st: StructType* = t.as_struct();
@@ -7690,8 +7711,9 @@ type struct AsyncLower {
     /// instance (`ty`) is a type the index never saw.  The method's stale
     /// Output-return entry is retired first, or it stays resolvable beside
     /// the new struct-return one; its sibling overloads keep theirs.
-    repoint_method(mut &this, owner: AsyncOwner*, node: FunctionDeclNode*) -> void {
-        this.rebuild_method_info(owner.ty, owner.method, node);
+    repoint_method(mut &this, owner: AsyncOwner*, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
+        this.rebuild_method_info(owner.ty, owner.method, node_decl);
 
         mut arr: [MethodNode*] = [owner.method];
         this.ctx.decl_index.retire_entry(node.overload_entry);
@@ -7746,12 +7768,13 @@ type struct AsyncLower {
     /// typed: fill in the struct's fields, `poll`'s body, and the constructor the
     /// function itself becomes. Requires `declare` to have run (it is called here
     /// if the module pre-pass did not reach this node).
-    lower(mut &this, node: FunctionDeclNode*) -> void {
+    lower(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node == null || node.body == null) { return; }
-        mut pi: i64 = this.pending_index(node);
+        mut pi: i64 = this.pending_index(node_decl);
         if (pi < 0) {
-            this.declare(node);
-            pi = this.pending_index(node);
+            this.declare(node_decl);
+            pi = this.pending_index(node_decl);
             if (pi < 0) { return; }
         }
         if (!this.pending[pi].ok) { return; }
@@ -7774,10 +7797,11 @@ type struct AsyncLower {
         const struct_header: DeclarationNode* = this.pending[pi].struct_decl;
         const struct_decl: StructDecl*        = DeclarationNode::struct_of(struct_header);
         const impl:      DeclarationNode*  = this.pending[pi].impl_node;
-        mut poll_fn:     FunctionDeclNode* = this.pending[pi].poll_fn;
+        const poll_fn_decl: DeclarationNode* = this.pending[pi].poll_fn;
+        mut poll_fn:     FunctionDecl* = DeclarationNode::fn_of(poll_fn_decl);
         const method:      MethodNode* = this.pending[pi].method;
         const recv_field:  SymbolStr   = this.pending[pi].recv_field;
-        const span: SourceSpan = node.span;
+        const span: SourceSpan = node_decl.span;
 
         this.stand_ins = [];
         this.stand_in_keys = [];
@@ -7854,17 +7878,17 @@ type struct AsyncLower {
         mut body_block: Stmt* = null;
         sm.opt_base = this.lookup_future_type(this.ctx.generic_registry.wellknown(LangItem::Option));
         if (!sm.opt_base.is_valid()
-            && (total_await > 0 || this.params_need_carrier(&this.pending[pi], node))) {
+            && (total_await > 0 || this.params_need_carrier(&this.pending[pi], node_decl))) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
                 "async: `Option` must be in scope to lower an `async function`", span);
             if (generic) { this.arena.set_symbolic_no_demand(saved_no_demand); }
             return;
         }
         if (total_await > 0) {
-            body_block = this.build_poll_body_sm(&this.pending[pi], node, &sm);
+            body_block = this.build_poll_body_sm(&this.pending[pi], node_decl, &sm);
         } else {
             body_block = this.build_poll_body_no_await(
-                &this.pending[pi], node, &sm, poll_out, span);
+                &this.pending[pi], node_decl, &sm, poll_out, span);
         }
         if (body_block == null) {   // a diagnostic was already emitted
             if (generic) { this.arena.set_symbolic_no_demand(saved_no_demand); }
@@ -7939,7 +7963,7 @@ type struct AsyncLower {
 
         // ---- 3. poll body into the signature `declare` registered ----
         poll_fn.set_body(body_block);
-        this.rebind_poll_locals(poll_fn);
+        this.rebind_poll_locals(poll_fn_decl);
 
         // ---- 4. Inject so mono/codegen walk the struct + impl ----
         if (this.ctx.artifacts.ast.root != null) {
@@ -8033,7 +8057,7 @@ type struct AsyncLower {
         // entry with the same mangled symbol.
         if (method == null) {
             this.ctx.decl_index.retire_entry(node.overload_entry);
-            TypeResolutionPasses::register_decl_in_index(node as ASTNode*, this.ctx, true);
+            TypeResolutionPasses::register_decl_in_index(node_decl as ASTNode*, this.ctx, true);
         }
 
         // The record has served its purpose; `is_async` is now false, so nothing

@@ -53,7 +53,7 @@ import compiler::types::user_defined;
 import compiler::types::user_defined::{ StructType };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, FunctionDeclNode,
+    ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, FunctionDecl,
     DeclKind, ImplBlock, MethodNode, StructDecl, UnionDecl,
     VarDecl
 };
@@ -272,7 +272,8 @@ type struct MoveChecker {
         };
     }
 
-    enter_function(mut &this, func: FunctionDeclNode*) -> void {
+    enter_function(mut &this, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         this.types       = HashMap::<SymbolKey, TypeRef>::new();
         this.moved_keys  = [];
         this.moved_spans = [];
@@ -911,18 +912,19 @@ type struct MoveChecker {
 
     walk_top_level(mut &this, stmt: ASTNode*) -> void {
         match (stmt.kind) {
-            NodeKind::FunctionDeclaration => {
-                this.walk_function(stmt as FunctionDeclNode*);
-            }
             NodeKind::ClassDeclaration => {
                 this.walk_methods((stmt as ClassDeclNode*).methods);
             }
             NodeKind::Declaration => {
                 match ((stmt as DeclarationNode*).shape) {
+                    DeclKind::Function(_) => {
+                        this.walk_function(DeclarationNode::with_shape(stmt));
+                    }
                     DeclKind::Trait(td) => {
                         for (mut i: i64 = 0; i < td.methods.length; i++) {
-                            const m: FunctionDeclNode* = td.methods[i];
-                            if (m != null) { this.walk_function(m); }
+                            const m_decl: DeclarationNode* = td.methods[i];
+                            const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
+                            if (m != null) { this.walk_function(m_decl); }
                         }
                     }
                     DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
@@ -946,11 +948,12 @@ type struct MoveChecker {
         }
     }
 
-    walk_function(mut &this, func: FunctionDeclNode*) -> void {
+    walk_function(mut &this, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         if (func.is_generic()) { return; }
         cdebug("[MoveCheck] === func '%s' ===\n", this.intern.resolve(func.name));
-        this.enter_function(func);
+        this.enter_function(func_decl);
         this.walk_stmt(func.body);
     }
 

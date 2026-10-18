@@ -29,7 +29,7 @@ import compiler::ast::pattern;
 import compiler::ast::pattern::{ MatchArmNode, Pattern, StaticMatchArmNode };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind,
-    FunctionDeclNode, ImplBlock, MethodNode, StructDecl,
+    FunctionDecl, ImplBlock, MethodNode, StructDecl,
     TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -84,7 +84,7 @@ public function annotation_span(ann: TypeAnnotation*) -> SourceSpan {
 /// `const body_str: Str = ...;`).  Returns `SourceSpan::none()` for
 /// non-declarations, for nodes whose name span the parser hasn't
 /// stamped, and for `MethodNode` (which delegates to its inner
-/// `FunctionDeclNode`).
+/// `FunctionDecl`).
 public function name_span_of(node: ASTNode*) -> SourceSpan {
     if (node == null) { return SourceSpan::none(); }
     if (node.kind == NodeKind::MethodDeclaration) {
@@ -290,33 +290,25 @@ type struct NodeLocator {
             }
 
             // -- Declarations --
-            NodeKind::FunctionDeclaration => {
-                const d: FunctionDeclNode* = node as FunctionDeclNode*;
-                // Body almost always covers the cursor; parameters span the
-                // signature line so they're checked first.
-                const param_match: ASTNode* = NodeLocator::pick_array_decl(
-                    d.parameters, line, character);
-                if (param_match != null) { return param_match; }
-                return NodeLocator::pick(d.body as ASTNode*, null, null, null, line, character);
-            }
             NodeKind::MethodDeclaration => {
                 const d: MethodNode* = node as MethodNode*;
                 if (d.func == null) { return null; }
                 // Stop at MethodNode when the cursor is on the method's
                 // name token; otherwise the walk descends into the inner
-                // FunctionDeclNode and the hover renders as a free
+                // FunctionDecl and the hover renders as a free
                 // function with a `function` keyword.  The method-name
                 // case is more useful, so let the MethodDeclaration
                 // hover branch handle it.
                 if (span_contains(d.func.name_span, line, character)) { return null; }
-                // Drive descent into the inner `FunctionDeclNode`'s
+                // Drive descent into the inner `FunctionDecl`'s
                 // params and body directly: parse_method leaves
                 // `func.span` covering only the method-name token, so a
                 // generic `pick(d.func)` span check would miss every
                 // position inside the params or body and the walk would
                 // stop at MethodNode (whole method) instead of the
                 // identifier under the cursor.
-                const f: FunctionDeclNode* = d.func;
+                const f_decl: DeclarationNode* = d.func;
+                const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
                 const param_match: ASTNode* = NodeLocator::pick_array_decl(
                     f.parameters, line, character);
                 if (param_match != null) { return param_match; }
@@ -333,22 +325,32 @@ type struct NodeLocator {
             }
             NodeKind::Declaration => {
                 match ((node as DeclarationNode*).shape) {
-                    // Trait methods are stored as bare `FunctionDeclNode*` (no
-                    // `MethodNode` wrapper, since trait decls have no instance
+                    DeclKind::Function(_) => {
+                        const d_decl: DeclarationNode* = DeclarationNode::with_shape(node);
+                        const d: FunctionDecl* = DeclarationNode::fn_of(d_decl);
+                        // Body almost always covers the cursor; parameters span the
+                        // signature line so they're checked first.
+                        const param_match: ASTNode* = NodeLocator::pick_array_decl(
+                            d.parameters, line, character);
+                        if (param_match != null) { return param_match; }
+                        return NodeLocator::pick(d.body as ASTNode*, null, null, null, line, character);
+                    }
+                    // Trait methods are stored as bare function declarations
+                    // (no `MethodNode` wrapper, since trait decls have no instance
                     // bodies in the inherent-method sense).  Without this
                     // descent the locator stops at the trait and any hover
                     // inside a trait method's signature renders the trait head
                     // instead of the method.
                     DeclKind::Trait(d) => {
-                        return NodeLocator::pick_array_function(d.methods, line, character);
+                        return NodeLocator::pick_array_decl(d.methods, line, character);
                     }
-                    // Extern declarations are bare `FunctionDeclNode*`s on the
+                    // Extern declarations are bare function declarations on the
                     // block's `functions` array, exactly like trait methods.
                     // Without this descent the locator stops at the block and
                     // hovering `syscall` in `extern "C" { function syscall(...) }`
                     // finds no declaration.
                     DeclKind::Extern(d) => {
-                        return NodeLocator::pick_array_function(d.functions, line, character);
+                        return NodeLocator::pick_array_decl(d.functions, line, character);
                     }
                     // Descend into variants so a hover on `NotFound` inside
                     // `type enum X { NotFound; ... }` reaches the variant's
@@ -498,19 +500,6 @@ type struct NodeLocator {
     static pick_array_method(arr: &[MethodNode*], line: u32, character: u32) -> ASTNode* {
         for (mut i: i64 = 0; i < arr.length; i++) {
             const elem: MethodNode* = arr[i];
-            if (elem != null && span_contains(elem.span, line, character)) {
-                return elem as ASTNode*;
-            }
-        }
-        return null;
-    }
-
-    /// Bare-function variant: `TraitDecl.methods` is a
-    /// `[FunctionDeclNode*]` rather than `[MethodNode*]`, so it can't go
-    /// through `pick_array_method`.
-    static pick_array_function(arr: &[FunctionDeclNode*], line: u32, character: u32) -> ASTNode* {
-        for (mut i: i64 = 0; i < arr.length; i++) {
-            const elem: FunctionDeclNode* = arr[i];
             if (elem != null && span_contains(elem.span, line, character)) {
                 return elem as ASTNode*;
             }

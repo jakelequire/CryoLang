@@ -27,7 +27,7 @@ import compiler::ast::node_locator;
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, EnumDecl, FieldDecl,
-    FunctionDeclNode, ImplBlock, ImportDecl, MethodNode,
+    FunctionDecl, ImplBlock, ImportDecl, MethodNode,
     DeclKind, ModuleDecl, StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::module_graph::{ ModulePath };
@@ -235,8 +235,8 @@ type struct Locator {
         for (mut i: i64 = 0; i < program.statements.length; i++) {
             const stmt: ASTNode* = program.statements[i];
             if (stmt == null || stmt.generated || !this.holds(stmt.span)) { continue; }
-            if (stmt.kind == NodeKind::FunctionDeclaration
-                    && (stmt as FunctionDeclNode*).is_specialization) { continue; }
+            if (DeclarationNode::fn_of(stmt) != null
+                    && DeclarationNode::fn_of(stmt).is_specialization) { continue; }
             cur = stmt;
             break;
         }
@@ -282,22 +282,23 @@ type struct Locator {
                 return this.annotation((n as CastExprNode*).target_annotation);
             }
             NodeKind::Pattern => { return this.pattern(n as Pattern*); }
-            NodeKind::FunctionDeclaration => {
-                const f: FunctionDeclNode* = n as FunctionDeclNode*;
-                if (this.holds(f.name_span)) { return this.function_decl(f, f.name_span); }
-                return this.annotation(f.return_type_annotation);
-            }
             NodeKind::MethodDeclaration => {
                 const m: MethodNode* = n as MethodNode*;
                 if (m.func == null) { return Answer::nothing(); }
                 if (this.holds(m.func.name_span)) { return this.function_decl(m.func, m.func.name_span); }
-                return this.annotation(m.func.return_type_annotation);
+                return this.annotation(DeclarationNode::fn_of(m.func).return_type_annotation);
             }
             NodeKind::ClassDeclaration => {
                 return this.type_decl(n, (n as ClassDeclNode*).def);
             }
             NodeKind::Declaration => {
                 match ((n as DeclarationNode*).shape) {
+                    DeclKind::Function(_) => {
+                        const f_decl: DeclarationNode* = DeclarationNode::with_shape(n);
+                        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
+                        if (this.holds(f_decl.name_span)) { return this.function_decl(f_decl, f_decl.name_span); }
+                        return this.annotation(f.return_type_annotation);
+                    }
                     DeclKind::Impl(ib) => { return this.impl_head(ib); }
                     DeclKind::TypeAlias(ta) => {
                         if (this.holds((n as DeclarationNode*).name_span)) { return this.type_decl(n, ta.def); }
@@ -413,7 +414,7 @@ type struct Locator {
                 const td: TraitDecl* = DeclarationNode::trait_of(decl);
                 if (td != null) {
                     if (ma.resolved_trait_slot < td.methods.length) {
-                        return Locator::def_target(td.methods[ma.resolved_trait_slot].def);
+                        return Locator::def_target(DeclarationNode::fn_of(td.methods[ma.resolved_trait_slot]).def);
                     }
                 }
             }
@@ -434,9 +435,9 @@ type struct Locator {
     entry_target(&this, e: OverloadId) -> Target {
         const decl: ASTNode* = this.di.entry_decl(e);
         if (decl == null) { return Target::Nothing; }
-        mut f: FunctionDeclNode* = null;
+        mut f: DeclarationNode* = null;
         if (decl.kind == NodeKind::MethodDeclaration) { f = (decl as MethodNode*).func; }
-        if (decl.kind == NodeKind::FunctionDeclaration) { f = decl as FunctionDeclNode*; }
+        if (DeclarationNode::fn_of(decl) != null) { f = DeclarationNode::with_shape(decl); }
         const shaped: DeclarationNode* = DeclarationNode::with_shape(decl);
         if (shaped != null) {
             match (shaped.shape) {
@@ -446,12 +447,12 @@ type struct Locator {
                 | DeclKind::TypeAlias(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
                 | DeclKind::Enum(_) | DeclKind::Trait(_) | DeclKind::Union(_)
                 | DeclKind::Struct(_) | DeclKind::Impl(_) | DeclKind::Variable(_)
-                | DeclKind::Legacy => {}
+                | DeclKind::Function(_) | DeclKind::Legacy => {}
             }
         }
         if (f == null) { return Target::Nothing; }
-        if (f.def.is_valid()) { return Target::Def(f.def); }
-        return Locator::def_target(f.copy_of);
+        if (DeclarationNode::fn_of(f).def.is_valid()) { return Target::Def(DeclarationNode::fn_of(f).def); }
+        return Locator::def_target(DeclarationNode::fn_of(f).copy_of);
     }
 
     static def_target(d: DefId) -> Target {
@@ -589,7 +590,8 @@ type struct Locator {
         return this.annotation(v.type_annotation);
     }
 
-    function_decl(&this, f: FunctionDeclNode*, at: SourceSpan) -> Answer {
+    function_decl(&this, f_decl: DeclarationNode*, at: SourceSpan) -> Answer {
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         const d: DefId = if (f.def.is_valid()) { f.def } else { f.copy_of };
         return Answer::of(Locator::def_target(d), at, TypeRef::invalid());
     }

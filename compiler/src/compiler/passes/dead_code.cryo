@@ -64,7 +64,7 @@ import std::collections::hashmap;
 import std::collections::hashmap::{ HashMap };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, FunctionDeclNode, ImplBlock,
+    ClassDeclNode, DeclarationNode, DeclKind, FunctionDecl, ImplBlock,
     MethodNode, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -147,15 +147,15 @@ type struct DeadCodeChecker {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    const fn: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                    this.check_fn(fn, this.is_body_resolved(fn));
-                }
                 NodeKind::ClassDeclaration => {
                     this.check_methods((stmt as ClassDeclNode*).methods);
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Function(_) => {
+                            const fn_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                            this.check_fn(fn_decl, this.is_body_resolved(fn_decl));
+                        }
                         // Trait default method bodies are not name-resolved
                         // (signatures only), so W0001 would false-positive on
                         // every local; run structural W0009 only
@@ -193,7 +193,8 @@ type struct DeadCodeChecker {
     /// compiler BUILT after resolution ran (`is_synthesized_body`, the `poll` of
     /// an `async` lowering) - none of them is a body the resolver walked.
     /// See the `body_resolved` field doc.
-    is_body_resolved(&this, func: FunctionDeclNode*) -> boolean {
+    is_body_resolved(&this, func_decl: DeclarationNode*) -> boolean {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         return !func.is_specialization && !func.is_synth_default
             && !func.is_synthesized_body;
     }
@@ -201,7 +202,8 @@ type struct DeadCodeChecker {
     /// `body_resolved` gates W0001 (see the field doc): pass false for bodies
     /// whose local references are absent from `used` (trait defaults, mono
     /// clones); W0009 runs regardless.
-    check_fn(mut &this, func: FunctionDeclNode*, body_resolved: boolean) -> void {
+    check_fn(mut &this, func_decl: DeclarationNode*, body_resolved: boolean) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         this.body_resolved = body_resolved;
         this.check_block(func.body);
@@ -371,8 +373,8 @@ type struct DeadCodeChecker {
             const mn: MethodNode* = node as MethodNode*;
             if (mn.func == null) { return; }
             key = ResolutionMap::make_key(mn.func.span);
-        } else if (node.kind == NodeKind::FunctionDeclaration) {
-            key = ResolutionMap::make_key((node as FunctionDeclNode*).span);
+        } else if (DeclarationNode::fn_of(node) != null) {
+            key = ResolutionMap::make_key(node.span);
         } else {
             return;
         }
@@ -403,10 +405,10 @@ type struct DeadCodeChecker {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => { this.harvest_fn(stmt as FunctionDeclNode*); }
                 NodeKind::ClassDeclaration    => { this.harvest_methods((stmt as ClassDeclNode*).methods); }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Function(_) => { this.harvest_fn(DeclarationNode::with_shape(stmt)); }
                         DeclKind::Trait(td) => {
                             for (mut j: i64 = 0; j < td.methods.length; j++) { this.harvest_fn(td.methods[j]); }
                         }
@@ -432,7 +434,8 @@ type struct DeadCodeChecker {
         }
     }
 
-    harvest_fn(mut &this, func: FunctionDeclNode*) -> void {
+    harvest_fn(mut &this, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         this.harvest_stmt(func.body);
     }
@@ -618,10 +621,10 @@ type struct DeadCodeChecker {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => { this.report_function(stmt as FunctionDeclNode*); }
                 NodeKind::ClassDeclaration    => { this.report_methods((stmt as ClassDeclNode*).methods); }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Function(_) => { this.report_function(DeclarationNode::with_shape(stmt)); }
                         DeclKind::Union(ud) => { this.report_methods(ud.methods); }
                         DeclKind::Struct(sd) => { this.report_methods(sd.methods); }
                         DeclKind::Impl(ib) => { this.report_methods(ib.methods); }
@@ -650,14 +653,15 @@ type struct DeadCodeChecker {
         return this.method_used.contains_key(&key) || this.is_referenced(key);
     }
 
-    report_function(mut &this, func: FunctionDeclNode*) -> void {
+    report_function(mut &this, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }   // extern / no body
         if (func.is_public) { return; }                       // only private
         if (func.is_generic()) { return; }                    // template - skip (conservative)
         if (func.is_specialization) { return; }               // mono-generated instance
-        if (this.is_directive_excluded(func)) { return; }
-        if (!func.span.has_location()) { return; }
-        if (this.is_target_used(func.span)) { return; }
+        if (this.is_directive_excluded(func_decl)) { return; }
+        if (!func_decl.span.has_location()) { return; }
+        if (this.is_target_used(func_decl.span)) { return; }
 
         const name: string = this.ctx.resolve_str(func.name);
         if (name == "" || (func.def.is_valid() && func.def.equals(this.ctx.entry_fn))) { return; }
@@ -665,12 +669,13 @@ type struct DeadCodeChecker {
         mut diag: Diagnostic = Diagnostic::warning(
             ErrorCode::W0002_UNUSED_FUNCTION,
             fmt::format("function `%s` is never used", name));
-        diag = diag.at(func.span);
+        diag = diag.at(func_decl.span);
         this.ctx.emit_diagnostic(diag);
     }
 
     report_method(mut &this, m: MethodNode*) -> void {
-        const f: FunctionDeclNode* = m.func;
+        const f_decl: DeclarationNode* = m.func;
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         if (f == null || f.body == null) { return; }          // abstract / no body
         // Only private methods.  A method's symbol visibility derives from
         // `MethodNode.visibility` (see name_resolution), which defaults Public,
@@ -688,9 +693,9 @@ type struct DeadCodeChecker {
         // Dispatch-only or implicitly-invoked methods are never called by name:
         if (m.is_constructor || m.is_destructor || m.is_virtual || m.is_override) { return; }
         if (f.origin_trait.is_valid()) { return; }            // trait-impl method
-        if (this.is_directive_excluded(f)) { return; }
-        if (!f.span.has_location()) { return; }
-        if (this.is_target_used(f.span)) { return; }
+        if (this.is_directive_excluded(f_decl)) { return; }
+        if (!f_decl.span.has_location()) { return; }
+        if (this.is_target_used(f_decl.span)) { return; }
 
         const name: string = this.ctx.resolve_str(f.name);
         if (name == "") { return; }
@@ -698,18 +703,19 @@ type struct DeadCodeChecker {
         mut diag: Diagnostic = Diagnostic::warning(
             ErrorCode::W0002_UNUSED_FUNCTION,
             fmt::format("method `%s` is never used", name));
-        diag = diag.at(f.span);
+        diag = diag.at(f_decl.span);
         this.ctx.emit_diagnostic(diag);
     }
 
     /// Always-live directives/link-names: entry points, tests, and functions
     /// whose linker symbol is pinned are never "unused".
-    is_directive_excluded(&this, func: FunctionDeclNode*) -> boolean {
+    is_directive_excluded(&this, func_decl: DeclarationNode*) -> boolean {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func.has_link_name) { return true; }
-        if (func.has_directive(Keyword::new("entry")))         { return true; }
-        if (func.has_directive(Keyword::new("test")))          { return true; }
-        if (func.has_directive(Keyword::new("ignore")))        { return true; }
-        if (func.has_directive(Keyword::new("should_panic")))  { return true; }
+        if (func_decl.has_directive(Keyword::new("entry")))         { return true; }
+        if (func_decl.has_directive(Keyword::new("test")))          { return true; }
+        if (func_decl.has_directive(Keyword::new("ignore")))        { return true; }
+        if (func_decl.has_directive(Keyword::new("should_panic")))  { return true; }
         return false;
     }
 }

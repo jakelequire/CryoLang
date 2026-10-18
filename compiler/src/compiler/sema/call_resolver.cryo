@@ -59,7 +59,7 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, DefKind, FamilyOwner, Res, ResBase, ResSlot };
 import compiler::decl_index::{ OverloadId };
 import compiler::ast::declaration::{
-    ClassDeclNode, FunctionDeclNode, DeclarationNode, GenericParamDecl, ImplBlock, MethodNode,
+    ClassDeclNode, FunctionDecl, DeclarationNode, GenericParamDecl, ImplBlock, MethodNode,
     StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -160,7 +160,7 @@ type struct Selection {
 
     /// A call already bound: its pin, and the pin's declared return.
     static of(mn: MethodNode*) -> Selection {
-        const r: TypeRef = if (mn != null && mn.func != null) { mn.func.resolved_return_type } else { TypeRef::invalid() };
+        const r: TypeRef = if (mn != null && mn.func != null) { DeclarationNode::fn_of(mn.func).resolved_return_type } else { TypeRef::invalid() };
         return Selection { owner_inst: TypeRef::invalid(), recv: TypeRef::invalid(), chosen: mn, ret: r,
                            tier: 0, info: null, collect: null };
     }
@@ -847,7 +847,7 @@ type struct CallResolver {
             const tm: TemplateEntry* = this.ctx.generic_registry.template_of_type(template);
             if (tm != null) { decl = tm.ast_node; }
         }
-        if (!FunctionDeclNode::caller_located(decl)) { return ty; }
+        if (!FunctionDecl::caller_located(decl)) { return ty; }
         this.ctx.emit_error_at(ErrorCode::E0151_DIRECTIVE_MISPLACED,
             "a `![caller_location]` function cannot be taken as a value: a call through the value would have no caller location to pass it",
             expr.span);
@@ -1239,12 +1239,12 @@ type struct CallResolver {
                     && !this.generic_canonical_return(call, mret)) {
                 const ovl_rm: MethodNode* = this.ctx.decl_index.entry_method(ovl_pin);
                 if (ovl_rm != null && ovl_rm.func != null
-                        && ovl_rm.func.generic_params.length == 0
-                        && ovl_rm.func.resolved_return_type.is_valid()
-                        && !ovl_rm.func.resolved_return_type.equals(mret)) {
+                        && DeclarationNode::fn_of(ovl_rm.func).generic_params.length == 0
+                        && DeclarationNode::fn_of(ovl_rm.func).resolved_return_type.is_valid()
+                        && !DeclarationNode::fn_of(ovl_rm.func).resolved_return_type.equals(mret)) {
                     const ovl_mem: MemberAccessNode* = callee as MemberAccessNode*;
-                    ovl_mem.set_resolved_type(ovl_rm.func.resolved_return_type);
-                    return ovl_rm.func.resolved_return_type;
+                    ovl_mem.set_resolved_type(DeclarationNode::fn_of(ovl_rm.func).resolved_return_type);
+                    return DeclarationNode::fn_of(ovl_rm.func).resolved_return_type;
                 }
             }
             return mret;
@@ -1538,18 +1538,19 @@ type struct CallResolver {
         const t: TemplateEntry* = this.lookup_scope_template(r);
         if (t == null || t.kind != TemplateKind::Function) { return null; }
         const entries: [OverloadId] = this.family_entries(r.def_id());
-        mut fits: FunctionDeclNode* = null;
+        mut fits: DeclarationNode* = null;
         mut count: i64 = 0;
         for (mut i: i64 = 0; i < entries.length; i++) {
             const d: ASTNode* = this.ctx.decl_index.entry_decl(entries[i]);
-            if (d == null || d.kind != NodeKind::FunctionDeclaration) { continue; }
-            const f: FunctionDeclNode* = d as FunctionDeclNode*;
+            if (d == null || DeclarationNode::fn_of(d) == null) { continue; }
+            const f_decl: DeclarationNode* = DeclarationNode::with_shape(d);
+            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
             if (f.parameters.length != argc) { continue; }
-            fits = f;
+            fits = f_decl;
             count = count + 1;
         }
         if (count != 1) { return null; }
-        const chosen: TemplateEntry* = this.ctx.generic_registry.template_of(fits.def);
+        const chosen: TemplateEntry* = this.ctx.generic_registry.template_of(DeclarationNode::fn_of(fits).def);
         if (chosen == null || chosen.kind != TemplateKind::Function) { return null; }
         return chosen;
     }
@@ -1667,7 +1668,8 @@ type struct CallResolver {
     check_generic_free_call(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
         const entry: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
         if (entry == null) { return TypeRef::invalid(); }
-        const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        const tmpl_decl: DeclarationNode* = DeclarationNode::with_shape(entry.ast_node);
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         if (tmpl == null) { return TypeRef::invalid(); }
         if (entry.param_types.length == 0) { return TypeRef::invalid(); }
         // Record WHICH template won, not just the type args: only sema has the
@@ -1716,7 +1718,7 @@ type struct CallResolver {
             // PASS D first for what the arguments bound: a param a where-bound
             // projects is what the bound requires, which the expected type
             // below must not decide instead.
-            this.project_where_bound_params(tmpl, entry, &ictx);
+            this.project_where_bound_params(tmpl_decl, entry, &ictx);
             // PASS B - recover unbound params from a CONCRETE expected type.
             if (this.state.expected_type.is_valid() && tmpl.resolved_return_type.is_valid()
                     && !this.types.contains_generic_param(this.state.expected_type)) {
@@ -1750,7 +1752,7 @@ type struct CallResolver {
             // in `where F: Future<R>`) by projecting it off the now-bound subject
             // (`R = F::Output`), so a return-only bound param resolves from the
             // arguments alone - no turbofish or expected-type context required.
-            this.project_where_bound_params(tmpl, entry, &ictx);
+            this.project_where_bound_params(tmpl_decl, entry, &ictx);
 
             for (mut i: i64 = 0; i < bindings.length; i++) { bindings[i] = ictx.bindings[i]; }
 
@@ -1767,7 +1769,7 @@ type struct CallResolver {
         }
 
         // E0306 - where-clause bound satisfaction for the bound type args.
-        if (!this.check_call_where_bounds(call.span, tmpl, &entry.param_syms, &bindings)) {
+        if (!this.check_call_where_bounds(call.span, tmpl_decl, &entry.param_syms, &bindings)) {
             return TypeRef::invalid();
         }
 
@@ -1780,7 +1782,7 @@ type struct CallResolver {
             mut stash: [TypeRef] = [];
             for (mut ci: i64 = 0; ci < bindings.length; ci++) { stash.push(bindings[ci]); }
             call.set_resolved_type_args(stash);
-            this.retype_variant_arguments(call, tmpl, entry, &bindings);
+            this.retype_variant_arguments(call, tmpl_decl, entry, &bindings);
         }
         return this.subst_free_call_return(entry, &bindings, tmpl.resolved_return_type);
     }
@@ -1811,7 +1813,7 @@ type struct CallResolver {
         if (tmpl.kind != TemplateKind::Class || tmpl.ast_node == null) { return ty; }
         if (tmpl.param_types.length == 0) { return ty; }
         const cd: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
-        mut ctor: FunctionDeclNode* = null;
+        mut ctor: DeclarationNode* = null;
         for (mut i: i64 = 0; i < cd.methods.length; i++) {
             const m: MethodNode* = cd.methods[i];
             if (m == null || !m.is_constructor || m.func == null) { continue; }
@@ -1821,8 +1823,8 @@ type struct CallResolver {
         }
         if (ctor == null) { return ty; }
         mut params: [VarDecl*] = [];
-        for (mut j: i64 = 0; j < ctor.parameters.length; j++) {
-            const p_decl: DeclarationNode* = ctor.parameters[j];
+        for (mut j: i64 = 0; j < DeclarationNode::fn_of(ctor).parameters.length; j++) {
+            const p_decl: DeclarationNode* = DeclarationNode::fn_of(ctor).parameters[j];
             const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p != null && !p.is_receiver()) { params.push(p); }
         }
@@ -1852,7 +1854,8 @@ type struct CallResolver {
     }
 
     /// How many parameters `f` takes besides its receiver.
-    static non_receiver_count(f: FunctionDeclNode*) -> i64 {
+    static non_receiver_count(f_decl: DeclarationNode*) -> i64 {
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         mut n: i64 = 0;
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
             const p_decl: DeclarationNode* = f.parameters[i];
@@ -1933,8 +1936,9 @@ type struct CallResolver {
     /// bindings are known the argument is the parameter's instance, and it
     /// takes that type.  An argument some other source already typed as an
     /// instance is left as it is.
-    retype_variant_arguments(mut &this, call: CallExprNode*, tmpl: FunctionDeclNode*,
+    retype_variant_arguments(mut &this, call: CallExprNode*, tmpl_decl: DeclarationNode*,
                              entry: TemplateEntry*, bindings: &[TypeRef]) -> void {
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         if (tmpl.parameters.length != call.arguments.length) { return; }
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
             const arg: ExpressionNode* = call.arguments[i];
@@ -2065,7 +2069,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < entries.length; i++) {
             if (head_trait.is_valid() && !this.ctx.decl_index.entry_trait(entries[i]).equals(head_trait)) { continue; }
             const m: MethodNode* = this.ctx.decl_index.entry_method(entries[i]);
-            if (m == null || m.func == null || m.is_static || m.func.generic_params.length != n_targs) { continue; }
+            if (m == null || m.func == null || m.is_static || DeclarationNode::fn_of(m.func).generic_params.length != n_targs) { continue; }
             if (chosen.is_valid()) { return out; }
             chosen = entries[i];
         }
@@ -2116,11 +2120,11 @@ type struct CallResolver {
         const recv_type: TypeRef = member.object.resolved_type;
         if (!recv_type.is_valid()) { return out; }
 
-        mut orig_func: FunctionDeclNode* = null;
+        mut orig_func: DeclarationNode* = null;
         mut owner_ctx: ResolutionContext =
             this.binding.find_generic_method_for_call(recv_type, member, null, &orig_func);
         if (orig_func == null) { return out; }
-        const n_method_params: i64 = orig_func.generic_params.length;
+        const n_method_params: i64 = DeclarationNode::fn_of(orig_func).generic_params.length;
         if (n_method_params == 0) { return out; }
         if (member.generic_args.length != n_method_params) { return out; }
 
@@ -2146,7 +2150,7 @@ type struct CallResolver {
         // (`Array<T>`, `Option<T>`) for free.
         mut pctx: ResolutionContext = owner_ctx.clone();
         for (mut i: i64 = 0; i < n_method_params; i++) {
-            const gp_decl: DeclarationNode* = orig_func.generic_params[i];
+            const gp_decl: DeclarationNode* = DeclarationNode::fn_of(orig_func).generic_params[i];
             const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { return out; }
             pctx.add_binding(gp.sym_id, gp.name, bindings[i]);
@@ -2154,8 +2158,8 @@ type struct CallResolver {
         pctx.set_this_type(recv_type);
 
         mut explicit_params: [VarDecl*] = [];
-        for (mut i: i64 = 0; i < orig_func.parameters.length; i++) {
-            const p_decl: DeclarationNode* = orig_func.parameters[i];
+        for (mut i: i64 = 0; i < DeclarationNode::fn_of(orig_func).parameters.length; i++) {
+            const p_decl: DeclarationNode* = DeclarationNode::fn_of(orig_func).parameters[i];
             const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null) { continue; }
             if (p.is_receiver()) { continue; }
@@ -2227,8 +2231,9 @@ type struct CallResolver {
     /// `TypeResolver::project_where_bound_params_into`, which the static + instance
     /// generic-method paths share; the template's `param_syms` are index-aligned
     /// with `ictx.bindings`, exactly as that helper requires.
-    project_where_bound_params(mut &this, tmpl: FunctionDeclNode*, entry: TemplateEntry*,
+    project_where_bound_params(mut &this, tmpl_decl: DeclarationNode*, entry: TemplateEntry*,
                                ictx: InferCtx*) -> void {
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         this.ctx.type_resolver.project_where_bound_params_into(
             &tmpl.trait_bounds, &entry.param_syms, ictx, this.ctx.source_file,
             this.state.in_symbolic_check);
@@ -2237,7 +2242,8 @@ type struct CallResolver {
     /// PASS A/B/C argument inference returning the per-param bindings (no
     /// diagnostics), used by the module-scoped scope-resolution path.
     infer_free_call_bindings(mut &this, call: CallExprNode*, entry: TemplateEntry*,
-                             tmpl: FunctionDeclNode*) -> [TypeRef] {
+                             tmpl_decl: DeclarationNode*) -> [TypeRef] {
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         mut empty: [TypeRef] = [];
         if (entry.param_types.length == 0) { return empty; }
         if (tmpl.parameters.length != call.arguments.length) { return empty; }
@@ -2265,7 +2271,7 @@ type struct CallResolver {
         }
         // A param a where-bound projects off a bound subject is what the bound
         // requires; the expected type only fills what nothing else decides.
-        this.project_where_bound_params(tmpl, entry, &ictx);
+        this.project_where_bound_params(tmpl_decl, entry, &ictx);
         if (this.state.expected_type.is_valid() && tmpl.resolved_return_type.is_valid()
                 && !this.types.contains_generic_param(this.state.expected_type)) {
             mut any_unbound: boolean = false;
@@ -2289,7 +2295,7 @@ type struct CallResolver {
         // PASS D - project a where-bound-only param off its now-bound subject
         // (mirrors `check_generic_free_call`; keeps the qualified scope path,
         // e.g. `future::block_on(fut)`, in step with the bare-identifier path).
-        this.project_where_bound_params(tmpl, entry, &ictx);
+        this.project_where_bound_params(tmpl_decl, entry, &ictx);
         mut bindings: [TypeRef] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length; i++) {
@@ -2307,9 +2313,10 @@ type struct CallResolver {
         const entry: TemplateEntry* = this.find_static_method_template(scope, call);
         if (entry == null || entry.kind != TemplateKind::Function) { return; }
         if (entry.param_types.length == 0) { return; }
-        const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        const tmpl_decl: DeclarationNode* = DeclarationNode::with_shape(entry.ast_node);
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         if (tmpl == null) { return; }
-        const binds: [TypeRef] = this.template_call_bindings(call, scope, entry, tmpl);
+        const binds: [TypeRef] = this.template_call_bindings(call, scope, entry, tmpl_decl);
         if (binds.length == 0) { return; }
         call.set_resolved_type_args(binds);
     }
@@ -2321,10 +2328,10 @@ type struct CallResolver {
     /// Empty when the turbofish's count differs from the function's, a type
     /// argument does not resolve, or inference leaves a parameter unbound.
     template_call_bindings(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
-                           entry: TemplateEntry*, tmpl: FunctionDeclNode*) -> [TypeRef] {
+                           entry: TemplateEntry*, tmpl_decl: DeclarationNode*) -> [TypeRef] {
         mut targs: &[TypeAnnotation*] = &call.generic_args;
         if (targs.length == 0 && scope != null && scope.generic_args.length > 0) { targs = &scope.generic_args; }
-        if (targs.length == 0) { return this.infer_free_call_bindings(call, entry, tmpl); }
+        if (targs.length == 0) { return this.infer_free_call_bindings(call, entry, tmpl_decl); }
         mut binds: [TypeRef] = [];
         if (targs.length != entry.param_types.length) { return binds; }
         mut rc: ResolutionContext = ResolutionContext::new("");
@@ -2337,8 +2344,9 @@ type struct CallResolver {
         return binds;
     }
 
-    emit_free_call_bound_failure(mut &this, at: SourceSpan, tmpl: FunctionDeclNode*,
+    emit_free_call_bound_failure(mut &this, at: SourceSpan, tmpl_decl: DeclarationNode*,
                                  tref: TraitRef*, concrete: TypeRef, trait_name: SymbolStr) -> void {
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         const trait_str: string = this.intern.resolve(trait_name);
         const fn_str:    string = this.intern.resolve(tmpl.name);
         const conc_str:  string = this.types.type_display_name(concrete);
@@ -2814,7 +2822,7 @@ type struct CallResolver {
         if (m.ast_node == null) { return DefId::invalid(); }
         const mn: MethodNode* = m.ast_node as MethodNode*;
         if (mn.func == null) { return DefId::invalid(); }
-        return mn.func.origin_trait;
+        return DeclarationNode::fn_of(mn.func).origin_trait;
     }
 
     /// `(&f32, i64)` - one parameter list, rendered.  `from` is where the
@@ -2923,7 +2931,7 @@ type struct CallResolver {
         mut tie_spans: [SourceSpan] = [];
         mut variadic_ok: boolean = false;
         mut chosen:    [TypeRef] = [];
-        mut chosen_fn: FunctionDeclNode* = null;
+        mut chosen_fn: DeclarationNode* = null;
         mut name_seen:  i64 = 0;
         mut uniq_arity: i64 = -1;
         // Every arity-matching candidate's parameter types, flat: each candidate
@@ -3034,7 +3042,8 @@ type struct CallResolver {
                     for (mut bmi: i64 = 0; bmi < block.methods.length; bmi++) {
                         const mn: MethodNode* = block.methods[bmi];
                         if (mn == null || mn.func == null) { continue; }
-                        const fn_node: FunctionDeclNode* = mn.func;
+                        const fn_node_decl: DeclarationNode* = mn.func;
+                        const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
                         if (!DeclarationIndex::holds_method(&block_named, mn)) { continue; }
                         if (fn_node.is_variadic) { variadic_ok = true; continue; }
                         mut tparams: [TypeRef] = [];
@@ -3054,7 +3063,7 @@ type struct CallResolver {
                         if (!found) {
                             found = true;
                             chosen = tparams;
-                            chosen_fn = fn_node;
+                            chosen_fn = fn_node_decl;
                             found_trait = block.trait_def;
                         } else {
                             const same: boolean = this.types.same_param_sig(chosen.as_slice(), tparams.as_slice());
@@ -3153,8 +3162,9 @@ type struct CallResolver {
     /// Record in `found` a candidate the selection tried, with its
     /// parameters seen through `view` (null: as declared) when it has the
     /// call's arity.
-    record_candidate(mut &this, fn_node: FunctionDeclNode*, params: &[TypeRef],
+    record_candidate(mut &this, fn_node_decl: DeclarationNode*, params: &[TypeRef],
                      view: TypeSubstitution*, found: ArgCandidates*) -> void {
+        const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
         if (fn_node.is_variadic) { found.variadic = true; return; }
         found.name_seen += 1;
         found.uniq_arity = this.diag.note_arity(found.uniq_arity, params.length);
@@ -3271,8 +3281,9 @@ type struct CallResolver {
         mut generics: [OverloadId] = [];
         for (mut i: i64 = 0; i < entries.length; i++) {
             const d: ASTNode* = this.ctx.decl_index.entry_decl(entries[i]);
-            if (d == null || d.kind != NodeKind::FunctionDeclaration) { continue; }
-            const f: FunctionDeclNode* = d as FunctionDeclNode*;
+            if (d == null || DeclarationNode::fn_of(d) == null) { continue; }
+            const f_decl: DeclarationNode* = DeclarationNode::with_shape(d);
+            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
             if (f.generic_params.length == 0) {
                 if (!plain.is_valid()
                         && this.signature_accepts(this.ctx.decl_index.entry_signature(entries[i]), arg_types)) {
@@ -3285,9 +3296,9 @@ type struct CallResolver {
             if (!this.template_fits(t, call, null, arg_types)) { continue; }
             // A generic whose where-clause the arguments fail does not
             // accept them.
-            const binds: [TypeRef] = this.template_call_bindings(call, null, t, f);
+            const binds: [TypeRef] = this.template_call_bindings(call, null, t, f_decl);
             mut unmet_arg: TypeRef = TypeRef::invalid();
-            if (this.unmet_call_bound(f, &t.param_syms, &binds, &unmet_arg) != null) { continue; }
+            if (this.unmet_call_bound(f_decl, &t.param_syms, &binds, &unmet_arg) != null) { continue; }
             generics.push(entries[i]);
         }
         if (!plain.is_valid() || generics.length == 0) { return false; }
@@ -3431,7 +3442,7 @@ type struct CallResolver {
                 scope as ExpressionNode*, &refused);
             if (refused) { return TypeRef::invalid(); }
             if (chosen.is_valid()) {
-                callee = (this.ctx.decl_index.entry_decl(chosen) as FunctionDeclNode*).def;
+                callee = DeclarationNode::fn_of(this.ctx.decl_index.entry_decl(chosen)).def;
                 ft = this.ctx.decl_index.entry_signature(chosen);
             }
         }
@@ -3615,7 +3626,8 @@ type struct CallResolver {
     /// deferred combinator template) is left unpinned.
     pin_method_callee(mut &this, call: CallExprNode*, mn: MethodNode*, is_static: boolean) -> void {
         if (mn == null || mn.func == null) { return; }
-        const fn_node: FunctionDeclNode* = mn.func;
+        const fn_node_decl: DeclarationNode* = mn.func;
+        const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
         if (!fn_node.resolved_return_type.is_valid()) { return; }
         // GATED (R2): never stomp mono's exact-spec pin with a generic template's entry.
         if (fn_node.generic_params.length > 0 && call.resolved_callee.is_some()) { return; }
@@ -3708,7 +3720,8 @@ type struct CallResolver {
         // guard above answers.  A copy with no instance pinned leaves the
         // call unbound, which monomorphization reports; nothing selects it
         // again by its member's name.
-        const pinned_fn: FunctionDeclNode* = this.ctx.decl_index.method_func_of(call.template_method);
+        const pinned_fn_decl: DeclarationNode* = this.ctx.decl_index.method_func_of(call.template_method);
+        const pinned_fn: FunctionDecl* = DeclarationNode::fn_of(pinned_fn_decl);
         if (call.template_method.is_valid() && !owner_inst.is_valid()
                 && !this.types.contains_generic_param(base_ref)) {
             if (pinned_fn == null || !pinned_fn.is_generic()) {
@@ -3843,15 +3856,15 @@ type struct CallResolver {
         if (mn.func == null) { return; }
         const base: TypeRef = this.arena.inst_generic_base(owner_inst);
         if (!base.is_valid()) { return; }
-        if (!mn.func.def.is_valid()) {
-            if (mn.func.copy_of.is_valid()) {
-                call.template_method = mn.func.copy_of;
+        if (!DeclarationNode::fn_of(mn.func).def.is_valid()) {
+            if (DeclarationNode::fn_of(mn.func).copy_of.is_valid()) {
+                call.template_method = DeclarationNode::fn_of(mn.func).copy_of;
                 call.template_recv = owner_inst;
             }
             return;
         }
-        if (!this.ctx.defs.parent_of(mn.func.def).equals(this.ctx.decl_index.registered_def(base))) { return; }
-        call.template_method = mn.func.def;
+        if (!this.ctx.defs.parent_of(DeclarationNode::fn_of(mn.func).def).equals(this.ctx.decl_index.registered_def(base))) { return; }
+        call.template_method = DeclarationNode::fn_of(mn.func).def;
         call.template_recv = owner_inst;
     }
 
@@ -3865,7 +3878,8 @@ type struct CallResolver {
     pin_minted_method(&this, call: CallExprNode*, sel: Selection, recv: TypeRef) -> void {
         const mn: MethodNode* = sel.chosen;
         if (!this.state.in_symbolic_check || sel.owner_inst.is_valid() || mn == null) { return; }
-        const f: FunctionDeclNode* = mn.func;
+        const f_decl: DeclarationNode* = mn.func;
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         if (f == null || f.generic_params.length > 0
                 || f.is_self_returning_default || f.is_lazy_self_growing) { return; }
         // A trait's default copied into an implementation has no definition
@@ -3976,7 +3990,8 @@ type struct CallResolver {
         if (call.resolved_type_args.length == 0 || member.resolved_trait_slot < 0) { return ret; }
         const decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(member.resolved_trait);
         if (decl == null || member.resolved_trait_slot >= decl.methods.length) { return ret; }
-        const f: FunctionDeclNode* = decl.methods[member.resolved_trait_slot];
+        const f_decl: DeclarationNode* = decl.methods[member.resolved_trait_slot];
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         if (f == null || f.generic_params.length != call.resolved_type_args.length) { return ret; }
         mut view: TypeSubstitution = TypeSubstitution::empty();
         for (mut i: i64 = 0; i < f.generic_params.length; i++) {
@@ -4013,7 +4028,8 @@ type struct CallResolver {
     /// instantiates per call.  An empty set qualifies; it binds nothing.
     static all_plain_methods(items: &[MethodNode*]) -> boolean {
         for (mut i: i64 = 0; i < items.length; i++) {
-            const f: FunctionDeclNode* = items[i].func;
+            const f_decl: DeclarationNode* = items[i].func;
+            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
             if (f == null || f.generic_params.length > 0
                     || f.is_self_returning_default || f.is_lazy_self_growing) { return false; }
         }
@@ -4033,7 +4049,8 @@ type struct CallResolver {
         for (mut tier: i32 = 0; tier <= 3; tier++) {
             if (tier == 3 && this.state.in_implicit_conversion) { break; }
             for (mut i: i64 = 0; i < items.length; i++) {
-                const f: FunctionDeclNode* = items[i].func;
+                const f_decl: DeclarationNode* = items[i].func;
+                const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
                 mut params: [TypeRef] = [];
                 for (mut pi: i64 = 0; pi < f.parameters.length; pi++) {
                     const pp_decl: DeclarationNode* = f.parameters[pi];
@@ -4102,7 +4119,7 @@ type struct CallResolver {
                        methods_ref: Slice<MethodInfo>, arg_types: &[TypeRef],
                        tmpl: TemplateEntry*, owner_inst: TypeRef, from_trait: boolean,
                        chosen: MethodNode*) -> void {
-        if (chosen == null || chosen.func == null || chosen.func.generic_params.length > 0) { return; }
+        if (chosen == null || chosen.func == null || DeclarationNode::fn_of(chosen.func).generic_params.length > 0) { return; }
         mut alt: Selection = Selection::none();
         alt.owner_inst = owner_inst;
         alt.recv = if (owner_inst.is_valid()) { owner_inst } else { base_ref };
@@ -4120,12 +4137,12 @@ type struct CallResolver {
             fmt::format("`%s` is ambiguous: a non-generic and a generic method of `%s` both accept these arguments",
                 leaf, this.arena.resolve_display_name_short(subject)));
         d = d.at_with_label(member.span, "both methods apply here");
-        const f1: FunctionDeclNode* = chosen.func;
-        const f2: FunctionDeclNode* = alt.chosen.func;
+        const f1_decl: DeclarationNode* = chosen.func;
+        const f2_decl: DeclarationNode* = alt.chosen.func;
         d = d.with_note_at(fmt::format("candidate #1: `%s`, not generic", leaf),
-            if (f1.has_name_span()) { f1.name_span } else { f1.span });
+            if (f1_decl.has_name_span()) { f1_decl.name_span } else { f1_decl.span });
         d = d.with_note_at(fmt::format("candidate #2: `%s`, generic", leaf),
-            if (f2.has_name_span()) { f2.name_span } else { f2.span });
+            if (f2_decl.has_name_span()) { f2_decl.name_span } else { f2_decl.span });
         d = d.help("a method is not preferred for being non-generic; rename one of them");
         this.ctx.emit_diagnostic(d);
     }
@@ -4164,8 +4181,8 @@ type struct CallResolver {
             if (!this.select_in_set(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
                     arg_types, tmpl, tid, true, &one)) { continue; }
             traits.push(tid);
-            const f: FunctionDeclNode* = one.chosen.func;
-            spans.push(if (f.has_name_span()) { f.name_span } else { f.span });
+            const f_decl: DeclarationNode* = one.chosen.func;
+            spans.push(if (f_decl.has_name_span()) { f_decl.name_span } else { f_decl.span });
         }
         if (traits.length == 0) { return; }
         this.report_method_call_tie(call, member, subject, &traits, &spans, inherent.func);
@@ -4175,10 +4192,10 @@ type struct CallResolver {
     /// help quotes the call's receiver and arguments as the impl-qualified
     /// form takes them.  See `report_trait_method_tie`.
     report_method_call_tie(mut &this, call: CallExprNode*, member: MemberAccessNode*, owner: TypeRef,
-                           traits: &[DefId], decl_spans: &[SourceSpan], inherent: FunctionDeclNode*) -> void {
+                           traits: &[DefId], decl_spans: &[SourceSpan], inherent_decl: DeclarationNode*) -> void {
         const args_text: string = this.receiver_call_args_text(call, member);
         this.report_trait_method_tie(member.span, member.member, owner,
-            traits, decl_spans, args_text, true, inherent);
+            traits, decl_spans, args_text, true, inherent_decl);
     }
 
     /// A method call's arguments as the impl-qualified form writes them:
@@ -4208,8 +4225,8 @@ type struct CallResolver {
         sel.tier = tier;
         sel.info = info;
         sel.ret = if (view != null) {
-            this.seen_through(view, mn.func.resolved_return_type)
-        } else { mn.func.resolved_return_type };
+            this.seen_through(view, DeclarationNode::fn_of(mn.func).resolved_return_type)
+        } else { DeclarationNode::fn_of(mn.func).resolved_return_type };
     }
 
     /// Bind the call to the method `sel` chose.  An argument that bound
@@ -4229,8 +4246,8 @@ type struct CallResolver {
                 this.apply_overload_converter_args(visitor, call, sel.info.param_types.as_slice());
             } else {
                 mut params: [TypeRef] = [];
-                for (mut pi: i64 = 0; pi < mn.func.parameters.length; pi++) {
-                    const pp_decl: DeclarationNode* = mn.func.parameters[pi];
+                for (mut pi: i64 = 0; pi < DeclarationNode::fn_of(mn.func).parameters.length; pi++) {
+                    const pp_decl: DeclarationNode* = DeclarationNode::fn_of(mn.func).parameters[pi];
                     const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
                     if (pp == null || pp.is_receiver()) { continue; }
                     params.push(pp.resolved_type);
@@ -4254,9 +4271,9 @@ type struct CallResolver {
     /// nothing.
     pin_instantiated_method(&this, call: CallExprNode*, mn: MethodNode*, recv: TypeRef) -> void {
         if (mn.func == null || !recv.is_valid()) { return; }
-        if (mn.func.generic_params.length == 0 && !mn.func.is_self_returning_default
-                && !mn.func.is_lazy_self_growing) { return; }
-        const d: DefId = if (mn.func.def.is_valid()) { mn.func.def } else { mn.func.copy_of };
+        if (DeclarationNode::fn_of(mn.func).generic_params.length == 0 && !DeclarationNode::fn_of(mn.func).is_self_returning_default
+                && !DeclarationNode::fn_of(mn.func).is_lazy_self_growing) { return; }
+        const d: DefId = if (DeclarationNode::fn_of(mn.func).def.is_valid()) { DeclarationNode::fn_of(mn.func).def } else { DeclarationNode::fn_of(mn.func).copy_of };
         if (d.is_valid()) {
             call.template_method = d;
             call.template_recv = recv;
@@ -4312,7 +4329,8 @@ type struct CallResolver {
                                  ident: IdentifierNode*) -> void {
         const entry: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
         if (entry == null) { return; }
-        const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        const tmpl_decl: DeclarationNode* = DeclarationNode::with_shape(entry.ast_node);
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         if (tmpl == null || tmpl.parameters.length != call.arguments.length) { return; }
         mut decl: [TypeRef] = [];
         for (mut i: i64 = 0; i < tmpl.parameters.length; i++) {
@@ -4343,8 +4361,9 @@ type struct CallResolver {
     /// unifying a parameter with its argument, as the selection binds them
     /// (`method_args_bind`); see `params_seen_through`.  `params` are the
     /// candidate's, index-aligned with `func`'s non-receiver parameters.
-    method_call_params(mut &this, call: CallExprNode*, func: FunctionDeclNode*,
+    method_call_params(mut &this, call: CallExprNode*, func_decl: DeclarationNode*,
                        params: &[TypeRef]) -> [TypeRef] {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.generic_params.length == 0) { return sema_copy_type_refs(params); }
         mut decl: [TypeRef] = [];
         for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
@@ -4499,10 +4518,11 @@ type struct CallResolver {
                     if (!DeclarationIndex::holds_method(&named, m.ast_node as MethodNode*)) { continue; }
                     if (this.method_origin_trait(m).is_valid() != from_trait) { continue; }
                     if (only_trait.is_valid() && !this.method_provided_by(m.ast_node as MethodNode*, only_trait)) { continue; }
-                    const mfn: FunctionDeclNode* = if (m.ast_node != null) { (m.ast_node as MethodNode*).func } else { null };
+                    const mfn_decl: DeclarationNode* = if (m.ast_node != null) { (m.ast_node as MethodNode*).func } else { null };
+                    const mfn: FunctionDecl* = DeclarationNode::fn_of(mfn_decl);
                     if ((mfn != null && mfn.generic_params.length > 0) != generic) { continue; }
                     if (!this.method_args_bind(call, arg_types, m.param_types.as_slice(),
-                            this.method_type_is_variadic(m.function_type), tier, mfn, null)) { continue; }
+                            this.method_type_is_variadic(m.function_type), tier, mfn_decl, null)) { continue; }
                     *out_tier = tier;
                     return m;
                 }
@@ -4523,8 +4543,8 @@ type struct CallResolver {
     /// `implement trait T for ..` block for `T` - by identity: `trait_id` and
     /// `origin_trait` are both the trait's canonical name.
     method_provided_by(&this, mn: MethodNode*, trait_id: DefId) -> boolean {
-        if (mn == null || mn.func == null || !mn.func.origin_trait.is_valid()) { return false; }
-        return mn.func.origin_trait.equals(trait_id);
+        if (mn == null || mn.func == null || !DeclarationNode::fn_of(mn.func).origin_trait.is_valid()) { return false; }
+        return DeclarationNode::fn_of(mn.func).origin_trait.equals(trait_id);
     }
 
     /// `select_method` for an instantiation not yet minted (`sel.owner_inst`):
@@ -4668,7 +4688,7 @@ type struct CallResolver {
         for (mut ci: i64 = 0; ci < methods.length; ci++) {
             const cm: MethodNode* = methods[ci];
             if (cm != null && cm.func != null && DeclarationIndex::holds_method(named, cm)
-                    && !cm.func.is_self_returning_default) {
+                    && !DeclarationNode::fn_of(cm.func).is_self_returning_default) {
                 has_concrete_sibling = true;
                 break;
             }
@@ -4689,12 +4709,13 @@ type struct CallResolver {
             for (mut mi: i64 = 0; mi < methods.length; mi++) {
                 const mn: MethodNode* = methods[mi];
                 if (mn == null || mn.func == null) { continue; }
-                const fn_node: FunctionDeclNode* = mn.func;
+                const fn_node_decl: DeclarationNode* = mn.func;
+                const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
                 if (!DeclarationIndex::holds_method(named, mn)) { continue; }
                 if (fn_node.is_self_returning_default && has_concrete_sibling) { continue; }
                 if ((fn_node.generic_params.length > 0) != generic) { continue; }
-                if (where_asked && !this.trait_checker().method_bounds_satisfied(fn_node, view)) { continue; }
-                if (where_asked && this.trait_checker().method_receiver_excludes(fn_node, view,
+                if (where_asked && !this.trait_checker().method_bounds_satisfied(fn_node_decl, view)) { continue; }
+                if (where_asked && this.trait_checker().method_receiver_excludes(fn_node_decl, view,
                         owner_base, &owner_args)) { continue; }
                 mut params: [TypeRef] = [];
                 for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
@@ -4707,10 +4728,10 @@ type struct CallResolver {
                 // Collecting for the argument check binds nothing: each
                 // candidate is recorded once.
                 if (sel.collect != null) {
-                    this.record_candidate(fn_node, &params, view, sel.collect);
+                    this.record_candidate(fn_node_decl, &params, view, sel.collect);
                     continue;
                 }
-                if (!this.method_args_bind(call, arg_types, params.as_slice(), fn_node.is_variadic, tier, fn_node,
+                if (!this.method_args_bind(call, arg_types, params.as_slice(), fn_node.is_variadic, tier, fn_node_decl,
                         view)) { continue; }
                 this.choose_method(mn, tier, null, sel, view);
                 return true;
@@ -4770,7 +4791,8 @@ type struct CallResolver {
     /// is never chosen would otherwise leave behind as a type nothing
     /// demands.
     method_args_bind(mut &this, call: CallExprNode*, arg_types: &[TypeRef], params: Slice<TypeRef>,
-                     variadic: boolean, tier: i32, func: FunctionDeclNode*, view: TypeSubstitution*) -> boolean {
+                     variadic: boolean, tier: i32, func_decl: DeclarationNode*, view: TypeSubstitution*) -> boolean {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         const n_own: i64 = if (func != null) { func.generic_params.length } else { 0 };
         if (n_own == 0 && view == null) {
             return this.args_bind_to_params(call, arg_types, params, variadic, tier);
@@ -4882,7 +4904,7 @@ type struct CallResolver {
 
     /// The first method a generic template's declaration writes that is one
     /// of `named`, the member-function door's answer for the leaf asked.
-    template_method_held(&this, ast_node: ASTNode*, named: &[MethodNode*]) -> FunctionDeclNode* {
+    template_method_held(&this, ast_node: ASTNode*, named: &[MethodNode*]) -> DeclarationNode* {
         if (ast_node == null) { return null; }
         const no_methods: [MethodNode*] = [];
         mut methods: &[MethodNode*] = &no_methods;
@@ -5083,7 +5105,7 @@ type struct CallResolver {
         const on_template: boolean = lookup_t != null && lookup_t.kind == TypeKind::InstantiatedType;
         const named: MethodNode* = selected.chosen;
         const ret: TypeRef = if (on_template) { selected.ret } else { if (named != null && named.func != null) {
-            named.func.resolved_return_type
+            DeclarationNode::fn_of(named.func).resolved_return_type
         } else { TypeRef::invalid() } };
         if (ret.is_valid() && !proj_blocked) {
             const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
@@ -5250,7 +5272,8 @@ type struct CallResolver {
         if (tmpl == null || tmpl.ast_node == null) { return false; }
         if (tmpl.param_names.length != inst.type_args.length) { return false; }
         const named: [MethodNode*] = this.ctx.decl_index.methods_named(FamilyOwner::Template(tmpl.def), member.member);
-        const func: FunctionDeclNode* = this.template_method_held(tmpl.ast_node, &named);
+        const func_decl: DeclarationNode* = this.template_method_held(tmpl.ast_node, &named);
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.trait_bounds.length == 0) { return false; }
         for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
             const bound: &TraitBound = &func.trait_bounds[bi];
@@ -5304,7 +5327,8 @@ type struct CallResolver {
     /// reported, and a copy calls a method its element type does not offer.
     check_symbolic_method_bounds(mut &this, member: MemberAccessNode*, chosen: MethodNode*) -> void {
         if (!this.state.in_symbolic_check || chosen == null || chosen.func == null) { return; }
-        const func: FunctionDeclNode* = chosen.func;
+        const func_decl: DeclarationNode* = chosen.func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func.trait_bounds.length == 0 || member.object == null) { return; }
         mut t: Type* = this.arena.lookup(member.object.resolved_type);
         mut depth: i32 = 0;
@@ -5684,7 +5708,7 @@ type struct CallResolver {
         const chosen: OverloadId = this.choose_entry(&fits, scope, call, FamilyOwner::Type(this.scope_owner_type(scope)));
         const m: MethodNode* = this.ctx.decl_index.entry_method(chosen);
         if (m == null || m.func == null) { return; }
-        call.template_method = if (m.func.def.is_valid()) { m.func.def } else { m.func.copy_of };
+        call.template_method = if (DeclarationNode::fn_of(m.func).def.is_valid()) { DeclarationNode::fn_of(m.func).def } else { DeclarationNode::fn_of(m.func).copy_of };
     }
 
     /// The definition of `trait_def`'s declared method the path `scope`
@@ -5696,7 +5720,7 @@ type struct CallResolver {
         if (slot < 0 || decl == null || slot >= decl.methods.length || decl.methods[slot] == null) {
             return DefId::invalid();
         }
-        return decl.methods[slot].def;
+        return DeclarationNode::fn_of(decl.methods[slot]).def;
     }
 
     /// A call written through a TRAIT's path, `Beta::go(&p, ...)`: the
@@ -5850,8 +5874,8 @@ type struct CallResolver {
         mut any_generic: boolean = false;
         for (mut i: i64 = 0; i < family.length; i++) {
             const d: ASTNode* = this.ctx.decl_index.entry_decl(family[i]);
-            if (d != null && d.kind == NodeKind::FunctionDeclaration
-                    && (d as FunctionDeclNode*).generic_params.length > 0) { any_generic = true; }
+            if (d != null && DeclarationNode::fn_of(d) != null
+                    && DeclarationNode::fn_of(d).generic_params.length > 0) { any_generic = true; }
         }
         if (!any_generic) { return OverloadId::invalid(); }
         mut expected: TypeRef = this.state.expected_type;
@@ -5881,8 +5905,9 @@ type struct CallResolver {
         mut example: TypeRef = TypeRef::invalid();
         for (mut i: i64 = 0; i < family.length; i++) {
             const d: ASTNode* = this.ctx.decl_index.entry_decl(family[i]);
-            if (d == null || d.kind != NodeKind::FunctionDeclaration) { continue; }
-            const f: FunctionDeclNode* = d as FunctionDeclNode*;
+            if (d == null || DeclarationNode::fn_of(d) == null) { continue; }
+            const f_decl: DeclarationNode* = DeclarationNode::with_shape(d);
+            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
             const sig: TypeRef = this.ctx.decl_index.entry_signature(family[i]);
             if (!sig.is_valid()) { continue; }
             const tm: TemplateEntry* = this.ctx.generic_registry.template_of(f.def);
@@ -5954,7 +5979,7 @@ type struct CallResolver {
         mut any_generic: boolean = false;
         for (mut i: i64 = 0; i < entries.length; i++) {
             const m: MethodNode* = this.ctx.decl_index.entry_method(entries[i]);
-            if (m != null && m.func != null && m.func.generic_params.length > 0) { any_generic = true; }
+            if (m != null && m.func != null && DeclarationNode::fn_of(m.func).generic_params.length > 0) { any_generic = true; }
         }
         if (!any_generic) { return null; }
         const shown: string = fmt::format("%s::%s",
@@ -6011,7 +6036,7 @@ type struct CallResolver {
         const node: MethodNode* = this.ctx.decl_index.entry_method(entry);
         const sig: TypeRef = this.ctx.decl_index.entry_signature(entry);
         if (node == null || node.func == null || !sig.is_valid()) { return TypeRef::invalid(); }
-        const gps: &[DeclarationNode*] = &node.func.generic_params;
+        const gps: &[DeclarationNode*] = &DeclarationNode::fn_of(node.func).generic_params;
         if (gps.length == 0) {
             if (written.length == 0 && expected.is_valid() && sig.equals(expected)) { return sig; }
             return TypeRef::invalid();
@@ -6118,7 +6143,7 @@ type struct CallResolver {
         }
         // A function's where-clause holds for the instance, as for a call.
         if (entry.kind == TemplateKind::Function && entry.ast_node != null
-                && !this.check_call_where_bounds(span, entry.ast_node as FunctionDeclNode*, &entry.param_syms, &bindings)) {
+                && !this.check_call_where_bounds(span, DeclarationNode::with_shape(entry.ast_node), &entry.param_syms, &bindings)) {
             return TypeRef::invalid();
         }
         const ty: TypeRef = this.subst_params(params, &bindings, sig);
@@ -6182,13 +6207,13 @@ type struct CallResolver {
             }
             if (node == null || node.func == null) { return TypeRef::invalid(); }
             is_static = node.is_static;
-            for (mut i: i64 = 0; i < node.func.parameters.length; i++) {
-                const p_decl: DeclarationNode* = node.func.parameters[i];
+            for (mut i: i64 = 0; i < DeclarationNode::fn_of(node.func).parameters.length; i++) {
+                const p_decl: DeclarationNode* = DeclarationNode::fn_of(node.func).parameters[i];
                 const p: VarDecl* = DeclarationNode::var_of(p_decl);
                 if (p == null || !p.resolved_type.is_valid()) { return TypeRef::invalid(); }
                 if (!p.is_receiver()) { call_params.push(p.resolved_type); }
             }
-            ret = node.func.resolved_return_type;
+            ret = DeclarationNode::fn_of(node.func).resolved_return_type;
         } else {
             mut m: MethodInfo* = null;
             if (chosen != null) {
@@ -6207,7 +6232,7 @@ type struct CallResolver {
             ret = ft.return_type;
             variadic = ft.is_variadic;
         }
-        if (node.func == null || node.func.generic_params.length == 0 || !node.func.def.is_valid()) {
+        if (node.func == null || DeclarationNode::fn_of(node.func).generic_params.length == 0 || !DeclarationNode::fn_of(node.func).def.is_valid()) {
             return TypeRef::invalid();
         }
         *owns = true;
@@ -6228,8 +6253,8 @@ type struct CallResolver {
         }
         mut params: [TypeRef] = [];
         if (!is_static) {
-            if (node.func.parameters.length == 0) { return TypeRef::invalid(); }
-            const recv_decl: DeclarationNode* = node.func.parameters[0];
+            if (DeclarationNode::fn_of(node.func).parameters.length == 0) { return TypeRef::invalid(); }
+            const recv_decl: DeclarationNode* = DeclarationNode::fn_of(node.func).parameters[0];
             const recv: VarDecl* = DeclarationNode::var_of(recv_decl);
             if (recv == null || !recv.is_receiver() || !recv.resolved_type.is_valid()) { return TypeRef::invalid(); }
             // A generic owner's receiver is the owner over the parameters
@@ -6246,8 +6271,8 @@ type struct CallResolver {
         mut handles: [TypeRef] = [];
         mut syms: [SymbolID] = [];
         mut bindings: [TypeRef] = [];
-        for (mut i: i64 = 0; i < node.func.generic_params.length; i++) {
-            const gp_decl: DeclarationNode* = node.func.generic_params[i];
+        for (mut i: i64 = 0; i < DeclarationNode::fn_of(node.func).generic_params.length; i++) {
+            const gp_decl: DeclarationNode* = DeclarationNode::fn_of(node.func).generic_params[i];
             const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             mut handle: TypeRef = TypeRef::invalid();
             for (mut k: i64 = 0; k < named.length; k++) {
@@ -6327,7 +6352,7 @@ type struct CallResolver {
         }
         for (mut i: i64 = 0; i < bindings.length; i++) {
             if (bindings[i].is_valid()) { continue; }
-            this.report_uninferable_value(this.intern.resolve(DeclarationNode::generic_param_of(node.func.generic_params[i]).name),
+            this.report_uninferable_value(this.intern.resolve(DeclarationNode::generic_param_of(DeclarationNode::fn_of(node.func).generic_params[i]).name),
                 shown, with_args, scope.span);
             return TypeRef::invalid();
         }
@@ -6355,7 +6380,7 @@ type struct CallResolver {
         }
         const value_ty: TypeRef = this.subst_params(&sub_params, &sub_args, sig);
         if (!value_ty.is_valid()) { return TypeRef::invalid(); }
-        scope.template_method = node.func.def;
+        scope.template_method = DeclarationNode::fn_of(node.func).def;
         scope.spec_owner = if (owner_handles.length == 0) {
             found
         } else {
@@ -6392,7 +6417,7 @@ type struct CallResolver {
         const entries: [OverloadId] = this.member_entries(FamilyOwner::Type(base), scope.member_name);
         if (entries.length != 1) { return TypeRef::invalid(); }
         const m: MethodNode* = this.ctx.decl_index.entry_method(entries[0]);
-        if (m == null || m.func == null || m.func.generic_params.length > 0 || !m.func.def.is_valid()) {
+        if (m == null || m.func == null || DeclarationNode::fn_of(m.func).generic_params.length > 0 || !DeclarationNode::fn_of(m.func).def.is_valid()) {
             return TypeRef::invalid();
         }
         *owns = true;
@@ -6406,24 +6431,24 @@ type struct CallResolver {
         // the symbol each declaration bound; one the signature never names is
         // held by the owner's, which nothing in the signature matches.
         mut named: [TypeRef] = [];
-        for (mut i: i64 = 0; i < m.func.parameters.length; i++) {
-            if (m.func.parameters[i] != null) {
-                this.arena.generic_params_in(DeclarationNode::var_of(m.func.parameters[i]).resolved_type, &named);
+        for (mut i: i64 = 0; i < DeclarationNode::fn_of(m.func).parameters.length; i++) {
+            if (DeclarationNode::fn_of(m.func).parameters[i] != null) {
+                this.arena.generic_params_in(DeclarationNode::var_of(DeclarationNode::fn_of(m.func).parameters[i]).resolved_type, &named);
             }
         }
-        this.arena.generic_params_in(m.func.resolved_return_type, &named);
+        this.arena.generic_params_in(DeclarationNode::fn_of(m.func).resolved_return_type, &named);
         mut tparams: [TypeRef] = [];
         if (!this.owner_param_handles(owner_entry, m, &named, &tparams)) { return TypeRef::invalid(); }
         const self_ty: TypeRef = this.arena.create_instantiation(owner_entry.base_type, &tparams);
         mut params: [TypeRef] = [];
-        for (mut i: i64 = 0; i < m.func.parameters.length; i++) {
-            const p_decl: DeclarationNode* = m.func.parameters[i];
+        for (mut i: i64 = 0; i < DeclarationNode::fn_of(m.func).parameters.length; i++) {
+            const p_decl: DeclarationNode* = DeclarationNode::fn_of(m.func).parameters[i];
             const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null || !p.resolved_type.is_valid()) { return TypeRef::invalid(); }
             params.push(if (i == 0 && p.is_receiver()) { this.receiver_over(p.resolved_type, self_ty) } else { p.resolved_type });
         }
-        if (!m.func.resolved_return_type.is_valid()) { return TypeRef::invalid(); }
-        const sig: TypeRef = this.arena.get_function(m.func.resolved_return_type, &params, false);
+        if (!DeclarationNode::fn_of(m.func).resolved_return_type.is_valid()) { return TypeRef::invalid(); }
+        const sig: TypeRef = this.arena.get_function(DeclarationNode::fn_of(m.func).resolved_return_type, &params, false);
         mut args: [TypeRef] = [];
         const shown: string = fmt::format("%s::%s",
             this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name));
@@ -6437,7 +6462,7 @@ type struct CallResolver {
         } else {
             this.ctx.generic_registry.instantiate(owner_entry.base_type, &args)
         };
-        scope.template_method = m.func.def;
+        scope.template_method = DeclarationNode::fn_of(m.func).def;
         return value_ty;
     }
 
@@ -6895,7 +6920,7 @@ type struct CallResolver {
             if (this.ctx.decl_index.entry_trait(fits[i]).is_valid()) { continue; }
             const m: MethodNode* = this.ctx.decl_index.entry_method(fits[i]);
             if (m == null || m.func == null) { continue; }
-            if (m.func.generic_params.length > 0) { generics.push(fits[i]); } else { plain = fits[i]; }
+            if (DeclarationNode::fn_of(m.func).generic_params.length > 0) { generics.push(fits[i]); } else { plain = fits[i]; }
         }
         if (generics.length == 0 || (!plain.is_valid() && generics.length < 2)) { return OverloadId::invalid(); }
         const leaf: string = if (path != null) { this.intern.resolve(path.member_name) } else { "" };
@@ -6947,7 +6972,7 @@ type struct CallResolver {
             spans.push(this.ctx.decl_index.entry_span(fits[i]));
         }
         const inh: MethodNode* = this.ctx.decl_index.entry_method(inherent);
-        const inh_func: FunctionDeclNode* = if (inh != null) { inh.func } else { null };
+        const inh_func_decl: DeclarationNode* = if (inh != null) { inh.func } else { null };
         mut args_text: string = "";
         if (call != null && call.arguments.length > 0) {
             const first: ExpressionNode* = call.arguments[0];
@@ -6963,7 +6988,7 @@ type struct CallResolver {
             FamilyOwner::Template(_) => { TypeRef::invalid() }
         };
         this.report_trait_method_tie(path.span, path.member_name, owner_t,
-            &traits, &spans, args_text, call != null, inh_func);
+            &traits, &spans, args_text, call != null, inh_func_decl);
     }
 
     /// The source text under a single-line `span`, or "" when it spans lines
@@ -6993,7 +7018,8 @@ type struct CallResolver {
     /// owner the tie is the same in every instantiation and is reported here.
     report_trait_method_tie(mut &this, span: SourceSpan, member: SymbolStr, owner: TypeRef,
                             traits: &[DefId], decl_spans: &[SourceSpan],
-                            args_text: string, is_call: boolean, inherent: FunctionDeclNode*) -> void {
+                            args_text: string, is_call: boolean, inherent_decl: DeclarationNode*) -> void {
+        const inherent: FunctionDecl* = DeclarationNode::fn_of(inherent_decl);
         if (this.state.in_symbolic_check && inherent == null
                 && this.types.contains_generic_param(owner)) { return; }
         if (!owner.is_valid()) { return; }
@@ -7013,7 +7039,7 @@ type struct CallResolver {
         mut first_trait: i32 = 1;
         if (inherent != null) {
             const inh_note: string = fmt::format("candidate #1: the inherent method `%s::%s`", owner_display, member_str);
-            const inh_span: SourceSpan = if (inherent.has_name_span()) { inherent.name_span } else { inherent.span };
+            const inh_span: SourceSpan = if (inherent_decl.has_name_span()) { inherent_decl.name_span } else { inherent_decl.span };
             diag = if (inh_span.has_location()) { diag.with_note_at(inh_note, inh_span) } else { diag.with_note(inh_note) };
             first_trait = 2;
         }
@@ -7141,9 +7167,10 @@ type struct CallResolver {
     template_fits(mut &this, t: TemplateEntry*, call: CallExprNode*,
                   scope: ScopeResolutionNode*, arg_types: &[TypeRef]) -> boolean {
         if (call == null) { return false; }
-        const f: FunctionDeclNode* = t.ast_node as FunctionDeclNode*;
+        const f_decl: DeclarationNode* = DeclarationNode::with_shape(t.ast_node);
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         if (f == null || f.parameters.length != arg_types.length) { return false; }
-        const binds: [TypeRef] = this.template_call_bindings(call, scope, t, f);
+        const binds: [TypeRef] = this.template_call_bindings(call, scope, t, f_decl);
         if (binds.length != t.param_types.length) { return false; }
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
             const p_decl: DeclarationNode* = f.parameters[i];
@@ -7173,8 +7200,8 @@ type struct CallResolver {
         if (ot == null || ot.kind != TypeKind::Function) { return params; }
         const fn_ty: FunctionType* = ot.as_function();
         const m: MethodNode* = this.ctx.decl_index.entry_method(e);
-        if (m != null && m.func != null && m.func.spec_type_args.length > 0) { return params; }
-        if (m == null || m.func == null || m.func.generic_params.length == 0) {
+        if (m != null && m.func != null && DeclarationNode::fn_of(m.func).spec_type_args.length > 0) { return params; }
+        if (m == null || m.func == null || DeclarationNode::fn_of(m.func).generic_params.length == 0) {
             for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) { params.push(fn_ty.param_types[pi]); }
             return params;
         }
@@ -7183,8 +7210,8 @@ type struct CallResolver {
         mut ctx: ResolutionContext = this.path_method_context(m, fn_ty.param_types[0], call, scope, &binds);
         if (binds.length == 0) { return params; }
         params.push(fn_ty.param_types[0]);
-        for (mut pi: i64 = 0; pi < m.func.parameters.length; pi++) {
-            const p_decl: DeclarationNode* = m.func.parameters[pi];
+        for (mut pi: i64 = 0; pi < DeclarationNode::fn_of(m.func).parameters.length; pi++) {
+            const p_decl: DeclarationNode* = DeclarationNode::fn_of(m.func).parameters[pi];
             const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null || p.is_receiver()) { continue; }
             if (p.type_annotation == null) { return []; }
@@ -7215,9 +7242,9 @@ type struct CallResolver {
         mut targs: &[TypeAnnotation*] = &call.generic_args;
         if (targs.length == 0 && scope != null) { targs = &scope.generic_args; }
         const binds: [TypeRef] = this.binding.solve_method_bindings_at(m.func, &ctx, targs, call, 1);
-        if (binds.length != m.func.generic_params.length) { return ctx; }
+        if (binds.length != DeclarationNode::fn_of(m.func).generic_params.length) { return ctx; }
         for (mut i: i64 = 0; i < binds.length; i++) {
-            const gp_decl: DeclarationNode* = m.func.generic_params[i];
+            const gp_decl: DeclarationNode* = DeclarationNode::fn_of(m.func).generic_params[i];
             const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { return ctx; }
             ctx.add_binding(gp.sym_id, gp.name, binds[i]);
@@ -7234,7 +7261,7 @@ type struct CallResolver {
     /// other entry is pinned.
     pin_static_entry(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*, e: OverloadId) -> void {
         const m: MethodNode* = this.ctx.decl_index.entry_method(e);
-        if (m == null || m.func == null || m.func.generic_params.length == 0 || m.is_static) {
+        if (m == null || m.func == null || DeclarationNode::fn_of(m.func).generic_params.length == 0 || m.is_static) {
             call.set_resolved_callee(CalleePin::Decl(e));
             return;
         }
@@ -7247,11 +7274,11 @@ type struct CallResolver {
         if (binds.length == 0) { return; }
         call.set_resolved_type_args(binds);
         if (!call.template_method.is_valid()) {
-            call.template_method = if (m.func.def.is_valid()) { m.func.def } else { m.func.copy_of };
+            call.template_method = if (DeclarationNode::fn_of(m.func).def.is_valid()) { DeclarationNode::fn_of(m.func).def } else { DeclarationNode::fn_of(m.func).copy_of };
         }
-        if (m.func.return_type_annotation != null) {
+        if (DeclarationNode::fn_of(m.func).return_type_annotation != null) {
             const ret: TypeRef = this.binding.reduce_assoc_projections(
-                this.ctx.type_resolver.resolve(m.func.return_type_annotation, &ctx));
+                this.ctx.type_resolver.resolve(DeclarationNode::fn_of(m.func).return_type_annotation, &ctx));
             if (ret.is_valid() && !this.types.contains_generic_param(ret)) { scope.set_resolved_type(ret); }
         }
     }
@@ -7406,8 +7433,8 @@ type struct CallResolver {
     /// method; null for any other entry.
     static_entry_template(&this, e: OverloadId) -> TemplateEntry* {
         const m: MethodNode* = this.ctx.decl_index.entry_method(e);
-        if (m == null || m.func == null || !m.is_static || m.func.generic_params.length == 0) { return null; }
-        const t: TemplateEntry* = this.ctx.generic_registry.template_of(m.func.def);
+        if (m == null || m.func == null || !m.is_static || DeclarationNode::fn_of(m.func).generic_params.length == 0) { return null; }
+        const t: TemplateEntry* = this.ctx.generic_registry.template_of(DeclarationNode::fn_of(m.func).def);
         if (t == null || t.kind != TemplateKind::Function) { return null; }
         return t;
     }
@@ -7439,13 +7466,14 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
         if (entry.param_types.length == 0) { return TypeRef::invalid(); }
-        const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        const tmpl_decl: DeclarationNode* = DeclarationNode::with_shape(entry.ast_node);
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         if (tmpl == null || !tmpl.resolved_return_type.is_valid()) { return TypeRef::invalid(); }
 
         // The method's own type args: explicit turbofish (on the member or,
         // as a fallback, the scope), else argument inference + where-bound
         // projection (the free-function inference, which runs PASS D).
-        const binds: [TypeRef] = this.template_call_bindings(call, scope, entry, tmpl);
+        const binds: [TypeRef] = this.template_call_bindings(call, scope, entry, tmpl_decl);
         if (binds.length != entry.param_types.length) { return TypeRef::invalid(); }
         // Every arg must BIND; it need not yet be CONCRETE.  Called from inside a
         // generic body the args carry the enclosing template's parameters
@@ -7464,7 +7492,7 @@ type struct CallResolver {
 
         // E0306 - where-clause bound satisfaction for the bound method args, so an
         // unsatisfied bound is a clean call-site error rather than a downstream miss.
-        if (!this.check_call_where_bounds(call.span, tmpl, &entry.param_syms, &binds)) {
+        if (!this.check_call_where_bounds(call.span, tmpl_decl, &entry.param_syms, &binds)) {
             return TypeRef::invalid();
         }
 
@@ -7490,12 +7518,12 @@ type struct CallResolver {
     /// true when every bound holds (or the arg is still abstract/skippable).
     /// Shared by the free-function and static-method-template call paths and
     /// a generic function or method taken as a value; `at` is the use's span.
-    check_call_where_bounds(mut &this, at: SourceSpan, tmpl: FunctionDeclNode*,
+    check_call_where_bounds(mut &this, at: SourceSpan, tmpl_decl: DeclarationNode*,
                             param_syms: &[SymbolID], bindings: &[TypeRef]) -> boolean {
         mut concrete: TypeRef = TypeRef::invalid();
-        const tref: TraitRef* = this.unmet_call_bound(tmpl, param_syms, bindings, &concrete);
+        const tref: TraitRef* = this.unmet_call_bound(tmpl_decl, param_syms, bindings, &concrete);
         if (tref == null) { return true; }
-        this.emit_free_call_bound_failure(at, tmpl, tref, concrete, tref.path[tref.path.length - 1]);
+        this.emit_free_call_bound_failure(at, tmpl_decl, tref, concrete, tref.path[tref.path.length - 1]);
         return false;
     }
 
@@ -7503,8 +7531,9 @@ type struct CallResolver {
     /// `bindings` do not satisfy, with the arg it fails written to
     /// `out_concrete`; null when every bound holds (or the arg is still
     /// abstract/skippable).  Reports nothing.
-    unmet_call_bound(mut &this, tmpl: FunctionDeclNode*, param_syms: &[SymbolID],
+    unmet_call_bound(mut &this, tmpl_decl: DeclarationNode*, param_syms: &[SymbolID],
                      bindings: &[TypeRef], out_concrete: TypeRef*) -> TraitRef* {
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
             const bound: TraitBound* = &tmpl.trait_bounds[bi];
             mut idx: i64 = -1;
@@ -7555,14 +7584,15 @@ type struct CallResolver {
         // its receiver as the path's first argument.  A non-generic one is
         // handled by the owner-only path.
         this.record_template_static(call, scope, this.scope_owner_type(scope));
-        const func: FunctionDeclNode* = this.ctx.decl_index.method_func_of(call.template_method);
+        const func_decl: DeclarationNode* = this.ctx.decl_index.method_func_of(call.template_method);
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.generic_params.length == 0) { return TypeRef::invalid(); }
         if (!func.resolved_return_type.is_valid()) { return TypeRef::invalid(); }
 
         // Infer the method's OWN `<T>` (turbofish -> argument types).  Inside a
         // generic body either argument list may name the body's parameters;
         // each copy of the body concretizes the stash.
-        mut method_binds: [TypeRef] = this.infer_generic_method_bindings(call, scope, func);
+        mut method_binds: [TypeRef] = this.infer_generic_method_bindings(call, scope, func_decl);
         if (method_binds.length != func.generic_params.length) { return TypeRef::invalid(); }
         for (mut i: i64 = 0; i < method_binds.length; i++) {
             if (!method_binds[i].is_valid()) { return TypeRef::invalid(); }
@@ -7613,7 +7643,8 @@ type struct CallResolver {
         const recorded: ASTNode* = this.ctx.decl_index.method_decl_of(d);
         if (recorded == null || recorded.kind != NodeKind::MethodDeclaration) { return false; }
         const m: MethodNode* = recorded as MethodNode*;
-        const func: FunctionDeclNode* = m.func;
+        const func_decl: DeclarationNode* = m.func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.generic_params.length != method_args.length) { return false; }
         mut named: [TypeRef] = [];
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
@@ -7655,7 +7686,8 @@ type struct CallResolver {
     }
 
     infer_generic_method_bindings(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
-                                  func: FunctionDeclNode*) -> [TypeRef] {
+                                  func_decl: DeclarationNode*) -> [TypeRef] {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         mut empty: [TypeRef] = [];
         const n: i64 = func.generic_params.length;
         if (n == 0) { return empty; }
@@ -7765,9 +7797,10 @@ type struct CallResolver {
         if (tmpl.kind != TemplateKind::Struct && tmpl.kind != TemplateKind::Union
                 && tmpl.kind != TemplateKind::Class) { return; }
         this.record_template_static(call, scope, this.scope_owner_type(scope));
-        const func: FunctionDeclNode* = this.ctx.decl_index.method_func_of(call.template_method);
+        const func_decl: DeclarationNode* = this.ctx.decl_index.method_func_of(call.template_method);
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.generic_params.length > 0) { return; }
-        this.stash_static_owner_bindings(scope, call, tmpl, func);
+        this.stash_static_owner_bindings(scope, call, tmpl, func_decl);
     }
 
     /// GATED (R1): resolve a static method's return off a generic owner TEMPLATE
@@ -7792,9 +7825,9 @@ type struct CallResolver {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null || !m.is_static) { continue; }
             if (!DeclarationIndex::holds_method(&named, m)) { continue; }
-            if (m.func.generic_params.length > 0) { return TypeRef::invalid(); }
+            if (DeclarationNode::fn_of(m.func).generic_params.length > 0) { return TypeRef::invalid(); }
             found_count += 1;
-            abstract_ret = m.func.resolved_return_type;
+            abstract_ret = DeclarationNode::fn_of(m.func).resolved_return_type;
             matched = m;
         }
         if (found_count != 1 || !abstract_ret.is_valid()) { return TypeRef::invalid(); }
@@ -7839,8 +7872,9 @@ type struct CallResolver {
     /// lives in `compute_static_owner_bindings` step 3, which calls this with `true`
     /// solely to detect the case, then emits E0307 (an unannotated literal is no
     /// longer accepted as the sole source for a generic owner's type argument).
-    infer_static_owner_bindings_from_args(mut &this, tmpl: TemplateEntry*, func: FunctionDeclNode*,
+    infer_static_owner_bindings_from_args(mut &this, tmpl: TemplateEntry*, func_decl: DeclarationNode*,
                                           call: CallExprNode*, allow_literal_default: boolean) -> [TypeRef] {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return []; }
         if (tmpl.param_types.length == 0) { return []; }
         if (func.parameters.length != call.arguments.length) { return []; }
@@ -7900,7 +7934,8 @@ type struct CallResolver {
     /// narrow base-equality expected-type source can't.  Returns a length-`want`
     /// all-bound binding set (declaration order) or `[]`.
     infer_static_owner_bindings_from_expected(mut &this, tmpl: TemplateEntry*,
-                                              func: FunctionDeclNode*) -> [TypeRef] {
+                                              func_decl: DeclarationNode*) -> [TypeRef] {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return []; }
         if (tmpl.param_types.length == 0) { return []; }
         if (!this.state.expected_type.is_valid()) { return []; }
@@ -7928,8 +7963,9 @@ type struct CallResolver {
     /// param be backfilled from its declared default when it appears in neither the
     /// params nor the return (`Arc<T, A = GlobalAlloc>::try_new`, whose `A` is
     /// hardcoded GlobalAlloc in the signature).  Empty when nothing binds.
-    infer_static_owner_prefix(mut &this, tmpl: TemplateEntry*, func: FunctionDeclNode*,
+    infer_static_owner_prefix(mut &this, tmpl: TemplateEntry*, func_decl: DeclarationNode*,
                               call: CallExprNode*) -> [TypeRef] {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return []; }
         if (tmpl.param_types.length == 0) { return []; }
         mut pids: [TypeRef] = [];
@@ -7977,7 +8013,7 @@ type struct CallResolver {
     /// source builds and returns its OWN array (no owning-array reassignment/
     /// aliasing); `[]` when no source yields a complete set.
     compute_static_owner_bindings(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*,
-                                  tmpl: TemplateEntry*, func: FunctionDeclNode*) -> [TypeRef] {
+                                  tmpl: TemplateEntry*, func_decl: DeclarationNode*) -> [TypeRef] {
         const want: i64 = tmpl.param_types.length;
         if (want == 0) { return []; }
 
@@ -8009,7 +8045,7 @@ type struct CallResolver {
 
         // 1. Inferred from CONCRETE argument types (no literal-default guess yet).
         // Returns a length-`want` all-bound set or `[]`.
-        const ib: [TypeRef] = this.infer_static_owner_bindings_from_args(tmpl, func, call, false);
+        const ib: [TypeRef] = this.infer_static_owner_bindings_from_args(tmpl, func_decl, call, false);
         if (ib.length == want) { return ib; }
 
         // 1b. Unify the method's ABSTRACT return type against the expected type to
@@ -8019,7 +8055,7 @@ type struct CallResolver {
         // - its owner param `T` is in no parameter, only in the annotation
         // `Result<Array<u64,GlobalAlloc>, E>`, so structural unification of the
         // declared return against the expected type is the only source.
-        const eb_unify: [TypeRef] = this.infer_static_owner_bindings_from_expected(tmpl, func);
+        const eb_unify: [TypeRef] = this.infer_static_owner_bindings_from_expected(tmpl, func_decl);
         if (eb_unify.length == want) { return eb_unify; }
 
         // 2. Expected-type derived (e.g. `const s: Slice<i32> = Slice::from_raw(..)`).
@@ -8050,7 +8086,7 @@ type struct CallResolver {
         // args/return DO determine, then backfill the trailing defaulted params from
         // their declared defaults.  Runs AFTER step 2 so a non-default owner arg from
         // a base-matching expected type still wins.
-        const prefix: [TypeRef] = this.infer_static_owner_prefix(tmpl, func, call);
+        const prefix: [TypeRef] = this.infer_static_owner_prefix(tmpl, func_decl, call);
         if (prefix.length > 0 && prefix.length < want) {
             mut rc_d: ResolutionContext = ResolutionContext::new("");
             this.symbolic.symbolic_bind_params(&rc_d);
@@ -8079,7 +8115,7 @@ type struct CallResolver {
         // not cascade; the emitted error aborts the build.  Single-fire: `stash_*`
         // sets `resolved_type_args` from these bindings, so its idempotency guard
         // short-circuits every later `compute` for this call before it re-emits.
-        const lb: [TypeRef] = this.infer_static_owner_bindings_from_args(tmpl, func, call, true);
+        const lb: [TypeRef] = this.infer_static_owner_bindings_from_args(tmpl, func_decl, call, true);
         if (lb.length == want) {
             // EXEMPTION: a range literal (`0..5` / `1..=4`) is lowered by the parser
             // into `Range::new` / `RangeInclusive::new` (see expr_parser.cryo), and its
@@ -8151,14 +8187,14 @@ type struct CallResolver {
     /// that names any OTHER template's parameter
     /// (`symbolic_type_concretizable`), so the next source answers instead.
     stash_static_owner_bindings(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*,
-                                tmpl: TemplateEntry*, func: FunctionDeclNode*) -> void {
+                                tmpl: TemplateEntry*, func_decl: DeclarationNode*) -> void {
         if (call == null || scope == null || tmpl == null) { return; }
         if (call.resolved_type_args.length > 0) { return; }
         const want: i64 = tmpl.param_types.length;
         if (want == 0) { return; }
         // `binds` owns a fresh buffer; `set_resolved_type_args` takes it by value
         // (move), so there is no aliasing/double-free.
-        mut binds: [TypeRef] = this.compute_static_owner_bindings(scope, call, tmpl, func);
+        mut binds: [TypeRef] = this.compute_static_owner_bindings(scope, call, tmpl, func_decl);
         if (binds.length != want) { return; }
         for (mut i: i64 = 0; i < binds.length; i++) {
             if (!binds[i].is_valid()) { return; }
@@ -8485,9 +8521,10 @@ type struct CallResolver {
                 if (arg_types.length == call.arguments.length) {
                     this.report_free_generic_tie(call, callee, scope, &arg_types);
                 }
-                const tfn: FunctionDeclNode* = tmpl.ast_node as FunctionDeclNode*;
+                const tfn_decl: DeclarationNode* = DeclarationNode::with_shape(tmpl.ast_node);
+                const tfn: FunctionDecl* = DeclarationNode::fn_of(tfn_decl);
                 if (tfn != null) {
-                    mut binds: [TypeRef] = this.infer_free_call_bindings(call, tmpl, tfn);
+                    mut binds: [TypeRef] = this.infer_free_call_bindings(call, tmpl, tfn_decl);
                     if (binds.length > 0) {
                         mut stash: [TypeRef] = [];
                         for (mut i: i64 = 0; i < binds.length; i++) { stash.push(binds[i]); }
@@ -8862,7 +8899,8 @@ type struct CallResolver {
     /// template's defaults.  A call with no complete stash is not checked here.
     check_template_static_args(mut &this, visitor: SemaVisitor*, scope: ScopeResolutionNode*,
                                call: CallExprNode*) -> void {
-        const func: FunctionDeclNode* = this.ctx.decl_index.method_func_of(call.template_method);
+        const func_decl: DeclarationNode* = this.ctx.decl_index.method_func_of(call.template_method);
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return; }
         const tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope);
         if (tmpl == null || tmpl.param_types.length == 0) { return; }

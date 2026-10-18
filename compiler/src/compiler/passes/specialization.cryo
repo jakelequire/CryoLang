@@ -40,7 +40,7 @@ import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, FunctionDeclNode, GenericParamDecl,
+    ClassDeclNode, DeclarationNode, DeclKind, FunctionDecl, GenericParamDecl,
     ImplBlock, MethodNode, StructDecl, TraitDecl, UnionDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -156,16 +156,17 @@ type struct SpecializationPasses {
                             ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
                     }
                 }
-                NodeKind::FunctionDeclaration => {
-                    const node: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                    if (node.is_generic()) {
-                        SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, TemplateKind::Function, node.def, registry, arena, ctx);
-                    }
-                }
                 NodeKind::Declaration => {
                     // A template holds the declaration's header.
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Function(_) => {
+                            const node_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                            const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
+                            if (node.is_generic()) {
+                                SpecializationPasses::register_generic_template(node.name, node.generic_params,
+                                    stmt, TemplateKind::Function, node.def, registry, arena, ctx);
+                            }
+                        }
                         DeclKind::Struct(node) => {
                             if (node.is_generic()) {
                                 SpecializationPasses::register_generic_template(node.name, node.generic_params,
@@ -571,7 +572,7 @@ type struct SpecializationPasses {
         // Two modules that instantiate the same generic now each emit it.  That
         // is sound because a monomorph is a pure function of (template,
         // type-args): both clone the same template source into the same symbol.
-        // `FunctionDeclNode::is_specialization` makes codegen give the definition
+        // `FunctionDecl::is_specialization` makes codegen give the definition
         // `linkonce_odr` linkage, so the linker keeps one and discards the rest.
         //
         // Placement does not affect symbol names, which is what makes relocation
@@ -688,11 +689,11 @@ type struct SpecializationPasses {
     /// can give it `linkonce_odr` linkage.  This is the one funnel through
     /// which a monomorph's AST reaches an owner module, so tagging here is
     /// exhaustive for anything that gets a definition emitted.  See
-    /// `FunctionDeclNode::is_specialization` for why the linkage is sound.
+    /// `FunctionDecl::is_specialization` for why the linkage is sound.
     static mark_specialized(node: ASTNode*) -> void {
         if (node == null) { return; }
-        if (node.kind == NodeKind::FunctionDeclaration) {
-            (node as FunctionDeclNode*).is_specialization = true;
+        if (DeclarationNode::fn_of(node) != null) {
+            DeclarationNode::fn_of(node).is_specialization = true;
             return;
         }
         if (DeclarationNode::struct_of(node) != null) {
@@ -709,7 +710,7 @@ type struct SpecializationPasses {
     static mark_methods(methods: &[MethodNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
-            if (m != null && m.func != null) { m.func.is_specialization = true; }
+            if (m != null && m.func != null) { DeclarationNode::fn_of(m.func).is_specialization = true; }
         }
     }
 
@@ -853,17 +854,17 @@ type struct SpecializationPasses {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null) { continue; }
             if (!m.is_static) { continue; }
-            if (!m.func.is_generic()) { continue; }
+            if (!DeclarationNode::fn_of(m.func).is_generic()) { continue; }
 
-            const qualified_sym: SymbolStr = ctx.defs.path_of(m.func.def).spelling();
+            const qualified_sym: SymbolStr = ctx.defs.path_of(DeclarationNode::fn_of(m.func).def).spelling();
 
             const refs: [TypeRef] = TypeResolutionPasses::create_generic_param_types(
-                m.func.generic_params, arena);
+                DeclarationNode::fn_of(m.func).generic_params, arena);
             mut param_names: [SymbolStr] = [];
             mut param_syms: [SymbolID] = [];
             mut param_types: [TypeRef] = [];
-            for (mut j: i64 = 0; j < m.func.generic_params.length; j++) {
-                const gp_decl: DeclarationNode* = m.func.generic_params[j];
+            for (mut j: i64 = 0; j < DeclarationNode::fn_of(m.func).generic_params.length; j++) {
+                const gp_decl: DeclarationNode* = DeclarationNode::fn_of(m.func).generic_params[j];
                 const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                 param_names.push(gp.name);
                 param_syms.push(gp.sym_id);
@@ -873,7 +874,7 @@ type struct SpecializationPasses {
             const base_type: TypeRef = arena.create_function_template(qualified_sym);
 
             const entry: TemplateEntry = TemplateEntry::new(
-                m.func.name, qualified_sym, m.func.def, written_in,
+                DeclarationNode::fn_of(m.func).name, qualified_sym, DeclarationNode::fn_of(m.func).def, written_in,
                 param_names, param_syms, param_types,
                 m.func as ASTNode*, TemplateKind::Function,
                 base_type

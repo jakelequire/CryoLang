@@ -206,6 +206,16 @@ public:
         };
     }
 
+    /// The function `n` is, or null.
+    static fn_of(n: ASTNode*) -> FunctionDecl* {
+        const d: DeclarationNode* = DeclarationNode::with_shape(n);
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Function(f) => { f }
+            _                     => { null }
+        };
+    }
+
     /// The variable `n` is (a local, a global or a parameter), or null.
     static var_of(n: ASTNode*) -> VarDecl* {
         const d: DeclarationNode* = DeclarationNode::with_shape(n);
@@ -535,9 +545,12 @@ implement trait Allocate for struct DestructureDecl {
 }
 
 
-type class FunctionDeclNode : DeclarationNode {
-public:
+/// A function: a free function, a method's function, a trait's method or an
+/// extern block's prototype.
+type struct FunctionDecl {
     name:                   SymbolStr;
+    /// Each a declaration whose shape is `DeclKind::Variable`, read through
+    /// `DeclarationNode::var_of`.
     parameters:             [DeclarationNode*];
     generic_params:         [DeclarationNode*];
     trait_bounds:           [TraitBound];
@@ -563,7 +576,7 @@ public:
     /// For a function the compiler synthesizes from code written in another
     /// - an async function's `poll`, a capturing lambda's `__call__` - that
     /// function's definition; invalid for a function written as itself.  A
-    /// `Location` made in the body names it (`FunctionDeclNode::written_in_of`).
+    /// `Location` made in the body names it (`FunctionDecl::written_in_of`).
     written_in:             DefId;
     is_variadic:            boolean;
     /// `![implicit]` was applied. Permits the inference engine to recover
@@ -699,53 +712,55 @@ public:
     /// type arguments.  Invalid on anything else.
     instance:               TypeRef;
 
-    FunctionDeclNode(name: SymbolStr, span: SourceSpan)
-        : DeclarationNode(NodeKind::FunctionDeclaration, span) {
-        this.name                   = name;
-        this.parameters             = [];
-        this.generic_params         = [];
-        this.trait_bounds           = [];
-        this.body                   = null;
-        this.is_public              = false;
-        this.is_static              = false;
-        this.is_async               = false;
-        this.is_inline              = false;
-        this.is_noinline            = false;
-        this.is_caller_located      = false;
-        this.written_in             = DefId::invalid();
-        this.is_variadic            = false;
-        this.is_implicit            = false;
-        this.is_synthesized_body    = false;
-        this.is_synth_default       = false;
-        this.is_intrinsic           = false;
-        this.is_self_returning_default = false;
-        this.is_lazy_self_growing   = false;
-        this.link_name              = "";
-        this.has_link_name          = false;
-        this.is_weak                = false;
-        this.is_naked               = false;
-        this.link_section           = "";
-        this.return_type_annotation = null;
-        this.resolved_return_type   = TypeRef::invalid();
-        this.origin_trait           = DefId::invalid();
-        this.async_fut_slot         = -1;
-        this.spec_type_args         = [];
-        this.overload_entry         = OverloadId::invalid();
-        this.is_specialization      = false;
-        this.def                    = DefId::invalid();
-        this.copy_of                = DefId::invalid();
-        this.instance               = TypeRef::invalid();
+    static new(name: SymbolStr) -> FunctionDecl* {
+        return new FunctionDecl {
+            name:                      name,
+            parameters:                [],
+            generic_params:            [],
+            trait_bounds:              [],
+            body:                      null,
+            is_public:                 false,
+            is_static:                 false,
+            is_async:                  false,
+            is_inline:                 false,
+            is_noinline:               false,
+            is_caller_located:         false,
+            written_in:                DefId::invalid(),
+            is_variadic:               false,
+            is_implicit:               false,
+            is_synthesized_body:       false,
+            is_synth_default:          false,
+            is_intrinsic:              false,
+            is_self_returning_default: false,
+            is_lazy_self_growing:      false,
+            link_name:                 "",
+            has_link_name:             false,
+            is_weak:                   false,
+            is_naked:                  false,
+            link_section:              "",
+            return_type_annotation:    null,
+            resolved_return_type:      TypeRef::invalid(),
+            origin_trait:              DefId::invalid(),
+            async_fut_slot:            -1,
+            spec_type_args:            [],
+            overload_entry:            OverloadId::invalid(),
+            is_specialization:         false,
+            def:                       DefId::invalid(),
+            copy_of:                   DefId::invalid(),
+            instance:                  TypeRef::invalid(),
+        };
     }
 
-    has_body() -> boolean                 { return this.body != null; }
-    is_generic() -> boolean               { return this.generic_params.length > 0; }
-    has_resolved_return_type() -> boolean { return this.resolved_return_type.is_valid(); }
+    has_body(&this) -> boolean                 { return this.body != null; }
+    is_generic(&this) -> boolean               { return this.generic_params.length > 0; }
+    has_resolved_return_type(&this) -> boolean { return this.resolved_return_type.is_valid(); }
 
     /// The definition the code of `f` was written as: for a synthesized
     /// function the one it was made from, for a copy (a specialization, a
     /// placed trait default) the definition it copies - `def` is invalid
     /// there - and otherwise its own.
-    static written_in_of(f: FunctionDeclNode*) -> DefId {
+    static written_in_of(f_decl: DeclarationNode*) -> DefId {
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         if (f == null) { return DefId::invalid(); }
         if (f.written_in.is_valid()) { return f.written_in; }
         if (f.copy_of.is_valid()) { return f.copy_of; }
@@ -758,51 +773,63 @@ public:
         if (decl == null) { return false; }
         if (decl.kind == NodeKind::MethodDeclaration) {
             const m: MethodNode* = decl as MethodNode*;
-            return m.func != null && m.func.is_caller_located;
+            return m.func != null && DeclarationNode::fn_of(m.func).is_caller_located;
         }
-        if (decl.kind == NodeKind::FunctionDeclaration) {
-            return (decl as FunctionDeclNode*).is_caller_located;
+        if (DeclarationNode::fn_of(decl) != null) {
+            return DeclarationNode::fn_of(decl).is_caller_located;
         }
         return false;
     }
 
-    add_parameter(param: DeclarationNode*) -> void {
+    add_parameter(mut &this, param: DeclarationNode*) -> void {
         this.parameters.push(param);
     }
 
-    add_generic_param(param: DeclarationNode*) -> void {
+    add_generic_param(mut &this, param: DeclarationNode*) -> void {
         this.generic_params.push(param);
     }
 
-    add_trait_bound(bound: TraitBound) -> void {
+    add_trait_bound(mut &this, bound: TraitBound) -> void {
         this.trait_bounds.push(bound);
     }
 
-    set_name(n: SymbolStr) -> void                           { this.name = n; }
-    set_body(b: Stmt*) -> void                     { this.body = b; }
-    set_public(v: boolean) -> void                          { this.is_public = v; }
-    set_static(v: boolean) -> void                          { this.is_static = v; }
-    set_async(v: boolean) -> void                           { this.is_async = v; }
-    set_variadic(v: boolean) -> void                        { this.is_variadic = v; }
-    set_synthesized_body(v: boolean) -> void                { this.is_synthesized_body = v; }
-    set_synth_default(v: boolean) -> void                   { this.is_synth_default = v; }
-    set_intrinsic(v: boolean) -> void                       { this.is_intrinsic = v; }
-    set_self_returning_default(v: boolean) -> void          { this.is_self_returning_default = v; }
-    set_lazy_self_growing(v: boolean) -> void               { this.is_lazy_self_growing = v; }
-    set_return_type_annotation(a: TypeAnnotation*) -> void  { this.return_type_annotation = a; }
-    set_resolved_return_type(t: TypeRef) -> void             { this.resolved_return_type = t; }
-    set_origin_trait(t: DefId) -> void                       { this.origin_trait = t; }
-    set_async_fut_slot(s: i64) -> void                       { this.async_fut_slot = s; }
-    set_spec_type_args(a: [TypeRef]) -> void                 { this.spec_type_args = a; }
-    set_overload_entry(e: OverloadId) -> void                { this.overload_entry = e; }
+    set_name(mut &this, n: SymbolStr) -> void                          { this.name = n; }
+    set_body(mut &this, b: Stmt*) -> void                              { this.body = b; }
+    set_public(mut &this, v: boolean) -> void                          { this.is_public = v; }
+    set_static(mut &this, v: boolean) -> void                          { this.is_static = v; }
+    set_async(mut &this, v: boolean) -> void                           { this.is_async = v; }
+    set_variadic(mut &this, v: boolean) -> void                        { this.is_variadic = v; }
+    set_synthesized_body(mut &this, v: boolean) -> void                { this.is_synthesized_body = v; }
+    set_synth_default(mut &this, v: boolean) -> void                   { this.is_synth_default = v; }
+    set_intrinsic(mut &this, v: boolean) -> void                       { this.is_intrinsic = v; }
+    set_self_returning_default(mut &this, v: boolean) -> void          { this.is_self_returning_default = v; }
+    set_lazy_self_growing(mut &this, v: boolean) -> void               { this.is_lazy_self_growing = v; }
+    set_return_type_annotation(mut &this, a: TypeAnnotation*) -> void  { this.return_type_annotation = a; }
+    set_resolved_return_type(mut &this, t: TypeRef) -> void            { this.resolved_return_type = t; }
+    set_origin_trait(mut &this, t: DefId) -> void                      { this.origin_trait = t; }
+    set_async_fut_slot(mut &this, s: i64) -> void                      { this.async_fut_slot = s; }
+    set_spec_type_args(mut &this, a: [TypeRef]) -> void                { this.spec_type_args = a; }
+    set_overload_entry(mut &this, e: OverloadId) -> void               { this.overload_entry = e; }
+
+    static walk_children<V>(n: FunctionDecl*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.parameters.length; i++) { v.walk_decl(n.parameters[i]); }
+        v.walk_stmt(n.body);
+    }
+}
+
+implement trait Allocate for struct FunctionDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
 }
 
 
-/// Method node uses composition: holds a FunctionDeclNode* for the function
-/// signature and body, plus method-specific flags.
+/// Method node uses composition: holds the function's declaration (shape
+/// `DeclKind::Function`) for the signature and body, plus method-specific
+/// flags.
 type class MethodNode : DeclarationNode {
 public:
-    func:                  FunctionDeclNode*;
+    func:                  DeclarationNode*;
     visibility:            Visibility;
     is_constructor:        boolean;
     is_destructor:         boolean;
@@ -825,7 +852,7 @@ public:
     /// instance of it.
     spec_of:               MethodNode*;
 
-    MethodNode(func: FunctionDeclNode*, span: SourceSpan)
+    MethodNode(func: DeclarationNode*, span: SourceSpan)
         : DeclarationNode(NodeKind::MethodDeclaration, span) {
         this.func                  = func;
         this.spec_of               = null;
@@ -890,6 +917,7 @@ type enum DeclKind {
     Enum(EnumDecl*);
     Extern(ExternBlock*);
     Field(FieldDecl*);
+    Function(FunctionDecl*);
     GenericParam(GenericParamDecl*);
     Impl(ImplBlock*);
     Import(ImportDecl*);
@@ -1403,7 +1431,7 @@ type struct AssocTypeDeclNode {
 type struct TraitDecl {
     name:           SymbolStr;
     generic_params: [DeclarationNode*];
-    methods:        [FunctionDeclNode*];
+    methods:        [DeclarationNode*];
     /// The supertraits written after the name (`type trait Step : Ord`),
     /// each stamped with its identity by the name layer where it is written.
     /// A reader asks `definition()`; the written path is never a key.
@@ -1967,7 +1995,7 @@ type struct ExternBlock {
     /// system search path), false for a quoted include (`#include
     /// "foo.h"`, resolved relative to the importing file's directory).
     include_is_system: [boolean];
-    functions:       [FunctionDeclNode*];
+    functions:       [DeclarationNode*];
     /// Imported globals declared in this block (`mut errno: i32;`).  Held here
     /// so the block owns what it declared, but HOISTED into the top-level
     /// statement stream by the parser: they are globals whose storage lives in
@@ -2023,8 +2051,8 @@ type struct ExternBlock {
         this.include_is_system.push(true);
     }
 
-    add_function(mut &this, func: FunctionDeclNode*) -> void {
-        this.functions.push(func);
+    add_function(mut &this, func_decl: DeclarationNode*) -> void {
+        this.functions.push(func_decl);
     }
 }
 
