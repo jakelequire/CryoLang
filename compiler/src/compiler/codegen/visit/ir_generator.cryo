@@ -49,11 +49,11 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
-    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
+    AlignofExpr, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    CallExprNode, CastExprNode, DeleteExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
-    ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode, StructLiteralNode,
-    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
+    ScopeResolutionNode, SizeofExpr, StaticMatchExprNode, StructLiteralNode,
+    TernaryExprNode, TryExprNode, TupleLiteralNode, UnaryExprNode,
     YieldExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -211,8 +211,6 @@ type struct IRGeneratorVisitor {
             NodeKind::StaticMatchExpression  => { return this.visit_static_match_expr(n as StaticMatchExprNode*); }
             NodeKind::CallExpression         => { return this.visit_call(n as CallExprNode*); }
             NodeKind::NewExpression          => { return this.visit_new(n as NewExprNode*); }
-            NodeKind::SizeofExpression       => { return this.visit_sizeof(n as SizeofExprNode*); }
-            NodeKind::AlignofExpression      => { return this.visit_alignof(n as AlignofExprNode*); }
             NodeKind::CastExpression         => { return this.visit_cast(n as CastExprNode*); }
             NodeKind::StructLiteral          => { return this.visit_struct_literal(n as StructLiteralNode*); }
             NodeKind::ArrayLiteral           => { return this.visit_array_literal(n as ArrayLiteralNode*); }
@@ -221,7 +219,6 @@ type struct IRGeneratorVisitor {
             NodeKind::ArrayAccess            => { return this.visit_array_access(n as ArrayAccessNode*); }
             NodeKind::MemberAccess           => { return this.visit_member_access(n as MemberAccessNode*); }
             NodeKind::ScopeResolution        => { return this.visit_scope_resolution(n as ScopeResolutionNode*); }
-            NodeKind::TypeofExpression       => { return this.visit_typeof(n as TypeofExprNode*); }
             NodeKind::DeleteExpression       => { return this.visit_delete(n as DeleteExprNode*); }
             NodeKind::AwaitExpression        => { return this.visit_await(n as AwaitExprNode*); }
             NodeKind::YieldExpression        => { return this.visit_yield(n as YieldExprNode*); }
@@ -258,7 +255,17 @@ type struct IRGeneratorVisitor {
                 }
             }
 
-            NodeKind::Expression | NodeKind::AsyncExpression | NodeKind::Unknown => { return Emitted::none(); }
+            NodeKind::Expression => {
+                const e: ExpressionNode* = n as ExpressionNode*;
+                match (e.shape) {
+                    ExprKind::Alignof(a) => { return this.visit_alignof(e, a); }
+                    ExprKind::Sizeof(s)  => { return this.visit_sizeof(e, s); }
+                    ExprKind::Typeof(_)  => { return this.visit_typeof(e); }
+                    ExprKind::Legacy     => { return Emitted::none(); }
+                }
+            }
+
+            NodeKind::Unknown => { return Emitted::none(); }
         }
     }
 
@@ -1668,18 +1675,18 @@ type struct IRGeneratorVisitor {
         return operand;
     }
 
-    visit_sizeof(mut &this, node: SizeofExprNode*) -> Emitted {
+    visit_sizeof(mut &this, e: ExpressionNode*, node: SizeofExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         out.value = this.cg.expr_ops.codegen_sizeof(
-            this.layout_operand("sizeof", node.operand_type, node.span));
+            this.layout_operand("sizeof", node.operand_type, e.span));
         out.is_lvalue = false;
         return out;
     }
 
-    visit_alignof(mut &this, node: AlignofExprNode*) -> Emitted {
+    visit_alignof(mut &this, e: ExpressionNode*, node: AlignofExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         out.value = this.cg.expr_ops.codegen_alignof(
-            this.layout_operand("alignof", node.operand_type, node.span));
+            this.layout_operand("alignof", node.operand_type, e.span));
         out.is_lvalue = false;
         return out;
     }
@@ -2167,11 +2174,11 @@ type struct IRGeneratorVisitor {
         return out;
     }
 
-    visit_typeof(mut &this, node: TypeofExprNode*) -> Emitted {
+    visit_typeof(mut &this, e: ExpressionNode*) -> Emitted {
         mut out: Emitted = Emitted::none();
         this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: 'typeof' expressions are not implemented",
-            node.span);
+            e.span);
         out.value     = LValue::null();
         out.is_lvalue = false;
         return out;

@@ -74,11 +74,11 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
-    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
+    ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    CallExprNode, CastExprNode, DeleteExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
-    ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode, StructLiteralNode,
-    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
+    ScopeResolutionNode, StaticMatchExprNode, StructLiteralNode,
+    TernaryExprNode, TryExprNode, TupleLiteralNode, UnaryExprNode,
     YieldExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -1663,14 +1663,15 @@ type struct SemaVisitor {
         match (n.kind) {
             NodeKind::Program                => { this.visit_program(n as ProgramNode*); }
 
-            NodeKind::Literal | NodeKind::Identifier | NodeKind::BinaryExpression
+            NodeKind::Expression
+            | NodeKind::Literal | NodeKind::Identifier | NodeKind::BinaryExpression
             | NodeKind::UnaryExpression | NodeKind::TernaryExpression | NodeKind::IfExpression
             | NodeKind::MatchExpression | NodeKind::StaticMatchExpression
-            | NodeKind::CallExpression | NodeKind::NewExpression | NodeKind::SizeofExpression
-            | NodeKind::AlignofExpression | NodeKind::CastExpression | NodeKind::StructLiteral
+            | NodeKind::CallExpression | NodeKind::NewExpression
+            | NodeKind::CastExpression | NodeKind::StructLiteral
             | NodeKind::ArrayLiteral | NodeKind::TupleLiteral | NodeKind::LambdaExpression
             | NodeKind::ArrayAccess | NodeKind::MemberAccess | NodeKind::ScopeResolution
-            | NodeKind::TypeofExpression | NodeKind::DeleteExpression | NodeKind::AwaitExpression
+            | NodeKind::DeleteExpression | NodeKind::AwaitExpression
             | NodeKind::YieldExpression | NodeKind::TryExpression => {
                 this.resolve_expr(n as ExpressionNode*);
             }
@@ -1702,7 +1703,7 @@ type struct SemaVisitor {
                 }
             }
 
-            NodeKind::Expression | NodeKind::AsyncExpression | NodeKind::Unknown => { }
+            NodeKind::Unknown => { }
         }
     }
 
@@ -1737,27 +1738,7 @@ type struct SemaVisitor {
             NodeKind::NewExpression     => { this.resolve_new_expr(expr as NewExprNode*) }
             NodeKind::ArrayLiteral      => { this.resolve_array_literal(expr as ArrayLiteralNode*) }
             NodeKind::TupleLiteral      => { this.resolve_tuple_literal(expr as TupleLiteralNode*) }
-            NodeKind::SizeofExpression  => {
-                const s: SizeofExprNode* = expr as SizeofExprNode*;
-                if (!s.operand_type.is_valid()) {
-                    s.set_operand_type(this.resolve_layout_operand(s.type_ann));
-                }
-                this.arena.get_u64()
-            }
-            NodeKind::AlignofExpression => {
-                const a: AlignofExprNode* = expr as AlignofExprNode*;
-                if (!a.operand_type.is_valid()) {
-                    a.set_operand_type(this.resolve_layout_operand(a.type_ann));
-                }
-                this.arena.get_u64()
-            }
-            NodeKind::TypeofExpression  => {
-                const te: TypeofExprNode* = expr as TypeofExprNode*;
-                this.resolve_expr(te.operand);
-                this.ctx.emit_error_at(ErrorCode::E0209_INVALID_OPERATION,
-                    "`typeof` may only be used in type position (e.g. `const y: typeof(x)`)", expr.span);
-                TypeRef::invalid()
-            }
+            NodeKind::Expression        => { this.resolve_expr_shape(expr) }
             NodeKind::DeleteExpression  => {
                 const de: DeleteExprNode* = expr as DeleteExprNode*;
                 this.resolve_expr(de.operand);
@@ -1770,6 +1751,33 @@ type struct SemaVisitor {
         };
         if (result.is_valid()) { expr.set_resolved_type(result); }
         return result;
+    }
+
+    /// The type of an expression whose kind has a payload; `resolve_expr`
+    /// records it on the header.
+    resolve_expr_shape(mut &this, expr: ExpressionNode*) -> TypeRef {
+        return match (expr.shape) {
+            ExprKind::Sizeof(s) => {
+                if (!s.operand_type.is_valid()) {
+                    s.set_operand_type(this.resolve_layout_operand(s.type_ann));
+                }
+                this.arena.get_u64()
+            }
+            ExprKind::Alignof(a) => {
+                if (!a.operand_type.is_valid()) {
+                    a.set_operand_type(this.resolve_layout_operand(a.type_ann));
+                }
+                this.arena.get_u64()
+            }
+            ExprKind::Typeof(te) => {
+                this.resolve_expr(te.operand);
+                this.ctx.emit_error_at(ErrorCode::E0209_INVALID_OPERATION,
+                    "`typeof` may only be used in type position (e.g. `const y: typeof(x)`)", expr.span);
+                TypeRef::invalid()
+            }
+            // Built with its own `NodeKind`, which `resolve_expr` dispatched.
+            ExprKind::Legacy => { TypeRef::invalid() }
+        };
     }
 
     /// Type an `await e`: `e` must be a `Future`, and the await evaluates to

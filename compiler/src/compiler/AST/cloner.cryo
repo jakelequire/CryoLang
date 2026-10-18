@@ -30,11 +30,11 @@ import compiler::ast::declaration::{
     VarDecl
 };
 import compiler::ast::expression::{
-    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
-    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
+    AlignofExpr, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    CallExprNode, CastExprNode, DeleteExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
-    ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode, StructLiteralNode,
-    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
+    ScopeResolutionNode, SizeofExpr, StaticMatchExprNode, StructLiteralNode,
+    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExpr, UnaryExprNode,
     YieldExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -127,8 +127,6 @@ type struct ASTCloner {
             NodeKind::StaticMatchExpression     => { return this.visit_static_match_expr(n as StaticMatchExprNode*); }
             NodeKind::CallExpression            => { return this.visit_call(n as CallExprNode*); }
             NodeKind::NewExpression             => { return this.visit_new(n as NewExprNode*); }
-            NodeKind::SizeofExpression          => { return this.visit_sizeof(n as SizeofExprNode*); }
-            NodeKind::AlignofExpression         => { return this.visit_alignof(n as AlignofExprNode*); }
             NodeKind::CastExpression            => { return this.visit_cast(n as CastExprNode*); }
             NodeKind::StructLiteral             => { return this.visit_struct_literal(n as StructLiteralNode*); }
             NodeKind::ArrayLiteral              => { return this.visit_array_literal(n as ArrayLiteralNode*); }
@@ -137,12 +135,12 @@ type struct ASTCloner {
             NodeKind::ArrayAccess               => { return this.visit_array_access(n as ArrayAccessNode*); }
             NodeKind::MemberAccess              => { return this.visit_member_access(n as MemberAccessNode*); }
             NodeKind::ScopeResolution           => { return this.visit_scope_resolution(n as ScopeResolutionNode*); }
-            NodeKind::TypeofExpression          => { return this.visit_typeof(n as TypeofExprNode*); }
             NodeKind::DeleteExpression          => { return this.visit_delete(n as DeleteExprNode*); }
             NodeKind::AwaitExpression           => { return this.visit_await(n as AwaitExprNode*); }
             NodeKind::YieldExpression           => { return this.visit_yield(n as YieldExprNode*); }
             NodeKind::TryExpression             => { return this.visit_try(n as TryExprNode*); }
 
+            NodeKind::Expression                => { return this.copy_expr_shape(n as ExpressionNode*); }
             NodeKind::Statement                 => { return this.copy_stmt(n as Stmt*); }
 
             NodeKind::Declaration               => { return this.copy_decl_shape(n as DeclarationNode*); }
@@ -153,8 +151,8 @@ type struct ASTCloner {
             NodeKind::Directive                 => { return this.visit_directive(n as DirectiveNode*); }
             NodeKind::Pattern                   => { return this.clone_pattern(n as Pattern*); }
 
-            // Kinds no node is built with.
-            NodeKind::Expression | NodeKind::AsyncExpression | NodeKind::Unknown => { return null; }
+            // A kind no node is built with.
+            NodeKind::Unknown                   => { return null; }
         }
     }
 
@@ -408,20 +406,32 @@ type struct ASTCloner {
         return c;
     }
 
-    visit_sizeof(mut &this, node: SizeofExprNode*) -> ASTNode* {
-        mut c: SizeofExprNode* = new SizeofExprNode(
-            this.clone_type_annotation(node.type_ann), node.span);
-        // The operand's type is carried as every decided type is; a copy's
-        // substitution rewrites it with the annotation.
-        c.set_operand_type(node.operand_type);
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_alignof(mut &this, node: AlignofExprNode*) -> ASTNode* {
-        mut c: AlignofExprNode* = new AlignofExprNode(
-            this.clone_type_annotation(node.type_ann), node.span);
-        c.set_operand_type(node.operand_type);
+    /// A copy of an expression whose kind has a payload: the payload copied
+    /// field by field, under a header carrying the original's span and
+    /// error flag.  `Legacy` is built with its own `NodeKind`, which
+    /// `dispatch_node` copied, and answers null.
+    copy_expr_shape(mut &this, node: ExpressionNode*) -> ExpressionNode* {
+        mut c: ExpressionNode* = null;
+        match (node.shape) {
+            // The operand's type is carried as every decided type is; a
+            // copy's substitution rewrites it with the annotation.
+            ExprKind::Alignof(n) => {
+                c = ExpressionNode::of(ExprKind::Alignof(new AlignofExpr {
+                    type_ann:     this.clone_type_annotation(n.type_ann),
+                    operand_type: n.operand_type,
+                }), node.span);
+            }
+            ExprKind::Sizeof(n) => {
+                c = ExpressionNode::of(ExprKind::Sizeof(new SizeofExpr {
+                    type_ann:     this.clone_type_annotation(n.type_ann),
+                    operand_type: n.operand_type,
+                }), node.span);
+            }
+            ExprKind::Typeof(n) => {
+                c = ExpressionNode::typeof_expr(this.clone_expr(n.operand), node.span);
+            }
+            ExprKind::Legacy => { return null; }
+        }
         c.has_error = node.has_error;
         return c;
     }
@@ -563,14 +573,6 @@ type struct ASTCloner {
         c.resolved_trait = node.resolved_trait;
         c.template_method = node.template_method;
         c.member_def = node.member_def;
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_typeof(mut &this, node: TypeofExprNode*) -> ASTNode* {
-        mut c: TypeofExprNode* = new TypeofExprNode(
-            this.clone_expr(node.operand), node.span
-        );
         c.has_error = node.has_error;
         return c;
     }

@@ -25,11 +25,11 @@ import compiler::ast::declaration::{
     StructDecl, TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
-    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, IdentifierNode, IfExprNode,
-    LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
-    ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode, StructLiteralNode,
-    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
+    AlignofExpr, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    CallExprNode, CastExprNode, DeleteExprNode, ExprKind, ExpressionNode, IdentifierNode,
+    IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
+    ScopeResolutionNode, SizeofExpr, StaticMatchExprNode, StructLiteralNode,
+    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExpr, UnaryExprNode,
     YieldExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -59,8 +59,6 @@ type trait Walk {
             NodeKind::StaticMatchExpression     => { this.walk_static_match_expr(n as StaticMatchExprNode*); }
             NodeKind::CallExpression            => { this.walk_call(n as CallExprNode*); }
             NodeKind::NewExpression             => { this.walk_new(n as NewExprNode*); }
-            NodeKind::SizeofExpression          => { this.walk_sizeof(n as SizeofExprNode*); }
-            NodeKind::AlignofExpression         => { this.walk_alignof(n as AlignofExprNode*); }
             NodeKind::CastExpression            => { this.walk_cast(n as CastExprNode*); }
             NodeKind::StructLiteral             => { this.walk_struct_literal(n as StructLiteralNode*); }
             NodeKind::ArrayLiteral              => { this.walk_array_literal(n as ArrayLiteralNode*); }
@@ -69,12 +67,12 @@ type trait Walk {
             NodeKind::ArrayAccess               => { this.walk_array_access(n as ArrayAccessNode*); }
             NodeKind::MemberAccess              => { this.walk_member_access(n as MemberAccessNode*); }
             NodeKind::ScopeResolution           => { this.walk_scope_resolution(n as ScopeResolutionNode*); }
-            NodeKind::TypeofExpression          => { this.walk_typeof(n as TypeofExprNode*); }
             NodeKind::DeleteExpression          => { this.walk_delete(n as DeleteExprNode*); }
             NodeKind::AwaitExpression           => { this.walk_await(n as AwaitExprNode*); }
             NodeKind::YieldExpression           => { this.walk_yield(n as YieldExprNode*); }
             NodeKind::TryExpression             => { this.walk_try(n as TryExprNode*); }
 
+            NodeKind::Expression                => { this.walk_expr_shape(n as ExpressionNode*); }
             NodeKind::Statement                 => { this.walk_stmt(n as Stmt*); }
 
             NodeKind::Declaration               => { this.walk_decl_shape(n as DeclarationNode*); }
@@ -85,14 +83,23 @@ type trait Walk {
             NodeKind::Directive                 => { this.walk_directive(n as DirectiveNode*); }
             NodeKind::Pattern                   => { this.walk_pattern(n as Pattern*); }
 
-            // Category and placeholder kinds that no node is built with.
-            NodeKind::Expression               => { }
-            NodeKind::AsyncExpression           => { }
+            // A placeholder kind that no node is built with.
             NodeKind::Unknown                   => { }
         }
     }
 
     walk_expr(mut &this, e: ExpressionNode*) -> void { this.walk_node(e as ASTNode*); }
+
+    /// An expression whose kind has a payload, dispatched on its kind.
+    walk_expr_shape(mut &this, e: ExpressionNode*) -> void {
+        match (e.shape) {
+            ExprKind::Alignof(n) => { this.walk_alignof(e, n); }
+            ExprKind::Sizeof(n)  => { this.walk_sizeof(e, n); }
+            ExprKind::Typeof(n)  => { this.walk_typeof(e, n); }
+            // Built with its own `NodeKind`, which `walk_node` dispatched.
+            ExprKind::Legacy     => { }
+        }
+    }
     /// A statement, dispatched on its kind; nothing for `null`.
     walk_stmt(mut &this, s: Stmt*) -> void {
         if (s == null) { return; }
@@ -156,8 +163,8 @@ type trait Walk {
     }
     walk_call(mut &this, n: CallExprNode*) -> void { CallExprNode::walk_children(n, this); }
     walk_new(mut &this, n: NewExprNode*) -> void { NewExprNode::walk_children(n, this); }
-    walk_sizeof(mut &this, n: SizeofExprNode*) -> void { }
-    walk_alignof(mut &this, n: AlignofExprNode*) -> void { }
+    walk_sizeof(mut &this, e: ExpressionNode*, n: SizeofExpr*) -> void { }
+    walk_alignof(mut &this, e: ExpressionNode*, n: AlignofExpr*) -> void { }
     walk_cast(mut &this, n: CastExprNode*) -> void { CastExprNode::walk_children(n, this); }
     walk_struct_literal(mut &this, n: StructLiteralNode*) -> void {
         StructLiteralNode::walk_children(n, this);
@@ -176,7 +183,7 @@ type trait Walk {
         MemberAccessNode::walk_children(n, this);
     }
     walk_scope_resolution(mut &this, n: ScopeResolutionNode*) -> void { }
-    walk_typeof(mut &this, n: TypeofExprNode*) -> void { TypeofExprNode::walk_children(n, this); }
+    walk_typeof(mut &this, e: ExpressionNode*, n: TypeofExpr*) -> void { TypeofExpr::walk_children(n, this); }
     walk_delete(mut &this, n: DeleteExprNode*) -> void { DeleteExprNode::walk_children(n, this); }
     walk_await(mut &this, n: AwaitExprNode*) -> void { AwaitExprNode::walk_children(n, this); }
     walk_yield(mut &this, n: YieldExprNode*) -> void { YieldExprNode::walk_children(n, this); }
@@ -365,12 +372,6 @@ implement class ArrayAccessNode {
 implement class MemberAccessNode {
     static walk_children<V>(n: MemberAccessNode*, v: mut &V) -> void where V: Walk {
         v.walk_expr(n.object);
-    }
-}
-
-implement class TypeofExprNode {
-    static walk_children<V>(n: TypeofExprNode*, v: mut &V) -> void where V: Walk {
-        v.walk_expr(n.operand);
     }
 }
 
