@@ -3004,6 +3004,43 @@ type struct TypeResolutionPasses {
     /// Resolves function parameter types and return types for all top-level
     /// and method declarations.  Makes function signatures available for
     /// template registration and later type checking.
+    /// Record the target of every non-generic alias the module declares,
+    /// before anything resolves an annotation naming one.  Until its target
+    /// is recorded an alias resolves to itself, so a parameter or return
+    /// type written as an alias would keep the alias type - which is no
+    /// function to call and takes no operator - while a local's annotation,
+    /// resolved later, is the target.  Returns how many were recorded.
+    static alias_targets(runner: TypeResolutionRunner*, root: ProgramNode*, ctx: CompilationContext*,
+                         resolver: TypeResolver*) -> i64 {
+        mut alias_count: i64 = 0;
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            const node: TypeAliasDecl* = DeclarationNode::alias_of(stmt);
+            if (node == null) { continue; }
+            // A generic alias is resolved when it is instantiated.
+            if (node.is_generic()) { continue; }
+            if (node.target_annotation == null || node.has_resolved_target()) { continue; }
+            const target: TypeRef = resolver.resolve(node.target_annotation, &runner.res_ctx);
+            if (!target.is_valid()) {
+                runner.emit_undefined_type(node.target_annotation,
+                    "target type", ctx.resolve_str(node.alias_name), stmt.span);
+                continue;
+            }
+            node.resolved_target = target;
+            const alias_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/alias target");
+            if (alias_ref.is_valid()) {
+                const alias_ty: Type* = runner.arena.lookup(alias_ref);
+                if (alias_ty != null && alias_ty.kind == TypeKind::TypeAlias) {
+                    const alias_obj: TypeAliasType* = alias_ty.as_alias();
+                    alias_obj.set_target(target);
+                }
+            }
+            alias_count++;
+        }
+        return alias_count;
+    }
+
     static run_function_signature(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
@@ -3029,6 +3066,10 @@ type struct TypeResolutionPasses {
         }
 
         mut runner: TypeResolutionRunner = TypeResolutionRunner::new(ctx);
+        const alias_count: i64 = TypeResolutionPasses::alias_targets(&runner, root, ctx, resolver);
+        if (ctx.options.verbose) {
+            cdebug("[FunctionSignature] Resolved %lld type aliases\n", alias_count);
+        }
         mut sig_count: i64 = 0;
 
         // Track resolved free-function signatures within this module to
@@ -3298,7 +3339,8 @@ type struct TypeResolutionPasses {
     // Pass 2: TypeResolution (order 9)
 
     /// Resolves ALL remaining type annotations in the AST.
-    /// Phase 1: Type aliases
+    /// Phase 1, the alias targets, runs at the start of the signature pass
+    /// (`alias_targets`).
     /// Phase 2: Struct/class field types
     /// Phase 3: Variable and expression types in function bodies
     /// Phase 4: Register declarations in the DeclarationIndex
@@ -3323,43 +3365,6 @@ type struct TypeResolutionPasses {
         }
 
         mut runner: TypeResolutionRunner = TypeResolutionRunner::new(ctx);
-
-        // -- Phase 1: Type alias resolution ----------------------------------
-        mut alias_count: i64 = 0;
-        for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
-            if (stmt == null) { continue; }
-
-            const node: TypeAliasDecl* = DeclarationNode::alias_of(stmt);
-            if (node != null) {
-                // Skip generic aliases; resolved during instantiation
-                if (node.is_generic()) { continue; }
-
-                if (node.target_annotation != null && !node.has_resolved_target()) {
-                    const target: TypeRef = resolver.resolve(node.target_annotation, &runner.res_ctx);
-                    if (target.is_valid()) {
-                        node.resolved_target = target;
-                        // Update the TypeAliasType in the arena with the resolved target
-                        const alias_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/alias target");
-                        if (alias_ref.is_valid()) {
-                            const alias_ty: Type* = runner.arena.lookup(alias_ref);
-                            if (alias_ty != null && alias_ty.kind == TypeKind::TypeAlias) {
-                                const alias_obj: TypeAliasType* = alias_ty.as_alias();
-                                alias_obj.set_target(target);
-                            }
-                        }
-                        alias_count++;
-                    } else {
-                        runner.emit_undefined_type(node.target_annotation,
-                            "target type", ctx.resolve_str(node.alias_name), stmt.span);
-                    }
-                }
-            }
-        }
-
-        if (ctx.options.verbose) {
-            cdebug("[TypeResolution] Phase 1: Resolved %lld type aliases\n", alias_count);
-        }
 
         // -- Phase 2: Declaration field types --------------------------------
         mut field_count: i64 = 0;

@@ -601,6 +601,8 @@ type StringResult<T> = Result<T, string>;
 type Callback        = (int) -> void;
 ```
 
+A function's parameter and return types written as aliases are the types they name, as everywhere else: a parameter `cb: Callback` is called as a function, and a call returning `Byte` takes the operators of `u8`. So two overloads whose parameters differ only by an alias and its target, `pick(x: u8)` and `pick(x: Byte)`, have one signature, and the second is a redefinition (`E0206`).
+
 A path through an alias names what the same path through its target names, type arguments included: with `type PI = Pl<i32>;`, `PI::plain(8)` is `Pl::<i32>::plain(8)`, and with `type Hue = Color;`, `Hue::Green` is `Color::Green`. An alias of an alias is followed. An alias with no parameters of its own fixes its target's arguments, so arguments written on it, `PI::<u8>::size()`, are too many and refused (`E0307`); a path with other arguments is written through the target, `Pl::<u8>::size()`. An alias of a type that is no named type (`Callback`) names no path. A path through an alias with parameters of its own, `StringResult::<i32>::Ok(1)` or `StringResult::Ok(1)`, is refused where it is written (`E0233`); the path is written through the type the alias names. So is a struct literal through one: with `type Keyed<T> = Pair<T, i64>;`, `Keyed::<boolean> { ... }` and `Keyed { ... }` are refused (`E0233`) and the literal is written `Pair::<boolean, i64> { ... }`, while a non-generic alias's literal, `Fixed { ... }` with `type Fixed = Pair<boolean, i64>;`, builds its target. Such an alias is a type like any other.
 
 ### 2.9 Casting with `as`

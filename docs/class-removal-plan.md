@@ -1511,11 +1511,11 @@ committed with the change and deleted in the next commit.
   an alias is.  The other two share one cause: every module's signatures
   are resolved before any alias target is recorded (type resolution's
   first phase), so a parameter or return type written as an alias keeps
-  the alias, which no call or operator looks through.  Resolving the
-  targets first thing in the signature pass fixes both and moves no
-  object, but refuses (E0206) two overloads that differ only by an alias
-  and its target, which build today, the alias one unreachable; it waits
-  for Jake.
+  the alias, which no call or operator looks through.  The targets are
+  now recorded first thing in the signature pass
+  (`TypeResolutionPasses::alias_targets`), which fixes both and moves no
+  object; two overloads that differ only by an alias and its target are
+  one signature and refused (E0206).
 - `Field(FieldDecl*)` followed.  A struct's, union's or class's `fields`
   hold the headers (`[DeclarationNode*]`), read through
   `DeclarationNode::field_of`, the projection `variant_of` is for a
