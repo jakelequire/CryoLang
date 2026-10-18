@@ -2571,13 +2571,28 @@ type struct CallResolver {
             if (!this.types.arg_type_is_concrete(arg_ty))   { continue; }
             if (!this.types.arg_type_is_concrete(param_ty)) { continue; }
             const compat: TypeCompatibility = this.checker.check_compatibility(arg_ty, param_ty);
-            if (compat == TypeCompatibility::Incompatible) {
+            if (compat == TypeCompatibility::Incompatible || this.pointer_needs_cast(arg_ty, param_ty, compat)) {
                 if (this.types.indirection_compatible(arg_ty, param_ty)) { continue; }
                 if (this.types.enum_int_compatible(arg_ty, param_ty)) { continue; }
                 return false;
             }
         }
         return true;
+    }
+
+    /// Whether an argument of pointer type `arg_ty` reaches the pointer
+    /// parameter `param_ty` only through a cast: a pointer to a different
+    /// pointee that neither `void*`, an upcast nor an assignable pointee
+    /// relates.  A method call binds no such argument, and neither does any
+    /// other call: the callee would read the pointee as a type it is not.
+    /// A `const` dropped from the pointee is not this question, and keeps its
+    /// own diagnosis.
+    pointer_needs_cast(&this, arg_ty: TypeRef, param_ty: TypeRef, compat: TypeCompatibility) -> boolean {
+        if (compat != TypeCompatibility::ExplicitCast) { return false; }
+        if (this.diag.kind_or_void(arg_ty) != TypeKind::Pointer || this.diag.kind_or_void(param_ty) != TypeKind::Pointer) {
+            return false;
+        }
+        return !this.checker.is_const_drop(arg_ty, param_ty);
     }
 
     /// True when a registered `![implicit]` converter bridges `arg_ty -> param_ty`.
@@ -2774,7 +2789,7 @@ type struct CallResolver {
             if (!this.arg_side_judgeable(arg_ty))   { continue; }
             if (!this.arg_side_judgeable(param_ty)) { continue; }
             const compat: TypeCompatibility = this.checker.check_compatibility(arg_ty, param_ty);
-            if (compat == TypeCompatibility::Incompatible) {
+            if (compat == TypeCompatibility::Incompatible || this.pointer_needs_cast(arg_ty, param_ty, compat)) {
                 if (this.types.indirection_compatible(arg_ty, param_ty)) { continue; }
                 if (this.types.enum_int_compatible(arg_ty, param_ty)) { continue; }
                 if (this.try_apply_implicit_conversion(visitor, args, i, arg, arg_ty, param_ty)) { continue; }
@@ -4345,7 +4360,14 @@ type struct CallResolver {
     /// either way an argument can still disagree with its parameter.
     check_generic_free_call_args(mut &this, visitor: SemaVisitor*, call: CallExprNode*,
                                  ident: IdentifierNode*) -> void {
-        const entry: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
+        this.check_function_template_args(visitor, call,
+            this.find_fn_template_for_call(ident, call.arguments.length));
+    }
+
+    /// The arguments of `call` to the function template `entry`, checked
+    /// against its parameters as the call's type arguments instantiate them.
+    check_function_template_args(mut &this, visitor: SemaVisitor*, call: CallExprNode*,
+                                 entry: TemplateEntry*) -> void {
         if (entry == null) { return; }
         const tmpl_decl: DeclarationNode* = DeclarationNode::with_shape(entry.ast_node);
         const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
@@ -8893,8 +8915,7 @@ type struct CallResolver {
                 return;
             }
             overloads = this.ctx.decl_index.lookup_func_type_overloads(FamilyOwner::Type(owner_ty), scope.member_name);
-        }
-        if (overloads.length == 1) {
+        }        if (overloads.length == 1) {
             const ot: Type* = this.arena.lookup(overloads[0]);
             if (ot != null && ot.kind == TypeKind::Function) {
                 const ft: FunctionType* = ot.as_function();
@@ -8935,11 +8956,18 @@ type struct CallResolver {
     /// template's defaults.  A call with no complete stash is not checked here.
     check_template_static_args(mut &this, visitor: SemaVisitor*, scope: ScopeResolutionNode*,
                                call: CallExprNode*) -> void {
+        const tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope);
+        // A generic static method of a non-generic owner is a function
+        // template of its own, and its arguments are a generic free call's.
+        if (tmpl == null) {
+            const owner_def: DefId = this.ctx.decl_index.def_of(this.scope_owner_type(scope), this.ctx.type_arena);
+            this.check_function_template_args(visitor, call, this.static_call_template(owner_def, scope, call));
+            return;
+        }
         const func_decl: DeclarationNode* = this.ctx.decl_index.method_func_of(call.template_method);
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return; }
-        const tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope);
-        if (tmpl == null || tmpl.param_types.length == 0) { return; }
+        if (tmpl.param_types.length == 0) { return; }
         const no_args: [TypeRef] = [];
         mut owner_args: [TypeRef] = [];
         mut method_args: &[TypeRef] = &no_args;

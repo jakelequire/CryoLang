@@ -147,6 +147,38 @@ yet is recorded with the change that builds it, not here.
      matched node a second time inside the arm; the change compiles every
      program to the same output.  (Dispatch, delegated)
 
+440. **A pointer argument is judged the same way at every kind of call.**
+     A free function, a static function, a function reached by its path, a
+     generic one and a class constructor refuse a pointer to a type the
+     parameter's pointer does not convert from without a cast, as a method
+     call does; an `if` or conditional expression with a `null` arm has its
+     other arm's type, so a `null` first arm does not let an unrelated
+     pointer through.  Existing code the check refuses is fixed first, then
+     the check lands, with compile-fail tests proved against the parent.
+
+441. **A function signature sees an alias's target.**  Alias targets are
+     recorded at the start of the signature pass, so a parameter or return
+     type written as an alias is the type it names (a call through a
+     function-type alias, an operator on an alias-typed call result).  Two
+     overloads that differ only by an alias and its target have one
+     signature and are refused (E0206).
+
+442. **A Linux-hosted cross build to windows-gnu links with clang and lld
+     by default,** as the pin does; `CRYO_CC` still overrides the driver.
+
+443. **A thread-local's initializer is static data or it is refused.**
+     First, struct literals nested in a global's initializer (in a struct
+     or an array) fold into static data too; then a `![thread_local]`
+     whose initializer still cannot fold is refused with its own error
+     code.
+
+444. **A struct literal through a generic alias keeps the E0233 wording**
+     ("cannot build a `K` literal: `K` is a generic type alias, and a
+     struct literal through one is not supported").
+
+445. **A struct literal whose type name is refused has the error type,**
+     not `void`, so nothing that uses its value reports a second error.
+
 ### 2026-10-17
 
 405. **A `return` inside an await-free `unsafe` block or `static match`

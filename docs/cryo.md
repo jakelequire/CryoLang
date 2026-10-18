@@ -317,6 +317,8 @@ const pp: int** = &p;          // pointer to pointer
 const v:  void* = malloc(64);  // type-erased
 ```
 
+A pointer converts to another pointer type without a cast only when the pointee is the same type (`T*` to `const T*`, never back), when either side is `void*`, or from a derived class to its base. A pointer to any other type is written with `as`. The rule is the same wherever a value meets a declared type: an initializer, an assignment, a `return`, a struct field, and an argument of every kind of call - a method, a free or static function, a function reached by its path, a generic one and a constructor (`E0214` at an argument, `E0200` elsewhere).
+
 Raw pointers are unchecked. Validity, aliasing, and lifetime are the programmer's responsibility. For a pointer that is statically guaranteed non-null, see `core::ptr::NonNull<T>`. For owned heap allocations, prefer `Box<T>`. See [section 15](#15-pointers-and-memory).
 
 ### 2.3 References
@@ -1140,7 +1142,7 @@ if (x > 0) {
 }
 ```
 
-`if` may also be used as an **expression** that evaluates to the value of the chosen branch. When used this way, both arms are required and must produce the same type.
+`if` may also be used as an **expression** that evaluates to the value of the chosen branch. When used this way, both arms are required and must produce the same type. An arm that is `null` converts to any pointer, so the expression has the other arm's type, whichever arm the `null` is in: `if (c) { null } else { b }` is a `B*` for `b: B*`, and is refused where an unrelated pointer type is declared. The conditional form `c ? x : y` follows the same rule.
 
 ```cryo
 const is_even: boolean = if (n % 2 == 0) { true } else { false };

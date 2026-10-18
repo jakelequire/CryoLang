@@ -1770,12 +1770,12 @@ committed with the change and deleted in the next commit.
   cost until the last kind converts.  Selfhost fixed point on both hosts;
   clean build 0 warnings.
 
-**Expressions: prepared, not started.**  Conversion waits for Jake's
-answer on the unchecked pointer arguments (the type check does not compare
-a pointer argument of a free function, a static function or a class
-constructor with its parameter): an expression payload handed where an
-`ExpressionNode*` is wanted would compile silently there, and expressions
-are handed to static helpers far more often than declarations were.
+**Expressions: prepared, not started.**  The type check now compares a
+pointer argument with its parameter at every kind of call (free, static,
+path-qualified, generic, constructor) and types a `null`-first `if` by its
+other arm, so an expression payload handed where an `ExpressionNode*` is
+wanted is refused rather than compiled silently; the argument and cast
+scans remain for casts, which no check sees.
 
 - **Inventory.**  25 expression classes deriving from `ExpressionNode`, one
   per `NodeKind`, plus `NodeKind::AsyncExpression`, which nothing builds:
