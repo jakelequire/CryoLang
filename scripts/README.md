@@ -31,7 +31,7 @@ one; the history keeps it.
 | script | what it does | called by |
 |---|---|---|
 | `cryo-pin.py` | Copies (and strips) a built compiler into `bin/` and writes its `.pin.txt` sidecar | `make pin` (Linux) |
-| `verify-pin.py` | Each pin's sha256 and stamped commit match its sidecar, and both sidecars name one commit; `--require-clean` for a release; `--selftest` drives the checks through fixtures | `make verify-pin`, `make verify-pin-clean`, `make verify-selftest`, CI, release |
+| `verify-pin.py` | Each pin's sha256 and stamped commit match its sidecar, both sidecars name one commit, and the Windows pin carries no 32-bit base relocation (one over a thread-local's offset faults at run time); `--require-clean` for a release; `--selftest` drives the checks through fixtures | `make verify-pin`, `make verify-pin-clean`, `make verify-selftest`, CI, release |
 | `pin-windows.cmd` | Windows host: re-enters this Makefile inside WSL to run `make pin` | `make pin` (Windows) |
 
 ## Release

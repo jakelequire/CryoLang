@@ -280,6 +280,28 @@ yet is recorded with the change that builds it, not here.
      comparison operator,** not only `==` and `!=`, as built.  (Jake, on
      class-removal session 9's questions)
 
+434. **The Windows pin is linked so that it carries no base relocation
+     over a thread-local's offset,** and a gate scans the built binary for
+     one so the defect cannot come back silently.  Fixed in the pin build,
+     as a change of its own, proven by the gate refusing the old pin and
+     passing the fixed one, and by the fixed pin printing a deliberate
+     panic's report.  (Jake, on class-removal session 10's questions)
+
+435. **`null` and string literals in a global's initializer fold into
+     static data,** so a thread-local initialized by a struct literal holding
+     them is not written by a startup constructor on the main thread only.
+     Whether a thread-local whose initializer still cannot be folded is
+     refused is NOT decided.  (Jake, on class-removal session 10's
+     questions)
+
+436. **The runtime panic entry point is named `__cryo_panic` again** (it was
+     `__cryo_panic_at` while the old symbol lived beside it), through the
+     two-step pin refresh.  (Jake, on class-removal session 10's questions)
+
+437. **The panic report keeps the form `panicked at
+     <file>:<line>:<column> in <function>: <msg>`.**  (Jake, on
+     class-removal session 10's questions)
+
 ### 2026-10-16
 
 379. **A fixed-size array does not convert implicitly to a dynamic `[T]`:**

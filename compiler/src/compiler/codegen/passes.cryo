@@ -226,6 +226,20 @@ type struct CodegenPasses {
     /// here, as it would have been (a linker's warnings).  The log is
     /// removed on success and kept on failure, beside the response file.
     static run_tool(cmd_text: string, log_path_text: string, out: string*) -> i32 {
+        const log_path: string = log_path_text;
+        const rc: i32 = CodegenPasses::capture_tool(cmd_text, log_path_text, out);
+        const text: string = *out;
+        if (rc == 0) {
+            if (text.length() > 0) { fmt::eprintf("%s", text); }
+            dir::remove_file(Path::from(log_path));
+        }
+        return rc;
+    }
+
+    /// Run a toolchain command with its combined output captured to
+    /// `log_path`, and answer its exit code, the output in `*out`.  The log
+    /// is left in place and nothing is printed: the caller decides both.
+    static capture_tool(cmd_text: string, log_path_text: string, out: string*) -> i32 {
         const cmd: string = cmd_text;
         const log_path: string = log_path_text;
         const rc: i32 = Command::shell(fmt::format("%s > %s 2>&1", cmd,
@@ -236,11 +250,22 @@ type struct CodegenPasses {
             Result::Err(_) => { }
         }
         *out = text;
-        if (rc == 0) {
-            if (text.length() > 0) { fmt::eprintf("%s", text); }
-            dir::remove_file(Path::from(log_path));
-        }
         return rc;
+    }
+
+    /// Whether the link driver's toolchain takes its unwinder from libgcc:
+    /// the driver resolves `libgcc_eh.a` to a path (`-print-file-name` echoes
+    /// the bare name back when the file is not in its search dirs).  A
+    /// toolchain without it unwinds through LLVM's libunwind instead.  The
+    /// probe's output goes to `log_path`, which is removed afterwards.
+    static unwinds_with_libgcc(driver_text: string, log_path_text: string) -> boolean {
+        const driver: string = driver_text;
+        mut out: string = "";
+        const rc: i32 = CodegenPasses::capture_tool(
+            fmt::format("%s -print-file-name=libgcc_eh.a", driver), log_path_text, &out);
+        dir::remove_file(Path::from(log_path_text));
+        const answer: string = out;
+        return rc == 0 && (answer.contains("/") || answer.contains("\\"));
     }
 
     /// The error for a toolchain command that failed: what ran, where its
@@ -323,7 +348,8 @@ type struct CodegenPasses {
     /// benefit (identical ABI).  An LLVM-libunwind / freestanding combination
     /// that needs an explicit unwinder is a follow-up (a `[link]`-config knob).
     static append_hosted_runtime_libs(ctx: CompilationContext*, cmd_text: string,
-                                      triple_text: string) -> string {
+                                      triple_text: string, driver_text: string,
+                                      probe_log_text: string) -> string {
         const cmd: string = cmd_text;
         const triple: string = triple_text;
         const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple_text, true);
@@ -339,38 +365,32 @@ type struct CodegenPasses {
         };
         out = fmt::format("%s %s", out, CodegenPasses::link_quote(
             fmt::format("%s/%s", lib_dir, archive)));
-        // Windows resolves the `_Unwind_*` ABI through LLVM's libunwind rather
-        // than libgcc_s, and the mingw clang driver links it SHARED whenever the
-        // toolchain ships `libunwind.dll.a` - which makes every binary we emit
-        // carry a runtime `libunwind.dll` import.  That is wrong twice over: a
-        // shipped `cryo.exe` would need a loose DLL beside it, and any stage of
-        // the self-host chain that runs a freshly linked compiler dies before
-        // main with STATUS_DLL_NOT_FOUND (c0000135) and an empty log.  Take the
-        // static `libunwind.a` instead: `--unwindlib=none` stops the driver
-        // adding its own shared one, and the `-Bstatic`/`-Bdynamic` bracket
-        // pins OUR `-lunwind` to the archive while leaving every other library
-        // (kernel32, ntdll, the CRT) dynamic.  `-lunwind` stays un-pathed so it
-        // resolves from the active toolchain's own lib dir.
+        // A windows toolchain built on LLVM's runtimes (llvm-mingw) resolves the
+        // `_Unwind_*` ABI through libunwind, and its clang driver links that
+        // SHARED whenever the toolchain ships `libunwind.dll.a` - which makes
+        // every binary we emit carry a runtime `libunwind.dll` import.  That is
+        // wrong twice over: a shipped `cryo.exe` would need a loose DLL beside
+        // it, and any stage of the self-host chain that runs a freshly linked
+        // compiler dies before main with STATUS_DLL_NOT_FOUND (c0000135) and an
+        // empty log.  Take the static `libunwind.a` instead: `--unwindlib=none`
+        // stops the driver adding its own shared one, and the
+        // `-Bstatic`/`-Bdynamic` bracket pins OUR `-lunwind` to the archive
+        // while leaving every other library (kernel32, ntdll, the CRT) dynamic.
+        // `-lunwind` stays un-pathed so it resolves from the active toolchain's
+        // own lib dir.
         //
         // Scoped to windows on purpose: a hosted glibc link must NOT gain an
         // explicit `-lunwind` (see this function's contract above) - such hosts
         // ship `libunwind.so.8` with no `.so` dev symlink and the link fails.
         //
-        // Scoped to a CLANG driver too, and that is not cosmetic: the default
-        // windows-gnu driver is `x86_64-w64-mingw32-gcc`, which resolves
-        // `_Unwind_*` from its own libgcc, ships no libunwind to link, and
-        // rejects `--unwindlib` outright ("unrecognized command line option").
-        // Adding these unconditionally turns a working mingw-gcc cross-link
-        // into a hard failure.  Resolved through `pick_link_driver` with the
-        // same default the windows link config uses, so this sees exactly the
-        // driver the command was built with - including a `CRYO_CC` override,
-        // which is how the self-host chain selects llvm-mingw's clang.
-        if (triple.contains("windows")) {
-            const driver: string =
-                CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc");
-            if (driver.contains("clang")) {
-                out = fmt::format("%s --unwindlib=none -Wl,-Bstatic -lunwind -Wl,-Bdynamic", out);
-            }
+        // Scoped to a toolchain WITHOUT libgcc's unwinder too, and asked of the
+        // toolchain rather than read off the driver's name: a mingw-w64 gcc, or
+        // a clang driving the same gcc sysroot, resolves `_Unwind_*` from
+        // `libgcc_eh`, ships no libunwind to link, and a gcc driver rejects
+        // `--unwindlib` outright ("unrecognized command line option").
+        if (triple.contains("windows")
+                && !CodegenPasses::unwinds_with_libgcc(driver_text, probe_log_text)) {
+            out = fmt::format("%s --unwindlib=none -Wl,-Bstatic -lunwind -Wl,-Bdynamic", out);
         }
         if (ctx.options.static_link) {
             return out;
@@ -1720,7 +1740,8 @@ type struct CodegenPasses {
         if (cfg.no_runtime) {
             cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, effective_triple);
         } else {
-            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, effective_triple);
+            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, effective_triple,
+                link_cfg.driver, fmt::format("%s.probe", link_rsp_path));
         }
         // Cryo runtime support is fully inline-lowered: every intrinsic
         // with a kind (ptr_diff, fpclass, atomic_*, dirent_*, ...) is
@@ -1884,7 +1905,8 @@ type struct CodegenPasses {
         if (ctx.options.freestanding()) {
             cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, raw_triple);
         } else {
-            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, raw_triple);
+            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, raw_triple,
+                link_cfg.driver, fmt::format("%s.probe", link_rsp_path));
             cmd = fmt::format("%s %s", cmd, link_cfg.extra_system_libs);
         }
 
