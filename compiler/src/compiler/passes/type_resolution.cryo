@@ -52,7 +52,7 @@ import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDecl, EnumDecl,
     EnumVariant, FieldDecl, FunctionDeclNode, GenericParamDecl,
     DeclKind, ImplBlock, MethodNode, StructDecl,
-    TraitDecl, TypeAliasDecl, UnionDecl, VarDeclNode
+    TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     AlignofExprNode, ArrayAccessNode, BinaryExprNode, CallExprNode, CastExprNode,
@@ -448,11 +448,11 @@ type struct TypeResolutionRunner {
             return;
         }
 
-        const trecv: VarDeclNode* = TypeResolutionRunner::receiver_of(tm);
-        const frecv: VarDeclNode* = TypeResolutionRunner::receiver_of(f);
+        const trecv: DeclarationNode* = TypeResolutionRunner::receiver_of(tm);
+        const frecv: DeclarationNode* = TypeResolutionRunner::receiver_of(f);
         if (trecv != null && frecv != null) {
-            const tform: string = TypeResolutionRunner::receiver_spelling(trecv);
-            const fform: string = TypeResolutionRunner::receiver_spelling(frecv);
+            const tform: string = TypeResolutionRunner::receiver_spelling(DeclarationNode::var_of(trecv));
+            const fform: string = TypeResolutionRunner::receiver_spelling(DeclarationNode::var_of(frecv));
             if (!tform.equals(fform)) {
                 this.report_conformance(frecv.span,
                     fmt::format("`%s` takes `%s` in trait `%s`, but `%s` here", name, tform, trait_name, fform));
@@ -469,10 +469,11 @@ type struct TypeResolutionRunner {
             return;
         }
         for (mut pi: i64 = 0; pi < tcount; pi++) {
-            const tp: VarDeclNode* = TypeResolutionRunner::value_param_at(tm, pi);
-            const fp: VarDeclNode* = TypeResolutionRunner::value_param_at(f, pi);
+            const tp: VarDecl* = DeclarationNode::var_of(TypeResolutionRunner::value_param_at(tm, pi));
+            const fp_decl: DeclarationNode* = TypeResolutionRunner::value_param_at(f, pi);
+            const fp: VarDecl* = DeclarationNode::var_of(fp_decl);
             if (this.same_type(tp.resolved_type, fp.resolved_type, terms, true)) { continue; }
-            this.report_conformance(fp.span,
+            this.report_conformance(fp_decl.span,
                 fmt::format("parameter %lld of `%s` is `%s` in trait `%s`, but `%s` here",
                     pi + 1, name, this.shown_type(tp.resolved_type), trait_name,
                     this.shown_type(fp.resolved_type)));
@@ -612,10 +613,11 @@ type struct TypeResolutionRunner {
         return if (t != null) { this.arena.format_display(t) } else { "?" };
     }
 
-    static receiver_of(f: FunctionDeclNode*) -> VarDeclNode* {
+    static receiver_of(f: FunctionDeclNode*) -> DeclarationNode* {
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
-            const p: VarDeclNode* = f.parameters[i];
-            if (p != null && p.is_receiver()) { return p; }
+            const p_decl: DeclarationNode* = f.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
+            if (p != null && p.is_receiver()) { return p_decl; }
         }
         return null;
     }
@@ -623,26 +625,28 @@ type struct TypeResolutionRunner {
     static value_param_count(f: FunctionDeclNode*) -> i64 {
         mut n: i64 = 0;
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
-            const p: VarDeclNode* = f.parameters[i];
+            const p_decl: DeclarationNode* = f.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p != null && !p.is_receiver()) { n += 1; }
         }
         return n;
     }
 
     /// The `k`-th parameter after the receiver.
-    static value_param_at(f: FunctionDeclNode*, k: i64) -> VarDeclNode* {
+    static value_param_at(f: FunctionDeclNode*, k: i64) -> DeclarationNode* {
         mut n: i64 = 0;
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
-            const p: VarDeclNode* = f.parameters[i];
+            const p_decl: DeclarationNode* = f.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null || p.is_receiver()) { continue; }
-            if (n == k) { return p; }
+            if (n == k) { return p_decl; }
             n += 1;
         }
         return null;
     }
 
     /// The receiver as written: `this`, `&this` or `mut &this`.
-    static receiver_spelling(p: VarDeclNode*) -> string {
+    static receiver_spelling(p: VarDecl*) -> string {
         if (p.is_value_receiver()) { return "this"; }
         return if (p.is_mutable) { "mut &this" } else { "&this" };
     }
@@ -676,11 +680,12 @@ type struct TypeResolutionRunner {
     /// (`cit::NAME`), any other the writing module's.  A global with a
     /// written type is registered by type resolution; one whose type is its
     /// initializer's, by sema once the initializer is typed.
-    static register_module_global(ctx: CompilationContext*, var_node: VarDeclNode*) -> void {
+    static register_module_global(ctx: CompilationContext*, decl: DeclarationNode*,
+                                  var_node: VarDecl*) -> void {
         const gmod_sym: SymbolStr = ctx.intern(ctx.source_file);
         mut g_ns: ModulePath = ModulePath::none();
         const g_key: SymbolStr = ctx.decl_global_key(
-            var_node.name, var_node.binding_namespace, var_node.span.file, &g_ns);
+            var_node.name, var_node.binding_namespace, decl.span.file, &g_ns);
         ctx.decl_index.register_global(
             var_node.def, g_key, var_node.resolved_type, gmod_sym, g_ns,
             var_node.is_thread_local);
@@ -692,7 +697,7 @@ type struct TypeResolutionRunner {
     /// its declared name.  A no-op for a global Cryo defines, which is mangled
     /// under its namespace.  The directive pass runs after this and re-records
     /// the override on the same slot.
-    static record_extern_symbol(ctx: CompilationContext*, node: VarDeclNode*) -> void {
+    static record_extern_symbol(ctx: CompilationContext*, node: VarDecl*) -> void {
         if (!node.is_extern_import) { return; }
         const sym: SymbolStr = if (node.link_name.length() > 0) {
             ctx.intern(node.link_name)
@@ -756,7 +761,8 @@ type struct TypeResolutionRunner {
         // Sema reads param types directly from the AST node (param.resolved_type)
         // via enter_function() -> declare().
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const param: VarDeclNode* = func.parameters[i];
+            const param_decl: DeclarationNode* = func.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null) { continue; }
             if (param.type_annotation != null && !param.resolved_type.is_valid()) {
                 // The receiver is not a written annotation and has no import
@@ -767,7 +773,7 @@ type struct TypeResolutionRunner {
                 // header rather than anything the author can act on.
                 if (param.is_receiver()) { continue; }
                 this.emit_undefined_type(param.type_annotation,
-                    "type", this.ctx.resolve_str(param.name), param.span);
+                    "type", this.ctx.resolve_str(param.name), param_decl.span);
             }
         }
     }
@@ -872,7 +878,7 @@ type struct TypeResolutionRunner {
 
     // Recursive statement walker for variable/expression types
 
-    /// Recursively walks a statement, resolving VarDeclNode.type_annotation and
+    /// Recursively walks a statement, resolving VarDecl.type_annotation and
     /// CastExprNode.target_annotation within function bodies.  `stmt` is a
     /// statement, or a for-loop's initializer.
     resolve_var_types_in_statement(&this, stmt: ASTNode*,
@@ -883,11 +889,12 @@ type struct TypeResolutionRunner {
             NodeKind::Statement => {
                 this.resolve_var_types_in_stmt(stmt as Stmt*, res_ctx);
             }
-            NodeKind::VariableDeclaration => {
-                // Raw VarDeclNode (not wrapped in DeclStmt): produced by
+            NodeKind::Declaration => {
+                // Raw VarDecl (not wrapped in DeclStmt): produced by
                 // the parser for C-style for-loop initializers: for (mut i: int = 0; ...)
-                const var_node: VarDeclNode* = stmt as VarDeclNode*;
-                if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
+                const var_node: VarDecl* = DeclarationNode::var_of(stmt);
+                if (var_node != null && var_node.type_annotation != null
+                        && !var_node.resolved_type.is_valid()) {
                     const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
                     if (vtype.is_valid()) {
                         var_node.resolved_type = vtype;
@@ -916,8 +923,8 @@ type struct TypeResolutionRunner {
             StmtKind::Decl(decl_stmt) => {
                 if (decl_stmt.declaration != null) {
                     const decl: DeclarationNode* = decl_stmt.declaration;
-                    if (decl.kind == NodeKind::VariableDeclaration) {
-                        const var_node: VarDeclNode* = decl as VarDeclNode*;
+                    if (DeclarationNode::var_of(decl) != null) {
+                        const var_node: VarDecl* = DeclarationNode::var_of(decl);
                         if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
                             const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
                             if (vtype.is_valid()) {
@@ -1086,7 +1093,8 @@ type struct TypeResolutionRunner {
                 const lam: LambdaExprNode* = expr as LambdaExprNode*;
                 // Resolve each parameter's type annotation into resolved_type.
                 for (mut li: i64 = 0; li < lam.parameters.length; li++) {
-                    const lp: VarDeclNode* = lam.parameters[li];
+                    const lp_decl: DeclarationNode* = lam.parameters[li];
+                    const lp: VarDecl* = DeclarationNode::var_of(lp_decl);
                     if (lp != null && lp.type_annotation != null && !lp.resolved_type.is_valid()) {
                         const ptype: TypeRef = this.resolver.resolve(lp.type_annotation, res_ctx);
                         if (ptype.is_valid()) {
@@ -1134,8 +1142,8 @@ type struct TypeResolutionRunner {
             StmtKind::Decl(ds) => {
                 if (ds.declaration != null) {
                     const decl_node: ASTNode* = ds.declaration as ASTNode*;
-                    if (decl_node.kind == NodeKind::VariableDeclaration) {
-                        const var_node: VarDeclNode* = ds.declaration as VarDeclNode*;
+                    if (DeclarationNode::var_of(decl_node) != null) {
+                        const var_node: VarDecl* = DeclarationNode::var_of(ds.declaration);
                         if (var_node.has_initializer()) {
                             this.collect_generic_fn_calls_in_expr(var_node.initializer, res_ctx);
                         }
@@ -1398,7 +1406,7 @@ type struct TypeResolutionPasses {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => { }
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => { }
                     }
                 }
                 _ => { }
@@ -1423,7 +1431,8 @@ type struct TypeResolutionPasses {
                     // Collect resolved param types from AST
                     mut param_types: [TypeRef] = [];
                     for (mut p: i64 = 0; p < func.parameters.length; p++) {
-                        const param: VarDeclNode* = func.parameters[p];
+                        const param_decl: DeclarationNode* = func.parameters[p];
+                        const param: VarDecl* = DeclarationNode::var_of(param_decl);
                         if (param != null && param.resolved_type.is_valid()) {
                             param_types.push(param.resolved_type);
                         }
@@ -1489,7 +1498,7 @@ type struct TypeResolutionPasses {
                     DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                     | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                     | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                    | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
                 }
             }
             _ => {}
@@ -1862,7 +1871,8 @@ type struct TypeResolutionPasses {
             }
         }
         for (mut p: i64 = 0; p < cloned.parameters.length; p++) {
-            const param: VarDeclNode* = cloned.parameters[p];
+            const param_decl: DeclarationNode* = cloned.parameters[p];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param != null && param.type_annotation != null) {
                 TypeResolutionPasses::rewrite_this_type_annotation(
                     param.type_annotation, target, target_args, home_span, home_res);
@@ -2676,7 +2686,8 @@ type struct TypeResolutionPasses {
             const fn_node: FunctionDeclNode* = mnode.func;
             mut ptypes: [TypeRef] = [];
             for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
-                const pp: VarDeclNode* = fn_node.parameters[pi];
+                const pp_decl: DeclarationNode* = fn_node.parameters[pi];
+                const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
                 if (pp == null) { continue; }
                 if (pp.is_receiver()) { continue; }
                 ptypes.push(pp.resolved_type);
@@ -2727,7 +2738,8 @@ type struct TypeResolutionPasses {
             const fn_node: FunctionDeclNode* = mnode.func;
             mut ptypes: [TypeRef] = [];
             for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
-                const pp: VarDeclNode* = fn_node.parameters[pi];
+                const pp_decl: DeclarationNode* = fn_node.parameters[pi];
+                const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
                 if (pp == null) { continue; }
                 if (pp.is_receiver()) { continue; }
                 ptypes.push(pp.resolved_type);
@@ -2814,7 +2826,8 @@ type struct TypeResolutionPasses {
             const fn_node: FunctionDeclNode* = mnode.func;
             mut ptypes: [TypeRef] = [];
             for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
-                const pp: VarDeclNode* = fn_node.parameters[pi];
+                const pp_decl: DeclarationNode* = fn_node.parameters[pi];
+                const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
                 if (pp == null) { continue; }
                 if (pp.is_receiver()) { continue; }
                 ptypes.push(pp.resolved_type);
@@ -2936,7 +2949,8 @@ type struct TypeResolutionPasses {
                 if (tfunc == null) { continue; }
                 mut param_types: [TypeRef] = [];
                 for (mut p: i64 = 0; p < tfunc.parameters.length; p++) {
-                    const param: VarDeclNode* = tfunc.parameters[p];
+                    const param_decl: DeclarationNode* = tfunc.parameters[p];
+                    const param: VarDecl* = DeclarationNode::var_of(param_decl);
                     if (param == null) { continue; }
                     if (param.is_receiver()) { continue; }
                     if (param.resolved_type.is_valid()) {
@@ -3008,7 +3022,8 @@ type struct TypeResolutionPasses {
                     if (func.resolved_return_type.is_valid()) {
                         mut fparams: [TypeRef] = [];
                         for (mut p: i64 = 0; p < func.parameters.length; p++) {
-                            const fp: VarDeclNode* = func.parameters[p];
+                            const fp_decl: DeclarationNode* = func.parameters[p];
+                            const fp: VarDecl* = DeclarationNode::var_of(fp_decl);
                             if (fp != null && fp.resolved_type.is_valid()) {
                                 fparams.push(fp.resolved_type);
                             }
@@ -3067,7 +3082,8 @@ type struct TypeResolutionPasses {
                                     // Collect resolved param types
                                     mut ext_params: [TypeRef] = [];
                                     for (mut p: i64 = 0; p < fn_node.parameters.length; p++) {
-                                        const param: VarDeclNode* = fn_node.parameters[p];
+                                        const param_decl: DeclarationNode* = fn_node.parameters[p];
+                                        const param: VarDecl* = DeclarationNode::var_of(param_decl);
                                         if (param != null && param.resolved_type.is_valid()) {
                                             ext_params.push(param.resolved_type);
                                         }
@@ -3170,7 +3186,8 @@ type struct TypeResolutionPasses {
                         DeclKind::Intrinsic(node) => {
                             // Resolve parameter types
                             for (mut j: i64 = 0; j < node.parameters.length; j++) {
-                                const param: VarDeclNode* = node.parameters[j];
+                                const param_decl: DeclarationNode* = node.parameters[j];
+                                const param: VarDecl* = DeclarationNode::var_of(param_decl);
                                 if (param != null && param.type_annotation != null &&
                                     !param.resolved_type.is_valid()) {
                                     const ptype: TypeRef = resolver.resolve(param.type_annotation, &runner.res_ctx);
@@ -3191,7 +3208,8 @@ type struct TypeResolutionPasses {
                                 // Build FunctionType for full signature.
                                 mut i_param_types: [TypeRef] = [];
                                 for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
-                                    const ip: VarDeclNode* = node.parameters[pi];
+                                    const ip_decl: DeclarationNode* = node.parameters[pi];
+                                    const ip: VarDecl* = DeclarationNode::var_of(ip_decl);
                                     if (ip.resolved_type.is_valid()) {
                                         i_param_types.push(ip.resolved_type);
                                     }
@@ -3226,7 +3244,8 @@ type struct TypeResolutionPasses {
                         }
                         DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Variant(_)
                         | DeclKind::Destructure(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
-                        | DeclKind::GenericParam(_) | DeclKind::Enum(_) | DeclKind::Legacy => {}
+                        | DeclKind::GenericParam(_) | DeclKind::Enum(_) | DeclKind::Variable(_)
+                        | DeclKind::Legacy => {}
                     }
                 }
                 _ => {
@@ -3401,7 +3420,7 @@ type struct TypeResolutionPasses {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {
@@ -3526,7 +3545,7 @@ type struct TypeResolutionPasses {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                        | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -3598,7 +3617,7 @@ type struct TypeResolutionPasses {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -3614,27 +3633,25 @@ type struct TypeResolutionPasses {
             // Register in DeclarationIndex (shared logic with Specialization).
             TypeResolutionPasses::register_decl_in_index(stmt, ctx, true);
 
-            match (stmt.kind) {
-                NodeKind::VariableDeclaration => {
-                    // Phase 4-specific: resolve and register top-level global variables
-                    const var_node: VarDeclNode* = stmt as VarDeclNode*;
-                    // A module-level initializer is folded to the constant that
-                    // is emitted, so a `sizeof` in it needs its operand resolved
-                    // for the same reason a `static_assert` does. Without it the
-                    // fold declines, and declining publishes 0 as the value.
-                    TypeResolutionPasses::resolve_const_operand_types(
-                        var_node.initializer, resolver, &runner.res_ctx);
-                    if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
-                        const vtype: TypeRef = resolver.resolve(var_node.type_annotation, &runner.res_ctx);
-                        if (vtype.is_valid()) {
-                            var_node.resolved_type = vtype;
-                        }
-                    }
-                    if (var_node.resolved_type.is_valid()) {
-                        TypeResolutionRunner::register_module_global(ctx, var_node);
+            // Phase 4-specific: resolve and register top-level global variables
+            const var_node: VarDecl* = DeclarationNode::var_of(stmt);
+            if (var_node != null) {
+                // A module-level initializer is folded to the constant that
+                // is emitted, so a `sizeof` in it needs its operand resolved
+                // for the same reason a `static_assert` does. Without it the
+                // fold declines, and declining publishes 0 as the value.
+                TypeResolutionPasses::resolve_const_operand_types(
+                    var_node.initializer, resolver, &runner.res_ctx);
+                if (var_node.type_annotation != null && !var_node.resolved_type.is_valid()) {
+                    const vtype: TypeRef = resolver.resolve(var_node.type_annotation, &runner.res_ctx);
+                    if (vtype.is_valid()) {
+                        var_node.resolved_type = vtype;
                     }
                 }
-                _ => {}
+                if (var_node.resolved_type.is_valid()) {
+                    TypeResolutionRunner::register_module_global(
+                        ctx, DeclarationNode::with_shape(stmt), var_node);
+                }
             }
         }
 
@@ -3817,7 +3834,8 @@ type struct TypeResolutionPasses {
                         // call arguments during overload resolution.
                         mut ptypes: [TypeRef] = [];
                         for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
-                            const pp: VarDeclNode* = fn_node.parameters[pi];
+                            const pp_decl: DeclarationNode* = fn_node.parameters[pi];
+                            const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
                             if (pp == null) { continue; }
                             if (pp.is_receiver()) { continue; }
                             ptypes.push(pp.resolved_type);
@@ -3897,7 +3915,7 @@ type struct TypeResolutionPasses {
                         DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Field(_)
                         | DeclKind::GenericParam(_) | DeclKind::Import(_) | DeclKind::Intrinsic(_)
                         | DeclKind::Module(_) | DeclKind::Trait(_) | DeclKind::TypeAlias(_)
-                        | DeclKind::Variant(_) | DeclKind::Legacy => { continue; }
+                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => { continue; }
                     }
                     const node: EnumDecl* = DeclarationNode::enum_of(stmt);
 

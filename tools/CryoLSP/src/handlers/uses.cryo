@@ -16,7 +16,7 @@ import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind,
     FieldDecl, FunctionDeclNode, ImplBlock, MethodNode,
-    StructDecl, TraitDecl, UnionDecl, VarDeclNode
+    StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode, CallExprNode,
@@ -159,8 +159,8 @@ type struct Uses {
                 _ => {}
             }
         }
-        if (n.generated && n.kind == NodeKind::VariableDeclaration) {
-            this.expr((n as VarDeclNode*).initializer, null);
+        if (n.generated && DeclarationNode::var_of(n) != null) {
+            this.expr((DeclarationNode::var_of(n)).initializer, null);
             return;
         }
         // Any other declaration the compiler wrote holds copies of written
@@ -169,7 +169,6 @@ type struct Uses {
         if (n.generated && !n.kind.is_expression()) { return; }
         match (n.kind) {
             NodeKind::Statement => { this.stmt(n as Stmt*); }
-            NodeKind::VariableDeclaration => { this.var_decl(n as VarDeclNode*); }
             NodeKind::FunctionDeclaration => { this.function(n as FunctionDeclNode*, false); }
             NodeKind::MethodDeclaration => { this.method(n as MethodNode*); }
             NodeKind::Declaration => {
@@ -189,6 +188,7 @@ type struct Uses {
                         this.annotation(d.type_annotation);
                         this.expr(d.initializer, null);
                     }
+                    DeclKind::Variable(_) => { this.var_decl(h); }
                     DeclKind::Extern(d) => {
                         for (mut i: i64 = 0; i < d.functions.length; i++) { this.function(d.functions[i], false); }
                         for (mut i: i64 = 0; i < d.globals.length; i++) { this.var_decl(d.globals[i]); }
@@ -307,11 +307,12 @@ type struct Uses {
         }
     }
 
-    var_decl(mut &this, v: VarDeclNode*) -> void {
+    var_decl(mut &this, d: DeclarationNode*) -> void {
+        const v: VarDecl* = DeclarationNode::var_of(d);
         if (v == null) { return; }
         const t: Target = if (v.is_global) { Locator::def_target(v.def) } else { Target::Local(v.sym_id) };
         const before: i64 = this.out.length;
-        this.add(v.name_span, t, true);
+        this.add(d.name_span, t, true);
         if (this.out.length > before && v.type_annotation == null) {
             this.out[before].inferred = v.resolved_type;
         }
@@ -326,13 +327,14 @@ type struct Uses {
         if (f == null || f.is_specialization) { return; }
         this.add(f.name_span, Locator::def_target(f.def), true);
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
-            const p: VarDeclNode* = f.parameters[i];
+            const p_decl: DeclarationNode* = f.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null) { continue; }
             if (i == 0 && receiver) {
-                this.push(p.name_span, Target::Local(p.sym_id), true, true);
+                this.push(p_decl.name_span, Target::Local(p.sym_id), true, true);
                 continue;
             }
-            this.var_decl(p);
+            this.var_decl(p_decl);
         }
         this.annotation(f.return_type_annotation);
         this.node(f.body as ASTNode*);

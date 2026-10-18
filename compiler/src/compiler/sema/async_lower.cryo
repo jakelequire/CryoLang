@@ -59,7 +59,7 @@ import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, DestructureBinding, DestructureDecl, FieldDecl, FunctionDeclNode,
     GenericParamDecl, ImplBlock, MethodNode, ReceiverForm, StructDecl, TraitDecl,
-    VarDeclNode
+    VarDecl
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode, CallExprNode,
@@ -415,7 +415,7 @@ type struct AsyncLower {
     // aggregate is reached through - and a use names the binding it MEANS;
     // `rebind_poll_locals` gives it the stand-in its scope holds.  Reset per
     // function by `lower`.
-    stand_ins:     [VarDeclNode*];
+    stand_ins:     [VarDecl*];
     stand_in_keys: [SymbolID];
     // The bindings of the `poll` being built: its receiver, which every
     // `this.<field>` this lowering writes reads, and its context parameter.
@@ -596,14 +596,14 @@ type struct AsyncLower {
     /// without a resolved type by type resolution. Neither name is a field name
     /// the future can use, and neither is the name the body reads the receiver
     /// by, so every parameter walk routes the receiver through `recv_field`.
-    is_receiver_param(&this, p: VarDeclNode*) -> boolean {
+    is_receiver_param(&this, p: VarDecl*) -> boolean {
         if (p == null) { return false; }
         return p.is_receiver();
     }
 
     /// The future field backing parameter `p`, and the name the poll body binds
     /// it to: its own name, or the receiver field for a receiver.
-    param_field_name(&this, p: VarDeclNode*) -> SymbolStr {
+    param_field_name(&this, p: VarDecl*) -> SymbolStr {
         if (this.is_receiver_param(p)) { return this.recv_sym; }
         return p.name;
     }
@@ -611,7 +611,7 @@ type struct AsyncLower {
     /// The type parameter `p` is stored and bound as. The receiver's is the one
     /// `declare` settled (a pointer for `&this`, the owner by value otherwise);
     /// type resolution leaves a by-value `this` with no resolved type at all.
-    param_slot_type(&this, d: AsyncDecl*, p: VarDeclNode*) -> TypeRef {
+    param_slot_type(&this, d: AsyncDecl*, p: VarDecl*) -> TypeRef {
         if (this.is_receiver_param(p)) {
             if (d.recv_ptr) { return this.arena.get_pointer_to(d.recv_ty); }
             return d.recv_ty;
@@ -622,7 +622,7 @@ type struct AsyncLower {
     /// True when `p` contributes a field to the future at all. Every parameter
     /// does, except a receiver on a lowering that captured none — which cannot
     /// happen, but keeps the walks total rather than depending on it.
-    param_has_slot(&this, d: AsyncDecl*, p: VarDeclNode*) -> boolean {
+    param_has_slot(&this, d: AsyncDecl*, p: VarDecl*) -> boolean {
         if (p == null) { return false; }
         if (this.is_receiver_param(p)) { return d.recv_field.is_valid(); }
         return p.resolved_type.is_valid();
@@ -1028,8 +1028,8 @@ type struct AsyncLower {
             }
             StmtKind::For(f) => {
                 if (f.init != null) {
-                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                        this.rewrite_returns_expr((f.init as VarDeclNode*).initializer, poll_out, span);
+                    if (DeclarationNode::var_of(f.init) != null) {
+                        this.rewrite_returns_expr((DeclarationNode::var_of(f.init)).initializer, poll_out, span);
                     } else {
                         this.rewrite_returns_expr(f.init as ExpressionNode*, poll_out, span);
                     }
@@ -1322,8 +1322,8 @@ type struct AsyncLower {
                 mut n: i64 = this.expr_await_count(f.condition) + this.expr_await_count(f.update)
                            + this.stmt_await_count(f.body);
                 if (f.init != null) {
-                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                        n += this.expr_await_count((f.init as VarDeclNode*).initializer);
+                    if (DeclarationNode::var_of(f.init) != null) {
+                        n += this.expr_await_count((DeclarationNode::var_of(f.init)).initializer);
                     } else {
                         n += this.expr_await_count(f.init as ExpressionNode*);
                     }
@@ -1357,7 +1357,7 @@ type struct AsyncLower {
         mut e: ExpressionNode* = null;
         match (stmt.shape) {
             StmtKind::Decl(_) => {
-                const vd: VarDeclNode* = this.stmt_decl_var(stmt);
+                const vd: VarDecl* = this.stmt_decl_var(stmt);
                 if (vd != null) { e = vd.initializer; }
             }
             StmtKind::Return(rs) => { e = rs.expression; }
@@ -1377,8 +1377,8 @@ type struct AsyncLower {
         if (stmt == null) { return; }
         match (stmt.shape) {
             StmtKind::Decl(ds) => {
-                if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                    (ds.declaration as VarDeclNode*).initializer = repl;
+                if (ds.declaration != null && DeclarationNode::var_of(ds.declaration) != null) {
+                    (DeclarationNode::var_of(ds.declaration)).initializer = repl;
                 }
             }
             StmtKind::Return(rs) => { rs.expression = repl; }
@@ -1425,7 +1425,7 @@ type struct AsyncLower {
     /// Record the declaration `s` makes as a stand-in for binding `key`, and
     /// hand the statement back.
     stand_in(mut &this, s: Stmt*, key: SymbolID) -> Stmt* {
-        const vd: VarDeclNode* = this.stmt_decl_var(s);
+        const vd: VarDecl* = this.stmt_decl_var(s);
         if (vd != null && key.is_valid()) {
             this.stand_ins.push(vd);
             this.stand_in_keys.push(key);
@@ -1435,7 +1435,7 @@ type struct AsyncLower {
 
     /// The binding declaration `vd` stands for: the one recorded by
     /// `stand_in`, or its own.
-    decl_key(&this, vd: VarDeclNode*) -> SymbolID {
+    decl_key(&this, vd: VarDecl*) -> SymbolID {
         for (mut i: i64 = 0; i < this.stand_ins.length; i++) {
             if (this.stand_ins[i] == vd) { return this.stand_in_keys[i]; }
         }
@@ -1646,12 +1646,13 @@ type struct AsyncLower {
     var_decl_stmt_bound(mut &this, name: SymbolStr, sym: SymbolID,
                         mutable: boolean, ty: TypeRef,
                         init: ExpressionNode*, span: SourceSpan) -> Stmt* {
-        mut vd: VarDeclNode* = new VarDeclNode(name, span);
+        mut vd: VarDecl* = VarDecl::new(name);
+        const vd_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vd), span);
         vd.set_sym_id(sym);
         vd.set_mutable(mutable);
         vd.set_resolved_type(ty);
         vd.set_initializer(init);
-        mut ds: Stmt* = Stmt::decl_stmt(vd as DeclarationNode*, span);
+        mut ds: Stmt* = Stmt::decl_stmt(vd_decl, span);
         return ds;
     }
 
@@ -1667,7 +1668,8 @@ type struct AsyncLower {
     emit_shadow_prelude(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, body: BlockStmt*,
                         sm: PollSm*, skip_carried: boolean, span: SourceSpan) -> void {
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const p: VarDeclNode* = node.parameters[i];
+            const p_decl: DeclarationNode* = node.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (!this.param_has_slot(d, p)) { continue; }
             const slot_ty: TypeRef = this.param_slot_type(d, p);
             const carried: boolean = this.param_is_carried(sm, slot_ty);
@@ -1682,12 +1684,13 @@ type struct AsyncLower {
                 continue;
             }
             const access: ExpressionNode* = this.own_field(sm.struct_ref, fname, slot_ty, span);
-            mut shadow: VarDeclNode* = new VarDeclNode(fname, span);
+            mut shadow: VarDecl* = VarDecl::new(fname);
+            const shadow_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(shadow), span);
             shadow.set_sym_id(this.resolver.alloc_synthetic_binding());
             shadow.set_mutable(false);
             shadow.set_resolved_type(slot_ty);
             shadow.set_initializer(access as ExpressionNode*);
-            const shadow_stmt: Stmt* = Stmt::decl_stmt(shadow as DeclarationNode*, span);
+            const shadow_stmt: Stmt* = Stmt::decl_stmt(shadow_decl, span);
             body.add_statement(this.stand_in(shadow_stmt, p.sym_id));
         }
     }
@@ -2262,8 +2265,8 @@ type struct AsyncLower {
                                                      true);
             }
             StmtKind::Decl(ds) => {
-                if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                    const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
+                if (ds.declaration != null && DeclarationNode::var_of(ds.declaration) != null) {
+                    const vd: VarDecl* = DeclarationNode::var_of(ds.declaration);
                     // Initializing another binding from it moves the value there.
                     vd.initializer = this.subst_name_expr(vd.initializer, key, field, struct_ref,
                                                          ty, span, true);
@@ -2288,8 +2291,8 @@ type struct AsyncLower {
             }
             StmtKind::For(f) => {
                 if (f.init != null) {
-                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                        const vd: VarDeclNode* = f.init as VarDeclNode*;
+                    if (DeclarationNode::var_of(f.init) != null) {
+                        const vd: VarDecl* = DeclarationNode::var_of(f.init);
                         vd.initializer = this.subst_name_expr(vd.initializer, key, field, struct_ref,
                                                              ty, span, true);
                     } else {
@@ -2331,14 +2334,19 @@ type struct AsyncLower {
     /// The variable declared by a top-level `const/mut x = …;` statement
     /// (including an `await` carrier `const x = await e;`), or null if the
     /// statement declares no local.
-    stmt_decl_var(&this, s: Stmt*) -> VarDeclNode* {
+    stmt_decl_var(&this, s: Stmt*) -> VarDecl* {
+        return DeclarationNode::var_of(this.stmt_var_decl(s));
+    }
+
+    /// The declaration `stmt_decl_var` answers the payload of, or null.
+    stmt_var_decl(&this, s: Stmt*) -> DeclarationNode* {
         if (s == null) { return null; }
         match (s.shape) {
             StmtKind::Decl(ds) => {
-                if (ds.declaration == null || ds.declaration.kind != NodeKind::VariableDeclaration) {
+                if (ds.declaration == null || DeclarationNode::var_of(ds.declaration) == null) {
                     return null;
                 }
-                return ds.declaration as VarDeclNode*;
+                return ds.declaration;
             }
             _ => { return null; }
         }
@@ -2350,8 +2358,8 @@ type struct AsyncLower {
     /// destructure is not a statement it cannot see into.
     decl_stmt_init(&this, ds: DeclStmt*) -> ExpressionNode* {
         if (ds == null || ds.declaration == null) { return null; }
-        if (ds.declaration.kind == NodeKind::VariableDeclaration) {
-            return (ds.declaration as VarDeclNode*).initializer;
+        if (DeclarationNode::var_of(ds.declaration) != null) {
+            return (DeclarationNode::var_of(ds.declaration)).initializer;
         }
         const dd: DestructureDecl* = DeclarationNode::destructure_of(ds.declaration);
         if (dd != null) { return dd.initializer; }
@@ -2360,8 +2368,8 @@ type struct AsyncLower {
 
     set_decl_stmt_init(&this, ds: DeclStmt*, init: ExpressionNode*) -> void {
         if (ds == null || ds.declaration == null) { return; }
-        if (ds.declaration.kind == NodeKind::VariableDeclaration) {
-            (ds.declaration as VarDeclNode*).initializer = init;
+        if (DeclarationNode::var_of(ds.declaration) != null) {
+            (DeclarationNode::var_of(ds.declaration)).initializer = init;
         } else if (DeclarationNode::destructure_of(ds.declaration) != null) {
             DeclarationNode::destructure_of(ds.declaration).initializer = init;
         }
@@ -2387,7 +2395,8 @@ type struct AsyncLower {
     /// parameter needs an `Option` slot whether or not the body ever suspends.
     params_need_carrier(&this, d: AsyncDecl*, node: FunctionDeclNode*) -> boolean {
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const p: VarDeclNode* = node.parameters[i];
+            const p_decl: DeclarationNode* = node.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (!this.param_has_slot(d, p)) { continue; }
             if (this.param_needs_carrier(this.param_slot_type(d, p))) { return true; }
         }
@@ -2424,7 +2433,8 @@ type struct AsyncLower {
     carry_params(mut &this, d: AsyncDecl*, sm: PollSm*, node: FunctionDeclNode*) -> void {
         const span: SourceSpan = sm.span;
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const p: VarDeclNode* = node.parameters[i];
+            const p_decl: DeclarationNode* = node.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (!this.param_has_slot(d, p)) { continue; }
             const lty: TypeRef = this.param_slot_type(d, p);
             if (!this.param_is_carried(sm, lty)) { continue; }
@@ -2464,7 +2474,7 @@ type struct AsyncLower {
                     if (!local.name.is_valid()) {
                         this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                             "async: this parameter is reassigned after an `await` from inside a branch; assign it once at the top level of that step so the state machine can bind it there",
-                            p.span);
+                            p_decl.span);
                         sm.ok = false; return;
                     }
                 }
@@ -2752,7 +2762,8 @@ type struct AsyncLower {
             if (f == null || !f.is_async || !(item >= 0 && this.ctx.generic_registry.trait_item_slot(trait_def, f.name) == item)) { continue; }
             if (f.async_fut_slot < 0 || ap.slot != f.async_fut_slot) { continue; }
             for (mut j: i64 = 0; j < f.parameters.length; j++) {
-                const p: VarDeclNode* = f.parameters[j];
+                const p_decl: DeclarationNode* = f.parameters[j];
+                const p: VarDecl* = DeclarationNode::var_of(p_decl);
                 if (p == null || !p.name.is_valid()) { continue; }
                 // Only the by-pointer spelling keeps a pointer; a by-value
                 // `this` holds the object itself and cannot go stale.
@@ -2854,12 +2865,14 @@ type struct AsyncLower {
         // parameter list. Combinators are statics; anything else is a shape
         // this cannot vouch for.
         if (fd.parameters.length > 0) {
-            const p0: VarDeclNode* = fd.parameters[0];
+            const p0_decl: DeclarationNode* = fd.parameters[0];
+            const p0: VarDecl* = DeclarationNode::var_of(p0_decl);
             if (p0 != null && p0.is_receiver()) {
                 return none;
             }
         }
-        const pd: VarDeclNode* = fd.parameters[argi];
+        const pd_decl: DeclarationNode* = fd.parameters[argi];
+        const pd: VarDecl* = DeclarationNode::var_of(pd_decl);
         if (pd == null || !pd.name.is_valid()) { return none; }
 
         // Exactly one `return`, and it must build the struct directly. A second
@@ -3820,7 +3833,7 @@ type struct AsyncLower {
         const span: SourceSpan = sm.span;
         mut s0: i64 = cur;
         if (f.init != null) {
-            if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+            if (DeclarationNode::var_of(f.init) != null) {
                 const ds: Stmt* = Stmt::decl_stmt(f.init as DeclarationNode*, span);
                 s0 = this.lower_stmt_sm(sm, ds, s0);
             } else {
@@ -4173,8 +4186,8 @@ type struct AsyncLower {
                 // there is a read.
                 const r: i64 = this.expr_first_use(this.decl_stmt_init(ds), key);
                 if (r != 0) { return r; }
-                if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                    if (this.decl_key(ds.declaration as VarDeclNode*).equals(key)) { return 2; }
+                if (ds.declaration != null && DeclarationNode::var_of(ds.declaration) != null) {
+                    if (this.decl_key(DeclarationNode::var_of(ds.declaration)).equals(key)) { return 2; }
                 }
                 return 0;
             }
@@ -4787,7 +4800,7 @@ type struct AsyncLower {
     }
 
     /// Index of the top-level statement in `blk` that declares `vd`, or -1.
-    decl_stmt_index(&this, blk: Stmt*, vd: VarDeclNode*) -> i64 {
+    decl_stmt_index(&this, blk: Stmt*, vd: VarDecl*) -> i64 {
         for (mut i: i64 = 0; i < blk.as_block().statements.length; i++) {
             if (this.stmt_decl_var(blk.as_block().statements[i]) == vd) { return i; }
         }
@@ -5122,7 +5135,7 @@ type struct AsyncLower {
     /// state block `ds`) with `this.<field> = <init>;`, so the promoted field —
     /// not a stack local — receives the value. A declaration with no initializer
     /// is dropped: the constructor already zero-initialized the field.
-    rewrite_mut_decl(mut &this, sm: PollSm*, ds: i64, vd: VarDeclNode*,
+    rewrite_mut_decl(mut &this, sm: PollSm*, ds: i64, vd: VarDecl*,
                      field: SymbolStr, lty: TypeRef) -> void {
         const span: SourceSpan = sm.span;
         const blk: BlockStmt* = sm.blocks[ds].as_block();
@@ -5148,7 +5161,8 @@ type struct AsyncLower {
     /// them).  Must run after that rename, which is what records them.
     collect_frame_names(mut &this, d: AsyncDecl*, sm: PollSm*, node: FunctionDeclNode*) -> void {
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const p: VarDeclNode* = node.parameters[i];
+            const p_decl: DeclarationNode* = node.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (!this.param_has_slot(d, p)) { continue; }
             sm.frame_keys.push(p.sym_id);
         }
@@ -5384,7 +5398,8 @@ type struct AsyncLower {
     /// nothing. A NUMBER, a `boolean` or a `char` has no room for a pointer, so
     /// for those the address provably died with the call that consumed it.
     /// Every other type stays conservative.
-    reject_frame_addr_carry(mut &this, sm: PollSm*, vd: VarDeclNode*, key: SymbolID) -> boolean {
+    reject_frame_addr_carry(mut &this, sm: PollSm*, vd_decl: DeclarationNode*, key: SymbolID) -> boolean {
+        const vd: VarDecl* = DeclarationNode::var_of(vd_decl);
         if (this.type_cannot_hold_address(vd.resolved_type)) { return false; }
         mut root: IdentifierNode* = this.frame_addr_root_expr(sm, vd.initializer);
         if (root == null) {
@@ -5398,7 +5413,7 @@ type struct AsyncLower {
             fmt::format("async: `%s` holds the address of the local or parameter `%s` and is live across an `await`; each poll runs on a fresh frame, so that address is dangling by the time a later step uses it — have the caller own the storage and pass a pointer parameter, whose pointee the suspend does not move",
                    this.intern.resolve(this.source_name(key, vd.name)),
                    this.intern.resolve(this.source_name(this.local_key(root as ExpressionNode*), root.name))),
-            vd.span);
+            vd_decl.span);
         sm.ok = false;
         return true;
     }
@@ -5427,7 +5442,7 @@ type struct AsyncLower {
         const span: SourceSpan = sm.span;
         mut d_keys: [SymbolID] = [];
         mut d_states: [i64] = [];
-        mut d_nodes: [VarDeclNode*] = [];
+        mut d_nodes: [DeclarationNode*] = [];
         // Carriers that ended up living in their field, released together in one
         // pass once every carrier is known; see `release_before_ready`.
         mut inplace_fields: [SymbolStr] = [];
@@ -5435,15 +5450,20 @@ type struct AsyncLower {
         for (mut b: i64 = 0; b < sm.blocks.length; b++) {
             const blk: Stmt* = sm.blocks[b];
             for (mut i: i64 = 0; i < blk.as_block().statements.length; i++) {
-                const vd: VarDeclNode* = this.stmt_decl_var(blk.as_block().statements[i]);
-                if (vd != null) { d_keys.push(this.decl_key(vd)); d_states.push(b); d_nodes.push(vd); }
+                const vd_decl: DeclarationNode* = this.stmt_var_decl(blk.as_block().statements[i]);
+                if (vd_decl != null) {
+                    d_keys.push(this.decl_key(DeclarationNode::var_of(vd_decl)));
+                    d_states.push(b);
+                    d_nodes.push(vd_decl);
+                }
             }
         }
 
         for (mut d: i64 = 0; d < d_keys.length; d++) {
             const key: SymbolID = d_keys[d];
             const ds: i64 = d_states[d];
-            const vd: VarDeclNode* = d_nodes[d];
+            const vd_decl: DeclarationNode* = d_nodes[d];
+            const vd: VarDecl* = DeclarationNode::var_of(vd_decl);
             const nm: SymbolStr = vd.name;
 
             const lty: TypeRef = vd.resolved_type;
@@ -5469,7 +5489,7 @@ type struct AsyncLower {
             if (lk == TypeKind::Reference) {
                 this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
                     "async: a reference cannot be held live across an `await` (owned values only); a suspended future may outlive the referent",
-                    vd.span);
+                    vd_decl.span);
                 sm.ok = false; return;
             }
             if (!this.zeroable_kind(lk)) {
@@ -5494,7 +5514,7 @@ type struct AsyncLower {
                 if (agg_decls > 1) {
                     this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                         "async: an aggregate local whose name is re-declared in another state cannot be carried across an `await`; rename one of them",
-                        vd.span);
+                        vd_decl.span);
                     sm.ok = false; return;
                 }
                 // Only a state that READS the value before writing it needs it to
@@ -5528,21 +5548,21 @@ type struct AsyncLower {
                         if (!this.decl_at_first_assignment(sm.blocks[b], key, nm, lty, span).name.is_valid()) {
                             this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                                 "async: this value is rebuilt after an `await` from inside a branch; assign it once at the top level of that step (`x = …;`) so the state machine can bind it there",
-                                vd.span);
+                                vd_decl.span);
                             sm.ok = false; return;
                         }
                     }
                     continue;
                 }
 
-                if (this.reject_frame_addr_carry(sm, vd, key)) { return; }
+                if (this.reject_frame_addr_carry(sm, vd_decl, key)) { return; }
 
                 mut agg_args: [TypeRef] = [lty];
                 const opt_ty: TypeRef = this.ctx.generic_registry.instantiate(sm.opt_base, &agg_args);
                 if (!opt_ty.is_valid()) {
                     this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                         "async: could not build the carrier for an aggregate held across an `await`",
-                        vd.span);
+                        vd_decl.span);
                     sm.ok = false; return;
                 }
                 const afield: SymbolStr = this.intern.intern(
@@ -5642,7 +5662,7 @@ type struct AsyncLower {
             // Reaching here the value is a scalar that one of the two paths below
             // will carry, so an address of the frame inside it would outlive the
             // storage it names.
-            if (this.reject_frame_addr_carry(sm, vd, key)) { return; }
+            if (this.reject_frame_addr_carry(sm, vd_decl, key)) { return; }
 
             if (vd.is_mutable) {
                 // A `mut` value written across states cannot live on the native
@@ -5661,7 +5681,7 @@ type struct AsyncLower {
                 if (decl_sites > 1) {
                     this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                         "async: a `mut` local whose name is re-declared in another state cannot be carried across an `await`; rename one of them",
-                        vd.span);
+                        vd_decl.span);
                     sm.ok = false; return;
                 }
                 const mfield: SymbolStr = this.intern.intern(
@@ -6242,8 +6262,8 @@ type struct AsyncLower {
                 // per iteration and are rewritten during lowering instead, inside
                 // the states `continue` re-enters.
                 if (f.init != null) {
-                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                        mut vd: VarDeclNode* = f.init as VarDeclNode*;
+                    if (DeclarationNode::var_of(f.init) != null) {
+                        mut vd: VarDecl* = DeclarationNode::var_of(f.init);
                         vd.initializer = this.hoist_toplevel(vd.initializer, &pre);
                     } else {
                         f.init = this.hoist_toplevel(f.init as ExpressionNode*, &pre) as ASTNode*;
@@ -6318,7 +6338,7 @@ type struct AsyncLower {
 
     /// Rename a `const/mut <name> = <init>;` local: its initializer first,
     /// then the declaration, recording the binding's fresh name for its uses.
-    rn_var_decl(mut &this, map: RenameMap*, vd: VarDeclNode*) -> void {
+    rn_var_decl(mut &this, map: RenameMap*, vd: VarDecl*) -> void {
         if (vd == null) { return; }
         this.rn_expr(map, vd.initializer);
         const fresh: SymbolStr = this.mint_local(vd.name, vd.sym_id);
@@ -6633,8 +6653,8 @@ type struct AsyncLower {
             StmtKind::Expr(e)   => { this.rn_expr(map, e.expression); }
             StmtKind::Return(r) => { this.rn_expr(map, r.expression); }
             StmtKind::Decl(ds) => {
-                if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                    this.rn_var_decl(map, ds.declaration as VarDeclNode*);
+                if (ds.declaration != null && DeclarationNode::var_of(ds.declaration) != null) {
+                    this.rn_var_decl(map, DeclarationNode::var_of(ds.declaration));
                 } else if (DeclarationNode::destructure_of(ds.declaration) != null) {
                     this.rn_destructure(map, DeclarationNode::destructure_of(ds.declaration));
                 }
@@ -6656,8 +6676,8 @@ type struct AsyncLower {
             }
             StmtKind::For(f) => {
                 if (f.init != null) {
-                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                        this.rn_var_decl(map, f.init as VarDeclNode*);
+                    if (DeclarationNode::var_of(f.init) != null) {
+                        this.rn_var_decl(map, DeclarationNode::var_of(f.init));
                     } else {
                         this.rn_expr(map, f.init as ExpressionNode*);
                     }
@@ -6747,7 +6767,7 @@ type struct AsyncLower {
         return SymbolID::invalid();
     }
 
-    rb_var_decl(mut &this, ctx: RebindCtx*, vd: VarDeclNode*) -> void {
+    rb_var_decl(mut &this, ctx: RebindCtx*, vd: VarDecl*) -> void {
         if (vd == null) { return; }
         this.rb_expr(ctx, vd.initializer);
         if (!vd.sym_id.is_valid()) { vd.set_sym_id(this.resolver.alloc_synthetic_binding()); }
@@ -6933,8 +6953,8 @@ type struct AsyncLower {
             StmtKind::Expr(e)   => { this.rb_expr(ctx, e.expression); }
             StmtKind::Return(r) => { this.rb_expr(ctx, r.expression); }
             StmtKind::Decl(ds) => {
-                if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                    this.rb_var_decl(ctx, ds.declaration as VarDeclNode*);
+                if (ds.declaration != null && DeclarationNode::var_of(ds.declaration) != null) {
+                    this.rb_var_decl(ctx, DeclarationNode::var_of(ds.declaration));
                 } else if (DeclarationNode::destructure_of(ds.declaration) != null) {
                     const dd: DestructureDecl* = DeclarationNode::destructure_of(ds.declaration);
                     this.rb_expr(ctx, dd.initializer);
@@ -6964,8 +6984,8 @@ type struct AsyncLower {
             StmtKind::For(f) => {
                 this.rb_enter(ctx);
                 if (f.init != null) {
-                    if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                        this.rb_var_decl(ctx, f.init as VarDeclNode*);
+                    if (DeclarationNode::var_of(f.init) != null) {
+                        this.rb_var_decl(ctx, DeclarationNode::var_of(f.init));
                     } else {
                         this.rb_expr(ctx, f.init as ExpressionNode*);
                     }
@@ -6997,7 +7017,8 @@ type struct AsyncLower {
         mut ctx: RebindCtx = RebindCtx { keys: [], syms: [], marks: [] };
         this.rb_enter(&ctx);
         for (mut i: i64 = 0; i < poll_fn.parameters.length; i++) {
-            const p: VarDeclNode* = poll_fn.parameters[i];
+            const p_decl: DeclarationNode* = poll_fn.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null) { continue; }
             this.rb_bind(&ctx, p.sym_id, p.sym_id);
         }
@@ -7178,16 +7199,17 @@ type struct AsyncLower {
         mut cloner: ASTCloner = ASTCloner::new();
         mut fwd: [ExpressionNode*] = [];
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const p: VarDeclNode* = node.parameters[i];
+            const p_decl: DeclarationNode* = node.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null) { continue; }
-            const cloned: ASTNode* = cloner.clone_node(p as ASTNode*);
-            if (cloned == null || cloned.kind != NodeKind::VariableDeclaration) { continue; }
-            mut cp: VarDeclNode* = cloned as VarDeclNode*;
+            const cloned: ASTNode* = cloner.clone_node(p_decl as ASTNode*);
+            if (cloned == null || DeclarationNode::var_of(cloned) == null) { continue; }
+            mut cp: VarDecl* = DeclarationNode::var_of(cloned);
             // A clone keeps the annotation but drops the resolved type, and type
             // resolution has already run — codegen would meet a parameter it
             // cannot lower and skip the entry point's body entirely.
             cp.set_resolved_type(p.resolved_type);
-            wrapper.add_parameter(cp);
+            wrapper.add_parameter(DeclarationNode::with_shape(cloned));
             mut fwd_use: IdentifierNode* = new IdentifierNode(p.name, span);
             fwd_use.set_res(Res::Local(cp.sym_id));
             fwd.push(fwd_use as ExpressionNode*);
@@ -7201,12 +7223,13 @@ type struct AsyncLower {
         ex_scope.set_synthesized_ref(exec_ty, this.ctx.decl_index.def_of(exec_ty, this.ctx.type_arena));
         mut ex_new: CallExprNode* = new CallExprNode(
             ex_scope as ExpressionNode*, span);
-        mut ex_decl: VarDeclNode* = new VarDeclNode(ex_sym, span);
+        mut ex_decl: VarDecl* = VarDecl::new(ex_sym);
         ex_decl.set_sym_id(this.resolver.alloc_synthetic_binding());
         ex_decl.set_mutable(true);
         ex_decl.set_type_annotation(this.make_type_ann(exec_ty, span));
         ex_decl.set_initializer(ex_new as ExpressionNode*);
-        body.as_block().add_statement(Stmt::decl_stmt(ex_decl as DeclarationNode*, span));
+        body.as_block().add_statement(Stmt::decl_stmt(
+            DeclarationNode::of(DeclKind::Variable(ex_decl), span), span));
 
         // `ex.block_on(main$async(<forwarded>))`.  Nothing name-resolves a
         // synthesized identifier, so the call names the renamed body by the
@@ -7232,12 +7255,13 @@ type struct AsyncLower {
             // annotation is the expected type that fixes `block_on`'s `O`, which
             // is otherwise reachable only through its where-bound.
             const out_sym: SymbolStr = this.intern.intern("main$out");
-            mut out_decl: VarDeclNode* = new VarDeclNode(out_sym, span);
+            mut out_decl: VarDecl* = VarDecl::new(out_sym);
             out_decl.set_sym_id(this.resolver.alloc_synthetic_binding());
             out_decl.set_mutable(false);
             out_decl.set_type_annotation(this.make_type_ann(i32_ty, span));
             out_decl.set_initializer(drive as ExpressionNode*);
-            body.as_block().add_statement(Stmt::decl_stmt(out_decl as DeclarationNode*, span));
+            body.as_block().add_statement(Stmt::decl_stmt(
+                DeclarationNode::of(DeclKind::Variable(out_decl), span), span));
             mut out_use: IdentifierNode* = new IdentifierNode(out_sym, span);
             out_use.set_res(Res::Local(out_decl.sym_id));
             body.as_block().add_statement(Stmt::return_stmt(
@@ -7385,9 +7409,10 @@ type struct AsyncLower {
         mut recv_field: SymbolStr = SymbolStr::empty();
         mut recv_ptr: boolean = false;
         if (owner.method != null && !owner.method.is_static && owner.ty.is_valid()) {
-            mut recv: VarDeclNode* = null;
+            mut recv: VarDecl* = null;
             for (mut i: i64 = 0; i < node.parameters.length; i++) {
-                if (this.is_receiver_param(node.parameters[i])) { recv = node.parameters[i]; }
+                const p: VarDecl* = DeclarationNode::var_of(node.parameters[i]);
+                if (this.is_receiver_param(p)) { recv = p; }
             }
             if (recv == null) {
                 this.ctx.ice_at("an instance method reached the async lowering with no receiver parameter",
@@ -7493,13 +7518,15 @@ type struct AsyncLower {
         }
         // `poll` is a method of the future: its receiver is the future, and
         // every `this` the lowering writes into the body names it.
-        mut poll_recv: VarDeclNode* = new VarDeclNode(this.this_amp_sym, span);
+        mut poll_recv: VarDecl* = VarDecl::new(this.this_amp_sym);
+        const poll_recv_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(poll_recv), span);
         poll_recv.set_receiver(ReceiverForm::ByReference);
         poll_recv.set_sym_id(this.resolver.alloc_synthetic_binding());
         poll_recv.set_mutable(false);
         poll_recv.set_resolved_type(this.arena.get_pointer_to(struct_ref));
-        poll_fn.add_parameter(poll_recv);
-        mut cx_param: VarDeclNode* = new VarDeclNode(this.intern.intern("cx"), span);
+        poll_fn.add_parameter(poll_recv_decl);
+        mut cx_param: VarDecl* = VarDecl::new(this.intern.intern("cx"));
+        const cx_param_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(cx_param), span);
         cx_param.set_sym_id(this.resolver.alloc_synthetic_binding());
         cx_param.set_resolved_type(ctx_ptr_ty);
         if (generic) {
@@ -7509,7 +7536,7 @@ type struct AsyncLower {
                 inner: this.make_type_ann(ctx_ref, span), is_const: false, span: span,
             }));
         }
-        poll_fn.add_parameter(cx_param);
+        poll_fn.add_parameter(cx_param_decl);
 
         mut poll_method: MethodNode* = new MethodNode(poll_fn, span);
         poll_fn.def = this.ctx.define_method(fut_def, poll_fn.name, span,
@@ -7610,7 +7637,8 @@ type struct AsyncLower {
     method_param_types(&this, node: FunctionDeclNode*) -> [TypeRef] {
         mut ptypes: [TypeRef] = [];
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const p: VarDeclNode* = node.parameters[i];
+            const p_decl: DeclarationNode* = node.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null || this.is_receiver_param(p)) { continue; }
             ptypes.push(p.resolved_type);
         }
@@ -7756,8 +7784,8 @@ type struct AsyncLower {
         this.poll_self = SymbolID::invalid();
         this.poll_cx = SymbolID::invalid();
         if (poll_fn.parameters.length == 2) {
-            this.poll_self = poll_fn.parameters[0].sym_id;
-            this.poll_cx = poll_fn.parameters[1].sym_id;
+            this.poll_self = DeclarationNode::var_of(poll_fn.parameters[0]).sym_id;
+            this.poll_cx = DeclarationNode::var_of(poll_fn.parameters[1]).sym_id;
         }
 
         // ---- 0. Receiver ----
@@ -7770,7 +7798,8 @@ type struct AsyncLower {
         // different binding, so this rewrite never reaches it.
         mut recv_key: SymbolID = SymbolID::invalid();
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            if (this.is_receiver_param(node.parameters[i])) { recv_key = node.parameters[i].sym_id; }
+            const p: VarDecl* = DeclarationNode::var_of(node.parameters[i]);
+            if (this.is_receiver_param(p)) { recv_key = p.sym_id; }
         }
         const body_is_block: boolean = match (node.body.shape) {
             StmtKind::Block(_) => { true }
@@ -7852,7 +7881,8 @@ type struct AsyncLower {
         mut fields_ok: boolean = this.add_future_field(struct_decl, state_sym, u32_ty, &this.pending[pi], span);
 
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const p: VarDeclNode* = node.parameters[i];
+            const p_decl: DeclarationNode* = node.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (!this.param_has_slot(&this.pending[pi], p)) { continue; }
             // The receiver's slot is recorded on the declaration as the field
             // is minted: a reader asks for it by the slot, not by its name.
@@ -7889,7 +7919,8 @@ type struct AsyncLower {
             mut infos: [FieldInfo] = [];
             infos.push(FieldInfo::new(state_sym, u32_ty, true, false, false));
             for (mut i: i64 = 0; i < node.parameters.length; i++) {
-                const p: VarDeclNode* = node.parameters[i];
+                const p_decl: DeclarationNode* = node.parameters[i];
+                const p: VarDecl* = DeclarationNode::var_of(p_decl);
                 if (!this.param_has_slot(&this.pending[pi], p)) { continue; }
                 if (this.is_receiver_param(p)) { st.set_async_recv_slot(infos.length); }
                 infos.push(FieldInfo::new(this.param_field_name(p),
@@ -7928,7 +7959,8 @@ type struct AsyncLower {
                                             pin: this.own_field_pin(self_ty, state_sym, span),
                                             pin_carried: false });
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const p: VarDeclNode* = node.parameters[i];
+            const p_decl: DeclarationNode* = node.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (!this.param_has_slot(&this.pending[pi], p)) { continue; }
             const slot_ty: TypeRef = this.param_slot_type(&this.pending[pi], p);
             // The receiver is not readable by its parameter name (`&this` is

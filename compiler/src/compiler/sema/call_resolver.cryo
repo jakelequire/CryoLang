@@ -60,7 +60,7 @@ import compiler::resolver::res::{ DefId, DefKind, FamilyOwner, Res, ResBase, Res
 import compiler::decl_index::{ OverloadId };
 import compiler::ast::declaration::{
     ClassDeclNode, FunctionDeclNode, DeclarationNode, GenericParamDecl, ImplBlock, MethodNode,
-    StructDecl, TraitDecl, UnionDecl, VarDeclNode
+    StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     CalleePin,
@@ -1694,7 +1694,8 @@ type struct CallResolver {
 
             // PASS A - non-literal args; reject two concrete actuals for one T (E0214).
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                const param: VarDeclNode* = tmpl.parameters[i];
+                const param_decl: DeclarationNode* = tmpl.parameters[i];
+                const param: VarDecl* = DeclarationNode::var_of(param_decl);
                 if (param == null || !param.resolved_type.is_valid()) { continue; }
                 const arg: ExpressionNode* = call.arguments[i];
                 if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
@@ -1727,7 +1728,8 @@ type struct CallResolver {
             }
             // PASS C - literal fallback (a polymorphic literal adopts a pinned numeric T).
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                const param: VarDeclNode* = tmpl.parameters[i];
+                const param_decl: DeclarationNode* = tmpl.parameters[i];
+                const param: VarDecl* = DeclarationNode::var_of(param_decl);
                 if (param == null || !param.resolved_type.is_valid()) { continue; }
                 const arg: ExpressionNode* = call.arguments[i];
                 if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
@@ -1818,9 +1820,10 @@ type struct CallResolver {
             ctor = m.func;
         }
         if (ctor == null) { return ty; }
-        mut params: [VarDeclNode*] = [];
+        mut params: [VarDecl*] = [];
         for (mut j: i64 = 0; j < ctor.parameters.length; j++) {
-            const p: VarDeclNode* = ctor.parameters[j];
+            const p_decl: DeclarationNode* = ctor.parameters[j];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p != null && !p.is_receiver()) { params.push(p); }
         }
         mut pids: [TypeRef] = [];
@@ -1852,7 +1855,8 @@ type struct CallResolver {
     static non_receiver_count(f: FunctionDeclNode*) -> i64 {
         mut n: i64 = 0;
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
-            const p: VarDeclNode* = f.parameters[i];
+            const p_decl: DeclarationNode* = f.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p != null && !p.is_receiver()) { n += 1; }
         }
         return n;
@@ -1934,7 +1938,8 @@ type struct CallResolver {
         if (tmpl.parameters.length != call.arguments.length) { return; }
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
             const arg: ExpressionNode* = call.arguments[i];
-            const param: VarDeclNode* = tmpl.parameters[i];
+            const param_decl: DeclarationNode* = tmpl.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (arg == null || param == null || !arg.has_resolved_type()) { continue; }
             const scope: ScopeResolutionNode* = CallResolver::variant_scope_of(arg);
             if (scope == null) { continue; }
@@ -2148,9 +2153,10 @@ type struct CallResolver {
         }
         pctx.set_this_type(recv_type);
 
-        mut explicit_params: [VarDeclNode*] = [];
+        mut explicit_params: [VarDecl*] = [];
         for (mut i: i64 = 0; i < orig_func.parameters.length; i++) {
-            const p: VarDeclNode* = orig_func.parameters[i];
+            const p_decl: DeclarationNode* = orig_func.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null) { continue; }
             if (p.is_receiver()) { continue; }
             explicit_params.push(p);
@@ -2158,7 +2164,7 @@ type struct CallResolver {
         if (explicit_params.length != out.length) { return out; }
 
         for (mut i: i64 = 0; i < out.length; i++) {
-            const p: VarDeclNode* = explicit_params[i];
+            const p: VarDecl* = explicit_params[i];
             if (p == null || p.type_annotation == null) { continue; }
             const formal: TypeRef = this.ctx.type_resolver.resolve(p.type_annotation, &pctx);
             if (!formal.is_valid()) { continue; }
@@ -2240,7 +2246,8 @@ type struct CallResolver {
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
 
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
-            const param: VarDeclNode* = tmpl.parameters[i];
+            const param_decl: DeclarationNode* = tmpl.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null || !param.resolved_type.is_valid()) { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
@@ -2268,7 +2275,8 @@ type struct CallResolver {
             if (any_unbound) { ictx.unify(tmpl.resolved_return_type, this.state.expected_type); }
         }
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
-            const param: VarDeclNode* = tmpl.parameters[i];
+            const param_decl: DeclarationNode* = tmpl.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null || !param.resolved_type.is_valid()) { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
@@ -3031,7 +3039,8 @@ type struct CallResolver {
                         if (fn_node.is_variadic) { variadic_ok = true; continue; }
                         mut tparams: [TypeRef] = [];
                         for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
-                            const pp: VarDeclNode* = fn_node.parameters[pi];
+                            const pp_decl: DeclarationNode* = fn_node.parameters[pi];
+                            const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
                             if (pp == null) { continue; }
                             if (pp.is_receiver()) { continue; }
                             tparams.push(pp.resolved_type);
@@ -4027,7 +4036,8 @@ type struct CallResolver {
                 const f: FunctionDeclNode* = items[i].func;
                 mut params: [TypeRef] = [];
                 for (mut pi: i64 = 0; pi < f.parameters.length; pi++) {
-                    const pp: VarDeclNode* = f.parameters[pi];
+                    const pp_decl: DeclarationNode* = f.parameters[pi];
+                    const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
                     if (pp == null || pp.is_receiver()) { continue; }
                     params.push(pp.resolved_type);
                 }
@@ -4220,7 +4230,8 @@ type struct CallResolver {
             } else {
                 mut params: [TypeRef] = [];
                 for (mut pi: i64 = 0; pi < mn.func.parameters.length; pi++) {
-                    const pp: VarDeclNode* = mn.func.parameters[pi];
+                    const pp_decl: DeclarationNode* = mn.func.parameters[pi];
+                    const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
                     if (pp == null || pp.is_receiver()) { continue; }
                     params.push(pp.resolved_type);
                 }
@@ -4305,7 +4316,8 @@ type struct CallResolver {
         if (tmpl == null || tmpl.parameters.length != call.arguments.length) { return; }
         mut decl: [TypeRef] = [];
         for (mut i: i64 = 0; i < tmpl.parameters.length; i++) {
-            const p: VarDeclNode* = tmpl.parameters[i];
+            const p_decl: DeclarationNode* = tmpl.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             decl.push(if (p != null) { p.resolved_type } else { TypeRef::invalid() });
         }
         const params: [TypeRef] = this.free_call_params(entry, call, &decl, &decl);
@@ -4336,7 +4348,8 @@ type struct CallResolver {
         if (func == null || func.generic_params.length == 0) { return sema_copy_type_refs(params); }
         mut decl: [TypeRef] = [];
         for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
-            const pp: VarDeclNode* = func.parameters[pi];
+            const pp_decl: DeclarationNode* = func.parameters[pi];
+            const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
             if (pp == null || pp.is_receiver()) { continue; }
             decl.push(pp.resolved_type);
         }
@@ -4685,7 +4698,8 @@ type struct CallResolver {
                         owner_base, &owner_args)) { continue; }
                 mut params: [TypeRef] = [];
                 for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
-                    const pp: VarDeclNode* = fn_node.parameters[pi];
+                    const pp_decl: DeclarationNode* = fn_node.parameters[pi];
+                    const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
                     if (pp == null) { continue; }
                     if (pp.is_receiver()) { continue; }
                     params.push(pp.resolved_type);
@@ -6169,7 +6183,8 @@ type struct CallResolver {
             if (node == null || node.func == null) { return TypeRef::invalid(); }
             is_static = node.is_static;
             for (mut i: i64 = 0; i < node.func.parameters.length; i++) {
-                const p: VarDeclNode* = node.func.parameters[i];
+                const p_decl: DeclarationNode* = node.func.parameters[i];
+                const p: VarDecl* = DeclarationNode::var_of(p_decl);
                 if (p == null || !p.resolved_type.is_valid()) { return TypeRef::invalid(); }
                 if (!p.is_receiver()) { call_params.push(p.resolved_type); }
             }
@@ -6214,7 +6229,8 @@ type struct CallResolver {
         mut params: [TypeRef] = [];
         if (!is_static) {
             if (node.func.parameters.length == 0) { return TypeRef::invalid(); }
-            const recv: VarDeclNode* = node.func.parameters[0];
+            const recv_decl: DeclarationNode* = node.func.parameters[0];
+            const recv: VarDecl* = DeclarationNode::var_of(recv_decl);
             if (recv == null || !recv.is_receiver() || !recv.resolved_type.is_valid()) { return TypeRef::invalid(); }
             // A generic owner's receiver is the owner over the parameters
             // the signature names.
@@ -6391,7 +6407,9 @@ type struct CallResolver {
         // held by the owner's, which nothing in the signature matches.
         mut named: [TypeRef] = [];
         for (mut i: i64 = 0; i < m.func.parameters.length; i++) {
-            if (m.func.parameters[i] != null) { this.arena.generic_params_in(m.func.parameters[i].resolved_type, &named); }
+            if (m.func.parameters[i] != null) {
+                this.arena.generic_params_in(DeclarationNode::var_of(m.func.parameters[i]).resolved_type, &named);
+            }
         }
         this.arena.generic_params_in(m.func.resolved_return_type, &named);
         mut tparams: [TypeRef] = [];
@@ -6399,7 +6417,8 @@ type struct CallResolver {
         const self_ty: TypeRef = this.arena.create_instantiation(owner_entry.base_type, &tparams);
         mut params: [TypeRef] = [];
         for (mut i: i64 = 0; i < m.func.parameters.length; i++) {
-            const p: VarDeclNode* = m.func.parameters[i];
+            const p_decl: DeclarationNode* = m.func.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null || !p.resolved_type.is_valid()) { return TypeRef::invalid(); }
             params.push(if (i == 0 && p.is_receiver()) { this.receiver_over(p.resolved_type, self_ty) } else { p.resolved_type });
         }
@@ -7127,7 +7146,8 @@ type struct CallResolver {
         const binds: [TypeRef] = this.template_call_bindings(call, scope, t, f);
         if (binds.length != t.param_types.length) { return false; }
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
-            const p: VarDeclNode* = f.parameters[i];
+            const p_decl: DeclarationNode* = f.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null || !p.resolved_type.is_valid()) { return false; }
             const param: TypeRef = this.subst_params(&t.param_types, &binds, p.resolved_type);
             if (!param.is_valid()) { return false; }
@@ -7164,7 +7184,8 @@ type struct CallResolver {
         if (binds.length == 0) { return params; }
         params.push(fn_ty.param_types[0]);
         for (mut pi: i64 = 0; pi < m.func.parameters.length; pi++) {
-            const p: VarDeclNode* = m.func.parameters[pi];
+            const p_decl: DeclarationNode* = m.func.parameters[pi];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null || p.is_receiver()) { continue; }
             if (p.type_annotation == null) { return []; }
             const f: TypeRef = this.binding.reduce_assoc_projections(this.ctx.type_resolver.resolve(p.type_annotation, &ctx));
@@ -7596,7 +7617,9 @@ type struct CallResolver {
         if (func == null || func.generic_params.length != method_args.length) { return false; }
         mut named: [TypeRef] = [];
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            if (func.parameters[i] != null) { this.arena.generic_params_in(func.parameters[i].resolved_type, &named); }
+            if (func.parameters[i] != null) {
+                this.arena.generic_params_in(DeclarationNode::var_of(func.parameters[i]).resolved_type, &named);
+            }
         }
         this.arena.generic_params_in(func.resolved_return_type, &named);
         mut tparams: [TypeRef] = [];
@@ -7655,7 +7678,8 @@ type struct CallResolver {
         if (func.parameters.length != call.arguments.length) { return empty; }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
-            const param: VarDeclNode* = func.parameters[i];
+            const param_decl: DeclarationNode* = func.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null || !param.resolved_type.is_valid()) { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
@@ -7666,7 +7690,8 @@ type struct CallResolver {
         }
         // Polymorphic literals second (fill only still-unbound params).
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
-            const param: VarDeclNode* = func.parameters[i];
+            const param_decl: DeclarationNode* = func.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null || !param.resolved_type.is_valid()) { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
@@ -7824,7 +7849,8 @@ type struct CallResolver {
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
         // Pass 1: bind from concrete (non-literal, non-null) argument types.
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const p: VarDeclNode* = func.parameters[i];
+            const p_decl: DeclarationNode* = func.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null || !p.resolved_type.is_valid()) { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null) { continue; }
@@ -7845,7 +7871,8 @@ type struct CallResolver {
         // accepted source for a generic owner's type argument.  No emission here.
         if (allow_literal_default) {
             for (mut i: i64 = 0; i < func.parameters.length; i++) {
-                const p2: VarDeclNode* = func.parameters[i];
+                const p2_decl: DeclarationNode* = func.parameters[i];
+                const p2: VarDecl* = DeclarationNode::var_of(p2_decl);
                 if (p2 == null || !p2.resolved_type.is_valid()) { continue; }
                 const arg2: ExpressionNode* = call.arguments[i];
                 if (arg2 == null || !this.sema_arg_is_polymorphic_literal(arg2)) { continue; }
@@ -7911,7 +7938,8 @@ type struct CallResolver {
         // Source A: concrete (non-literal, non-null) argument types.
         if (func.parameters.length == call.arguments.length) {
             for (mut i: i64 = 0; i < func.parameters.length; i++) {
-                const p: VarDeclNode* = func.parameters[i];
+                const p_decl: DeclarationNode* = func.parameters[i];
+                const p: VarDecl* = DeclarationNode::var_of(p_decl);
                 if (p == null || !p.resolved_type.is_valid()) { continue; }
                 const arg: ExpressionNode* = call.arguments[i];
                 if (arg == null) { continue; }
@@ -8852,7 +8880,8 @@ type struct CallResolver {
         if (!this.path_method_subst(tmpl, call.template_method, &owner_args, method_args, &subst)) { return; }
         mut params: [TypeRef] = [];
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const p: VarDeclNode* = func.parameters[i];
+            const p_decl: DeclarationNode* = func.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null || !p.resolved_type.is_valid()) { return; }
             const pt: TypeRef = this.binding.reduce_assoc_projections(subst.apply(p.resolved_type, this.arena));
             const open: boolean = this.types.contains_generic_param(pt) || this.types.contains_unresolved_projection(pt);

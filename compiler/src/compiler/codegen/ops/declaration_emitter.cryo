@@ -52,7 +52,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDeclNode,
-    ImplBlock, IntrinsicDecl, MethodNode, StructDecl, UnionDecl, VarDeclNode
+    ImplBlock, IntrinsicDecl, MethodNode, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::lex::{ TokenType };
@@ -107,7 +107,7 @@ type struct DebugInfoState {
 /// computed when the program starts (`emit_global_initializers`).  Read by
 /// position only.
 type struct StartedGlobals {
-    nodes: [VarDeclNode*];
+    nodes: [DeclarationNode*];
     slots: [LValue];
 }
 
@@ -245,7 +245,8 @@ type struct DeclarationEmitter {
                         DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::Impl(_)
                         | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
                         | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
-                        | DeclKind::GenericParam(_) | DeclKind::Trait(_) | DeclKind::Legacy => {}
+                        | DeclKind::GenericParam(_) | DeclKind::Trait(_) | DeclKind::Variable(_)
+                        | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -338,6 +339,11 @@ type struct DeclarationEmitter {
                         DeclKind::Union(n)     => { this.declare_union_methods(n); }
                         DeclKind::Struct(n)    => { this.declare_struct_methods(n); }
                         DeclKind::Impl(n)      => { this.declare_impl_block(n); }
+                        DeclKind::Variable(n)  => {
+                            if (n.is_global) {
+                                this.codegen_global_var(stmt as DeclarationNode*, n);
+                            }
+                        }
                         DeclKind::Import(_) | DeclKind::Module(_)
                         | DeclKind::Variant(_) | DeclKind::Destructure(_) | DeclKind::TypeAlias(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Enum(_)
@@ -346,12 +352,6 @@ type struct DeclarationEmitter {
                 }
                 NodeKind::ClassDeclaration => {
                     this.declare_class_methods(stmt as ClassDeclNode*);
-                }
-                NodeKind::VariableDeclaration => {
-                    const var_decl: VarDeclNode* = stmt as VarDeclNode*;
-                    if (var_decl.is_global) {
-                        this.codegen_global_var(var_decl);
-                    }
                 }
                 _ => {}
             }
@@ -532,7 +532,8 @@ type struct DeclarationEmitter {
         } else {
             mut params: [TypeRef] = [];
             for (mut i: u32 = 0; i < param_count; i++) {
-                const param: VarDeclNode* = node.parameters[i];
+                const param_decl: DeclarationNode* = node.parameters[i];
+                const param: VarDecl* = DeclarationNode::var_of(param_decl);
                 if (param != null && param.resolved_type.is_valid()) {
                     params.push(param.resolved_type);
                 }
@@ -1024,7 +1025,8 @@ type struct DeclarationEmitter {
         const fixed_user_count: u32 = CodegenUtil::fixed_param_count(func);
         mut user_param_count: u32 = 0;
         for (mut pc: u32 = 0; pc < fixed_user_count; pc++) {
-            const pp: VarDeclNode* = func.parameters[pc];
+            const pp_decl: DeclarationNode* = func.parameters[pc];
+            const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
             if (pp != null) { user_param_count += 1; }
         }
         // sret-returning methods get a hidden `ptr sret(%T)` parameter
@@ -1044,7 +1046,8 @@ type struct DeclarationEmitter {
         mut user_plans: [ParamPlan] = [];
         mut total_user_slots: u32 = 0;
         for (mut i: u32 = 0; i < fixed_user_count; i++) {
-            const param: VarDeclNode* = func.parameters[i];
+            const param_decl: DeclarationNode* = func.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null) {
                 mut empty_slots: [LType] = [];
                 user_plans.push(ParamPlan {
@@ -1141,7 +1144,8 @@ type struct DeclarationEmitter {
                 // a malformed signature.  This branch only fires for
                 // null params (which the loop above produced an
                 // empty plan for).
-                const param: VarDeclNode* = func.parameters[i];
+                const param_decl: DeclarationNode* = func.parameters[i];
+                const param: VarDecl* = DeclarationNode::var_of(param_decl);
                 const fallback: LType = if (param != null) {
                     this.type_mapper.map_type(param.resolved_type)
                 } else {
@@ -1234,7 +1238,8 @@ type struct DeclarationEmitter {
         const param_count: u32 = node.fixed_param_count();
         mut params: [TypeRef] = [];
         for (mut i: u32 = 0; i < param_count; i++) {
-            const param: VarDeclNode* = node.parameters[i];
+            const param_decl: DeclarationNode* = node.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param != null && param.resolved_type.is_valid()) {
                 params.push(param.resolved_type);
             }
@@ -1275,7 +1280,8 @@ type struct DeclarationEmitter {
             // into a register-sized integer (Phase 3).
             mut params: [TypeRef] = [];
             for (mut pi: u32 = 0; pi < param_count; pi++) {
-                const param_pi: VarDeclNode* = func.parameters[pi];
+                const param_pi_decl: DeclarationNode* = func.parameters[pi];
+                const param_pi: VarDecl* = DeclarationNode::var_of(param_pi_decl);
                 if (param_pi != null && param_pi.resolved_type.is_valid()) {
                     params.push(param_pi.resolved_type);
                 }
@@ -1323,8 +1329,9 @@ type struct DeclarationEmitter {
         }
     }
 
-    /// Generate a global variable declaration with optional initializer.
-    codegen_global_var(mut &this, node: VarDeclNode*) -> void {
+    /// Generate a global variable declaration with optional initializer;
+    /// `decl` is the declaration whose payload `node` is.
+    codegen_global_var(mut &this, decl: DeclarationNode*, node: VarDecl*) -> void {
         // Mangle definitions under the current module's namespace
         // (`C$<namespace>.<name>`) so two modules with the same private
         // `const NAME = ...` don't collide at link time.  Cross-module readers
@@ -1495,7 +1502,7 @@ type struct DeclarationEmitter {
         }
         global.set_initializer(init);
         if (started) {
-            this.started.nodes.push(node);
+            this.started.nodes.push(decl);
             this.started.slots.push(global);
         }
 
@@ -1535,7 +1542,8 @@ type struct DeclarationEmitter {
     /// storage `codegen_global_var` gave it.
     store_started_global(mut &this, k: i64, value: LValue) -> void {
         if (!value.is_valid()) { return; }
-        const node: VarDeclNode* = this.started.nodes[k];
+        const node_decl: DeclarationNode* = this.started.nodes[k];
+        const node: VarDecl* = DeclarationNode::var_of(node_decl);
         const ty: LType = this.type_mapper.map_type(node.resolved_type);
         this.builder.build_store(this.expr_ops.init_store_value(value, ty, node.resolved_type),
                                  this.started.slots[k]);
@@ -1580,7 +1588,7 @@ type struct DeclarationEmitter {
     /// `SymbolResolver::resolve_global_entry` reads and writes too, so a
     /// reader in this module and one in another reach the same value, and
     /// two imports declaring one leaf (`a::FOO`, `b::FOO`) hold two.
-    global_cache_slot(&this, node: VarDeclNode*) -> i64 {
+    global_cache_slot(&this, node: VarDecl*) -> i64 {
         return this.ctx.global_entry_of_def(node.def).slot;
     }
 
@@ -1746,7 +1754,8 @@ type struct DeclarationEmitter {
 
         const fixed_count: u32 = CodegenUtil::fixed_param_count(node);
         for (mut i: u32 = 0; i < fixed_count; i++) {
-            const param: VarDeclNode* = node.parameters[i];
+            const param_decl: DeclarationNode* = node.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             const param_name: string = this.resolve(param.name);
             const param_ty: LType = this.type_mapper.map_type(param.resolved_type);
 
@@ -1755,7 +1764,7 @@ type struct DeclarationEmitter {
                 this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
                     fmt::format("codegen: function '%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this function will fail at link time.",
                         fname, param_name),
-                    if (param != null) { param.span } else { node.span });
+                    if (param != null) { param_decl.span } else { node.span });
                 this.values.pop_scope();
                 return LValue::null();
             }
@@ -1829,7 +1838,7 @@ type struct DeclarationEmitter {
         // a v* variant (vsprintf, vfprintf, etc.).  Without this the `args`
         // identifier has no LLVM value and every forwarding call codegens
         // with a null operand.
-        const va_param: VarDeclNode* = CodegenUtil::variadic_param(node);
+        const va_param: VarDecl* = CodegenUtil::variadic_param(node);
         if (va_param != null) {
             this.expr_ops.emit_va_start_for_variadic(fn_val, va_param.name, va_param.sym_id);
         } else {
@@ -2125,7 +2134,8 @@ type struct DeclarationEmitter {
         mut explicit_val_idx: i64 = -1;    // parameters[i] is bare "this" (by-value self)
         mut explicit_typed_idx: i64 = -1;  // parameters[i] is "this: T*" (user-typed self)
         for (mut pc: i64 = 0; pc < func.parameters.length; pc++) {
-            const pp: VarDeclNode* = func.parameters[pc];
+            const pp_decl: DeclarationNode* = func.parameters[pc];
+            const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
             if (pp == null) { continue; }
             if (pp.is_ref_receiver()) { explicit_ref_idx = pc; break; }
             if (pp.is_value_receiver()) {
@@ -2163,7 +2173,7 @@ type struct DeclarationEmitter {
             if (recv_idx < 0) { recv_idx = explicit_val_idx; }
             if (recv_idx < 0) { recv_idx = explicit_typed_idx; }
             const this_bind: SymbolID = if (recv_idx >= 0) {
-                func.parameters[recv_idx].sym_id
+                DeclarationNode::var_of(func.parameters[recv_idx]).sym_id
             } else {
                 SymbolID::invalid()
             };
@@ -2249,7 +2259,8 @@ type struct DeclarationEmitter {
         // an LLVM param that doesn't exist.
         const fixed_count: u32 = CodegenUtil::fixed_param_count(func);
         for (mut i: u32 = 0; i < fixed_count; i++) {
-            const param: VarDeclNode* = func.parameters[i];
+            const param_decl: DeclarationNode* = func.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null) { continue; }
             if (i as i64 == explicit_ref_idx) { continue; }
             if (i as i64 == explicit_val_idx) { continue; }
@@ -2261,7 +2272,7 @@ type struct DeclarationEmitter {
                 this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
                     fmt::format("codegen: method '%s::%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this method will fail at link time.",
                         type_str, method_str, param_name),
-                    if (param != null) { param.span } else { func.span });
+                    if (param != null) { param_decl.span } else { func.span });
                 this.values.pop_scope();
                 return LValue::null();
             }

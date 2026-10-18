@@ -33,7 +33,7 @@ import compiler::types::generic_registry::{ TemplateKind };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, FunctionDeclNode, GenericParamDecl, ImplBlock,
-    MethodNode, StructDecl, UnionDecl, VarDeclNode
+    MethodNode, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     ArrayAccessNode, BinaryExprNode, CallExprNode, CastExprNode, ExpressionNode,
@@ -244,8 +244,8 @@ type struct MonoAstResolver {
             }
             StmtKind::Decl(ds) => {
                 if (ds.declaration != null &&
-                    ds.declaration.kind == NodeKind::VariableDeclaration) {
-                    const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
+                    DeclarationNode::var_of(ds.declaration) != null) {
+                    const vd: VarDecl* = DeclarationNode::var_of(ds.declaration);
                     this.prune_static_match_in_expr(vd.initializer, res_ctx);
                 }
             }
@@ -266,8 +266,8 @@ type struct MonoAstResolver {
                 // A variable declaration initializer is pruned; an expression
                 // one is not.
                 if (fs.init != null) {
-                    if (fs.init.kind == NodeKind::VariableDeclaration) {
-                        this.prune_static_match_in_expr((fs.init as VarDeclNode*).initializer, res_ctx);
+                    if (DeclarationNode::var_of(fs.init) != null) {
+                        this.prune_static_match_in_expr((DeclarationNode::var_of(fs.init)).initializer, res_ctx);
                     } else if (fs.init.kind == NodeKind::Statement) {
                         this.prune_static_match_in_stmt(fs.init as Stmt*, res_ctx);
                     }
@@ -540,7 +540,8 @@ type struct MonoAstResolver {
         // receiver).  `&this` -> `Pointer(this_type)`; bare `this` -> the owner type.
         if (this_type.is_valid()) {
             for (mut bp: i64 = 0; bp < func.parameters.length; bp++) {
-                const param: VarDeclNode* = func.parameters[bp];
+                const param_decl: DeclarationNode* = func.parameters[bp];
+                const param: VarDecl* = DeclarationNode::var_of(param_decl);
                 if (param == null || param.resolved_type.is_valid()) { continue; }
                 if (param.is_ref_receiver()) {
                     param.resolved_type = this.arena.get_pointer_to(this_type);
@@ -557,7 +558,8 @@ type struct MonoAstResolver {
                 this.trait_spec.reduce_projections(func.resolved_return_type);
         }
         for (mut rpi: i64 = 0; rpi < func.parameters.length; rpi++) {
-            const rpp: VarDeclNode* = func.parameters[rpi];
+            const rpp_decl: DeclarationNode* = func.parameters[rpi];
+            const rpp: VarDecl* = DeclarationNode::var_of(rpp_decl);
             if (rpp != null && rpp.resolved_type.is_valid()) {
                 rpp.resolved_type = this.trait_spec.reduce_projections(rpp.resolved_type);
             }
@@ -595,8 +597,8 @@ type struct MonoAstResolver {
                     const inner_decl: DeclarationNode* = decl_stmt.declaration;
                     if (inner_decl != null) {
                         const inner_node: ASTNode* = inner_decl as ASTNode*;
-                        if (inner_node.kind == NodeKind::VariableDeclaration) {
-                            const var_decl: VarDeclNode* = inner_decl as VarDeclNode*;
+                        if (DeclarationNode::var_of(inner_node) != null) {
+                            const var_decl: VarDecl* = DeclarationNode::var_of(inner_decl);
                             if (var_decl.type_annotation != null && !var_decl.resolved_type.is_valid()) {
                                 const vtype: TypeRef = this.type_resolver.resolve(
                                     var_decl.type_annotation, res_ctx);
@@ -619,19 +621,19 @@ type struct MonoAstResolver {
                 }
                 StmtKind::For(for_stmt) => {
                     // Resolve the loop's init VarDecl (e.g. `mut i: int = 0`).  The init
-                    // can be a bare VariableDeclaration or a declaration statement.
+                    // can be a bare variable declaration or a declaration statement.
                     if (for_stmt.init != null) {
                         const init_node: ASTNode* = for_stmt.init;
-                        mut for_var: VarDeclNode* = null;
-                        if (init_node.kind == NodeKind::VariableDeclaration) {
-                            for_var = for_stmt.init as VarDeclNode*;
+                        mut for_var: VarDecl* = null;
+                        if (DeclarationNode::var_of(init_node) != null) {
+                            for_var = DeclarationNode::var_of(for_stmt.init);
                         } else if (init_node.kind == NodeKind::Statement) {
                             match ((init_node as Stmt*).shape) {
                                 StmtKind::Decl(init_decl) => {
                                     const inner_decl: DeclarationNode* = init_decl.declaration;
                                     if (inner_decl != null
-                                            && (inner_decl as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                                        for_var = inner_decl as VarDeclNode*;
+                                            && DeclarationNode::var_of(inner_decl) != null) {
+                                        for_var = DeclarationNode::var_of(inner_decl);
                                     }
                                 }
                                 _ => {}

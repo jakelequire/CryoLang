@@ -133,6 +133,15 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-18
+
+438. **A `Location` constant keeps its pointers, and the growth of the
+     position-independent Linux pin from relocating them is accepted for
+     now.**  Making a `Location` relocation-free (offsets instead of
+     pointers, an ABI change for the panic funnel and the check handlers)
+     or linking the Linux pin as a fixed-address executable is not decided.
+     (Dispatch, delegated)
+
 ### 2026-10-17
 
 405. **A `return` inside an await-free `unsafe` block or `static match`

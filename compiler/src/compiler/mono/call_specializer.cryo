@@ -43,7 +43,7 @@ import compiler::ast::walk::{ Walk };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, DestructureDecl, FunctionDeclNode, GenericParamDecl,
-    ImplBlock, MethodNode, StructDecl, UnionDecl, VarDeclNode
+    ImplBlock, MethodNode, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     CalleePin,
@@ -189,6 +189,13 @@ type struct MonoCallSpecializer {
                             if (un.is_generic()) { continue; }
                             this.walk_methods(un.methods, &res_ctx);
                         }
+                        DeclKind::Variable(vd) => {
+                            // A module's global: its initializer is code like a
+                            // body's, computed at program start when no fold
+                            // answers it, so its calls and values are specialized
+                            // as a body's are.
+                            if (vd.initializer != null) { this.walk_expr(vd.initializer, &res_ctx, null); }
+                        }
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
@@ -199,14 +206,6 @@ type struct MonoCallSpecializer {
                     const cn: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (cn.is_generic()) { continue; }
                     this.walk_methods(cn.methods, &res_ctx);
-                }
-                NodeKind::VariableDeclaration => {
-                    // A module's global: its initializer is code like a
-                    // body's, computed at program start when no fold
-                    // answers it, so its calls and values are specialized
-                    // as a body's are.
-                    const vd: VarDeclNode* = stmt as VarDeclNode*;
-                    if (vd.initializer != null) { this.walk_expr(vd.initializer, &res_ctx, null); }
                 }
                 _ => {}
             }
@@ -278,7 +277,8 @@ type struct MonoCallSpecializer {
                     DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                     | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                     | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                    | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
+                    | DeclKind::Legacy => {}
                 }
             }
             NodeKind::ClassDeclaration => {
@@ -315,8 +315,8 @@ type struct MonoCallSpecializer {
                 if (dd != null) {
                     this.walk_expr(dd.initializer, res_ctx, subst);
                 }
-                if (inner != null && (inner as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                    mut vd: VarDeclNode* = inner as VarDeclNode*;
+                const vd: VarDecl* = DeclarationNode::var_of(inner);
+                if (vd != null) {
                     if (vd.initializer != null) {
                         this.walk_expr(vd.initializer, res_ctx, subst);
                         // Sema already typed this binding to a concrete
@@ -369,8 +369,8 @@ type struct MonoCallSpecializer {
             StmtKind::For(fs) => {
                 // The initializer is a declaration or an expression.
                 if (fs.init != null) {
-                    if ((fs.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                        this.walk_expr((fs.init as VarDeclNode*).initializer, res_ctx, subst);
+                    if (DeclarationNode::var_of(fs.init) != null) {
+                        this.walk_expr((DeclarationNode::var_of(fs.init)).initializer, res_ctx, subst);
                     } else {
                         this.walk_expr(fs.init as ExpressionNode*, res_ctx, subst);
                     }
@@ -791,7 +791,8 @@ type struct MonoCallSpecializer {
     /// invalid for a method with none.
     static receiver_param_type(m: MethodNode*) -> TypeRef {
         if (m.func == null || m.func.parameters.length == 0) { return TypeRef::invalid(); }
-        const recv: VarDeclNode* = m.func.parameters[0];
+        const recv_decl: DeclarationNode* = m.func.parameters[0];
+        const recv: VarDecl* = DeclarationNode::var_of(recv_decl);
         if (recv == null || !recv.is_receiver()) { return TypeRef::invalid(); }
         return recv.resolved_type;
     }
@@ -1046,7 +1047,8 @@ type struct MonoCallSpecializer {
         mut method_generic_in_value_param: boolean = false;
         if (orig_func != null) {
             for (mut pi: i64 = 0; pi < orig_func.parameters.length; pi++) {
-                const pp: VarDeclNode* = orig_func.parameters[pi];
+                const pp_decl: DeclarationNode* = orig_func.parameters[pi];
+                const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
                 if (pp == null) { continue; }
                 if (pp.is_receiver()) { continue; }
                 if (this.arena.contains_generic_param(pp.resolved_type)) {
@@ -1454,7 +1456,8 @@ type struct MonoCallSpecializer {
         if (m.func == null || call.bound_params.length == 0) { return false; }
         mut k: i64 = 0;
         for (mut i: i64 = 0; i < m.func.parameters.length; i++) {
-            const p: VarDeclNode* = m.func.parameters[i];
+            const p_decl: DeclarationNode* = m.func.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null) { return false; }
             if (p.is_receiver()) { continue; }
             if (k >= call.bound_params.length || !p.resolved_type.equals(call.bound_params[k])) { return false; }
@@ -1537,7 +1540,8 @@ type struct MonoCallSpecializer {
         if (m != null && m.func != null) {
             const on_receiver: boolean = (call.callee as ASTNode*).kind == NodeKind::MemberAccess;
             for (mut i: i64 = 0; i < m.func.parameters.length; i++) {
-                const p: VarDeclNode* = m.func.parameters[i];
+                const p_decl: DeclarationNode* = m.func.parameters[i];
+                const p: VarDecl* = DeclarationNode::var_of(p_decl);
                 if (p == null) { return; }
                 if (on_receiver && p.is_receiver()) { continue; }
                 params.push(p.resolved_type);
@@ -2135,7 +2139,8 @@ type struct MonoCallSpecializer {
         spec_method.func.generic_params = [];
         spec_method.func.set_resolved_return_type(TypeRef::invalid());
         for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
-            const p: VarDeclNode* = spec_method.func.parameters[i];
+            const p_decl: DeclarationNode* = spec_method.func.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p != null) { p.set_resolved_type(TypeRef::invalid()); }
         }
 
@@ -2176,7 +2181,8 @@ type struct MonoCallSpecializer {
             }
             this.type_resolver.resolve_func_signature(spec_method.func, &res_ctx);
             for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
-                const p: VarDeclNode* = spec_method.func.parameters[i];
+                const p_decl: DeclarationNode* = spec_method.func.parameters[i];
+                const p: VarDecl* = DeclarationNode::var_of(p_decl);
                 if (p == null) { continue; }
                 if (p.resolved_type.is_valid()) { continue; }
                 if (p.is_ref_receiver()) {
@@ -2203,8 +2209,10 @@ type struct MonoCallSpecializer {
         const n_orig_params: i64 = original.func.parameters.length;
         if (n_clone_params == n_orig_params) {
             for (mut i: i64 = 0; i < n_clone_params; i++) {
-                const p: VarDeclNode* = spec_method.func.parameters[i];
-                const op: VarDeclNode* = original.func.parameters[i];
+                const p_decl: DeclarationNode* = spec_method.func.parameters[i];
+                const p: VarDecl* = DeclarationNode::var_of(p_decl);
+                const op_decl: DeclarationNode* = original.func.parameters[i];
+                const op: VarDecl* = DeclarationNode::var_of(op_decl);
                 if (p == null || op == null) { continue; }
                 if (!this.type_has_unresolved(p.resolved_type, 0)) { continue; }
                 if (!op.resolved_type.is_valid()) { continue; }
@@ -2220,7 +2228,8 @@ type struct MonoCallSpecializer {
                 subst_ptr.apply(spec_method.func.resolved_return_type, this.arena));
         }
         for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
-            const sp: VarDeclNode* = spec_method.func.parameters[i];
+            const sp_decl: DeclarationNode* = spec_method.func.parameters[i];
+            const sp: VarDecl* = DeclarationNode::var_of(sp_decl);
             if (sp != null && sp.resolved_type.is_valid()) {
                 sp.set_resolved_type(subst_ptr.apply(sp.resolved_type, this.arena));
             }
@@ -2232,7 +2241,8 @@ type struct MonoCallSpecializer {
                 this.trait_spec.reduce_projections(spec_method.func.resolved_return_type));
         }
         for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
-            const sp2: VarDeclNode* = spec_method.func.parameters[i];
+            const sp2_decl: DeclarationNode* = spec_method.func.parameters[i];
+            const sp2: VarDecl* = DeclarationNode::var_of(sp2_decl);
             if (sp2 != null && sp2.resolved_type.is_valid()) {
                 sp2.set_resolved_type(this.trait_spec.reduce_projections(sp2.resolved_type));
             }
@@ -2243,7 +2253,8 @@ type struct MonoCallSpecializer {
             return null;
         }
         for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
-            const p: VarDeclNode* = spec_method.func.parameters[i];
+            const p_decl: DeclarationNode* = spec_method.func.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p != null && this.type_has_unresolved(p.resolved_type, 0)) {
                 return null;
             }
@@ -2270,7 +2281,8 @@ type struct MonoCallSpecializer {
             this.state.request_nested_instantiations(spec_method.func.resolved_return_type);
         }
         for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
-            const sp: VarDeclNode* = spec_method.func.parameters[i];
+            const sp_decl: DeclarationNode* = spec_method.func.parameters[i];
+            const sp: VarDecl* = DeclarationNode::var_of(sp_decl);
             if (sp != null && sp.resolved_type.is_valid()) {
                 this.state.request_nested_instantiations(sp.resolved_type);
             }

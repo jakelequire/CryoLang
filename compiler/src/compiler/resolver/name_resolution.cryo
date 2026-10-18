@@ -44,7 +44,7 @@ import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDecl, EnumDecl, EnumVariant,
     ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlock,
     DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDecl,
-    TraitDecl, TypeAliasDecl, UnionDecl, VarDeclNode
+    TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
@@ -277,17 +277,18 @@ type struct NameResolver {
     /// Declare a C-imported global in its alias's module, as the module's
     /// own constant or variable, exported: `cit::FLAG_A` is then the
     /// module lane's answer, as `cit::add3` and `cit::Vec2` are.
-    declare_c_imported_global(&this, c_module: ModulePath, node: VarDeclNode*) -> void {
+    declare_c_imported_global(&this, c_module: ModulePath, decl: DeclarationNode*,
+                              node: VarDecl*) -> void {
         if (!c_module.is_valid() || !node.name.is_valid()) { return; }
         const saved_module: ModulePath = this.resolver.current_module_path();
         const saved_scope: u64 = this.resolver.get_current_scope_id();
         this.resolver.set_module(c_module);
         const sym_id: SymbolID = if (node.is_mutable) {
-            this.resolver.declare_variable(node.name, node.span, true, true)
+            this.resolver.declare_variable(node.name, decl.span, true, true)
         } else {
-            this.resolver.declare_constant(node.name, node.span)
+            this.resolver.declare_constant(node.name, decl.span)
         };
-        this.resolver.record_resolution(node.span, sym_id);
+        this.resolver.record_resolution(decl.span, sym_id);
         this.resolver.export_symbol(sym_id);
         node.def = this.resolver.get_symbol(sym_id).def;
         if (!node.is_mutable) { this.record_const_value(this.resolver.get_symbol(sym_id).def, node); }
@@ -369,6 +370,41 @@ type struct NameResolver {
         return false;
     }
 
+    /// Declare a module-level variable `decl` (whose payload is `var_node`);
+    /// a local is declared where the body walk meets it.
+    forward_declare_var(mut &this, decl: DeclarationNode*, var_node: VarDecl*) -> void {
+        // A C-imported global (binding_namespace set) is a
+        // declaration of its alias's module, reachable as
+        // `cit::NAME`; declared bare here it would shadow same-leaf
+        // globals in other modules.
+        if (var_node.is_global && !var_node.binding_namespace.is_valid()) {
+            // An immutable global is a named constant
+            // (`SymbolKind::Constant`); a mutable global is a variable.
+            // The kind lets later passes treat a const named in a
+            // `match` arm as a value pattern rather than a binding.
+            const sym_id: SymbolID = if (var_node.is_mutable) {
+                this.resolver.declare_variable(
+                    var_node.name, decl.span, true, true)
+            } else {
+                this.resolver.declare_constant(
+                    var_node.name, decl.span)
+            };
+            this.resolver.record_resolution(decl.span, sym_id);
+            var_node.def = this.resolver.get_symbol(sym_id).def;
+            // The export set is what `exports_named` reads, so a
+            // module-level declaration left out of it cannot be
+            // resolved across modules by the name layer at all - which
+            // is what forces a later stage to key the global map by
+            // bare leaf and take whichever module registered last.
+            this.resolver.export_symbol(sym_id);
+            if (!var_node.is_mutable) {
+                this.record_const_value(this.resolver.get_symbol(sym_id).def, var_node);
+            }
+        } else if (var_node.is_global) {
+            this.declare_c_imported_global(var_node.binding_namespace, decl, var_node);
+        }
+    }
+
     forward_declare_node(mut &this, node: ASTNode*) -> void {
         match (node.kind) {
             NodeKind::FunctionDeclaration => {
@@ -398,42 +434,10 @@ type struct NameResolver {
                     }
                 }
             }
-            NodeKind::VariableDeclaration => {
-                const var_node: VarDeclNode* = node as VarDeclNode*;
-                // A C-imported global (binding_namespace set) is a
-                // declaration of its alias's module, reachable as
-                // `cit::NAME`; declared bare here it would shadow same-leaf
-                // globals in other modules.
-                if (var_node.is_global && !var_node.binding_namespace.is_valid()) {
-                    // An immutable global is a named constant
-                    // (`SymbolKind::Constant`); a mutable global is a variable.
-                    // The kind lets later passes treat a const named in a
-                    // `match` arm as a value pattern rather than a binding.
-                    const sym_id: SymbolID = if (var_node.is_mutable) {
-                        this.resolver.declare_variable(
-                            var_node.name, var_node.span, true, true)
-                    } else {
-                        this.resolver.declare_constant(
-                            var_node.name, var_node.span)
-                    };
-                    this.resolver.record_resolution(var_node.span, sym_id);
-                    var_node.def = this.resolver.get_symbol(sym_id).def;
-                    // The export set is what `exports_named` reads, so a
-                    // module-level declaration left out of it cannot be
-                    // resolved across modules by the name layer at all - which
-                    // is what forces a later stage to key the global map by
-                    // bare leaf and take whichever module registered last.
-                    this.resolver.export_symbol(sym_id);
-                    if (!var_node.is_mutable) {
-                        this.record_const_value(this.resolver.get_symbol(sym_id).def, var_node);
-                    }
-                } else if (var_node.is_global) {
-                    this.declare_c_imported_global(var_node.binding_namespace, var_node);
-                }
-            }
             NodeKind::Declaration => {
                 const decl: DeclarationNode* = node as DeclarationNode*;
                 match (decl.shape) {
+                    DeclKind::Variable(var_node) => { this.forward_declare_var(decl, var_node); }
                     DeclKind::Extern(extern_node) => {
                         if (extern_node.is_c_import()) {
                             // A C import: the alias is a binding of this module to a
@@ -612,9 +616,9 @@ type struct NameResolver {
     keep_declared(&this, node: ASTNode*) -> void {
         const d: DefId = match (node.kind) {
             NodeKind::ClassDeclaration     => { (node as ClassDeclNode*).def }
-            NodeKind::VariableDeclaration  => { (node as VarDeclNode*).def }
             NodeKind::Declaration => {
                 match ((node as DeclarationNode*).shape) {
+                    DeclKind::Variable(v)        => { v.def }
                     DeclKind::Intrinsic(i)       => { i.def }
                     DeclKind::Trait(t)           => { t.def }
                     DeclKind::TypeAlias(a)       => { a.def }
@@ -833,7 +837,10 @@ type struct NameResolver {
     /// Whether parameter `i` repeats the name of an earlier parameter.
     static repeats_parameter(node: FunctionDeclNode*, i: i64) -> boolean {
         for (mut j: i64 = 0; j < i; j++) {
-            if (node.parameters[j].name.id == node.parameters[i].name.id) { return true; }
+            if (DeclarationNode::var_of(node.parameters[j]).name.id
+                    == DeclarationNode::var_of(node.parameters[i]).name.id) {
+                return true;
+            }
         }
         return false;
     }
@@ -2397,7 +2404,7 @@ type struct NameResolver {
     /// Kept under `def`, the definition the constant was just declared as:
     /// the one every use's stamp carries, a C-imported constant's in its
     /// alias module as any other's in its own.
-    record_const_value(&this, def: DefId, node: VarDeclNode*) -> void {
+    record_const_value(&this, def: DefId, node: VarDecl*) -> void {
         if (this.ctx == null || this.ctx.const_table == null) { return; }
         const intern: InternTable* = this.ctx.intern_table;
         if (intern == null) { return; }
@@ -2978,7 +2985,8 @@ implement trait Walk for struct NameResolver {
 
         // Declare parameters and record spans for type write-back
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const param: VarDeclNode* = node.parameters[i];
+            const param_decl: DeclarationNode* = node.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             // Reject a duplicate parameter name (E0205). `Scope::insert` drops
             // the duplicate silently, so `function f(x: i32, x: i32)` would
             // otherwise compile with the second `x` shadowed and unreachable.
@@ -2990,14 +2998,14 @@ implement trait Walk for struct NameResolver {
                     ErrorCode::E0205_REDEFINED_SYMBOL,
                     fmt::format("the parameter `%s` is already declared in this function",
                         this.resolver.intern_table.resolve(param.name)),
-                    param.span);
+                    param_decl.span);
             }
             // The receiver binds as `this` whatever its written form: `&this`
             // is a spelling no use can write, and every use of `this` in the
             // body names this parameter.
             const bound_as: SymbolStr = if (param.is_receiver()) { this.this_sym } else { param.name };
-            const param_sym: SymbolID = this.resolver.declare_parameter(bound_as, param.span);
-            this.resolver.record_resolution(param.span, param_sym);
+            const param_sym: SymbolID = this.resolver.declare_parameter(bound_as, param_decl.span);
+            this.resolver.record_resolution(param_decl.span, param_sym);
             param.set_sym_id(param_sym);
             // After `declare_generics`, so a parameter spelled `T` is answered
             // as the generic param it names rather than searched for as a type.
@@ -3363,7 +3371,7 @@ implement trait Walk for struct NameResolver {
         this.resolver.exit_scope();
     }
 
-    walk_var(mut &this, node: VarDeclNode*) -> void {
+    walk_var(mut &this, d: DeclarationNode*, node: VarDecl*) -> void {
         this.stamp_annotation(node.type_annotation);
         // Local variable declarations (globals handled in forward_declare)
         if (!node.is_global) {
@@ -3378,13 +3386,13 @@ implement trait Walk for struct NameResolver {
                     ErrorCode::E0205_REDEFINED_SYMBOL,
                     fmt::format("the name `%s` is already declared in this scope",
                         this.resolver.intern_table.resolve(node.name)),
-                    node.span);
+                    d.span);
             }
-            const sym_id: SymbolID = this.resolver.declare_variable(node.name, node.span, node.is_mutable,
+            const sym_id: SymbolID = this.resolver.declare_variable(node.name, d.span, node.is_mutable,
                                                           false);
             // Record the declaration span so downstream passes (TypeResolution,
-            // Sema) can map VarDeclNode.span -> SymbolID for type write-back.
-            this.resolver.record_resolution(node.span, sym_id);
+            // Sema) can map the declaration's span -> SymbolID for type write-back.
+            this.resolver.record_resolution(d.span, sym_id);
             node.set_sym_id(sym_id);
         }
 
@@ -3459,15 +3467,16 @@ implement trait Walk for struct NameResolver {
         // written name the name layer answers, not a token that needs no
         // answer.
         for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
-            this.stamp_annotation(node.parameters[pi].type_annotation);
+            this.stamp_annotation(DeclarationNode::var_of(node.parameters[pi]).type_annotation);
         }
         this.stamp_annotation(node.return_type_annotation);
         if (node.body != null) {
             this.resolver.enter_scope(ScopeKind::Function, this.resolver.intern_table.resolve(node.name), d.span);
             for (mut i: i64 = 0; i < node.parameters.length; i++) {
-                const param: VarDeclNode* = node.parameters[i];
-                const param_sym: SymbolID = this.resolver.declare_parameter(param.name, param.span);
-                this.resolver.record_resolution(param.span, param_sym);
+                const param_decl: DeclarationNode* = node.parameters[i];
+                const param: VarDecl* = DeclarationNode::var_of(param_decl);
+                const param_sym: SymbolID = this.resolver.declare_parameter(param.name, param_decl.span);
+                this.resolver.record_resolution(param_decl.span, param_sym);
                 param.set_sym_id(param_sym);
             }
             this.visit_block_contents(node.body);
@@ -3746,8 +3755,9 @@ implement trait Walk for struct NameResolver {
 
         // Declare parameters
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const param: VarDeclNode* = node.parameters[i];
-            param.set_sym_id(this.resolver.declare_parameter(param.name, param.span));
+            const param_decl: DeclarationNode* = node.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
+            param.set_sym_id(this.resolver.declare_parameter(param.name, param_decl.span));
             this.stamp_annotation(param.type_annotation);
         }
         this.stamp_annotation(node.return_type_ann);

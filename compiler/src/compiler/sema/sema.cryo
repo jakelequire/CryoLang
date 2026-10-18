@@ -70,7 +70,7 @@ import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
     FunctionDeclNode, GenericParamDecl, ImplBlock, MethodNode,
-    StructDecl, TraitDecl, UnionDecl, VarDeclNode
+    StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     CalleePin,
@@ -391,7 +391,7 @@ type struct SemaVisitor {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => { }
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => { }
                     }
                 }
                 _ => { }
@@ -876,7 +876,8 @@ type struct SemaVisitor {
     /// is the owner with its own parameters.
     written_receiver_type(&this, func: FunctionDeclNode*) -> TypeRef {
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const p: VarDeclNode* = func.parameters[i];
+            const p_decl: DeclarationNode* = func.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null || !p.is_value_receiver() || p.type_annotation == null) { continue; }
             if (!p.resolved_type.is_valid()) { return TypeRef::invalid(); }
             mut written: TypeRef = p.resolved_type;
@@ -959,7 +960,8 @@ type struct SemaVisitor {
         this.state.current_lambda      = null;
 
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const param: VarDeclNode* = func.parameters[i];
+            const param_decl: DeclarationNode* = func.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null) { continue; }
             // A parameter whose annotation failed to resolve was reported
             // where it was written; it is bound with NO type, so a use of it
@@ -1078,8 +1080,9 @@ type struct SemaVisitor {
                     StmtKind::Expr(e) => { this.resolve_expr(e.expression); }
                     _ => {}
                 }
-            } else if (node.init.kind == NodeKind::VariableDeclaration) {
-                const var_node: VarDeclNode* = node.init as VarDeclNode*;
+            } else if (DeclarationNode::var_of(node.init) != null) {
+                const decl: DeclarationNode* = DeclarationNode::with_shape(node.init);
+                const var_node: VarDecl* = DeclarationNode::var_of(decl);
                 if (var_node.type_annotation == null) {
                     const init_e: ExpressionNode* = var_node.initializer;
                     const init_is_lambda: boolean = init_e != null
@@ -1089,14 +1092,14 @@ type struct SemaVisitor {
                         mut diag: Diagnostic = Diagnostic::error(
                             ErrorCode::E0104_EXPECTED_TYPE,
                             fmt::format("for-loop initializer `%s` needs a type annotation; type inference is only available for lambda initializers", var_name));
-                        diag = diag.at_with_label(var_node.span, "missing `:` and type annotation");
+                        diag = diag.at_with_label(decl.span, "missing `:` and type annotation");
                         this.ctx.emit_diagnostic(diag);
                     }
                 }
                 // Past the annotation rule a for-loop's binding is a declaration
                 // like any other: its initializer is typed under the declared
                 // type and checked against it.
-                this.check_var_decl(var_node);
+                this.check_var_decl(decl, var_node);
                 this.register_var_decl_local(var_node);
             }
         }
@@ -1201,14 +1204,14 @@ type struct SemaVisitor {
             this.visit_destructure(node.declaration, dd);
             return;
         }
-        if (decl.kind != NodeKind::VariableDeclaration) { return; }
-        const var_node: VarDeclNode* = decl as VarDeclNode*;
-        this.check_var_decl(var_node);
+        if (DeclarationNode::var_of(decl) == null) { return; }
+        const var_node: VarDecl* = DeclarationNode::var_of(decl);
+        this.check_var_decl(node.declaration, var_node);
         this.register_var_decl_local(var_node);
     }
 
     /// A declaration written at MODULE scope.  It reaches sema as a bare
-    /// `VarDeclNode` in the program's statement list, not wrapped in the
+    /// `VarDecl` in the program's statement list, not wrapped in the
     /// `DeclStmt` a body uses, so without this override `accept` found
     /// nothing and a global's initializer was never resolved: no type for
     /// codegen's constant folder to work from (the global then landed on the
@@ -1217,15 +1220,15 @@ type struct SemaVisitor {
     ///
     /// Guarded on `is_global` so this cannot become a second answering path for
     /// a local; the statement form and the for-loop form own those.
-    visit_var(mut &this, node: VarDeclNode*) -> void {
+    visit_var(mut &this, decl: DeclarationNode*, node: VarDecl*) -> void {
         if (node == null || !node.is_global) { return; }
         if (this.typed_before_bodies(node)) { return; }
-        this.check_var_decl(node);
+        this.check_var_decl(decl, node);
     }
 
     /// Whether `node` is a module-level variable with no written type and an
     /// initializer, which `type_unwritten_globals` checked before any body.
-    typed_before_bodies(&this, node: VarDeclNode*) -> boolean {
+    typed_before_bodies(&this, node: VarDecl*) -> boolean {
         return node.type_annotation == null && node.has_initializer();
     }
 
@@ -1238,13 +1241,14 @@ type struct SemaVisitor {
     type_unwritten_globals(mut &this, root: ProgramNode*) -> void {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
-            if (stmt == null || stmt.kind != NodeKind::VariableDeclaration) { continue; }
-            const var_node: VarDeclNode* = stmt as VarDeclNode*;
+            if (stmt == null || DeclarationNode::var_of(stmt) == null) { continue; }
+            const var_node: VarDecl* = DeclarationNode::var_of(stmt);
             if (!var_node.is_global || !this.typed_before_bodies(var_node)) { continue; }
             const registered: boolean = var_node.resolved_type.is_valid();
-            this.check_var_decl(var_node);
+            const decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+            this.check_var_decl(decl, var_node);
             if (!registered && var_node.resolved_type.is_valid()) {
-                TypeResolutionRunner::register_module_global(this.ctx, var_node);
+                TypeResolutionRunner::register_module_global(this.ctx, decl, var_node);
             }
         }
     }
@@ -1255,7 +1259,7 @@ type struct SemaVisitor {
     /// E0200 agreement between the two.  Shared by the statement form and the
     /// module-level form - they reach sema through different visitors and must
     /// not answer this differently.
-    check_var_decl(mut &this, var_node: VarDeclNode*) -> void {
+    check_var_decl(mut &this, decl: DeclarationNode*, var_node: VarDecl*) -> void {
 
         // A type-less binding with no initializer has nothing to infer from.
         // With an initializer, the binding's type is inferred from it below
@@ -1267,7 +1271,7 @@ type struct SemaVisitor {
             const var_name: string = this.intern.resolve(var_node.name);
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0104_EXPECTED_TYPE,
                 fmt::format("variable `%s` needs a type annotation or an initializer to infer from: write `: T` or `= <expr>`", var_name));
-            diag = diag.at_with_label(var_node.span, "no `:` type and no `=` initializer to infer from");
+            diag = diag.at_with_label(decl.span, "no `:` type and no `=` initializer to infer from");
             this.ctx.emit_diagnostic(diag);
         }
 
@@ -1400,7 +1404,7 @@ type struct SemaVisitor {
                 const var_name: string = this.intern.resolve(var_node.name);
                 mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0104_EXPECTED_TYPE,
                     fmt::format("cannot infer the type of `%s`: its initializer produces no value (`void`); add a `: T` annotation or use a value-producing initializer", var_name));
-                diag = diag.at_with_label(var_node.span, "binding has no inferable type");
+                diag = diag.at_with_label(decl.span, "binding has no inferable type");
                 this.ctx.emit_diagnostic(diag);
             }
             if (imp_ann != null && init_type.is_valid()) {
@@ -1413,7 +1417,7 @@ type struct SemaVisitor {
                     && this.symbolic.symbolic_judgeable(init_type)
                     && this.symbolic.symbolic_judgeable(var_node.resolved_type)) {
                 this.lambda.refuse_stored_closure(init_type, var_node.resolved_type,
-                    if (var_node.initializer != null) { var_node.initializer.span } else { var_node.span }, "a variable");
+                    if (var_node.initializer != null) { var_node.initializer.span } else { decl.span }, "a variable");
                 if (!this.checker.can_assign(init_type, var_node.resolved_type)) {
                     const conv: ExpressionNode* = this.calls.build_implicit_conversion(
                         this, var_node.initializer, init_type, var_node.resolved_type);
@@ -1422,7 +1426,7 @@ type struct SemaVisitor {
                         init_type = var_node.resolved_type;
                     } else {
                         const var_name: string = this.intern.resolve(var_node.name);
-                        const value_span: SourceSpan = if (var_node.initializer != null) { var_node.initializer.span } else { var_node.span };
+                        const value_span: SourceSpan = if (var_node.initializer != null) { var_node.initializer.span } else { decl.span };
                         const ann_span: SourceSpan = annotation_span(var_node.type_annotation);
                         this.diag.emit_declared_mismatch(
                             ErrorCode::E0200_TYPE_MISMATCH, value_span, var_node.resolved_type,
@@ -1440,7 +1444,7 @@ type struct SemaVisitor {
     /// form does this: a module-level declaration is already registered as a
     /// global by an earlier pass, and binding it here would shadow that global
     /// with a local for the rest of the module.
-    register_var_decl_local(mut &this, var_node: VarDeclNode*) -> void {
+    register_var_decl_local(mut &this, var_node: VarDecl*) -> void {
         mut ty: TypeRef = this.arena.get_void();
         mut is_mut: boolean = var_node.is_mutable;
         if (var_node.resolved_type.is_valid()) {
@@ -1661,7 +1665,6 @@ type struct SemaVisitor {
 
             NodeKind::Statement              => { this.dispatch_stmt(n as Stmt*); }
 
-            NodeKind::VariableDeclaration    => { this.visit_var(n as VarDeclNode*); }
             NodeKind::FunctionDeclaration    => { this.visit_function(n as FunctionDeclNode*); }
             NodeKind::ClassDeclaration       => { this.visit_class(n as ClassDeclNode*); }
 
@@ -1673,6 +1676,7 @@ type struct SemaVisitor {
                 const d: DeclarationNode* = n as DeclarationNode*;
                 match (d.shape) {
                     DeclKind::Destructure(dd) => { this.visit_destructure(d, dd); }
+                    DeclKind::Variable(v)     => { this.visit_var(d, v); }
                     DeclKind::Trait(t)        => { this.visit_trait(t); }
                     DeclKind::Union(u)        => { this.visit_union(u); }
                     DeclKind::Struct(s)       => { this.visit_struct(s); }
@@ -3792,7 +3796,8 @@ type struct SemaVisitor {
         if (m == null || m.is_static || m.ast_node == null) { return TypeRef::invalid(); }
         const node: MethodNode* = m.ast_node as MethodNode*;
         if (node.func == null || node.func.parameters.length == 0) { return TypeRef::invalid(); }
-        const recv: VarDeclNode* = node.func.parameters[0];
+        const recv_decl: DeclarationNode* = node.func.parameters[0];
+        const recv: VarDecl* = DeclarationNode::var_of(recv_decl);
         if (recv == null || !recv.is_receiver() || !recv.resolved_type.is_valid()) { return TypeRef::invalid(); }
         const sig: Type* = this.arena.lookup(m.function_type);
         if (sig == null || sig.kind != TypeKind::Function) { return TypeRef::invalid(); }
@@ -4516,7 +4521,7 @@ type struct SemaVisitor {
         }
     }
 
-    verify_impl_trait_bounds(mut &this, imp: ImplTraitAnnotation*, concrete: TypeRef, var_node: VarDeclNode*) -> void {
+    verify_impl_trait_bounds(mut &this, imp: ImplTraitAnnotation*, concrete: TypeRef, var_node: VarDecl*) -> void {
         if (imp == null) { return; }
         for (mut i: i64 = 0; i < imp.bounds.length; i++) {
             const trait_name: SymbolStr = this.trait_leaf_name(imp.bounds[i]);
@@ -4575,7 +4580,7 @@ type struct SemaVisitor {
         return true;
     }
 
-    check_opaque_assoc_item(mut &this, bound_ann: TypeAnnotation*, concrete: TypeRef, var_node: VarDeclNode*) -> void {
+    check_opaque_assoc_item(mut &this, bound_ann: TypeAnnotation*, concrete: TypeRef, var_node: VarDecl*) -> void {
         mut expected: TypeRef = TypeRef::invalid();
         mut actual:   TypeRef = TypeRef::invalid();
         mut trait_sym: SymbolStr = SymbolStr::empty();

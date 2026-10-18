@@ -78,7 +78,7 @@ import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl,
     DeclKind, FunctionDeclNode, ImplBlock, MethodNode, StructDecl,
-    UnionDecl, VarDeclNode
+    UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode, CalleePin, CastExprNode,
@@ -145,7 +145,7 @@ type struct DropInserter {
     resolver: Resolver*;
 
     /// Every per-binding set below is keyed by the binding's IDENTITY - the
-    /// symbol the name layer declared, `VarDeclNode.sym_id` at the
+    /// symbol the name layer declared, `VarDecl.sym_id` at the
     /// declaration and `Res::Local` at a use - and never by its spelling.  One
     /// function may declare a spelling more than once (an inner block's
     /// binding shadows an outer one; a loop body re-declares one every
@@ -859,7 +859,7 @@ type struct DropInserter {
                     DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                     | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                     | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                    | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                    | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
                 }
             }
             _ => {}
@@ -936,16 +936,17 @@ type struct DropInserter {
         // gate, exactly like locals. Params are registered before body locals,
         // so reverse-order scope-exit drops them last (after the locals).
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const p: VarDeclNode* = func.parameters[i];
+            const p_decl: DeclarationNode* = func.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null) { continue; }
-            this.register_param_type(p.name, p.sym_id, p.resolved_type, p.span);
+            this.register_param_type(p.name, p.sym_id, p.resolved_type, p_decl.span);
             if (p.name.is_valid() && p.sym_id.is_valid()
                     && this.type_needs_drop(p.resolved_type)
                     && this.param_drop_well_formed(p.resolved_type)) {
                 this.binding_syms.push(p.sym_id);
                 this.binding_names.push(p.name.id);
                 this.binding_types.push(p.resolved_type);
-                this.binding_spans.push(p.span);
+                this.binding_spans.push(p_decl.span);
                 // A by-value param is initialized by the caller's move-in, so
                 // it is unconditionally live - no init flag (keep the parallel
                 // arrays in lock-step; register_binding is bypassed here).
@@ -1199,9 +1200,9 @@ type struct DropInserter {
                 const decl_snap: i64 = this.snapshot_moves();
                 this.stmt_writes_flags = true;
                 if (ds.declaration != null) {
-                    if (ds.declaration.kind == NodeKind::VariableDeclaration) {
-                        const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
-                        this.walk_var_decl(vd);
+                    if (DeclarationNode::var_of(ds.declaration) != null) {
+                        const vd: VarDecl* = DeclarationNode::var_of(ds.declaration);
+                        this.walk_var_decl(ds.declaration);
                         // A droppable local declared WITHOUT an initializer is
                         // only conditionally initialized: assigned on some paths,
                         // untouched on others.  Attach an init flag so its
@@ -1217,10 +1218,10 @@ type struct DropInserter {
                             !vd.is_capture_alias &&
                             this.type_needs_drop(vd.resolved_type)) {
                             if (!this.attach_member_flags(vd.name, vd.sym_id,
-                                                          vd.resolved_type, vd.span,
+                                                          vd.resolved_type, ds.declaration.span,
                                                           &flag_decls)) {
                                 init_flag = this.attach_init_flag(vd.name, vd.sym_id,
-                                                                  vd.span);
+                                                                  ds.declaration.span);
                             }
                         }
                     } else if (DeclarationNode::destructure_of(ds.declaration) != null) {
@@ -1318,7 +1319,8 @@ type struct DropInserter {
         };
     }
 
-    walk_var_decl(mut &this, vd: VarDeclNode*) -> void {
+    walk_var_decl(mut &this, d: DeclarationNode*) -> void {
+        const vd: VarDecl* = DeclarationNode::var_of(d);
         if (vd == null) { return; }
         if (vd.initializer != null) {
             this.walk_expr_move(vd.initializer);
@@ -1330,7 +1332,7 @@ type struct DropInserter {
         // `__call__` invocation would drop the captured value on return.
         if (vd.is_capture_alias) { return; }
         if (!vd.is_global) {
-            this.register_binding(vd.name, vd.sym_id, vd.resolved_type, vd.span,
+            this.register_binding(vd.name, vd.sym_id, vd.resolved_type, d.span,
                                   vd.initializer != null);
         }
     }
@@ -1465,8 +1467,8 @@ type struct DropInserter {
         // enclosing block.  Push a scope so the init binding is dropped
         // when the for finishes.
         this.push_scope();
-        if (f.init != null && f.init.kind == NodeKind::VariableDeclaration) {
-            this.walk_var_decl(f.init as VarDeclNode*);
+        if (f.init != null && DeclarationNode::var_of(f.init) != null) {
+            this.walk_var_decl(DeclarationNode::with_shape(f.init));
         }
         if (f.condition != null) { this.walk_expr_read(f.condition); }
         const snap: i64 = this.snapshot_moves();
@@ -2798,12 +2800,13 @@ type struct DropInserter {
             fmt::format("__assign_old%lld", this.assign_seq)));
         this.assign_seq = this.assign_seq + 1;
 
-        const vd: VarDeclNode* = new VarDeclNode(old.name, span);
+        const vd: VarDecl* = VarDecl::new(old.name);
+        const vd_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vd), span);
         vd.set_sym_id(old.binding);
         vd.set_resolved_type(ty);
         vd.set_initializer(place);
-        const ds: Stmt* = Stmt::decl_stmt(vd as DeclarationNode*, span);
-        vd.generated = true;
+        const ds: Stmt* = Stmt::decl_stmt(vd_decl, span);
+        vd_decl.generated = true;
         ds.generated = true;
         out.push(ds);
 
@@ -2859,12 +2862,13 @@ type struct DropInserter {
         const tmp: PassLocal = this.mint_local(this.intern.intern(
             fmt::format("__drop_tmp%d", this.discard_seq)));
         this.discard_seq = this.discard_seq + 1;
-        const vd: VarDeclNode* = new VarDeclNode(tmp.name, span);
+        const vd: VarDecl* = VarDecl::new(tmp.name);
+        const vd_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vd), span);
         vd.set_sym_id(tmp.binding);
         vd.set_resolved_type(ty);
         vd.set_initializer(expr);
-        const ds: Stmt* = Stmt::decl_stmt(vd as DeclarationNode*, span);
-        vd.generated = true;
+        const ds: Stmt* = Stmt::decl_stmt(vd_decl, span);
+        vd_decl.generated = true;
         ds.generated = true;
         out.push(ds);
         const drop_stmt: Stmt* = this.make_drop_call(tmp, ty, span);
@@ -2895,12 +2899,13 @@ type struct DropInserter {
         // allocator, and the subject identifier carries it, so the arm walk's
         // consumption tracking finds the binding by what it IS.
         const sym: SymbolID = this.resolver.alloc_synthetic_binding();
-        mut vd: VarDeclNode* = new VarDeclNode(name, span);
+        mut vd: VarDecl* = VarDecl::new(name);
+        const vd_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vd), span);
         vd.set_sym_id(sym);
         vd.set_resolved_type(ty);
         vd.set_initializer(m.subject);
-        const ds: Stmt* = Stmt::decl_stmt(vd as DeclarationNode*, span);
-        vd.generated = true;
+        const ds: Stmt* = Stmt::decl_stmt(vd_decl, span);
+        vd_decl.generated = true;
         ds.generated = true;
         out.push(ds);
         // Register the synthesized binding so scope-exit drop synthesis sees
@@ -2957,15 +2962,16 @@ type struct DropInserter {
                          span: SourceSpan) -> Stmt* {
         const lit: LiteralNode* = new LiteralNode("false", LiteralKind::Boolean, span);
         lit.set_resolved_type(this.arena.get_bool());
-        const vd: VarDeclNode* = new VarDeclNode(flag.name, span);
+        const vd: VarDecl* = VarDecl::new(flag.name);
+        const vd_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vd), span);
         vd.set_sym_id(flag.binding);
         vd.set_resolved_type(this.arena.get_bool());
         vd.set_mutable(true);
         vd.set_drop_flag(true);
         vd.set_initializer(lit as ExpressionNode*);
-        const ds: Stmt* = Stmt::decl_stmt(vd as DeclarationNode*, span);
+        const ds: Stmt* = Stmt::decl_stmt(vd_decl, span);
         lit.generated = true;
-        vd.generated = true;
+        vd_decl.generated = true;
         ds.generated = true;
         return ds;
     }
@@ -3389,9 +3395,9 @@ type struct DropInserter {
             }
             StmtKind::Decl(ds) => {
                 if (ds.declaration != null &&
-                    ds.declaration.kind == NodeKind::VariableDeclaration) {
+                    DeclarationNode::var_of(ds.declaration) != null) {
                     this.disq_scan_expr(
-                        (ds.declaration as VarDeclNode*).initializer);
+                        (DeclarationNode::var_of(ds.declaration)).initializer);
                 } else if (DeclarationNode::destructure_of(ds.declaration) != null) {
                     this.disq_scan_expr(DeclarationNode::destructure_of(ds.declaration).initializer);
                 }
@@ -3416,8 +3422,8 @@ type struct DropInserter {
                 // f.init is an ASTNode* (usually a `mut i = 0` var decl); only
                 // its initializer can hold a disqualifying use.
                 if (f.init != null &&
-                    f.init.kind == NodeKind::VariableDeclaration) {
-                    this.disq_scan_expr((f.init as VarDeclNode*).initializer);
+                    DeclarationNode::var_of(f.init) != null) {
+                    this.disq_scan_expr((DeclarationNode::var_of(f.init)).initializer);
                 }
                 this.disq_scan_expr(f.condition);
                 this.disq_scan_expr(f.update);

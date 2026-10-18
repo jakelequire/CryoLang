@@ -27,7 +27,7 @@ import compiler::ast::declaration::{
     EnumVariant, ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl,
     DeclKind, ImplBlock, ImportDecl, IntrinsicDecl, MethodNode,
     ModuleDecl, StructDecl, TraitDecl, TypeAliasDecl, UnionDecl,
-    VarDeclNode
+    VarDecl
 };
 import compiler::ast::expression::{
     AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
@@ -145,7 +145,6 @@ type struct ASTCloner {
 
             NodeKind::Statement                 => { return this.copy_stmt(n as Stmt*); }
 
-            NodeKind::VariableDeclaration       => { return this.visit_var(n as VarDeclNode*); }
             NodeKind::FunctionDeclaration       => { return this.visit_function(n as FunctionDeclNode*); }
             NodeKind::MethodDeclaration         => { return this.visit_method(n as MethodNode*); }
             NodeKind::Declaration               => { return this.copy_decl_shape(n as DeclarationNode*); }
@@ -732,15 +731,6 @@ type struct ASTCloner {
 
     // Declaration visitors
 
-    visit_var(mut &this, node: VarDeclNode*) -> ASTNode* {
-        const c: VarDeclNode* = this.clone_var_decl(node);
-        // A local declaration's decided type is carried, and a copy's
-        // substitution rewrites it.  Only the statement: a parameter's type
-        // is the copy's signature, which monomorphization builds itself.
-        c.resolved_type = node.resolved_type;
-        return c;
-    }
-
     visit_function(mut &this, node: FunctionDeclNode*) -> ASTNode* {
         const name: SymbolStr = this.consume_spec_name(node.name);
         const skip_gp: boolean = this.consume_skip_generics();
@@ -1075,6 +1065,15 @@ type struct ASTCloner {
                 c.has_value      = n.has_value;
                 DeclKind::Variant(c)
             }
+            DeclKind::Variable(n) => {
+                const c: VarDecl* = this.copy_var(n);
+                // A local declaration's decided type is carried, and a copy's
+                // substitution rewrites it.  Only here: a parameter's type is
+                // the copy's signature, which monomorphization builds itself
+                // (`clone_var_decl`).
+                c.resolved_type = n.resolved_type;
+                DeclKind::Variable(c)
+            }
             // Built with its own `NodeKind`, which `dispatch_node` copies.
             DeclKind::Legacy => { unreachable() }
         };
@@ -1207,10 +1206,17 @@ type struct ASTCloner {
 
     // Typed clone helpers (avoid code duplication)
 
-    /// Clone a VarDeclNode.
-    clone_var_decl(mut &this, node: VarDeclNode*) -> VarDeclNode* {
-        mut c: VarDeclNode* = new VarDeclNode(node.name, node.span);
+    /// Clone a variable declaration (a parameter, without its decided type).
+    clone_var_decl(mut &this, node: DeclarationNode*) -> DeclarationNode* {
+        const c: DeclarationNode* = DeclarationNode::of(
+            DeclKind::Variable(this.copy_var(DeclarationNode::var_of(node))), node.span);
         this.copy_decl_base(node, c);
+        return c;
+    }
+
+    /// The payload of a variable's copy; its resolved type is left invalid.
+    copy_var(mut &this, node: VarDecl*) -> VarDecl* {
+        mut c: VarDecl* = VarDecl::new(node.name);
         c.is_mutable       = node.is_mutable;
         c.is_auto          = node.is_auto;
         c.is_global        = node.is_global;

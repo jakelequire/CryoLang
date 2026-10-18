@@ -61,7 +61,7 @@ import utils::logger::{ cdebug };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDeclNode,
-    ImplBlock, MethodNode, StructDecl, UnionDecl, VarDeclNode
+    ImplBlock, MethodNode, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ DirectiveArg, DirectiveArgKind, DirectiveNode };
@@ -161,7 +161,6 @@ implement enum DirectiveTarget {
             NodeKind::FunctionDeclaration   => { DirectiveTarget::Function }
             NodeKind::MethodDeclaration     => { DirectiveTarget::Method   }
             NodeKind::ClassDeclaration      => { DirectiveTarget::Class    }
-            NodeKind::VariableDeclaration   => { DirectiveTarget::Variable }
             NodeKind::Declaration => {
                 match ((n as DeclarationNode*).shape) {
                     DeclKind::Enum(_)           => { DirectiveTarget::Enum   }
@@ -174,6 +173,7 @@ implement enum DirectiveTarget {
                     DeclKind::Struct(_)         => { DirectiveTarget::Struct }
                     DeclKind::Impl(_)           => { DirectiveTarget::Impl   }
                     DeclKind::Field(_)          => { DirectiveTarget::Field  }
+                    DeclKind::Variable(_)       => { DirectiveTarget::Variable }
                     DeclKind::Variant(_)        => { DirectiveTarget::Other  }
                     DeclKind::GenericParam(_)   => { DirectiveTarget::Other  }
                     DeclKind::Destructure(_)    => { DirectiveTarget::Other  }
@@ -641,7 +641,7 @@ type struct DirectiveProcessingPasses {
             }
 
             // `![thread_local]`: zero args; variable-target only.  Applied in
-            // `apply_effects` onto the VarDeclNode.
+            // `apply_effects` onto the VarDecl.
             "thread_local" => {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
@@ -1179,8 +1179,8 @@ type struct DirectiveProcessingPasses {
 
         // `![thread_local]` on a global variable: mark it for thread-local
         // emission (read by codegen_global_var and cross-module extern refs).
-        if (decl.kind == NodeKind::VariableDeclaration) {
-            const vd: VarDeclNode* = decl as VarDeclNode*;
+        if (DeclarationNode::var_of(decl) != null) {
+            const vd: VarDecl* = DeclarationNode::var_of(decl);
             // TypeResolution registered this global before directives ran,
             // under its definition; a directive corrects that slot.
             if (name.eq("thread_local")) {
@@ -1707,7 +1707,7 @@ type struct DirectiveProcessingPasses {
                         DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                         | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => {}
                     }
                 }
                 _ => {}
@@ -1736,7 +1736,8 @@ type struct DirectiveProcessingPasses {
         if (fn.parameters.length != 1) { return; }
         if (fn.generic_params.length != 0) { return; }
         if (!fn.resolved_return_type.is_valid()) { return; }
-        const p: VarDeclNode* = fn.parameters[0];
+        const p_decl: DeclarationNode* = fn.parameters[0];
+        const p: VarDecl* = DeclarationNode::var_of(p_decl);
         if (p == null || !p.resolved_type.is_valid()) { return; }
         ctx.decl_index.register_implicit_converter(
             p.resolved_type, fn.resolved_return_type, fn.def);
@@ -1832,7 +1833,7 @@ type struct DirectiveProcessingPasses {
                         DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Field(_)
                         | DeclKind::GenericParam(_) | DeclKind::Impl(_) | DeclKind::Import(_)
                         | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Legacy => { }
+                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Legacy => { }
                     }
                 }
                 _ => { }

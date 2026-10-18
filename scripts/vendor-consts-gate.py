@@ -4,7 +4,7 @@
 WHY THIS EXISTS
 ---------------
 The vendor path has two halves that must agree on an AST shape: the importer
-BINDS a constant (into a VarDeclNode) and the serializer WRITES it (as `.cryo`
+BINDS a constant (into a variable declaration) and the serializer WRITES it (as `.cryo`
 source text).  When they disagree, the importer's own translation report still
 says the constant bound, the generator still exits 0, and the constant is
 simply absent from the generated file.  Nothing downstream can tell that apart

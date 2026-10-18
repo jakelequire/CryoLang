@@ -68,7 +68,7 @@ import compiler::ast::declaration::{
     BindingAccessor, DeclarationNode, DeclKind, EnumDecl, EnumVariant, ExternBlock,
     FieldDecl,
     FunctionDeclNode, ImplBlock, MethodNode, ReceiverForm, StructDecl,
-    TypeAliasDecl, UnionDecl, VarDeclNode
+    TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::diag::diagnostic::{ Diagnostic };
@@ -563,14 +563,15 @@ type struct Importer {
     /// lower to.  `binding_namespace` keeps it reachable only as `alias::name`.
     emit_alias_const(mut &this, name_sym: SymbolStr,
                      type_annotation: TypeAnnotation*, init: ExpressionNode*) -> void {
-        mut vnode: VarDeclNode* = new VarDeclNode(name_sym, SourceSpan::none());
+        mut vnode: VarDecl* = VarDecl::new(name_sym);
+        const vnode_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vnode), SourceSpan::none());
         vnode.is_global = true;
         vnode.is_mutable = false;
         vnode.binding_namespace = this.alias;
         vnode.type_annotation = type_annotation;
         vnode.set_initializer(this.widen_integer_init(type_annotation, init));
         this.seen_names.push(name_sym);
-        this.emit_top_level(vnode as ASTNode*);
+        this.emit_top_level(vnode_decl as ASTNode*);
     }
 
     /// Emit one FunctionDeclNode for a C function prototype.
@@ -581,14 +582,15 @@ type struct Importer {
         mut func: FunctionDeclNode* = new FunctionDeclNode(name_sym, SourceSpan::none());
         func.return_type_annotation = this.types.map(clang::clang_getCursorResultType(cursor));
 
-        mut params: [VarDeclNode*] = [];
+        mut params: [DeclarationNode*] = [];
         for (mut i: i32 = 0; i < nargs; i++) {
             const arg: CXCursor = clang::clang_Cursor_getArgument(cursor, i as u32);
             const ptype: TypeAnnotation* = this.types.map(clang::clang_getCursorType(arg));
             const pname: SymbolStr = arg.intern_arg_name(i, this.ctx);
-            mut pnode: VarDeclNode* = new VarDeclNode(pname, SourceSpan::none());
+            mut pnode: VarDecl* = VarDecl::new(pname);
+            const pnode_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(pnode), SourceSpan::none());
             pnode.type_annotation = ptype;
-            params.push(pnode);
+            params.push(pnode_decl);
         }
         func.parameters = params;
         func.is_variadic =
@@ -801,11 +803,10 @@ type struct Importer {
         // `const T*`, so an immutable Cryo `&this` is the faithful receiver.
         if (!is_static) {
             const recv_tok: string = if (cursor.is_const_method()) { "&this" } else { "mut &this" };
-            mut recv: VarDeclNode* = new VarDeclNode(
-                this.ctx.intern_table.intern(recv_tok), SourceSpan::none());
+            mut recv: VarDecl* = VarDecl::new(this.ctx.intern_table.intern(recv_tok));
             recv.set_receiver(ReceiverForm::ByReference);
             recv.type_annotation = null;
-            func.parameters.push(recv);
+            func.parameters.push(DeclarationNode::of(DeclKind::Variable(recv), SourceSpan::none()));
         }
 
         const nargs: i32 = clang::clang_Cursor_getNumArguments(cursor);
@@ -813,9 +814,10 @@ type struct Importer {
             const arg: CXCursor = clang::clang_Cursor_getArgument(cursor, i as u32);
             const ptype: TypeAnnotation* = this.types.map(clang::clang_getCursorType(arg));
             const pname: SymbolStr = arg.intern_arg_name(i, this.ctx);
-            mut pnode: VarDeclNode* = new VarDeclNode(pname, SourceSpan::none());
+            mut pnode: VarDecl* = VarDecl::new(pname);
+            const pnode_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(pnode), SourceSpan::none());
             pnode.type_annotation = ptype;
-            func.parameters.push(pnode);
+            func.parameters.push(pnode_decl);
         }
         func.is_variadic =
             clang::clang_isFunctionTypeVariadic(clang::clang_getCursorType(cursor)) != 0;
@@ -1340,7 +1342,8 @@ type struct Importer {
             return;
         }
 
-        mut vnode: VarDeclNode* = new VarDeclNode(name_sym, SourceSpan::none());
+        mut vnode: VarDecl* = VarDecl::new(name_sym);
+        const vnode_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vnode), SourceSpan::none());
         vnode.is_global        = true;
         vnode.is_extern_import = true;
         vnode.is_mutable       = clang::clang_isConstQualifiedType(ctype) == 0;
@@ -1358,7 +1361,7 @@ type struct Importer {
         }
 
         this.seen_names.push(name_sym);
-        this.emit_top_level(vnode as ASTNode*);
+        this.emit_top_level(vnode_decl as ASTNode*);
     }
 
     /// Emit a `type alias` for a C typedef.  Skips the redundant
@@ -1873,17 +1876,19 @@ type struct Importer {
         wrapper.is_public = true;
         wrapper.return_type_annotation = target_fn.return_type_annotation;
 
-        mut params: [VarDeclNode*] = [];
+        mut params: [DeclarationNode*] = [];
         mut call_args: [ExpressionNode*] = [];
         for (mut i: i64 = 0; i < target_fn.parameters.length; i++) {
-            const tp: VarDeclNode* = target_fn.parameters[i];
+            const tp_decl: DeclarationNode* = target_fn.parameters[i];
+            const tp: VarDecl* = DeclarationNode::var_of(tp_decl);
             mut pname: SymbolStr = tp.name;
             if (this.ctx.intern_table.resolve(pname).eq("")) {
                 pname = this.ctx.intern_table.intern(fmt::format("arg%lld", i));
             }
-            mut pnode: VarDeclNode* = new VarDeclNode(pname, SourceSpan::none());
+            mut pnode: VarDecl* = VarDecl::new(pname);
+            const pnode_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(pnode), SourceSpan::none());
             pnode.type_annotation = tp.type_annotation;
-            params.push(pnode);
+            params.push(pnode_decl);
             call_args.push((new IdentifierNode(pname, SourceSpan::none())) as ExpressionNode*);
         }
         wrapper.parameters = params;

@@ -42,7 +42,7 @@ import compiler::ast::declaration::{
     FunctionDeclNode, GenericParamDecl, ImplBlock, ImportDecl,
     IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDecl,
-    TraitDecl, TypeAliasDecl, UnionDecl, VarDeclNode
+    TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     CallExprNode, ExpressionNode, IdentifierNode, MemberAccessNode
@@ -179,7 +179,6 @@ implement struct Parser {
         return match (node.kind) {
             NodeKind::FunctionDeclaration   => { true }
             NodeKind::ClassDeclaration      => { true }
-            NodeKind::VariableDeclaration   => { true }
             NodeKind::Declaration           => { true }
             _                               => { false }
         };
@@ -474,15 +473,15 @@ implement struct Parser {
         // Variable declaration: const or mut.  If the next-after token is `{`
         // it's a struct destructure binding (`const { f }: T = expr;`); these
         // are body-only (no global destructures), so the global path stays on
-        // the VarDeclNode form.
+        // the VarDecl form.
         if (tok.kind == TokenType::KwConst || tok.kind == TokenType::KwMut) {
             if (this.peek_at(1).kind == TokenType::LBrace && this.scope_depth > 0) {
                 return this.parse_destructure_decl();
             }
-            const vd: VarDeclNode* = this.parse_variable_declaration();
+            const vd: DeclarationNode* = this.parse_variable_declaration();
             if (vd != null) {
                 if (doc != "") { vd.set_documentation(doc_text); }
-                if (this.scope_depth == 0) { vd.set_global(true); }
+                if (this.scope_depth == 0) { DeclarationNode::var_of(vd).set_global(true); }
             }
             return vd;
         }
@@ -568,7 +567,7 @@ implement struct Parser {
     /// Parse a variable declaration: const/mut name: Type = expr;
     /// The variable name may be a keyword used as an identifier
     /// (e.g. `mut string: String`, `const default: i32`).
-    parse_variable_declaration() -> VarDeclNode* {
+    parse_variable_declaration() -> DeclarationNode* {
         const start: Token = this.current();
         const is_mutable: boolean = this.current().kind == TokenType::KwMut;
         this.advance(); // consume 'const' or 'mut'
@@ -581,9 +580,10 @@ implement struct Parser {
             name_tok = this.consume(TokenType::Identifier, "variable name");
         }
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: VarDeclNode* = new VarDeclNode(name, this.span_from_token(start));
+        mut node: VarDecl* = VarDecl::new(name);
+        const node_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(node), this.span_from_token(start));
         node.set_mutable(is_mutable);
-        node.set_name_span(this.span_from_token(name_tok));
+        node_decl.set_name_span(this.span_from_token(name_tok));
         // The leading `const`/`mut` keyword's exact span - recorded
         // separately from the whole-declaration span so E0218 can emit a
         // precise replace-keyword quickfix.
@@ -607,8 +607,8 @@ implement struct Parser {
         }
 
         this.consume(TokenType::Semicolon, "';'");
-        node.span = this.span_from(start);
-        return node;
+        node_decl.span = this.span_from(start);
+        return node_decl;
     }
 
     /// Parse a struct destructure declaration: `const { f1, f2: alias, mut f3 }: T = expr;`.
@@ -789,7 +789,7 @@ implement struct Parser {
     parse_function_param_list_into(func: FunctionDeclNode*) -> void {
         this.consume(TokenType::LParen, "'('");
         if (!this.check(TokenType::RParen)) {
-            const params: [VarDeclNode*] = this.parse_parameter_list();
+            const params: [DeclarationNode*] = this.parse_parameter_list();
             for (mut i: i64 = 0; i < params.length; i++) {
                 func.add_parameter(params[i]);
             }
@@ -808,8 +808,8 @@ implement struct Parser {
     /// instead of producing a parameter; the named form `args...` sets
     /// `this.pending_named_variadic` after pushing the parameter. Callers
     /// forward either flag onto the function node they're building.
-    parse_parameter_list() -> [VarDeclNode*] {
-        mut params: [VarDeclNode*] = [];
+    parse_parameter_list() -> [DeclarationNode*] {
+        mut params: [DeclarationNode*] = [];
         this.pending_bare_variadic  = false;
         this.pending_named_variadic = false;
 
@@ -822,7 +822,7 @@ implement struct Parser {
                 break;
             }
 
-            const param: VarDeclNode* = this.parse_parameter();
+            const param: DeclarationNode* = this.parse_parameter();
             if (param != null) {
                 params.push(param);
             }
@@ -904,16 +904,17 @@ implement struct Parser {
     give_receiver(func: FunctionDeclNode*, is_static: boolean) -> void {
         if (func == null || is_static) { return; }
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            if (func.parameters[i].is_receiver()) { return; }
+            if (DeclarationNode::var_of(func.parameters[i]).is_receiver()) { return; }
         }
         const at: SourceSpan = if (func.name_span.has_location()) { func.name_span } else { func.span };
         const span: SourceSpan = SourceSpan::new(at.file, at.start_line, at.start_col,
                                                  at.start_line, at.start_col);
-        mut param: VarDeclNode* = new VarDeclNode(this.ctx.intern("&this"), span);
+        mut param: VarDecl* = VarDecl::new(this.ctx.intern("&this"));
+        const param_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(param), span);
         param.set_mutable(false);
         param.set_receiver(ReceiverForm::ByReference);
         param.set_type_annotation(this.receiver_type_annotation(false, span));
-        func.parameters.insert(0, param);
+        func.parameters.insert(0, param_decl);
     }
 
     /// `give_receiver` over every method of a type body or an impl block, once
@@ -926,7 +927,7 @@ implement struct Parser {
     }
 
     /// Parse a single parameter: [mut] name: Type [= default]
-    parse_parameter() -> VarDeclNode* {
+    parse_parameter() -> DeclarationNode* {
         const start: Token = this.current();
         mut is_mutable: boolean = false;
         // Span of the leading `mut` keyword if present; otherwise an
@@ -952,14 +953,15 @@ implement struct Parser {
             this.advance(); // consume 'this'
             const pname: SymbolStr = this.ctx.intern("&this");
             const span: SourceSpan = this.span_from(start);
-            mut param: VarDeclNode* = new VarDeclNode(pname, span);
+            mut param: VarDecl* = VarDecl::new(pname);
+            const param_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(param), span);
             param.set_mutable(is_mutable);
             // One of the two places the receiver's spelling is read; every
             // later stage asks the mark.
             param.set_receiver(ReceiverForm::ByReference);
 
             param.set_type_annotation(this.receiver_type_annotation(is_mutable, span));
-            return param;
+            return param_decl;
         }
 
         // Accept keywords as parameter names (e.g., this, default, type, value).
@@ -973,7 +975,8 @@ implement struct Parser {
             name_tok = this.consume(TokenType::Identifier, "parameter name");
         }
         const pname: SymbolStr = this.intern_lexeme(name_tok);
-        mut param: VarDeclNode* = new VarDeclNode(pname, this.span_from_token(name_tok));
+        mut param: VarDecl* = VarDecl::new(pname);
+        const param_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(param), this.span_from_token(name_tok));
         param.set_mutable(is_mutable);
         // A parameter written `this` is the by-value receiver: `this` is a
         // keyword, so nothing else can be spelled that way.  The other half of
@@ -981,7 +984,7 @@ implement struct Parser {
         if (name_tok.kind == TokenType::KwThis) {
             param.set_receiver(ReceiverForm::ByValue);
         }
-        param.set_name_span(this.span_from_token(name_tok));
+        param_decl.set_name_span(this.span_from_token(name_tok));
         // If no `mut` keyword was consumed, point kw_span at a zero-width
         // anchor just before the parameter name so a downstream E0218
         // fix can insert `mut ` at exactly the right place.
@@ -1000,7 +1003,7 @@ implement struct Parser {
             this.advance(); // consume '...'
             param.set_mutable(false);
             this.pending_named_variadic = true;
-            return param;
+            return param_decl;
         }
 
         // Type annotation
@@ -1015,8 +1018,8 @@ implement struct Parser {
             param.set_initializer(default_val);
         }
 
-        param.span = this.span_from(start);
-        return param;
+        param_decl.span = this.span_from(start);
+        return param_decl;
     }
 
     /// Parse a struct declaration: type struct Name<T> { fields, methods }
@@ -2488,7 +2491,7 @@ implement struct Parser {
                     node.add_function(func);
                 }
             } else if (this.check(TokenType::KwMut) || this.check(TokenType::KwConst)) {
-                const gvar: VarDeclNode* = this.parse_extern_global();
+                const gvar: DeclarationNode* = this.parse_extern_global();
                 if (gvar != null) {
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         gvar.add_directive(pending_dirs[pi]);
@@ -2612,9 +2615,10 @@ implement struct Parser {
     /// cannot be inferred because there is nothing to infer it from.  `mut` and
     /// `const` still say what CRYO may do with it - `const` is not a promise
     /// about the library, which remains free to change the value.
-    parse_extern_global() -> VarDeclNode* {
-        mut node: VarDeclNode* = this.parse_variable_declaration();
-        if (node == null) { return null; }
+    parse_extern_global() -> DeclarationNode* {
+        const decl: DeclarationNode* = this.parse_variable_declaration();
+        if (decl == null) { return null; }
+        mut node: VarDecl* = DeclarationNode::var_of(decl);
         node.is_global = true;
         node.is_extern_import = true;
         if (node.initializer != null) {
@@ -2625,7 +2629,7 @@ implement struct Parser {
             this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
                 "an imported global needs a type annotation: there is no initializer to infer one from");
         }
-        return node;
+        return decl;
     }
 
     /// Move an `extern "C"` block's imported globals into the top-level
@@ -2665,15 +2669,16 @@ implement struct Parser {
         // Parameter list
         this.consume(TokenType::LParen, "'('");
         if (!this.check(TokenType::RParen)) {
-            const params: [VarDeclNode*] = this.parse_parameter_list();
+            const params: [DeclarationNode*] = this.parse_parameter_list();
             for (mut i: i64 = 0; i < params.length; i++) {
-                const p: VarDeclNode* = params[i];
+                const p_decl: DeclarationNode* = params[i];
+                const p: VarDecl* = DeclarationNode::var_of(p_decl);
                 // Detect variadic marker: the `args...` param has no type
                 // annotation (parse_parameter returns it early on `...`).
                 if (p.type_annotation == null && i == params.length - 1) {
                     node.is_variadic = true;
                 } else {
-                    node.parameters.push(p);
+                    node.parameters.push(p_decl);
                 }
             }
         }
@@ -3165,7 +3170,7 @@ implement struct Parser {
                 }
                 return null;
             }
-            const var_decl: VarDeclNode* = this.parse_variable_declaration();
+            const var_decl: DeclarationNode* = this.parse_variable_declaration();
             if (var_decl != null) {
                 return Stmt::decl_stmt(var_decl, var_decl.span);
             }
@@ -3398,12 +3403,12 @@ implement struct Parser {
         const iter_name: SymbolStr = this.ctx.intern(iter_str);
 
         // `mut __cryo_for_iter_N = collection;`
-        mut iter_decl: VarDeclNode* = new VarDeclNode(iter_name, full_span);
-        iter_decl.set_mutable(true);
-        iter_decl.set_auto(true);                      // type from initializer
-        iter_decl.set_initializer(collection);
+        mut iter_var: VarDecl* = VarDecl::new(iter_name);
+        iter_var.set_mutable(true);
+        iter_var.set_auto(true);                      // type from initializer
+        iter_var.set_initializer(collection);
         const iter_decl_stmt: Stmt* = Stmt::decl_stmt(
-            iter_decl as DeclarationNode*, full_span);
+            DeclarationNode::of(DeclKind::Variable(iter_var), full_span), full_span);
 
         // `__cryo_for_iter_N.next()` - match scrutinee.  The call is
         // `Iterator::next`: the loop is defined over the language's

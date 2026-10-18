@@ -206,6 +206,16 @@ public:
         };
     }
 
+    /// The variable `n` is (a local, a global or a parameter), or null.
+    static var_of(n: ASTNode*) -> VarDecl* {
+        const d: DeclarationNode* = DeclarationNode::with_shape(n);
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Variable(v) => { v }
+            _                     => { null }
+        };
+    }
+
     /// The import (or export) declaration `n` is, or null.
     static import_of(n: ASTNode*) -> ImportDecl* {
         const d: DeclarationNode* = DeclarationNode::with_shape(n);
@@ -303,8 +313,8 @@ implement enum ReceiverForm {
 }
 
 
-type class VarDeclNode : DeclarationNode {
-public:
+/// A variable: a local, a global, or a parameter.
+type struct VarDecl {
     name:            SymbolStr;
     initializer:     ExpressionNode*;
     is_mutable:      boolean;
@@ -374,29 +384,30 @@ public:
     /// `ReceiverForm`.  `NotReceiver` on every local and every other parameter.
     receiver:         ReceiverForm;
 
-    VarDeclNode(name: SymbolStr, span: SourceSpan)
-        : DeclarationNode(NodeKind::VariableDeclaration, span) {
-        this.name             = name;
-        this.initializer      = null;
-        this.is_mutable       = false;
-        this.is_auto          = false;
-        this.is_global        = false;
-        this.type_annotation  = null;
-        this.resolved_type    = TypeRef::invalid();
-        this.kw_span          = SourceSpan::none();
-        this.is_capture_alias = false;
-        this.is_drop_flag     = false;
-        this.binding_namespace = ModulePath::none();
-        this.is_thread_local  = false;
-        this.is_extern_import = false;
-        this.link_name        = "";
-        this.sym_id           = SymbolID::invalid();
-        this.def              = DefId::invalid();
-        this.receiver         = ReceiverForm::NotReceiver;
+    static new(name: SymbolStr) -> VarDecl* {
+        return new VarDecl {
+            name:              name,
+            initializer:       null,
+            is_mutable:        false,
+            is_auto:           false,
+            is_global:         false,
+            type_annotation:   null,
+            resolved_type:     TypeRef::invalid(),
+            kw_span:           SourceSpan::none(),
+            is_capture_alias:  false,
+            is_drop_flag:      false,
+            binding_namespace: ModulePath::none(),
+            is_thread_local:   false,
+            is_extern_import:  false,
+            link_name:         "",
+            sym_id:            SymbolID::invalid(),
+            def:               DefId::invalid(),
+            receiver:          ReceiverForm::NotReceiver,
+        };
     }
 
     /// Record that this parameter is the enclosing method's receiver.
-    set_receiver(form: ReceiverForm) -> void { this.receiver = form; }
+    set_receiver(mut &this, form: ReceiverForm) -> void { this.receiver = form; }
 
     /// Whether this parameter is the receiver, in either form.
     is_receiver(&this) -> boolean { return this.receiver.is_receiver(); }
@@ -420,28 +431,38 @@ public:
 
     /// Rename this declaration.  The receiver mark goes with the spelling:
     /// a renamed parameter is no longer the one the language named.
-    set_name(n: SymbolStr) -> void {
+    set_name(mut &this, n: SymbolStr) -> void {
         this.name     = n;
         this.receiver = ReceiverForm::NotReceiver;
     }
 
-    has_initializer() -> boolean     { return this.initializer != null; }
-    has_type_annotation() -> boolean { return this.type_annotation != null; }
-    has_resolved_type() -> boolean   { return this.resolved_type.is_valid(); }
+    has_initializer(&this) -> boolean     { return this.initializer != null; }
+    has_type_annotation(&this) -> boolean { return this.type_annotation != null; }
+    has_resolved_type(&this) -> boolean   { return this.resolved_type.is_valid(); }
 
-    set_initializer(expr: ExpressionNode*) -> void  { this.initializer = expr; }
-    set_mutable(v: boolean) -> void                 { this.is_mutable = v; }
-    set_auto(v: boolean) -> void                    { this.is_auto = v; }
-    set_global(v: boolean) -> void                  { this.is_global = v; }
-    set_type_annotation(a: TypeAnnotation*) -> void { this.type_annotation = a; }
-    set_resolved_type(t: TypeRef) -> void           { this.resolved_type = t; }
-    set_kw_span(s: SourceSpan) -> void              { this.kw_span = s; }
-    set_capture_alias(v: boolean) -> void           { this.is_capture_alias = v; }
-    set_drop_flag(v: boolean) -> void               { this.is_drop_flag = v; }
+    set_initializer(mut &this, expr: ExpressionNode*) -> void  { this.initializer = expr; }
+    set_mutable(mut &this, v: boolean) -> void                 { this.is_mutable = v; }
+    set_auto(mut &this, v: boolean) -> void                    { this.is_auto = v; }
+    set_global(mut &this, v: boolean) -> void                  { this.is_global = v; }
+    set_type_annotation(mut &this, a: TypeAnnotation*) -> void { this.type_annotation = a; }
+    set_resolved_type(mut &this, t: TypeRef) -> void           { this.resolved_type = t; }
+    set_kw_span(mut &this, s: SourceSpan) -> void              { this.kw_span = s; }
+    set_capture_alias(mut &this, v: boolean) -> void           { this.is_capture_alias = v; }
+    set_drop_flag(mut &this, v: boolean) -> void               { this.is_drop_flag = v; }
     /// Record the binding this declaration introduced.  Written once, by the
     /// resolver that declared the name; a second answer would mean two
     /// resolvers disagreeing about which binding this is.
-    set_sym_id(s: SymbolID) -> void                 { this.sym_id = s; }
+    set_sym_id(mut &this, s: SymbolID) -> void                 { this.sym_id = s; }
+
+    static walk_children<V>(n: VarDecl*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.initializer);
+    }
+}
+
+implement trait Allocate for struct VarDecl {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
 }
 
 
@@ -459,7 +480,7 @@ type struct DestructureBinding {
     name_span:     SourceSpan;    // span of just the local name
     resolved_type: TypeRef;       // sema fills from the struct field's type
     /// The binding the name layer declared for `local_name`: the key a pass
-    /// keeping per-binding state takes, as `VarDeclNode.sym_id` is.
+    /// keeping per-binding state takes, as `VarDecl.sym_id` is.
     sym_id:        SymbolID;
     /// The position of `source_field` among the type's declared fields, which
     /// sema pins where it checks the destructure; -1 until then, or for a
@@ -517,7 +538,7 @@ implement trait Allocate for struct DestructureDecl {
 type class FunctionDeclNode : DeclarationNode {
 public:
     name:                   SymbolStr;
-    parameters:             [VarDeclNode*];
+    parameters:             [DeclarationNode*];
     generic_params:         [DeclarationNode*];
     trait_bounds:           [TraitBound];
     body:                   Stmt*;
@@ -745,7 +766,7 @@ public:
         return false;
     }
 
-    add_parameter(param: VarDeclNode*) -> void {
+    add_parameter(param: DeclarationNode*) -> void {
         this.parameters.push(param);
     }
 
@@ -878,6 +899,7 @@ type enum DeclKind {
     Trait(TraitDecl*);
     TypeAlias(TypeAliasDecl*);
     Union(UnionDecl*);
+    Variable(VarDecl*);
     Variant(EnumVariant*);
 }
 
@@ -888,7 +910,7 @@ type struct IntrinsicDecl {
     /// The definition this declaration is, stamped by the name layer when
     /// it declares the intrinsic, as a function's is.
     def:                    DefId;
-    parameters:             [VarDeclNode*];
+    parameters:             [DeclarationNode*];
     body:                   Stmt*;
     resolved_return_type:   TypeRef;
     return_type_annotation: TypeAnnotation*;
@@ -911,7 +933,8 @@ type struct IntrinsicDecl {
     fixed_param_count(&this) -> u32 {
         mut count: u32 = this.parameters.length as u32;
         if (this.is_variadic && count > 0) {
-            const last: VarDeclNode* = this.parameters[count - 1];
+            const last_decl: DeclarationNode* = this.parameters[count - 1];
+            const last: VarDecl* = DeclarationNode::var_of(last_decl);
             if (last.type_annotation == null) {
                 count -= 1;
             }
@@ -1951,7 +1974,7 @@ type struct ExternBlock {
     /// another object, and every later pass already knows how to handle a
     /// top-level global.  Teaching each of those passes to also look inside an
     /// extern block would be the same rule written several times.
-    globals:         [VarDeclNode*];
+    globals:         [DeclarationNode*];
 
     static new(linkage_type: string) -> ExternBlock* {
         return new ExternBlock {
@@ -1973,7 +1996,7 @@ type struct ExternBlock {
     }
 
     /// Record an imported global declared inside this block.
-    add_global(mut &this, node: VarDeclNode*) -> void {
+    add_global(mut &this, node: DeclarationNode*) -> void {
         this.globals.push(node);
     }
 

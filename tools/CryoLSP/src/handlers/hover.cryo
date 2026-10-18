@@ -19,7 +19,7 @@ import compiler::ast::{ NodeKind, TypeAnnotation };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, EnumVariant, FieldDecl, FunctionDeclNode,
-    MethodNode, VarDeclNode
+    MethodNode, VarDecl
 };
 import compiler::resolver::res::{ DefId, DefKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
@@ -166,6 +166,11 @@ type struct Shown {
                     DeclKind::Trait(_)     => { this.text = "type trait " + this.path(d); }
                     DeclKind::Union(_)     => { this.text = "type union " + this.path(d); }
                     DeclKind::Struct(_)    => { this.text = "type struct " + this.path(d); }
+                    DeclKind::Variable(v)  => {
+                        const kw: string = if (v.is_mutable) { "mut " } else { "const " };
+                        this.text = kw + this.path(d) + ": "
+                            + this.names.type_text_written(v.resolved_type, v.type_annotation);
+                    }
                     DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Impl(_)
                     | DeclKind::Variant(_) | DeclKind::Extern(_) | DeclKind::Destructure(_)
                     | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Legacy => {
@@ -174,12 +179,6 @@ type struct Shown {
                 }
             }
             NodeKind::ClassDeclaration     => { this.text = "type class " + this.path(d); }
-            NodeKind::VariableDeclaration => {
-                const v: VarDeclNode* = decl as VarDeclNode*;
-                const kw: string = if (v.is_mutable) { "mut " } else { "const " };
-                this.text = kw + this.path(d) + ": "
-                    + this.names.type_text_written(v.resolved_type, v.type_annotation);
-            }
             _ => { this.text = this.path(d); }
         }
     }
@@ -198,13 +197,14 @@ type struct Shown {
             + this.names.type_text_written(f.resolved_return_type, f.return_type_annotation);
     }
 
-    params(&this, ps: &[VarDeclNode*], receiver: boolean) -> string {
+    params(&this, ps: &[DeclarationNode*], receiver: boolean) -> string {
         mut out: string = "";
         for (mut i: i64 = 0; i < ps.length; i++) {
             if (i > 0) { out = out + ", "; }
-            out = out + this.ctx.intern_table.resolve(ps[i].name);
+            const p: VarDecl* = DeclarationNode::var_of(ps[i]);
+            out = out + this.ctx.intern_table.resolve(p.name);
             if (i > 0 || !receiver) {
-                out = out + ": " + this.names.type_text_written(ps[i].resolved_type, ps[i].type_annotation);
+                out = out + ": " + this.names.type_text_written(p.resolved_type, p.type_annotation);
             }
         }
         return out;
@@ -221,9 +221,9 @@ type struct Shown {
         }
         // A binding declared with an annotation shows its type as written.
         const at: ASTNode* = Declared::binding_node(this.ctx, s);
-        if (at != null && at.kind == NodeKind::VariableDeclaration) {
+        if (at != null && DeclarationNode::var_of(at) != null) {
             this.text = kw + name + ": "
-                + this.names.type_text_written(ty, (at as VarDeclNode*).type_annotation);
+                + this.names.type_text_written(ty, (DeclarationNode::var_of(at)).type_annotation);
             return;
         }
         this.text = kw + name + ": " + this.type_text(ty);
