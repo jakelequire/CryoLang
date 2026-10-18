@@ -1507,6 +1507,12 @@ type struct DeclarationEmitter {
         // since a store into a constant global is one the optimizer may
         // read past.
         const started: boolean = !init.is_valid() && init_expr != null;
+        // Each thread's copy of a thread-local starts from the global's
+        // static data; a value computed at program start would reach the
+        // main thread's copy only, and every other thread would read zero.
+        if (started && node.is_thread_local) {
+            this.refuse_computed_thread_local(node, init_expr);
+        }
         if (!init.is_valid()) {
             init = LType::const_null(ty);
         }
@@ -1527,6 +1533,18 @@ type struct DeclarationEmitter {
         }
 
         this.globals.register(this.global_cache_slot(node), global);
+    }
+
+    /// E0646 at a `![thread_local]` global whose initializer is not a
+    /// constant the program can carry as static data.
+    refuse_computed_thread_local(&this, node: VarDecl*, init_expr: ExpressionNode*) -> void {
+        const name: string = this.resolve(node.name);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0646_THREAD_LOCAL_NOT_CONSTANT,
+            fmt::format("thread-local `%s` is initialized by a value computed at program start", name));
+        d = d.at_with_label(init_expr.span, "not a constant");
+        d = d.with_note("every thread's copy of a thread-local starts from its initializer as static data; a computed value would reach the main thread's copy only");
+        d = d.help("initialize it with a constant (a number, `null`, a string literal, or array and struct literals of those writing every field) and assign the computed value on each thread that reads it");
+        this.diag.emit(d);
     }
 
     /// The function that computes the module's started globals, opened with
@@ -2523,7 +2541,7 @@ type struct DeclarationEmitter {
     /// emits the field initializers in struct DECLARATION order, so a positional
     /// zip against the LLVM struct's element types is exact.  Every field init
     /// must fold to a constant (`const_element`: a number, a `null` or string
-    /// literal, a nested array); any non-constant field, or a field-count mismatch (an unexpected shape),
+    /// literal, a nested array or struct literal); any non-constant field, or a field-count mismatch (an unexpected shape),
     /// returns an invalid value so the caller declines to the zeroinitializer
     /// fallback - correct-or-decline, never a silently wrong layout.
     /// `layout` is the Cryo type whose field list `sl` initializes, so a field
@@ -2579,10 +2597,11 @@ type struct DeclarationEmitter {
     /// disagree about which expressions are constant, and the disagreement
     /// would surface as a zeroed aggregate rather than as an error.
     ///
-    /// A nested aggregate recurses, so `[[f32; 2]; 2]` and an array inside a struct
-    /// are built rather than declined.  A struct element declines: building one
-    /// needs its layout to map field order onto element order, which is reached
-    /// from the declaration and not from the llvm type in hand here.
+    /// A nested aggregate recurses, so `[[f32; 2]; 2]`, an array inside a
+    /// struct and a struct literal inside either are built rather than
+    /// declined.  A struct literal's layout, which maps its field order onto
+    /// element order, is its own type's, not anything the llvm type in hand
+    /// says.
     const_element(&this, ety: LType, expr: ExpressionNode*) -> LValue {
         if (expr == null) { return LValue::null(); }
         const k: LTypeKind = LType::kind_of(ety.raw);
@@ -2602,6 +2621,10 @@ type struct DeclarationEmitter {
         }
         if (k == LTypeKind::Array && expr.kind == NodeKind::ArrayLiteral) {
             return this.try_const_array(expr as ArrayLiteralNode*, ety);
+        }
+        if (k == LTypeKind::Struct && expr.kind == NodeKind::StructLiteral) {
+            const sl: StructLiteralNode* = expr as StructLiteralNode*;
+            return this.try_const_struct(this.type_mapper, this.arena_type(sl.resolved_type), sl, ety);
         }
         if (k == LTypeKind::Pointer) {
             return this.const_pointer(ety, expr);
