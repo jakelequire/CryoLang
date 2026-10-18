@@ -1516,6 +1516,17 @@ type struct NameResolver {
     /// path is its target's, and the target may be stamped in a module
     /// walked later: claimed now, and answered once every module's names
     /// are (`NameResolutionPass::settle_alias_paths`).
+    /// Whether `r` names a type alias with parameters of its own.
+    names_generic_alias(&this, r: Res) -> boolean {
+        return match (r) {
+            Res::Def(d) => {
+                const alias: TypeAliasDecl* = NameResolutionPass::alias_decl(this.ctx, d);
+                alias != null && alias.generic_params.length > 0
+            }
+            _ => { false }
+        };
+    }
+
     answer_type_scope(&this, node: ScopeResolutionNode*, base: ResBase, trailing: u32) -> void {
         match (base) {
             ResBase::Def(d) => {
@@ -3743,7 +3754,14 @@ implement trait Walk for struct NameResolver {
         // lookup a bare value name gets - `type_sym` above answers whether the
         // leaf binds here, which is not the same thing.
         match (this.type_spelling_res(node.struct_type, node.span)) {
-            ResSlot::Answered(r) => { node.set_res(r); }
+            ResSlot::Answered(r) => {
+                if (this.names_generic_alias(r)) {
+                    NameResolutionPass::refuse_generic_alias_literal(this.ctx, node);
+                    node.set_res(Res::Err);
+                } else {
+                    node.set_res(r);
+                }
+            }
             _                    => {
                 if (this.refuse_unbound_type(node.struct_type, node.span)) {
                     node.set_res(Res::Err);
@@ -4108,6 +4126,20 @@ type struct NameResolutionPass {
                 written, member, written));
         d = d.at_with_label(span, "a generic alias used as a path");
         d = d.help("write the path through the type the alias names, with its type arguments");
+        ctx.emit_diagnostic(d);
+    }
+
+    /// E0233 at a struct literal through a generic alias, `Keyed::<boolean> {
+    /// ... }` with `type Keyed<T> = Pair<T, i64>;`: like a path through one,
+    /// the literal would name the target over the alias's arguments, which
+    /// nothing substitutes, so it is refused where it is written.
+    static refuse_generic_alias_literal(ctx: CompilationContext*, node: StructLiteralNode*) -> void {
+        const written: string = ctx.resolver.intern_table.resolve(node.struct_type);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
+            fmt::format("cannot build a `%s` literal: `%s` is a generic type alias, and a struct literal through one is not supported",
+                written, written));
+        d = d.at_with_label(node.span, "a generic alias used as a struct literal's type");
+        d = d.help("write the literal through the type the alias names, with its type arguments");
         ctx.emit_diagnostic(d);
     }
 

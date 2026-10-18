@@ -1506,7 +1506,16 @@ committed with the change and deleted in the next commit.
   three refusals of valid alias uses, the same on the parent: a call
   through a function-type alias, an operator on a call returning an
   alias, and a struct literal through a generic alias reported as a
-  mismatch instead of E0233.
+  mismatch instead of E0233.  The literal is refused with E0233 by the
+  name layer now (`refuse_generic_alias_literal`), as a path through such
+  an alias is.  The other two share one cause: every module's signatures
+  are resolved before any alias target is recorded (type resolution's
+  first phase), so a parameter or return type written as an alias keeps
+  the alias, which no call or operator looks through.  Resolving the
+  targets first thing in the signature pass fixes both and moves no
+  object, but refuses (E0206) two overloads that differ only by an alias
+  and its target, which build today, the alias one unreachable; it waits
+  for Jake.
 - `Field(FieldDecl*)` followed.  A struct's, union's or class's `fields`
   hold the headers (`[DeclarationNode*]`), read through
   `DeclarationNode::field_of`, the projection `variant_of` is for a
@@ -1760,6 +1769,93 @@ committed with the change and deleted in the next commit.
   16-byte `shape` on every declaration, converted or not, is the bridge's
   cost until the last kind converts.  Selfhost fixed point on both hosts;
   clean build 0 warnings.
+
+**Expressions: prepared, not started.**  Conversion waits for Jake's
+answer on the unchecked pointer arguments (the type check does not compare
+a pointer argument of a free function, a static function or a class
+constructor with its parameter): an expression payload handed where an
+`ExpressionNode*` is wanted would compile silently there, and expressions
+are handed to static helpers far more often than declarations were.
+
+- **Inventory.**  25 expression classes deriving from `ExpressionNode`, one
+  per `NodeKind`, plus `NodeKind::AsyncExpression`, which nothing builds:
+  its six uses are no-op arms (cloner, walk, sema, codegen, the kind's
+  name and `is_expression`), so it is deleted, not converted.
+  `NodeKind::Expression` is built nowhere either and is free to be the
+  bridge kind, as `Statement` and `Declaration` are.  The header
+  `ExpressionNode` (resolved type, auto-ref flag, argument binding) stays a
+  class under the bridge and gains `shape: ExprKind` with a `Legacy`
+  variant; it has 913 references and 218 `as ExpressionNode*` casts in the
+  compiler (9 and 5 in the language server).
+- **Sizing per kind** (compiler / language server; a scan over the tree
+  counting the class name as a word, `as X*` casts, `NodeKind::K` uses and
+  `new X(` constructions; its controls are a converted kind's
+  `NodeKind::WhileStatement`, which counts 0, and `BinaryExpression`,
+  which does not).  The last column is `async_lower.cryo`'s share of
+  references / casts / kind tests.
+
+  | kind | refs | casts | kind tests | `new` | async lowering |
+  |---|---|---|---|---|---|
+  | Sizeof | 37 / 2 | 8 / 1 | 14 / 1 | 2 | 0 / 0 / 1 |
+  | Alignof | 35 / 2 | 8 / 1 | 14 / 1 | 2 | 0 / 0 / 1 |
+  | Typeof | 38 / 2 | 9 / 1 | 13 / 1 | 2 | 3 / 2 / 2 |
+  | Yield | 32 / 2 | 6 / 1 | 10 / 1 | 2 | 0 / 0 / 0 |
+  | Delete | 45 / 2 | 13 / 1 | 17 / 1 | 2 | 7 / 5 / 5 |
+  | New | 59 / 6 | 13 / 2 | 17 / 2 | 2 | 5 / 2 / 2 |
+  | Try | 61 / 2 | 16 / 1 | 27 / 1 | 2 | 7 / 3 / 10 |
+  | Lambda | 64 / 3 | 14 / 1 | 19 / 1 | 2 | 5 / 2 / 2 |
+  | TupleLiteral | 61 / 2 | 17 / 1 | 22 / 1 | 2 | 11 / 5 / 5 |
+  | ArrayLiteral | 69 / 3 | 18 / 1 | 24 / 1 | 2 | 11 / 5 / 5 |
+  | StructLiteral | 103 / 6 | 28 / 2 | 34 / 2 | 5 | 25 / 11 / 11 |
+  | Literal | 149 / 0 | 27 / 0 | 37 / 0 | 37 | 13 / 0 / 2 |
+  | Ternary | 78 / 3 | 25 / 1 | 28 / 1 | 2 | 21 / 10 / 10 |
+  | If | 81 / 3 | 26 / 1 | 30 / 1 | 2 | 21 / 10 / 10 |
+  | StaticMatch | 63 / 3 | 16 / 1 | 20 / 1 | 2 | 3 / 1 / 1 |
+  | Match | 96 / 3 | 30 / 1 | 33 / 1 | 5 | 26 / 12 / 12 |
+  | Cast | 88 / 5 | 32 / 2 | 36 / 2 | 3 | 14 / 11 / 11 |
+  | Unary | 155 / 3 | 44 / 2 | 50 / 2 | 18 | 28 / 13 / 13 |
+  | Binary | 137 / 3 | 40 / 1 | 46 / 1 | 5 | 34 / 13 / 13 |
+  | ArrayAccess | 110 / 3 | 33 / 1 | 37 / 1 | 5 | 27 / 13 / 13 |
+  | Await | 53 / 2 | 18 / 1 | 22 / 1 | 2 | 18 / 11 / 11 |
+  | Identifier | 241 / 6 | 68 / 2 | 81 / 2 | 28 | 43 / 7 / 11 |
+  | ScopeResolution | 231 / 7 | 38 / 2 | 45 / 2 | 12 | 14 / 3 / 4 |
+  | MemberAccess | 268 / 9 | 69 / 3 | 71 / 3 | 33 | 39 / 17 / 17 |
+  | Call | 375 / 12 | 39 / 3 | 45 / 3 | 34 | 49 / 16 / 15 |
+
+  Totals over the 25 kinds in the compiler: 2,729 references, 655 casts,
+  798 kind tests (`AsyncExpression`'s six included).  The async lowering
+  (8,070 lines) holds casts of 21 of the 25 kinds, so it cannot get one
+  commit of its own under a per-kind conversion: every kind's commit
+  touches it.  What can be its own commit is `Await`, whose arms are the
+  state machine's.
+- **Proposed order**, one kind per commit, smallest and least
+  identity-bearing first, each proved like a declaration kind (verify
+  identical, `--ast` with a relabelled control that contains the kind, the
+  cast and argument scans with their parent-source controls, the shape
+  scans over the language server, selfhost, warnings, check cost):
+  1. The bridge: `ExprKind` with `Legacy`, `ExpressionNode::of(shape,
+     span)`, `walk_expr_shape`, `copy_expr_shape`; `NodeKind::AsyncExpression`
+     deleted.
+  2. The type-operand leaves: Sizeof, Alignof, Typeof.
+  3. Yield, Delete, New, Try (small; Try's ten kind tests in the async
+     lowering are its `?` desugaring checks).  A `new` of a class
+     constructor is deleted with the class in slice 9; until then New's
+     payload carries the constructor arguments beside the heap struct
+     initializer, as the class does.
+  4. The literals: Tuple, Array, Struct, then Literal (37 constructions,
+     most synthesized: a factory per literal kind first).
+  5. The value-producing control forms: Ternary, If, StaticMatch, Match
+     (they share the async lowering's expression-statement rewrites).
+  6. The operators: Cast, Unary, Binary, ArrayAccess.
+  7. Lambda (the closure synthesizer and capture analysis), then Await
+     (the state machine), each its own commit.
+  8. The names and paths last, the identity-heavy ones the language server
+     reads most: Identifier, ScopeResolution, MemberAccess, Call.  Each
+     carries a `res` slot the name layer writes and every later stage
+     reads by address, so each is the size of the function conversion.
+  When the last kind converts, `Legacy` goes and `ExpressionNode` becomes
+  the `Expr` struct by a codemod renaming every `ExpressionNode*`, as the
+  section above says.
 
 ### Slice 7: the remaining walks and traits
 
