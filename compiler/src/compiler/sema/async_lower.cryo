@@ -58,7 +58,7 @@ import compiler::types::generic::{
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, DestructureBinding, DestructureDecl, FieldDecl, FunctionDeclNode,
-    GenericParamDecl, ImplBlockNode, MethodNode, ReceiverForm, StructDecl, TraitDecl,
+    GenericParamDecl, ImplBlock, MethodNode, ReceiverForm, StructDecl, TraitDecl,
     VarDeclNode
 };
 import compiler::ast::expression::{
@@ -293,16 +293,18 @@ type struct AsyncOwner {
     /// The owner's generic parameters. The future is generic in these as well
     /// as in the method's own, since the body may mention either.
     params:       [DeclarationNode*];
-    /// The enclosing impl block when the owner is one, else null. Carried so an
-    /// `async` method implementing an `async` TRAIT method can bind the trait's
-    /// implicit `<Method>Fut` associated type to the future it lowers to.
-    impl_node:    ImplBlockNode*;
+    /// The enclosing impl block's declaration when the owner is one, else
+    /// null.  Carried so an `async` method implementing an `async` TRAIT
+    /// method can bind the trait's implicit `<Method>Fut` associated type to
+    /// the future it lowers to, and so the future is minted in the block's
+    /// module.
+    impl_decl:    DeclarationNode*;
 
     /// The owner of a free function: no method, no receiver, no owner keys.
     static free() -> AsyncOwner {
         return AsyncOwner { method: null, ty: TypeRef::invalid(),
                             decl: TypeRef::invalid(), written: SymbolStr::empty(),
-                            params: [], impl_node: null };
+                            params: [], impl_decl: null };
     }
 }
 
@@ -361,9 +363,10 @@ type struct AsyncDecl {
     state_sym:   SymbolStr;
 
     // Nodes created empty by `declare` and completed by `lower`.  The future
-    // struct is held by its declaration, the node the program holds.
+    // struct and its `Future` implementation are held by their declarations,
+    // the nodes the program holds.
     struct_decl: DeclarationNode*;
-    impl_node:   ImplBlockNode*;
+    impl_node:   DeclarationNode*;
     poll_fn:     FunctionDeclNode*;
     poll_method: MethodNode*;
 }
@@ -770,9 +773,10 @@ type struct AsyncLower {
     bind_async_trait_assoc(mut &this, owner: AsyncOwner*, node: FunctionDeclNode*,
                            fut_ann: TypeAnnotation*) -> void {
         if (owner == null || node == null || fut_ann == null) { return; }
-        if (owner.impl_node == null || !owner.impl_node.is_trait_impl()) { return; }
+        const impl_node: ImplBlock* = DeclarationNode::impl_of(owner.impl_decl);
+        if (impl_node == null || !impl_node.is_trait_impl()) { return; }
         const leaf: DefId =
-            TypeAnnotation::trait_def(owner.impl_node.trait_annotation);
+            TypeAnnotation::trait_def(impl_node.trait_annotation);
         if (!leaf.is_valid()) { return; }
         const tdecl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(leaf);
         if (tdecl == null) { return; }
@@ -786,8 +790,8 @@ type struct AsyncLower {
             if (tf != null && tf.is_async && item >= 0 && this.ctx.generic_registry.trait_item_slot(leaf, tf.name) == item) { slot = tf.async_fut_slot; break; }
         }
         if (slot < 0) { return; }
-        if (owner.impl_node.assoc_binding_at(tdecl, slot) != null) { return; }
-        owner.impl_node.bind_assoc_slot(slot, fut_ann);
+        if (impl_node.assoc_binding_at(tdecl, slot) != null) { return; }
+        impl_node.bind_assoc_slot(slot, fut_ann);
     }
 
     /// An annotation for the `Future`'s `Output` — the declared return type, or
@@ -7343,7 +7347,7 @@ type struct AsyncLower {
         // it; anything else is the function's own file.  The counter in
         // `mint_bare` is per module, so the module is what keeps one
         // trait's fifteen implementations' futures apart.
-        const mint_file: string = if (owner.impl_node != null) { owner.impl_node.span.file } else { node.span.file };
+        const mint_file: string = if (owner.impl_decl != null) { owner.impl_decl.span.file } else { node.span.file };
         const fut_def: DefId = this.ctx.register_in_module(
             this.ctx.module_of_file(mint_file), bare, DefKind::Type, span);
         const q_name: SymbolStr = this.ctx.defs.path_of(fut_def).spelling();
@@ -7536,7 +7540,8 @@ type struct AsyncLower {
 
         // `implement trait Future<Output> for struct <Q>`, its head stamped
         // with the declaration a written one's would resolve to.
-        mut impl_node: ImplBlockNode* = new ImplBlockNode(q_name, span);
+        const impl_node: ImplBlock* = ImplBlock::new(q_name);
+        const impl_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Impl(impl_node), span);
         // The head names the struct registered above; a synthesized node is
         // walked by no resolver, so the synthesizer that holds the definition
         // records it.
@@ -7546,23 +7551,23 @@ type struct AsyncLower {
             args: [this.output_type_ann(&d, span)],
             span: span,
         };
-        impl_node.set_trait_annotation(new TypeAnnotation::Generic(gen));
+        impl_node.trait_annotation = new TypeAnnotation::Generic(gen);
         impl_node.trait_def = future_id;
         impl_node.add_assoc_binding(this.intern.intern("Output"), this.output_type_ann(&d, span));
-        impl_node.add_method(poll_method);
+        impl_node.methods.push(poll_method);
         if (generic) {
             for (mut gi: i64 = 0; gi < d.fut_params.length; gi++) {
-                impl_node.add_generic_param(d.fut_params[gi]);
+                impl_node.generic_params.push(d.fut_params[gi]);
             }
             // `target_args` is what makes `This` inside the impl resolve to the
             // full `Fut<T>` rather than the bare template base.
-            impl_node.set_target_args(this.generic_param_anns(d.fut_params, span));
+            impl_node.target_args = this.generic_param_anns(d.fut_params, span);
             // Hang the block off the template so the same demand that specializes
             // `Fut<i64>` specializes its `Future` impl. Without it the
             // specialization exists but has no `poll`.
-            this.ctx.generic_registry.register_impl_block(impl_node.target_def(), impl_node);
+            this.ctx.generic_registry.register_impl_block(impl_node.target_def(), impl_decl);
         }
-        d.impl_node = impl_node;
+        d.impl_node = impl_decl;
         this.bind_async_trait_assoc(&owner, node, this.future_type_ann(&d, span));
 
         // Register the struct's method + trait impl.
@@ -7572,7 +7577,7 @@ type struct AsyncLower {
 
         // `.poll()` dispatch and the `F: Future<R>` bound check both select
         // the impl by the trait's identity and the struct's type.
-        this.ctx.generic_registry.register_trait_impl(future_id, struct_ref, impl_node);
+        this.ctx.generic_registry.register_trait_impl(future_id, struct_ref, impl_decl);
 
         // Repoint callers at the future type.
         node.set_resolved_return_type(self_ty);
@@ -7665,17 +7670,18 @@ type struct AsyncLower {
         // A method written in an implement block returns a future generic
         // in the block's parameters; stored in the owner's, as the block's
         // other returns are.
+        const impl_node: ImplBlock* = DeclarationNode::impl_of(owner.impl_decl);
         mut head: TypeSubstitution = TypeResolutionPasses::impl_params_to_owner(
-            owner.impl_node, this.ctx, this.arena);
+            impl_node, this.ctx, this.arena);
         // The block's trait arguments are lent, never copied: a by-value
         // copy of the block's array shares its buffer and frees it twice.
-        if (owner.impl_node == null) {
+        if (impl_node == null) {
             const no_trait_args: [TypeRef] = [];
             this.ctx.decl_index.register_methods_through(
                 owner.decl, arr, &head, &no_trait_args, this.intern, this.arena, "async_lower/repoint method");
         } else {
             this.ctx.decl_index.register_methods_through(
-                owner.decl, arr, &head, &owner.impl_node.trait_arg_types, this.intern, this.arena,
+                owner.decl, arr, &head, &impl_node.trait_arg_types, this.intern, this.arena,
                 "async_lower/repoint method");
         }
     }
@@ -7739,7 +7745,7 @@ type struct AsyncLower {
         const state_sym:   SymbolStr = this.pending[pi].state_sym;
         const struct_header: DeclarationNode* = this.pending[pi].struct_decl;
         const struct_decl: StructDecl*        = DeclarationNode::struct_of(struct_header);
-        mut impl:        ImplBlockNode*    = this.pending[pi].impl_node;
+        const impl:      DeclarationNode*  = this.pending[pi].impl_node;
         mut poll_fn:     FunctionDeclNode* = this.pending[pi].poll_fn;
         const method:      MethodNode* = this.pending[pi].method;
         const recv_field:  SymbolStr   = this.pending[pi].recv_field;

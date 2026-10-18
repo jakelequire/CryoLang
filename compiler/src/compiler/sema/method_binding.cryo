@@ -36,7 +36,7 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::{ state, type_utils, symbolic_checker, helpers };
 import std::fmt;
 import compiler::ast::declaration::{
-    AssocTypeDeclNode, ClassDeclNode, FunctionDeclNode, DeclarationNode, GenericParamDecl, ImplBlockNode,
+    AssocTypeDeclNode, ClassDeclNode, FunctionDeclNode, DeclarationNode, GenericParamDecl, ImplBlock,
     MethodNode, StructDecl, TraitDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -1048,9 +1048,9 @@ type struct MethodBinding {
         if (!method_name.is_valid()) { return false; }
         // The WRITTEN heads: the Item is read off the head's positional trait
         // arguments, which a placed clone has already substituted.
-        const blocks: [ImplBlockNode*] = this.ctx.generic_registry.template_trait_impls_of(recv_type, this.intern);
+        const blocks: [DeclarationNode*] = this.ctx.generic_registry.template_trait_impls_of(recv_type, this.intern);
         for (mut ti: i64 = 0; ti < blocks.length; ti++) {
-            const dimpl: ImplBlockNode* = blocks[ti];
+            const dimpl: ImplBlock* = DeclarationNode::impl_of(blocks[ti]);
             const tdecl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(dimpl.trait_def);
             if (tdecl == null) { continue; }
             // The trait's default-bodied method of this name, if projection-bounded.
@@ -1064,7 +1064,7 @@ type struct MethodBinding {
     /// Whether any projection-subject where-bound on `mfunc` has a CONCRETE Item
     /// (drawn from `impl_node`'s positional trait args) that fails the bound
     /// trait. Symbolic Item (a projection, or an impl generic param) -> false.
-    projection_bound_fails(&this, mfunc: FunctionDeclNode*, impl_node: ImplBlockNode*,
+    projection_bound_fails(&this, mfunc: FunctionDeclNode*, impl_node: ImplBlock*,
                            tdecl: TraitDecl*) -> boolean {
         if (mfunc == null || impl_node == null || tdecl == null) { return false; }
         if (impl_node.trait_annotation == null) { return false; }
@@ -1248,15 +1248,15 @@ type struct MethodBinding {
         }
         if (found != null && owner_tmpl != null) {
             for (mut b: i64 = 0; b < owner_tmpl.impl_blocks.length; b++) {
-                const block: ImplBlockNode* = owner_tmpl.impl_blocks[b];
+                const block: ImplBlock* = DeclarationNode::impl_of(owner_tmpl.impl_blocks[b]);
                 if (block == null || block.trait_annotation != null) { continue; }
-                if (MethodNode::is_method_of(found, block as ASTNode*)) {
+                if (MethodNode::is_method_of(found, owner_tmpl.impl_blocks[b] as ASTNode*)) {
                     owner_params = &block.generic_params;
                     break;
                 }
             }
         }
-        mut impl_block: ImplBlockNode* = null;
+        mut impl_block: ImplBlock* = null;
         if (found == null) {
             found = this.find_method_in_trait_impls(
                 owner_ref, member.member, member.generic_args.length, &impl_block);
@@ -1306,13 +1306,14 @@ type struct MethodBinding {
     /// registry's candidates in registration order: a placed clone when the
     /// receiver is a specialization, else the written heads that unify.
     find_method_in_trait_impls(&this, owner_ref: TypeRef, method_name: SymbolStr,
-                               n_generic_args: i64, out_impl: ImplBlockNode**) -> MethodNode* {
-        const blocks: [ImplBlockNode*] = this.ctx.generic_registry.trait_impls_of(owner_ref, this.intern);
+                               n_generic_args: i64, out_impl: ImplBlock**) -> MethodNode* {
+        const blocks: [DeclarationNode*] = this.ctx.generic_registry.trait_impls_of(owner_ref, this.intern);
         for (mut i: i64 = 0; i < blocks.length; i++) {
-            const m: MethodNode* = this.ctx.generic_registry.impl_method_by_leaf(blocks[i], method_name);
+            const block: ImplBlock* = DeclarationNode::impl_of(blocks[i]);
+            const m: MethodNode* = this.ctx.generic_registry.impl_method_by_leaf(block, method_name);
             if (m == null || m.func == null) { continue; }
             if (m.func.generic_params.length != n_generic_args) { continue; }
-            *out_impl = blocks[i];
+            *out_impl = block;
             return m;
         }
         return null;
@@ -1337,9 +1338,10 @@ type struct MethodBinding {
     /// the trait decl's FunctionDeclNode, or null.
     find_generic_trait_default(mut &this, recv_type: TypeRef,
                                method_name: SymbolStr) -> FunctionDeclNode* {
-        const blocks: [ImplBlockNode*] = this.ctx.generic_registry.template_trait_impls_of(recv_type, this.intern);
+        const blocks: [DeclarationNode*] = this.ctx.generic_registry.template_trait_impls_of(recv_type, this.intern);
         for (mut i: i64 = 0; i < blocks.length; i++) {
-            const f: FunctionDeclNode* = this.ctx.generic_registry.trait_method_by_leaf(blocks[i].trait_def, method_name);
+            const f: FunctionDeclNode* = this.ctx.generic_registry.trait_method_by_leaf(
+                DeclarationNode::impl_of(blocks[i]).trait_def, method_name);
             if (f == null || f.generic_params.length == 0) { continue; }
             return f;
         }
@@ -1357,10 +1359,10 @@ type struct MethodBinding {
     /// decided where the stamp is read.
     find_generic_method_in_trait_impls(&this, owner_ref: TypeRef, method_name: SymbolStr,
                                        only_trait: DefId,
-                                       out_impl: ImplBlockNode**) -> MethodNode* {
-        const blocks: [ImplBlockNode*] = this.ctx.generic_registry.trait_impls_of(owner_ref, this.intern);
+                                       out_impl: ImplBlock**) -> MethodNode* {
+        const blocks: [DeclarationNode*] = this.ctx.generic_registry.trait_impls_of(owner_ref, this.intern);
         for (mut i: i64 = 0; i < blocks.length; i++) {
-            const impl_node: ImplBlockNode* = blocks[i];
+            const impl_node: ImplBlock* = DeclarationNode::impl_of(blocks[i]);
             if (only_trait.is_valid() && !impl_node.trait_def.equals(only_trait)) { continue; }
             const m: MethodNode* = this.ctx.generic_registry.impl_method_by_leaf(impl_node, method_name);
             if (m == null || m.func == null || m.func.generic_params.length == 0) { continue; }
@@ -1548,11 +1550,11 @@ type struct MethodBinding {
         }
         const owner_ast: ASTNode* = this.ctx.generic_registry.lookup_inherent_owner(recv_type);
         if (MethodNode::is_method_of(m, owner_ast)) { return owner_ast; }
-        const inherent: [ImplBlockNode*] = this.ctx.generic_registry.inherent_impl_blocks(recv_type);
+        const inherent: [DeclarationNode*] = this.ctx.generic_registry.inherent_impl_blocks(recv_type);
         for (mut bi: i64 = 0; bi < inherent.length; bi++) {
             if (MethodNode::is_method_of(m, inherent[bi] as ASTNode*)) { return inherent[bi] as ASTNode*; }
         }
-        const traits: [ImplBlockNode*] = this.ctx.generic_registry.trait_impls_of(recv_type, this.intern);
+        const traits: [DeclarationNode*] = this.ctx.generic_registry.trait_impls_of(recv_type, this.intern);
         for (mut bi: i64 = 0; bi < traits.length; bi++) {
             if (MethodNode::is_method_of(m, traits[bi] as ASTNode*)) { return traits[bi] as ASTNode*; }
         }
@@ -1642,8 +1644,8 @@ type struct MethodBinding {
             if (found == null) {
                 const d: DefId = if (chosen.func.def.is_valid()) { chosen.func.def } else { chosen.func.copy_of };
                 chosen_func = this.ctx.decl_index.method_func_of(d);
-            } else if (site.kind == NodeKind::ImplementationBlock) {
-                owner_params = &(site as ImplBlockNode*).generic_params;
+            } else if (DeclarationNode::impl_of(site) != null) {
+                owner_params = &(DeclarationNode::impl_of(site)).generic_params;
             } else if (DeclarationNode::struct_of(site) != null) {
                 owner_params = &(DeclarationNode::struct_of(site)).generic_params;
             } else if (DeclarationNode::union_of(site) != null) {
@@ -1664,7 +1666,7 @@ type struct MethodBinding {
         // string`, `implement struct Driver { run<F,R> }`) is the selection's
         // choice, found above by identity.  Trait: the trait impls for the
         // receiver, then a trait default.
-        mut trait_impl_block: ImplBlockNode* = null;
+        mut trait_impl_block: ImplBlock* = null;
         if (!by_identity && member.resolved_trait.is_valid()) {
             found = this.find_generic_method_in_trait_impls(
                 recv_type, member.member, member.resolved_trait, &trait_impl_block);
@@ -1689,7 +1691,7 @@ type struct MethodBinding {
             }
             if (found == null) {
                 for (mut bi: i64 = 0; bi < tmpl.impl_blocks.length; bi++) {
-                    const ib: ImplBlockNode* = tmpl.impl_blocks[bi];
+                    const ib: ImplBlock* = DeclarationNode::impl_of(tmpl.impl_blocks[bi]);
                     if (ib == null || ib.is_trait_impl()) { continue; }
                     const m: MethodNode* = this.generic_method_held(&ib.methods, &tmpl_named);
                     if (m != null) {
@@ -2026,7 +2028,7 @@ type struct MethodBinding {
 
     /// Bind impl-introduced generic params the Self type doesn't determine
     /// (`A`/`O` in `ZipIter<I,J> where I: Iterator<A>, J: Iterator<O>`) into `res_ctx`.
-    proj_derive_impl_where_generics(mut &this, impl_node: ImplBlockNode*,
+    proj_derive_impl_where_generics(mut &this, impl_node: ImplBlock*,
                                     subst: TypeSubstitution*, res_ctx: ResolutionContext*) -> void {
         if (impl_node == null || subst == null) { return; }
         if (impl_node.where_bounds.length == 0) { return; }
@@ -2190,13 +2192,14 @@ type struct MethodBinding {
         // The TEMPLATE's impl, not this specialization's: the impl supplies the
         // type args this projection substitutes (`Named` target arguments bound
         // to the subject's), which a placed clone has already substituted away.
-        mut found_impl: ImplBlockNode* = null;
+        mut found_impl: ImplBlock* = null;
         mut found_method: MethodNode* = null;
-        const blocks: [ImplBlockNode*] = this.ctx.generic_registry.template_trait_impls_of(subject_ref, this.intern);
+        const blocks: [DeclarationNode*] = this.ctx.generic_registry.template_trait_impls_of(subject_ref, this.intern);
         for (mut i: i64 = 0; i < blocks.length; i++) {
-            const m: MethodNode* = this.ctx.generic_registry.impl_method_by_leaf(blocks[i], method_name);
+            const block: ImplBlock* = DeclarationNode::impl_of(blocks[i]);
+            const m: MethodNode* = this.ctx.generic_registry.impl_method_by_leaf(block, method_name);
             if (m == null || m.func == null) { continue; }
-            found_impl = blocks[i];
+            found_impl = block;
             found_method = m;
             break;
         }

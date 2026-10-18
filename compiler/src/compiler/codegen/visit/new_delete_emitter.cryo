@@ -46,7 +46,7 @@ import compiler::lex;
 import compiler::lex::{ Token, TokenType };
 import compiler::ast::statement::{ Stmt };
 import compiler::ast::declaration;
-import compiler::ast::declaration::{ ImplBlockNode, MethodNode };
+import compiler::ast::declaration::{ DeclarationNode, ImplBlock, MethodNode };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::codegen::visit::ir_generator;
@@ -102,7 +102,7 @@ type struct NewDeleteEmitter {
     /// for a class below the root of its hierarchy the root's, the only one a
     /// hierarchy may implement; null when there is none, and the
     /// global allocator serves it.
-    allocator_of(mut &this, ty: TypeRef) -> ImplBlockNode* {
+    allocator_of(mut &this, ty: TypeRef) -> ImplBlock* {
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
         const trait_id: DefId = registry.wellknown(LangItem::Allocate);
         if (!trait_id.is_valid()) { return null; }
@@ -110,7 +110,8 @@ type struct NewDeleteEmitter {
         loop {
             const t: Type* = this.cg.arena_type(cur);
             if (t == null || (t.kind != TypeKind::Class && t.kind != TypeKind::Struct)) { return null; }
-            const block: ImplBlockNode* = registry.select_trait_impl(trait_id, cur, this.cg.get_intern());
+            const block: ImplBlock* = DeclarationNode::impl_of(
+                registry.select_trait_impl(trait_id, cur, this.cg.get_intern()));
             if (block != null) { return block; }
             if (t.kind != TypeKind::Class) { return null; }
             const ct: ClassType* = t.as_class();
@@ -123,7 +124,7 @@ type struct NewDeleteEmitter {
     /// to: the one it writes, or the copy of the trait's default.  Null,
     /// reported, when the implementation has no function code generation
     /// can call.
-    allocator_method(mut &this, block: ImplBlockNode*, item: LangItem, span: SourceSpan) -> LValue {
+    allocator_method(mut &this, block: ImplBlock*, item: LangItem, span: SourceSpan) -> LValue {
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
         const m: MethodNode* = registry.trait_item_method(
             block, registry.trait_item_position(registry.wellknown(item)));
@@ -232,7 +233,7 @@ type struct NewDeleteEmitter {
         // from it; everything else shares the canonical GlobalAlloc via the
         // shared funnel. The bitcast / vtable seed / struct init / ctor call
         // below are the same whichever allocator supplied the storage.
-        const alloc_block: ImplBlockNode* = this.allocator_of(type_ref);
+        const alloc_block: ImplBlock* = this.allocator_of(type_ref);
         mut alloc_fn: LValue = LValue::null();
         if (alloc_block != null) {
             alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, node.span);
@@ -438,7 +439,7 @@ type struct NewDeleteEmitter {
 
         // An element type with an `Allocate` takes the block from it, as
         // `new` of one does.  Array allocations use a fixed 16 alignment.
-        const alloc_block: ImplBlockNode* = this.allocator_of(elem_ref);
+        const alloc_block: ImplBlock* = this.allocator_of(elem_ref);
         mut alloc_fn: LValue = LValue::null();
         if (alloc_block != null) {
             alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, node.span);
@@ -514,7 +515,7 @@ type struct NewDeleteEmitter {
         // does not own it.
         mut release_fn: LValue = LValue::null();
         if (pointee.is_valid()) {
-            const alloc_block: ImplBlockNode* = this.allocator_of(pointee);
+            const alloc_block: ImplBlock* = this.allocator_of(pointee);
             if (alloc_block != null) {
                 release_fn = this.allocator_method(alloc_block, LangItem::AllocateRelease, node.span);
                 if (!release_fn.is_valid()) {

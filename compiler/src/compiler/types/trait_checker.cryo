@@ -28,7 +28,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::resolver::{ intern_table, symbol_str };
 import std::fmt;
-import compiler::ast::declaration::{ FunctionDeclNode, ImplBlockNode, MethodNode, VarDeclNode };
+import compiler::ast::declaration::{ DeclarationNode, FunctionDeclNode, ImplBlock, MethodNode, VarDeclNode };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::resolver::intern_table::{ InternTable };
@@ -169,7 +169,7 @@ type struct TraitChecker {
         const subject: TypeRef = ty;
         if (!this.arena.carries_impl_key(subject, this.intern_table)) { return false; }
         // The candidates by identity, the first whose bounds hold.
-        const impl_block: ImplBlockNode* = this.select_impl(trait_name, subject, depth);
+        const impl_block: ImplBlock* = this.select_impl(trait_name, subject, depth);
         // A method merely named `drop` does not satisfy `Drop`: a type
         // implements it with `implement trait Drop`, as any other trait.
         return impl_block != null;
@@ -181,11 +181,12 @@ type struct TraitChecker {
     /// subject's arguments.  Null when no head unifies or every one that
     /// does is refused by its bounds - selection, candidate assembly then
     /// confirmation, in one place.
-    select_impl(&this, trait_id: DefId, subject: TypeRef, depth: i32) -> ImplBlockNode* {
+    select_impl(&this, trait_id: DefId, subject: TypeRef, depth: i32) -> ImplBlock* {
         if (this.generic_registry == null) { return null; }
-        const heads: [ImplBlockNode*] = this.generic_registry.heads_for(trait_id, subject, this.intern_table);
+        const heads: [DeclarationNode*] = this.generic_registry.heads_for(trait_id, subject, this.intern_table);
         for (mut i: i64 = 0; i < heads.length; i++) {
-            if (this.impl_applies(heads[i], subject, depth)) { return heads[i]; }
+            const head: ImplBlock* = DeclarationNode::impl_of(heads[i]);
+            if (this.impl_applies(head, subject, depth)) { return head; }
         }
         return null;
     }
@@ -193,12 +194,13 @@ type struct TraitChecker {
     /// Every impl that applies to `subject`, of every trait: the registry's
     /// candidates (`trait_impls_of`) with each one's where-clause confirmed.
     /// The set a method call on a concrete receiver binds against.
-    impls_of(&this, subject: TypeRef) -> [ImplBlockNode*] {
-        mut out: [ImplBlockNode*] = [];
+    impls_of(&this, subject: TypeRef) -> [ImplBlock*] {
+        mut out: [ImplBlock*] = [];
         if (this.generic_registry == null) { return out; }
-        const heads: [ImplBlockNode*] = this.generic_registry.trait_impls_of(subject, this.intern_table);
+        const heads: [DeclarationNode*] = this.generic_registry.trait_impls_of(subject, this.intern_table);
         for (mut i: i64 = 0; i < heads.length; i++) {
-            if (this.impl_applies(heads[i], subject, 0)) { out.push(heads[i]); }
+            const head: ImplBlock* = DeclarationNode::impl_of(heads[i]);
+            if (this.impl_applies(head, subject, 0)) { out.push(head); }
         }
         return out;
     }
@@ -208,7 +210,7 @@ type struct TraitChecker {
     /// placed (its bounds held for those arguments, and are substituted away
     /// on the clone), so it applies outright; a written head applies when
     /// its where-clause holds for the subject.
-    impl_applies(&this, head: ImplBlockNode*, subject: TypeRef, depth: i32) -> boolean {
+    impl_applies(&this, head: ImplBlock*, subject: TypeRef, depth: i32) -> boolean {
         if (head == null) { return false; }
         if (head.spec_owner.is_valid()) { return true; }
         return this.impl_bounds_hold(head, subject, depth);
@@ -219,7 +221,7 @@ type struct TraitChecker {
     /// checked recursively.  A head with no where-clause holds outright.  A
     /// subject that carries no arguments cannot bind the head's parameters,
     /// so a bounded head is refused for it rather than assumed.
-    impl_bounds_hold(&this, impl_block: ImplBlockNode*, subject: TypeRef, depth: i32) -> boolean {
+    impl_bounds_hold(&this, impl_block: ImplBlock*, subject: TypeRef, depth: i32) -> boolean {
         if (impl_block == null) { return false; }
         if (impl_block.where_bounds.length == 0) { return true; }
         // Build a fresh substitution from the impl's generic params to
@@ -263,7 +265,7 @@ type struct TraitChecker {
     /// writes (`where U: Show`) is checked against these bindings and never
     /// against the type's parameters, which may be spelled differently.  A
     /// head whose argument count differs from `args` binds nothing.
-    add_head_param_bindings(&this, impl_block: ImplBlockNode*, args: &[TypeRef],
+    add_head_param_bindings(&this, impl_block: ImplBlock*, args: &[TypeRef],
                             subst: TypeSubstitution*) -> void {
         if (impl_block == null || subst == null) { return; }
         if (impl_block.target_args.length != args.length) { return; }
@@ -276,7 +278,7 @@ type struct TraitChecker {
     /// The type of the parameter an implement block's head writes at
     /// position `index` (`U` in `.. for Wrap<U>`, at 0), or invalid where
     /// the head writes a type there.
-    head_param_type(&this, impl_block: ImplBlockNode*, index: i64) -> TypeRef {
+    head_param_type(&this, impl_block: ImplBlock*, index: i64) -> TypeRef {
         if (impl_block == null || index < 0 || index >= impl_block.target_args.length) {
             return TypeRef::invalid();
         }
@@ -323,9 +325,9 @@ type struct TraitChecker {
     diagnose_method_bounds_failure(&this, receiver: TypeRef,
                                     method_name: SymbolStr) -> DeclName {
         if (this.generic_registry == null) { return DeclName::empty(); }
-        const blocks: [ImplBlockNode*] = this.generic_registry.trait_impls_of(receiver, this.intern_table);
+        const blocks: [DeclarationNode*] = this.generic_registry.trait_impls_of(receiver, this.intern_table);
         for (mut i: i64 = 0; i < blocks.length; i++) {
-            const impl_block: ImplBlockNode* = blocks[i];
+            const impl_block: ImplBlock* = DeclarationNode::impl_of(blocks[i]);
             const m: MethodNode* = this.generic_registry.impl_method_by_leaf(impl_block, method_name);
             if (m == null || m.func == null) { continue; }
             if (!this.type_implements_trait(receiver, impl_block.trait_def, 0)) {

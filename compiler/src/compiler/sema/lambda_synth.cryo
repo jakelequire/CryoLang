@@ -37,7 +37,7 @@ import std::collections::hashmap::{ HashMap, HashMapIter };
 import std::fmt;
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
-    DeclarationNode, DeclKind, FieldDecl, FunctionDeclNode, ImplBlockNode, MethodNode, ReceiverForm,
+    DeclarationNode, DeclKind, FieldDecl, FunctionDeclNode, ImplBlock, MethodNode, ReceiverForm,
     StructDecl, VarDeclNode
 };
 import compiler::resolver::lang_item;
@@ -444,7 +444,7 @@ type struct LambdaSynth {
         mut method_arr: [MethodNode*] = [method];
         ctx_ptr.decl_index.register_methods(
             struct_ref, method_arr, intern_ptr, arena_ptr, "closure/struct methods");
-        const drop_impl: ImplBlockNode* = this.closure_drop_impl(lambda, struct_decl, struct_ref, span);
+        const drop_impl: DeclarationNode* = this.closure_drop_impl(lambda, struct_decl, struct_ref, span);
 
         // 8. Inject into ProgramNode so subsequent passes walk it.
         if (ctx_ptr.artifacts.ast.root != null) {
@@ -466,7 +466,7 @@ type struct LambdaSynth {
     /// destructor, it is what a written `f.drop()` and the scope-exit
     /// release both reach.
     closure_drop_impl(mut &this, lambda: LambdaExprNode*, struct_decl: StructDecl*,
-                      struct_ref: TypeRef, span: SourceSpan) -> ImplBlockNode* {
+                      struct_ref: TypeRef, span: SourceSpan) -> DeclarationNode* {
         const registry_ptr: GenericRegistry* = this.ctx.get_generic_registry();
         mut has_noncopy_capture: boolean = false;
         for (mut di: i64 = 0; di < lambda.captured_names.length; di++) {
@@ -492,7 +492,8 @@ type struct LambdaSynth {
         drop_method.set_static(false);
         drop_method.set_sink(false);
 
-        mut impl_node: ImplBlockNode* = new ImplBlockNode(struct_decl.name, span);
+        const impl_node: ImplBlock* = ImplBlock::new(struct_decl.name);
+        const impl_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Impl(impl_node), span);
         // A synthesized head is walked by no resolver, so the synthesizer,
         // which holds both definitions, records what it names.
         impl_node.res.answer(Res::Def(struct_decl.def));
@@ -501,15 +502,15 @@ type struct LambdaSynth {
             res: ResSlot::Pending,
         };
         trait_ann.res.answer(Res::Def(drop_id));
-        impl_node.set_trait_annotation(new TypeAnnotation::Named(trait_ann));
+        impl_node.trait_annotation = new TypeAnnotation::Named(trait_ann);
         impl_node.trait_def = drop_id;
-        impl_node.add_method(drop_method);
+        impl_node.methods.push(drop_method);
 
         mut impl_methods: [MethodNode*] = [drop_method];
         this.ctx.decl_index.register_methods(
             struct_ref, impl_methods, this.intern, this.arena, "closure/drop impl");
-        registry_ptr.register_trait_impl(drop_id, struct_ref, impl_node);
-        return impl_node;
+        registry_ptr.register_trait_impl(drop_id, struct_ref, impl_decl);
+        return impl_decl;
     }
 
     /// True when `ty` is a struct carrying a `__call__` method (a closure type).

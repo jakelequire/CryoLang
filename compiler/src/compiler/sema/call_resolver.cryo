@@ -59,7 +59,7 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, DefKind, FamilyOwner, Res, ResBase, ResSlot };
 import compiler::decl_index::{ OverloadId };
 import compiler::ast::declaration::{
-    ClassDeclNode, FunctionDeclNode, DeclarationNode, GenericParamDecl, ImplBlockNode, MethodNode,
+    ClassDeclNode, FunctionDeclNode, DeclarationNode, GenericParamDecl, ImplBlock, MethodNode,
     StructDecl, TraitDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -3016,11 +3016,11 @@ type struct CallResolver {
             // The impls selected for the receiver: a placed clone when it is
             // a specialization, else the written heads that unify with it and
             // whose bounds hold.
-            const blocks: [ImplBlockNode*] = this.trait_checker().impls_of(base_ref);
+            const blocks: [ImplBlock*] = this.trait_checker().impls_of(base_ref);
             if (blocks.length > 0) {
                 for (mut ti: i64 = 0; ti < blocks.length; ti++) {
                     if (ambiguous || trait_ambiguous) { break; }
-                    const block: ImplBlockNode* = blocks[ti];
+                    const block: ImplBlock* = blocks[ti];
                     if (want_trait.is_valid() && !block.trait_def.equals(want_trait)) { continue; }
                     const block_named: [MethodNode*] = this.block_methods_named(block, member.member);
                     for (mut bmi: i64 = 0; bmi < block.methods.length; bmi++) {
@@ -3169,7 +3169,7 @@ type struct CallResolver {
     /// minted: the block's own parameters bound by its head (`T` in
     /// `implement enum Option<T>`, for `Option<u8>`, is `u8`) and by its
     /// where-clause.
-    impl_view(mut &this, block: ImplBlockNode*, owner_inst: TypeRef) -> TypeSubstitution {
+    impl_view(mut &this, block: ImplBlock*, owner_inst: TypeRef) -> TypeSubstitution {
         mut view: TypeSubstitution = TypeSubstitution::empty();
         const args: [TypeRef] = this.inst_args(owner_inst);
         this.trait_checker().add_head_param_bindings(block, &args, &view);
@@ -3902,8 +3902,8 @@ type struct CallResolver {
         if (recv.is_valid() && !owner_inst.is_valid()) {
             const slot: i64 = this.ctx.generic_registry.trait_item_position(d);
             if (slot >= 0) {
-                const block: ImplBlockNode* = this.ctx.generic_registry.select_trait_impl(
-                    this.ctx.defs.parent_of(d), recv, this.intern);
+                const block: ImplBlock* = DeclarationNode::impl_of(this.ctx.generic_registry.select_trait_impl(
+                    this.ctx.defs.parent_of(d), recv, this.intern));
                 chosen = this.ctx.generic_registry.trait_item_method(block, slot);
             } else {
                 chosen = this.ctx.decl_index.entry_method(this.ctx.decl_index.method_entry_on(recv, d));
@@ -3935,7 +3935,7 @@ type struct CallResolver {
         // whether or not the type has a destructor to bind: code generation
         // releases one without by its glue, and knows the call by this.
         call.named_method = d;
-        const block: ImplBlockNode* = this.trait_checker().select_impl(
+        const block: ImplBlock* = this.trait_checker().select_impl(
             this.ctx.defs.parent_of(d), recv, 0);
         const chosen: MethodNode* = this.ctx.generic_registry.trait_item_method(
             block, this.ctx.generic_registry.trait_item_position(d));
@@ -3989,10 +3989,11 @@ type struct CallResolver {
     trait_item_answers(&this, member: MemberAccessNode*, recv: TypeRef) -> [MethodNode*] {
         mut out: [MethodNode*] = [];
         if (member.resolved_trait_slot < 0) { return out; }
-        const heads: [ImplBlockNode*] = this.ctx.generic_registry.heads_for(
+        const heads: [DeclarationNode*] = this.ctx.generic_registry.heads_for(
             member.resolved_trait, recv, this.intern);
         for (mut i: i64 = 0; i < heads.length; i++) {
-            const m: MethodNode* = this.ctx.generic_registry.trait_item_method(heads[i], member.resolved_trait_slot);
+            const m: MethodNode* = this.ctx.generic_registry.trait_item_method(
+                DeclarationNode::impl_of(heads[i]), member.resolved_trait_slot);
             if (m != null) { out.push(m); }
         }
         return out;
@@ -4139,7 +4140,7 @@ type struct CallResolver {
         // asked whole answers only its first.  Only the impls whose
         // where-clauses hold for the receiver count, minted or not.
         const subject: TypeRef = if (owner_inst.is_valid()) { owner_inst } else { base_ref };
-        const blocks: [ImplBlockNode*] = this.trait_checker().impls_of(subject);
+        const blocks: [ImplBlock*] = this.trait_checker().impls_of(subject);
         for (mut ti: i64 = 0; ti < blocks.length; ti++) {
             const tid: DefId = blocks[ti].trait_def;
             if (!tid.is_valid()) { continue; }
@@ -4439,9 +4440,10 @@ type struct CallResolver {
         // folded into its method set above.
         if (!from_trait) {
             if (start_cls == null && base_t.kind != TypeKind::Struct && base_t.kind != TypeKind::Enum) {
-                const blocks: [ImplBlockNode*] = this.ctx.generic_registry.inherent_impl_blocks(base_ref);
+                const blocks: [DeclarationNode*] = this.ctx.generic_registry.inherent_impl_blocks(base_ref);
                 for (mut bi: i64 = 0; bi < blocks.length; bi++) {
-                    if (this.bind_on_impl_block(visitor, call, member, blocks[bi], arg_types, generic, sel)) { return true; }
+                    if (this.bind_on_impl_block(visitor, call, member, DeclarationNode::impl_of(blocks[bi]),
+                            arg_types, generic, sel)) { return true; }
                 }
             }
             return false;
@@ -4451,9 +4453,9 @@ type struct CallResolver {
         // placed clone when it is a specialization, else the written heads
         // that unify with it and whose bounds hold.
         const impl_subject: TypeRef = if (sel.owner_inst.is_valid()) { sel.owner_inst } else { base_ref };
-        const blocks: [ImplBlockNode*] = this.trait_checker().impls_of(impl_subject);
+        const blocks: [ImplBlock*] = this.trait_checker().impls_of(impl_subject);
         for (mut ti: i64 = 0; ti < blocks.length; ti++) {
-            const block: ImplBlockNode* = blocks[ti];
+            const block: ImplBlock* = blocks[ti];
             // WHICH trait the block provides is the head's stamped identity.
             if (only_trait.is_valid() && !block.trait_def.equals(only_trait)) { continue; }
             if (this.bind_on_impl_block(visitor, call, member, block, arg_types, generic, sel)) { return true; }
@@ -4540,7 +4542,7 @@ type struct CallResolver {
                         arg_types, generic, sel, &view)) { return true; }
             }
             for (mut bi: i64 = 0; bi < tmpl.impl_blocks.length; bi++) {
-                const block: ImplBlockNode* = tmpl.impl_blocks[bi];
+                const block: ImplBlock* = DeclarationNode::impl_of(tmpl.impl_blocks[bi]);
                 if (block == null || block.is_trait_impl()) { continue; }
                 if (this.bind_on_impl_block(visitor, call, member, block, arg_types, generic, sel)) { return true; }
             }
@@ -4551,9 +4553,9 @@ type struct CallResolver {
         // only in its where-clause cannot be bound by the checker, so an
         // instantiation not yet minted would fail every such head.  The pass
         // that sees the minted type selects among confirmed impls.
-        const blocks: [ImplBlockNode*] = this.ctx.generic_registry.trait_impls_of(sel.owner_inst, this.intern);
+        const blocks: [DeclarationNode*] = this.ctx.generic_registry.trait_impls_of(sel.owner_inst, this.intern);
         for (mut ti: i64 = 0; ti < blocks.length; ti++) {
-            const block: ImplBlockNode* = blocks[ti];
+            const block: ImplBlock* = DeclarationNode::impl_of(blocks[ti]);
             if (only_trait.is_valid() && !block.trait_def.equals(only_trait)) { continue; }
             if (this.bind_on_impl_block(visitor, call, member, block, arg_types, generic, sel)) { return true; }
         }
@@ -4562,7 +4564,7 @@ type struct CallResolver {
 
     /// Select among one impl block's methods; see `bind_on_methods`.
     bind_on_impl_block(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessNode*,
-                       block: ImplBlockNode*, arg_types: &[TypeRef],
+                       block: ImplBlock*, arg_types: &[TypeRef],
                        generic: boolean, sel: Selection*) -> boolean {
         if (block == null) { return false; }
         const named: [MethodNode*] = this.block_methods_named(block, member.member);
@@ -4579,7 +4581,7 @@ type struct CallResolver {
     /// implementation's by the trait-method door, from the trait's method of
     /// that leaf; an inherent block's by the member-function door, asked of
     /// the owner whose families keep them.
-    block_methods_named(&this, block: ImplBlockNode*, leaf: SymbolStr) -> [MethodNode*] {
+    block_methods_named(&this, block: ImplBlock*, leaf: SymbolStr) -> [MethodNode*] {
         if (block.is_trait_impl()) { return this.ctx.generic_registry.impl_methods_at_leaf(block, leaf); }
         const owner: FamilyOwner = match (this.ctx.decl_index.impl_family_owner(block)) {
             FamilyOwner::Def(d)      => { this.ctx.generic_registry.methods_owner_of(d) }
@@ -4595,7 +4597,7 @@ type struct CallResolver {
     /// `I` bound by the head, and `A` is `i32` because that is what
     /// `Range<i32>`'s `Iterator` impl writes.  Bounds are read in order, so
     /// a bound may use a parameter an earlier one bound.
-    bind_where_only_params(mut &this, block: ImplBlockNode*, view: TypeSubstitution*) -> void {
+    bind_where_only_params(mut &this, block: ImplBlock*, view: TypeSubstitution*) -> void {
         for (mut bi: i64 = 0; bi < block.where_bounds.length; bi++) {
             const bound: &TraitBound = &block.where_bounds[bi];
             const subject: TypeRef = this.trait_checker().lookup_subst_for_param(bound.subject_sym, view);
@@ -4614,7 +4616,7 @@ type struct CallResolver {
     /// Bind a parameter of `block` a where-clause writes as a trait argument
     /// (`A` in `Iterator<A>`, `T` in `Iterator<T*>`) to the concrete argument
     /// in its place, unless it is bound already.
-    bind_where_arg(mut &this, block: ImplBlockNode*, ta: TypeAnnotation*, concrete: TypeRef,
+    bind_where_arg(mut &this, block: ImplBlock*, ta: TypeAnnotation*, concrete: TypeRef,
                    view: TypeSubstitution*) -> void {
         if (ta == null || !concrete.is_valid()) { return; }
         match (*ta) {
@@ -6433,9 +6435,9 @@ type struct CallResolver {
     owner_param_handles(&this, owner_entry: TemplateEntry*, m: MethodNode*, named: &[TypeRef],
                         out: mut &[TypeRef]) -> boolean {
         for (mut b: i64 = 0; b < owner_entry.impl_blocks.length && out.length == 0; b++) {
-            const block: ImplBlockNode* = owner_entry.impl_blocks[b];
+            const block: ImplBlock* = DeclarationNode::impl_of(owner_entry.impl_blocks[b]);
             if (block == null || block.trait_annotation != null) { continue; }
-            if (!MethodNode::is_method_of(m, block as ASTNode*)) { continue; }
+            if (!MethodNode::is_method_of(m, owner_entry.impl_blocks[b] as ASTNode*)) { continue; }
             if (block.generic_params.length != owner_entry.param_types.length) { return false; }
             for (mut i: i64 = 0; i < block.generic_params.length; i++) {
                 mut handle: TypeRef = owner_entry.param_types[i];

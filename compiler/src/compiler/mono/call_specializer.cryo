@@ -43,7 +43,7 @@ import compiler::ast::walk::{ Walk };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, DestructureDecl, FunctionDeclNode, GenericParamDecl,
-    ImplBlockNode, MethodNode, StructDecl, UnionDecl, VarDeclNode
+    ImplBlock, MethodNode, StructDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
     CalleePin,
@@ -181,6 +181,10 @@ type struct MonoCallSpecializer {
                             if (sn.is_generic()) { continue; }
                             this.walk_methods(sn.methods, &res_ctx);
                         }
+                        DeclKind::Impl(ib) => {
+                            if (ib.generic_params.length > 0) { continue; }
+                            this.walk_methods(ib.methods, &res_ctx);
+                        }
                         DeclKind::Union(un) => {
                             if (un.is_generic()) { continue; }
                             this.walk_methods(un.methods, &res_ctx);
@@ -195,11 +199,6 @@ type struct MonoCallSpecializer {
                     const cn: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (cn.is_generic()) { continue; }
                     this.walk_methods(cn.methods, &res_ctx);
-                }
-                NodeKind::ImplementationBlock => {
-                    const ib: ImplBlockNode* = stmt as ImplBlockNode*;
-                    if (ib.generic_params.length > 0) { continue; }
-                    this.walk_methods(ib.methods, &res_ctx);
                 }
                 NodeKind::VariableDeclaration => {
                     // A module's global: its initializer is code like a
@@ -274,6 +273,7 @@ type struct MonoCallSpecializer {
             NodeKind::Declaration => {
                 match ((decl as DeclarationNode*).shape) {
                     DeclKind::Struct(sn) => { this.walk_spec_methods(sn.methods, &res_ctx, subst); }
+                    DeclKind::Impl(ib) => { this.walk_spec_methods(ib.methods, &res_ctx, subst); }
                     DeclKind::Union(un) => { this.walk_spec_methods(un.methods, &res_ctx, subst); }
                     DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                     | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
@@ -283,9 +283,6 @@ type struct MonoCallSpecializer {
             }
             NodeKind::ClassDeclaration => {
                 this.walk_spec_methods((decl as ClassDeclNode*).methods, &res_ctx, subst);
-            }
-            NodeKind::ImplementationBlock => {
-                this.walk_spec_methods((decl as ImplBlockNode*).methods, &res_ctx, subst);
             }
             _ => {}
         }
@@ -764,14 +761,14 @@ type struct MonoCallSpecializer {
     /// the stores the receiver's method sets are read from; false when none
     /// holds it.  This is where an instance of `m` is added.
     method_placement(&this, m: MethodNode*, recv_type: TypeRef,
-                     out_impl: ImplBlockNode**, out_owner: ASTNode**) -> boolean {
+                     out_impl: DeclarationNode**, out_owner: ASTNode**) -> boolean {
         for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
             const entry: SpecializationEntry* = &this.state.spec_entries[i];
             if (!entry.specialized_type.equals(recv_type)) { continue; }
             if (MethodNode::is_method_of(m, entry.ast_node)) { *out_owner = entry.ast_node; return true; }
             for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
                 if (MethodNode::is_method_of(m, entry.impl_nodes[j])) {
-                    *out_impl = entry.impl_nodes[j] as ImplBlockNode*;
+                    *out_impl = DeclarationNode::with_shape(entry.impl_nodes[j]);
                     return true;
                 }
             }
@@ -779,11 +776,11 @@ type struct MonoCallSpecializer {
         if (this.generic_registry == null) { return false; }
         const owner_ast: ASTNode* = this.generic_registry.lookup_inherent_owner(recv_type);
         if (MethodNode::is_method_of(m, owner_ast)) { *out_owner = owner_ast; return true; }
-        const inherent: [ImplBlockNode*] = this.generic_registry.inherent_impl_blocks(recv_type);
+        const inherent: [DeclarationNode*] = this.generic_registry.inherent_impl_blocks(recv_type);
         for (mut bi: i64 = 0; bi < inherent.length; bi++) {
             if (MethodNode::is_method_of(m, inherent[bi] as ASTNode*)) { *out_impl = inherent[bi]; return true; }
         }
-        const traits: [ImplBlockNode*] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
+        const traits: [DeclarationNode*] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
         for (mut bi: i64 = 0; bi < traits.length; bi++) {
             if (MethodNode::is_method_of(m, traits[bi] as ASTNode*)) { *out_impl = traits[bi]; return true; }
         }
@@ -926,7 +923,7 @@ type struct MonoCallSpecializer {
         // receiver's method for it, found by identity.  Nothing is found by
         // the member's name.
         if (path_method == null && call.template_method.is_valid()) {
-            mut id_impl: ImplBlockNode* = null;
+            mut id_impl: DeclarationNode* = null;
             mut id_owner: ASTNode* = null;
             const id_m: MethodNode* = this.receiver_method_of(call.template_method, recv_type, &id_impl, &id_owner);
             this.bind_receiver_method(call, id_m, id_impl, id_owner, recv_type, subst);
@@ -934,7 +931,7 @@ type struct MonoCallSpecializer {
             return;
         }
         if (ma != null && ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
-            mut item_impl: ImplBlockNode* = null;
+            mut item_impl: DeclarationNode* = null;
             const item_m: MethodNode* = this.trait_item_on(call, ma, recv_type, &item_impl);
             if (item_m != null) {
                 this.bind_receiver_method(call, item_m, item_impl, null, recv_type, subst);
@@ -949,7 +946,7 @@ type struct MonoCallSpecializer {
         // nothing: it is left unbound, and `report_unbound_calls` refuses it
         // once monomorphization ends.  Nothing is found by the member's name.
         if (path_method == null) { return; }
-        mut impl_node: ImplBlockNode* = null;
+        mut impl_node: DeclarationNode* = null;
         mut inherent_owner_ast: ASTNode* = null;
         if (!this.method_placement(path_method, recv_type, &impl_node, &inherent_owner_ast)) { return; }
         this.instantiate_generic_method(call, path_method, impl_node, inherent_owner_ast, recv_type, subst);
@@ -959,7 +956,7 @@ type struct MonoCallSpecializer {
     /// held by `impl_node` or declared on `inherent_owner_ast` - at the
     /// type arguments sema stashed on the call (`method_instance_entry`).
     instantiate_generic_method(mut &this, call: CallExprNode*, orig_method: MethodNode*,
-                               impl_node: ImplBlockNode*, inherent_owner_ast: ASTNode*,
+                               impl_node: DeclarationNode*, inherent_owner_ast: ASTNode*,
                                recv_type: TypeRef, subst: TypeSubstitution*) -> void {
         this.pin_spec_entry(call, this.method_instance_entry(orig_method, impl_node, inherent_owner_ast,
             recv_type, &call.resolved_type_args, subst));
@@ -972,7 +969,7 @@ type struct MonoCallSpecializer {
     /// type parameters of its own, arguments not one per parameter, and
     /// arguments that are still a generic body's parameters.
     method_instance_entry(mut &this, orig_method: MethodNode*,
-                          impl_node: ImplBlockNode*, inherent_owner_ast: ASTNode*,
+                          impl_node: DeclarationNode*, inherent_owner_ast: ASTNode*,
                           recv_type: TypeRef, stashed: &[TypeRef], subst: TypeSubstitution*) -> OverloadId {
         if (impl_node == null && inherent_owner_ast == null) { return OverloadId::invalid(); }
         const orig_func: FunctionDeclNode* = orig_method.func;
@@ -1017,7 +1014,8 @@ type struct MonoCallSpecializer {
 
         mut copy_subst: TypeSubstitution* = null;
         const spec_method: MethodNode* = this.specialize_method(
-            orig_method, &orig_func.generic_params, &bindings, recv_type, impl_node, &copy_subst);
+            orig_method, &orig_func.generic_params, &bindings, recv_type,
+            DeclarationNode::impl_of(impl_node), &copy_subst);
         if (spec_method == null) { return OverloadId::invalid(); }
         // Whether this spec is resolved through a PINNED `resolved_callee` (the
         // precise mangled symbol) rather than the trait-impl/combinator DI path.
@@ -1029,7 +1027,7 @@ type struct MonoCallSpecializer {
         // suffixed definition diverge from their unsuffixed combined-key
         // resolution (collapsing coexisting combinator specs onto the first).
         const inherent_pin: boolean = inherent_owner_ast != null
-            || (impl_node != null && !impl_node.is_trait_impl());
+            || (impl_node != null && !DeclarationNode::impl_of(impl_node).is_trait_impl());
 
         // A trait-impl generic method whose type params appear ONLY in the
         // return / where-bound - no VALUE parameter mentions them - can't be
@@ -1107,7 +1105,7 @@ type struct MonoCallSpecializer {
                 (target_ast as ClassDeclNode*).methods.push(spec_method);
             }
         } else {
-            impl_node.methods.push(spec_method);
+            DeclarationNode::impl_of(impl_node).methods.push(spec_method);
         }
 
         // DI registration + symbol pin.  Inherent generic methods on a fixed
@@ -1173,7 +1171,7 @@ type struct MonoCallSpecializer {
     /// it is a copy of; every other method is the receiver's index entry for
     /// `d` - the declaration itself, or the receiver's copy of it - placed
     /// by its identity.  Null when the receiver has neither.
-    receiver_method_of(&this, d: DefId, recv_type: TypeRef, out_impl: ImplBlockNode**,
+    receiver_method_of(&this, d: DefId, recv_type: TypeRef, out_impl: DeclarationNode**,
                        out_owner_ast: ASTNode**) -> MethodNode* {
         const deferred: MethodNode* = this.deferred_copy_of(d, recv_type, out_impl);
         if (deferred != null) { return deferred; }
@@ -1186,27 +1184,27 @@ type struct MonoCallSpecializer {
     /// receiver's methods are read from - those placed under its
     /// specialization, then the trait impls selected for it - and the block
     /// holding it (`out_impl`); null when none holds one.
-    deferred_copy_of(&this, d: DefId, recv_type: TypeRef, out_impl: ImplBlockNode**) -> MethodNode* {
+    deferred_copy_of(&this, d: DefId, recv_type: TypeRef, out_impl: DeclarationNode**) -> MethodNode* {
         for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
             const entry: SpecializationEntry* = &this.state.spec_entries[i];
             if (!entry.specialized_type.equals(recv_type)) { continue; }
             for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
-                const block: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
-                const m: MethodNode* = MonoCallSpecializer::deferred_in(block, d);
+                const block: DeclarationNode* = DeclarationNode::with_shape(entry.impl_nodes[j]);
+                const m: MethodNode* = MonoCallSpecializer::deferred_in(DeclarationNode::impl_of(block), d);
                 if (m != null) { *out_impl = block; return m; }
             }
         }
         if (this.generic_registry == null) { return null; }
-        const traits: [ImplBlockNode*] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
+        const traits: [DeclarationNode*] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
         for (mut i: i64 = 0; i < traits.length; i++) {
-            const m: MethodNode* = MonoCallSpecializer::deferred_in(traits[i], d);
+            const m: MethodNode* = MonoCallSpecializer::deferred_in(DeclarationNode::impl_of(traits[i]), d);
             if (m != null) { *out_impl = traits[i]; return m; }
         }
         return null;
     }
 
     /// The method of `block` that is a deferred copy of the definition `d`.
-    static deferred_in(block: ImplBlockNode*, d: DefId) -> MethodNode* {
+    static deferred_in(block: ImplBlock*, d: DefId) -> MethodNode* {
         if (block == null) { return null; }
         for (mut k: i64 = 0; k < block.methods.length; k++) {
             const m: MethodNode* = block.methods[k];
@@ -1229,15 +1227,16 @@ type struct MonoCallSpecializer {
     /// emitted; any other receiver's are the registry's heads selected for
     /// it.
     trait_item_on(&this, call: CallExprNode*, ma: MemberAccessNode*, recv_type: TypeRef,
-                  out_impl: ImplBlockNode**) -> MethodNode* {
+                  out_impl: DeclarationNode**) -> MethodNode* {
         if (this.generic_registry == null) { return null; }
-        const heads: [ImplBlockNode*] = this.trait_heads_on(ma.resolved_trait, recv_type);
-        mut head: ImplBlockNode* = null;
+        const heads: [DeclarationNode*] = this.trait_heads_on(ma.resolved_trait, recv_type);
+        mut head: DeclarationNode* = null;
         if (heads.length == 1) {
             head = heads[0];
         } else if (call.bound_trait_args.length > 0) {
             for (mut h: i64 = 0; h < heads.length; h++) {
-                if (!this.generic_registry.trait_args_unify(heads[h], &call.bound_trait_args, this.intern_table)) {
+                if (!this.generic_registry.trait_args_unify(DeclarationNode::impl_of(heads[h]),
+                        &call.bound_trait_args, this.intern_table)) {
                     continue;
                 }
                 if (head != null) { return null; }
@@ -1245,7 +1244,7 @@ type struct MonoCallSpecializer {
             }
         }
         if (head == null) { return null; }
-        const m: MethodNode* = this.generic_registry.trait_item_method(head, ma.resolved_trait_slot);
+        const m: MethodNode* = this.generic_registry.trait_item_method(DeclarationNode::impl_of(head), ma.resolved_trait_slot);
         if (m != null) { *out_impl = head; }
         return m;
     }
@@ -1254,17 +1253,17 @@ type struct MonoCallSpecializer {
     /// generic type's specialization, the blocks placed under it, where the
     /// instances its calls ask for are added and emitted; for any other
     /// receiver, the registry's heads selected for it.
-    trait_heads_on(&this, trait_def: DefId, recv_type: TypeRef) -> [ImplBlockNode*] {
-        mut heads: [ImplBlockNode*] = [];
+    trait_heads_on(&this, trait_def: DefId, recv_type: TypeRef) -> [DeclarationNode*] {
+        mut heads: [DeclarationNode*] = [];
         mut specialized: boolean = false;
         for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
             const entry: SpecializationEntry* = &this.state.spec_entries[i];
             if (!entry.specialized_type.equals(recv_type)) { continue; }
             specialized = true;
             for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
-                const block: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
+                const block: ImplBlock* = DeclarationNode::impl_of(entry.impl_nodes[j]);
                 if (block != null && block.is_trait_impl() && block.trait_def.equals(trait_def)) {
-                    heads.push(block);
+                    heads.push(DeclarationNode::with_shape(entry.impl_nodes[j]));
                 }
             }
         }
@@ -1283,7 +1282,7 @@ type struct MonoCallSpecializer {
     /// generic body's parameters, has no method of its own to bind to: the
     /// call is bound once it is minted (`bind_queued_calls`), or in each
     /// copy that substitutes the parameters.
-    bind_receiver_method(mut &this, call: CallExprNode*, m: MethodNode*, impl_node: ImplBlockNode*,
+    bind_receiver_method(mut &this, call: CallExprNode*, m: MethodNode*, impl_node: DeclarationNode*,
                          owner_ast: ASTNode*, recv_type: TypeRef,
                          subst: TypeSubstitution*) -> void {
         if (m == null || m.func == null) { return; }
@@ -1299,10 +1298,11 @@ type struct MonoCallSpecializer {
             }
             return;
         }
-        if (impl_node == null) { return; }
+        const block: ImplBlock* = DeclarationNode::impl_of(impl_node);
+        if (block == null) { return; }
         mut made: MethodNode* = null;
-        for (mut k: i64 = 0; k < impl_node.methods.length && made == null; k++) {
-            const c: MethodNode* = impl_node.methods[k];
+        for (mut k: i64 = 0; k < block.methods.length && made == null; k++) {
+            const c: MethodNode* = block.methods[k];
             if (c != null && c != m && c.func != null && c.func.copy_of.equals(m.func.copy_of)
                     && !c.func.is_self_returning_default && !c.func.is_lazy_self_growing
                     && c.func.generic_params.length == 0) {
@@ -1401,7 +1401,7 @@ type struct MonoCallSpecializer {
         // A method with type parameters of its own is the instance at the
         // arguments the type check kept on the path.
         if (m.func.generic_params.length > 0) {
-            mut impl_node: ImplBlockNode* = null;
+            mut impl_node: DeclarationNode* = null;
             mut owner_ast: ASTNode* = null;
             if (!this.method_placement(m, owner, &impl_node, &owner_ast)) { return; }
             const inst: OverloadId = this.method_instance_entry(m, impl_node, owner_ast, owner,
@@ -1431,14 +1431,16 @@ type struct MonoCallSpecializer {
         const d: DefId = call.template_method;
         const slot: i64 = this.generic_registry.trait_item_position(d);
         if (slot < 0) { return this.recorded_method_on(d, owner); }
-        const heads: [ImplBlockNode*] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
-        if (heads.length == 1) { return this.generic_registry.trait_item_method(heads[0], slot); }
+        const heads: [DeclarationNode*] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
+        if (heads.length == 1) {
+            return this.generic_registry.trait_item_method(DeclarationNode::impl_of(heads[0]), slot);
+        }
         // Several implementations of one generic trait (`TryFrom<&JsonValue>`
         // beside `TryFrom<i64>` for `u64`): the one the bound directing the
         // call names, whose method takes the parameters the bound gives it.
         mut found: MethodNode* = null;
         for (mut h: i64 = 0; h < heads.length; h++) {
-            const m: MethodNode* = this.generic_registry.trait_item_method(heads[h], slot);
+            const m: MethodNode* = this.generic_registry.trait_item_method(DeclarationNode::impl_of(heads[h]), slot);
             if (m == null || !this.takes_bound_params(m, call)) { continue; }
             if (found != null) { return null; }
             found = m;
@@ -1468,9 +1470,9 @@ type struct MonoCallSpecializer {
     recorded_method_on(&this, d: DefId, owner: TypeRef) -> MethodNode* {
         const slot: i64 = this.generic_registry.trait_item_position(d);
         if (slot >= 0) {
-            const heads: [ImplBlockNode*] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
+            const heads: [DeclarationNode*] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
             if (heads.length != 1) { return null; }
-            return this.generic_registry.trait_item_method(heads[0], slot);
+            return this.generic_registry.trait_item_method(DeclarationNode::impl_of(heads[0]), slot);
         }
         return this.decl_index.entry_method(this.decl_index.method_entry_on(owner, d));
     }
@@ -1481,9 +1483,9 @@ type struct MonoCallSpecializer {
     named_method_on(&this, d: DefId, owner: TypeRef) -> MethodNode* {
         const slot: i64 = this.generic_registry.trait_item_position(d);
         if (slot >= 0) {
-            const heads: [ImplBlockNode*] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
+            const heads: [DeclarationNode*] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
             if (heads.length == 0) { return null; }
-            return this.generic_registry.trait_item_method(heads[0], slot);
+            return this.generic_registry.trait_item_method(DeclarationNode::impl_of(heads[0]), slot);
         }
         return this.decl_index.entry_method(this.decl_index.method_entry_on(owner, d));
     }
@@ -1601,18 +1603,18 @@ type struct MonoCallSpecializer {
             if (call.named_method.is_valid()) {
                 this.pin_plain(call, this.named_method_on(call.named_method, owner));
             } else if (own_params != null && own_params.generic_params.length > 0) {
-                mut gm_impl: ImplBlockNode* = null;
+                mut gm_impl: DeclarationNode* = null;
                 mut gm_owner: ASTNode* = null;
                 const gm: MethodNode* = this.receiver_method_of(call.template_method, owner, &gm_impl, &gm_owner);
                 if (gm != null) { this.instantiate_generic_method(call, gm, gm_impl, gm_owner, owner, null); }
             } else if ((call.callee as ASTNode*).kind == NodeKind::ScopeResolution) {
                 this.pin_plain(call, this.path_method_on(call, owner));
             } else if (call.template_method.is_valid()) {
-                mut id_impl: ImplBlockNode* = null;
+                mut id_impl: DeclarationNode* = null;
                 mut id_owner: ASTNode* = null;
                 this.pin_plain(call, this.receiver_method_of(call.template_method, owner, &id_impl, &id_owner));
             } else {
-                mut item_impl: ImplBlockNode* = null;
+                mut item_impl: DeclarationNode* = null;
                 this.pin_plain(call, this.trait_item_on(call, call.callee as MemberAccessNode*, owner, &item_impl));
             }
         }
@@ -1741,19 +1743,20 @@ type struct MonoCallSpecializer {
     /// of `impl_node`: `made` when an earlier call instantiated it, else an
     /// instance minted now, registered, and walked for the calls its body
     /// makes.  The pin is the instance's registered entry.
-    instantiate_deferred(mut &this, call: CallExprNode*, orig: MethodNode*, impl_node: ImplBlockNode*,
+    instantiate_deferred(mut &this, call: CallExprNode*, orig: MethodNode*, impl_node: DeclarationNode*,
                          recv_type: TypeRef, made: MethodNode*) -> boolean {
         if (made != null) {
             this.pin_spec_entry(call, made.func.overload_entry);
             return true;
         }
+        const block: ImplBlock* = DeclarationNode::impl_of(impl_node);
         mut empty_params: [DeclarationNode*] = [];
         mut empty_args: [TypeRef] = [];
         mut copy_subst: TypeSubstitution* = null;
         const spec_method: MethodNode* = this.specialize_method(
-            orig, &empty_params, &empty_args, recv_type, impl_node, &copy_subst);
+            orig, &empty_params, &empty_args, recv_type, block, &copy_subst);
         if (spec_method == null || spec_method.func == null) { return false; }
-        impl_node.methods.push(spec_method);
+        block.methods.push(spec_method);
         this.register_spec_method_in_di(spec_method, recv_type, impl_node);
         this.pin_spec_entry(call, spec_method.func.overload_entry);
         if (spec_method.func.body != null) {
@@ -1884,7 +1887,7 @@ type struct MonoCallSpecializer {
             return true;
         }
         const recv_type: TypeRef = spec_entry.specialized_type;
-        mut impl_node: ImplBlockNode* = null;
+        mut impl_node: DeclarationNode* = null;
         mut owner_ast: ASTNode* = null;
         const m: MethodNode* = this.receiver_method_of(call.template_method, recv_type, &impl_node, &owner_ast);
         if (m != null) { this.instantiate_generic_method(call, m, impl_node, owner_ast, recv_type, subst); }
@@ -2051,7 +2054,7 @@ type struct MonoCallSpecializer {
     /// is the one the copy's body is walked with.
     specialize_method(mut &this, original: MethodNode*,
                       params: &[DeclarationNode*], args: &[TypeRef],
-                      owner_type: TypeRef, owner_impl: ImplBlockNode*,
+                      owner_type: TypeRef, owner_impl: ImplBlock*,
                       out_subst: TypeSubstitution**) -> MethodNode* {
         if (original == null || original.func == null) { return null; }
         if (params.length != args.length) { return null; }
@@ -2340,7 +2343,7 @@ type struct MonoCallSpecializer {
     /// Register an impl-block-owned spec method in the DeclarationIndex under the
     /// receiver's type so codegen/linker find the right func_type/mangle.
     register_spec_method_in_di(mut &this, spec_method: MethodNode*,
-                               recv_type: TypeRef, impl_node: ImplBlockNode*) -> void {
+                               recv_type: TypeRef, impl_node: DeclarationNode*) -> void {
         if (this.decl_index == null) { return; }
         if (spec_method == null || impl_node == null) { return; }
         mut owning_file: SymbolStr = SymbolStr::empty();

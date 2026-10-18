@@ -176,6 +176,16 @@ public:
         };
     }
 
+    /// The implement block `n` is, or null.
+    static impl_of(n: ASTNode*) -> ImplBlock* {
+        const d: DeclarationNode* = DeclarationNode::with_shape(n);
+        if (d == null) { return null; }
+        return match (d.shape) {
+            DeclKind::Impl(i) => { i }
+            _                 => { null }
+        };
+    }
+
     /// The struct declaration `n` is, or null.
     static struct_of(n: ASTNode*) -> StructDecl* {
         const d: DeclarationNode* = DeclarationNode::with_shape(n);
@@ -839,8 +849,8 @@ public:
             methods = &(DeclarationNode::union_of(decl)).methods;
         } else if (decl.kind == NodeKind::ClassDeclaration) {
             methods = &(decl as ClassDeclNode*).methods;
-        } else if (decl.kind == NodeKind::ImplementationBlock) {
-            methods = &(decl as ImplBlockNode*).methods;
+        } else if (DeclarationNode::impl_of(decl) != null) {
+            methods = &(DeclarationNode::impl_of(decl)).methods;
         }
         for (mut k: i64 = 0; k < methods.length; k++) {
             if (methods[k] == m) { return true; }
@@ -860,6 +870,7 @@ type enum DeclKind {
     Extern(ExternBlock*);
     Field(FieldDecl*);
     GenericParam(GenericParamDecl*);
+    Impl(ImplBlock*);
     Import(ImportDecl*);
     Intrinsic(IntrinsicDecl*);
     Module(ModuleDecl*);
@@ -1357,7 +1368,7 @@ public:
 /// An associated-type member declared inside a trait body: `type Item;` or
 /// `type Item: Copy + Clone;`. `bounds` holds the declaration-site trait
 /// constraints (empty for an unbounded `type Item;`). Stored on
-/// `TraitDecl.assoc_types`; bound concretely per-impl (see ImplBlockNode's
+/// `TraitDecl.assoc_types`; bound concretely per-impl (see ImplBlock's
 /// assoc bindings) and projected via `TypeAnnotation::Projection`.
 type struct AssocTypeDeclNode {
     name:   SymbolStr;
@@ -1607,8 +1618,7 @@ implement trait Allocate for struct EnumVariant {
     }
 }
 
-type class ImplBlockNode : DeclarationNode {
-public:
+type struct ImplBlock {
     target_type:    SymbolStr;
     /// What `target_type` names, stamped by NameResolution from the scope the
     /// impl head was written in.  An impl head names one type outright, so
@@ -1715,29 +1725,30 @@ public:
     assoc_binding_slots:       [i64];
     assoc_binding_annotations: [TypeAnnotation*];
 
-    ImplBlockNode(target_type: SymbolStr, span: SourceSpan)
-        : DeclarationNode(NodeKind::ImplementationBlock, span) {
-        this.target_type           = target_type;
-        this.res                   = ResSlot::Pending;
-        this.spec_owner            = TypeRef::invalid();
-        this.trait_def             = DefId::invalid();
-        this.generic_params        = [];
-        this.target_args           = [];
-        this.methods               = [];
-        this.trait_item_methods    = [];
-        this.trait_arg_types       = [];
-        this.trait_annotation      = null;
-        this.where_bounds          = [];
-        this.target_type_span      = SourceSpan::none();
-        this.derived_param_names   = [];
-        this.derived_param_syms    = [];
-        this.derived_param_types   = [];
-        this.assoc_binding_names       = [];
-        this.assoc_binding_slots       = [];
-        this.assoc_binding_annotations = [];
+    static new(target_type: SymbolStr) -> ImplBlock* {
+        return new ImplBlock {
+            target_type:               target_type,
+            res:                       ResSlot::Pending,
+            spec_owner:                TypeRef::invalid(),
+            trait_def:                 DefId::invalid(),
+            generic_params:            [],
+            target_args:               [],
+            methods:                   [],
+            trait_item_methods:        [],
+            trait_arg_types:           [],
+            trait_annotation:          null,
+            where_bounds:              [],
+            target_type_span:          SourceSpan::none(),
+            derived_param_names:       [],
+            derived_param_syms:        [],
+            derived_param_types:       [],
+            assoc_binding_names:       [],
+            assoc_binding_slots:       [],
+            assoc_binding_annotations: [],
+        };
     }
 
-    is_generic() -> boolean { return this.generic_params.length > 0; }
+    is_generic(&this) -> boolean { return this.generic_params.length > 0; }
     is_trait_impl(&this) -> boolean { return this.trait_annotation != null; }
 
     /// The method this block provides for its trait's `slot`-th declared
@@ -1748,7 +1759,6 @@ public:
         if (at < 0 || at >= this.methods.length) { return null; }
         return this.methods[at];
     }
-    set_target_type(n: SymbolStr) -> void { this.target_type = n; }
 
     /// The definition the head's target names, off its stamp; invalid for a
     /// primitive (declared nowhere) and for a monomorphized clone (whose
@@ -1800,36 +1810,6 @@ public:
             answer = arena.get_qualified_name(this.spec_owner).spelling();
         }
         return answer;
-    }
-
-
-    set_target_type_span(mut &this, sp: SourceSpan) -> void {
-        this.target_type_span = sp;
-    }
-
-    add_generic_param(param: DeclarationNode*) -> void {
-        this.generic_params.push(param);
-    }
-
-    /// Record what the impl head's target type name refers to.  First wins.
-    set_res(mut &this, r: Res) -> void {
-        this.res.answer(r);
-    }
-
-    set_target_args(mut &this, args: [TypeAnnotation*]) -> void {
-        this.target_args = args;
-    }
-
-    set_trait_annotation(mut &this, ann: TypeAnnotation*) -> void {
-        this.trait_annotation = ann;
-    }
-
-    add_where_bound(mut &this, bound: TraitBound) -> void {
-        this.where_bounds.push(bound);
-    }
-
-    add_method(m: MethodNode*) -> void {
-        this.methods.push(m);
     }
 
     /// Record a concrete trait-element binding recovered at impl-spec time.
@@ -1929,6 +1909,16 @@ public:
         if (assoc_idx < 0 || assoc_idx >= tdecl.assoc_types.length) { return null; }
         if (tdecl.assoc_types[assoc_idx] == null) { return null; }
         return this.assoc_binding_at(tdecl, assoc_idx);
+    }
+
+    static walk_children<V>(n: ImplBlock*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.methods.length; i++) { v.walk_decl(n.methods[i] as DeclarationNode*); }
+    }
+}
+
+implement trait Allocate for struct ImplBlock {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

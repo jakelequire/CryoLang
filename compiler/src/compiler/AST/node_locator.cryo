@@ -29,7 +29,7 @@ import compiler::ast::pattern;
 import compiler::ast::pattern::{ MatchArmNode, Pattern, StaticMatchArmNode };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind,
-    FunctionDeclNode, ImplBlockNode, MethodNode, StructDecl,
+    FunctionDeclNode, ImplBlock, MethodNode, StructDecl,
     TraitDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -371,25 +371,25 @@ type struct NodeLocator {
                         if (f != null) { return f; }
                         return NodeLocator::pick_array_method(d.methods, line, character);
                     }
+                    // `synthesize_default_trait_methods` (TypeResolution)
+                    // clones default-bodied trait methods INTO this impl's
+                    // `methods` array.  The clones retain spans from the
+                    // trait decl's source file (e.g. `io/traits.cryo`), so a
+                    // line-only match can land on a synthesized method whose
+                    // line number happens to overlap the impl head in the
+                    // impl's own file.  Filter to methods whose span.file
+                    // matches the impl block's span.file so position lookup
+                    // only sees real source positions in the file we're
+                    // walking.
+                    DeclKind::Impl(d) => {
+                        return NodeLocator::pick_array_method_in_file(
+                            d.methods, node.span.file, line, character);
+                    }
                     DeclKind::Destructure(_) | DeclKind::Import(_) | DeclKind::Intrinsic(_)
                     | DeclKind::Module(_) | DeclKind::Variant(_)
                     | DeclKind::TypeAlias(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
                     | DeclKind::Legacy => { return null; }
                 }
-            }
-            NodeKind::ImplementationBlock => {
-                // `synthesize_default_trait_methods` (TypeResolution) clones
-                // default-bodied trait methods INTO this impl's `methods`
-                // array.  The clones retain spans from the trait decl's
-                // source file (e.g. `io/traits.cryo`), so a line-only match
-                // can land on a synthesized method whose line number
-                // happens to overlap the impl head in the impl's own file.
-                // Filter to methods whose span.file matches the impl
-                // block's span.file so position lookup only sees real
-                // source positions in the file we're walking.
-                const d: ImplBlockNode* = node as ImplBlockNode*;
-                return NodeLocator::pick_array_method_in_file(
-                    d.methods, d.span.file, line, character);
             }
             _ => { return null; }
         }
@@ -530,7 +530,7 @@ type struct NodeLocator {
     }
 
     /// Like `pick_array_method`, but skips methods whose span.file differs
-    /// from `expected_file`.  Used by the ImplementationBlock dispatch:
+    /// from `expected_file`.  Used by the implement-block dispatch:
     /// `synthesize_default_trait_methods` clones default-bodied trait
     /// methods into the impl's `methods` array, and the clones retain
     /// spans from the trait decl's source file.  Without the file filter

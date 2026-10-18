@@ -25,7 +25,7 @@ import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDecl,
     EnumVariant, ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl,
-    DeclKind, ImplBlockNode, ImportDecl, IntrinsicDecl, MethodNode,
+    DeclKind, ImplBlock, ImportDecl, IntrinsicDecl, MethodNode,
     ModuleDecl, StructDecl, TraitDecl, TypeAliasDecl, UnionDecl,
     VarDeclNode
 };
@@ -150,7 +150,6 @@ type struct ASTCloner {
             NodeKind::MethodDeclaration         => { return this.visit_method(n as MethodNode*); }
             NodeKind::Declaration               => { return this.copy_decl_shape(n as DeclarationNode*); }
             NodeKind::ClassDeclaration          => { return this.visit_class(n as ClassDeclNode*); }
-            NodeKind::ImplementationBlock       => { return this.visit_impl(n as ImplBlockNode*); }
 
             NodeKind::MatchArm                  => { return this.visit_match_arm(n as MatchArmNode*); }
             NodeKind::StaticMatchArm            => { return this.visit_static_match_arm(n as StaticMatchArmNode*); }
@@ -1016,6 +1015,56 @@ type struct ASTCloner {
                 }
                 DeclKind::Struct(c)
             }
+            DeclKind::Impl(n) => {
+                const c: ImplBlock* = ImplBlock::new(n.target_type);
+                for (mut i: i64 = 0; i < n.generic_params.length; i++) {
+                    c.generic_params.push(this.copy_decl_shape(n.generic_params[i]));
+                }
+                if (n.trait_annotation != null) {
+                    c.trait_annotation = this.clone_type_annotation(n.trait_annotation);
+                }
+                c.target_args = this.clone_type_annotations(n.target_args);
+                mut tats: [TypeRef] = [];
+                for (mut i: i64 = 0; i < n.trait_arg_types.length; i++) { tats.push(n.trait_arg_types[i]); }
+                c.trait_arg_types = tats;
+                // where_bounds: shallow array copy. TraitBound entries are not
+                // mutated post-construction (parser fills them, sema reads
+                // them), so the inner trait_refs arrays can be shared safely.
+                c.where_bounds = n.where_bounds;
+                // `target_type_span` is deliberately NOT copied.
+                // `trait_def` IS copied: specializing an impl rewrites which
+                // type it is for, never which trait it provides, so the
+                // template's trait identity is the clone's.
+                c.trait_def = n.trait_def;
+                // `res` is NOT copied: a specialization rebinds WHICH type the
+                // head is for, and the stamp names the template's definition.
+                // A clone whose `target_type` the monomorphizer rewrote to the
+                // spec would otherwise carry a stamp naming the generic base
+                // beside a spelling naming the instantiation, and a consumer
+                // reading the stamp would bind the head to the template.  Left
+                // unanswered, the spelling stays the single carrier of which
+                // specialization the clone is for.
+                // Associated-type bindings (`type Item = T;` / positional-header
+                // desugar) and monomorphizer-recovered derived element
+                // bindings are how `This::Item` projections and self-returning
+                // default methods resolve concretely; without them an
+                // eager-specialized generic-trait impl's projections fail
+                // (E0636).  The annotations are owning pointers, so deep-clone
+                // them (no aliasing).
+                for (mut i: i64 = 0; i < n.derived_param_names.length; i++) {
+                    c.add_derived_param(n.derived_param_syms[i], n.derived_param_names[i],
+                                        n.derived_param_types[i]);
+                }
+                for (mut i: i64 = 0; i < n.assoc_binding_names.length; i++) {
+                    c.assoc_binding_names.push(n.assoc_binding_names[i]);
+                    c.assoc_binding_slots.push(n.assoc_binding_slots[i]);
+                    c.assoc_binding_annotations.push(this.clone_type_annotation(n.assoc_binding_annotations[i]));
+                }
+                for (mut i: i64 = 0; i < n.methods.length; i++) {
+                    c.methods.push(this.dispatch_node(n.methods[i]) as MethodNode*);
+                }
+                DeclKind::Impl(c)
+            }
             DeclKind::Variant(n) => {
                 const c: EnumVariant* = EnumVariant::new(n.name);
                 // Deep-clone type annotations (not shallow copy)
@@ -1064,56 +1113,6 @@ type struct ASTCloner {
         return c;
     }
 
-    visit_impl(mut &this, node: ImplBlockNode*) -> ASTNode* {
-        mut c: ImplBlockNode* = new ImplBlockNode(node.target_type, node.span);
-        this.copy_decl_base(node, c);
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
-        }
-        if (node.trait_annotation != null) {
-            c.set_trait_annotation(this.clone_type_annotation(node.trait_annotation));
-        }
-        c.set_target_args(this.clone_type_annotations(node.target_args));
-        mut tats: [TypeRef] = [];
-        for (mut i: i64 = 0; i < node.trait_arg_types.length; i++) { tats.push(node.trait_arg_types[i]); }
-        c.trait_arg_types = tats;
-        // where_bounds: shallow array copy. TraitBound entries are not mutated
-        // post-construction (parser fills them, sema reads them), so the inner
-        // trait_refs arrays can be shared safely.
-        c.where_bounds = node.where_bounds;
-        // `target_type_span` is deliberately NOT copied.
-        // `trait_def` IS copied: specializing an impl rewrites
-        // which type it is for, never which trait it provides, so the
-        // template's trait identity is the clone's.
-        c.trait_def = node.trait_def;
-        // `res` is NOT copied:
-        // a specialization rebinds WHICH type the head is for, and the stamp
-        // names the template's definition.  A clone whose `target_type` the
-        // monomorphizer rewrote to the spec would otherwise carry a stamp
-        // naming the generic base beside a spelling naming the instantiation,
-        // and a consumer reading the stamp would bind the head to the template.
-        // Left unanswered, the spelling stays the single carrier of which
-        // specialization the clone is for.
-        // Associated-type bindings (`type Item = T;` / positional-header
-        // desugar) and monomorphizer-recovered derived element bindings. These
-        // are how `This::Item` projections and self-returning default methods
-        // resolve concretely. Omitting them left eager-specialized generic-trait
-        // impls with empty bindings -> E0636-class projection failures. The
-        // annotations are owning pointers, so deep-clone them (no aliasing).
-        for (mut i: i64 = 0; i < node.derived_param_names.length; i++) {
-            c.add_derived_param(node.derived_param_syms[i], node.derived_param_names[i],
-                                node.derived_param_types[i]);
-        }
-        for (mut i: i64 = 0; i < node.assoc_binding_names.length; i++) {
-            c.assoc_binding_names.push(node.assoc_binding_names[i]);
-            c.assoc_binding_slots.push(node.assoc_binding_slots[i]);
-            c.assoc_binding_annotations.push(this.clone_type_annotation(node.assoc_binding_annotations[i]));
-        }
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            c.add_method(this.dispatch_node(node.methods[i]) as MethodNode*);
-        }
-        return c;
-    }
 
 
 

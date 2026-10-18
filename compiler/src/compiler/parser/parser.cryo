@@ -39,7 +39,7 @@ import std::fmt;
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
     DestructureDecl, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
-    FunctionDeclNode, GenericParamDecl, ImplBlockNode, ImportDecl,
+    FunctionDeclNode, GenericParamDecl, ImplBlock, ImportDecl,
     IntrinsicDecl, MethodNode, ModuleDecl, ReceiverForm,
     StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDeclNode
@@ -180,7 +180,6 @@ implement struct Parser {
             NodeKind::FunctionDeclaration   => { true }
             NodeKind::ClassDeclaration      => { true }
             NodeKind::VariableDeclaration   => { true }
-            NodeKind::ImplementationBlock   => { true }
             NodeKind::Declaration           => { true }
             _                               => { false }
         };
@@ -409,7 +408,7 @@ implement struct Parser {
 
         // Implement block
         if (tok.kind == TokenType::KwImplement) {
-            const impl_blk: ImplBlockNode* = this.parse_implementation_block();
+            const impl_blk: DeclarationNode* = this.parse_implementation_block();
             if (impl_blk != null && doc != "") {
                 impl_blk.set_documentation(doc);
             }
@@ -2192,7 +2191,7 @@ implement struct Parser {
         return false;
     }
 
-    parse_implementation_block() -> ImplBlockNode* {
+    parse_implementation_block() -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_implementation_block()");
         const start: Token = this.advance(); // consume 'implement'
 
@@ -2299,17 +2298,18 @@ implement struct Parser {
             type_name = this.intern_lexeme(type_tok);
             type_text = type_tok.lexeme;
         }
-        mut node: ImplBlockNode* = new ImplBlockNode(type_name, this.span_from_token(start));
-        node.set_target_type_span(this.span_from_token(type_tok));
+        const node: ImplBlock* = ImplBlock::new(type_name);
+        const decl: DeclarationNode* = DeclarationNode::of(DeclKind::Impl(node), this.span_from_token(start));
+        node.target_type_span = this.span_from_token(type_tok);
         this.current_type_name = type_text;
 
         // Attach the trait annotation and the leading generic params (if any)
         // collected before the target name was known.
         if (trait_ann != null) {
-            node.set_trait_annotation(trait_ann);
+            node.trait_annotation = trait_ann;
         }
         for (mut lgi: i64 = 0; lgi < leading_gen_params.length; lgi++) {
-            node.add_generic_param(leading_gen_params[lgi]);
+            node.generic_params.push(leading_gen_params[lgi]);
         }
 
         // The `<...>` after the target name is what the head writes for the
@@ -2328,7 +2328,7 @@ implement struct Parser {
                 for (mut gi: i64 = 0; gi < gen_params.length; gi++) {
                     const gp_decl: DeclarationNode* = gen_params[gi];
                     const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
-                    if (!Parser::declares_generic_param(&leading_gen_params, gp)) { node.add_generic_param(gp_decl); }
+                    if (!Parser::declares_generic_param(&leading_gen_params, gp)) { node.generic_params.push(gp_decl); }
                     const arg: NamedAnnotation* = new NamedAnnotation {
                         name: gp.name,
                         span: gp_decl.span,
@@ -2337,9 +2337,9 @@ implement struct Parser {
                     };
                     inherent_args.push(new TypeAnnotation::Named(arg));
                 }
-                node.set_target_args(inherent_args);
+                node.target_args = inherent_args;
             } else {
-                node.set_target_args(this.parse_generic_args());
+                node.target_args = this.parse_generic_args();
             }
         }
 
@@ -2347,7 +2347,7 @@ implement struct Parser {
         if (this.check(TokenType::KwWhere)) {
             const bounds: [TraitBound] = this.parse_trait_bounds();
             for (mut wi: i64 = 0; wi < bounds.length; wi++) {
-                node.add_where_bound(bounds[wi].clone());
+                node.where_bounds.push(bounds[wi].clone());
             }
         }
 
@@ -2424,7 +2424,7 @@ implement struct Parser {
                         method.add_directive(pending_dirs[pi]);
                     }
                     method.note_modifier_span(modifier_span);
-                    node.add_method(method);
+                    node.methods.push(method);
                 }
             } else {
                 this.error_unexpected();
@@ -2435,8 +2435,8 @@ implement struct Parser {
         this.consume(TokenType::RBrace, "'}'");
         this.give_receivers(&node.methods);
         this.current_type_name = "";
-        node.span = this.span_from(start);
-        return node;
+        decl.span = this.span_from(start);
+        return decl;
     }
 
     /// Parse an extern block: extern "C" { function declarations }

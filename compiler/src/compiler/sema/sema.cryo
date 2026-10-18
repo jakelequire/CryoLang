@@ -69,7 +69,7 @@ import compiler::passes::type_resolution::{ TypeResolutionPasses, TypeResolution
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
-    FunctionDeclNode, GenericParamDecl, ImplBlockNode, MethodNode,
+    FunctionDeclNode, GenericParamDecl, ImplBlock, MethodNode,
     StructDecl, TraitDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -370,16 +370,16 @@ type struct SemaVisitor {
                     this.declare_async_methods(c.methods, c.generic_params,
                         this.ctx.decl_index.type_of_decl(c.def, "sema/async declare class"), c.name, null);
                 }
-                NodeKind::ImplementationBlock => {
-                    const ib: ImplBlockNode* = stmt as ImplBlockNode*;
-                    // The head's owner, off the stamp; the written target is
-                    // what a refusal names.
-                    mut owner_params: [DeclarationNode*] = this.impl_owner_params(ib);
-                    this.declare_async_methods(ib.methods, owner_params,
-                        this.ctx.decl_index.impl_owner(ib, "sema/async declare"), ib.target_type, ib);
-                }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Impl(ib) => {
+                            // The head's owner, off the stamp; the written
+                            // target is what a refusal names.
+                            mut owner_params: [DeclarationNode*] = this.impl_owner_params(ib);
+                            this.declare_async_methods(ib.methods, owner_params,
+                                this.ctx.decl_index.impl_owner(ib, "sema/async declare"), ib.target_type,
+                                stmt as DeclarationNode*);
+                        }
                         DeclKind::Struct(s) => {
                             this.declare_async_methods(s.methods, s.generic_params,
                                 this.ctx.decl_index.type_of_decl(s.def, "sema/async declare struct"), s.name, null);
@@ -407,13 +407,14 @@ type struct SemaVisitor {
     /// the key its methods are registered under is the index's to name from
     /// it.  `written` is the owner as the source spelled it, for the refusal
     /// of a method whose owner has no type.
-    /// `impl_node` is the enclosing impl block when the owner is one (null
-    /// otherwise); a trait impl uses it to bind the trait's implicit
-    /// `<Method>Fut` associated type to the future each method lowers to.
+    /// `impl_decl` is the enclosing impl block's declaration when the owner
+    /// is one (null otherwise); a trait impl uses it to bind the trait's
+    /// implicit `<Method>Fut` associated type to the future each method
+    /// lowers to.
     declare_async_methods(mut &this, methods: &[MethodNode*],
                           owner_params: &[DeclarationNode*],
                           owner_ty: TypeRef, written: SymbolStr,
-                          impl_node: ImplBlockNode*) -> void {
+                          impl_decl: DeclarationNode*) -> void {
         if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, written); return; }
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
@@ -436,7 +437,7 @@ type struct SemaVisitor {
                 decl: owner_ty,
                 written: written,
                 params: this.clone_generic_params(owner_params),
-                impl_node: impl_node,
+                impl_decl: impl_decl,
             };
             this.async_lower.declare_method(own);
         }
@@ -485,7 +486,7 @@ type struct SemaVisitor {
     /// symbolically, and a body walked concretely while an abstract projection
     /// (`S::ReadFut::Output`) is still in it fails every check against that
     /// projection instead of deferring until monomorphization resolves it.
-    impl_owner_params(mut &this, ib: ImplBlockNode*) -> [DeclarationNode*] {
+    impl_owner_params(mut &this, ib: ImplBlock*) -> [DeclarationNode*] {
         if (ib.generic_params.length > 0) {
             return this.clone_generic_params(ib.generic_params);
         }
@@ -654,10 +655,10 @@ type struct SemaVisitor {
         this.state.symbolic_trait = saved_trait;
     }
 
-    visit_impl(mut &this, node: ImplBlockNode*) -> void {
+    visit_impl(mut &this, decl: DeclarationNode*, node: ImplBlock*) -> void {
         if (node.is_generic()) {
-            const impl_target: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/visit:ImplBlockNode");
-            const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
+            const impl_target: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/visit:ImplBlock");
+            const saved_impl: ImplBlock* = this.state.symbolic_impl_node;
             this.state.symbolic_impl_node = node;
             this.symbolic_check_owner_methods(node.methods, impl_target, node.generic_params);
             this.state.symbolic_impl_node = saved_impl;
@@ -688,8 +689,8 @@ type struct SemaVisitor {
             }
             if (tmpl != null) {
                 if (tmpl.ast_node != null) {
-                    const owner_ty: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/visit:ImplBlockNode");
-                    const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
+                    const owner_ty: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/visit:ImplBlock");
+                    const saved_impl: ImplBlock* = this.state.symbolic_impl_node;
                     this.state.symbolic_impl_node = node;
                     if (tmpl.kind == TemplateKind::Struct) {
                         this.symbolic_check_owner_methods(node.methods, owner_ty,
@@ -709,8 +710,8 @@ type struct SemaVisitor {
                 return;
             }
         }
-        const impl_this: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/visit:ImplBlockNode");
-        this.check_assoc_decl_bounds(node, impl_this);
+        const impl_this: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/visit:ImplBlock");
+        this.check_assoc_decl_bounds(decl, node, impl_this);
         this.visit_methods(node.methods, impl_this);
     }
 
@@ -778,14 +779,14 @@ type struct SemaVisitor {
 
     /// Enforce a trait's declaration-site associated-type bounds against this
     /// concrete impl's binding (E0306).
-    check_assoc_decl_bounds(mut &this, node: ImplBlockNode*, impl_this: TypeRef) -> void {
+    check_assoc_decl_bounds(mut &this, decl: DeclarationNode*, node: ImplBlock*, impl_this: TypeRef) -> void {
         if (node == null || !node.is_trait_impl()) { return; }
         if (!impl_this.is_valid()) { return; }
         const trait_leaf: DefId = TypeAnnotation::trait_def(node.trait_annotation);
         if (!trait_leaf.is_valid()) { return; }
         const tdecl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
         if (tdecl == null) { return; }
-        const span: SourceSpan = if (node.target_type_span.has_location()) { node.target_type_span } else { node.span };
+        const span: SourceSpan = if (node.target_type_span.has_location()) { node.target_type_span } else { decl.span };
         const trait_str: string = this.intern.shown(this.ctx.defs.path_of(trait_leaf));
         for (mut i: i64 = 0; i < tdecl.assoc_types.length; i++) {
             const adecl: AssocTypeDeclNode* = tdecl.assoc_types[i];
@@ -1663,7 +1664,6 @@ type struct SemaVisitor {
             NodeKind::VariableDeclaration    => { this.visit_var(n as VarDeclNode*); }
             NodeKind::FunctionDeclaration    => { this.visit_function(n as FunctionDeclNode*); }
             NodeKind::ClassDeclaration       => { this.visit_class(n as ClassDeclNode*); }
-            NodeKind::ImplementationBlock    => { this.visit_impl(n as ImplBlockNode*); }
 
             NodeKind::MethodDeclaration
             | NodeKind::MatchArm | NodeKind::StaticMatchArm | NodeKind::Pattern
@@ -1676,6 +1676,7 @@ type struct SemaVisitor {
                     DeclKind::Trait(t)        => { this.visit_trait(t); }
                     DeclKind::Union(u)        => { this.visit_union(u); }
                     DeclKind::Struct(s)       => { this.visit_struct(s); }
+                    DeclKind::Impl(ib)        => { this.visit_impl(d, ib); }
                     // None of these has a check.
                     DeclKind::Import(_) | DeclKind::Intrinsic(_)
                     | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Extern(_)
@@ -2238,7 +2239,7 @@ type struct SemaVisitor {
         if (!is_primitive) { return null; }
         // Gate on the impl EXISTING on the primitive before building anything,
         // so a plain `2 * 3`-shaped error never materializes a bogus call.
-        const impl_block: ImplBlockNode* = this.trait_checker().select_impl(
+        const impl_block: ImplBlock* = this.trait_checker().select_impl(
             this.ctx.generic_registry.wellknown(map.lang), lhs, 0);
         if (impl_block == null || !impl_block.trait_def.is_valid()) { return null; }
         const method_sym: SymbolStr = this.intern.intern(map.method);

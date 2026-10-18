@@ -42,7 +42,7 @@ import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDecl, EnumDecl, EnumVariant,
-    ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlockNode,
+    ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlock,
     DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDeclNode
 };
@@ -151,8 +151,8 @@ type struct NameResolver {
     static this_owner_params_of(decl: ASTNode*) -> [DeclarationNode*] {
         mut out: [DeclarationNode*] = [];
         if (decl == null) { return out; }
-        if (decl.kind == NodeKind::ImplementationBlock) {
-            const ib: ImplBlockNode* = decl as ImplBlockNode*;
+        if (DeclarationNode::impl_of(decl) != null) {
+            const ib: ImplBlock* = DeclarationNode::impl_of(decl);
             for (mut i: i64 = 0; i < ib.generic_params.length; i++) { out.push(ib.generic_params[i]); }
         } else if (DeclarationNode::struct_of(decl) != null) {
             const sd: StructDecl* = DeclarationNode::struct_of(decl);
@@ -335,7 +335,7 @@ type struct NameResolver {
     /// The definition an impl head names as the type its methods belong to:
     /// the declared type, or the primitive.  Invalid for a head that names
     /// neither.
-    impl_owner_def(&this, node: ImplBlockNode*) -> DefId {
+    impl_owner_def(&this, node: ImplBlock*) -> DefId {
         return match (node.res) {
             ResSlot::Answered(r) => {
                 match (r) {
@@ -578,11 +578,12 @@ type struct NameResolver {
                                 alias_node.binding_namespace, alias_node.alias_name, decl.span));
                         }
                     }
-                    // A module declaration introduces no name of this module.
-                    // A variant or a field is declared with its type, a
-                    // generic parameter in its declaration's scope; a
-                    // destructure's locals where the walk meets them.
-                    DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Field(_)
+                    // A module declaration introduces no name of this module,
+                    // nor does an implement block.  A variant or a field is
+                    // declared with its type, a generic parameter in its
+                    // declaration's scope; a destructure's locals where the
+                    // walk meets them.
+                    DeclKind::Module(_) | DeclKind::Impl(_) | DeclKind::Variant(_) | DeclKind::Field(_)
                     | DeclKind::GenericParam(_)
                     | DeclKind::Destructure(_) | DeclKind::Legacy => {}
                 }
@@ -622,7 +623,7 @@ type struct NameResolver {
                     DeclKind::Struct(s)          => { s.def }
                     DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
                     | DeclKind::Variant(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
-                    | DeclKind::Destructure(_) | DeclKind::Legacy => {
+                    | DeclKind::Impl(_) | DeclKind::Destructure(_) | DeclKind::Legacy => {
                         DefId::invalid()
                     }
                 }
@@ -866,7 +867,7 @@ type struct NameResolver {
     /// list declares its names (the parser makes each a parameter), so
     /// nothing in it is unbound; anything nested, or written as more than a
     /// name, is stamped as every annotation is.
-    stamp_impl_target_args(&this, node: ImplBlockNode*) -> void {
+    stamp_impl_target_args(&this, decl: DeclarationNode*, node: ImplBlock*) -> void {
         mut undeclared: [string] = [];
         for (mut i: i64 = 0; i < node.target_args.length; i++) {
             const arg: TypeAnnotation* = node.target_args[i];
@@ -915,7 +916,7 @@ type struct NameResolver {
         }
         const target: string = intern.resolve(node.target_type);
         const trait_part: string = TypeAnnotation::spell(node.trait_annotation, intern);
-        const span: SourceSpan = if (node.target_type_span.has_location()) { node.target_type_span } else { node.span };
+        const span: SourceSpan = if (node.target_type_span.has_location()) { node.target_type_span } else { decl.span };
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0302_GENERIC_PARAM_MISMATCH,
             fmt::format("this impl head names %s, which %s declared nowhere",
@@ -3271,9 +3272,9 @@ implement trait Walk for struct NameResolver {
         this.resolver.exit_scope();
     }
 
-    walk_impl(mut &this, node: ImplBlockNode*) -> void {
+    walk_impl(mut &this, decl: DeclarationNode*, node: ImplBlock*) -> void {
         this.resolver.enter_scope(ScopeKind::Impl,
-            this.resolver.intern_table.resolve(node.target_type), node.span);
+            this.resolver.intern_table.resolve(node.target_type), decl.span);
 
         // Declare generic params (e.g., implement enum Optional<T> { ... })
         this.declare_generics(node.generic_params);
@@ -3282,14 +3283,14 @@ implement trait Walk for struct NameResolver {
         const target_id: SymbolID = this.resolver.lookup(
             node.target_type, this.resolver.current_scope);
         if (target_id.is_valid()) {
-            this.resolver.record_resolution(node.span, target_id);
+            this.resolver.record_resolution(decl.span, target_id);
         }
         // The type an impl head is FOR, stamped after `declare_generics` for
         // the same reason the trait side is: a name spelled like an impl
         // generic is that param, not a type to search for.
-        match (this.type_spelling_res(node.target_type, node.span)) {
+        match (this.type_spelling_res(node.target_type, decl.span)) {
             ResSlot::Answered(r) => {
-                node.set_res(r);
+                node.res.answer(r);
             }
             _                    => { }
         }
@@ -3302,11 +3303,11 @@ implement trait Walk for struct NameResolver {
         match (node.res) {
             ResSlot::Answered(Res::Def(d)) => {
                 this.this_owner = ResBase::Def(d);
-                this.this_owner_decl = node as ASTNode*;
+                this.this_owner_decl = decl as ASTNode*;
             }
             ResSlot::Answered(Res::PrimTy(p)) => {
                 this.this_owner = ResBase::PrimTy(p);
-                this.this_owner_decl = node as ASTNode*;
+                this.this_owner_decl = decl as ASTNode*;
             }
             _ => { }
         }
@@ -3330,7 +3331,7 @@ implement trait Walk for struct NameResolver {
         // a declaration (`Array<T, GlobalAlloc>`), and only a stamp can say
         // which.  Read after `declare_generics` for the reason the trait
         // side is.
-        this.stamp_impl_target_args(node);
+        this.stamp_impl_target_args(decl, node);
 
         // `type Item = T;` in the body binds an associated type to written
         // syntax, and the impl's own `where` clause spells types the same way

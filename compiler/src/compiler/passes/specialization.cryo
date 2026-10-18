@@ -41,7 +41,7 @@ import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, FunctionDeclNode, GenericParamDecl,
-    ImplBlockNode, MethodNode, StructDecl, TraitDecl, UnionDecl
+    ImplBlock, MethodNode, StructDecl, TraitDecl, UnionDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::mono::monomorphizer::{ Monomorphizer };
@@ -220,15 +220,15 @@ type struct SpecializationPasses {
                                     ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
                             }
                         }
+                        DeclKind::Impl(_) => {
+                            SpecializationPasses::register_impl_block(stmt as DeclarationNode*, registry, ctx);
+                        }
                         // No other kind with a payload can be generic.
                         DeclKind::Import(_) | DeclKind::Intrinsic(_)
                         | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
                         | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
                         | DeclKind::Legacy => {}
                     }
-                }
-                NodeKind::ImplementationBlock => {
-                    SpecializationPasses::register_impl_block(stmt as ImplBlockNode*, registry, ctx);
                 }
                 _ => {
                     // Not a declaration that can be generic
@@ -649,18 +649,19 @@ type struct SpecializationPasses {
             SymbolStr::empty()
         };
         for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
-            const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
+            const impl_node: ImplBlock* = DeclarationNode::impl_of(entry.impl_nodes[j]);
             // Bounds-violating impls were dropped pre-clone by
             // `Monomorphizer::filter_bounds_violating_impls`; any
             // impl reaching here is fully applicable to this spec.
             if (impl_qname.is_valid() && impl_node != null) {
-                impl_node.set_target_type(impl_qname);
+                impl_node.target_type = impl_qname;
                 impl_node.spec_owner = entry.specialized_type;
                 // The clone under the SPECIALIZATION: a subject that is a type
                 // of its own selects among the clones placed under it.
                 if (impl_node.is_trait_impl()) {
                     ctx.generic_registry.register_trait_impl(
-                        impl_node.trait_def, entry.specialized_type, impl_node);
+                        impl_node.trait_def, entry.specialized_type,
+                        DeclarationNode::with_shape(entry.impl_nodes[j]));
                 }
             } else {
                 SpecInjector::register_injected_decl(entry.impl_nodes[j], ctx);
@@ -700,8 +701,8 @@ type struct SpecializationPasses {
             SpecializationPasses::mark_methods((node as ClassDeclNode*).methods);
         } else if (DeclarationNode::union_of(node) != null) {
             SpecializationPasses::mark_methods((DeclarationNode::union_of(node)).methods);
-        } else if (node.kind == NodeKind::ImplementationBlock) {
-            SpecializationPasses::mark_methods((node as ImplBlockNode*).methods);
+        } else if (DeclarationNode::impl_of(node) != null) {
+            SpecializationPasses::mark_methods((DeclarationNode::impl_of(node)).methods);
         }
     }
 
@@ -904,8 +905,9 @@ type struct SpecializationPasses {
         registry.register_inherent_owner(owner, owner_ast);
     }
 
-    static register_impl_block(node: ImplBlockNode*, registry: GenericRegistry*,
+    static register_impl_block(decl: DeclarationNode*, registry: GenericRegistry*,
                                  ctx: CompilationContext*) -> void {
+        const node: ImplBlock* = DeclarationNode::impl_of(decl);
         // The key a template is registered under is the target's canonical
         // name, which is the head's stamp.  Qualifying the spelling by the
         // module the impl was WRITTEN in names the template only when that
@@ -913,7 +915,7 @@ type struct SpecializationPasses {
         // module's type (`Display for Option<T>` in `fmt::display`) keyed a
         // name no template carries and was attached to none.
         if (registry.template_of(node.target_def()) != null) {
-            registry.register_impl_block(node.target_def(), node);
+            registry.register_impl_block(node.target_def(), decl);
         } else if (!node.is_trait_impl()) {
             // Non-generic target: there is no TemplateEntry to hang the block
             // on, so an inherent `implement T { ... }` block would otherwise be
@@ -921,7 +923,7 @@ type struct SpecializationPasses {
             // type the head names - a declared type's, a primitive's - which
             // is what every reader holds as a receiver.
             registry.register_inherent_impl_block(
-                ctx.decl_index.impl_owner(node, "specialization/inherent impl"), node);
+                ctx.decl_index.impl_owner(node, "specialization/inherent impl"), decl);
             // A generic static method on a non-generic target needs its own
             // template entry, exactly as when it is written inside the type's
             // body (see the struct arm of `run_template_registration`).
@@ -946,7 +948,7 @@ type struct SpecializationPasses {
         if (node.is_trait_impl()) {
             registry.register_trait_impl(
                 TypeAnnotation::trait_def(node.trait_annotation),
-                ctx.decl_index.impl_owner(node, "specialization/trait impl"), node);
+                ctx.decl_index.impl_owner(node, "specialization/trait impl"), decl);
         }
     }
 

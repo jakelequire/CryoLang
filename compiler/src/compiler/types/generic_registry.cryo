@@ -45,7 +45,7 @@ import compiler::resolver::intern_table;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, FunctionDeclNode, GenericParamDecl,
-    ImplBlockNode, MethodNode, StructDecl, TraitDecl, UnionDecl
+    ImplBlock, MethodNode, StructDecl, TraitDecl, UnionDecl
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::types::arena::{ TypeArena };
@@ -98,7 +98,7 @@ type struct TemplateEntry {
     ast_node:       ASTNode*;           // Original generic declaration
     kind:           TemplateKind;
     base_type:      TypeRef;            // The uninstantiated generic type in arena
-    impl_blocks:    [ImplBlockNode*];   // Associated impl blocks
+    impl_blocks:    [DeclarationNode*]; // Associated impl blocks' declarations
     // True when this is a free-function template whose bare leaf name also
     // exists as a free function in another module (e.g. `read_frame` in both
     // `net::ws::frame` and `net::http2::frame`).  Set once by
@@ -260,7 +260,8 @@ implement trait Eq for struct TraitImplKey {
 type struct TraitImplHead {
     trait_id:   DefId;
     target:     TypeRef;
-    block:      ImplBlockNode*;
+    /// The implement block's declaration.
+    block:      DeclarationNode*;
 }
 
 /// One binding made while two impl heads are unified: a parameter of one
@@ -340,7 +341,7 @@ type struct GenericRegistry {
     coh_pool:   [u64];
     coh_start:  [i64];
     coh_len:    [i64];
-    coh_node:   [ImplBlockNode*];
+    coh_node:   [DeclarationNode*];
     coh_next:   [i64];
     coh_heads:  HashMap<u64, i64>;
 
@@ -377,12 +378,12 @@ type struct GenericRegistry {
     // `impl_blocks` on.  Parallel arrays: `inherent_impl_keys[i]` is the
     // target's type - a declared type's, or a primitive's, which is declared
     // nowhere and so has no name to be keyed by but its one arena type -
-    // `inherent_impl_nodes[i]` the block.
+    // `inherent_impl_nodes[i]` the block's declaration.
     // Lets ownership classification see a `drop` declared in a separate
     // impl block rather than inline in the type body - without this the
     // type is wrongly treated as Copy and never dropped.
     inherent_impl_keys:  [TypeRef];
-    inherent_impl_nodes: [ImplBlockNode*];
+    inherent_impl_nodes: [DeclarationNode*];
 
     // Set once by `finalize_disambiguation()` so the O(N^2) leaf-collision
     // scan runs a single time even though `process_all` is invoked per module.
@@ -514,7 +515,7 @@ type struct GenericRegistry {
     }
 
     /// Associate an impl block with the template its head's target names.
-    /// `target` is the head's stamp (`ImplBlockNode::target_def`); a
+    /// `target` is the head's stamp (`ImplBlock::target_def`); a
     /// primitive or a monomorphized clone carries none and names no
     /// template, so nothing is attached.
     /// Uses pointer-based access to avoid value-copy semantics on the
@@ -527,7 +528,7 @@ type struct GenericRegistry {
     /// TypeResolution, where every template exists - and whether the first
     /// offer took is a fact of the entry, not of any name the caller could
     /// compute.
-    register_impl_block(mut &this, target: DefId, block: ImplBlockNode*) -> void {
+    register_impl_block(mut &this, target: DefId, block: DeclarationNode*) -> void {
         const idx: i64 = this.entry_index_of(target);
         if (idx < 0) { return; }
         mut entry_ptr: TemplateEntry* = &this.entries[idx];
@@ -552,7 +553,7 @@ type struct GenericRegistry {
     /// type.  Generic targets already capture their blocks on the
     /// TemplateEntry; this is the fallback for the template-less case.
     register_inherent_impl_block(mut &this, owner: TypeRef,
-                                 block: ImplBlockNode*) -> void {
+                                 block: DeclarationNode*) -> void {
         if (block == null || !owner.is_valid()) { return; }
         this.inherent_impl_keys.push(owner);
         this.inherent_impl_nodes.push(block);
@@ -561,8 +562,8 @@ type struct GenericRegistry {
     /// Every inherent impl block registered under `owner`, in registration
     /// order: the method set of a target that has no arena method list (a
     /// primitive), for overload selection.
-    inherent_impl_blocks(&this, owner: TypeRef) -> [ImplBlockNode*] {
-        mut out: [ImplBlockNode*] = [];
+    inherent_impl_blocks(&this, owner: TypeRef) -> [DeclarationNode*] {
+        mut out: [DeclarationNode*] = [];
         if (!owner.is_valid()) { return out; }
         for (mut i: i64 = 0; i < this.inherent_impl_keys.length; i++) {
             if (!this.inherent_impl_keys[i].equals(owner)) { continue; }
@@ -584,7 +585,7 @@ type struct GenericRegistry {
     /// answered with the first (the caller reports E0308) and the record
     /// cleared so a re-run or a third impl reports nothing more.  Null for a
     /// first filing and for the same node seen again.
-    register_coherence_head(mut &this, key: &[u64], node: ImplBlockNode*) -> ImplBlockNode* {
+    register_coherence_head(mut &this, key: &[u64], node: DeclarationNode*) -> DeclarationNode* {
         if (node == null) { return null; }
         mut h: u64 = 1469598103934665603;
         for (mut i: i64 = 0; i < key.length; i++) {
@@ -602,7 +603,7 @@ type struct GenericRegistry {
                     if (this.coh_pool[s + i] != key[i]) { same = false; break; }
                 }
                 if (same) {
-                    const prior: ImplBlockNode* = this.coh_node[at];
+                    const prior: DeclarationNode* = this.coh_node[at];
                     if (prior == null || prior == node) { return null; }
                     this.coh_node[at] = null;
                     return prior;
@@ -629,7 +630,7 @@ type struct GenericRegistry {
     /// and again by TypeResolution, and once more by the specialization walk
     /// under its clone's key, and whether an offer took is a fact of the table.
     register_trait_impl(mut &this, trait_id: DefId, target: TypeRef,
-                        block: ImplBlockNode*) -> void {
+                        block: DeclarationNode*) -> void {
         if (block == null || !trait_id.is_valid() || !target.is_valid()) { return; }
         const key: TraitImplKey = GenericRegistry::trait_impl_key(this.arena.defs, trait_id, target);
         const slot: [i64]* = this.trait_head_index.get_or_insert(key, []);
@@ -641,8 +642,8 @@ type struct GenericRegistry {
     }
 
     /// The heads under `(trait_id, target)`, in registration order.
-    heads_under(&this, trait_id: DefId, target: TypeRef) -> [ImplBlockNode*] {
-        mut out: [ImplBlockNode*] = [];
+    heads_under(&this, trait_id: DefId, target: TypeRef) -> [DeclarationNode*] {
+        mut out: [DeclarationNode*] = [];
         if (!trait_id.is_valid() || !target.is_valid()) { return out; }
         const key: TraitImplKey = GenericRegistry::trait_impl_key(this.arena.defs, trait_id, target);
         match (this.trait_head_index.get_ref(&key)) {
@@ -673,8 +674,8 @@ type struct GenericRegistry {
     /// registered answering here is the only head in a program that
     /// compiles.
     select_trait_impl(&this, trait_id: DefId, subject: TypeRef,
-                      intern: InternTable*) -> ImplBlockNode* {
-        const heads: [ImplBlockNode*] = this.heads_for(trait_id, subject, intern);
+                      intern: InternTable*) -> DeclarationNode* {
+        const heads: [DeclarationNode*] = this.heads_for(trait_id, subject, intern);
         if (heads.length == 0) { return null; }
         return heads[0];
     }
@@ -685,17 +686,17 @@ type struct GenericRegistry {
     /// subject implements it at several arguments (`From<i8>` and `From<u8>`
     /// for `u64`), which is one trait identity and as many impls.
     heads_for(&this, trait_id: DefId, subject: TypeRef,
-              intern: InternTable*) -> [ImplBlockNode*] {
-        mut out: [ImplBlockNode*] = [];
+              intern: InternTable*) -> [DeclarationNode*] {
+        mut out: [DeclarationNode*] = [];
         if (!trait_id.is_valid() || !subject.is_valid() || intern == null) { return out; }
         const target: TypeRef = this.impl_target_of(subject);
         if (!target.equals(subject)) {
-            const placed: [ImplBlockNode*] = this.heads_under(trait_id, subject);
+            const placed: [DeclarationNode*] = this.heads_under(trait_id, subject);
             if (placed.length > 0) { return placed; }
         }
-        const heads: [ImplBlockNode*] = this.heads_under(trait_id, target);
+        const heads: [DeclarationNode*] = this.heads_under(trait_id, target);
         for (mut i: i64 = 0; i < heads.length; i++) {
-            if (this.head_matches(heads[i], subject, intern)) {
+            if (this.head_matches(DeclarationNode::impl_of(heads[i]), subject, intern)) {
                 out.push(heads[i]);
             }
         }
@@ -717,8 +718,8 @@ type struct GenericRegistry {
     /// order - the candidate set a method call on `subject` binds against.
     /// The candidates a caller used to gather one trait at a time, with the selection
     /// done rather than left to the caller.
-    trait_impls_of(&this, subject: TypeRef, intern: InternTable*) -> [ImplBlockNode*] {
-        mut out: [ImplBlockNode*] = [];
+    trait_impls_of(&this, subject: TypeRef, intern: InternTable*) -> [DeclarationNode*] {
+        mut out: [DeclarationNode*] = [];
         if (!subject.is_valid() || intern == null) { return out; }
         const target: TypeRef = this.impl_target_of(subject);
         mut seen: [DefId] = [];
@@ -731,7 +732,7 @@ type struct GenericRegistry {
             }
             if (dup) { continue; }
             seen.push(h.trait_id);
-            const heads: [ImplBlockNode*] = this.heads_for(h.trait_id, subject, intern);
+            const heads: [DeclarationNode*] = this.heads_for(h.trait_id, subject, intern);
             for (mut k: i64 = 0; k < heads.length; k++) { out.push(heads[k]); }
         }
         return out;
@@ -742,11 +743,11 @@ type struct GenericRegistry {
     /// readers that substitute the head's WRITTEN trait and target arguments
     /// against the subject's own, which a clone has already substituted away.
     template_head_for(&this, trait_id: DefId, subject: TypeRef,
-                      intern: InternTable*) -> ImplBlockNode* {
+                      intern: InternTable*) -> DeclarationNode* {
         if (!trait_id.is_valid() || !subject.is_valid() || intern == null) { return null; }
-        const heads: [ImplBlockNode*] = this.heads_under(trait_id, this.impl_target_of(subject));
+        const heads: [DeclarationNode*] = this.heads_under(trait_id, this.impl_target_of(subject));
         for (mut i: i64 = 0; i < heads.length; i++) {
-            if (this.head_matches(heads[i], subject, intern)) {
+            if (this.head_matches(DeclarationNode::impl_of(heads[i]), subject, intern)) {
                 return heads[i];
             }
         }
@@ -758,14 +759,14 @@ type struct GenericRegistry {
     /// placed under the specialization.  For the readers that substitute the
     /// head's written target arguments against the subject's, which a placed
     /// clone has already substituted away.
-    template_trait_impls_of(&this, subject: TypeRef, intern: InternTable*) -> [ImplBlockNode*] {
-        mut out: [ImplBlockNode*] = [];
+    template_trait_impls_of(&this, subject: TypeRef, intern: InternTable*) -> [DeclarationNode*] {
+        mut out: [DeclarationNode*] = [];
         if (!subject.is_valid() || intern == null) { return out; }
         const target: TypeRef = this.impl_target_of(subject);
         for (mut i: i64 = 0; i < this.trait_heads.length; i++) {
             const h: TraitImplHead* = &this.trait_heads[i];
             if (!h.target.equals(target)) { continue; }
-            if (!this.head_matches(h.block, subject, intern)) { continue; }
+            if (!this.head_matches(DeclarationNode::impl_of(h.block), subject, intern)) { continue; }
             out.push(h.block);
         }
         return out;
@@ -777,7 +778,7 @@ type struct GenericRegistry {
     /// under its key; a subject that carries no arguments (a template asked
     /// before any instantiation exists, a non-generic type) cannot refute
     /// one, so every head under its key is for it.
-    head_matches(&this, block: ImplBlockNode*, subject: TypeRef, intern: InternTable*) -> boolean {
+    head_matches(&this, block: ImplBlock*, subject: TypeRef, intern: InternTable*) -> boolean {
         if (block == null) { return false; }
         if (block.target_args.length == 0) { return true; }
         const n: i64 = this.arena.inst_type_arg_count(subject);
@@ -790,7 +791,7 @@ type struct GenericRegistry {
     /// `head_matches` over an argument list already in hand (the
     /// monomorphizer's, before it has a subject type to ask by).  An arity
     /// disagreement is no match: the head names a different template shape.
-    head_matches_args(&this, block: ImplBlockNode*, args: &[TypeRef], intern: InternTable*) -> boolean {
+    head_matches_args(&this, block: ImplBlock*, args: &[TypeRef], intern: InternTable*) -> boolean {
         if (block == null) { return false; }
         if (block.target_args.length == 0) { return true; }
         if (block.target_args.length != args.length) { return false; }
@@ -805,7 +806,7 @@ type struct GenericRegistry {
     /// Whether the trait arguments `block`'s head writes (`Conv<i32>` in
     /// `implement trait Conv<i32> for S`) unify, position by position, with
     /// `args`.  A head writing a different number is not for them.
-    trait_args_unify(&this, block: ImplBlockNode*, args: &[TypeRef], intern: InternTable*) -> boolean {
+    trait_args_unify(&this, block: ImplBlock*, args: &[TypeRef], intern: InternTable*) -> boolean {
         if (block == null || block.trait_annotation == null) { return false; }
         match (*block.trait_annotation) {
             TypeAnnotation::Generic(g) => {
@@ -887,13 +888,14 @@ type struct GenericRegistry {
     /// answer, so a third overlapping head is reported against the first
     /// and not once per pair.
     overlapping_head(&this, trait_id: DefId, target: TypeRef,
-                     block: ImplBlockNode*) -> ImplBlockNode* {
+                     block: ImplBlock*) -> DeclarationNode* {
         if (block == null || block.spec_owner.is_valid()) { return null; }
-        const heads: [ImplBlockNode*] = this.heads_under(trait_id, target);
+        const heads: [DeclarationNode*] = this.heads_under(trait_id, target);
         for (mut i: i64 = 0; i < heads.length; i++) {
-            if (heads[i] == block) { return null; }
-            if (heads[i].spec_owner.is_valid()) { continue; }
-            if (GenericRegistry::heads_overlap(heads[i], block)) { return heads[i]; }
+            const other: ImplBlock* = DeclarationNode::impl_of(heads[i]);
+            if (other == block) { return null; }
+            if (other.spec_owner.is_valid()) { continue; }
+            if (GenericRegistry::heads_overlap(other, block)) { return heads[i]; }
         }
         return null;
     }
@@ -908,7 +910,7 @@ type struct GenericRegistry {
     /// unify under ONE substitution, so `From<i8> for u64` and `From<u8> for
     /// u64` do not overlap while `Show for Wrap<T>` and `Show for Wrap<i32>`
     /// do, and `Show for Pair<T, T>` and `Show for Pair<i32, u8>` do not.
-    static heads_overlap(a: ImplBlockNode*, b: ImplBlockNode*) -> boolean {
+    static heads_overlap(a: ImplBlock*, b: ImplBlock*) -> boolean {
         if (a == null || b == null || a == b) { return false; }
         mut bindings: [HeadBinding] = [];
         const ga: GenericAnnotation* = GenericRegistry::trait_generic_of(a.trait_annotation);
@@ -1257,7 +1259,7 @@ type struct GenericRegistry {
     /// trait's declared method of that leaf, by the trait-method door, then
     /// the block's method at its position.  Null when the trait declares no
     /// such method or the block provides none.
-    impl_method_by_leaf(&this, block: ImplBlockNode*, leaf: SymbolStr) -> MethodNode* {
+    impl_method_by_leaf(&this, block: ImplBlock*, leaf: SymbolStr) -> MethodNode* {
         if (block == null || !block.is_trait_impl()) { return null; }
         const slot: i64 = this.trait_item_slot(block.trait_def, leaf);
         if (slot < 0) { return null; }
@@ -1269,7 +1271,7 @@ type struct GenericRegistry {
     /// trait-method door places at that method's position - a method
     /// written for it, the copy of its default, and the copies the
     /// monomorphizer appends.  Empty when the trait declares no such method.
-    impl_methods_at_leaf(&this, block: ImplBlockNode*, leaf: SymbolStr) -> [MethodNode*] {
+    impl_methods_at_leaf(&this, block: ImplBlock*, leaf: SymbolStr) -> [MethodNode*] {
         mut out: [MethodNode*] = [];
         if (block == null || !block.is_trait_impl()) { return out; }
         const slot: i64 = this.trait_item_slot(block.trait_def, leaf);
@@ -1286,7 +1288,7 @@ type struct GenericRegistry {
     /// method the trait-method door places at the trait's `slot`-th declared
     /// method.  Asked before the block's defaults are copied in, so the
     /// block's position table (`trait_item_method`) is not filled here.
-    writes_trait_item(&this, block: ImplBlockNode*, trait_def: DefId, slot: i64) -> boolean {
+    writes_trait_item(&this, block: ImplBlock*, trait_def: DefId, slot: i64) -> boolean {
         if (block == null || slot < 0) { return false; }
         for (mut mi: i64 = 0; mi < block.methods.length; mi++) {
             const m: MethodNode* = block.methods[mi];
@@ -1324,12 +1326,12 @@ type struct GenericRegistry {
     /// The method trait implementation `block` provides for its trait's
     /// `slot`-th declared method - written there, or the copy of its
     /// default - or null when it provides none.  Found by position in the
-    /// block's table (`ImplBlockNode.trait_item_methods`), which is filled
+    /// block's table (`ImplBlock.trait_item_methods`), which is filled
     /// the first time the block is asked: by then every trait is registered
     /// and every default the block receives is copied in, which is not true
     /// when the block is first seen - its module may be walked before its
     /// trait's.
-    trait_item_method(&this, block: ImplBlockNode*, slot: i64) -> MethodNode* {
+    trait_item_method(&this, block: ImplBlock*, slot: i64) -> MethodNode* {
         if (block == null || !block.is_trait_impl()) { return null; }
         if (block.trait_item_methods.length == 0) { this.fill_trait_item_table(block); }
         return block.trait_item_method(slot);
@@ -1342,7 +1344,7 @@ type struct GenericRegistry {
     /// decided which the block writes.  A method the monomorphizer appends
     /// later - a specialization of one of them - comes after its template,
     /// so it never takes a position.
-    fill_trait_item_table(&this, block: ImplBlockNode*) -> void {
+    fill_trait_item_table(&this, block: ImplBlock*) -> void {
         const trait_def: DefId = TypeAnnotation::trait_def(block.trait_annotation);
         const decl: TraitDecl* = this.get_trait_decl(trait_def);
         if (decl == null) { return; }
