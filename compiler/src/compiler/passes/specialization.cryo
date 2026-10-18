@@ -41,7 +41,7 @@ import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, FunctionDeclNode, GenericParamDecl,
-    ImplBlockNode, MethodNode, StructDeclNode, TraitDecl, UnionDecl
+    ImplBlockNode, MethodNode, StructDecl, TraitDecl, UnionDecl
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::mono::monomorphizer::{ Monomorphizer };
@@ -80,7 +80,7 @@ type struct SpecInjector {
     static register(node: ASTNode*, spec_type: TypeRef, ctx: CompilationContext*) -> void {
         if (node == null) { return; }
         const named: boolean = spec_type.is_valid()
-            && (node.kind == NodeKind::StructDeclaration
+            && (DeclarationNode::struct_of(node) != null
                 || DeclarationNode::union_of(node) != null
                 || node.kind == NodeKind::ClassDeclaration
                 || DeclarationNode::enum_of(node) != null);
@@ -143,27 +143,6 @@ type struct SpecializationPasses {
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
-                NodeKind::StructDeclaration => {
-                    const node: StructDeclNode* = stmt as StructDeclNode*;
-                    if (node.is_generic()) {
-                        SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, TemplateKind::Struct, node.def, registry, arena, ctx);
-                    }
-                    // Static generic methods on non-generic structs (e.g.
-                    // `Layout::array<T>`) need their own template entries;
-                    // run_template_registration would otherwise miss them.
-                    if (!node.is_generic()) {
-                        SpecializationPasses::register_static_method_templates(node.methods,
-                            registry, arena, ctx);
-                        // Generic INSTANCE methods on non-generic structs
-                        // (e.g. `Response::write_to<W>`) dispatch via receiver
-                        // type rather than scope-qualified name; record the
-                        // owner AST here so try_infer_method_call can find
-                        // its `methods[]` from a receiver TypeRef.
-                        SpecializationPasses::register_inherent_owner(
-                            ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) {
@@ -187,6 +166,27 @@ type struct SpecializationPasses {
                 NodeKind::Declaration => {
                     // A template holds the declaration's header.
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Struct(node) => {
+                            if (node.is_generic()) {
+                                SpecializationPasses::register_generic_template(node.name, node.generic_params,
+                                    stmt, TemplateKind::Struct, node.def, registry, arena, ctx);
+                            }
+                            // Static generic methods on non-generic structs (e.g.
+                            // `Layout::array<T>`) need their own template entries;
+                            // run_template_registration would otherwise miss them.
+                            if (!node.is_generic()) {
+                                SpecializationPasses::register_static_method_templates(node.methods,
+                                    registry, arena, ctx);
+                                // Generic INSTANCE methods on non-generic structs
+                                // (e.g. `Response::write_to<W>`) dispatch via
+                                // receiver type rather than scope-qualified name;
+                                // record the owner AST here so
+                                // try_infer_method_call can find its `methods[]`
+                                // from a receiver TypeRef.
+                                SpecializationPasses::register_inherent_owner(
+                                    ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
+                            }
+                        }
                         DeclKind::Trait(node) => {
                             if (node.is_generic()) {
                                 SpecializationPasses::register_generic_template(node.name, node.generic_params,
@@ -694,8 +694,8 @@ type struct SpecializationPasses {
             (node as FunctionDeclNode*).is_specialization = true;
             return;
         }
-        if (node.kind == NodeKind::StructDeclaration) {
-            SpecializationPasses::mark_methods((node as StructDeclNode*).methods);
+        if (DeclarationNode::struct_of(node) != null) {
+            SpecializationPasses::mark_methods((DeclarationNode::struct_of(node)).methods);
         } else if (node.kind == NodeKind::ClassDeclaration) {
             SpecializationPasses::mark_methods((node as ClassDeclNode*).methods);
         } else if (DeclarationNode::union_of(node) != null) {
@@ -924,7 +924,7 @@ type struct SpecializationPasses {
                 ctx.decl_index.impl_owner(node, "specialization/inherent impl"), node);
             // A generic static method on a non-generic target needs its own
             // template entry, exactly as when it is written inside the type's
-            // body (see the StructDeclaration arm of `run_template_registration`).
+            // body (see the struct arm of `run_template_registration`).
             // Without one, `Layout::array<T>(n)` finds no template, the
             // monomorphizer never specializes the call, and codegen emits a
             // reference to the bare template symbol that nothing defines.

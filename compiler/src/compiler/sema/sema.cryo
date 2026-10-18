@@ -70,7 +70,7 @@ import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
     FunctionDeclNode, GenericParamDecl, ImplBlockNode, MethodNode,
-    StructDeclNode, TraitDecl, UnionDecl, VarDeclNode
+    StructDecl, TraitDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
     CalleePin,
@@ -365,11 +365,6 @@ type struct SemaVisitor {
                 }
                 // A declaration's owner is its own registered type and the
                 // key it registered under, both off the stamp.
-                NodeKind::StructDeclaration => {
-                    const s: StructDeclNode* = stmt as StructDeclNode*;
-                    this.declare_async_methods(s.methods, s.generic_params,
-                        this.ctx.decl_index.type_of_decl(s.def, "sema/async declare struct"), s.name, null);
-                }
                 NodeKind::ClassDeclaration => {
                     const c: ClassDeclNode* = stmt as ClassDeclNode*;
                     this.declare_async_methods(c.methods, c.generic_params,
@@ -385,6 +380,10 @@ type struct SemaVisitor {
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Struct(s) => {
+                            this.declare_async_methods(s.methods, s.generic_params,
+                                this.ctx.decl_index.type_of_decl(s.def, "sema/async declare struct"), s.name, null);
+                        }
                         DeclKind::Union(u) => {
                             this.declare_async_methods(u.methods, u.generic_params,
                                 this.ctx.decl_index.type_of_decl(u.def, "sema/async declare union"), u.name, null);
@@ -501,7 +500,7 @@ type struct SemaVisitor {
         const tmpl: TemplateEntry* = greg.template_of(ib.target_def());
         if (tmpl == null || tmpl.ast_node == null) { return []; }
         if (tmpl.kind == TemplateKind::Struct) {
-            return this.clone_generic_params((tmpl.ast_node as StructDeclNode*).generic_params);
+            return this.clone_generic_params((DeclarationNode::struct_of(tmpl.ast_node)).generic_params);
         }
         if (tmpl.kind == TemplateKind::Class) {
             return this.clone_generic_params((tmpl.ast_node as ClassDeclNode*).generic_params);
@@ -605,12 +604,11 @@ type struct SemaVisitor {
         }
     }
 
-    visit_struct(mut &this, node: StructDeclNode*) -> void {
+    visit_struct(mut &this, node: StructDecl*) -> void {
         // The declaration's own registration, by the id it stamped - for an
         // injected specialization the one its injector wrote, whichever
         // module the clone was placed in.
-        const st_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:StructDeclNode");
-        if (node.is_generic()) {
+        const st_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:StructDecl");        if (node.is_generic()) {
             this.symbolic_check_owner_methods(node.methods, st_type, node.generic_params);
             return;
         }
@@ -695,7 +693,7 @@ type struct SemaVisitor {
                     this.state.symbolic_impl_node = node;
                     if (tmpl.kind == TemplateKind::Struct) {
                         this.symbolic_check_owner_methods(node.methods, owner_ty,
-                            (tmpl.ast_node as StructDeclNode*).generic_params);
+                            (DeclarationNode::struct_of(tmpl.ast_node)).generic_params);
                     } else if (tmpl.kind == TemplateKind::Class) {
                         this.symbolic_check_owner_methods(node.methods, owner_ty,
                             (tmpl.ast_node as ClassDeclNode*).generic_params);
@@ -1664,7 +1662,6 @@ type struct SemaVisitor {
 
             NodeKind::VariableDeclaration    => { this.visit_var(n as VarDeclNode*); }
             NodeKind::FunctionDeclaration    => { this.visit_function(n as FunctionDeclNode*); }
-            NodeKind::StructDeclaration      => { this.visit_struct(n as StructDeclNode*); }
             NodeKind::ClassDeclaration       => { this.visit_class(n as ClassDeclNode*); }
             NodeKind::ImplementationBlock    => { this.visit_impl(n as ImplBlockNode*); }
 
@@ -1678,6 +1675,7 @@ type struct SemaVisitor {
                     DeclKind::Destructure(dd) => { this.visit_destructure(d, dd); }
                     DeclKind::Trait(t)        => { this.visit_trait(t); }
                     DeclKind::Union(u)        => { this.visit_union(u); }
+                    DeclKind::Struct(s)       => { this.visit_struct(s); }
                     // None of these has a check.
                     DeclKind::Import(_) | DeclKind::Intrinsic(_)
                     | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Extern(_)

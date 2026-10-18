@@ -58,7 +58,7 @@ import compiler::types::generic::{
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, DestructureBinding, DestructureDecl, FieldDecl, FunctionDeclNode,
-    GenericParamDecl, ImplBlockNode, MethodNode, ReceiverForm, StructDeclNode, TraitDecl,
+    GenericParamDecl, ImplBlockNode, MethodNode, ReceiverForm, StructDecl, TraitDecl,
     VarDeclNode
 };
 import compiler::ast::expression::{
@@ -360,8 +360,9 @@ type struct AsyncDecl {
     u32_ty:      TypeRef;
     state_sym:   SymbolStr;
 
-    // Nodes created empty by `declare` and completed by `lower`.
-    struct_decl: StructDeclNode*;
+    // Nodes created empty by `declare` and completed by `lower`.  The future
+    // struct is held by its declaration, the node the program holds.
+    struct_decl: DeclarationNode*;
     impl_node:   ImplBlockNode*;
     poll_fn:     FunctionDeclNode*;
     poll_method: MethodNode*;
@@ -749,7 +750,7 @@ type struct AsyncLower {
     future_type_ann(mut &this, d: AsyncDecl*, span: SourceSpan) -> TypeAnnotation* {
         if (!d.generic) { return this.make_type_ann(d.struct_ref, span); }
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann_def(d.q_name, d.struct_decl.def, span),
+            base: this.named_ann_def(d.q_name, DeclarationNode::struct_of(d.struct_decl).def, span),
             args: this.generic_param_anns(d.fut_params, span),
             span: span,
         };
@@ -7409,11 +7410,8 @@ type struct AsyncLower {
         const struct_ref: TypeRef = this.arena.create_struct(
             q_name, this.ctx.declaring_module(fut_def));
 
-        mut struct_decl: StructDeclNode* = new StructDeclNode(q_name, span);
-        struct_decl.repr_c = false;
-        struct_decl.repr_packed = false;
-        struct_decl.repr_transparent = false;
-        struct_decl.min_alignment = 0;
+        const struct_decl: StructDecl* = StructDecl::new(q_name);
+        const struct_header: DeclarationNode* = DeclarationNode::of(DeclKind::Struct(struct_decl), span);
 
         // Register the generic future as an ordinary struct template, so the
         // demand that specializes `identity<i64>` also specializes its
@@ -7424,7 +7422,7 @@ type struct AsyncLower {
         mut self_ty: TypeRef = struct_ref;
         if (generic) {
             for (mut gi: i64 = 0; gi < fut_params.length; gi++) {
-                struct_decl.add_generic_param(fut_params[gi]);
+                struct_decl.generic_params.push(fut_params[gi]);
             }
             const param_refs: [TypeRef] = TypeResolutionPasses::create_generic_param_types(
                 fut_params, this.arena);
@@ -7441,7 +7439,7 @@ type struct AsyncLower {
             // body in its scope.
             this.ctx.generic_registry.register_template(TemplateEntry::new(
                 bare, q_name, fut_def, this.ctx.current_module(), param_names, param_syms, param_types,
-                struct_decl as ASTNode*, TemplateKind::Struct, struct_ref));
+                struct_header as ASTNode*, TemplateKind::Struct, struct_ref));
             self_ty = this.ctx.generic_registry.instantiate(struct_ref, &param_refs);
         }
 
@@ -7464,7 +7462,7 @@ type struct AsyncLower {
             output_ref: output_ref, declared_ref: declared_ref,
             poll_out: poll_out, poll_base: poll_base, ctx_ptr_ty: ctx_ptr_ty,
             u32_ty: u32_ty, state_sym: state_sym,
-            struct_decl: struct_decl, impl_node: null,
+            struct_decl: struct_header, impl_node: null,
             poll_fn: null, poll_method: null,
         };
 
@@ -7690,7 +7688,7 @@ type struct AsyncLower {
     /// generic parameter through a shape `type_ann_for` cannot spell — emitting
     /// the field anyway would leave the specialization's field still generic,
     /// which surfaces far from here as an unresolved member type.
-    add_future_field(mut &this, struct_decl: StructDeclNode*, name: SymbolStr,
+    add_future_field(mut &this, struct_decl: StructDecl*, name: SymbolStr,
                      ty: TypeRef, d: AsyncDecl*, span: SourceSpan) -> boolean {
         mut f: FieldDecl* = FieldDecl::new(name);
         f.visibility = Visibility::Public;
@@ -7706,7 +7704,7 @@ type struct AsyncLower {
             }
             f.type_annotation = ann;
         }
-        struct_decl.add_field(DeclarationNode::of(DeclKind::Field(f), span));
+        struct_decl.fields.push(DeclarationNode::of(DeclKind::Field(f), span));
         return true;
     }
 
@@ -7739,7 +7737,8 @@ type struct AsyncLower {
         const ctx_ptr_ty:  TypeRef   = this.pending[pi].ctx_ptr_ty;
         const u32_ty:      TypeRef   = this.pending[pi].u32_ty;
         const state_sym:   SymbolStr = this.pending[pi].state_sym;
-        mut struct_decl: StructDeclNode*   = this.pending[pi].struct_decl;
+        const struct_header: DeclarationNode* = this.pending[pi].struct_decl;
+        const struct_decl: StructDecl*        = DeclarationNode::struct_of(struct_header);
         mut impl:        ImplBlockNode*    = this.pending[pi].impl_node;
         mut poll_fn:     FunctionDeclNode* = this.pending[pi].poll_fn;
         const method:      MethodNode* = this.pending[pi].method;
@@ -7851,7 +7850,7 @@ type struct AsyncLower {
             if (!this.param_has_slot(&this.pending[pi], p)) { continue; }
             // The receiver's slot is recorded on the declaration as the field
             // is minted: a reader asks for it by the slot, not by its name.
-            if (this.is_receiver_param(p)) { struct_decl.set_async_recv_slot(struct_decl.fields.length); }
+            if (this.is_receiver_param(p)) { struct_decl.async_recv_slot = struct_decl.fields.length; }
             if (!this.add_future_field(struct_decl, this.param_field_name(p),
                     this.param_field_type(&sm, this.param_slot_type(&this.pending[pi], p)),
                     &this.pending[pi], span)) {
@@ -7907,7 +7906,7 @@ type struct AsyncLower {
 
         // ---- 4. Inject so mono/codegen walk the struct + impl ----
         if (this.ctx.artifacts.ast.root != null) {
-            this.ctx.artifacts.ast.root.add_statement(struct_decl as ASTNode*);
+            this.ctx.artifacts.ast.root.add_statement(struct_header as ASTNode*);
             this.ctx.artifacts.ast.root.add_statement(impl as ASTNode*);
         }
 

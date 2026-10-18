@@ -43,7 +43,7 @@ import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DestructureBinding, DestructureDecl, EnumDecl, EnumVariant,
     ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl, ImplBlockNode,
-    DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDeclNode,
+    DeclarationNode, DeclKind, ImportDecl, IntrinsicDecl, MethodNode, StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -154,8 +154,8 @@ type struct NameResolver {
         if (decl.kind == NodeKind::ImplementationBlock) {
             const ib: ImplBlockNode* = decl as ImplBlockNode*;
             for (mut i: i64 = 0; i < ib.generic_params.length; i++) { out.push(ib.generic_params[i]); }
-        } else if (decl.kind == NodeKind::StructDeclaration) {
-            const sd: StructDeclNode* = decl as StructDeclNode*;
+        } else if (DeclarationNode::struct_of(decl) != null) {
+            const sd: StructDecl* = DeclarationNode::struct_of(decl);
             for (mut i: i64 = 0; i < sd.generic_params.length; i++) { out.push(sd.generic_params[i]); }
         }
         return out;
@@ -380,30 +380,6 @@ type struct NameResolver {
                     this.resolver.export_symbol(sym_id);
                 }
             }
-            NodeKind::StructDeclaration => {
-                const struct_node: StructDeclNode* = node as StructDeclNode*;
-                // A C-imported struct (binding_namespace set) is reachable only
-                // through its alias namespace (`cit::Vec2`, via the decl_index
-                // qualified key); declaring its bare name in the file scope here
-                // would shadow same-named types in other modules.
-                if (!struct_node.binding_namespace.is_valid()) {
-                    // A `private` type is nameable only inside its own module,
-                    // the same rule a `private` function gets above.  Declared
-                    // public here it binds in every importer's scope, and the
-                    // only thing left saying otherwise is the declaration
-                    // index - two lanes with two answers about one name.
-                    const sym_id: SymbolID = this.resolver.declare_type(
-                        struct_node.name, struct_node.span,
-                        struct_node.is_public);
-                    struct_node.def = this.type_def_of(sym_id);
-                    if (struct_node.is_public) {
-                        this.resolver.export_symbol(sym_id);
-                    }
-                } else {
-                    struct_node.def = this.type_def_of(this.declare_c_imported(
-                        struct_node.binding_namespace, struct_node.name, struct_node.span));
-                }
-            }
             NodeKind::ClassDeclaration => {
                 const class_node: ClassDeclNode* = node as ClassDeclNode*;
                 const sym_id: SymbolID = this.resolver.declare_type(
@@ -552,6 +528,30 @@ type struct NameResolver {
                         }
                         this.record_enum_decl(enum_node);
                     }
+                    DeclKind::Struct(struct_node) => {
+                        // A C-imported struct (binding_namespace set) is reachable
+                        // only through its alias namespace (`cit::Vec2`, via the
+                        // decl_index qualified key); declaring its bare name in the
+                        // file scope here would shadow same-named types in other
+                        // modules.
+                        if (!struct_node.binding_namespace.is_valid()) {
+                            // A `private` type is nameable only inside its own
+                            // module, the same rule a `private` function gets
+                            // above.  Declared public here it binds in every
+                            // importer's scope, and the only thing left saying
+                            // otherwise is the declaration index - two lanes with
+                            // two answers about one name.
+                            const sym_id: SymbolID = this.resolver.declare_type(
+                                struct_node.name, decl.span, struct_node.is_public);
+                            struct_node.def = this.type_def_of(sym_id);
+                            if (struct_node.is_public) {
+                                this.resolver.export_symbol(sym_id);
+                            }
+                        } else {
+                            struct_node.def = this.type_def_of(this.declare_c_imported(
+                                struct_node.binding_namespace, struct_node.name, decl.span));
+                        }
+                    }
                     DeclKind::Union(union_node) => {
                         // Same binding_namespace rule as structs (see above).
                         if (!union_node.binding_namespace.is_valid()) {
@@ -610,7 +610,6 @@ type struct NameResolver {
     /// they are stamped, extern ones included (`stamp_function_def`).
     keep_declared(&this, node: ASTNode*) -> void {
         const d: DefId = match (node.kind) {
-            NodeKind::StructDeclaration    => { (node as StructDeclNode*).def }
             NodeKind::ClassDeclaration     => { (node as ClassDeclNode*).def }
             NodeKind::VariableDeclaration  => { (node as VarDeclNode*).def }
             NodeKind::Declaration => {
@@ -620,6 +619,7 @@ type struct NameResolver {
                     DeclKind::TypeAlias(a)       => { a.def }
                     DeclKind::Enum(e)            => { e.def }
                     DeclKind::Union(u)           => { u.def }
+                    DeclKind::Struct(s)          => { s.def }
                     DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
                     | DeclKind::Variant(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
                     | DeclKind::Destructure(_) | DeclKind::Legacy => {
@@ -3047,10 +3047,10 @@ implement trait Walk for struct NameResolver {
         }
     }
 
-    walk_struct(mut &this, node: StructDeclNode*) -> void {
+    walk_struct(mut &this, d: DeclarationNode*, node: StructDecl*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] visit(StructDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
         // Enter type body scope
-        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
+        this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), d.span);
 
         // Declare generic params
         this.declare_generics(node.generic_params);
@@ -3082,7 +3082,7 @@ implement trait Walk for struct NameResolver {
         const outer_owner_decl: ASTNode* = this.this_owner_decl;
         const outer_owner_sym: SymbolID = this.this_owner_sym;
         this.this_owner = ResBase::Def(node.def);
-        this.this_owner_decl = if (node.def.is_valid()) { node as ASTNode* } else { null };
+        this.this_owner_decl = if (node.def.is_valid()) { d as ASTNode* } else { null };
         this.this_owner_sym = SymbolID::invalid();
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.walk_node(node.methods[i]);
@@ -3987,7 +3987,7 @@ type struct NameDeclarationPass {
     /// The id a type declaration node was declared under; invalid for none.
     static type_decl_def(node: ASTNode*) -> DefId {
         if (node == null) { return DefId::invalid(); }
-        if (node.kind == NodeKind::StructDeclaration)    { return (node as StructDeclNode*).def; }
+        if (DeclarationNode::struct_of(node) != null)    { return (DeclarationNode::struct_of(node)).def; }
         if (DeclarationNode::union_of(node) != null)     { return (DeclarationNode::union_of(node)).def; }
         const en: EnumDecl* = DeclarationNode::enum_of(node);
         if (en != null) { return en.def; }

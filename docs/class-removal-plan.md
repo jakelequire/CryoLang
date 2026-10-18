@@ -1600,6 +1600,26 @@ committed with the change and deleted in the next commit.
   that compiles (documented, with inline static and instance methods,
   `![repr(C)]`, `![align]`, generic, generic with a `where` bound,
   private), which both compilers also run to the same result.
+- `Struct(StructDecl*)` followed.  Its `NodeKind` arms moved into the
+  `Declaration` arms beside the union's, its field and method sync
+  lifted into `TypeResolutionPasses::sync_struct_members` as the union's
+  was.  The parser, the C-import engine and the two synthesizers (an
+  `async` function's future, a capturing closure's struct) build the
+  payload and its header; the setters went with the class.  A struct's
+  header-only reads were few (spans in the AST validator and name
+  resolution, the closure struct's `generated` mark, the language
+  server's name span), and the type check found them; what it cannot see
+  is a pointer cast, and six places handed the struct on as a node by an
+  `as ASTNode*` cast (the import engine's two emits, the future's
+  template registration and injection, the closure's injection, and name
+  resolution's `This` owner).  Each now hands on the header.  A scan for
+  casts of a value whose nearest declaration is `StructDecl*` finds none;
+  its control is the same scan over the parent's source with the old class
+  name, which finds exactly those six.  A second scan found no `.kind`
+  match with a `Declaration` arm and a non-empty `_` arm that did not
+  already name structs, so no struct changes route by falling out of a
+  default.  The codemod (`scripts/struct-codemod.py`) rewrote the casts,
+  the `kind` tests and the type's spelling.
 - The cloner's partial copies of an intrinsic, an import and an extern
   block are never exercised: an assertion in each of the three arms
   passed verify whole (tests, examples, the language server and the cross
@@ -1607,7 +1627,7 @@ committed with the change and deleted in the next commit.
   in the variant arm fires at once.  The cloner is entered only through a
   template, an impl block, an async parameter and a lambda, and none
   holds those kinds.
-- Left: structs, implement blocks, functions, methods and variables.  Class declarations are not converted: slice 9 deletes the
+- Left: implement blocks, functions, methods and variables.  Class declarations are not converted: slice 9 deletes the
   feature, so `ClassDeclNode` stays a subclass behind the bridge (its
   `NodeKind::ClassDeclaration` arms and `as ClassDeclNode*` casts are
   deleted with the feature, not rewritten), and `DeclKind::Legacy` lives
@@ -1912,4 +1932,4 @@ final audit greps for each name listed and expects none.
 | `Stmt` a class deriving from `ASTNode`, so an `ASTNode*` (a program item, a `for` initializer, the editor's node at a position) can hold a statement; the 21 `as Stmt*` casts from such handles, each behind a `NodeKind::Statement` test | `compiler/src/compiler/AST/statement.cryo` and the casts' files | slice 6 (statements) | the header becomes a struct when the "any node" handle is `Node`; the casts become `Node::Stmt(s)` arms |
 | `Stmt.shape`, the statement's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/statement.cryo` | slice 6 (statements) | renamed `kind` when the header stops deriving from `ASTNode` |
 | `DeclKind::Legacy` and every `match` arm for it; `DeclarationNode.shape` on a declaration whose kind is still a subclass; the `NodeKind`-per-kind dispatch for those kinds beside the `NodeKind::Declaration` arms | `compiler/src/compiler/AST/declaration.cryo` and every declaration consumer | slice 6 (declarations, `IntrinsicConst` and `Module`) | when slice 9 deletes the class, the one kind never converted; then `shape` is renamed `kind` with the header's struct |
-| `DeclarationNode::with_shape` (dead code, language server identity), `DeclarationNode::module_of` (parser, language server definition and semantic tokens x2), `DeclarationNode::import_of` (instance, diagnostics x2, pass registry x2, language server semantic tokens), `DeclarationNode::extern_of` (parser, bindgen importer, directive processing), `DeclarationNode::alias_of` (generic registry, type resolver, name resolution x2, bindgen generator x4 and importer, monomorphizer, type resolution) and `DeclarationNode::enum_of` (generic registry x2, type resolver, monomorphizer x3, type populator, sema x2, parser, bindgen generator x4 and importer, specialization, directive processing x2, type resolution, name resolution, language server code lens, completion, identity and members), `DeclarationNode::trait_of` (generic registry, monomorphizer, language server code lens, identity and rename), `DeclarationNode::union_of` (bindgen generator x4 and importer, AST resolver x2, call specializer x4, monomorphizer x5, trait specializer x2, type populator, parser, config gating, directive processing x6, specialization x3, name resolution, call resolver x5, member resolver, method binding x8, sema x2, symbolic checker, generic registry x2, ownership, type resolver, language server code lens, identity x2 and members x2), and the `as DeclarationNode*` casts behind a `NodeKind::Declaration` test (walker, cloner, sema x2, codegen, inline bodies x2, call specializer x2, type resolution x6, name resolution x2, stamp check, directive processing x3, dead code x3, drop insertion, move check, language server identity) | `compiler/src/compiler/AST/declaration.cryo` and those files | slice 6 (declarations) | the casts become `Node::Decl(d)` arms when the "any node" handle is `Node`; `module_of`, `import_of`, `extern_of`, `alias_of`, `enum_of`, `trait_of` and `union_of` then match on `Node` |
+| `DeclarationNode::with_shape` (dead code, language server identity), `DeclarationNode::module_of` (parser, language server definition and semantic tokens x2), `DeclarationNode::import_of` (instance, diagnostics x2, pass registry x2, language server semantic tokens), `DeclarationNode::extern_of` (parser, bindgen importer, directive processing), `DeclarationNode::alias_of` (generic registry, type resolver, name resolution x2, bindgen generator x4 and importer, monomorphizer, type resolution) and `DeclarationNode::enum_of` (generic registry x2, type resolver, monomorphizer x3, type populator, sema x2, parser, bindgen generator x4 and importer, specialization, directive processing x2, type resolution, name resolution, language server code lens, completion, identity and members), `DeclarationNode::trait_of` (generic registry, monomorphizer, language server code lens, identity and rename), `DeclarationNode::union_of` (bindgen generator x4 and importer, AST resolver x2, call specializer x4, monomorphizer x5, trait specializer x2, type populator, parser, config gating, directive processing x6, specialization x3, name resolution, call resolver x5, member resolver, method binding x8, sema x2, symbolic checker, generic registry x2, ownership, type resolver, language server code lens, identity x2 and members x2), `DeclarationNode::struct_of` (AST resolver x2, async lowering x2, call resolver x5, call specializer x6, config gating, declaration x2, directive processing x6, bindgen generator x4 and importer, generic registry x2, member resolver x2, method binding x8, monomorphizer x5, name resolution x3, ownership, parser, type resolver, sema x2, specialization x3, symbolic checker, trait specializer x2, type populator, language server code lens, identity x2 and members x2), and the `as DeclarationNode*` casts behind a `NodeKind::Declaration` test (walker, cloner, sema x2, codegen, inline bodies x2, call specializer x2, type resolution x6, name resolution x2, stamp check, directive processing x3, dead code x3, drop insertion, move check, language server identity) | `compiler/src/compiler/AST/declaration.cryo` and those files | slice 6 (declarations) | the casts become `Node::Decl(d)` arms when the "any node" handle is `Node`; `module_of`, `import_of`, `extern_of`, `alias_of`, `enum_of`, `trait_of`, `union_of` and `struct_of` then match on `Node` |

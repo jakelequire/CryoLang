@@ -51,7 +51,7 @@ import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDecl, EnumDecl,
     EnumVariant, FieldDecl, FunctionDeclNode, GenericParamDecl,
-    DeclKind, ImplBlockNode, MethodNode, StructDeclNode,
+    DeclKind, ImplBlockNode, MethodNode, StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::expression::{
@@ -1367,12 +1367,6 @@ type struct TypeResolutionPasses {
         // A generic type's own methods, under the template.
         if (is_source_decl) {
             match (stmt.kind) {
-                NodeKind::StructDeclaration => {
-                    const node: StructDeclNode* = stmt as StructDeclNode*;
-                    if (ctx.generic_registry.template_of(node.def) != null) {
-                        ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (ctx.generic_registry.template_of(node.def) != null) {
@@ -1381,6 +1375,11 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Struct(node) => {
+                            if (ctx.generic_registry.template_of(node.def) != null) {
+                                ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
+                            }
+                        }
                         DeclKind::Union(node) => {
                             if (ctx.generic_registry.template_of(node.def) != null) {
                                 ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
@@ -1407,10 +1406,6 @@ type struct TypeResolutionPasses {
         }
 
         match (stmt.kind) {
-            NodeKind::StructDeclaration => {
-                const node: StructDeclNode* = stmt as StructDeclNode*;
-                ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register struct methods"), node.methods, ctx.intern_table, arena, "type_resolution/register struct methods");
-            }
             NodeKind::ClassDeclaration => {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
                 ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register class methods"), node.methods, ctx.intern_table, arena, "type_resolution/register class methods");
@@ -1638,6 +1633,9 @@ type struct TypeResolutionPasses {
             }
             NodeKind::Declaration => {
                 match ((stmt as DeclarationNode*).shape) {
+                    DeclKind::Struct(node) => {
+                        ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register struct methods"), node.methods, ctx.intern_table, arena, "type_resolution/register struct methods");
+                    }
                     DeclKind::Union(node) => {
                         ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register union methods"), node.methods, ctx.intern_table, arena, "type_resolution/register union methods");
                     }
@@ -2626,6 +2624,82 @@ type struct TypeResolutionPasses {
         return false;
     }
 
+    /// Record a non-generic struct's resolved fields and methods on its arena
+    /// type; false when there is nothing to record - a template, or no arena
+    /// type to record on.
+    static sync_struct_members(node: StructDecl*, ctx: CompilationContext*, arena: TypeArena*) -> boolean {
+        if (node.is_generic()) { return false; }
+
+        const type_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/struct field sync");
+        if (!type_ref.is_valid()) { return false; }
+
+        const base_type: Type* = arena.lookup(type_ref);
+        if (base_type == null || base_type.kind != TypeKind::Struct) { return false; }
+
+        mut st: StructType* = base_type.as_struct();
+        mut field_infos: [FieldInfo] = [];
+        for (mut j: i64 = 0; j < node.fields.length; j++) {
+            const field_decl: DeclarationNode* = node.fields[j];
+            const field: FieldDecl* = DeclarationNode::field_of(field_decl);
+            if (field == null) { continue; }
+            // An unresolved field type must never be baked into the arena:
+            // TypeLowering would size the struct from the id-0 sentinel (wrong
+            // layout) or the mangler would ICE, both decoupled from any
+            // diagnostic.  Emit E0203 here so the pass fails (via
+            // from_snapshot) and Phase 5 aborts before codegen ever sees the
+            // poisoned StructType.
+            if (!field.resolved_type.is_valid()) {
+                const fname: string = ctx.intern_table.resolve(field.name);
+                const sname: string = ctx.intern_table.resolve(node.name);
+                ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+                    fmt::format("cannot resolve type for field `%s` of `%s`", fname, sname),
+                    field_decl.span);
+                continue;
+            }
+            const is_pub: boolean = field.visibility == Visibility::Public;
+            const is_prot: boolean = field.visibility == Visibility::Protected;
+            mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true);
+            fi.set_default_value(field.default_value);
+            field_infos.push(fi);
+        }
+        st.set_fields(field_infos);
+
+        // Layout attributes (`![repr]` / `![align]`) are propagated from the
+        // AST onto the StructType by DirectiveProcessing, which runs *after*
+        // this pass.  See `propagate_layout_attrs_to_types` there.
+
+        // Populate StructType.methods so sema's overload resolution
+        // (resolve_method_overload) can pick the right overload for struct
+        // methods; structs are dispatched statically rather than via vtable.
+        for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
+            const mnode: MethodNode* = node.methods[jm];
+            if (mnode == null || mnode.func == null) { continue; }
+            const fn_node: FunctionDeclNode* = mnode.func;
+            mut ptypes: [TypeRef] = [];
+            for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                const pp: VarDeclNode* = fn_node.parameters[pi];
+                if (pp == null) { continue; }
+                if (pp.is_receiver()) { continue; }
+                ptypes.push(pp.resolved_type);
+            }
+            const fn_ty: TypeRef = arena.get_function(
+                fn_node.resolved_return_type, ptypes, fn_node.is_variadic);
+            const minfo: MethodInfo = MethodInfo {
+                name:          fn_node.name,
+                function_type: fn_ty,
+                is_public:     mnode.visibility == Visibility::Public,
+                is_protected:  mnode.visibility == Visibility::Protected,
+                is_static:     mnode.is_static,
+                is_virtual:    mnode.is_virtual,
+                is_override:   mnode.is_override,
+                param_types:   ptypes,
+                ast_node:      mnode as void*,
+            };
+            st.add_method(minfo);
+        }
+        return true;
+    }
+
     /// Record a non-generic union's resolved fields and methods on its arena
     /// type (a StructType with is_union set); false when there is nothing to
     /// record - a template, or no arena type to record on.  A field whose type
@@ -2833,15 +2907,6 @@ type struct TypeResolutionPasses {
                         }
                     }
                 }
-                NodeKind::StructDeclaration => {
-                    const node: StructDeclNode* = stmt as StructDeclNode*;
-                    mut struct_ctx: ResolutionContext = runner.make_generic_context(
-                        node.generic_params, &runner.res_ctx);
-                    const struct_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/struct methods");
-                    const struct_args: [TypeRef] = runner.decl_owner_args(node.generic_params, &struct_ctx);
-                    runner.resolve_method_signatures(node.methods, &struct_ctx, struct_owner, node.def, &struct_args);
-                    sig_count += node.methods.length;
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     mut class_ctx: ResolutionContext = runner.make_generic_context(
@@ -2903,6 +2968,14 @@ type struct TypeResolutionPasses {
                     match (decl.shape) {
                         DeclKind::Trait(node) => {
                             sig_count += TypeResolutionPasses::trait_signatures(&runner, node, ctx, arena);
+                        }
+                        DeclKind::Struct(node) => {
+                            mut struct_ctx: ResolutionContext = runner.make_generic_context(
+                                node.generic_params, &runner.res_ctx);
+                            const struct_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/struct methods");
+                            const struct_args: [TypeRef] = runner.decl_owner_args(node.generic_params, &struct_ctx);
+                            runner.resolve_method_signatures(node.methods, &struct_ctx, struct_owner, node.def, &struct_args);
+                            sig_count += node.methods.length;
                         }
                         DeclKind::Union(node) => {
                             mut union_ctx: ResolutionContext = runner.make_generic_context(
@@ -3170,25 +3243,6 @@ type struct TypeResolutionPasses {
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
-                NodeKind::StructDeclaration => {
-                    const node: StructDeclNode* = stmt as StructDeclNode*;
-                    mut struct_ctx: ResolutionContext = runner.make_generic_context(
-                        node.generic_params, &runner.res_ctx);
-                    runner.resolve_fields(node.fields, &struct_ctx);
-                    field_count += node.fields.length;
-                    // Re-resolve the inline methods' signatures now that the
-                    // owner type exists in the arena.  The DeclarationCollection
-                    // FunctionSignature pass ran before this type was registered,
-                    // so its owner lookup was invalid and a by-value `this`
-                    // receiver (which carries no annotation) was left without a
-                    // resolved_type.  Impl-block methods are repaired by the
-                    // ImplementationBlock branch below; inline methods need the
-                    // same repair here, or a consuming method (`fn m(mut this)`)
-                    // reaches drop-insertion with an unresolved receiver and its
-                    // by-value `this` is never dropped - a leak on every call.
-                    runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &struct_ctx);
-                    runner.emit_method_signature_diagnostics(node.methods);
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     mut class_ctx: ResolutionContext = runner.make_generic_context(
@@ -3239,6 +3293,26 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Struct(node) => {
+                            mut struct_ctx: ResolutionContext = runner.make_generic_context(
+                                node.generic_params, &runner.res_ctx);
+                            runner.resolve_fields(node.fields, &struct_ctx);
+                            field_count += node.fields.length;
+                            // Re-resolve the inline methods' signatures now that
+                            // the owner type exists in the arena.  The
+                            // DeclarationCollection FunctionSignature pass ran
+                            // before this type was registered, so its owner lookup
+                            // was invalid and a by-value `this` receiver (which
+                            // carries no annotation) was left without a
+                            // resolved_type.  Impl-block methods are repaired by
+                            // the ImplementationBlock branch; inline methods need
+                            // the same repair here, or a consuming method
+                            // (`fn m(mut this)`) reaches drop-insertion with an
+                            // unresolved receiver and its by-value `this` is never
+                            // dropped - a leak on every call.
+                            runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &struct_ctx);
+                            runner.emit_method_signature_diagnostics(node.methods);
+                        }
                         DeclKind::Union(node) => {
                             mut union_ctx: ResolutionContext = runner.make_generic_context(
                                 node.generic_params, &runner.res_ctx);
@@ -3282,27 +3356,6 @@ type struct TypeResolutionPasses {
                         body_count++;
                     }
                 }
-                NodeKind::StructDeclaration => {
-                    const node: StructDeclNode* = stmt as StructDeclNode*;
-                    if (!node.is_generic()) {
-                        for (mut j: i64 = 0; j < node.methods.length; j++) {
-                            const method: MethodNode* = node.methods[j];
-                            if (method != null && method.func != null && method.func.body != null) {
-                                // Method-level generics (`Layout::array<T>(n)`)
-                                // must be in scope when the walker reaches a
-                                // `mut x: T = ...` body annotation; without
-                                // the binding, the resolver returns invalid
-                                // and `emit_undefined_type` fires E0203 on a
-                                // perfectly legal generic param.
-                                mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                    method.func.generic_params, &runner.res_ctx);
-                                runner.resolve_var_types_in_statement(
-                                    method.func.body as ASTNode*, &m_ctx);
-                                body_count++;
-                            }
-                        }
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (!node.is_generic()) {
@@ -3320,6 +3373,26 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Struct(node) => {
+                            if (!node.is_generic()) {
+                                for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                    const method: MethodNode* = node.methods[j];
+                                    if (method != null && method.func != null && method.func.body != null) {
+                                        // Method-level generics (`Layout::array<T>(n)`)
+                                        // must be in scope when the walker reaches a
+                                        // `mut x: T = ...` body annotation; without
+                                        // the binding, the resolver returns invalid
+                                        // and `emit_undefined_type` fires E0203 on a
+                                        // perfectly legal generic param.
+                                        mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                            method.func.generic_params, &runner.res_ctx);
+                                        runner.resolve_var_types_in_statement(
+                                            method.func.body as ASTNode*, &m_ctx);
+                                        body_count++;
+                                    }
+                                }
+                            }
+                        }
                         DeclKind::Union(node) => {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
@@ -3406,17 +3479,6 @@ type struct TypeResolutionPasses {
                         runner.collect_generic_fn_calls_in_stmt(func.body, &runner.res_ctx);
                     }
                 }
-                NodeKind::StructDeclaration => {
-                    const node: StructDeclNode* = stmt as StructDeclNode*;
-                    if (!node.is_generic()) {
-                        for (mut j: i64 = 0; j < node.methods.length; j++) {
-                            const method: MethodNode* = node.methods[j];
-                            if (method != null && method.func != null && method.func.body != null) {
-                                runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
-                            }
-                        }
-                    }
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (!node.is_generic()) {
@@ -3441,6 +3503,16 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Struct(node) => {
+                            if (!node.is_generic()) {
+                                for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                    const method: MethodNode* = node.methods[j];
+                                    if (method != null && method.func != null && method.func.body != null) {
+                                        runner.collect_generic_fn_calls_in_stmt(method.func.body, &runner.res_ctx);
+                                    }
+                                }
+                            }
+                        }
                         DeclKind::Union(node) => {
                             if (!node.is_generic()) {
                                 for (mut j: i64 = 0; j < node.methods.length; j++) {
@@ -3615,82 +3687,6 @@ type struct TypeResolutionPasses {
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
-                NodeKind::StructDeclaration => {
-                    const node: StructDeclNode* = stmt as StructDeclNode*;
-                    if (node.is_generic()) { continue; }
-
-                    const type_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/struct field sync");
-                    if (!type_ref.is_valid()) { continue; }
-
-                    const base_type: Type* = arena.lookup(type_ref);
-                    if (base_type == null || base_type.kind != TypeKind::Struct) { continue; }
-
-                    mut st: StructType* = base_type.as_struct();
-                    mut field_infos: [FieldInfo] = [];
-                    for (mut j: i64 = 0; j < node.fields.length; j++) {
-                        const field_decl: DeclarationNode* = node.fields[j];
-                        const field: FieldDecl* = DeclarationNode::field_of(field_decl);
-                        if (field == null) { continue; }
-                        // An unresolved field type must never be baked into the
-                        // arena: TypeLowering would size the struct from the id-0
-                        // sentinel (wrong layout) or the mangler would ICE, both
-                        // decoupled from any diagnostic. Emit E0203 here so the
-                        // pass fails (via from_snapshot) and Phase 5 aborts before
-                        // codegen ever sees the poisoned StructType.
-                        if (!field.resolved_type.is_valid()) {
-                            const fname: string = ctx.intern_table.resolve(field.name);
-                            const sname: string = ctx.intern_table.resolve(node.name);
-                            ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
-                                fmt::format("cannot resolve type for field `%s` of `%s`", fname, sname),
-                                field_decl.span);
-                            continue;
-                        }
-                        const is_pub: boolean = field.visibility == Visibility::Public;
-                        const is_prot: boolean = field.visibility == Visibility::Protected;
-                        mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true);
-                        fi.set_default_value(field.default_value);
-                        field_infos.push(fi);
-                    }
-                    st.set_fields(field_infos);
-
-                    // Layout attributes (`![repr]` / `![align]`) are
-                    // propagated from the AST onto the StructType by
-                    // DirectiveProcessing, which runs *after* this pass.
-                    // See `propagate_layout_attrs_to_types` there.
-
-                    // Populate StructType.methods so sema's overload
-                    // resolution (resolve_method_overload) can pick the
-                    // right overload for struct methods; same rationale
-                    // as ClassType below, except structs are dispatched
-                    // statically rather than via vtable.
-                    for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
-                        const mnode: MethodNode* = node.methods[jm];
-                        if (mnode == null || mnode.func == null) { continue; }
-                        const fn_node: FunctionDeclNode* = mnode.func;
-                        mut ptypes: [TypeRef] = [];
-                        for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
-                            const pp: VarDeclNode* = fn_node.parameters[pi];
-                            if (pp == null) { continue; }
-                            if (pp.is_receiver()) { continue; }
-                            ptypes.push(pp.resolved_type);
-                        }
-                        const fn_ty: TypeRef = arena.get_function(
-                            fn_node.resolved_return_type, ptypes, fn_node.is_variadic);
-                        const minfo: MethodInfo = MethodInfo {
-                            name:          fn_node.name,
-                            function_type: fn_ty,
-                            is_public:     mnode.visibility == Visibility::Public,
-                            is_protected:  mnode.visibility == Visibility::Protected,
-                            is_static:     mnode.is_static,
-                            is_virtual:    mnode.is_virtual,
-                            is_override:   mnode.is_override,
-                            param_types:   ptypes,
-                            ast_node:      mnode as void*,
-                        };
-                        st.add_method(minfo);
-                    }
-                    struct_count++;
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) { continue; }
@@ -3707,7 +3703,7 @@ type struct TypeResolutionPasses {
                         const field_decl: DeclarationNode* = node.fields[j];
                         const field: FieldDecl* = DeclarationNode::field_of(field_decl);
                         if (field == null) { continue; }
-                        // See the StructDeclaration arm: never bake an unresolved
+                        // See `sync_struct_members`: never bake an unresolved
                         // field type into the arena. Emit E0203 so the pass fails
                         // and Phase 5 aborts before the poisoned ClassType reaches
                         // layout/vtable codegen.
@@ -3727,8 +3723,8 @@ type struct TypeResolutionPasses {
                     }
                     ct.set_fields(field_infos);
 
-                    // See the StructDeclaration arm - layout attrs are
-                    // propagated in DirectiveProcessing.
+                    // See `sync_struct_members` - layout attrs are propagated
+                    // in DirectiveProcessing.
 
                     // Populate ClassType.methods from the AST so virtual
                     // dispatch machinery (vtable emission, `has_virtual_methods`
@@ -3811,6 +3807,10 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Struct(sn) => {
+                            if (TypeResolutionPasses::sync_struct_members(sn, ctx, arena)) { struct_count++; }
+                            continue;
+                        }
                         DeclKind::Union(un) => {
                             if (TypeResolutionPasses::sync_union_members(un, ctx, arena)) { struct_count++; }
                             continue;
@@ -3914,8 +3914,8 @@ type struct TypeResolutionPasses {
                         }
                     }
 
-                    // See the StructDeclaration arm - layout attrs are
-                    // propagated in DirectiveProcessing.
+                    // See `sync_struct_members` - layout attrs are propagated
+                    // in DirectiveProcessing.
                 }
                 NodeKind::ImplementationBlock => {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;

@@ -26,7 +26,7 @@ import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDecl,
     EnumVariant, ExternBlock, FieldDecl, FunctionDeclNode, GenericParamDecl,
     DeclKind, ImplBlockNode, ImportDecl, IntrinsicDecl, MethodNode,
-    ModuleDecl, StructDeclNode, TraitDecl, TypeAliasDecl, UnionDecl,
+    ModuleDecl, StructDecl, TraitDecl, TypeAliasDecl, UnionDecl,
     VarDeclNode
 };
 import compiler::ast::expression::{
@@ -50,7 +50,7 @@ import compiler::ast::statement::{
 
 type struct ASTCloner {
     /// One-shot specialization name applied at the first decl-level visit
-    /// (StructDeclNode / ClassDeclNode / EnumDecl / FunctionDeclNode).
+    /// (StructDecl / ClassDeclNode / EnumDecl / FunctionDeclNode).
     /// `consume_spec_name()` reads and clears it so child decls keep their
     /// own names.
     spec_name: SymbolStr;
@@ -149,7 +149,6 @@ type struct ASTCloner {
             NodeKind::FunctionDeclaration       => { return this.visit_function(n as FunctionDeclNode*); }
             NodeKind::MethodDeclaration         => { return this.visit_method(n as MethodNode*); }
             NodeKind::Declaration               => { return this.copy_decl_shape(n as DeclarationNode*); }
-            NodeKind::StructDeclaration         => { return this.visit_struct(n as StructDeclNode*); }
             NodeKind::ClassDeclaration          => { return this.visit_class(n as ClassDeclNode*); }
             NodeKind::ImplementationBlock       => { return this.visit_impl(n as ImplBlockNode*); }
 
@@ -960,7 +959,7 @@ type struct ASTCloner {
             DeclKind::Union(n) => {
                 const c: UnionDecl* = UnionDecl::new(this.consume_spec_name(n.name));
                 const skip_gp: boolean = this.consume_skip_generics();
-                // See StructDeclNode clone: carry layout flags onto the spec so the
+                // See StructDecl clone: carry layout flags onto the spec so the
                 // monomorphizer can stamp the chosen layout on the concrete type.
                 // The definition is stamped on the copy by whoever places it.
                 c.repr_c            = n.repr_c;
@@ -983,6 +982,40 @@ type struct ASTCloner {
                 }
                 DeclKind::Union(c)
             }
+            DeclKind::Struct(n) => {
+                const c: StructDecl* = StructDecl::new(this.consume_spec_name(n.name));
+                const skip_gp: boolean = this.consume_skip_generics();
+                // Carry `![repr(...)]` / `![align]` onto the specialization so the
+                // monomorphizer can stamp the chosen layout on the concrete type
+                // (DirectiveProcessing runs before mono and never sees specialized
+                // decls); `copy_decl_base` copies only the raw directive nodes.
+                // The definition is stamped on the copy by whoever places it.
+                c.repr_c           = n.repr_c;
+                c.repr_packed      = n.repr_packed;
+                c.repr_transparent = n.repr_transparent;
+                c.min_alignment    = n.min_alignment;
+                c.async_recv_slot  = n.async_recv_slot;
+                c.is_public        = n.is_public;
+                c.where_bounds     = n.where_bounds;
+                if (!skip_gp) {
+                    for (mut i: i64 = 0; i < n.generic_params.length; i++) {
+                        c.generic_params.push(this.copy_decl_shape(n.generic_params[i]));
+                    }
+                }
+                for (mut i: i64 = 0; i < n.fields.length; i++) {
+                    c.fields.push(this.copy_decl_shape(n.fields[i]));
+                }
+                for (mut i: i64 = 0; i < n.methods.length; i++) {
+                    c.methods.push(this.dispatch_node(n.methods[i]) as MethodNode*);
+                }
+                // Bindgen-only blob accessors (shallow: shares the value_type
+                // annotation pointers, as elsewhere in cloning).  Empty for every
+                // parser-produced struct.
+                for (mut i: i64 = 0; i < n.binding_accessors.length; i++) {
+                    c.binding_accessors.push(n.binding_accessors[i]);
+                }
+                DeclKind::Struct(c)
+            }
             DeclKind::Variant(n) => {
                 const c: EnumVariant* = EnumVariant::new(n.name);
                 // Deep-clone type annotations (not shallow copy)
@@ -1002,49 +1035,12 @@ type struct ASTCloner {
     }
 
 
-    visit_struct(mut &this, node: StructDeclNode*) -> ASTNode* {
-        const name: SymbolStr = this.consume_spec_name(node.name);
-        const skip_gp: boolean = this.consume_skip_generics();
-        mut c: StructDeclNode* = new StructDeclNode(name, node.span);
-        this.copy_decl_base(node, c);
-        // Carry `![repr(...)]` / `![align]` onto the specialization so the
-        // monomorphizer can stamp the chosen layout on the concrete type
-        // (DirectiveProcessing runs before mono and never sees specialized
-        // decls). copy_decl_base only copies the raw directive nodes, not
-        // these resolved flags.
-        c.repr_c           = node.repr_c;
-        c.repr_packed      = node.repr_packed;
-        c.repr_transparent = node.repr_transparent;
-        c.min_alignment    = node.min_alignment;
-        c.async_recv_slot  = node.async_recv_slot;
-        c.is_public        = node.is_public;
-        c.where_bounds     = node.where_bounds;
-        if (!skip_gp) {
-            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
-            }
-        }
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            c.add_field(this.copy_decl_shape(node.fields[i]));
-        }
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            c.add_method(this.dispatch_node(node.methods[i]) as MethodNode*);
-        }
-        // Bindgen-only blob accessors (shallow: shares the value_type annotation
-        // pointers, as elsewhere in cloning).  Empty for every parser-produced
-        // struct, so this is a no-op outside the C-import path.
-        for (mut i: i64 = 0; i < node.binding_accessors.length; i++) {
-            c.add_accessor(node.binding_accessors[i]);
-        }
-        return c;
-    }
-
     visit_class(mut &this, node: ClassDeclNode*) -> ASTNode* {
         const name: SymbolStr = this.consume_spec_name(node.name);
         const skip_gp: boolean = this.consume_skip_generics();
         mut c: ClassDeclNode* = new ClassDeclNode(name, node.span);
         this.copy_decl_base(node, c);
-        // See StructDeclNode clone: carry layout flags onto the spec.
+        // See StructDecl clone: carry layout flags onto the spec.
         c.repr_c           = node.repr_c;
         c.repr_packed      = node.repr_packed;
         c.repr_transparent = node.repr_transparent;

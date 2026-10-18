@@ -38,7 +38,7 @@ import std::fmt;
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, FieldDecl, FunctionDeclNode, ImplBlockNode, MethodNode, ReceiverForm,
-    StructDeclNode, VarDeclNode
+    StructDecl, VarDeclNode
 };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
@@ -314,18 +314,15 @@ type struct LambdaSynth {
         const qual_name: SymbolStr = ctx_ptr.defs.path_of(closure_def).spelling();
 
         // 1. The struct declaration and its fields.
-        mut struct_decl: StructDeclNode* = new StructDeclNode(qual_name, span);
-        struct_decl.generated = true;
-        struct_decl.repr_c = false;
-        struct_decl.repr_packed = false;
-        struct_decl.repr_transparent = false;
-        struct_decl.min_alignment = 0;
+        const struct_decl: StructDecl* = StructDecl::new(qual_name);
+        const struct_header: DeclarationNode* = DeclarationNode::of(DeclKind::Struct(struct_decl), span);
+        struct_header.generated = true;
 
         for (mut i: i64 = 0; i < lambda.captured_names.length; i++) {
             mut field: FieldDecl* = FieldDecl::new(lambda.captured_names[i]);
             field.visibility = Visibility::Public;
             field.resolved_type = lambda.captured_types[i];
-            struct_decl.add_field(DeclarationNode::of(DeclKind::Field(field), span));
+            struct_decl.fields.push(DeclarationNode::of(DeclKind::Field(field), span));
         }
 
         // 2. Arena StructType + fields.
@@ -412,7 +409,7 @@ type struct LambdaSynth {
         method.set_visibility(Visibility::Public);
         method.set_static(false);
         method.set_sink(false);
-        struct_decl.add_method(method);
+        struct_decl.methods.push(method);
 
         // 6. Populate StructType.methods so overload resolution finds `__call__`.
         if (struct_t != null && struct_t.kind == TypeKind::Struct) {
@@ -451,7 +448,7 @@ type struct LambdaSynth {
 
         // 8. Inject into ProgramNode so subsequent passes walk it.
         if (ctx_ptr.artifacts.ast.root != null) {
-            ctx_ptr.artifacts.ast.root.add_statement(struct_decl as ASTNode*);
+            ctx_ptr.artifacts.ast.root.add_statement(struct_header as ASTNode*);
             if (drop_impl != null) {
                 drop_impl.generated = true;
                 ctx_ptr.artifacts.ast.root.add_statement(drop_impl as ASTNode*);
@@ -468,7 +465,7 @@ type struct LambdaSynth {
     /// after its `drop` runs, as any aggregate's are.  Being the closure's
     /// destructor, it is what a written `f.drop()` and the scope-exit
     /// release both reach.
-    closure_drop_impl(mut &this, lambda: LambdaExprNode*, struct_decl: StructDeclNode*,
+    closure_drop_impl(mut &this, lambda: LambdaExprNode*, struct_decl: StructDecl*,
                       struct_ref: TypeRef, span: SourceSpan) -> ImplBlockNode* {
         const registry_ptr: GenericRegistry* = this.ctx.get_generic_registry();
         mut has_noncopy_capture: boolean = false;

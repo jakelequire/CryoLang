@@ -61,7 +61,7 @@ import utils::logger::{ cdebug };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDeclNode,
-    ImplBlockNode, MethodNode, StructDeclNode, UnionDecl, VarDeclNode
+    ImplBlockNode, MethodNode, StructDecl, UnionDecl, VarDeclNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ DirectiveArg, DirectiveArgKind, DirectiveNode };
@@ -160,7 +160,6 @@ implement enum DirectiveTarget {
         return match (n.kind) {
             NodeKind::FunctionDeclaration   => { DirectiveTarget::Function }
             NodeKind::MethodDeclaration     => { DirectiveTarget::Method   }
-            NodeKind::StructDeclaration     => { DirectiveTarget::Struct   }
             NodeKind::ClassDeclaration      => { DirectiveTarget::Class    }
             NodeKind::VariableDeclaration   => { DirectiveTarget::Variable }
             NodeKind::ImplementationBlock   => { DirectiveTarget::Impl     }
@@ -173,6 +172,7 @@ implement enum DirectiveTarget {
                     DeclKind::Trait(_)          => { DirectiveTarget::Trait  }
                     DeclKind::TypeAlias(_)      => { DirectiveTarget::TypeAlias }
                     DeclKind::Union(_)          => { DirectiveTarget::Union  }
+                    DeclKind::Struct(_)         => { DirectiveTarget::Struct }
                     DeclKind::Field(_)          => { DirectiveTarget::Field  }
                     DeclKind::Variant(_)        => { DirectiveTarget::Other  }
                     DeclKind::GenericParam(_)   => { DirectiveTarget::Other  }
@@ -917,7 +917,7 @@ type struct DirectiveProcessingPasses {
 
     static apply_layout_effects_struct(ctx: CompilationContext*,
                                          dir: DirectiveNode*,
-                                         sd: StructDeclNode*,
+                                         sd: StructDecl*,
                                          name: Keyword) -> void {
         match (name.as_string()) {
             "repr" => {
@@ -1218,8 +1218,8 @@ type struct DirectiveProcessingPasses {
         // observe it.  Conflict detection (e.g. `repr(packed)` + `align`,
         // duplicate `repr`) lives in the same place so a stable diagnostic
         // is produced regardless of source order.
-        if (decl.kind == NodeKind::StructDeclaration) {
-            const sd: StructDeclNode* = decl as StructDeclNode*;
+        if (DeclarationNode::struct_of(decl) != null) {
+            const sd: StructDecl* = DeclarationNode::struct_of(decl);
             DirectiveProcessingPasses::apply_layout_effects_struct(ctx, dir, sd, dir.directive_kind);
             return;
         }
@@ -1540,8 +1540,8 @@ type struct DirectiveProcessingPasses {
             // would free the decl node's buffer when the local drops.
             const empty_methods: [MethodNode*] = [];
             mut method_list: &[MethodNode*] = &empty_methods;
-            if (decl.kind == NodeKind::StructDeclaration) {
-                const sn: StructDeclNode* = decl as StructDeclNode*;
+            if (DeclarationNode::struct_of(decl) != null) {
+                const sn: StructDecl* = DeclarationNode::struct_of(decl);
                 method_list = &sn.methods;
             } else if (DeclarationNode::union_of(decl) != null) {
                 const un: UnionDecl* = DeclarationNode::union_of(decl);
@@ -1586,8 +1586,8 @@ type struct DirectiveProcessingPasses {
             // own directives are validated and recorded as a declaration's are.
             const empty_fields: [DeclarationNode*] = [];
             mut field_list: &[DeclarationNode*] = &empty_fields;
-            if (decl.kind == NodeKind::StructDeclaration) {
-                field_list = &(decl as StructDeclNode*).fields;
+            if (DeclarationNode::struct_of(decl) != null) {
+                field_list = &(DeclarationNode::struct_of(decl)).fields;
             } else if (DeclarationNode::union_of(decl) != null) {
                 field_list = &(DeclarationNode::union_of(decl)).fields;
             } else if (decl.kind == NodeKind::ClassDeclaration) {
@@ -1689,10 +1689,6 @@ type struct DirectiveProcessingPasses {
                 NodeKind::FunctionDeclaration => {
                     DirectiveProcessingPasses::register_converter_fn(ctx, stmt as FunctionDeclNode*);
                 }
-                NodeKind::StructDeclaration => {
-                    const sd: StructDeclNode* = stmt as StructDeclNode*;
-                    DirectiveProcessingPasses::register_converter_methods(ctx, &sd.methods);
-                }
                 NodeKind::ClassDeclaration => {
                     const cd: ClassDeclNode* = stmt as ClassDeclNode*;
                     DirectiveProcessingPasses::register_converter_methods(ctx, &cd.methods);
@@ -1703,6 +1699,9 @@ type struct DirectiveProcessingPasses {
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Struct(sd) => {
+                            DirectiveProcessingPasses::register_converter_methods(ctx, &sd.methods);
+                        }
                         DeclKind::Union(ud) => {
                             DirectiveProcessingPasses::register_converter_methods(ctx, &ud.methods);
                         }
@@ -1765,28 +1764,6 @@ type struct DirectiveProcessingPasses {
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
-                NodeKind::StructDeclaration => {
-                    const node: StructDeclNode* = stmt as StructDeclNode*;
-                    if (node.is_generic()) {
-                        // Generic struct definitions have no concrete Type yet;
-                        // each specialization stamps its own layout in the
-                        // monomorphizer (`populate_struct_fields`), which copies
-                        // the repr/align flags the cloner carried over from this
-                        // template. Nothing to do for the template itself.
-                        continue;
-                    }
-                    if (!node.repr_c && !node.repr_packed
-                            && !node.repr_transparent && node.min_alignment == 0) {
-                        continue;
-                    }
-                    const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/struct layout");
-                    if (!tref.is_valid()) { continue; }
-                    const ty: Type* = arena.lookup(tref);
-                    if (ty == null || ty.kind != TypeKind::Struct) { continue; }
-                    mut st: StructType* = ty.as_struct();
-                    st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
-                    st.set_min_alignment(node.min_alignment);
-                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) { continue; }
@@ -1804,6 +1781,27 @@ type struct DirectiveProcessingPasses {
                 }
                 NodeKind::Declaration => {
                     match ((stmt as DeclarationNode*).shape) {
+                        DeclKind::Struct(node) => {
+                            if (node.is_generic()) {
+                                // Generic struct definitions have no concrete Type
+                                // yet; each specialization stamps its own layout in
+                                // the monomorphizer (`populate_struct_fields`), which
+                                // copies the repr/align flags the cloner carried over
+                                // from this template.
+                                continue;
+                            }
+                            if (!node.repr_c && !node.repr_packed
+                                    && !node.repr_transparent && node.min_alignment == 0) {
+                                continue;
+                            }
+                            const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/struct layout");
+                            if (!tref.is_valid()) { continue; }
+                            const ty: Type* = arena.lookup(tref);
+                            if (ty == null || ty.kind != TypeKind::Struct) { continue; }
+                            mut st: StructType* = ty.as_struct();
+                            st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
+                            st.set_min_alignment(node.min_alignment);
+                        }
                         DeclKind::Enum(node) => {
                             if (node.is_generic()) { continue; }
                             if (!node.repr_c && node.min_alignment == 0) { continue; }
