@@ -179,6 +179,25 @@ yet is recorded with the change that builds it, not here.
 445. **A struct literal whose type name is refused has the error type,**
      not `void`, so nothing that uses its value reports a second error.
 
+446. **A pointer converts only to a pointer at the same type.**  A pointer
+     to a type that merely converts to the wanted pointee (`i32*` for
+     `i64*`, `f32*` for `f64*`, `i32**` for `i64**` or `void**`) is
+     refused wherever it meets a declared type and at every kind of call,
+     a method call and a value bound to a pointer parameter by its address
+     included.  What stays implicit is what the language already states:
+     the same pointee, `const` added, `void*` on either side, `null`, and a
+     class to its base.  Existing code the check refuses is fixed first,
+     then the check lands with compile-fail tests proved against the
+     parent.
+
+447. **A thread-local whose initializer cannot fold keeps the E0646
+     wording** ("thread-local `x` is initialized by a value computed at
+     program start").
+
+448. **The libc bindings are aligned with their C headers later,** at low
+     priority (`void*` and `char*` where C has them, not `u8*`); recorded
+     in the roadmap, not done with the pointer check.
+
 ### 2026-10-17
 
 405. **A `return` inside an await-free `unsafe` block or `static match`

@@ -317,7 +317,7 @@ const pp: int** = &p;          // pointer to pointer
 const v:  void* = malloc(64);  // type-erased
 ```
 
-A pointer converts to another pointer type without a cast only when the pointee is the same type (`T*` to `const T*`, never back), when either side is `void*`, or from a derived class to its base. A pointer to any other type is written with `as`. The rule is the same wherever a value meets a declared type: an initializer, an assignment, a `return`, a struct field, and an argument of every kind of call - a method, a free or static function, a function reached by its path, a generic one and a constructor (`E0214` at an argument, `E0200` elsewhere).
+A pointer converts to another pointer type without a cast only when the pointee is the same type (`T*` to `const T*`, never back), when either side is `void*`, or from a derived class to its base. A pointer to any other type is written with `as`, including a pointee that converts to the wanted one: an `i32` converts to an `i64`, but an `i32*` addresses four bytes, so it is not an `i64*` (nor is an `i32**` an `i64**` or a `void**`). A value passed where a pointer parameter wants its address must be of the pointee type itself. The rule is the same wherever a value meets a declared type: an initializer, an assignment, a `return`, a struct field, and an argument of every kind of call - a method, a free or static function, a function reached by its path, a generic one and a constructor (`E0214` at an argument, `E0200` elsewhere).
 
 Raw pointers are unchecked. Validity, aliasing, and lifetime are the programmer's responsibility. For a pointer that is statically guaranteed non-null, see `core::ptr::NonNull<T>`. For owned heap allocations, prefer `Box<T>`. See [section 15](#15-pointers-and-memory).
 

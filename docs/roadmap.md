@@ -602,6 +602,14 @@ told apart before the warning becomes an error.
 Open: whether `ptr::drop_in_place` stays the spelling for releasing a
 value through a raw pointer.
 
+## libc bindings spelled as their C headers
+
+Low priority.  Most of the standard library's libc bindings spell C's
+`void*` and `char*` as `u8*`; only the `mem*`/`b*` family takes and returns
+`void*` as C does.  Every binding is aligned with the C header it binds, so
+a call passes the pointer type C declares and a generic copy does not need
+a cast to reach it.
+
 ## Open questions
 
 - **How wide a `char` is**, and so what a character literal holds above

@@ -261,35 +261,11 @@ type struct TypeChecker {
             // void*/identity rules so `const T*` -> `T*` cannot slip through the
             // same-pointee fast path below.
             const drops_const: boolean = from_ptr.const_pointee && !to_ptr.const_pointee;
-            // void* -> T* and T* -> void* are implicit (C-style universal pointer)
-            const from_inner: Type* = this.arena.lookup(from_ptr.pointee);
-            const to_inner: Type* = this.arena.lookup(to_ptr.pointee);
-            if ((from_inner != null && from_inner.kind == TypeKind::Void) ||
-                (to_inner != null && to_inner.kind == TypeKind::Void)) {
-                if (drops_const) { return TypeCompatibility::ExplicitCast; }
-                return TypeCompatibility::ImplicitConvert;
-            }
-            // Same pointee type after deref
             if (from_ptr.pointee.equals(to_ptr.pointee)) {
                 if (drops_const) { return TypeCompatibility::ExplicitCast; }
                 return TypeCompatibility::Identical;
             }
-            // Class hierarchy upcast: Derived* -> Base* is implicit.
-            // Walk the from-side inheritance chain to check if the to-side
-            // class is an ancestor.  This handles the common OOP pattern of
-            // returning a subclass pointer from a function typed as base.
-            if (from_inner != null && to_inner != null &&
-                from_inner.kind == TypeKind::Class && to_inner.kind == TypeKind::Class) {
-                if (this.is_subclass_of(from_ptr.pointee, to_ptr.pointee)) {
-                    return TypeCompatibility::ImplicitConvert;
-                }
-            }
-
-            // Recursive pointee compatibility (e.g., i8** -> string*
-            // follows from i8* -> string).
-            const pointee_compat: TypeCompatibility = this.check_compatibility(
-                from_ptr.pointee, to_ptr.pointee);
-            if (pointee_compat.is_assignable() && !drops_const) {
+            if (this.pointee_converts(from_ptr.pointee, to_ptr.pointee) && !drops_const) {
                 return TypeCompatibility::ImplicitConvert;
             }
             return TypeCompatibility::ExplicitCast;
@@ -481,6 +457,30 @@ type struct TypeChecker {
         }
 
         return TypeCompatibility::Incompatible;
+    }
+
+    /// Whether `from` and `to` are one type: the same id, or two spellings of
+    /// it (an alias and its target, a generic base and its instance) that
+    /// convert without any change to the value's representation.
+    is_same_type(&this, from: TypeRef, to: TypeRef) -> boolean {
+        if (from.equals(to)) { return true; }
+        const c: TypeCompatibility = this.check_compatibility(from, to);
+        return c == TypeCompatibility::Identical || c == TypeCompatibility::Compatible;
+    }
+
+    /// Whether a pointer to `from` stands for a pointer to `to` with no cast:
+    /// the same type, `void` on either side, or a class to its base.  A
+    /// pointee that only converts does not qualify: a conversion changes a
+    /// value, and nothing changes the memory a pointer addresses, so an
+    /// `i32*` read as an `i64*` reads past the value.
+    pointee_converts(&this, from: TypeRef, to: TypeRef) -> boolean {
+        if (this.is_same_type(from, to)) { return true; }
+        const from_inner: Type* = this.arena.lookup(from);
+        const to_inner: Type* = this.arena.lookup(to);
+        if (from_inner == null || to_inner == null) { return false; }
+        if (from_inner.kind == TypeKind::Void || to_inner.kind == TypeKind::Void) { return true; }
+        return from_inner.kind == TypeKind::Class && to_inner.kind == TypeKind::Class
+            && this.is_subclass_of(from, to);
     }
 
     /// Whether from can be assigned to to (Identical, Compatible, or ImplicitConvert).
