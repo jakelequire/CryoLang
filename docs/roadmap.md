@@ -617,3 +617,9 @@ value through a raw pointer.
   behaviour as it is.  Whether that is refused, and where, is open.
 - **`std::Range`.**  Nothing re-exports `Range` at the root of `std`, so the
   path is refused today.  Whether `stdlib/lib.cryo` exports it there is open.
+- **A thread-local whose initializer is not folded.**  A global's initializer
+  that is not a constant (a call, another global's value or address, a
+  struct literal nested in another or leaving fields out) is computed once
+  before `main`, on the main thread, so a `![thread_local]` global with one
+  holds zero in every other thread's copy.  Whether such a thread-local is
+  refused is undecided.

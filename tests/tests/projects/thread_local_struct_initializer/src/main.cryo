@@ -1,0 +1,46 @@
+/// A thread-local initialized by a struct literal holding `null`, a string
+/// literal and a nonzero integer, or by an array literal of a string and
+/// `null`, starts with that value on EVERY thread, not
+/// only on the main one: the initializer is static data rather than a store
+/// the program makes once at start, on the main thread.  The exit code names
+/// the field that read wrong on the spawned thread; 0 means all held.
+namespace ThreadLocalStructInitializer::Main;
+
+import std::thread;
+import std::ffi::libc;
+
+type struct Place {
+    file: string;
+    line: u32;
+    tag:  string;
+}
+
+![thread_local]
+mut g_place: Place = Place { file: null, line: 7, tag: "start" };
+
+![thread_local]
+mut g_names: [string; 2] = ["first", null];
+
+/// What a fresh thread finds in its own copies of `g_place` and `g_names`.
+function inspect(_unused: u32) -> u32 {
+    if (g_place.file != null) { return 1; }
+    if (g_place.line != 7) { return 2; }
+    if (g_place.tag == null) { return 3; }
+    if (libc::strcmp(g_place.tag as u8*, "start" as u8*) != 0) { return 4; }
+    if (g_names[0] == null) { return 6; }
+    if (libc::strcmp(g_names[0] as u8*, "first" as u8*) != 0) { return 7; }
+    if (g_names[1] != null) { return 8; }
+    return 0;
+}
+
+function main() -> int {
+    // The main thread's copy changes first, so a value read on the spawned
+    // thread cannot have come from it.
+    g_place.line = 9;
+    const h: thread::JoinHandle<u32> = thread::spawn(0, inspect);
+    const code: u32 = h.join();
+    if (code != 0) { return code as int; }
+    if (g_place.line != 9) { return 5; }
+    libc::printf("thread-local initializer ok\n");
+    return 0;
+}

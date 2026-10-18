@@ -746,7 +746,7 @@ mut it         = arr.iter();   // inferred: the concrete iterator type
 mut y: int;                     // declared without an initialiser; assigned later
 ```
 
-**Globals.** Module-level `const` declares an immutable global; module-level `mut` declares mutable global state. Use the latter sparingly. An initializer that is a constant expression is folded into the program; any other - a call, another global's value - is computed once, before `main` runs, a module's globals after those of the modules it imports, in the order they are declared.
+**Globals.** Module-level `const` declares an immutable global; module-level `mut` declares mutable global state. Use the latter sparingly. An initializer that is a constant expression is folded into the program: a number, a `null` or string literal, an array literal of those (arrays nest), and a struct literal writing every field with one of those (a struct literal inside another, or inside an array, is not folded). Any other - a call, another global's value - is computed once, before `main` runs, a module's globals after those of the modules it imports, in the order they are declared. A `![thread_local]` global gets a folded initializer in every thread's copy; one that is computed is computed for the main thread's copy only.
 
 ```cryo
 const VERSION:    string = "1.0.0";

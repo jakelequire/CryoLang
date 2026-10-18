@@ -1430,15 +1430,8 @@ type struct DeclarationEmitter {
                        && (tk == LTypeKind::Float || tk == LTypeKind::Double)) {
                 const fval: f64 = float::parse_f64(lit.value).unwrap_or(0.0);
                 init = LType::const_real(ty, fval);
-            } else if (lit.literal_kind == LiteralKind::Null && tk == LTypeKind::Pointer) {
-                init = LType::const_pointer_null(ty);
-            } else if (lit.literal_kind == LiteralKind::String && tk == LTypeKind::Pointer) {
-                // String literal global: store the address of the interned
-                // string global as the initializer.  Without this, every
-                // `const SOME_TEXT: string = "..."` emits as `null`, which
-                // surfaces as literal "(null)" in any printf/format output
-                // that consumes the constant.
-                init = this.str_cache.get_or_create(lit.value, lit.byte_length, this.llvm_module);
+            } else if (tk == LTypeKind::Pointer) {
+                init = this.const_pointer(ty, init_expr);
             }
         }
         // Fold a constant-expression initializer that isn't a bare literal -
@@ -2506,8 +2499,8 @@ type struct DeclarationEmitter {
     /// the bindgen importer lowers a C compound-literal macro to).  The importer
     /// emits the field initializers in struct DECLARATION order, so a positional
     /// zip against the LLVM struct's element types is exact.  Every field init
-    /// must fold to a scalar constant (`try_fold_const_int`/`try_fold_const_real`);
-    /// any non-constant field, or a field-count mismatch (an unexpected shape),
+    /// must fold to a constant (`const_element`: a number, a `null` or string
+    /// literal, a nested array); any non-constant field, or a field-count mismatch (an unexpected shape),
     /// returns an invalid value so the caller declines to the zeroinitializer
     /// fallback - correct-or-decline, never a silently wrong layout.
     /// `layout` is the Cryo type whose field list `sl` initializes, so a field
@@ -2586,6 +2579,33 @@ type struct DeclarationEmitter {
         }
         if (k == LTypeKind::Array && expr.kind == NodeKind::ArrayLiteral) {
             return this.try_const_array(expr as ArrayLiteralNode*, ety);
+        }
+        if (k == LTypeKind::Pointer) {
+            return this.const_pointer(ety, expr);
+        }
+        return LValue::null();
+    }
+
+    /// A constant pointer of type `ty` from a `null` literal or a string
+    /// literal (the address of its interned bytes), with one cast around the
+    /// literal peeled, as `"..." as u8*` is written; any other expression is
+    /// not a pointer constant here, and answers an invalid value.
+    ///
+    /// A string literal must answer its address rather than decline: a
+    /// declined global is zeroed and filled in by the startup constructor,
+    /// which for a thread-local fills only the main thread's copy.
+    const_pointer(&this, ty: LType, expr_in: ExpressionNode*) -> LValue {
+        mut expr: ExpressionNode* = expr_in;
+        if (expr != null && expr.kind == NodeKind::CastExpression) {
+            expr = (expr as CastExprNode*).expression;
+        }
+        if (expr == null || expr.kind != NodeKind::Literal) { return LValue::null(); }
+        const lit: LiteralNode* = expr as LiteralNode*;
+        if (lit.literal_kind == LiteralKind::Null) {
+            return LType::const_pointer_null(ty);
+        }
+        if (lit.literal_kind == LiteralKind::String) {
+            return this.str_cache.get_or_create(lit.value, lit.byte_length, this.llvm_module);
         }
         return LValue::null();
     }

@@ -70,30 +70,12 @@ mut g_exn: UnwindException = UnwindException {
 /// The place is copied, not pointed at: the caller's `Location` may live in a
 /// frame the unwind leaves.
 ///
-/// One scalar per field rather than a `Sys::Location`: each scalar's
-/// initializer is static data, while a struct literal holding `null` is
-/// computed by a startup constructor, which sets only the main thread's copy
-/// of a thread-local.  `null`-initialized `string` pointers zero-init cleanly
-/// and are only read after `__cryo_panic` has stashed a real message and
-/// place into them.
+/// `null`-initialized `string` pointers zero-init cleanly and are only read
+/// after `__cryo_panic` has stashed a real message and place into them.
 ![thread_local]
 mut g_panic_msg: string = null;
 ![thread_local]
-mut g_panic_file: string = null;
-![thread_local]
-mut g_panic_line: u32 = 0;
-![thread_local]
-mut g_panic_column: u32 = 0;
-![thread_local]
-mut g_panic_function: string = null;
-
-/// The stashed place, as the report writer takes it.
-function stashed_location() -> Sys::Location {
-    return Sys::Location {
-        file: g_panic_file, line: g_panic_line,
-        column: g_panic_column, function: g_panic_function,
-    };
-}
+mut g_panic_loc: Sys::Location = Sys::Location { file: null, line: 0, column: 0, function: null };
 
 // --- Unwinder Level-1 ABI ---------------------------------------------------
 // All handles are opaque pointers passed as i64. `_Unwind_RaiseException`
@@ -155,11 +137,8 @@ function __cryo_panic(msg: string, loc: Sys::Location*) -> never {
     // Stash the payload BEFORE raising: the raise transfers control to a
     // landing pad and never returns here, so a root `catch_unwind` reads these
     // back through the accessors to build its `Err(PanicInfo)`.
-    g_panic_msg      = msg;
-    g_panic_file     = loc.file;
-    g_panic_line     = loc.line;
-    g_panic_column   = loc.column;
-    g_panic_function = loc.function;
+    g_panic_msg = msg;
+    g_panic_loc = *loc;
     g_exn.exception_class   = CRYO_EXCEPTION_CLASS;
     g_exn.exception_cleanup = 0;
     mut i: u64 = 0;
@@ -177,10 +156,10 @@ function __cryo_panic(msg: string, loc: Sys::Location*) -> never {
 function __cryo_panic_taken_message() -> string { return g_panic_msg; }
 
 ![no_mangle]
-function __cryo_panic_taken_file() -> string { return g_panic_file; }
+function __cryo_panic_taken_file() -> string { return g_panic_loc.file; }
 
 ![no_mangle]
-function __cryo_panic_taken_line() -> u32 { return g_panic_line; }
+function __cryo_panic_taken_line() -> u32 { return g_panic_loc.line; }
 
 /// Called by the compiler-synthesized root-catch `main` wrapper when a panic
 /// unwinds all the way out (uncaught by any `catch_unwind`). The raising funnel
@@ -190,8 +169,7 @@ function __cryo_panic_taken_line() -> u32 { return g_panic_line; }
 /// 2), so all pending destructors executed before this point.
 ![no_mangle]
 function __cryo_panic_finish() -> never {
-    mut loc: Sys::Location = stashed_location();
-    Sys::write_panic_report(g_panic_msg, &loc);
+    Sys::write_panic_report(g_panic_msg, &g_panic_loc);
     Sys::rt_exit(101);
 }
 
