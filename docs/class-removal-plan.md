@@ -1727,6 +1727,11 @@ committed with the change and deleted in the next commit.
   helper that takes the header (`is_method_of`, `holds_method`,
   `method_consumes_receiver`) and five casts of a call's result (a cloned
   method) to the payload type; the type check refused neither.
+- The arms those scripts moved kept their old bodies, which projected the
+  matched node again (`const f: FunctionDecl* = DeclarationNode::fn_of(...)`
+  under `DeclKind::Function(_)`).  Each binds the payload in its pattern
+  now; a scan of every shape arm for a projection of its own scrutinee
+  finds none (it found 16 before).
 - The cloner's partial copies of an intrinsic, an import and an extern
   block are never exercised: an assertion in each of the three arms
   passed verify whole (tests, examples, the language server and the cross

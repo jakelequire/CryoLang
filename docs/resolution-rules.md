@@ -142,6 +142,11 @@ yet is recorded with the change that builds it, not here.
      or linking the Linux pin as a fixed-address executable is not decided.
      (Dispatch, delegated)
 
+439. **A `match` arm on a declaration's shape binds the payload in its
+     pattern** (`DeclKind::Function(f) =>`) instead of projecting the
+     matched node a second time inside the arm; the change compiles every
+     program to the same output.  (Dispatch, delegated)
+
 ### 2026-10-17
 
 405. **A `return` inside an await-free `unsafe` block or `static match`
