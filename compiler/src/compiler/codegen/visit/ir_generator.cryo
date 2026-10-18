@@ -53,7 +53,7 @@ import compiler::ast::expression::{
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
     ScopeResolutionNode, SizeofExpr, StaticMatchExprNode, StructLiteralNode,
-    TernaryExprNode, TryExprNode, TupleLiteralNode, UnaryExprNode
+    TernaryExprNode, TryExpr, TupleLiteralNode, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, Pattern };
@@ -219,7 +219,6 @@ type struct IRGeneratorVisitor {
             NodeKind::MemberAccess           => { return this.visit_member_access(n as MemberAccessNode*); }
             NodeKind::ScopeResolution        => { return this.visit_scope_resolution(n as ScopeResolutionNode*); }
             NodeKind::AwaitExpression        => { return this.visit_await(n as AwaitExprNode*); }
-            NodeKind::TryExpression          => { return this.visit_try(n as TryExprNode*); }
 
             NodeKind::Statement              => { return this.emit_stmt(n as Stmt*); }
 
@@ -260,6 +259,7 @@ type struct IRGeneratorVisitor {
                     ExprKind::Typeof(_)  => { return this.visit_typeof(e); }
                     ExprKind::Delete(d)  => { return this.new_delete.emit_delete(this, e, d); }
                     ExprKind::Yield(_)   => { return this.visit_yield(e); }
+                    ExprKind::Try(t)     => { return this.visit_try(e, t); }
                     ExprKind::Legacy     => { return Emitted::none(); }
                 }
             }
@@ -2108,16 +2108,16 @@ type struct IRGeneratorVisitor {
 
     /// Try operator `expr?`: sema lowered it to an equivalent `match`
     /// stored on `desugared`, so codegen just emits that.  `desugared` is
-    /// non-null for any `TryExprNode` that passed semantic analysis; a null
+    /// non-null for any `?` that passed semantic analysis; a null
     /// here means sema rejected the operand, and a diagnostic already fired.
-    visit_try(mut &this, node: TryExprNode*) -> Emitted {
+    visit_try(mut &this, e: ExpressionNode*, node: TryExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         if (node.desugared != null) {
             return this.dispatch_node(node.desugared);
         }
         this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: `?` operator was not lowered by semantic analysis",
-            node.span);
+            e.span);
         out.value     = LValue::null();
         out.is_lvalue = false;
         return out;
@@ -2127,9 +2127,6 @@ type struct IRGeneratorVisitor {
     visit_new(mut &this, node: NewExprNode*) -> Emitted {
         return this.new_delete.emit_new(this, node);
     }
-
-    /// Delete expression (heap free): delegate to NewDeleteEmitter.
-    /// Runs the pointee's drop method (if any) then frees the allocation.
 
     // Unsupported AST node kinds
     //

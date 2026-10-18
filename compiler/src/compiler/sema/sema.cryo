@@ -78,7 +78,7 @@ import compiler::ast::expression::{
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
     ScopeResolutionNode, StaticMatchExprNode, StructLiteralNode,
-    TernaryExprNode, TryExprNode, TupleLiteralNode, UnaryExprNode
+    TernaryExprNode, TryExpr, TupleLiteralNode, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::node_locator::{ annotation_span };
@@ -1670,7 +1670,7 @@ type struct SemaVisitor {
             | NodeKind::CastExpression | NodeKind::StructLiteral
             | NodeKind::ArrayLiteral | NodeKind::TupleLiteral | NodeKind::LambdaExpression
             | NodeKind::ArrayAccess | NodeKind::MemberAccess | NodeKind::ScopeResolution
-            | NodeKind::AwaitExpression | NodeKind::TryExpression => {
+            | NodeKind::AwaitExpression => {
                 this.resolve_expr(n as ExpressionNode*);
             }
 
@@ -1737,7 +1737,6 @@ type struct SemaVisitor {
             NodeKind::ArrayLiteral      => { this.resolve_array_literal(expr as ArrayLiteralNode*) }
             NodeKind::TupleLiteral      => { this.resolve_tuple_literal(expr as TupleLiteralNode*) }
             NodeKind::Expression        => { this.resolve_expr_shape(expr) }
-            NodeKind::TryExpression     => { this.resolve_try_expr(expr as TryExprNode*) }
             NodeKind::LambdaExpression  => { this.lambda.resolve_lambda(this, expr as LambdaExprNode*) }
             NodeKind::AwaitExpression   => { this.resolve_await(expr as AwaitExprNode*) }
             _ => { TypeRef::invalid() }
@@ -1774,6 +1773,7 @@ type struct SemaVisitor {
             }
             // A `yield` has no type: codegen refuses it.
             ExprKind::Yield(_) => { TypeRef::invalid() }
+            ExprKind::Try(t)   => { this.resolve_try_expr(expr, t) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -3317,9 +3317,9 @@ type struct SemaVisitor {
     /// is the enum its scope segment names. The two agree on shape (the caller
     /// rejects a mismatch) but not necessarily on instantiation, and only the
     /// returned one is what the synthesized reference refers to.
-    build_try_desugar(mut &this, node: TryExprNode*, is_result: boolean,
+    build_try_desugar(mut &this, e: ExpressionNode*, node: TryExpr*, is_result: boolean,
                       operand_ty: TypeRef, ret_ty: TypeRef) -> MatchExprNode* {
-        const span: SourceSpan = node.span;
+        const span: SourceSpan = e.span;
         this.state.try_counter += 1;
         const enum_name: SymbolStr = this.intern.intern(if (is_result) { "Result" } else { "Option" });
         const ok_variant: SymbolStr = this.intern.intern(if (is_result) { "Ok" } else { "Some" });
@@ -3393,7 +3393,7 @@ type struct SemaVisitor {
         return match_expr;
     }
 
-    resolve_try_expr(mut &this, node: TryExprNode*) -> TypeRef {
+    resolve_try_expr(mut &this, e: ExpressionNode*, node: TryExpr*) -> TypeRef {
         // The operand is resolved on EVERY visit, including one that reuses an
         // existing desugar: call-specialization and dispatch annotation both
         // walk `operand` (never `desugared`), so a specialization whose operand
@@ -3418,7 +3418,7 @@ type struct SemaVisitor {
             const ot: Type* = this.arena.lookup(operand_type);
             const disp: string = if (ot != null) { this.arena.format_display(ot) } else { "?" };
             this.ctx.emit_error_at(ErrorCode::E0234_INVALID_TRY_OPERAND,
-                fmt::format("the `?` operator requires a `Result` or `Option` value, but the operand has type '%s'", disp), node.span);
+                fmt::format("the `?` operator requires a `Result` or `Option` value, but the operand has type '%s'", disp), e.span);
             return TypeRef::invalid();
         }
         // Inside a lowered `poll`, the async function's Output is what `?`
@@ -3443,7 +3443,7 @@ type struct SemaVisitor {
             const want: string = if (operand_shape == 1) { "Result" } else { "Option" };
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0235_TRY_OUTSIDE_RESULT_FN,
                 fmt::format("the `?` operator can only be used in a function that returns `%s`", want));
-            diag = diag.at_with_label(node.span, fmt::format("propagates a `%s`, but the enclosing function doesn't return one", want));
+            diag = diag.at_with_label(e.span, fmt::format("propagates a `%s`, but the enclosing function doesn't return one", want));
             const ann_span: SourceSpan = annotation_span(this.state.return_type_ann);
             if (ann_span.has_location()) {
                 const ret_repl: string = this.arena.resolve_display_name_short(operand_type);
@@ -3452,7 +3452,7 @@ type struct SemaVisitor {
             this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();
         }
-        mut desugared: MatchExprNode* = this.build_try_desugar(node, operand_shape == 1, operand_type, fn_ret);
+        mut desugared: MatchExprNode* = this.build_try_desugar(e, node, operand_shape == 1, operand_type, fn_ret);
         node.set_desugared(desugared as ExpressionNode*);
         return this.resolve_expr(desugared as ExpressionNode*);
     }

@@ -34,7 +34,7 @@ import compiler::ast::expression::{
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
     ScopeResolutionNode, SizeofExpr, StaticMatchExprNode, StructLiteralNode,
-    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExpr, UnaryExprNode
+    TernaryExprNode, TryExpr, TupleLiteralNode, TypeofExpr, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{
@@ -135,7 +135,6 @@ type struct ASTCloner {
             NodeKind::MemberAccess              => { return this.visit_member_access(n as MemberAccessNode*); }
             NodeKind::ScopeResolution           => { return this.visit_scope_resolution(n as ScopeResolutionNode*); }
             NodeKind::AwaitExpression           => { return this.visit_await(n as AwaitExprNode*); }
-            NodeKind::TryExpression             => { return this.visit_try(n as TryExprNode*); }
 
             NodeKind::Expression                => { return this.copy_expr_shape(n as ExpressionNode*); }
             NodeKind::Statement                 => { return this.copy_stmt(n as Stmt*); }
@@ -433,6 +432,34 @@ type struct ASTCloner {
             ExprKind::Yield(n) => {
                 c = ExpressionNode::yield_expr(this.clone_expr(n.operand), node.span);
             }
+            ExprKind::Try(n) => {
+                mut ct: TryExpr* = new TryExpr {
+                    operand:   this.clone_expr(n.operand),
+                    desugared: null,
+                };
+                c = ExpressionNode::of(ExprKind::Try(ct), node.span);
+                // `desugared` is normally null at clone time (monomorphization
+                // runs before sema lowers `?`), but clone it defensively if
+                // present so a post-sema clone stays self-consistent.
+                if (n.desugared != null) {
+                    ct.desugared = this.clone_expr(n.desugared);
+                    // The desugared `match` takes the operand node ITSELF as
+                    // its subject. Cloning the two independently splits that
+                    // sharing, and the halves are read by different consumers:
+                    // call specialization and dispatch annotation walk
+                    // `operand`, while codegen emits `desugared`. A split clone
+                    // therefore emits a call that nothing specialized. Re-point
+                    // the copy so the invariant survives the clone.
+                    //
+                    // The async lowering deliberately breaks the sharing (it
+                    // hoists an `await` out of the subject into a temp), so
+                    // this only re-points when the original still holds it.
+                    if (n.desugared.kind == NodeKind::MatchExpression
+                            && (n.desugared as MatchExprNode*).subject == n.operand) {
+                        (ct.desugared as MatchExprNode*).subject = ct.operand;
+                    }
+                }
+            }
             ExprKind::Legacy => { return null; }
         }
         c.has_error = node.has_error;
@@ -584,35 +611,6 @@ type struct ASTCloner {
         mut c: AwaitExprNode* = new AwaitExprNode(
             this.clone_expr(node.operand), node.span
         );
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_try(mut &this, node: TryExprNode*) -> ASTNode* {
-        mut c: TryExprNode* = new TryExprNode(
-            this.clone_expr(node.operand), node.span
-        );
-        // `desugared` is normally null at clone time (monomorphization runs
-        // before sema lowers `?`), but clone it defensively if present so a
-        // post-sema clone stays self-consistent.
-        if (node.desugared != null) {
-            c.desugared = this.clone_expr(node.desugared);
-            // The desugared `match` takes the operand node ITSELF as its
-            // subject. Cloning the two independently splits that sharing, and
-            // the halves are read by different consumers: call specialization
-            // and dispatch annotation walk `operand`, while codegen emits
-            // `desugared`. A split clone therefore emits a call that nothing
-            // specialized — `?` on a generic free function stopped resolving at
-            // codegen. Re-point the copy so the invariant survives the clone.
-            //
-            // The async lowering deliberately breaks the sharing (it hoists an
-            // `await` out of the subject into a temp), so this only re-points
-            // when the original still holds it.
-            if (node.desugared.kind == NodeKind::MatchExpression
-                    && (node.desugared as MatchExprNode*).subject == node.operand) {
-                (c.desugared as MatchExprNode*).subject = c.operand;
-            }
-        }
         c.has_error = node.has_error;
         return c;
     }

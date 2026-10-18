@@ -152,6 +152,14 @@ public:
         return ExpressionNode::of(ExprKind::Delete(new DeleteExpr { operand: operand }), span);
     }
 
+    /// `operand?` at `span`, not yet desugared.
+    static try_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Try(new TryExpr {
+            operand:   operand,
+            desugared: null,
+        }), span);
+    }
+
     /// `yield operand` at `span`; a bare `yield` when `operand` is null.
     static yield_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::Yield(new YieldExpr { operand: operand }), span);
@@ -202,6 +210,16 @@ public:
             _                   => { null }
         };
     }
+
+    /// The `?` expression `n` is, or null.
+    static try_of(n: ASTNode*) -> TryExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::Try(t) => { t }
+            _                => { null }
+        };
+    }
 }
 
 
@@ -213,6 +231,7 @@ type enum ExprKind {
     Alignof(AlignofExpr*);
     Delete(DeleteExpr*);
     Sizeof(SizeofExpr*);
+    Try(TryExpr*);
     Typeof(TypeofExpr*);
     Yield(YieldExpr*);
 }
@@ -1455,18 +1474,35 @@ implement trait Allocate for struct YieldExpr {
 // in `desugared`.  Every post-sema consumer (codegen, drop insertion,
 // move check) forwards through `desugared`, so they only ever deal with
 // an ordinary `MatchExprNode`.  `desugared` is null until sema runs.
-type class TryExprNode : ExpressionNode {
-public:
+type struct TryExpr {
     operand:   ExpressionNode*;
     desugared: ExpressionNode*;
 
-    TryExprNode(operand: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::TryExpression, span) {
-        this.operand   = operand;
-        this.desugared = null;
+    static walk_children<V>(n: TryExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
     }
 
-    set_desugared(d: ExpressionNode*) -> void { this.desugared = d; }
+    set_desugared(mut &this, d: ExpressionNode*) -> void { this.desugared = d; }
+
+    /// The expression a `?` actually evaluates to.
+    ///
+    /// Sema replaces `expr?` with an equivalent `match` and stores it on
+    /// `desugared`; every pass downstream reads that and never the operand
+    /// (codegen emits it, move-check and drop insertion walk it), so the
+    /// async lowering must too. Walking BOTH would visit the operand twice,
+    /// because the desugared `match` takes the very same operand node as its
+    /// subject.
+    ///
+    /// The desugar carries a `return` in its `Err`/`None` arm and may hold an
+    /// `await` in its subject, so a walk that stopped at the `?` node would
+    /// leave that `return` unwrapped and that `await` uncounted.
+    ///
+    /// A null `desugared` means sema rejected the operand and has already
+    /// reported it; the operand is walked so the traversal stays total.
+    live(&this) -> ExpressionNode* {
+        if (this.desugared != null) { return this.desugared; }
+        return this.operand;
+    }
 
     /// Re-point `operand` at the desugared `match`'s subject.
     ///
@@ -1481,9 +1517,15 @@ public:
     /// Every in-place rewrite of the desugar must call this.  The async
     /// lowering has two: hoisting an `await` out of the subject, and promoting
     /// a carried local there to a frame field.
-    resync_operand() -> void {
+    resync_operand(mut &this) -> void {
         if (this.desugared == null) { return; }
         if ((this.desugared as ASTNode*).kind != NodeKind::MatchExpression) { return; }
         this.operand = (this.desugared as MatchExprNode*).subject;
+    }
+}
+
+implement trait Allocate for struct TryExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
