@@ -41,7 +41,7 @@ import std::fmt::float;
 import compiler::ast::expression;
 import compiler::ast::expression::{
     CalleePin,
-    ArrayExpr, BinaryExprNode, CastExprNode, ExpressionNode, LiteralExpr,
+    ArrayExpr, BinaryExprNode, CastExpr, ExpressionNode, LiteralExpr,
     ScopeResolutionNode, StructExpr, UnaryExprNode
 };
 import compiler::types::generic_registry;
@@ -1414,8 +1414,8 @@ type struct DeclarationEmitter {
         // of this function, leaving HEX_LOWER null at runtime, which
         // segfaults the moment a downstream consumer indexes it.
         mut init_expr: ExpressionNode* = node.initializer;
-        if (init_expr != null && init_expr.kind == NodeKind::CastExpression) {
-            const ce: CastExprNode* = init_expr as CastExprNode*;
+        const ce: CastExpr* = ExpressionNode::cast_of(init_expr);
+        if (ce != null) {
             if (ExpressionNode::literal_of(ce.expression) != null) {
                 init_expr = ce.expression;
             }
@@ -2424,13 +2424,13 @@ type struct DeclarationEmitter {
     try_fold_const_int(&this, expr: ExpressionNode*, out: u64*) -> boolean {
         if (expr == null) { return false; }
         const node: ASTNode* = expr as ASTNode*;
-        if (node.kind == NodeKind::CastExpression) {
-            // `Enum::Variant as u64`, `SOME_CONST as i32`.  Fold the OPERAND:
-            // the cast's own width is applied by `const_int` when it builds the
-            // constant against the global's type, so a cast chain folds once and
-            // narrows once.  Without this the initializer does not fold at all
-            // and the global lands on the zero fallback below.
-            const ce: CastExprNode* = expr as CastExprNode*;
+        // `Enum::Variant as u64`, `SOME_CONST as i32`.  Fold the OPERAND: the
+        // cast's own width is applied by `const_int` when it builds the
+        // constant against the global's type, so a cast chain folds once and
+        // narrows once.  Without this the initializer does not fold at all and
+        // the global lands on the zero fallback below.
+        const ce: CastExpr* = ExpressionNode::cast_of(expr);
+        if (ce != null) {
             return this.try_fold_const_int(ce.expression, out);
         }
         if (node.kind == NodeKind::ScopeResolution) {
@@ -2641,8 +2641,9 @@ type struct DeclarationEmitter {
     /// which for a thread-local fills only the main thread's copy.
     const_pointer(&this, ty: LType, expr_in: ExpressionNode*) -> LValue {
         mut expr: ExpressionNode* = expr_in;
-        if (expr != null && expr.kind == NodeKind::CastExpression) {
-            expr = (expr as CastExprNode*).expression;
+        const ce: CastExpr* = ExpressionNode::cast_of(expr);
+        if (ce != null) {
+            expr = ce.expression;
         }
         const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
         if (lit == null) { return LValue::null(); }

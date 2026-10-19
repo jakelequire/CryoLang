@@ -75,7 +75,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     CalleePin,
     ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
-    CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
+    CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExpr, LambdaExprNode, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr,
     TernaryExpr, TryExpr, TupleExpr, UnaryExprNode
@@ -1666,7 +1666,6 @@ type struct SemaVisitor {
             | NodeKind::Identifier | NodeKind::BinaryExpression
             | NodeKind::UnaryExpression
             | NodeKind::CallExpression
-            | NodeKind::CastExpression
             | NodeKind::LambdaExpression
             | NodeKind::ArrayAccess | NodeKind::MemberAccess | NodeKind::ScopeResolution
             | NodeKind::AwaitExpression => {
@@ -1722,7 +1721,6 @@ type struct SemaVisitor {
             NodeKind::CallExpression    => { this.calls.resolve_call(this, expr as CallExprNode*) }
             NodeKind::MemberAccess      => { this.member.resolve_member_access(this, expr as MemberAccessNode*) }
             NodeKind::ArrayAccess       => { this.member.resolve_array_access(this, expr as ArrayAccessNode*) }
-            NodeKind::CastExpression    => { this.resolve_cast(expr as CastExprNode*) }
             NodeKind::ScopeResolution   => {
                 this.calls.located_value_checked(expr, this.resolve_scope_resolution(expr as ScopeResolutionNode*))
             }
@@ -1773,6 +1771,7 @@ type struct SemaVisitor {
             ExprKind::If(i) => { this.resolve_if_expr(i) }
             ExprKind::StaticMatch(s) => { this.resolve_static_match_expr(expr, s) }
             ExprKind::Match(m) => { this.resolve_match_expr(expr, m) }
+            ExprKind::Cast(c) => { this.resolve_cast(expr, c) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -2828,7 +2827,7 @@ type struct SemaVisitor {
         TypeAnnotation::refused(ann);
     }
 
-    resolve_cast(mut &this, cast: CastExprNode*) -> TypeRef {
+    resolve_cast(mut &this, e: ExpressionNode*, cast: CastExpr*) -> TypeRef {
         // The operand of an explicit cast is not bounded by the SURROUNDING
         // annotation.  `as` names its own target, and performing a conversion
         // the operand would not survive implicitly is the whole reason to write
@@ -2871,7 +2870,7 @@ type struct SemaVisitor {
             && this.is_aggregate_scalar_cast(from_ty, to_ty)) {
             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0208_INVALID_CAST,
                 "invalid cast between an aggregate type (struct/class/tuple/array) and a scalar or pointer: there is no valid representation for this conversion");
-            d = d.at(cast.span);
+            d = d.at(e.span);
             if (this.diag.kind_or_void(this.cast_subject(from_ty)) == TypeKind::Class
                     && this.diag.kind_or_void(to_ty) == TypeKind::Pointer) {
                 d = d.help("a class value's address is written `&value`, and `&value as T*` converts it");
@@ -2884,7 +2883,7 @@ type struct SemaVisitor {
             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0208_INVALID_CAST,
                 fmt::format("cannot cast `%s` to `%s`: a struct, class, tuple or array value is cast only from a value of its own type",
                     this.types.type_display_name(from_ty), to_name));
-            d = d.at_with_label(cast.span, "no conversion makes this value");
+            d = d.at_with_label(e.span, "no conversion makes this value");
             if (this.diag.kind_or_void(this.cast_subject(to_ty)) == TypeKind::Class) {
                 d = d.help(fmt::format("a class converts along its hierarchy by pointer, `p as %s*`; `*p` reads the value a pointer points at", to_name));
             }
@@ -2897,7 +2896,7 @@ type struct SemaVisitor {
             this.ctx.emit_error_at(ErrorCode::E0208_INVALID_CAST,
                 fmt::format("cannot cast `%s` to `boolean`: nothing converts to `boolean`; %s",
                     this.types.type_display_name(from_ty), this.diag.truth_test_hint(from_ty)),
-                cast.span);
+                e.span);
         }
         return cast.resolved_target;
     }
