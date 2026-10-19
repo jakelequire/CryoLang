@@ -327,6 +327,20 @@ public:
         }), span);
     }
 
+    /// The bare name `name` at `span`, not yet resolved.
+    static identifier_expr(name: SymbolStr, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Identifier(new IdentifierExpr {
+            name:                 name,
+            is_this_keyword:      false,
+            is_this_type_keyword: false,
+            generic_args:         [],
+            resolved_callee:      CalleePin::None,
+            value_type_args:      [],
+            value_template:       TypeRef::invalid(),
+            res:                  ResSlot::Pending,
+        }), span);
+    }
+
     /// `yield operand` at `span`; a bare `yield` when `operand` is null.
     static yield_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::Yield(new YieldExpr { operand: operand }), span);
@@ -528,6 +542,16 @@ public:
         };
     }
 
+    /// The bare name `n` is, or null.
+    static identifier_of(n: ASTNode*) -> IdentifierExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::Identifier(i) => { i }
+            _                       => { null }
+        };
+    }
+
     /// The `?` expression `n` is, or null.
     static try_of(n: ASTNode*) -> TryExpr* {
         const e: ExpressionNode* = ExpressionNode::with_shape(n);
@@ -552,6 +576,7 @@ type enum ExprKind {
     Binary(BinaryExpr*);
     Cast(CastExpr*);
     Delete(DeleteExpr*);
+    Identifier(IdentifierExpr*);
     If(IfExpr*);
     Lambda(LambdaExpr*);
     Literal(LiteralExpr*);
@@ -597,10 +622,9 @@ implement trait Allocate for struct LiteralExpr {
 }
 
 
-type class IdentifierNode : ExpressionNode {
-public:
+/// A bare name, `this` and `This` among them.
+type struct IdentifierExpr {
     name:                SymbolStr;
-    is_global_reference: boolean;
     /// Whether the parser read this identifier from the keyword `this`.
     is_this_keyword:     boolean;
     /// Whether the parser read this identifier from the keyword `This`.
@@ -642,20 +666,7 @@ public:
     /// meet without a search.
     res:                 ResSlot;
 
-    IdentifierNode(name: SymbolStr, span: SourceSpan)
-        : ExpressionNode(NodeKind::Identifier, span) {
-        this.name                = name;
-        this.is_global_reference = false;
-        this.is_this_keyword     = false;
-        this.is_this_type_keyword = false;
-        this.generic_args        = [];
-        this.resolved_callee     = CalleePin::None;
-        this.value_type_args     = [];
-        this.value_template      = TypeRef::invalid();
-        this.res                 = ResSlot::Pending;
-    }
-
-    set_value_instance(template: TypeRef, args: [TypeRef]) -> void {
+    set_value_instance(mut &this, template: TypeRef, args: [TypeRef]) -> void {
         this.value_template  = template;
         this.value_type_args = args;
     }
@@ -663,7 +674,7 @@ public:
     /// Record what this name refers to.  The first answer wins, for the reason
     /// `ScopeResolutionNode::set_scope_res` gives: a `Res` states what the file
     /// that WROTE the name can see.
-    set_res(r: Res) -> void {
+    set_res(mut &this, r: Res) -> void {
         this.res.answer(r);
     }
 
@@ -677,7 +688,7 @@ public:
     /// the stand-in; left on the original, it names nothing in the body it now
     /// lives in.  A use answered with anything but a local is not a binding
     /// and keeps its answer.
-    rebind_local(sym: SymbolID) -> void {
+    rebind_local(mut &this, sym: SymbolID) -> void {
         match (this.res) {
             ResSlot::Answered(r) => {
                 match (r) {
@@ -692,12 +703,18 @@ public:
         this.res = ResSlot::Answered(Res::Local(sym));
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    set_resolved_callee(pin: CalleePin) -> void {
+    set_resolved_callee(mut &this, pin: CalleePin) -> void {
         this.resolved_callee = pin;
+    }
+}
+
+implement trait Allocate for struct IdentifierExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

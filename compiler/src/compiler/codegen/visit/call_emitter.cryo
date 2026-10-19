@@ -49,7 +49,7 @@ import std::fmt;
 import compiler::ast::declaration::{ FunctionDecl, MethodDecl, DeclarationNode, VarDecl };
 import compiler::ast::expression::{
     CalleePin,
-    CallExprNode, ExpressionNode, IdentifierNode,
+    CallExprNode, ExpressionNode, IdentifierExpr,
     MemberAccessNode, ScopeResolutionNode
 };
 import compiler::ast::node::{ ASTNode };
@@ -309,8 +309,8 @@ type struct CallEmitter {
         mut vtable_slot_idx: i32 = -1;
         mut vtable_obj_ref: TypeRef = TypeRef::invalid();
 
-        if (node.callee.kind == NodeKind::Identifier) {
-            const id: IdentifierNode* = node.callee as IdentifierNode*;
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(node.callee);
+        if (id != null) {
 
             // An intrinsic is lowered inline before anything reads the
             // written name: sema pins `resolved_callee` to the intrinsic's
@@ -448,7 +448,7 @@ type struct CallEmitter {
                     }
                 }
                 if (local.is_valid()) {
-                    const ft: FunctionType* = this.value_function_type(id.resolved_type);
+                    const ft: FunctionType* = this.value_function_type(node.callee.resolved_type);
                     if (ft != null) {
                         const plan: SignaturePlan = this.cg.abi.classify_signature(
                             ft.param_types, ft.return_type, false);
@@ -849,7 +849,7 @@ type struct CallEmitter {
         // declaration's widths.  A method's symbol is its own mangling, so a
         // method call keeps the declared type.
         if (node.resolved_callee.is_some()
-                && (node.callee.kind == NodeKind::Identifier
+                && (ExpressionNode::identifier_of(node.callee) != null
                     || node.callee.kind == NodeKind::ScopeResolution)) {
             const pinned_ft: TypeRef = this.cg.resolver.call_signature(
                 this.cg.resolver.pinned_entry(node.resolved_callee));
@@ -1047,12 +1047,12 @@ type struct CallEmitter {
         this.glue_seq = this.glue_seq + 1;
         const nm_sym: SymbolID = this.cg.ctx.resolver.alloc_synthetic_binding();
         this.cg.values.set(nm_sym, slot);
-        mut id_node: IdentifierNode* = new IdentifierNode(nm, span);
-        id_node.set_res(Res::Local(nm_sym));
+        const id_node: ExpressionNode* = ExpressionNode::identifier_expr(nm, span);
+        ExpressionNode::identifier_of(id_node).set_res(Res::Local(nm_sym));
         id_node.set_resolved_type(ty);
         const drop_sym: SymbolStr = intern.intern("drop");
         mut da: MemberAccessNode* = new MemberAccessNode(
-            id_node as ExpressionNode*, drop_sym, span, span);
+            id_node, drop_sym, span, span);
         mut call: CallExprNode* = new CallExprNode(da as ExpressionNode*, span);
         this.cg.bind_destructor_call(call);
         mut stmt: Stmt* = Stmt::expr_stmt(call as ExpressionNode*, span);
@@ -1399,7 +1399,7 @@ type struct CallEmitter {
         // carry a `va_list` parameter; methods (`MemberAccess`) never do, so we
         // skip them - which also keeps `node.arguments[i]` aligned with
         // `param_types[i]` (no receiver in the parameter list).
-        if (node.callee.kind != NodeKind::Identifier
+        if (ExpressionNode::identifier_of(node.callee) == null
                 && node.callee.kind != NodeKind::ScopeResolution) {
             return null;
         }
@@ -1663,11 +1663,11 @@ type struct CallEmitter {
                     this.glue_seq = this.glue_seq + 1;
                     const nm_sym: SymbolID = this.cg.ctx.resolver.alloc_synthetic_binding();
                     this.cg.values.set(nm_sym, field_ptr);
-                    mut id_node: IdentifierNode* = new IdentifierNode(nm, receiver.span);
-                    id_node.set_res(Res::Local(nm_sym));
+                    const id_node: ExpressionNode* = ExpressionNode::identifier_expr(nm, receiver.span);
+                    ExpressionNode::identifier_of(id_node).set_res(Res::Local(nm_sym));
                     id_node.set_resolved_type(pt);
                     mut da: MemberAccessNode* = new MemberAccessNode(
-                        id_node as ExpressionNode*, drop_sym, receiver.span, receiver.span);
+                        id_node, drop_sym, receiver.span, receiver.span);
                     mut call: CallExprNode* = new CallExprNode(
                         da as ExpressionNode*, receiver.span);
                     this.cg.bind_destructor_call(call);

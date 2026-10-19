@@ -59,7 +59,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, BinaryExpr, CallExprNode, CastExpr,
-    ExprKind, ExpressionNode, IdentifierNode, IfExpr, LambdaExpr, MatchExpr,
+    ExprKind, ExpressionNode, IdentifierExpr, IfExpr, LambdaExpr, MatchExpr,
     MemberAccessNode, NewExpr, StructExpr, TernaryExpr,
     TupleExpr, UnaryExpr
 };
@@ -503,8 +503,9 @@ type struct MoveChecker {
         if (c.callee.kind != NodeKind::MemberAccess) { return; }
         const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
         if (ma.member.id != this.intern.intern("poll").id) { return; }
-        if (ma.object == null || ma.object.kind != NodeKind::Identifier) { return; }
-        const nm: SymbolID = (ma.object as IdentifierNode*).res.local_sym();
+        const obj_id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
+        if (obj_id == null) { return; }
+        const nm: SymbolID = obj_id.res.local_sym();
         if (!this.type_implements_future(this.lookup_type(nm))) { return; }
         this.mark_polled(nm, (c as ASTNode*).span);
     }
@@ -536,8 +537,8 @@ type struct MoveChecker {
     /// and Copy types never enter that set at all.
     check_polled_move(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null || this.suppress_emit) { return; }
-        if (expr.kind != NodeKind::Identifier) { return; }
-        const id: IdentifierNode* = expr as IdentifierNode*;
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
+        if (id == null) { return; }
         const sym: SymbolID = id.res.local_sym();
         if (!this.is_polled(sym)) { return; }
         this.emit_moved_after_poll(id.name, sym, expr.span);
@@ -1263,8 +1264,9 @@ type struct MoveChecker {
         // covers owned-value places, but an owning `[T]` field aliases its
         // buffer regardless of how the struct is reached, so it double-frees.
         if (real) { this.check_array_field_move_out(expr); }
-        if (expr.kind == NodeKind::Identifier) {
-            this.handle_ident(expr as IdentifierNode*, true, real);
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
+        if (id != null) {
+            this.handle_ident(expr, id, true, real);
             return;
         }
         // For other shapes, descend in read mode by default; the
@@ -1280,11 +1282,11 @@ type struct MoveChecker {
     walk_expr_read(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::Identifier         => { this.handle_ident(expr as IdentifierNode*, false, false); }
             NodeKind::CallExpression     => { this.read_call(expr as CallExprNode*);                 }
             NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);           }
             NodeKind::Expression         => {
                 match (expr.shape) {
+                    ExprKind::Identifier(id) => { this.handle_ident(expr, id, false, false); }
                     // Reduced to one live arm by the monomorphizer; walk it as
                     // a block.
                     ExprKind::Match(m) => { this.read_match(m); }
@@ -1342,16 +1344,17 @@ type struct MoveChecker {
             const cap_ty:   TypeRef   = lam.captured_types[i];
             if (!cap_ty.is_valid()) { continue; }
             if (this.is_copy(cap_ty)) { continue; }
-            // Synthesize an IdentifierNode at the capture's recorded span so
+            // Synthesize an identifier at the capture's recorded span so
             // handle_ident's existing use-after-move and loop-carried logic
             // applies uniformly with any other move site.  It carries the
             // binding the capture names: minted from the spelling alone it
             // names nothing, and the capture's move silently goes unrecorded.
-            mut id: IdentifierNode* = new IdentifierNode(cap_name,
+            const id: ExpressionNode* = ExpressionNode::identifier_expr(cap_name,
                 lam.captured_spans[i]);
-            id.set_res(Res::Local(lam.captured_syms[i]));
+            const id_p: IdentifierExpr* = ExpressionNode::identifier_of(id);
+            id_p.set_res(Res::Local(lam.captured_syms[i]));
             id.set_resolved_type(cap_ty);
-            this.handle_ident(id, true, true);
+            this.handle_ident(id, id_p, true, true);
         }
     }
 
@@ -1376,7 +1379,7 @@ type struct MoveChecker {
             const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
             if (this.intern != null &&
                 ma.member.id == this.intern.intern("drop").id &&
-                ma.object != null && ma.object.kind == NodeKind::Identifier) {
+                ExpressionNode::identifier_of(ma.object) != null) {
                 // walk_expr_move's Copy guard short-circuits for
                 // primitives and POD types, so this is a no-op for
                 // bindings that don't actually own anything.
@@ -1448,7 +1451,8 @@ type struct MoveChecker {
             // below passes `real=false`, which skips both checks.
             if (b.right != null) { this.check_field_move_out(b.right); }
             if (b.right != null) { this.check_deref_move_out(b.right); }
-            if (b.left != null && b.left.kind == NodeKind::Identifier) {
+            const left_id: IdentifierExpr* = ExpressionNode::identifier_of(b.left);
+            if (left_id != null) {
                 // Plain assignment to a bare identifier is a pure write: it
                 // reinitializes the binding rather than reading it.  MOVE the
                 // RHS (real=false: mark a bare-ident non-Copy RHS moved so a
@@ -1468,7 +1472,7 @@ type struct MoveChecker {
                 // (reading it would spuriously flag reassigning a moved-out
                 // binding).
                 if (b.right != null) { this.walk_expr_move(b.right, false); }
-                this.unmark_moved((b.left as IdentifierNode*).res.local_sym());
+                this.unmark_moved(left_id.res.local_sym());
                 return;
             }
             // Field / index LHS: read the LHS place (its address is computed)
@@ -1593,8 +1597,9 @@ type struct MoveChecker {
     /// subject that is a local names anything to mark - the subjects drop
     /// insertion links a payload to.
     move_subject_of_taken_payload(mut &this, subject: ExpressionNode*, pat_snap: i64) -> void {
-        if (subject == null || subject.kind != NodeKind::Identifier) { return; }
-        const subj: SymbolID = (subject as IdentifierNode*).res.local_sym();
+        const subj_id: IdentifierExpr* = ExpressionNode::identifier_of(subject);
+        if (subj_id == null) { return; }
+        const subj: SymbolID = subj_id.res.local_sym();
         if (!subj.is_valid()) { return; }
         for (mut i: i64 = pat_snap; i < this.pat_binding_keys.length; i++) {
             const key: u64 = this.pat_binding_keys[i];
@@ -1702,10 +1707,10 @@ type struct MoveChecker {
     /// The owner shape `partial_move_allowed` accepts, whatever the branch
     /// depth: a bare owned local of a non-`Drop` struct or class.
     partial_move_shape(&this, ma: MemberAccessNode*) -> boolean {
-        if (ma.object == null || ma.object.kind != NodeKind::Identifier) {
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
+        if (id == null) {
             return false;
         }
-        const id: IdentifierNode* = ma.object as IdentifierNode*;
         // Must be a real `let`/param local (in the types map); pattern payload
         // bindings are excluded (their subject-glue-suppression is whole-payload
         // only), so their field moves stay rejected.
@@ -1757,7 +1762,8 @@ type struct MoveChecker {
     /// here, and is left alone (no false-positive rejection).
     is_owned_value_place(&this, obj: ExpressionNode*) -> boolean {
         if (obj == null) { return false; }
-        if (obj.kind == NodeKind::Identifier) {
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(obj);
+        if (id != null) {
             // Key off the binding's DECLARED type, not the node's
             // resolved type: inside a `&this` / `mut &this` method the
             // `this` identifier (and any `&T` parameter) is auto-deref'd
@@ -1765,7 +1771,6 @@ type struct MoveChecker {
             // a Reference - a borrow we don't drop here.  A binding absent
             // from the local map (global, function name) isn't a
             // scope-glued local either.
-            const id: IdentifierNode* = obj as IdentifierNode*;
             const decl_ty: TypeRef = this.lookup_type(id.res.local_sym());
             if (decl_ty.is_valid()) {
                 return !this.is_ptr_or_ref(decl_ty);
@@ -1821,14 +1826,14 @@ type struct MoveChecker {
         // iteration: the same double free as a carried whole value.
         if (this.loop_repeat && this.type_needs_drop(field_ty) && this.partial_move_shape(ma)) {
             if (!this.suppress_emit) {
-                const owner: string = this.intern.resolve((ma.object as IdentifierNode*).name);
+                const owner: string = this.intern.resolve(ExpressionNode::identifier_of(ma.object).name);
                 this.emit_loop_carried_text(
                     fmt::format("%s.%s", owner, this.intern.resolve(ma.member)), ma.span);
             }
             return;
         }
         if (this.type_needs_drop(field_ty) && this.partial_move_allowed(ma)) {
-            const owner_id: u64 = (ma.object as IdentifierNode*).res.local_sym().key();
+            const owner_id: u64 = ExpressionNode::identifier_of(ma.object).res.local_sym().key();
             const field_id: u32 = ma.member.id;
             if (this.pm_has(owner_id, field_id)) {
                 // Moving the SAME field out twice is a double free.
@@ -1874,8 +1879,9 @@ type struct MoveChecker {
     /// releases when `drop` returns.
     is_receiver_value_place(&this, obj: ExpressionNode*) -> boolean {
         if (obj == null) { return false; }
-        if (obj.kind == NodeKind::Identifier) {
-            return (obj as IdentifierNode*).res.local_sym().equals(this.drop_receiver);
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(obj);
+        if (id != null) {
+            return id.res.local_sym().equals(this.drop_receiver);
         }
         if (obj.kind == NodeKind::MemberAccess) {
             if (this.is_ptr_or_ref(obj.resolved_type)) { return false; }
@@ -2059,7 +2065,7 @@ type struct MoveChecker {
         this.fatal += 1;
     }
 
-    handle_ident(mut &this, ident: IdentifierNode*, in_move_context: boolean,
+    handle_ident(mut &this, e: ExpressionNode*, ident: IdentifierExpr*, in_move_context: boolean,
                  real: boolean) -> void {
         if (ident == null) { return; }
         const name: SymbolStr = ident.name;
@@ -2081,7 +2087,7 @@ type struct MoveChecker {
         // edge.  Refused even when the body gave the value a new one: the
         // value the last test moved is still the one the scope releases.
         if (this.loop_repeat && in_move_context && real) {
-            if (!this.suppress_emit) { this.emit_loop_carried(name, ident.span); }
+            if (!this.suppress_emit) { this.emit_loop_carried(name, e.span); }
             return;
         }
 
@@ -2095,7 +2101,7 @@ type struct MoveChecker {
                     "use of partially-moved value '%s'", this.intern.resolve(name));
                 mut diag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0452_USE_AFTER_MOVE, headline);
-                diag = diag.at_with_label(ident.span,
+                diag = diag.at_with_label(e.span,
                     "value moved here after one of its fields was already moved out");
                 diag = diag.help(
                     "a value with a moved-out field cannot be moved or consumed as a whole");
@@ -2109,22 +2115,22 @@ type struct MoveChecker {
         if (this.is_moved(sym)) {
             // A real move site re-reading an already-moved binding upgrades
             // it (borrow-then-move), even when emission is suppressed.
-            if (in_move_context && real) { this.mark_moved(sym, ident.span, true); }
+            if (in_move_context && real) { this.mark_moved(sym, e.span, true); }
             if (this.suppress_emit) { return; }
             if (this.is_carried(sym)) {
                 // Moved on a previous iteration of the enclosing loop.
-                this.emit_loop_carried(name, ident.span);
+                this.emit_loop_carried(name, e.span);
                 return;
             }
             const move_span: SourceSpan = this.moved_at_span(sym);
             const headline: string = fmt::format("use of moved value '%s'",
                 this.intern.resolve(name));
             this.emit_use_after_move(ErrorCode::E0452_USE_AFTER_MOVE,
-                headline, ident.span, move_span);
+                headline, e.span, move_span);
             return;
         }
         if (in_move_context) {
-            this.mark_moved(sym, ident.span, real);
+            this.mark_moved(sym, e.span, real);
         }
     }
 }

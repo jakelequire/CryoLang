@@ -48,7 +48,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     CalleePin,
     CallExprNode,
-    ExprKind, ExpressionNode, IdentifierNode,
+    ExprKind, ExpressionNode, IdentifierExpr,
     MemberAccessNode, ScopeResolutionNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -430,17 +430,15 @@ type struct MonoCallSpecializer {
                 const ma: MemberAccessNode* = expr as MemberAccessNode*;
                 this.walk_expr(ma.object, res_ctx, subst);
             }
-            NodeKind::Identifier => {
-                // A bare identifier carrying turbofish args is a generic
-                // function-reference VALUE (`tramp<i32>` passed/cast/assigned).
-                this.specialize_fn_value_ref(expr as IdentifierNode*, subst);
-            }
             NodeKind::ScopeResolution => {
                 this.specialize_path_fn_value(expr as ScopeResolutionNode*, subst);
                 this.bind_path_value(expr as ScopeResolutionNode*, subst);
             }
             NodeKind::Expression => {
                 match (expr.shape) {
+                    // A bare identifier carrying turbofish args is a generic
+                    // function-reference VALUE (`tramp<i32>` passed/cast/assigned).
+                    ExprKind::Identifier(id) => { this.specialize_fn_value_ref(id, subst); }
                     ExprKind::Ternary(te) => {
                         this.walk_expr(te.condition, res_ctx, subst);
                         this.walk_expr(te.true_expr, res_ctx, subst);
@@ -618,7 +616,7 @@ type struct MonoCallSpecializer {
             const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
             callee_scope_slot = &sr.scope_res;
             this.bind_on_substituted_owner(call, sr);
-        } else if (callee_node.kind != NodeKind::Identifier) {
+        } else if (ExpressionNode::identifier_of(callee_node) == null) {
             return;
         }
 
@@ -710,7 +708,7 @@ type struct MonoCallSpecializer {
     /// on the node (`value_template` applied to `value_type_args`),
     /// concretized by the active specialization - and queue the
     /// instantiation.  No-op for an identifier with none.
-    specialize_fn_value_ref(mut &this, ident: IdentifierNode*, subst: TypeSubstitution*) -> void {
+    specialize_fn_value_ref(mut &this, ident: IdentifierExpr*, subst: TypeSubstitution*) -> void {
         if (ident == null) { return; }
         if (ident.value_type_args.length == 0 || ident.resolved_callee.is_some()) { return; }
         if (this.generic_registry == null) { return; }
@@ -1577,8 +1575,9 @@ type struct MonoCallSpecializer {
     callee_is_value(&this, callee: ExpressionNode*) -> boolean {
         if (callee == null) { return false; }
         const k: NodeKind = (callee as ASTNode*).kind;
-        if (k == NodeKind::Identifier) {
-            return match ((callee as IdentifierNode*).res) {
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(callee);
+        if (id != null) {
+            return match (id.res) {
                 ResSlot::Answered(r) => {
                     match (r) {
                         Res::Local(_) => { true }
@@ -1681,22 +1680,23 @@ type struct MonoCallSpecializer {
     call_is_bound(&this, call: CallExprNode*) -> boolean {
         if (call.resolved_callee.is_some()) { return true; }
         const callee: ASTNode* = call.callee as ASTNode*;
-        match (callee.kind) {
-            NodeKind::Identifier => {
-                const id: IdentifierNode* = call.callee as IdentifierNode*;
-                if (id.res.local_sym().is_valid() && this.is_function_value(id.resolved_type)) { return true; }
-                // A module's global of function type is called through its
-                // storage, as a local is.
-                match (id.res) {
-                    ResSlot::Answered(r) => {
-                        if (this.decl_index.global_entry_of_def(r.def_id()).valid
-                            && this.is_function_value(id.resolved_type)) { return true; }
-                    }
-                    _ => { }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(callee);
+        if (id != null) {
+            const id_ty: TypeRef = call.callee.resolved_type;
+            if (id.res.local_sym().is_valid() && this.is_function_value(id_ty)) { return true; }
+            // A module's global of function type is called through its
+            // storage, as a local is.
+            match (id.res) {
+                ResSlot::Answered(r) => {
+                    if (this.decl_index.global_entry_of_def(r.def_id()).valid
+                        && this.is_function_value(id_ty)) { return true; }
                 }
-                const rt: Type* = this.arena.lookup(call.resolved_type);
-                return rt != null && (rt.kind == TypeKind::Class || rt.kind == TypeKind::Struct);
+                _ => { }
             }
+            const rt: Type* = this.arena.lookup(call.resolved_type);
+            return rt != null && (rt.kind == TypeKind::Class || rt.kind == TypeKind::Struct);
+        }
+        match (callee.kind) {
             NodeKind::ScopeResolution => {
                 const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
                 match (sr.resolved_member) {
@@ -1744,8 +1744,9 @@ type struct MonoCallSpecializer {
         const callee: ASTNode* = call.callee as ASTNode*;
         mut leaf: string = "<value>";
         mut what: string = "function";
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(callee);
+        if (id != null) { leaf = this.intern_table.resolve(id.name); }
         match (callee.kind) {
-            NodeKind::Identifier      => { leaf = this.intern_table.resolve((call.callee as IdentifierNode*).name); }
             NodeKind::ScopeResolution => { leaf = this.intern_table.resolve((call.callee as ScopeResolutionNode*).member_name); }
             NodeKind::MemberAccess    => {
                 leaf = this.intern_table.resolve((call.callee as MemberAccessNode*).member);

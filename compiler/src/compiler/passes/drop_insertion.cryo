@@ -82,7 +82,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, BinaryExpr, CallExprNode, CalleePin, CastExpr,
-    ExprKind, ExpressionNode, IdentifierNode, IfExpr, LambdaExpr, LiteralExpr,
+    ExprKind, ExpressionNode, IdentifierExpr, IfExpr, LambdaExpr, LiteralExpr,
     MemberAccessNode, NewExpr, StructExpr, TernaryExpr,
     TupleExpr, UnaryExpr
 };
@@ -816,9 +816,9 @@ type struct DropInserter {
     }
 
     /// A reference to `l`, stamped with its binding.
-    local_ident(&this, l: PassLocal, ty: TypeRef, span: SourceSpan) -> IdentifierNode* {
-        mut ident: IdentifierNode* = new IdentifierNode(l.name, span);
-        ident.set_res(Res::Local(l.binding));
+    local_ident(&this, l: PassLocal, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut ident: ExpressionNode* = ExpressionNode::identifier_expr(l.name, span);
+        ExpressionNode::identifier_of(ident).set_res(Res::Local(l.binding));
         ident.set_resolved_type(ty);
         ident.generated = true;
         return ident;
@@ -1292,7 +1292,7 @@ type struct DropInserter {
                 // subject (engaging consumption tracking + drop-glue
                 // suppression for arms that move the payload out).
                 if (m.subject != null &&
-                    m.subject.kind != NodeKind::Identifier &&
+                    ExpressionNode::identifier_of(m.subject) == null &&
                     this.type_needs_drop(m.subject.resolved_type)) {
                     this.hoist_match_subject(m, out);
                 }
@@ -1630,10 +1630,10 @@ type struct DropInserter {
         // (Borrow-only arms leave the subject live so glue still frees it.)
         mut subj_sym: SymbolID = SymbolID::invalid();
         mut subj_ty:  TypeRef  = TypeRef::invalid();
-        if (subject != null && subject.kind == NodeKind::Identifier &&
+        const sid: IdentifierExpr* = ExpressionNode::identifier_of(subject);
+        if (sid != null &&
             OwnershipQuery::needs_drop(this.arena, this.registry, this.intern,
                                        subject.resolved_type)) {
-            const sid: IdentifierNode* = subject as IdentifierNode*;
             subj_sym = sid.res.local_sym();
             subj_ty  = subject.resolved_type;
         }
@@ -2299,8 +2299,8 @@ type struct DropInserter {
     /// `--panic=unwind` by the callers so the default path allocates nothing.
     record_pending_arg(mut &this, arg: ExpressionNode*) -> void {
         if (arg == null) { return; }
-        if (arg.kind != NodeKind::Identifier) { return; }
-        const id: IdentifierNode* = arg as IdentifierNode*;
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(arg);
+        if (id == null) { return; }
         const sym: SymbolID = id.res.local_sym();
         const ty: TypeRef = this.lookup_type(sym);
         if (!this.type_needs_drop(ty)) { return; }
@@ -2439,10 +2439,10 @@ type struct DropInserter {
     /// the scope stack), matching MoveCheck's "real let/param local" rule.
     partial_move_allowed(&this, ma: MemberAccessNode*) -> boolean {
         if (this.branch_depth != 0) { return false; }
-        if (ma.object == null || ma.object.kind != NodeKind::Identifier) {
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
+        if (id == null) {
             return false;
         }
-        const id: IdentifierNode* = ma.object as IdentifierNode*;
         const sym: SymbolID = id.res.local_sym();
         if (!this.sym_is_live(sym)) { return false; }
         const decl_ty: TypeRef = this.lookup_type(sym);
@@ -2464,7 +2464,7 @@ type struct DropInserter {
         // field is bitwise-independent and never double-freed.
         if (!this.type_needs_drop(field_ty)) { return; }
         if (!this.partial_move_allowed(ma)) { return; }
-        const owner_id: u64 = (ma.object as IdentifierNode*).res.local_sym().key();
+        const owner_id: u64 = ExpressionNode::identifier_of(ma.object).res.local_sym().key();
         const field_id: u32 = ma.member.id;
         if (this.pm_has(owner_id, field_id)) { return; }
         this.pm_binding.push(owner_id);
@@ -2516,9 +2516,9 @@ type struct DropInserter {
     make_field_drop_call(mut &this, name: PassLocal, ty: TypeRef,
                          field_name: SymbolStr, field_index: i64, field_ty: TypeRef,
                          span: SourceSpan) -> Stmt* {
-        const ident: IdentifierNode* = this.local_ident(name, ty, span);
+        const ident: ExpressionNode* = this.local_ident(name, ty, span);
         const field_access: MemberAccessNode* = new MemberAccessNode(
-            ident as ExpressionNode*, field_name, span, span);
+            ident, field_name, span, span);
         field_access.set_resolved_type(field_ty);
         // A node minted after the last sema walk carries its own answer:
         // the field is the `field_index`-th of the aggregate's own list.
@@ -2770,8 +2770,9 @@ type struct DropInserter {
         const b: BinaryExpr* = ExpressionNode::binary_of(expr);
         if (b == null) { return PassLocal::none(); }
         if (b.op.kind != TokenType::Equal || b.left == null) { return PassLocal::none(); }
-        if (b.left.kind != NodeKind::Identifier) { return PassLocal::none(); }
-        const sym: SymbolID = (b.left as IdentifierNode*).res.local_sym();
+        const left_id: IdentifierExpr* = ExpressionNode::identifier_of(b.left);
+        if (left_id == null) { return PassLocal::none(); }
+        const sym: SymbolID = left_id.res.local_sym();
         if (!sym.is_valid()) { return PassLocal::none(); }
         return this.get_drop_flag(sym.key());
     }
@@ -2916,11 +2917,11 @@ type struct DropInserter {
         // it.  walk_var_decl is the usual entry point but it also walks the
         // initializer - which we just walked - so register directly.
         this.register_binding(name, sym, ty, span, true);
-        mut ident: IdentifierNode* = new IdentifierNode(name, span);
-        ident.set_res(Res::Local(sym));
+        mut ident: ExpressionNode* = ExpressionNode::identifier_expr(name, span);
+        ExpressionNode::identifier_of(ident).set_res(Res::Local(sym));
         ident.set_resolved_type(ty);
         ident.generated = true;
-        m.subject = ident as ExpressionNode*;
+        m.subject = ident;
     }
 
     // ---- drop-flag synthesis --------------------------------------------
@@ -2991,14 +2992,14 @@ type struct DropInserter {
     /// `make_drop_flag_decl`), so this is a legal assignment target.
     make_drop_flag_write(mut &this, flag: PassLocal, value: boolean,
                          span: SourceSpan) -> Stmt* {
-        const lhs: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
+        const lhs: ExpressionNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const text: string = if (value) { "true" } else { "false" };
         const rhs: ExpressionNode* = ExpressionNode::literal(text, LiteralKind::Boolean, span);
         rhs.set_resolved_type(this.arena.get_bool());
         const eq_tok: Token = Token::new(TokenType::Equal, "=",
             span.start_line as int, span.start_col as int);
         const assign: ExpressionNode* = ExpressionNode::binary_expr(
-            eq_tok, lhs as ExpressionNode*, rhs, span);
+            eq_tok, lhs, rhs, span);
         assign.set_resolved_type(this.arena.get_bool());
         const stmt: Stmt* = Stmt::expr_stmt(assign, span);
         rhs.generated = true;
@@ -3015,11 +3016,11 @@ type struct DropInserter {
                                  flag: PassLocal,
                                  span: SourceSpan) -> Stmt* {
         // Condition: `!<flag>`
-        const flag_ident: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
+        const flag_ident: ExpressionNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const not_tok: Token = Token::new(TokenType::Exclaim, "!",
             span.start_line as int, span.start_col as int);
         const cond: ExpressionNode* = ExpressionNode::unary_expr(
-            not_tok, flag_ident as ExpressionNode*, span);
+            not_tok, flag_ident, span);
         cond.set_resolved_type(this.arena.get_bool());
         // Body: `{ <binding>.drop(); }`
         const drop_stmt: Stmt* = this.make_drop_call(binding, ty, span);
@@ -3264,8 +3265,7 @@ type struct DropInserter {
     build_place_expr(mut &this, base: PassLocal, base_ty: TypeRef,
                      kind: &[u8], key: &[u32], start: i64, len: i64,
                      span: SourceSpan) -> ExpressionNode* {
-        const ident: IdentifierNode* = this.local_ident(base, base_ty, span);
-        mut cur: ExpressionNode* = ident as ExpressionNode*;
+        mut cur: ExpressionNode* = this.local_ident(base, base_ty, span);
         mut cur_ty: TypeRef = base_ty;
         for (mut k: i64 = 0; k < len; k++) {
             const pkind: u8  = kind[start + k];
@@ -3354,7 +3354,7 @@ type struct DropInserter {
     /// The binding a written place names, as the resolver answered it.  A
     /// place rooted in anything but a local answers invalid and disqualifies
     /// nothing, which is right: no binding this pass tracks is touched.
-    disqualify_init(mut &this, id: IdentifierNode*) -> void {
+    disqualify_init(mut &this, id: IdentifierExpr*) -> void {
         const sym: SymbolID = id.res.local_sym();
         if (!sym.is_valid()) { return; }
         for (mut i: i64 = 0; i < this.init_disq.length; i++) {
@@ -3464,7 +3464,6 @@ type struct DropInserter {
     disq_scan_expr(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::Identifier => { }
             NodeKind::MemberAccess => {
                 this.disq_scan_expr((expr as MemberAccessNode*).object);
             }
@@ -3515,7 +3514,7 @@ type struct DropInserter {
                     | ExprKind::New(_) | ExprKind::Array(_) | ExprKind::Literal(_)
                     | ExprKind::Ternary(_) | ExprKind::If(_) | ExprKind::StaticMatch(_)
                     | ExprKind::Match(_) | ExprKind::Lambda(_) | ExprKind::Await(_)
-                    | ExprKind::Legacy => { }
+                    | ExprKind::Identifier(_) | ExprKind::Legacy => { }
                 }
             }
             _ => {
@@ -3542,18 +3541,6 @@ type struct DropInserter {
     disq_scan_place(mut &this, expr: ExpressionNode*, escaping: boolean) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::Identifier => {
-                if (escaping) {
-                    this.disqualify_init(expr as IdentifierNode*);
-                } else {
-                    // The whole-binding write the init flag exists to observe.
-                    // Recording it keeps members untracked for this local: a
-                    // value that becomes live all at once is governed by one
-                    // flag, and a later member write displaces a member of an
-                    // already-live parent rather than initializing it.
-                    this.note_whole_assignment(expr as IdentifierNode*);
-                }
-            }
             NodeKind::MemberAccess => {
                 // A member write is an initialization at MEMBER granularity
                 // when the place is carved out of the local's own storage.
@@ -3563,8 +3550,9 @@ type struct DropInserter {
                 if (!escaping && this.record_init_place(expr)) { return; }
                 const ma: MemberAccessNode* = expr as MemberAccessNode*;
                 if (ma.object != null) {
-                    if (ma.object.kind == NodeKind::Identifier) {
-                        this.disqualify_init(ma.object as IdentifierNode*);
+                    const obj_id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
+                    if (obj_id != null) {
+                        this.disqualify_init(obj_id);
                     } else {
                         this.disq_scan_place(ma.object, escaping);
                     }
@@ -3572,11 +3560,24 @@ type struct DropInserter {
             }
             NodeKind::Expression => {
                 match (expr.shape) {
+                    ExprKind::Identifier(id) => {
+                        if (escaping) {
+                            this.disqualify_init(id);
+                        } else {
+                            // The whole-binding write the init flag exists to observe.
+                            // Recording it keeps members untracked for this local: a
+                            // value that becomes live all at once is governed by one
+                            // flag, and a later member write displaces a member of an
+                            // already-live parent rather than initializing it.
+                            this.note_whole_assignment(id);
+                        }
+                    }
                     ExprKind::ArrayAccess(aa) => {
                         if (!escaping && this.record_init_place(expr)) { return; }
                         if (aa.array != null) {
-                            if (aa.array.kind == NodeKind::Identifier) {
-                                this.disqualify_init(aa.array as IdentifierNode*);
+                            const arr_id: IdentifierExpr* = ExpressionNode::identifier_of(aa.array);
+                            if (arr_id != null) {
+                                this.disqualify_init(arr_id);
                             } else {
                                 this.disq_scan_place(aa.array, escaping);
                             }
@@ -3670,8 +3671,9 @@ type struct DropInserter {
     collect_place_chain(&this, expr: ExpressionNode*,
                         out_kind: [u8]*, out_key: [u32]*) -> SymbolID {
         if (expr == null) { return SymbolID::invalid(); }
-        if (expr.kind == NodeKind::Identifier) {
-            return (expr as IdentifierNode*).res.local_sym();
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
+        if (id != null) {
+            return id.res.local_sym();
         }
         if (expr.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = expr as MemberAccessNode*;
@@ -3763,7 +3765,7 @@ type struct DropInserter {
 
     /// Note that the binding `id` names is written as a whole somewhere in
     /// this function.
-    note_whole_assignment(mut &this, id: IdentifierNode*) -> void {
+    note_whole_assignment(mut &this, id: IdentifierExpr*) -> void {
         const sym: SymbolID = id.res.local_sym();
         if (!sym.is_valid()) { return; }
         for (mut i: i64 = 0; i < this.pw_whole.length; i++) {
@@ -3878,8 +3880,9 @@ type struct DropInserter {
         if (b == null) { return PassLocal::none(); }
         if (b.op.kind != TokenType::Equal) { return PassLocal::none(); }
         if (b.left == null) { return PassLocal::none(); }
-        if (b.left.kind == NodeKind::Identifier) {
-            return this.get_init_flag_for((b.left as IdentifierNode*).res.local_sym());
+        const left_id: IdentifierExpr* = ExpressionNode::identifier_of(b.left);
+        if (left_id != null) {
+            return this.get_init_flag_for(left_id.res.local_sym());
         }
         const midx: i64 = this.member_slot_for_place(b.left);
         if (midx < 0) { return PassLocal::none(); }
@@ -3891,13 +3894,13 @@ type struct DropInserter {
     /// inverse of `make_conditional_drop_call` (`if (flag)`, not `if (!flag)`).
     wrap_in_init_guard(mut &this, flag: PassLocal, core: &[Stmt*],
                         span: SourceSpan) -> Stmt* {
-        const flag_ident: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
+        const flag_ident: ExpressionNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const body: Stmt* = Stmt::block(span);
         for (mut i: i64 = 0; i < core.length; i++) {
             body.as_block().statements.push(core[i]);
         }
         const if_stmt: Stmt* = Stmt::if_stmt(
-            flag_ident as ExpressionNode*, body, null, span);
+            flag_ident, body, null, span);
         body.generated = true;
         if_stmt.generated = true;
         return if_stmt;
@@ -3929,11 +3932,11 @@ type struct DropInserter {
     /// special case of this shape.
     wrap_in_move_guard(mut &this, flag: PassLocal, core: &[Stmt*],
                        span: SourceSpan) -> Stmt* {
-        const flag_ident: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
+        const flag_ident: ExpressionNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const not_tok: Token = Token::new(TokenType::Exclaim, "!",
             span.start_line as int, span.start_col as int);
         const cond: ExpressionNode* = ExpressionNode::unary_expr(
-            not_tok, flag_ident as ExpressionNode*, span);
+            not_tok, flag_ident, span);
         cond.set_resolved_type(this.arena.get_bool());
         const body: Stmt* = Stmt::block(span);
         for (mut i: i64 = 0; i < core.length; i++) {
@@ -4038,9 +4041,9 @@ type struct DropInserter {
     /// and fail E0156 method lookup.
     make_drop_call(mut &this, name: PassLocal, ty: TypeRef,
                     span: SourceSpan) -> Stmt* {
-        const ident: IdentifierNode* = this.local_ident(name, ty, span);
+        const ident: ExpressionNode* = this.local_ident(name, ty, span);
         const member: MemberAccessNode* = new MemberAccessNode(
-            ident as ExpressionNode*, this.drop_sym, span, span);
+            ident, this.drop_sym, span, span);
         const call: CallExprNode* = new CallExprNode(member as ExpressionNode*, span);
         this.sema.bind_destructor_call(call);
         const stmt: Stmt* = Stmt::expr_stmt(call as ExpressionNode*, span);
@@ -4064,8 +4067,9 @@ type struct DropInserter {
         if (expr.kind == NodeKind::MemberAccess) {
             this.classify_field_move_out(expr as MemberAccessNode*);
         }
-        if (expr.kind == NodeKind::Identifier) {
-            this.handle_ident(expr as IdentifierNode*, true);
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
+        if (id != null) {
+            this.handle_ident(expr, id, true);
             return;
         }
         this.walk_expr_read(expr);
@@ -4074,7 +4078,6 @@ type struct DropInserter {
     walk_expr_read(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::Identifier         => { this.handle_ident(expr as IdentifierNode*, false);      }
             NodeKind::CallExpression     => {
                 const c: CallExprNode* = expr as CallExprNode*;
                 this.read_call(c);
@@ -4087,6 +4090,7 @@ type struct DropInserter {
             NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);             }
             NodeKind::Expression         => {
                 match (expr.shape) {
+                    ExprKind::Identifier(id) => { this.handle_ident(expr, id, false); }
                     // A match used as an expression, including the desugars
                     // of `?` and `??`.  Route through the shared arm walker
                     // in expression mode so an early `return` inside an arm
@@ -4168,11 +4172,12 @@ type struct DropInserter {
             const cap_ty:   TypeRef   = lam.captured_types[i];
             if (!cap_ty.is_valid()) { continue; }
             if (this.is_copy(cap_ty)) { continue; }
-            mut id: IdentifierNode* = new IdentifierNode(cap_name,
+            const id: ExpressionNode* = ExpressionNode::identifier_expr(cap_name,
                 lam.captured_spans[i]);
-            id.set_res(Res::Local(lam.captured_syms[i]));
+            const id_p: IdentifierExpr* = ExpressionNode::identifier_of(id);
+            id_p.set_res(Res::Local(lam.captured_syms[i]));
             id.set_resolved_type(cap_ty);
-            this.handle_ident(id, true);
+            this.handle_ident(id, id_p, true);
         }
     }
 
@@ -4220,9 +4225,8 @@ type struct DropInserter {
         if (c.callee != null && c.arguments.length == 0 &&
             c.callee.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
-            if (this.registry.names_lang_method(ma.member, LangItem::DropDrop) && ma.object != null &&
-                ma.object.kind == NodeKind::Identifier) {
-                const id: IdentifierNode* = ma.object as IdentifierNode*;
+            const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
+            if (this.registry.names_lang_method(ma.member, LangItem::DropDrop) && id != null) {
                 // Only treat as a move when the identifier is a binding
                 // we're tracking (in the types map).  Pattern bindings
                 // introduced by `match` arms aren't currently registered,
@@ -4232,7 +4236,7 @@ type struct DropInserter {
                 const sym: SymbolID = id.res.local_sym();
                 if (this.lookup_type(sym).is_valid()) {
                     if (!this.is_moved(sym)) {
-                        this.mark_moved(sym, id.span);
+                        this.mark_moved(sym, ma.object.span);
                     }
                     return;
                 }
@@ -4320,8 +4324,9 @@ type struct DropInserter {
                 // length-preserving (tombstones in place), so the
                 // moves_since_keys/set_moves_tail branch-join checkpoints
                 // stay valid.
-                if (b.left != null && b.left.kind == NodeKind::Identifier) {
-                    this.unmark_moved((b.left as IdentifierNode*).res.local_sym());
+                const left_id: IdentifierExpr* = ExpressionNode::identifier_of(b.left);
+                if (left_id != null) {
+                    this.unmark_moved(left_id.res.local_sym());
                 }
             } else {
                 this.walk_expr_read(b.right);
@@ -4429,7 +4434,7 @@ type struct DropInserter {
         }
     }
 
-    handle_ident(mut &this, ident: IdentifierNode*, in_move_context: boolean) -> void {
+    handle_ident(mut &this, e: ExpressionNode*, ident: IdentifierExpr*, in_move_context: boolean) -> void {
         if (ident == null) { return; }
         // The binding this use names, as the resolver answered from the scope
         // the writer stood in.  A use whose binding this pass does not track -
@@ -4439,7 +4444,7 @@ type struct DropInserter {
         if (!ty.is_valid()) { return; }
         if (this.is_copy(ty)) { return; }
         if (in_move_context && !this.is_moved(sym)) {
-            this.mark_moved(sym, ident.span);
+            this.mark_moved(sym, e.span);
         }
     }
 }

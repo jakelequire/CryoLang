@@ -64,7 +64,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    BinaryExpr, CallExprNode, ExpressionNode, IdentifierNode, LiteralExpr,
+    BinaryExpr, CallExprNode, ExpressionNode, IdentifierExpr, LiteralExpr,
     MemberAccessNode, ScopeResolutionNode, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode };
@@ -266,7 +266,7 @@ type struct CallResolver {
     /// `heap::free` or `intrinsics::free`, or declared in the writing
     /// module - an extern block, or `no_std`'s own declaration - and reached
     /// by their stamp like every other name).
-    callee_def(&this, ident: IdentifierNode*) -> DefId {
+    callee_def(&this, ident: IdentifierExpr*) -> DefId {
         return match (ident.res) {
             ResSlot::Answered(r) => { r.def_id() }
             _                    => { DefId::invalid() }
@@ -310,8 +310,8 @@ type struct CallResolver {
     lookup_callee_function_type(&this, callee: ExpressionNode*) -> TypeRef {
         if (callee == null) { return TypeRef::invalid(); }
         const n: ASTNode* = callee as ASTNode*;
-        if (n.kind == NodeKind::Identifier) {
-            const ident: IdentifierNode* = callee as IdentifierNode*;
+        const ident: IdentifierExpr* = ExpressionNode::identifier_of(n);
+        if (ident != null) {
             // The stamp is the writing scope's own answer for this callee and
             // names ONE binding.  A local (closure, fn-pointer, plain value)
             // hints from its own type when that is callable; a definition
@@ -781,8 +781,9 @@ type struct CallResolver {
     /// other expression.
     place_text(&this, e: ExpressionNode*) -> string {
         if (e == null) { return ""; }
-        if (e.kind == NodeKind::Identifier) {
-            return this.intern.resolve((e as IdentifierNode*).name);
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(e);
+        if (id != null) {
+            return this.intern.resolve(id.name);
         }
         if (e.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = e as MemberAccessNode*;
@@ -799,7 +800,8 @@ type struct CallResolver {
     family_callee(&this, callee: ExpressionNode*) -> DefId {
         if (callee == null) { return DefId::invalid(); }
         const n: ASTNode* = callee as ASTNode*;
-        if (n.kind == NodeKind::Identifier) { return this.callee_def(callee as IdentifierNode*); }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(n);
+        if (id != null) { return this.callee_def(id); }
         if (n.kind != NodeKind::ScopeResolution) { return DefId::invalid(); }
         const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;
         return match (sr.scope_res) {
@@ -832,8 +834,8 @@ type struct CallResolver {
         mut entry: OverloadId = OverloadId::invalid();
         mut template: TypeRef = TypeRef::invalid();
         const n: ASTNode* = expr as ASTNode*;
-        if (n.kind == NodeKind::Identifier) {
-            const ident: IdentifierNode* = expr as IdentifierNode*;
+        const ident: IdentifierExpr* = ExpressionNode::identifier_of(n);
+        if (ident != null) {
             entry = ident.resolved_callee.decl_entry();
             template = ident.value_template;
         } else if (n.kind == NodeKind::ScopeResolution) {
@@ -862,7 +864,7 @@ type struct CallResolver {
     /// function type it is called as - what the function-typed parameter it
     /// is passed to must be.  Invalid when the call is pinned already,
     /// passes no closure, or no signature accepts it.
-    closure_call_entry(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> OverloadId {
+    closure_call_entry(mut &this, call: CallExprNode*, ident: IdentifierExpr*) -> OverloadId {
         if (call == null || call.resolved_callee.is_some()) { return OverloadId::invalid(); }
         mut arg_types: [TypeRef] = [];
         mut any_closure: boolean = false;
@@ -1043,7 +1045,7 @@ type struct CallResolver {
                     // A generic struct's literal written without arguments is
                     // the instance the parameter names.
                     push_expected = true;
-                } else if (arg_node.kind == NodeKind::Identifier && this.types.is_function_type(slot)) {
+                } else if (ExpressionNode::identifier_of(arg_node) != null && this.types.is_function_type(slot)) {
                     // A function named as a value takes the overload a
                     // function-typed parameter selects.
                     push_expected = true;
@@ -1143,8 +1145,8 @@ type struct CallResolver {
         const callee: ExpressionNode* = call.callee;
         const callee_node: ASTNode* = callee as ASTNode*;
 
-        if (callee_node.kind == NodeKind::Identifier) {
-            const ident: IdentifierNode* = callee as IdentifierNode*;
+        const ident: IdentifierExpr* = ExpressionNode::identifier_of(callee_node);
+        if (ident != null) {
             this.lambda.try_specialize_for_closure_args(call, ident, this.closure_call_entry(call, ident));
 
             const inferred_generic_ret: TypeRef = this.check_generic_free_call(call, ident);
@@ -1300,7 +1302,7 @@ type struct CallResolver {
     /// computes.
     static callee_is_named(callee: ExpressionNode*) -> boolean {
         const kind: NodeKind = (callee as ASTNode*).kind;
-        return kind == NodeKind::Identifier
+        return ExpressionNode::identifier_of(callee) != null
             || kind == NodeKind::ScopeResolution
             || kind == NodeKind::MemberAccess;
     }
@@ -1536,7 +1538,7 @@ type struct CallResolver {
     /// diagnostic that the non-generic path reports would never run.  Two
     /// declarations of the call's arity are for the overload selection to
     /// tell apart, and name no template here.
-    find_fn_template_for_call(&this, ident: IdentifierNode*, argc: i64) -> TemplateEntry* {
+    find_fn_template_for_call(&this, ident: IdentifierExpr*, argc: i64) -> TemplateEntry* {
         // The name layer answers every bare callee - a binding, or `Err`
         // for one it refused - so a slot with no answer is a defect the door
         // records; measured at 0 over the corpus before the door went in.
@@ -1577,7 +1579,7 @@ type struct CallResolver {
         }
         const u: UnaryExpr* = ExpressionNode::unary_of(expr);
         if (u != null) {
-            if (u.op.kind == TokenType::Minus || u.op.kind == TokenType::Plus || u.op.kind == TokenType::Tilde) {
+            if (u.op.kind == TokenType::Minus || u.op.kind == TokenType::Tilde) {
                 return this.sema_arg_is_polymorphic_literal(u.operand);
             }
             return false;
@@ -1683,7 +1685,7 @@ type struct CallResolver {
     /// Invalid when not a generic free call, a binding stays abstract, or a
     /// diagnostic fired.  `resolved_callee` is left unpinned (mono specializes).
 
-    check_generic_free_call(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
+    check_generic_free_call(mut &this, call: CallExprNode*, ident: IdentifierExpr*) -> TypeRef {
         const entry: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
         if (entry == null) { return TypeRef::invalid(); }
         const tmpl_decl: DeclarationNode* = DeclarationNode::with_shape(entry.ast_node);
@@ -2004,8 +2006,8 @@ type struct CallResolver {
             return this.substitute_explicit_path_param_types(call, &out, forced);
         }
         if (call.generic_args.length == 0) { return out; }
-        if (callee_node.kind != NodeKind::Identifier) { return out; }
-        const ident: IdentifierNode* = call.callee as IdentifierNode*;
+        const ident: IdentifierExpr* = ExpressionNode::identifier_of(callee_node);
+        if (ident == null) { return out; }
         const entry: TemplateEntry* = this.find_fn_template_for_call(
             ident, call.arguments.length);
         if (entry == null || entry.param_types.length == 0) { return out; }
@@ -2410,7 +2412,7 @@ type struct CallResolver {
 
     // -- Free-call arity + argument type checking --
 
-    check_call_arity(mut &this, visitor: SemaVisitor*, call: CallExprNode*, ident: IdentifierNode*) -> void {
+    check_call_arity(mut &this, visitor: SemaVisitor*, call: CallExprNode*, ident: IdentifierExpr*) -> void {
         if (call.generic_args.length > 0) { return; }
         // Arity is checked against the family the callee names and nothing
         // else: a leaf-keyed list holds every module's `write`, and an arity
@@ -2554,7 +2556,7 @@ type struct CallResolver {
         this.diag.emit_method_arity_error(at, leaf, "constructor", expected, got, false);
     }
 
-    check_overloaded_free_call_arity(mut &this, call: CallExprNode*, ident: IdentifierNode*,
+    check_overloaded_free_call_arity(mut &this, call: CallExprNode*, ident: IdentifierExpr*,
                                      overloads: [TypeRef]) -> void {
         const got: i64 = call.arguments.length;
         mut uniq_arity:  i64 = -1;
@@ -2648,9 +2650,8 @@ type struct CallResolver {
         mut callee: ExpressionNode* = null;
         mut conv_call: CallExprNode* = null;
         if (this.ctx.defs.kind_of(conv) != DefKind::Method) {
-            mut id: IdentifierNode* = new IdentifierNode(this.ctx.defs.leaf_of(conv).spelling(), sp);
-            id.set_res(Res::Def(conv));
-            callee = id as ExpressionNode*;
+            callee = ExpressionNode::identifier_expr(this.ctx.defs.leaf_of(conv).spelling(), sp);
+            ExpressionNode::identifier_of(callee).set_res(Res::Def(conv));
             conv_call = new CallExprNode(callee, sp);
         } else {
             // The owner is the type declaring the converter; `to_ty` when the
@@ -3250,7 +3251,7 @@ type struct CallResolver {
     /// imports, and refuse a tie, and it still bound an intrinsic's C symbol
     /// where the stamp named the exported wrapper.  A `Def` is already the
     /// answer to which declaration; only which SIGNATURE is decided here.
-    try_pin_overload_mangled_callee(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
+    try_pin_overload_mangled_callee(mut &this, call: CallExprNode*, ident: IdentifierExpr*) -> TypeRef {
         if (call.resolved_callee.is_some()) { return TypeRef::invalid(); }
         // GATED: a generic function template has no concrete spec pre-mono; leave
         // unpinned so mono specializes.
@@ -3563,7 +3564,7 @@ type struct CallResolver {
         return false;
     }
 
-    resolve_direct_call(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
+    resolve_direct_call(mut &this, call: CallExprNode*, ident: IdentifierExpr*) -> TypeRef {
         // The name layer's own answer for this callee, and the only one asked.
         // A local is a value: when its type is callable, the call's type is
         // that signature's return, whatever global shares the leaf.  A
@@ -3581,12 +3582,12 @@ type struct CallResolver {
                         if (fp_local.is_valid()) {
                             const fp_t: Type* = this.arena.lookup(fp_local);
                             if (fp_t != null && fp_t.kind == TypeKind::Function) {
-                                ident.set_resolved_type(fp_local);
+                                call.callee.set_resolved_type(fp_local);
                                 return fp_t.as_function().return_type;
                             }
                             // A local is a value, and one of no function type is
                             // not called: E0213 at the callee, as for a computed one.
-                            this.refuse_call_of_non_function(ident.span, fp_local);
+                            this.refuse_call_of_non_function(call.callee.span, fp_local);
                             return TypeRef::invalid();
                         } else if (this.scopes.binds(sym)) {
                             // Bound, with no type: reported at the declaration.
@@ -3623,10 +3624,10 @@ type struct CallResolver {
         if (global_ty.is_valid()) {
             const g_t: Type* = this.arena.lookup(global_ty);
             if (g_t != null && g_t.kind == TypeKind::Function) {
-                ident.set_resolved_type(global_ty);
+                call.callee.set_resolved_type(global_ty);
                 return g_t.as_function().return_type;
             }
-            this.refuse_call_of_non_function(ident.span, global_ty);
+            this.refuse_call_of_non_function(call.callee.span, global_ty);
             return TypeRef::invalid();
         }
         // The name layer's own answer for this identifier, which is a canonical
@@ -3650,7 +3651,7 @@ type struct CallResolver {
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0202_UNDEFINED_FUNCTION,
             fmt::format("cannot find function `%s` in this scope", name));
-        diag = diag.at_with_label(ident.span, "not found in this scope");
+        diag = diag.at_with_label(call.callee.span, "not found in this scope");
         this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
     }
@@ -4375,7 +4376,7 @@ type struct CallResolver {
     /// inferred ones by a unification that skips what it cannot bind, so
     /// either way an argument can still disagree with its parameter.
     check_generic_free_call_args(mut &this, visitor: SemaVisitor*, call: CallExprNode*,
-                                 ident: IdentifierNode*) -> void {
+                                 ident: IdentifierExpr*) -> void {
         this.check_function_template_args(visitor, call,
             this.find_fn_template_for_call(ident, call.arguments.length));
     }
@@ -6666,8 +6667,9 @@ type struct CallResolver {
             const arg_un: UnaryExpr* = ExpressionNode::unary_of(arg);
             if (arg_un != null) {
                 const operand: ExpressionNode* = arg_un.operand;
-                if (operand != null && (operand as ASTNode*).kind == NodeKind::Identifier) {
-                    borrowed = this.intern.resolve((operand as IdentifierNode*).name);
+                const operand_id: IdentifierExpr* = ExpressionNode::identifier_of(operand);
+                if (operand_id != null) {
+                    borrowed = this.intern.resolve(operand_id.name);
                 }
             }
             const what: string = if (first_shared == 0) { "its receiver" } else {

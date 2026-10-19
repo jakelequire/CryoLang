@@ -44,7 +44,7 @@ import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::ast::expression::{
     CalleePin,
-    CallExprNode, ExpressionNode, IdentifierNode, LambdaExpr, MemberAccessNode
+    CallExprNode, ExpressionNode, IdentifierExpr, LambdaExpr, MemberAccessNode
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
@@ -264,7 +264,7 @@ type struct LambdaSynth {
     /// Record a captured outer binding `outer_ty` for the surrounding lambda
     /// (non-Copy captures flip `is_move`), shadow it as a per-lambda local, and
     /// return its type so the referencing identifier resolves.
-    record_lambda_capture(mut &this, ident: IdentifierNode*, outer_ty: TypeRef) -> TypeRef {
+    record_lambda_capture(mut &this, e: ExpressionNode*, ident: IdentifierExpr*, outer_ty: TypeRef) -> TypeRef {
         const is_copy: boolean = OwnershipQuery::is_copy(this.arena,
             this.ctx.get_generic_registry(), this.intern, outer_ty);
         if (!is_copy && this.state.current_lambda != null) {
@@ -273,7 +273,7 @@ type struct LambdaSynth {
         this.scopes.declare(ident.res.local_sym(), outer_ty, false);
         if (this.state.current_lambda != null) {
             this.state.current_lambda.add_capture(ident.name, ident.res.local_sym(),
-                                                  outer_ty, ident.span);
+                                                  outer_ty, e.span);
         }
         return outer_ty;
     }
@@ -365,11 +365,11 @@ type struct LambdaSynth {
             const cap_name: SymbolStr = lambda.captured_names[i];
             const cap_ty:   TypeRef   = lambda.captured_types[i];
 
-            mut this_ident: IdentifierNode* = new IdentifierNode(this_ident_sym, span);
+            const this_ident: ExpressionNode* = ExpressionNode::identifier_expr(this_ident_sym, span);
             this_ident.set_resolved_type(struct_ref);
-            this_ident.set_res(Res::Local(call_recv.sym_id));
+            ExpressionNode::identifier_of(this_ident).set_res(Res::Local(call_recv.sym_id));
             mut access: MemberAccessNode* = new MemberAccessNode(
-                this_ident as ExpressionNode*, cap_name, span, span);
+                this_ident, cap_name, span, span);
             access.set_resolved_type(cap_ty);
             // Capture `i` is field `i` of the struct laid out above; nothing
             // after this walks a node that already carries its type, so the
@@ -558,15 +558,14 @@ type struct LambdaSynth {
     /// `f.__call__(args)` in place.
     maybe_rewrite_closure_call(mut &this, call: CallExprNode*) -> void {
         if (call == null || call.callee == null) { return; }
-        const cn: ASTNode* = call.callee as ASTNode*;
-        if (cn.kind != NodeKind::Identifier) { return; }
-        const ident: IdentifierNode* = call.callee as IdentifierNode*;
+        const ident: IdentifierExpr* = ExpressionNode::identifier_of(call.callee);
+        if (ident == null) { return; }
         const local_ty: TypeRef = this.scopes.type_of(ident.res.local_sym());
         if (!this.is_closure_struct_type(local_ty)) { return; }
-        ident.set_resolved_type(local_ty);
+        call.callee.set_resolved_type(local_ty);
         const call_sym: SymbolStr = this.intern.intern("__call__");
         mut access: MemberAccessNode* = new MemberAccessNode(
-            call.callee, call_sym, ident.span, ident.span);
+            call.callee, call_sym, call.callee.span, call.callee.span);
         call.callee = access as ExpressionNode*;
     }
 
@@ -588,7 +587,7 @@ type struct LambdaSynth {
     /// A callee declared in another module has no AST in this root and is
     /// not specialized here; that is the reach of the pass, not a lookup
     /// that failed.
-    try_specialize_for_closure_args(mut &this, call: CallExprNode*, ident: IdentifierNode*,
+    try_specialize_for_closure_args(mut &this, call: CallExprNode*, ident: IdentifierExpr*,
                                     selected: OverloadId) -> void {
         if (call == null || ident == null) { return; }
 

@@ -75,7 +75,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     CalleePin,
     ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr,
-    CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
+    CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierExpr,
     IfExpr, LambdaExpr, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr,
     TernaryExpr, TryExpr, TupleExpr, UnaryExpr
@@ -1662,7 +1662,6 @@ type struct SemaVisitor {
             NodeKind::Program                => { this.visit_program(n as ProgramNode*); }
 
             NodeKind::Expression
-            | NodeKind::Identifier
             | NodeKind::CallExpression
             | NodeKind::MemberAccess | NodeKind::ScopeResolution => {
                 this.resolve_expr(n as ExpressionNode*);
@@ -1709,9 +1708,6 @@ type struct SemaVisitor {
         }
         const n: ASTNode* = expr as ASTNode*;
         const result: TypeRef = match (n.kind) {
-            NodeKind::Identifier        => {
-                this.calls.located_value_checked(expr, this.resolve_identifier(expr as IdentifierNode*))
-            }
             NodeKind::CallExpression    => { this.calls.resolve_call(this, expr as CallExprNode*) }
             NodeKind::MemberAccess      => { this.member.resolve_member_access(this, expr as MemberAccessNode*) }
             NodeKind::ScopeResolution   => {
@@ -1752,6 +1748,9 @@ type struct SemaVisitor {
             }
             // A `yield` has no type: codegen refuses it.
             ExprKind::Yield(_) => { TypeRef::invalid() }
+            ExprKind::Identifier(i) => {
+                this.calls.located_value_checked(expr, this.resolve_identifier(expr, i))
+            }
             ExprKind::Try(t)   => { this.resolve_try_expr(expr, t) }
             ExprKind::New(ne)  => { this.resolve_new_expr(expr, ne) }
             ExprKind::Tuple(t) => { this.resolve_tuple_literal(t) }
@@ -1858,15 +1857,15 @@ type struct SemaVisitor {
     /// has that parameter, written or synthesized, and the name layer binds
     /// it as `this`, so the identity answers where the spelling would also
     /// answer for a local or capture that happens to be spelled `this`.
-    names_receiver(&this, id: IdentifierNode*) -> boolean {
+    names_receiver(&this, id: IdentifierExpr*) -> boolean {
         if (id == null || !this.state.receiver_sym.is_valid()) { return false; }
         return id.res.local_sym().key() == this.state.receiver_sym.key();
     }
 
-    resolve_identifier(mut &this, ident: IdentifierNode*) -> TypeRef {
+    resolve_identifier(mut &this, e: ExpressionNode*, ident: IdentifierExpr*) -> TypeRef {
         if (this.names_receiver(ident)) {
             if (this.state.this_type.is_valid()) { return this.state.this_type; }
-            if (ident.resolved_type.is_valid()) { return ident.resolved_type; }
+            if (e.resolved_type.is_valid()) { return e.resolved_type; }
         }
         const sym: SymbolID = ident.res.local_sym();
         const local: TypeRef = this.scopes.type_of(sym);
@@ -1875,7 +1874,7 @@ type struct SemaVisitor {
         if (this.scopes.binds(sym)) { return TypeRef::invalid(); }
         if (this.state.in_lambda_depth > 0 && this.state.current_lambda != null) {
             match (this.scopes.outer_type_of(sym)) {
-                Option::Some(outer_ty) => { return this.lambda.record_lambda_capture(ident, outer_ty); }
+                Option::Some(outer_ty) => { return this.lambda.record_lambda_capture(e, ident, outer_ty); }
                 Option::None => { /* fall through */ }
             }
         }
@@ -1898,21 +1897,21 @@ type struct SemaVisitor {
         }
         if (func_ty.is_valid()) {
             if (ident.resolved_callee.is_some()) {
-                this.calls.enforce_value_ref_visibility(def_id, ident.span);
+                this.calls.enforce_value_ref_visibility(def_id, e.span);
                 return func_ty;
             }
             // A family holding a generic function: the overload the
             // turbofish and the expected type choose.
             mut refused: boolean = false;
             const chosen: OverloadId = this.calls.value_family_entry(def_id, &ident.generic_args, name_str,
-                ident.span, ident as ExpressionNode*, &refused);
+                e.span, e, &refused);
             if (refused) { return TypeRef::invalid(); }
             if (chosen.is_valid()) {
                 const decl: ASTNode* = this.ctx.decl_index.entry_decl(chosen);
                 def_id = DeclarationNode::fn_of(decl).def;
                 func_ty = this.ctx.decl_index.entry_signature(chosen);
             }
-            this.calls.enforce_value_ref_visibility(def_id, ident.span);
+            this.calls.enforce_value_ref_visibility(def_id, e.span);
             // A generic function as a value is one instance of it: the
             // template applied to the arguments the turbofish writes or the
             // expected function type binds.  Its type is the signature with
@@ -1922,7 +1921,7 @@ type struct SemaVisitor {
             if (tm != null && tm.kind == TemplateKind::Function) {
                 mut args: [TypeRef] = [];
                 const inst_ty: TypeRef = this.calls.generic_value_type(tm, &tm.param_types, func_ty, &ident.generic_args,
-                    name_str, fmt::format("%s::<...>", name_str), ident.span, &args);
+                    name_str, fmt::format("%s::<...>", name_str), e.span, &args);
                 if (inst_ty.is_valid()) { ident.set_value_instance(tm.base_type, args); }
                 return inst_ty;
             }
@@ -1935,7 +1934,7 @@ type struct SemaVisitor {
             // function type selects, pinned by its entry.
             const family: [OverloadId] = this.calls.family_entries(def_id);
             const picked: TypeRef = this.calls.value_overload_signature(&family, name_str,
-                ident.span, ident as ExpressionNode*, &refused);
+                e.span, e, &refused);
             if (refused) { return TypeRef::invalid(); }
             if (picked.is_valid()) {
                 for (mut i: i64 = 0; i < family.length; i++) {
@@ -1963,7 +1962,7 @@ type struct SemaVisitor {
         if (this.ctx.defs.signature_refused(def_id)) { return TypeRef::invalid(); }
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
             fmt::format("cannot find value `%s` in this scope", name_str));
-        diag = diag.at_with_label(ident.span, "not found in this scope");
+        diag = diag.at_with_label(e.span, "not found in this scope");
         this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
     }
@@ -2651,29 +2650,30 @@ type struct SemaVisitor {
 
     check_assignment_lvalue(mut &this, lhs: ExpressionNode*) -> void {
         if (lhs == null) { return; }
-        match (lhs.kind) {
-            NodeKind::Identifier => {
-                const id: IdentifierNode* = lhs as IdentifierNode*;
-                if (this.names_receiver(id)) { return; }
-                const sym: SymbolID = id.res.local_sym();
-                if (this.scopes.is_mutable(sym)) { return; }
-                const name_str: string = this.intern.resolve(id.name);
-                mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0218_IMMUTABLE_ASSIGNMENT,
-                    fmt::format("cannot assign to immutable variable `%s`", name_str));
-                diag = diag.at_with_label(lhs.span, "this binding is immutable");
-                const kw: SourceSpan = this.scopes.kw_span_of(sym);
-                if (kw.has_location()) {
-                    const kw_len: u32 = if (kw.end_col > kw.start_col) { kw.end_col - kw.start_col } else { 0 };
-                    if (kw_len == 0) {
-                        diag = diag.suggest(Suggestion::machine_applicable(kw, "mut ", fmt::format("make `%s` mutable", name_str)));
-                    } else {
-                        diag = diag.suggest(Suggestion::machine_applicable(kw, "mut", fmt::format("make `%s` mutable", name_str)));
-                    }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(lhs);
+        if (id != null) {
+            if (this.names_receiver(id)) { return; }
+            const sym: SymbolID = id.res.local_sym();
+            if (this.scopes.is_mutable(sym)) { return; }
+            const name_str: string = this.intern.resolve(id.name);
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0218_IMMUTABLE_ASSIGNMENT,
+                fmt::format("cannot assign to immutable variable `%s`", name_str));
+            diag = diag.at_with_label(lhs.span, "this binding is immutable");
+            const kw: SourceSpan = this.scopes.kw_span_of(sym);
+            if (kw.has_location()) {
+                const kw_len: u32 = if (kw.end_col > kw.start_col) { kw.end_col - kw.start_col } else { 0 };
+                if (kw_len == 0) {
+                    diag = diag.suggest(Suggestion::machine_applicable(kw, "mut ", fmt::format("make `%s` mutable", name_str)));
                 } else {
-                    diag = diag.with_note("declare the binding with `mut` instead of `const` to allow reassignment");
+                    diag = diag.suggest(Suggestion::machine_applicable(kw, "mut", fmt::format("make `%s` mutable", name_str)));
                 }
-                this.ctx.diagnostics.emit(diag);
+            } else {
+                diag = diag.with_note("declare the binding with `mut` instead of `const` to allow reassignment");
             }
+            this.ctx.diagnostics.emit(diag);
+            return;
+        }
+        match (lhs.kind) {
             NodeKind::MemberAccess => {
                 const ma: MemberAccessNode* = lhs as MemberAccessNode*;
                 if (ma.object == null) { return; }
@@ -2747,9 +2747,9 @@ type struct SemaVisitor {
                 "cannot take the address of a literal; `&` requires a place (variable, field, or index)", e.span);
             return TypeRef::invalid();
         }
-        if (unary.op.kind == TokenType::Star && unary.operand != null && unary.operand.kind == NodeKind::Identifier) {
-            const id: IdentifierNode* = unary.operand as IdentifierNode*;
-            if (this.names_receiver(id)) { return operand_type; }
+        if (unary.op.kind == TokenType::Star) {
+            const id: IdentifierExpr* = ExpressionNode::identifier_of(unary.operand);
+            if (id != null && this.names_receiver(id)) { return operand_type; }
         }
         const result: TypeCheckResult = this.checker.check_unary_op(unary.op.kind, operand_type);
         if (!result.success) {
@@ -2904,9 +2904,9 @@ type struct SemaVisitor {
     /// there the cast has no representation, exactly as for any other value.
     cast_operand_is_byref_receiver(&this, expr: ExpressionNode*) -> boolean {
         if (expr == null || !this.state.this_is_by_ref) { return false; }
-        const n: ASTNode* = expr as ASTNode*;
-        if (n.kind != NodeKind::Identifier) { return false; }
-        return this.names_receiver(expr as IdentifierNode*);
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
+        if (id == null) { return false; }
+        return this.names_receiver(id);
     }
 
     /// True when a cast's target is a struct, class, tuple or array value and
@@ -3334,10 +3334,10 @@ type struct SemaVisitor {
         ok_pat.add_element(PatternElement::Binding(ok_pb));
         mut ok_arm: MatchArmNode* = new MatchArmNode(span);
         ok_arm.add_pattern(ok_node);
-        const ok_ident: IdentifierNode* = new IdentifierNode(ok_bind, span);
-        ok_ident.set_res(Res::Local(ok_sym));
+        const ok_ident: ExpressionNode* = ExpressionNode::identifier_expr(ok_bind, span);
+        ExpressionNode::identifier_of(ok_ident).set_res(Res::Local(ok_sym));
         const ok_block: Stmt* = Stmt::block(span);
-        ok_block.as_block().add_statement(Stmt::expr_stmt(ok_ident as ExpressionNode*, span));
+        ok_block.as_block().add_statement(Stmt::expr_stmt(ok_ident, span));
         ok_arm.set_body(ok_block);
         match_expr.add_arm(ok_arm);
 
@@ -3356,9 +3356,9 @@ type struct SemaVisitor {
             mut err_scope: ScopeResolutionNode* = new ScopeResolutionNode(enum_name, err_variant, span);
             err_scope.set_synthesized_ref(ret_ty, this.ctx.decl_index.def_of(ret_ty, this.ctx.type_arena));
             mut err_call: CallExprNode* = new CallExprNode(err_scope as ExpressionNode*, span);
-            const err_ident: IdentifierNode* = new IdentifierNode(err_bind, span);
-            err_ident.set_res(Res::Local(err_sym));
-            err_call.add_argument(err_ident as ExpressionNode*);
+            const err_ident: ExpressionNode* = ExpressionNode::identifier_expr(err_bind, span);
+            ExpressionNode::identifier_of(err_ident).set_res(Res::Local(err_sym));
+            err_call.add_argument(err_ident);
             ret_value = err_call as ExpressionNode*;
         } else {
             mut bare_err: ScopeResolutionNode* =
@@ -4368,19 +4368,18 @@ type struct SemaVisitor {
 
     check_return_payload_escape(mut &this, e: ExpressionNode*, ret_ty: TypeRef) -> void {
         if (e == null) { return; }
-        if (e.kind == NodeKind::Identifier) {
-            const id: IdentifierNode* = e as IdentifierNode*;
-            if (this.scopes.names_payload(id.res.local_sym()) && this.ret_carries_pointer_to(ret_ty, id.resolved_type)) {
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(e);
+        if (id != null) {
+            if (this.scopes.names_payload(id.res.local_sym()) && this.ret_carries_pointer_to(ret_ty, e.resolved_type)) {
                 this.diag.emit_payload_escape(e.span);
             }
             return;
         }
         if (e.kind == NodeKind::CallExpression) {
             const c: CallExprNode* = e as CallExprNode*;
-            if (c.arguments.length == 1 && c.arguments[0] != null
-                    && c.arguments[0].kind == NodeKind::Identifier && this.callee_names_ret_variant(c.callee, ret_ty)) {
-                const id: IdentifierNode* = c.arguments[0] as IdentifierNode*;
-                if (this.scopes.names_payload(id.res.local_sym()) && this.ret_carries_pointer_to(ret_ty, id.resolved_type)) {
+            const arg_id: IdentifierExpr* = if (c.arguments.length == 1) { ExpressionNode::identifier_of(c.arguments[0]) } else { null };
+            if (arg_id != null && this.callee_names_ret_variant(c.callee, ret_ty)) {
+                if (this.scopes.names_payload(arg_id.res.local_sym()) && this.ret_carries_pointer_to(ret_ty, c.arguments[0].resolved_type)) {
                     this.diag.emit_payload_escape(c.arguments[0].span);
                 }
             }
@@ -4427,7 +4426,8 @@ type struct SemaVisitor {
     callee_names_ret_variant(&this, callee: ExpressionNode*, ret_ty: TypeRef) -> boolean {
         if (callee == null) { return false; }
         mut leaf: SymbolStr = SymbolStr::empty();
-        if (callee.kind == NodeKind::Identifier) { leaf = (callee as IdentifierNode*).name; }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(callee);
+        if (id != null) { leaf = id.name; }
         else if (callee.kind == NodeKind::ScopeResolution) { leaf = (callee as ScopeResolutionNode*).member_name; }
         else { return false; }
         if (!leaf.is_valid()) { return false; }
@@ -4450,11 +4450,11 @@ type struct SemaVisitor {
     subject_is_caller_backed(&this, e: ExpressionNode*) -> boolean {
         if (e == null) { return false; }
         const k: NodeKind = e.kind;
-        if (k == NodeKind::Identifier) {
-            const id: IdentifierNode* = e as IdentifierNode*;
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(e);
+        if (id != null) {
             if (this.names_receiver(id)) { return this.state.this_is_by_ref; }
             if (!this.scopes.names_param(id.res.local_sym())) { return false; }
-            return this.type_is_indirect(id.resolved_type);
+            return this.type_is_indirect(e.resolved_type);
         }
         // `&subject` / `*subject` keep naming the same storage; a member or
         // element of caller-backed storage is caller-backed too.
@@ -4511,8 +4511,8 @@ type struct SemaVisitor {
         }
         const u: UnaryExpr* = ExpressionNode::unary_of(e);
         if (u != null) {
-            if (u.op.kind == TokenType::Amp && u.operand != null && u.operand.kind == NodeKind::Identifier) {
-                const id: IdentifierNode* = u.operand as IdentifierNode*;
+            const id: IdentifierExpr* = ExpressionNode::identifier_of(u.operand);
+            if (u.op.kind == TokenType::Amp && id != null) {
                 // A payload binding over a caller-backed subject names the
                 // caller's storage, not a copy in this frame, so its address
                 // survives the return — that is exactly an in-place accessor.

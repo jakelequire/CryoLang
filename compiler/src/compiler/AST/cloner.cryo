@@ -31,7 +31,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     AlignofExpr, ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr,
-    CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
+    CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierExpr,
     LambdaExpr, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, SizeofExpr, StaticMatchExpr, StructExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExpr
@@ -116,7 +116,6 @@ type struct ASTCloner {
         match (n.kind) {
             NodeKind::Program                   => { return this.visit_program(n as ProgramNode*); }
 
-            NodeKind::Identifier                => { return this.visit_identifier(n as IdentifierNode*); }
             NodeKind::CallExpression            => { return this.visit_call(n as CallExprNode*); }
             NodeKind::MemberAccess              => { return this.visit_member_access(n as MemberAccessNode*); }
             NodeKind::ScopeResolution           => { return this.visit_scope_resolution(n as ScopeResolutionNode*); }
@@ -211,32 +210,6 @@ type struct ASTCloner {
 
 
     // Expression visitors
-
-    visit_identifier(mut &this, node: IdentifierNode*) -> ASTNode* {
-        mut c: IdentifierNode* = new IdentifierNode(node.name, node.span);
-        c.is_global_reference = node.is_global_reference;
-        c.is_this_keyword     = node.is_this_keyword;
-        c.is_this_type_keyword = node.is_this_type_keyword;
-        c.has_error           = node.has_error;
-        c.generic_args        = this.clone_type_annotations(node.generic_args);
-        c.resolved_callee     = node.resolved_callee;
-        c.res                 = node.res;
-        mut vta: [TypeRef] = [];
-        for (mut i: i64 = 0; i < node.value_type_args.length; i++) { vta.push(node.value_type_args[i]); }
-        c.value_type_args     = vta;
-        c.value_template      = node.value_template;
-        // Carry sema's type for the identifier.  A generic template body sema
-        // type-checked is cloned per specialization; the monomorphizer dispatches
-        // a method call on its receiver's `resolved_type`, and that receiver is
-        // commonly a local/parameter identifier (e.g. `raw.cast<..>()` where
-        // `raw` is a `match`-bound local).  Codegen re-resolves identifier types
-        // from their declaration, so carrying a still-generic type here is safe;
-        // the monomorphizer applies the active substitution at its walk.
-        c.set_resolved_type(node.resolved_type);
-        return c;
-    }
-
-
 
     visit_call(mut &this, node: CallExprNode*) -> ASTNode* {
         mut c: CallExprNode* = new CallExprNode(
@@ -377,6 +350,27 @@ type struct ASTCloner {
             }
             ExprKind::Await(n) => {
                 c = ExpressionNode::await_expr(this.clone_expr(n.operand), node.span);
+            }
+            ExprKind::Identifier(n) => {
+                c = ExpressionNode::identifier_expr(n.name, node.span);
+                mut ci: IdentifierExpr* = ExpressionNode::identifier_of(c);
+                ci.is_this_keyword      = n.is_this_keyword;
+                ci.is_this_type_keyword = n.is_this_type_keyword;
+                ci.generic_args         = this.clone_type_annotations(n.generic_args);
+                ci.resolved_callee      = n.resolved_callee;
+                ci.res                  = n.res;
+                mut vta: [TypeRef] = [];
+                for (mut i: i64 = 0; i < n.value_type_args.length; i++) { vta.push(n.value_type_args[i]); }
+                ci.value_type_args      = vta;
+                ci.value_template       = n.value_template;
+                // Carry sema's type for the identifier.  A generic template body sema
+                // type-checked is cloned per specialization; the monomorphizer dispatches
+                // a method call on its receiver's `resolved_type`, and that receiver is
+                // commonly a local/parameter identifier (e.g. `raw.cast<..>()` where
+                // `raw` is a `match`-bound local).  Codegen re-resolves identifier types
+                // from their declaration, so carrying a still-generic type here is safe;
+                // the monomorphizer applies the active substitution at its walk.
+                c.set_resolved_type(node.resolved_type);
             }
             ExprKind::Lambda(n) => {
                 c = ExpressionNode::lambda_expr(node.span);

@@ -63,7 +63,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr, CallExprNode,
-    CastExpr, DeleteExpr, ExpressionNode, FieldInit, IdentifierNode, IfExpr,
+    CastExpr, DeleteExpr, ExpressionNode, FieldInit, IdentifierExpr, IfExpr,
     LambdaExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr, TernaryExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExpr
@@ -1397,17 +1397,18 @@ type struct AsyncLower {
     /// `rebind_poll_locals` gives it the stand-in in its scope.
     ident_bound(&this, name: SymbolStr, sym: SymbolID, ty: TypeRef,
                 span: SourceSpan) -> ExpressionNode* {
-        mut id: IdentifierNode* = new IdentifierNode(name, span);
+        const id: ExpressionNode* = ExpressionNode::identifier_expr(name, span);
         id.set_resolved_type(ty);
-        if (sym.is_valid()) { id.set_res(Res::Local(sym)); }
-        return id as ExpressionNode*;
+        if (sym.is_valid()) { ExpressionNode::identifier_of(id).set_res(Res::Local(sym)); }
+        return id;
     }
 
     /// The binding an identifier use names, or the invalid binding for any
     /// other expression or a use that names no local.
     local_key(&this, e: ExpressionNode*) -> SymbolID {
-        if (e == null || (e as ASTNode*).kind != NodeKind::Identifier) { return SymbolID::invalid(); }
-        return (e as IdentifierNode*).res.local_sym();
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(e);
+        if (id == null) { return SymbolID::invalid(); }
+        return id.res.local_sym();
     }
 
     /// Whether `e` is a use of binding `key`.
@@ -1722,7 +1723,7 @@ type struct AsyncLower {
     name_read_in_expr(&this, e: ExpressionNode*, key: SymbolID) -> boolean {
         if (e == null) { return false; }
         const k: NodeKind = (e as ASTNode*).kind;
-        if (k == NodeKind::Identifier) {
+        if (ExpressionNode::identifier_of(e) != null) {
             return this.names_binding(e, key);
         }
         const b: BinaryExpr* = ExpressionNode::binary_of(e);
@@ -1988,7 +1989,8 @@ type struct AsyncLower {
                     by_value: boolean) -> ExpressionNode* {
         if (e == null) { return null; }
         const k: NodeKind = (e as ASTNode*).kind;
-        if (k == NodeKind::Identifier) {
+        const sub_id: IdentifierExpr* = ExpressionNode::identifier_of(e);
+        if (sub_id != null) {
             if (this.names_binding(e, key)) {
                 // The mention's OWN span, so a later use is reported where the
                 // programmer wrote it rather than at the function header.
@@ -2003,7 +2005,7 @@ type struct AsyncLower {
                     target = this.ident_bound(this.subst_hoist_name,
                                               this.subst_hoist_sym, ty, use_span);
                 } else if (by_value && this.subst_carrier_takes) {
-                    target = this.hoist_giveaway((e as IdentifierNode*).name, ty, use_span, span);
+                    target = this.hoist_giveaway(sub_id.name, ty, use_span, span);
                 } else {
                     target = this.subst_target(field, struct_ref, ty, span);
                 }
@@ -2897,8 +2899,9 @@ type struct AsyncLower {
 
         for (mut i: i64 = 0; i < lit.field_inits.length; i++) {
             mut val: ExpressionNode* = lit.field_inits[i].value;
-            if (val == null || (val as ASTNode*).kind != NodeKind::Identifier) { continue; }
-            if (pd.sym_id.is_valid() && pd.sym_id.equals((val as IdentifierNode*).res.local_sym())) {
+            const val_id: IdentifierExpr* = ExpressionNode::identifier_of(val);
+            if (val_id == null) { continue; }
+            if (pd.sym_id.is_valid() && pd.sym_id.equals(val_id.res.local_sym())) {
                 return lit.field_inits[i];
             }
         }
@@ -2932,8 +2935,9 @@ type struct AsyncLower {
         const k: NodeKind = (e as ASTNode*).kind;
         const ty: TypeRef = e.resolved_type;
         const span: SourceSpan = (e as ASTNode*).span;
-        if (k == NodeKind::Identifier) {
-            return this.ident_bound((e as IdentifierNode*).name, this.local_key(e), ty, span);
+        const place_id: IdentifierExpr* = ExpressionNode::identifier_of(e);
+        if (place_id != null) {
+            return this.ident_bound(place_id.name, this.local_key(e), ty, span);
         }
         if (k == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = e as MemberAccessNode*;
@@ -3112,11 +3116,11 @@ type struct AsyncLower {
         // state's frame, so an address of the current frame handed to it is
         // dangling by the time the operation writes through it — and writes to a
         // dead frame slot corrupt silently instead of faulting.
-        const op_root: IdentifierNode* = this.frame_addr_root_expr(sm, aw.operand);
+        const op_root: ExpressionNode* = this.frame_addr_root_expr(sm, aw.operand);
         if (op_root != null) {
             this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
                 fmt::format("async: this `await` hands the address of the local or parameter `%s` to a future that outlives the current step; each poll runs on a fresh frame, so the address is dangling when the future resumes — have the caller own the storage and pass a pointer parameter, or use an operation that owns the buffer itself",
-                       this.intern.resolve(this.source_name(this.local_key(op_root as ExpressionNode*), op_root.name))),
+                       this.intern.resolve(this.source_name(this.local_key(op_root), ExpressionNode::identifier_of(op_root).name))),
                 aw_e.span);
             sm.ok = false; return cur;
         }
@@ -4257,8 +4261,7 @@ type struct AsyncLower {
 
     expr_first_use(&this, e: ExpressionNode*, key: SymbolID) -> i64 {
         if (e == null) { return 0; }
-        const k: NodeKind = (e as ASTNode*).kind;
-        if (k == NodeKind::Identifier) {
+        if (ExpressionNode::identifier_of(e) != null) {
             if (this.names_binding(e, key)) { return 1; }
             return 0;
         }
@@ -4499,7 +4502,7 @@ type struct AsyncLower {
                        by_value: boolean, out: i64*) -> void {
         if (e == null) { return; }
         const k: NodeKind = (e as ASTNode*).kind;
-        if (k == NodeKind::Identifier) {
+        if (ExpressionNode::identifier_of(e) != null) {
             if (this.names_binding(e, key)) {
                 if (by_value) { *out = 2; } else { *out = 1; }
             }
@@ -5206,11 +5209,11 @@ type struct AsyncLower {
     /// names, or the empty symbol when `e` names storage elsewhere. Each step is
     /// tested against the type it indexes into, so a place stops being rooted in
     /// the frame at the first indirection it passes through.
-    addr_place_root(&this, sm: PollSm*, e: ExpressionNode*) -> IdentifierNode* {
+    addr_place_root(&this, sm: PollSm*, e: ExpressionNode*) -> ExpressionNode* {
         if (e == null) { return null; }
         const k: NodeKind = (e as ASTNode*).kind;
-        if (k == NodeKind::Identifier) {
-            if (this.is_frame_key(sm, this.local_key(e))) { return e as IdentifierNode*; }
+        if (ExpressionNode::identifier_of(e) != null) {
+            if (this.is_frame_key(sm, this.local_key(e))) { return e; }
             return null;
         }
         if (k == NodeKind::MemberAccess) {
@@ -5245,7 +5248,7 @@ type struct AsyncLower {
     /// dynamic array naming its heap block — stops the walk: the pointee does
     /// not move when a poll returns, so `arr.as_ptr()` and `this.conn.pending()`
     /// stay sound and must not be reported.
-    call_frame_addr_root(&this, sm: PollSm*, c: CallExprNode*) -> IdentifierNode* {
+    call_frame_addr_root(&this, sm: PollSm*, c: CallExprNode*) -> ExpressionNode* {
         const rt: TypeRef = (c as ExpressionNode*).resolved_type;
         if (!rt.is_valid()) { return null; }
         const t: Type* = this.arena.lookup(rt);
@@ -5267,31 +5270,31 @@ type struct AsyncLower {
     /// skipped: the compiler materializes those for a receiver or a comparison
     /// temp that it consumes within the same expression, so they never outlive
     /// the state that built them.
-    frame_addr_root_expr(&this, sm: PollSm*, e: ExpressionNode*) -> IdentifierNode* {
+    frame_addr_root_expr(&this, sm: PollSm*, e: ExpressionNode*) -> ExpressionNode* {
         if (e == null) { return null; }
         const k: NodeKind = (e as ASTNode*).kind;
         const root_un: UnaryExpr* = ExpressionNode::unary_of(e);
         if (root_un != null) {
             if (root_un.op.kind == TokenType::Amp && !root_un.is_synthetic) {
-                const root: IdentifierNode* = this.addr_place_root(sm, root_un.operand);
+                const root: ExpressionNode* = this.addr_place_root(sm, root_un.operand);
                 if (root != null) { return root; }
             }
             return this.frame_addr_root_expr(sm, root_un.operand);
         }
         const b: BinaryExpr* = ExpressionNode::binary_of(e);
         if (b != null) {
-            const l: IdentifierNode* = this.frame_addr_root_expr(sm, b.left);
+            const l: ExpressionNode* = this.frame_addr_root_expr(sm, b.left);
             if (l != null) { return l; }
             return this.frame_addr_root_expr(sm, b.right);
         }
         if (k == NodeKind::CallExpression) {
             const c: CallExprNode* = e as CallExprNode*;
-            const cr: IdentifierNode* = this.call_frame_addr_root(sm, c);
+            const cr: ExpressionNode* = this.call_frame_addr_root(sm, c);
             if (cr != null) { return cr; }
-            const cl: IdentifierNode* = this.frame_addr_root_expr(sm, c.callee);
+            const cl: ExpressionNode* = this.frame_addr_root_expr(sm, c.callee);
             if (cl != null) { return cl; }
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
-                const a: IdentifierNode* = this.frame_addr_root_expr(sm, c.arguments[i]);
+                const a: ExpressionNode* = this.frame_addr_root_expr(sm, c.arguments[i]);
                 if (a != null) { return a; }
             }
             return null;
@@ -5305,30 +5308,30 @@ type struct AsyncLower {
         }
         const root_aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
         if (root_aa != null) {
-            const av: IdentifierNode* = this.frame_addr_root_expr(sm, root_aa.array);
+            const av: ExpressionNode* = this.frame_addr_root_expr(sm, root_aa.array);
             if (av != null) { return av; }
             return this.frame_addr_root_expr(sm, root_aa.index);
         }
         const addr_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
         if (addr_tern != null) {
-            const c1: IdentifierNode* = this.frame_addr_root_expr(sm, addr_tern.condition);
+            const c1: ExpressionNode* = this.frame_addr_root_expr(sm, addr_tern.condition);
             if (c1 != null) { return c1; }
-            const c2: IdentifierNode* = this.frame_addr_root_expr(sm, addr_tern.true_expr);
+            const c2: ExpressionNode* = this.frame_addr_root_expr(sm, addr_tern.true_expr);
             if (c2 != null) { return c2; }
             return this.frame_addr_root_expr(sm, addr_tern.false_expr);
         }
         const addr_if: IfExpr* = ExpressionNode::if_of(e);
         if (addr_if != null) {
-            const i1: IdentifierNode* = this.frame_addr_root_expr(sm, addr_if.condition);
+            const i1: ExpressionNode* = this.frame_addr_root_expr(sm, addr_if.condition);
             if (i1 != null) { return i1; }
-            const i2: IdentifierNode* = this.frame_addr_root_expr(sm, addr_if.then_expr);
+            const i2: ExpressionNode* = this.frame_addr_root_expr(sm, addr_if.then_expr);
             if (i2 != null) { return i2; }
             return this.frame_addr_root_expr(sm, addr_if.else_expr);
         }
         const sl: StructExpr* = ExpressionNode::struct_of(e);
         if (sl != null) {
             for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-                const f: IdentifierNode* = this.frame_addr_root_expr(sm, sl.field_inits[i].value);
+                const f: ExpressionNode* = this.frame_addr_root_expr(sm, sl.field_inits[i].value);
                 if (f != null) { return f; }
             }
             return null;
@@ -5343,13 +5346,13 @@ type struct AsyncLower {
         }
         const me: MatchExpr* = ExpressionNode::match_of(e);
         if (me != null) {
-            const s: IdentifierNode* = this.frame_addr_root_expr(sm, me.subject);
+            const s: ExpressionNode* = this.frame_addr_root_expr(sm, me.subject);
             if (s != null) { return s; }
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] == null) { continue; }
-                const g: IdentifierNode* = this.frame_addr_root_expr(sm, me.arms[i].guard);
+                const g: ExpressionNode* = this.frame_addr_root_expr(sm, me.arms[i].guard);
                 if (g != null) { return g; }
-                const b2: IdentifierNode* = this.frame_addr_root_stmt(sm, me.arms[i].body);
+                const b2: ExpressionNode* = this.frame_addr_root_stmt(sm, me.arms[i].body);
                 if (b2 != null) { return b2; }
             }
             return null;
@@ -5359,7 +5362,7 @@ type struct AsyncLower {
 
     /// Statement twin of `frame_addr_root_expr`, for the value-block body of a
     /// `match` expression arm.
-    frame_addr_root_stmt(&this, sm: PollSm*, s: Stmt*) -> IdentifierNode* {
+    frame_addr_root_stmt(&this, sm: PollSm*, s: Stmt*) -> ExpressionNode* {
         if (s == null) { return null; }
         match (s.shape) {
             StmtKind::Expr(e)   => { return this.frame_addr_root_expr(sm, e.expression); }
@@ -5367,7 +5370,7 @@ type struct AsyncLower {
             StmtKind::Decl(d)   => { return this.frame_addr_root_expr(sm, this.decl_stmt_init(d)); }
             StmtKind::Block(blk) => {
                 for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                    const r: IdentifierNode* = this.frame_addr_root_stmt(sm, blk.statements[i]);
+                    const r: ExpressionNode* = this.frame_addr_root_stmt(sm, blk.statements[i]);
                     if (r != null) { return r; }
                 }
                 return null;
@@ -5379,12 +5382,12 @@ type struct AsyncLower {
     /// The frame-resident address root assigned into `name` by a `<name> = <expr>;`
     /// anywhere in `blk`, or the empty symbol. Complements the declaration
     /// initializer: a pointer may be declared null and filled in later.
-    assigned_frame_addr_root(&this, sm: PollSm*, blk_stmt: Stmt*, key: SymbolID) -> IdentifierNode* {
+    assigned_frame_addr_root(&this, sm: PollSm*, blk_stmt: Stmt*, key: SymbolID) -> ExpressionNode* {
         const blk: BlockStmt* = blk_stmt.as_block();
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             const b: BinaryExpr* = this.top_level_assignment(blk.statements[i]);
             if (b == null || !this.names_binding(b.left, key)) { continue; }
-            const r: IdentifierNode* = this.frame_addr_root_expr(sm, b.right);
+            const r: ExpressionNode* = this.frame_addr_root_expr(sm, b.right);
             if (r != null) { return r; }
         }
         return null;
@@ -5412,7 +5415,7 @@ type struct AsyncLower {
     reject_frame_addr_carry(mut &this, sm: PollSm*, vd_decl: DeclarationNode*, key: SymbolID) -> boolean {
         const vd: VarDecl* = DeclarationNode::var_of(vd_decl);
         if (this.type_cannot_hold_address(vd.resolved_type)) { return false; }
-        mut root: IdentifierNode* = this.frame_addr_root_expr(sm, vd.initializer);
+        mut root: ExpressionNode* = this.frame_addr_root_expr(sm, vd.initializer);
         if (root == null) {
             for (mut b: i64 = 0; b < sm.blocks.length; b++) {
                 if (root != null) { continue; }
@@ -5423,7 +5426,7 @@ type struct AsyncLower {
         this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
             fmt::format("async: `%s` holds the address of the local or parameter `%s` and is live across an `await`; each poll runs on a fresh frame, so that address is dangling by the time a later step uses it — have the caller own the storage and pass a pointer parameter, whose pointee the suspend does not move",
                    this.intern.resolve(this.source_name(key, vd.name)),
-                   this.intern.resolve(this.source_name(this.local_key(root as ExpressionNode*), root.name))),
+                   this.intern.resolve(this.source_name(this.local_key(root), ExpressionNode::identifier_of(root).name))),
             vd_decl.span);
         sm.ok = false;
         return true;
@@ -5792,7 +5795,7 @@ type struct AsyncLower {
     await_transparent(&this, e: ExpressionNode*) -> boolean {
         if (e == null) { return true; }
         const k: NodeKind = (e as ASTNode*).kind;
-        if (ExpressionNode::literal_of(e) != null || k == NodeKind::Identifier ||
+        if (ExpressionNode::literal_of(e) != null || ExpressionNode::identifier_of(e) != null ||
             k == NodeKind::ScopeResolution || ExpressionNode::sizeof_of(e) != null ||
             ExpressionNode::alignof_of(e) != null) { return true; }
         if (k == NodeKind::MemberAccess) {
@@ -6543,7 +6546,7 @@ type struct AsyncLower {
         this.rn_stmt(map, lam.body);
     }
 
-    /// Rename identifier uses in an expression in place (mutating `IdentifierNode.
+    /// Rename identifier uses in an expression in place (mutating `IdentifierExpr.
     /// name`), recursing through every expression form that can hold a local read.
     /// A use of a binding the body does not declare is left unchanged
     /// (parameter/global). An unwalked form leaves a renamed local's use
@@ -6552,9 +6555,10 @@ type struct AsyncLower {
     rn_expr(mut &this, map: RenameMap*, e: ExpressionNode*) -> void {
         if (e == null) { return; }
         const k: NodeKind = (e as ASTNode*).kind;
-        if (k == NodeKind::Identifier) {
+        mut rn_id: IdentifierExpr* = ExpressionNode::identifier_of(e);
+        if (rn_id != null) {
             const f: SymbolStr = map.fresh_of(this.local_key(e));
-            if (f.is_valid()) { (e as IdentifierNode*).name = f; }
+            if (f.is_valid()) { rn_id.name = f; }
             return;
         }
         const b: BinaryExpr* = ExpressionNode::binary_of(e);
@@ -6866,8 +6870,8 @@ type struct AsyncLower {
     rb_expr(mut &this, ctx: RebindCtx*, e: ExpressionNode*) -> void {
         if (e == null) { return; }
         const k: NodeKind = (e as ASTNode*).kind;
-        if (k == NodeKind::Identifier) {
-            mut id: IdentifierNode* = e as IdentifierNode*;
+        mut id: IdentifierExpr* = ExpressionNode::identifier_of(e);
+        if (id != null) {
             mut found: boolean = false;
             const s: SymbolID = this.rb_lookup(ctx, this.local_key(e), &found);
             if (found && s.is_valid()) { id.rebind_local(s); }
@@ -7241,9 +7245,9 @@ type struct AsyncLower {
             // cannot lower and skip the entry point's body entirely.
             cp.set_resolved_type(p.resolved_type);
             wrapper.add_parameter(DeclarationNode::with_shape(cloned));
-            mut fwd_use: IdentifierNode* = new IdentifierNode(p.name, span);
-            fwd_use.set_res(Res::Local(cp.sym_id));
-            fwd.push(fwd_use as ExpressionNode*);
+            const fwd_use: ExpressionNode* = ExpressionNode::identifier_expr(p.name, span);
+            ExpressionNode::identifier_of(fwd_use).set_res(Res::Local(cp.sym_id));
+            fwd.push(fwd_use);
         }
 
         mut body: Stmt* = Stmt::block(span);
@@ -7265,14 +7269,14 @@ type struct AsyncLower {
         // `ex.block_on(main$async(<forwarded>))`.  Nothing name-resolves a
         // synthesized identifier, so the call names the renamed body by the
         // id registered where it was renamed.
-        mut root_callee: IdentifierNode* = new IdentifierNode(inner_sym, span);
-        root_callee.res.answer(Res::Def(inner_def));
-        mut root: CallExprNode* = new CallExprNode(root_callee as ExpressionNode*, span);
+        const root_callee: ExpressionNode* = ExpressionNode::identifier_expr(inner_sym, span);
+        ExpressionNode::identifier_of(root_callee).res.answer(Res::Def(inner_def));
+        mut root: CallExprNode* = new CallExprNode(root_callee, span);
         for (mut i: i64 = 0; i < fwd.length; i++) { root.add_argument(fwd[i]); }
-        mut ex_use: IdentifierNode* = new IdentifierNode(ex_sym, span);
-        ex_use.set_res(Res::Local(ex_decl.sym_id));
+        const ex_use: ExpressionNode* = ExpressionNode::identifier_expr(ex_sym, span);
+        ExpressionNode::identifier_of(ex_use).set_res(Res::Local(ex_decl.sym_id));
         mut drive: CallExprNode* = new CallExprNode(
-            new MemberAccessNode(ex_use as ExpressionNode*,
+            new MemberAccessNode(ex_use,
                                  this.intern.intern("block_on"), span, span) as ExpressionNode*, span);
         drive.add_argument(root as ExpressionNode*);
 
@@ -7293,10 +7297,10 @@ type struct AsyncLower {
             out_decl.set_initializer(drive as ExpressionNode*);
             body.as_block().add_statement(Stmt::decl_stmt(
                 DeclarationNode::of(DeclKind::Variable(out_decl), span), span));
-            mut out_use: IdentifierNode* = new IdentifierNode(out_sym, span);
-            out_use.set_res(Res::Local(out_decl.sym_id));
+            const out_use: ExpressionNode* = ExpressionNode::identifier_expr(out_sym, span);
+            ExpressionNode::identifier_of(out_use).set_res(Res::Local(out_decl.sym_id));
             body.as_block().add_statement(Stmt::return_stmt(
-                out_use as ExpressionNode*, span));
+                out_use, span));
         }
         wrapper.set_body(body);
         // Name resolution has already run, so the resolution map holds no entry

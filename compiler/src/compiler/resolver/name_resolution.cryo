@@ -48,7 +48,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     AlignofExpr,
-    CallExprNode, CastExpr, ExpressionNode, IdentifierNode,
+    CallExprNode, CastExpr, ExpressionNode, IdentifierExpr,
     LambdaExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, SizeofExpr, StaticMatchExpr, StructExpr,
     TypeofExpr
@@ -93,7 +93,7 @@ type struct NameResolver {
     /// The identifier a call being visited names as its callee, while that
     /// callee is visited: an unbound one is refused as a function that does
     /// not exist rather than as a value.
-    callee_ident: IdentifierNode*;
+    callee_ident: IdentifierExpr*;
     /// The name a type alias binds, while its target annotation is stamped:
     /// barred from the did-you-mean, since rewriting the target to it would
     /// make the alias its own meaning.  Empty elsewhere.
@@ -1056,7 +1056,7 @@ type struct NameResolver {
     /// modules that do declare the leaf, or the nearest name in scope - and
     /// stamp `Err`, so the report is made once, here, where the name was
     /// written.
-    refuse_unbound_name(&this, node: IdentifierNode*) -> void {
+    refuse_unbound_name(&this, e: ExpressionNode*, node: IdentifierExpr*) -> void {
         const name: string = this.resolver.intern_table.resolve(node.name);
         const as_callee: boolean = this.callee_ident == node;
         mut d: Diagnostic = if (as_callee) {
@@ -1066,7 +1066,7 @@ type struct NameResolver {
             Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
                 fmt::format("cannot find value `%s` in this scope", name))
         };
-        d = d.at_with_label(node.span, "not found in this scope");
+        d = d.at_with_label(e.span, "not found in this scope");
         if (as_callee) {
             // A leaf some other module declares - `free` in `std::ffi::libc`,
             // `std::alloc::heap`, `std::core::intrinsics` - is not a typo of
@@ -1093,10 +1093,10 @@ type struct NameResolver {
                     "a bare name means a declaration in this module; `%s` is declared in %s - write %s, or import it",
                     name, declared_in, spellings));
             } else {
-                d = d.did_you_mean(name, this.visible_function_names(), "function", node.span);
+                d = d.did_you_mean(name, this.visible_function_names(), "function", e.span);
             }
         } else {
-            d = d.did_you_mean(name, this.visible_local_names(), "local", node.span);
+            d = d.did_you_mean(name, this.visible_local_names(), "local", e.span);
         }
         this.ctx.emit_diagnostic(d);
         node.set_res(Res::Err);
@@ -1106,7 +1106,7 @@ type struct NameResolver {
     /// no value: E0231 when a call names it, E0201 otherwise, stamped `Err`.
     /// A class that declares a constructor never reaches here - the
     /// constructor is its value.
-    refuse_type_as_value(&this, node: IdentifierNode*) -> void {
+    refuse_type_as_value(&this, e: ExpressionNode*, node: IdentifierExpr*) -> void {
         const name: string = this.resolver.intern_table.resolve(node.name);
         const as_callee: boolean = this.callee_ident == node;
         mut d: Diagnostic = if (as_callee) {
@@ -1116,7 +1116,7 @@ type struct NameResolver {
             Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
                 fmt::format("expected a value, found type `%s`", name))
         };
-        d = d.at_with_label(node.span, "a type, not a value");
+        d = d.at_with_label(e.span, "a type, not a value");
         d = d.with_note(fmt::format(
             "a bare name in an expression names a value; a class that declares a constructor is called by its name, and any other type is built by a literal or one of its own functions, `%s::new(..)`",
             name));
@@ -3511,7 +3511,7 @@ implement trait Walk for struct NameResolver {
         FieldDecl::walk_children(node, this);
     }
 
-    walk_identifier(mut &this, node: IdentifierNode*) -> void {
+    walk_identifier(mut &this, e: ExpressionNode*, node: IdentifierExpr*) -> void {
         // A bare identifier in expression position names a VALUE, so it is
         // asked in the value namespace alone: a type spelled the same is not
         // an answer, and when a module holds both a type and a function under
@@ -3523,7 +3523,7 @@ implement trait Walk for struct NameResolver {
             // A type is not a value.  Asking whether the name binds at all
             // chooses the message only - the answer is a refusal either way.
             if (this.resolver.lookup(node.name, this.resolver.current_scope).is_valid()) {
-                this.refuse_type_as_value(node);
+                this.refuse_type_as_value(e, node);
                 this.stamp_annotation_list(&node.generic_args);
                 return;
             }
@@ -3533,12 +3533,12 @@ implement trait Walk for struct NameResolver {
             // Refused here, as the name that does not exist that it is - a
             // function when a call names it, a value otherwise - and stamped
             // `Err` so no later stage reports it again or guesses at it.
-            this.refuse_unbound_name(node);
+            this.refuse_unbound_name(e, node);
             this.stamp_annotation_list(&node.generic_args);
             return;
         }
         if (sym_id.is_valid()) {
-            this.resolver.record_resolution(node.span, sym_id);
+            this.resolver.record_resolution(e.span, sym_id);
             // Two imports of one leaf from different modules bind the name to
             // neither: the scope keeps the first so a lookup lands somewhere,
             // and the record of the second is what says the first was never
@@ -3558,7 +3558,7 @@ implement trait Walk for struct NameResolver {
                     ErrorCode::E0154_AMBIGUOUS_CALL,
                     fmt::format("`%s` is ambiguous: it is imported from both `%s` and `%s`",
                         leaf, a, b));
-                d = d.at_with_label(node.span, "ambiguous name");
+                d = d.at_with_label(e.span, "ambiguous name");
                 d = d.with_note(fmt::format(
                     "write the path out to say which one is meant, `%s::%s` or `%s::%s`",
                     a, leaf, b, leaf));
@@ -3615,9 +3615,10 @@ implement trait Walk for struct NameResolver {
         // A bare callee is visited as the callee it is, so one that binds to
         // nothing is refused as a function rather than as a value.  Set for
         // the callee's own visit only: an argument is not a callee.
-        const outer_callee: IdentifierNode* = this.callee_ident;
-        if (callee_node.kind == NodeKind::Identifier) {
-            this.callee_ident = node.callee as IdentifierNode*;
+        const outer_callee: IdentifierExpr* = this.callee_ident;
+        const callee_id: IdentifierExpr* = ExpressionNode::identifier_of(callee_node);
+        if (callee_id != null) {
+            this.callee_ident = callee_id;
         }
         this.walk_node(node.callee);
         this.callee_ident = outer_callee;

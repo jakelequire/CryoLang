@@ -141,6 +141,18 @@ yet is recorded with the change that builds it, not here.
      LLVM verification on the parent compiler too, and neither blocks the
      conversion.  (Delegated)
 
+453. **An array literal whose elements are all literals adapts to the type
+     another argument fixes, as a single literal does:**
+     `count_eq([1, 2], an_i64)` with `count_eq<T>(xs: [T], y: T)` compiles
+     with `T = i64`.  Built as its own change after the expressions finish
+     converting to payloads.  (Delegated)
+
+454. **A variable a lambda captures is not reported unused, and `await` in a
+     function that is not `async` is a diagnostic at the `await` rather than
+     an internal error;** both are fixed after the expressions finish
+     converting to payloads, beside the two fixed-size-array defects of
+     ruling 452.  (Delegated)
+
 ### 2026-10-18
 
 438. **A `Location` constant keeps its pointers, and the growth of the

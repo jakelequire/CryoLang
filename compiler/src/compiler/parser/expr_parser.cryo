@@ -51,7 +51,7 @@ import std::fmt;
 import compiler::ast::declaration::{ DeclarationNode, DeclKind, VarDecl };
 import compiler::ast::expression::{
     ArrayExpr, BinaryExpr,
-    CallExprNode, ExpressionNode, FieldInit, IdentifierNode,
+    CallExprNode, ExpressionNode, FieldInit, IdentifierExpr,
     LambdaExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr,
     TupleExpr, UnaryExpr
@@ -254,9 +254,9 @@ implement struct Parser {
         some_pat.enum_payload().add_element(PatternElement::Binding(pb));
         mut some_arm: MatchArmNode* = new MatchArmNode(op_span);
         some_arm.add_pattern(some_pat);
-        const some_ident: IdentifierNode* = new IdentifierNode(bind_name, op_span);
+        const some_ident: ExpressionNode* = ExpressionNode::identifier_expr(bind_name, op_span);
         const some_block: Stmt* = Stmt::block(op_span);
-        some_block.as_block().add_statement(Stmt::expr_stmt(some_ident as ExpressionNode*, op_span));
+        some_block.as_block().add_statement(Stmt::expr_stmt(some_ident, op_span));
         some_arm.set_body(some_block);
         coalesce.add_arm(some_arm);
 
@@ -614,8 +614,8 @@ implement struct Parser {
                 } else {
                     scope_name = this.get_expr_name(expr);
                 }
-                const this_type_head: boolean = expr.kind == NodeKind::Identifier
-                    && (expr as IdentifierNode*).is_this_type_keyword;
+                const head_id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
+                const this_type_head: boolean = head_id != null && head_id.is_this_type_keyword;
                 mut sr: ScopeResolutionNode* = this.parse_scope_member(scope_name, carried_gen_args, expr.span);
                 sr.scope_is_this_type = this_type_head;
                 expr = sr as ExpressionNode*;
@@ -716,8 +716,8 @@ implement struct Parser {
         if (tok.kind == TokenType::KwThis) {
             const ttok: Token = this.advance();
             const name: SymbolStr = this.intern_lexeme(ttok);
-            mut id: IdentifierNode* = new IdentifierNode(name, this.span_from_token(ttok));
-            id.is_this_keyword = true;
+            const id: ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(ttok));
+            ExpressionNode::identifier_of(id).is_this_keyword = true;
             return id;
         }
 
@@ -812,15 +812,15 @@ implement struct Parser {
         if (this.is_primitive_type_token()) {
             const ptok: Token = this.advance();
             const name: SymbolStr = this.intern_lexeme(ptok);
-            return new IdentifierNode(name, this.span_from_token(ptok));
+            return ExpressionNode::identifier_expr(name, this.span_from_token(ptok));
         }
 
         // Any remaining keyword used as identifier (for built-in function names, etc.)
         if (tok.kind.is_keyword()) {
             const ktok: Token = this.advance();
             const name: SymbolStr = this.intern_lexeme(ktok);
-            mut id: IdentifierNode* = new IdentifierNode(name, this.span_from_token(ktok));
-            id.is_this_type_keyword = ktok.kind == TokenType::KwThisType;
+            const id: ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(ktok));
+            ExpressionNode::identifier_of(id).is_this_type_keyword = ktok.kind == TokenType::KwThisType;
             return id;
         }
 
@@ -1065,9 +1065,9 @@ implement struct Parser {
     /// neither the call nor its callee, so both are marked as the
     /// compiler's; the holes among its arguments are written code.
     fstr_call(name: string) -> CallExprNode* {
-        mut id: IdentifierNode* = new IdentifierNode(this.ctx.intern(name), this.fstr_span);
+        mut id: ExpressionNode* = ExpressionNode::identifier_expr(this.ctx.intern(name), this.fstr_span);
         id.generated = true;
-        mut call: CallExprNode* = new CallExprNode(id as ExpressionNode*, this.fstr_span);
+        mut call: CallExprNode* = new CallExprNode(id, this.fstr_span);
         call.generated = true;
         return call;
     }
@@ -1243,7 +1243,7 @@ implement struct Parser {
     parse_identifier_or_call() -> ExpressionNode* {
         const tok: Token = this.advance();
         const name: SymbolStr = this.intern_lexeme(tok);
-        mut expr: ExpressionNode* = new IdentifierNode(name, this.span_from_token(tok));
+        mut expr: ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(tok));
 
         // Generic arguments on the name: `Name::<T, U>`.  A bare `<` after a
         // name is a comparison, whatever the name binds.
@@ -1288,9 +1288,9 @@ implement struct Parser {
         } else {
             // The args are attached to the identifier so the monomorphizer can
             // instantiate the named template for them and codegen can
-            // reference the specialized symbol.  `head` is the IdentifierNode
+            // reference the specialized symbol.  `head` is the identifier
             // built by the caller; nothing else has consumed it yet.
-            (head as IdentifierNode*).set_generic_args(gen_args);
+            ExpressionNode::identifier_of(head).set_generic_args(gen_args);
         }
         return this.parse_identifier_tail(head, name, tok);
     }
@@ -1400,7 +1400,7 @@ implement struct Parser {
                 value = this.parse_expression();
             } else {
                 // Shorthand: create an identifier expression referencing the same name
-                value = new IdentifierNode(field_name, this.span_from_token(field_tok));
+                value = ExpressionNode::identifier_expr(field_name, this.span_from_token(field_tok));
             }
 
             const field_span: SourceSpan = this.span_from(field_tok);
@@ -3360,8 +3360,8 @@ implement struct Parser {
     /// Try to extract the name from an expression node (for scope resolution).
     get_expr_name(expr: ExpressionNode*) -> SymbolStr {
         const node: ASTNode* = expr as ASTNode*;
-        if (node.kind == NodeKind::Identifier) {
-            const id: IdentifierNode* = expr as IdentifierNode*;
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(node);
+        if (id != null) {
             return id.name;
         }
         if (node.kind == NodeKind::ScopeResolution) {
