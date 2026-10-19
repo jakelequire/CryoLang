@@ -52,7 +52,7 @@ import compiler::ast::declaration::{ DeclarationNode, DeclKind, VarDecl };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExpressionNode, FieldInit, IdentifierNode,
-    IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
+    IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExprNode, StructLiteralNode,
     TernaryExprNode, TupleLiteralNode, UnaryExprNode
 };
@@ -1810,7 +1810,8 @@ implement struct Parser {
         mut path: string = type_tok.lexeme;
         path = this.append_path_segments(path);
         mut type_name: SymbolStr = this.ctx.intern(path);
-        mut node: NewExprNode* = new NewExprNode(type_name, this.span_from_token(start));
+        mut new_e: ExpressionNode* = ExpressionNode::new_expr(type_name, this.span_from_token(start));
+        mut node: NewExpr* = ExpressionNode::new_of(new_e);
 
         // Optional generic args on the type: `new Type<T>(...)`.  The operand
         // of `new` is a type, so a `<` here is never a comparison.
@@ -1847,7 +1848,7 @@ implement struct Parser {
             this.consume(TokenType::RParen, "')'");
         } else if (this.check(TokenType::LBrace)) {
             // Heap-allocated struct literal: new Type { field: value, ... }
-            // Parse the struct literal body and attach it to the NewExprNode
+            // Parse the struct literal body and attach it to the `new`
             // so sema knows to return a pointer type.
             // Independent DEEP copy: `TypeAnnotation*[]` owns its pointees
             // (drop frees each node, like `ASTCloner::clone_type_annotations`),
@@ -1857,8 +1858,8 @@ implement struct Parser {
             for (mut gi: i64 = 0; gi < node.generic_args.length; gi++) { gen.push(TypeAnnotation::clone_ptr(node.generic_args[gi])); }
             const lit: StructLiteralNode* = this.parse_struct_literal_body(type_name, gen, start) as StructLiteralNode*;
             node.struct_init = lit;
-            node.span = this.span_from_token(start);
-            return node;
+            new_e.span = this.span_from_token(start);
+            return new_e;
         } else if (this.check(TokenType::LSquare)) {
             // Array allocation: new Type[size]
             this.advance();
@@ -1869,8 +1870,8 @@ implement struct Parser {
             this.consume(TokenType::RSquare, "']'");
         }
 
-        node.span = this.span_from(start);
-        return node;
+        new_e.span = this.span_from(start);
+        return new_e;
     }
 
     /// Parse sizeof(Type): supports qualified names and generic args.

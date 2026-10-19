@@ -1884,6 +1884,15 @@ scans remain for casts, which no check sees.
   type resolution, whose kind matches reached `?` by its own kind and every
   payload kind through a default, have a `NodeKind::Expression` arm naming
   each shape.
+- **Step 3, New done; step 3 complete.**  `NewExpr` holds what the class
+  held (type name, variant name, generic arguments, constructor arguments,
+  array size, struct initializer, unwind cleanup, the name layer's `res`,
+  the variant pin) with its methods and walk inline; factory `new_expr`,
+  projection `new_of` for the parser, the cloner and the async lowering's
+  two renaming walks; `NodeKind::NewExpression` deleted.  The constructor
+  arguments stay until slice 9 deletes the class.  The language server's
+  identity answers a `new` from its `NodeKind::Expression` arm and nothing
+  for the other payload kinds, as its default did.
 
 ### Slice 7: the remaining walks and traits
 
@@ -2163,7 +2172,7 @@ final audit greps for each name listed and expects none.
 |---|---|---|---|
 | `implement class XNode { static walk_children ... }`, one per node class with children | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | each moves inline into its kind's payload struct body (ruling 397) as that category converts (slices 5-6); none left when the last category does.  Patterns' and statements' are gone. |
 | `ExprKind::Legacy` and every `match` arm for it; `ExpressionNode.shape` on an expression whose kind is still a subclass; the `NodeKind`-per-kind dispatch for those kinds beside the `NodeKind::Expression` arms (walker, cloner, sema dispatch and `resolve_expr`, IR generator, node locator, dead code, default expansion, stamp check, language server uses) | `compiler/src/compiler/AST/expression.cryo` and every expression consumer | slice 6 (expressions, the bridge with Sizeof/Alignof/Typeof) | when the last expression kind converts; then `ExpressionNode` becomes the `Expr` struct and `shape` is renamed `kind` |
-| `ExpressionNode::with_shape`, `ExpressionNode::sizeof_of` (const table, type resolution, declaration emitter, async lowering), `ExpressionNode::alignof_of` (same four), `ExpressionNode::typeof_of` (async lowering x2), `ExpressionNode::delete_of` (async lowering x5) and `ExpressionNode::try_of` (async lowering x10) | `compiler/src/compiler/AST/expression.cryo` and those files | slice 6 (expressions) | the projections become `Node::Expr(e)` arms matching `e.kind` when the "any node" handle is `Node` |
+| `ExpressionNode::with_shape`, `ExpressionNode::sizeof_of` (const table, type resolution, declaration emitter, async lowering), `ExpressionNode::alignof_of` (same four), `ExpressionNode::typeof_of` (async lowering x2), `ExpressionNode::delete_of` (async lowering x5), `ExpressionNode::try_of` (async lowering x10) and `ExpressionNode::new_of` (parser, cloner, async lowering x2) | `compiler/src/compiler/AST/expression.cryo` and those files | slice 6 (expressions) | the projections become `Node::Expr(e)` arms matching `e.kind` when the "any node" handle is `Node` |
 | `Walk::walk_node`'s `match (n.kind)` plus a cast per arm | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | becomes `walk_expr`/`walk_stmt`/... matching on `ExprKind` etc. as each category converts; deleted with `NodeKind` |
 | `Pattern` a class deriving from `ASTNode`, so an `ASTNode*` can hold it; the six `as Pattern*` casts from such handles (cloner, walker, lang-ref settling, three in the language server) | `compiler/src/compiler/AST/pattern.cryo` and the casts' files | slice 5 | the header becomes a struct when the "any node" handle is `Node` (slice 6, `Program` and `Node`); the casts become `Node::Pattern(p)` arms |
 | `Pattern.shape`, the pattern's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/pattern.cryo` | slice 5 | renamed `kind` when the header stops deriving from `ASTNode` |

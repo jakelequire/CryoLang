@@ -152,6 +152,23 @@ public:
         return ExpressionNode::of(ExprKind::Delete(new DeleteExpr { operand: operand }), span);
     }
 
+    /// `new type_name` at `span`, with nothing after the name yet; the
+    /// parser and the cloner fill in the rest.
+    static new_expr(type_name: SymbolStr, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::New(new NewExpr {
+            type_name:       type_name,
+            variant_name:    SymbolStr::empty(),
+            generic_args:    [],
+            arguments:       [],
+            array_size:      null,
+            struct_init:     null,
+            unwind_cleanup:  [],
+            res:             ResSlot::Pending,
+            resolved_member: MemberPin::None,
+            pin_carried:     false,
+        }), span);
+    }
+
     /// `operand?` at `span`, not yet desugared.
     static try_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::Try(new TryExpr {
@@ -211,6 +228,16 @@ public:
         };
     }
 
+    /// The `new` expression `n` is, or null.
+    static new_of(n: ASTNode*) -> NewExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::New(ne) => { ne }
+            _                 => { null }
+        };
+    }
+
     /// The `?` expression `n` is, or null.
     static try_of(n: ASTNode*) -> TryExpr* {
         const e: ExpressionNode* = ExpressionNode::with_shape(n);
@@ -230,6 +257,7 @@ type enum ExprKind {
     Legacy;
     Alignof(AlignofExpr*);
     Delete(DeleteExpr*);
+    New(NewExpr*);
     Sizeof(SizeofExpr*);
     Try(TryExpr*);
     Typeof(TypeofExpr*);
@@ -718,8 +746,9 @@ public:
 }
 
 
-type class NewExprNode : ExpressionNode {
-public:
+/// `new T`, `new T(args)`, `new T[n]`, `new T { fields }` and
+/// `new Enum::Variant(args)`.
+type struct NewExpr {
     type_name:    SymbolStr;
     /// Set when the source spelling was `new EnumType::Variant(args)`.
     /// Empty for plain class `new` like `new Foo(args)`.  Codegen
@@ -754,53 +783,51 @@ public:
     /// carriage rule.
     pin_carried: boolean;
 
-    NewExprNode(type_name: SymbolStr, span: SourceSpan)
-        : ExpressionNode(NodeKind::NewExpression, span) {
-        this.type_name    = type_name;
-        this.variant_name = SymbolStr::empty();
-        this.resolved_member = MemberPin::None;
-        this.pin_carried  = false;
-        this.generic_args = [];
-        this.arguments    = [];
-        this.array_size   = null;
-        this.struct_init  = null;
-        this.unwind_cleanup = [];
-        this.res          = ResSlot::Pending;
+    static walk_children<V>(n: NewExpr*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.arguments.length; i++) { v.walk_expr(n.arguments[i]); }
+        v.walk_expr(n.array_size);
+        v.walk_expr(n.struct_init as ExpressionNode*);
     }
 
     /// Record what the expression's type name refers to.  First answer wins.
-    set_res(r: Res) -> void {
+    set_res(mut &this, r: Res) -> void {
         this.res.answer(r);
     }
 
-    has_array_size() -> boolean { return this.array_size != null; }
-    has_struct_init() -> boolean { return this.struct_init != null; }
-    has_variant() -> boolean { return this.variant_name.is_valid(); }
+    has_array_size(&this) -> boolean { return this.array_size != null; }
+    has_struct_init(&this) -> boolean { return this.struct_init != null; }
+    has_variant(&this) -> boolean { return this.variant_name.is_valid(); }
 
-    set_resolved_member(pin: MemberPin) -> void {
+    set_resolved_member(mut &this, pin: MemberPin) -> void {
         this.resolved_member = pin;
         this.pin_carried     = false;
     }
 
     /// Keep the pin a clone inherited and mark it carried.
-    carry_resolved_member() -> void {
+    carry_resolved_member(mut &this) -> void {
         this.pin_carried = this.resolved_member.is_some();
     }
 
-    add_argument(arg: ExpressionNode*) -> void {
+    add_argument(mut &this, arg: ExpressionNode*) -> void {
         this.arguments.push(arg);
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    set_array_size(size: ExpressionNode*) -> void {
+    set_array_size(mut &this, size: ExpressionNode*) -> void {
         this.array_size = size;
     }
 
-    set_variant_name(name: SymbolStr) -> void {
+    set_variant_name(mut &this, name: SymbolStr) -> void {
         this.variant_name = name;
+    }
+}
+
+implement trait Allocate for struct NewExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

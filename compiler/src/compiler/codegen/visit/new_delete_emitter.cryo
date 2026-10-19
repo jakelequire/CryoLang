@@ -40,7 +40,7 @@ import std::collections::pair::{ Pair };
 import std::fmt;
 import compiler::ast::expression::{
     CallExprNode, DeleteExpr, ExpressionNode, FieldInit, IdentifierNode,
-    MemberAccessNode, NewExprNode, StructLiteralNode, UnaryExprNode
+    MemberAccessNode, NewExpr, StructLiteralNode, UnaryExprNode
 };
 import compiler::lex;
 import compiler::lex::{ Token, TokenType };
@@ -141,7 +141,7 @@ type struct NewDeleteEmitter {
 
     // new T(args) / new T { fields }
 
-    emit_new(mut &this, visitor: IRGeneratorVisitor*, node: NewExprNode*) -> Emitted {
+    emit_new(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: NewExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         // Array allocation `new T[n]` is handled up front: it allocates raw
         // memory and the element may be a primitive (`new int[100]`) whose
@@ -149,7 +149,7 @@ type struct NewDeleteEmitter {
         // below would fail.  emit_new_array reads the element type from the
         // sema-resolved `T*` result type instead.
         if (node.has_array_size()) {
-            return this.emit_new_array(visitor, node);
+            return this.emit_new_array(visitor, e, node);
         }
 
         const intern: InternTable* = this.cg.get_intern();
@@ -165,8 +165,8 @@ type struct NewDeleteEmitter {
         // the index by leaf again could land on a same-named type from
         // another module.
         mut type_ref: TypeRef = TypeRef::invalid();
-        if (node.has_resolved_type()) {
-            const rt: Type* = arena_p.lookup(node.resolved_type);
+        if (e.has_resolved_type()) {
+            const rt: Type* = arena_p.lookup(e.resolved_type);
             if (rt != null && rt.kind == TypeKind::Pointer) {
                 type_ref = rt.as_pointer().pointee;
             }
@@ -177,7 +177,7 @@ type struct NewDeleteEmitter {
             this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
                 fmt::format("codegen: 'new': target type '%s' not found",
                     intern.resolve(node.type_name)),
-                node.span);
+                e.span);
             out.value = LValue::null();
             out.is_lvalue = false;
             return out;
@@ -191,7 +191,7 @@ type struct NewDeleteEmitter {
             if (variant == null) {
                 this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
                     "codegen: `new T::V(...)` carries no variant pin: no sema walk answered it",
-                    node.span);
+                    e.span);
                 out.value = LValue::null();
                 out.is_lvalue = false;
                 return out;
@@ -201,7 +201,7 @@ type struct NewDeleteEmitter {
                 vargs.push(this.dispatch.codegen_rvalue(visitor,node.arguments[i]));
             }
             const variant_val: LValue = this.enum_variant.build(et, variant, type_ref, vargs);
-            out.value = this.cg.expr_ops.heap_box_enum_variant(et, type_ref, variant_val, node.span);
+            out.value = this.cg.expr_ops.heap_box_enum_variant(et, type_ref, variant_val, e.span);
             out.is_lvalue = false;
             return out;
         }
@@ -236,7 +236,7 @@ type struct NewDeleteEmitter {
         const alloc_block: ImplBlock* = this.allocator_of(type_ref);
         mut alloc_fn: LValue = LValue::null();
         if (alloc_block != null) {
-            alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, node.span);
+            alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, e.span);
             if (!alloc_fn.is_valid()) {
                 out.value = LValue::null();
                 out.is_lvalue = false;
@@ -249,7 +249,7 @@ type struct NewDeleteEmitter {
             if (ct_a.computed_align > 0) { align = ct_a.computed_align; }
         }
         const raw_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
-            alloc_fn, size_val, align, "newtmp", node.span, "'new' expression");
+            alloc_fn, size_val, align, "newtmp", e.span, "'new' expression");
         if (!raw_ptr.is_valid()) {
             out.value = LValue::null();
             out.is_lvalue = false;
@@ -363,7 +363,7 @@ type struct NewDeleteEmitter {
             if (ctor_ty.is_valid() && LType::kind_of(ctor_ty.raw) == LTypeKind::Function) {
                 // Same single-element-literal bug applies here; use push.
                 mut ctor_args: [Pair<LValue, TypeRef>] = [];
-                ctor_args.push(Pair::<LValue, TypeRef>::new(obj_ptr, node.resolved_type));
+                ctor_args.push(Pair::<LValue, TypeRef>::new(obj_ptr, e.resolved_type));
                 for (mut i: i64 = 0; i < node.arguments.length; i++) {
                     const arg_val: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[i]);
                     ctor_args.push(Pair::<LValue, TypeRef>::new(arg_val, node.arguments[i].resolved_type));
@@ -387,13 +387,13 @@ type struct NewDeleteEmitter {
     /// The element type is read from the sema-resolved `T*` result type so
     /// primitive elements (whose name is a keyword, not a decl-index entry)
     /// resolve the same way user types do.
-    emit_new_array(mut &this, visitor: IRGeneratorVisitor*, node: NewExprNode*) -> Emitted {
+    emit_new_array(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: NewExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
-        const result_t: Type* = this.cg.arena_type(node.resolved_type);
+        const result_t: Type* = this.cg.arena_type(e.resolved_type);
         if (result_t == null || result_t.kind != TypeKind::Pointer) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
                 "codegen: 'new T[n]': could not resolve element type",
-                node.span);
+                e.span);
             out.value = LValue::null();
             out.is_lvalue = false;
             return out;
@@ -431,7 +431,7 @@ type struct NewDeleteEmitter {
         // u64 would malloc a too-small block and the element writes would
         // run off the heap. (Same guard class as `Layout::array`.)
         this.cg.expr_ops.emit_array_mul_guard(count_val, elem_size,
-            visitor, &node.unwind_cleanup, node.span);
+            visitor, &node.unwind_cleanup, e.span);
 
         const elem_size_val: LValue = LType::const_int(LType::i64(), elem_size, false);
         const total: LValue = this.cg.builder.build_mul(
@@ -442,7 +442,7 @@ type struct NewDeleteEmitter {
         const alloc_block: ImplBlock* = this.allocator_of(elem_ref);
         mut alloc_fn: LValue = LValue::null();
         if (alloc_block != null) {
-            alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, node.span);
+            alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, e.span);
             if (!alloc_fn.is_valid()) {
                 out.value = LValue::null();
                 out.is_lvalue = false;
@@ -450,7 +450,7 @@ type struct NewDeleteEmitter {
             }
         }
         const raw_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
-            alloc_fn, total, 16, "new.arr", node.span, "'new T[n]'");
+            alloc_fn, total, 16, "new.arr", e.span, "'new T[n]'");
         if (!raw_ptr.is_valid()) {
             out.value = LValue::null();
             out.is_lvalue = false;
