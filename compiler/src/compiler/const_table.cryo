@@ -59,7 +59,7 @@ import std::fmt;
 import compiler::ast::declaration::{ DeclarationNode, EnumDecl };
 import compiler::ast::expression::{
     AlignofExpr, BinaryExpr, CastExpr, ExpressionNode, IdentifierExpr,
-    LiteralExpr, ScopeResolutionNode, SizeofExpr, UnaryExpr
+    LiteralExpr, ScopeResolutionExpr, SizeofExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::lex::{ TokenType };
@@ -329,8 +329,8 @@ type struct ConstEval {
             return this.fold_named(id, out);
         }
 
-        if (node.kind == NodeKind::ScopeResolution) {
-            const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+        const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(node);
+        if (sr != null) {
             return this.fold_scoped(sr, out);
         }
 
@@ -432,12 +432,12 @@ type struct ConstEval {
             // Not a real constant - it may still be an integer one.
         }
 
-        if (node.kind == NodeKind::ScopeResolution) {
-            // Terminal, unlike the bare-name case above: the qualifier's own
-            // answer says which kind of thing the member is, so one dispatch
-            // settles both the real and the integer reading and there is no
-            // second question left for the promotion below to ask.
-            const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+        // Terminal, unlike the bare-name case above: the qualifier's own
+        // answer says which kind of thing the member is, so one dispatch
+        // settles both the real and the integer reading and there is no
+        // second question left for the promotion below to ask.
+        const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(node);
+        if (sr != null) {
             return this.fold_scoped_real(sr, out);
         }
 
@@ -518,7 +518,7 @@ type struct ConstEval {
     /// the name layer bound in that module (`member_def`); `TypeRelative`
     /// means it named a TYPE, so the member is an enum variant of it.
     /// Anything else is not a compile-time integer.
-    fold_scoped(&this, sr: ScopeResolutionNode*, out: i64*) -> boolean {
+    fold_scoped(&this, sr: ScopeResolutionExpr*, out: i64*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
         return this.fold_scoped_res(
             sr.scope_res.require("ConstEval::fold_scoped"), sr, out);
@@ -530,7 +530,7 @@ type struct ConstEval {
     /// without requiring the slot a second time: `require` records a pending
     /// bug for an unstamped node, so asking twice would count one unstamped
     /// path as two.
-    fold_scoped_res(&this, r: Res, sr: ScopeResolutionNode*, out: i64*) -> boolean {
+    fold_scoped_res(&this, r: Res, sr: ScopeResolutionExpr*, out: i64*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
 
         return match (r) {
@@ -622,7 +622,7 @@ type struct ConstEval {
     /// Everything else a scope can name is integer-valued - an enum variant's
     /// discriminant - so it is decoded once by the integer arm and promoted,
     /// rather than given a second decoder here that could disagree with it.
-    fold_scoped_real(&this, sr: ScopeResolutionNode*, out: f64*) -> boolean {
+    fold_scoped_real(&this, sr: ScopeResolutionExpr*, out: f64*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
 
         const r: Res = sr.scope_res.require("ConstEval::fold_scoped_real");

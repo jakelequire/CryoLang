@@ -77,7 +77,7 @@ import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr,
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierExpr,
     IfExpr, LambdaExpr, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
-    ScopeResolutionNode, StaticMatchExpr, StructExpr,
+    ScopeResolutionExpr, StaticMatchExpr, StructExpr,
     TernaryExpr, TryExpr, TupleExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -1324,7 +1324,8 @@ type struct SemaVisitor {
                         const n_lit: ExpressionNode* = ExpressionNode::literal(n_str, LiteralKind::Integer, sp);
                         const slice_sym: SymbolStr = this.intern.intern("Slice");
                         const from_raw_sym: SymbolStr = this.intern.intern("from_raw");
-                        mut sr: ScopeResolutionNode* = new ScopeResolutionNode(slice_sym, from_raw_sym, sp);
+                        const sr_e: ExpressionNode* = ExpressionNode::scope_resolution_expr(slice_sym, from_raw_sym, sp);
+                        mut sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(sr_e);
                         // The reference is to the stdlib `Slice`, which the
                         // prelude carries so this lowering can name it - the
                         // one declaration it means, whatever the writing
@@ -1341,7 +1342,7 @@ type struct SemaVisitor {
                         mut gen_args: [TypeAnnotation*] = [];
                         gen_args.push(elt_ann);
                         sr.set_scope_generic_args(gen_args);
-                        mut call: CallExprNode* = new CallExprNode(sr as ExpressionNode*, sp);
+                        mut call: CallExprNode* = new CallExprNode(sr_e, sp);
                         call.add_argument(amp);
                         call.add_argument(n_lit);
                         var_node.set_initializer(call as ExpressionNode*);
@@ -1663,7 +1664,7 @@ type struct SemaVisitor {
 
             NodeKind::Expression
             | NodeKind::CallExpression
-            | NodeKind::MemberAccess | NodeKind::ScopeResolution => {
+            | NodeKind::MemberAccess => {
                 this.resolve_expr(n as ExpressionNode*);
             }
 
@@ -1710,9 +1711,6 @@ type struct SemaVisitor {
         const result: TypeRef = match (n.kind) {
             NodeKind::CallExpression    => { this.calls.resolve_call(this, expr as CallExprNode*) }
             NodeKind::MemberAccess      => { this.member.resolve_member_access(this, expr as MemberAccessNode*) }
-            NodeKind::ScopeResolution   => {
-                this.calls.located_value_checked(expr, this.resolve_scope_resolution(expr as ScopeResolutionNode*))
-            }
             NodeKind::Expression        => { this.resolve_expr_shape(expr) }
             _ => { TypeRef::invalid() }
         };
@@ -1750,6 +1748,9 @@ type struct SemaVisitor {
             ExprKind::Yield(_) => { TypeRef::invalid() }
             ExprKind::Identifier(i) => {
                 this.calls.located_value_checked(expr, this.resolve_identifier(expr, i))
+            }
+            ExprKind::ScopeResolution(s) => {
+                this.calls.located_value_checked(expr, this.resolve_scope_resolution(expr, s))
             }
             ExprKind::Try(t)   => { this.resolve_try_expr(expr, t) }
             ExprKind::New(ne)  => { this.resolve_new_expr(expr, ne) }
@@ -3225,10 +3226,11 @@ type struct SemaVisitor {
     /// is built into is what pins the variant.
     make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef,
                     span: SourceSpan) -> ExpressionNode* {
-        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
+        const scope: ExpressionNode* = ExpressionNode::scope_resolution_expr(
             this.async_lower.poll_identity(), this.intern.intern("Ready"), span);
-        scope.set_synthesized_res(this.ctx.decl_index.def_of(poll_out, this.ctx.type_arena));
-        mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
+        ExpressionNode::scope_resolution_of(scope).set_synthesized_res(
+            this.ctx.decl_index.def_of(poll_out, this.ctx.type_arena));
+        mut call: CallExprNode* = new CallExprNode(scope, span);
         call.add_argument(value);
         return call as ExpressionNode*;
     }
@@ -3353,21 +3355,23 @@ type struct SemaVisitor {
                 resolved_type: TypeRef::invalid(), written_mut: false
             };
             err_pat.add_element(PatternElement::Binding(err_pb));
-            mut err_scope: ScopeResolutionNode* = new ScopeResolutionNode(enum_name, err_variant, span);
-            err_scope.set_synthesized_ref(ret_ty, this.ctx.decl_index.def_of(ret_ty, this.ctx.type_arena));
-            mut err_call: CallExprNode* = new CallExprNode(err_scope as ExpressionNode*, span);
+            const err_scope: ExpressionNode* = ExpressionNode::scope_resolution_expr(enum_name, err_variant, span);
+            ExpressionNode::scope_resolution_of(err_scope).set_synthesized_ref(err_scope, ret_ty,
+                this.ctx.decl_index.def_of(ret_ty, this.ctx.type_arena));
+            mut err_call: CallExprNode* = new CallExprNode(err_scope, span);
             const err_ident: ExpressionNode* = ExpressionNode::identifier_expr(err_bind, span);
             ExpressionNode::identifier_of(err_ident).set_res(Res::Local(err_sym));
             err_call.add_argument(err_ident);
             ret_value = err_call as ExpressionNode*;
         } else {
-            mut bare_err: ScopeResolutionNode* =
-                new ScopeResolutionNode(enum_name, err_variant, span);
+            const bare_err: ExpressionNode* =
+                ExpressionNode::scope_resolution_expr(enum_name, err_variant, span);
             // The `Res` alone: a node that carries its type is answered from
             // it and never walked, and the walk is what pins the variant
             // codegen builds.  It types the value by the return it is in.
-            bare_err.set_synthesized_res(this.ctx.decl_index.def_of(ret_ty, this.ctx.type_arena));
-            ret_value = bare_err as ExpressionNode*;
+            ExpressionNode::scope_resolution_of(bare_err).set_synthesized_res(
+                this.ctx.decl_index.def_of(ret_ty, this.ctx.type_arena));
+            ret_value = bare_err;
         }
         // Inside the `poll` an `async fn` was lowered into, every `return`
         // carries `Poll::Ready(...)`. The lowering wrapped the returns it could
@@ -3765,7 +3769,7 @@ type struct SemaVisitor {
     /// `i32::MAX` is no value of `i32`: answering yes would type it as one
     /// with nothing behind it, and code generation would store nothing into
     /// the variable it initializes.
-    scope_member_binds_type(mut &this, ty: TypeRef, scope: ScopeResolutionNode*) -> boolean {
+    scope_member_binds_type(mut &this, ty: TypeRef, scope: ScopeResolutionExpr*) -> boolean {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return true; }
         if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class) {
@@ -3776,7 +3780,7 @@ type struct SemaVisitor {
 
     /// The method `ty::member` names when `ty` is a struct or class and the
     /// member one of its methods; null otherwise.
-    scope_method(mut &this, ty: TypeRef, scope: ScopeResolutionNode*) -> MethodInfo* {
+    scope_method(mut &this, ty: TypeRef, scope: ScopeResolutionExpr*) -> MethodInfo* {
         if (!ty.is_valid()) { return null; }
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return null; }
@@ -3786,7 +3790,7 @@ type struct SemaVisitor {
 
     /// Whether `ty::member` names a method of a struct or class whose
     /// signature the name layer refused.
-    scope_method_refused(mut &this, ty: TypeRef, scope: ScopeResolutionNode*) -> boolean {
+    scope_method_refused(mut &this, ty: TypeRef, scope: ScopeResolutionExpr*) -> boolean {
         if (!ty.is_valid()) { return false; }
         const t: Type* = this.arena.lookup(ty);
         if (t == null || (t.kind != TypeKind::Struct && t.kind != TypeKind::Class)) { return false; }
@@ -3799,7 +3803,7 @@ type struct SemaVisitor {
     /// `function_type` already excludes the receiver and is interned through
     /// the same `get_function` an annotation goes through, so it is the SAME id
     /// a `(A) -> R` annotation resolves to.
-    scope_static_method_type(mut &this, ty: TypeRef, scope: ScopeResolutionNode*) -> TypeRef {
+    scope_static_method_type(mut &this, ty: TypeRef, scope: ScopeResolutionExpr*) -> TypeRef {
         const m: MethodInfo* = this.scope_method(ty, scope);
         if (m == null || !m.is_static) { return TypeRef::invalid(); }
         return m.function_type;
@@ -3831,7 +3835,7 @@ type struct SemaVisitor {
         return value_ft;
     }
 
-    resolve_scope_resolution(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
+    resolve_scope_resolution(mut &this, e: ExpressionNode*, scope: ScopeResolutionExpr*) -> TypeRef {
         // The qualifier's type is the resolver's own answer for this segment,
         // a primitive included.  A stamp that makes no type claim names a
         // module or a type parameter, and the index holds no type under
@@ -3850,11 +3854,11 @@ type struct SemaVisitor {
         if (this.scope_method_refused(found, scope)) { return TypeRef::invalid(); }
         // A method with type parameters of its own is one instance of it.
         mut generic_method: boolean = false;
-        const method_value: TypeRef = this.calls.generic_method_value(scope, found, &generic_method);
+        const method_value: TypeRef = this.calls.generic_method_value(e, scope, found, &generic_method);
         if (generic_method) { return method_value; }
         const static_ft: TypeRef = this.scope_static_method_type(found, scope);
         if (static_ft.is_valid()) {
-            return this.calls.pin_scope_value_static_method(scope, found, static_ft);
+            return this.calls.pin_scope_value_static_method(e, scope, found, static_ft);
         }
         // A method WITH a receiver, named by path, is a function value taking
         // the receiver first.  It names its method's entry exactly as a
@@ -3865,22 +3869,22 @@ type struct SemaVisitor {
         const recv_m: MethodInfo* = this.scope_method(found, scope);
         const recv_ft: TypeRef = this.scope_receiver_method_type(recv_m);
         if (recv_ft.is_valid()) {
-            return this.calls.pin_scope_value_static_method(scope, found, recv_ft);
+            return this.calls.pin_scope_value_static_method(e, scope, found, recv_ft);
         }
         // A generic owner's method is one instance's method.
         mut owner_method: boolean = false;
-        const owner_value: TypeRef = this.calls.generic_owner_method_value(scope, found, &owner_method);
+        const owner_value: TypeRef = this.calls.generic_owner_method_value(e, scope, found, &owner_method);
         if (owner_method) { return owner_value; }
         if (found.is_valid() && this.scope_member_binds_type(found, scope)) {
-            this.validate_enum_scope_member(found, scope);
+            this.validate_enum_scope_member(e, found, scope);
             // Type arguments written on the path (`Option::<i32>::None`,
             // `Option::None::<i32>`) name the instantiation; only a path
             // with none takes it from the expected type.
             if (scope.scope_generic_args.length > 0) {
-                return this.calls.demanded_scope_type(found, &scope.scope_generic_args, scope.span);
+                return this.calls.demanded_scope_type(found, &scope.scope_generic_args, e.span);
             }
             if (scope.generic_args.length > 0) {
-                return this.calls.demanded_scope_type(found, &scope.generic_args, scope.span);
+                return this.calls.demanded_scope_type(found, &scope.generic_args, e.span);
             }
             const promoted: TypeRef = this.calls.promote_to_expected_instantiation(found);
             // A payload-free variant of a generic enum that neither its path
@@ -3889,7 +3893,7 @@ type struct SemaVisitor {
             // what none binds is refused when the module's walk ends.
             if (promoted.equals(found) && !this.state.in_symbolic_check
                     && this.ctx.generic_registry.is_template(found)) {
-                this.state.unbound_variants.push(scope);
+                this.state.unbound_variants.push(e);
             }
             return promoted;
         }
@@ -3907,7 +3911,7 @@ type struct SemaVisitor {
         // a path naming a function that does not exist compiled, linked, and
         // called a null pointer at run time, and a `private` one was offered to
         // no gate.  Asking here is what gives both an owner.
-        const fn_val: TypeRef = this.calls.lookup_scope_value_function(scope);
+        const fn_val: TypeRef = this.calls.lookup_scope_value_function(e, scope);
         if (fn_val.is_valid()) { return fn_val; }
         // Nothing declares this path.  `found` is invalid here by construction:
         // the only way past the type lookup at the top is for it to have missed.  Everything codegen can emit for a
@@ -3934,12 +3938,12 @@ type struct SemaVisitor {
         const path_str: string = fmt::format("%s::%s", scope_str, member_str);
         mut miss: Diagnostic = Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
             fmt::format("cannot find value `%s` in this scope", path_str));
-        miss = miss.at_with_label(scope.span, "not found in this scope");
+        miss = miss.at_with_label(e.span, "not found in this scope");
         this.ctx.emit_diagnostic(miss);
         return found;
     }
 
-    validate_enum_scope_member(mut &this, scope_ty: TypeRef, scope: ScopeResolutionNode*) -> void {
+    validate_enum_scope_member(mut &this, e: ExpressionNode*, scope_ty: TypeRef, scope: ScopeResolutionExpr*) -> void {
         const t: Type* = this.arena.lookup(scope_ty);
         if (t == null || t.kind != TypeKind::Enum) { return; }
         const et: EnumType* = t.as_enum();
@@ -3959,7 +3963,7 @@ type struct SemaVisitor {
         const best: string = find_best_candidate(member, cands);
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0640_INVALID_ENUM_VARIANT_ACCESS,
             fmt::format("enum `%s` has no variant `%s`", enum_name, member));
-        d = d.at_with_label(scope.span, "unknown variant");
+        d = d.at_with_label(e.span, "unknown variant");
         if (best.length() > 0) { d = d.help(fmt::format("did you mean `%s::%s`?", enum_name, best)); }
         this.ctx.diagnostics.emit(d);
     }
@@ -4428,7 +4432,9 @@ type struct SemaVisitor {
         mut leaf: SymbolStr = SymbolStr::empty();
         const id: IdentifierExpr* = ExpressionNode::identifier_of(callee);
         if (id != null) { leaf = id.name; }
-        else if (callee.kind == NodeKind::ScopeResolution) { leaf = (callee as ScopeResolutionNode*).member_name; }
+        else if (ExpressionNode::scope_resolution_of(callee) != null) {
+            leaf = ExpressionNode::scope_resolution_of(callee).member_name;
+        }
         else { return false; }
         if (!leaf.is_valid()) { return false; }
         const et: Type* = this.types.unwrap_to_enum(ret_ty);

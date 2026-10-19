@@ -58,7 +58,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     CallExprNode,
     ExprKind, ExpressionNode, FieldInit, MemberAccessNode,
-    ScopeResolutionNode
+    ScopeResolutionExpr
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
@@ -553,6 +553,9 @@ type struct DefaultExpansionPasses {
                     ExprKind::Literal(_) => { }
                     // Its turbofish is not rewritten here.
                     ExprKind::Identifier(_) => { }
+                    ExprKind::ScopeResolution(sr) => {
+                        DefaultExpansionPasses::rewrite_path(sr, reg, scope);
+                    }
                     // Its body is not walked here.
                     ExprKind::Lambda(_) => { }
                     ExprKind::Await(_)  => { }
@@ -563,42 +566,40 @@ type struct DefaultExpansionPasses {
                 const ma: MemberAccessNode* = expr as MemberAccessNode*;
                 DefaultExpansionPasses::rewrite_expr(ma.object, reg, scope);
             }
-            NodeKind::ScopeResolution => {
-                const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
-                // Default-expand the scope itself: `String::from_str(...)`
-                // where `struct String<A = GlobalAlloc>` should become
-                // `String<GlobalAlloc>::from_str(...)`.  Without this, the
-                // call resolves to the bare-template method whose return
-                // type still references the bare `String`, and the LLVM
-                // signature mismatches with the spec'd target type at the
-                // call site.
-                //
-                // The segment's stamp is `TypeRelative(Def(d), _)` when it
-                // names a type; a module (`Def`), a primitive or a parameter
-                // names no template and is left alone.
-                if (sr.scope_generic_args.length == 0) {
-                    mut d: DefId = DefId::invalid();
-                    match (sr.require_scope_res("default_expansion:scope segment")) {
-                        Res::TypeRelative(ResBase::Def(td), _) => { d = td; }
-                        _ => {}
-                    }
-                    if (d.is_valid() && !scope.contains(d)) {
-                        const defaults: [TypeAnnotation*] = DefaultExpansionPasses::defaults_of(d, reg);
-                        if (defaults.length > 0) {
-                            sr.scope_generic_args = defaults;
-                        }
-                    }
-                }
-                for (mut i: i64 = 0; i < sr.generic_args.length; i++) {
-                    DefaultExpansionPasses::rewrite_annotation_in_place(
-                        sr.generic_args[i], reg, scope);
-                }
-                for (mut i: i64 = 0; i < sr.scope_generic_args.length; i++) {
-                    DefaultExpansionPasses::rewrite_annotation_in_place(
-                        sr.scope_generic_args[i], reg, scope);
+            _ => {}
+        }
+    }
+
+    /// Default-expand a path's scope: `String::from_str(...)` where `struct
+    /// String<A = GlobalAlloc>` should become `String<GlobalAlloc>::from_str(...)`.
+    /// Without this, the call resolves to the bare-template method whose
+    /// return type still references the bare `String`, and the LLVM signature
+    /// mismatches with the spec'd target type at the call site.
+    ///
+    /// The segment's stamp is `TypeRelative(Def(d), _)` when it names a type;
+    /// a module (`Def`), a primitive or a parameter names no template and is
+    /// left alone.
+    static rewrite_path(sr: ScopeResolutionExpr*, reg: GenericRegistry*, scope: ScopeStack*) -> void {
+        if (sr.scope_generic_args.length == 0) {
+            mut d: DefId = DefId::invalid();
+            match (sr.require_scope_res("default_expansion:scope segment")) {
+                Res::TypeRelative(ResBase::Def(td), _) => { d = td; }
+                _ => {}
+            }
+            if (d.is_valid() && !scope.contains(d)) {
+                const defaults: [TypeAnnotation*] = DefaultExpansionPasses::defaults_of(d, reg);
+                if (defaults.length > 0) {
+                    sr.scope_generic_args = defaults;
                 }
             }
-            _ => {}
+        }
+        for (mut i: i64 = 0; i < sr.generic_args.length; i++) {
+            DefaultExpansionPasses::rewrite_annotation_in_place(
+                sr.generic_args[i], reg, scope);
+        }
+        for (mut i: i64 = 0; i < sr.scope_generic_args.length; i++) {
+            DefaultExpansionPasses::rewrite_annotation_in_place(
+                sr.scope_generic_args[i], reg, scope);
         }
     }
 

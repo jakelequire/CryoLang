@@ -33,7 +33,7 @@ import compiler::ast::expression::{
     AlignofExpr, ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr,
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierExpr,
     LambdaExpr, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
-    ScopeResolutionNode, SizeofExpr, StaticMatchExpr, StructExpr,
+    ScopeResolutionExpr, SizeofExpr, StaticMatchExpr, StructExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -118,7 +118,6 @@ type struct ASTCloner {
 
             NodeKind::CallExpression            => { return this.visit_call(n as CallExprNode*); }
             NodeKind::MemberAccess              => { return this.visit_member_access(n as MemberAccessNode*); }
-            NodeKind::ScopeResolution           => { return this.visit_scope_resolution(n as ScopeResolutionNode*); }
 
             NodeKind::Expression                => { return this.copy_expr_shape(n as ExpressionNode*); }
             NodeKind::Statement                 => { return this.copy_stmt(n as Stmt*); }
@@ -351,6 +350,30 @@ type struct ASTCloner {
             ExprKind::Await(n) => {
                 c = ExpressionNode::await_expr(this.clone_expr(n.operand), node.span);
             }
+            ExprKind::ScopeResolution(n) => {
+                c = ExpressionNode::scope_resolution_expr(n.scope_name, n.member_name, node.span);
+                mut cs: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(c);
+                cs.generic_args       = this.clone_type_annotations(n.generic_args);
+                cs.scope_generic_args = this.clone_type_annotations(n.scope_generic_args);
+                // Copied verbatim: a `Res` names a definition, so it stays true for a
+                // copy of the syntax that named it.  A clone that dropped it would
+                // re-ask the question from wherever the cloner happens to be standing,
+                // which is the whole reason the answer is on the node.
+                cs.scope_res = n.scope_res;
+                cs.resolved_callee = n.resolved_callee;
+                cs.resolved_member = n.resolved_member;
+                cs.pin_carried = n.pin_carried;
+                cs.scope_is_this_type = n.scope_is_this_type;
+                mut vta: [TypeRef] = [];
+                for (mut i: i64 = 0; i < n.value_type_args.length; i++) { vta.push(n.value_type_args[i]); }
+                cs.value_type_args = vta;
+                cs.value_template = n.value_template;
+                cs.spec_owner = n.spec_owner;
+                cs.impl_trait = this.clone_type_annotation(n.impl_trait);
+                cs.resolved_trait = n.resolved_trait;
+                cs.template_method = n.template_method;
+                cs.member_def = n.member_def;
+            }
             ExprKind::Identifier(n) => {
                 c = ExpressionNode::identifier_expr(n.name, node.span);
                 mut ci: IdentifierExpr* = ExpressionNode::identifier_of(c);
@@ -516,33 +539,6 @@ type struct ASTCloner {
         return c;
     }
 
-    visit_scope_resolution(mut &this, node: ScopeResolutionNode*) -> ASTNode* {
-        mut c: ScopeResolutionNode* = new ScopeResolutionNode(
-            node.scope_name, node.member_name, node.span
-        );
-        c.generic_args       = this.clone_type_annotations(node.generic_args);
-        c.scope_generic_args = this.clone_type_annotations(node.scope_generic_args);
-        // Copied verbatim: a `Res` names a definition, so it stays true for a
-        // copy of the syntax that named it.  A clone that dropped it would
-        // re-ask the question from wherever the cloner happens to be standing,
-        // which is the whole reason the answer is on the node.
-        c.scope_res = node.scope_res;
-        c.resolved_callee = node.resolved_callee;
-        c.resolved_member = node.resolved_member;
-        c.pin_carried = node.pin_carried;
-        c.scope_is_this_type = node.scope_is_this_type;
-        mut vta: [TypeRef] = [];
-        for (mut i: i64 = 0; i < node.value_type_args.length; i++) { vta.push(node.value_type_args[i]); }
-        c.value_type_args = vta;
-        c.value_template = node.value_template;
-        c.spec_owner = node.spec_owner;
-        c.impl_trait = this.clone_type_annotation(node.impl_trait);
-        c.resolved_trait = node.resolved_trait;
-        c.template_method = node.template_method;
-        c.member_def = node.member_def;
-        c.has_error = node.has_error;
-        return c;
-    }
 
 
     // Statements

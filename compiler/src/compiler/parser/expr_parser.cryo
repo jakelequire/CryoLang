@@ -53,7 +53,7 @@ import compiler::ast::expression::{
     ArrayExpr, BinaryExpr,
     CallExprNode, ExpressionNode, FieldInit, IdentifierExpr,
     LambdaExpr, MatchExpr, MemberAccessNode, NewExpr,
-    ScopeResolutionNode, StaticMatchExpr, StructExpr,
+    ScopeResolutionExpr, StaticMatchExpr, StructExpr,
     TupleExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode };
@@ -417,12 +417,12 @@ implement struct Parser {
                     if (op.kind == TokenType::DotDotEq) { LangItem::RangeInclusive } else { LangItem::Range };
                 const ctor_scope: SymbolStr = this.ctx.intern(range_item.leaf());
                 const new_name: SymbolStr = this.ctx.intern("new");
-                mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
+                const sr: ExpressionNode* = ExpressionNode::scope_resolution_expr(
                     ctor_scope, new_name, span);
-                sr.scope_res = ResSlot::Lang(range_item);
+                ExpressionNode::scope_resolution_of(sr).scope_res = ResSlot::Lang(range_item);
                 this.ctx.note_lang_ref(sr as ASTNode*, range_item);
                 mut call: CallExprNode* =
-                    new CallExprNode(sr as ExpressionNode*, span);
+                    new CallExprNode(sr, span);
                 call.add_argument(left);
                 call.add_argument(right);
                 left = call as ExpressionNode*;
@@ -571,7 +571,7 @@ implement struct Parser {
                 expr = this.parse_member_access_expr(expr);
             } else if (this.check(TokenType::ColonColon)) {
                 // Scope resolution.  For chained paths like `alpha::utils::run`,
-                // join the prior `ScopeResolutionNode`'s scope and member into
+                // join the prior `ScopeResolutionExpr`'s scope and member into
                 // a single dotted scope name so the full qualifier is
                 // preserved on the new node.  Without this, the parser
                 // collapses `alpha::utils::run` to a node whose `scope_name`
@@ -582,8 +582,8 @@ implement struct Parser {
                 this.advance();
                 mut scope_name: SymbolStr = SymbolStr::empty();
                 mut carried_gen_args: [TypeAnnotation*] = [];
-                if (expr.kind == NodeKind::ScopeResolution) {
-                    const psr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+                const psr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(expr);
+                if (psr != null) {
                     // An impl-qualified path names one member of one
                     // implementation; folding it into a longer scope would
                     // drop the trait that qualifies it.
@@ -616,11 +616,10 @@ implement struct Parser {
                 }
                 const head_id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
                 const this_type_head: boolean = head_id != null && head_id.is_this_type_keyword;
-                mut sr: ScopeResolutionNode* = this.parse_scope_member(scope_name, carried_gen_args, expr.span);
-                sr.scope_is_this_type = this_type_head;
-                expr = sr as ExpressionNode*;
+                expr = this.parse_scope_member(scope_name, carried_gen_args, expr.span);
+                ExpressionNode::scope_resolution_of(expr).scope_is_this_type = this_type_head;
             } else if (this.check(TokenType::LBrace)
-                       && expr.kind == NodeKind::ScopeResolution
+                       && ExpressionNode::scope_resolution_of(expr) != null
                        && !this.struct_lit_suppressed()
                        && this.is_struct_literal_ahead()) {
                 // Qualified struct literal at the tail of a *deep* scope path
@@ -633,7 +632,7 @@ implement struct Parser {
                 // field validation and miscompiling to garbage.  Mirrors the
                 // bare-name path's `is_struct_literal_ahead()` guard, so it
                 // adds no new ambiguity beyond what already applies there.
-                const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+                const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(expr);
                 const scope_s: string  = this.ctx.intern_table.resolve(sr.scope_name);
                 const member_s: string = this.ctx.intern_table.resolve(sr.member_name);
                 const qname: SymbolStr = this.ctx.intern_table.intern(
@@ -1312,7 +1311,7 @@ implement struct Parser {
         // rather than naming conventions, so lowercase type names work too.
         //
         // When a scope resolution was parsed above (`Module::Type`), `expr` is
-        // a ScopeResolutionNode and `name` holds only the leading segment
+        // a ScopeResolutionExpr and `name` holds only the leading segment
         // ("Module"). A trailing struct-literal body must be built under the
         // *qualified* `Module::Type` name - otherwise sema resolves the literal
         // against the bare scope name, fails to find a type, skips field
@@ -1322,8 +1321,8 @@ implement struct Parser {
         if (this.check(TokenType::LBrace) && !this.struct_lit_suppressed() && this.is_struct_literal_ahead()) {
             mut lit_name: SymbolStr = name;
             mut lit_gen: [TypeAnnotation*] = [];
-            if (expr.kind == NodeKind::ScopeResolution) {
-                const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+            const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(expr);
+            if (sr != null) {
                 const scope_s: string  = this.ctx.intern_table.resolve(sr.scope_name);
                 const member_s: string = this.ctx.intern_table.resolve(sr.member_name);
                 lit_name = this.ctx.intern_table.intern(
@@ -1622,8 +1621,8 @@ implement struct Parser {
             return null;
         }
         this.advance(); // consume '::'
-        mut sr: ScopeResolutionNode* = this.parse_scope_member(scope_name, scope_args, head_span);
-        sr.set_impl_trait(trait_ann);
+        const sr: ExpressionNode* = this.parse_scope_member(scope_name, scope_args, head_span);
+        ExpressionNode::scope_resolution_of(sr).set_impl_trait(trait_ann);
         return sr;
     }
 
@@ -2584,11 +2583,11 @@ implement struct Parser {
     // Scope Resolution Helper
 
     /// Consume a member name after '::' has already been consumed, create a
-    /// ScopeResolutionNode, and parse any generic args on the member.
+    /// ScopeResolutionExpr, and parse any generic args on the member.
     /// `scope_name`       - the left-hand identifier (e.g. "Foo" in Foo::bar)
     /// `scope_gen_args`   - generic args on the scope (e.g. <T> in Foo<T>::bar), empty if none
     /// `start_span`       - span of the left-hand side (for merged span)
-    parse_scope_member(scope_name: SymbolStr, scope_gen_args: [TypeAnnotation*], start_span: SourceSpan) -> ScopeResolutionNode* {
+    parse_scope_member(scope_name: SymbolStr, scope_gen_args: [TypeAnnotation*], start_span: SourceSpan) -> ExpressionNode* {
         // Accept identifiers and any keyword as member names after '::'.
         // Keywords like `new`, `default`, `function`, `optional`, `type`
         // can all be used as static method / variant names.
@@ -2601,7 +2600,8 @@ implement struct Parser {
         const member_name: SymbolStr = this.intern_lexeme(member_tok);
         const member_span: SourceSpan = this.span_from_token(member_tok);
         const span: SourceSpan = Parser::merge_spans(start_span, member_span);
-        mut sr: ScopeResolutionNode* = new ScopeResolutionNode(scope_name, member_name, span);
+        const sr_e: ExpressionNode* = ExpressionNode::scope_resolution_expr(scope_name, member_name, span);
+        mut sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(sr_e);
         // Record the scope/member token spans separately so LSP hover can
         // resolve each side of `Scope::member` independently.
         sr.set_segment_spans(start_span, member_span);
@@ -2618,7 +2618,7 @@ implement struct Parser {
             sr.set_generic_args(member_gen_args);
         }
 
-        return sr;
+        return sr_e;
     }
 
 
@@ -3364,8 +3364,8 @@ implement struct Parser {
         if (id != null) {
             return id.name;
         }
-        if (node.kind == NodeKind::ScopeResolution) {
-            const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+        const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(node);
+        if (sr != null) {
             return sr.member_name;
         }
         if (node.kind == NodeKind::CallExpression) {

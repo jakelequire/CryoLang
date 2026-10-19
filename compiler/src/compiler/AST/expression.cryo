@@ -341,6 +341,32 @@ public:
         }), span);
     }
 
+    /// The path `scope_name::member_name` at `span`, not yet resolved; both
+    /// segments' spans are the whole path's until the parser sets them.
+    static scope_resolution_expr(scope_name: SymbolStr, member_name: SymbolStr,
+                                 span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::ScopeResolution(new ScopeResolutionExpr {
+            scope_name:         scope_name,
+            member_name:        member_name,
+            generic_args:       [],
+            scope_generic_args: [],
+            scope_span:         span,
+            member_span:        span,
+            scope_res:          ResSlot::Pending,
+            resolved_callee:    CalleePin::None,
+            resolved_member:    MemberPin::None,
+            pin_carried:        false,
+            scope_is_this_type: false,
+            value_type_args:    [],
+            value_template:     TypeRef::invalid(),
+            spec_owner:         TypeRef::invalid(),
+            impl_trait:         null,
+            resolved_trait:     DefId::invalid(),
+            template_method:    DefId::invalid(),
+            member_def:         DefId::invalid(),
+        }), span);
+    }
+
     /// `yield operand` at `span`; a bare `yield` when `operand` is null.
     static yield_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::Yield(new YieldExpr { operand: operand }), span);
@@ -552,6 +578,16 @@ public:
         };
     }
 
+    /// The path `n` is, or null.
+    static scope_resolution_of(n: ASTNode*) -> ScopeResolutionExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::ScopeResolution(s) => { s }
+            _                            => { null }
+        };
+    }
+
     /// The `?` expression `n` is, or null.
     static try_of(n: ASTNode*) -> TryExpr* {
         const e: ExpressionNode* = ExpressionNode::with_shape(n);
@@ -582,6 +618,7 @@ type enum ExprKind {
     Literal(LiteralExpr*);
     Match(MatchExpr*);
     New(NewExpr*);
+    ScopeResolution(ScopeResolutionExpr*);
     Sizeof(SizeofExpr*);
     StaticMatch(StaticMatchExpr*);
     Struct(StructExpr*);
@@ -672,7 +709,7 @@ type struct IdentifierExpr {
     }
 
     /// Record what this name refers to.  The first answer wins, for the reason
-    /// `ScopeResolutionNode::set_scope_res` gives: a `Res` states what the file
+    /// `ScopeResolutionExpr::set_scope_res` gives: a `Res` states what the file
     /// that WROTE the name can see.
     set_res(mut &this, r: Res) -> void {
         this.res.answer(r);
@@ -1274,7 +1311,7 @@ type struct StructExpr {
     /// Record what a SYNTHESIZED literal's type name refers to.
     ///
     /// A pass that builds a path-bearing node owes it a `Res`, for the reason
-    /// `ScopeResolutionNode::set_synthesized_ref` gives: name resolution has
+    /// `ScopeResolutionExpr::set_synthesized_ref` gives: name resolution has
     /// already run by the time the node exists, so the synthesizer is the only
     /// place the referent is known without a lookup, and a consumer left to
     /// guess for synthesized nodes keeps the guess alive for written ones too.
@@ -1543,8 +1580,9 @@ public:
 }
 
 
-type class ScopeResolutionNode : ExpressionNode {
-public:
+/// A path `scope::member`, with the scope's and the member's own type
+/// arguments.
+type struct ScopeResolutionExpr {
     scope_name:         SymbolStr;
     member_name:        SymbolStr;
     generic_args:       [TypeAnnotation*];
@@ -1649,57 +1687,35 @@ public:
     /// and when the module offers nothing under the leaf.
     member_def:         DefId;
 
-    ScopeResolutionNode(scope_name: SymbolStr, member_name: SymbolStr, span: SourceSpan)
-        : ExpressionNode(NodeKind::ScopeResolution, span) {
-        this.scope_name         = scope_name;
-        this.member_name        = member_name;
-        this.generic_args       = [];
-        this.scope_generic_args = [];
-        this.scope_span         = span;
-        this.member_span        = span;
-        this.scope_res          = ResSlot::Pending;
-        this.resolved_callee    = CalleePin::None;
-        this.resolved_member    = MemberPin::None;
-        this.pin_carried        = false;
-        this.scope_is_this_type = false;
-        this.value_type_args    = [];
-        this.value_template     = TypeRef::invalid();
-        this.spec_owner         = TypeRef::invalid();
-        this.impl_trait         = null;
-        this.resolved_trait     = DefId::invalid();
-        this.template_method    = DefId::invalid();
-        this.member_def         = DefId::invalid();
-    }
-
-    set_impl_trait(ann: TypeAnnotation*) -> void {
+    set_impl_trait(mut &this, ann: TypeAnnotation*) -> void {
         this.impl_trait = ann;
     }
 
-    set_resolved_trait(t: DefId) -> void {
+    set_resolved_trait(mut &this, t: DefId) -> void {
         this.resolved_trait = t;
     }
 
     /// Record the declaration the member segment names.  The first answer
     /// wins, as the scope segment's does.
-    set_member_def(d: DefId) -> void {
+    set_member_def(mut &this, d: DefId) -> void {
         if (!this.member_def.is_valid()) { this.member_def = d; }
     }
 
-    set_resolved_callee(pin: CalleePin) -> void {
+    set_resolved_callee(mut &this, pin: CalleePin) -> void {
         this.resolved_callee = pin;
     }
 
-    set_resolved_member(pin: MemberPin) -> void {
+    set_resolved_member(mut &this, pin: MemberPin) -> void {
         this.resolved_member = pin;
         this.pin_carried     = false;
     }
 
     /// Keep the pin a clone inherited and mark it carried.
-    carry_resolved_member() -> void {
+    carry_resolved_member(mut &this) -> void {
         this.pin_carried = this.resolved_member.is_some();
     }
 
-    set_segment_spans(scope_span: SourceSpan, member_span: SourceSpan) -> void {
+    set_segment_spans(mut &this, scope_span: SourceSpan, member_span: SourceSpan) -> void {
         this.scope_span  = scope_span;
         this.member_span = member_span;
     }
@@ -1707,14 +1723,14 @@ public:
     /// Record what the scope segment refers to.  The first answer wins: a
     /// `Res` states what the file that WROTE the path can see, so a later walk
     /// standing in a different module must not be able to replace it.
-    set_scope_res(r: Res) -> void {
+    set_scope_res(mut &this, r: Res) -> void {
         this.scope_res.answer(r);
     }
 
     /// Claim the scope segment for the type alias `alias`, to be answered
     /// with the alias's target (`ResSlot::Alias`).  False when the segment
     /// was already answered.
-    defer_to_alias(alias: DefId) -> boolean {
+    defer_to_alias(mut &this, alias: DefId) -> boolean {
         match (this.scope_res) {
             ResSlot::Pending => { this.scope_res = ResSlot::Alias(alias); return true; }
             _                => { return false; }
@@ -1722,7 +1738,8 @@ public:
     }
 
     /// Record BOTH answers a synthesized `Type::member` reference has: the type
-    /// it names, and the name-layer `Res` derived from that type.
+    /// it names, written on `e`, the path's header, and the name-layer `Res`
+    /// derived from that type.
     ///
     /// A pass that builds a path-bearing node owes it a `Res`, because the
     /// synthesizer is the only place the referent is known without a lookup.
@@ -1731,26 +1748,25 @@ public:
     /// exists to end - and a consumer that has to guess for synthesized nodes
     /// keeps the guess alive for written ones too.
     ///
-    /// `def_name` is the DEFINITION's canonical name, which the caller derives
-    /// from `ty` (`CompilationContext::definition_id_of`); it is not read off
-    /// the spelling the node was built with, since a synthesizer holds a bare
-    /// one. The trailing count is 1: the base is what `ty` names and the member
-    /// segment is the type layer's to finish.
+    /// `def` is the DEFINITION, which the caller derives from `ty`; it is not
+    /// read off the spelling the node was built with, since a synthesizer
+    /// holds a bare one. The trailing count is 1: the base is what `ty` names
+    /// and the member segment is the type layer's to finish.
     ///
-    /// An empty `def_name` leaves the slot unanswered rather than inventing a
+    /// An invalid `def` leaves the slot unanswered rather than inventing a
     /// base. A synthesized reference to a type that names no declaration is a
     /// defect in the synthesizer, and an unanswered slot is what reports it -
     /// against the stage that needed the answer, with a site - instead of being
     /// absorbed here.
-    set_synthesized_ref(ty: TypeRef, def: DefId) -> void {
-        this.set_resolved_type(ty);
+    set_synthesized_ref(mut &this, e: ExpressionNode*, ty: TypeRef, def: DefId) -> void {
+        e.set_resolved_type(ty);
         this.set_synthesized_res(def);
     }
 
     /// The `Res` half alone, for a synthesizer that knows WHAT it is referring
     /// to before it knows the type - a lowering that names a stdlib type and
     /// lets the following resolution walk supply the instantiation.
-    set_synthesized_res(def: DefId) -> void {
+    set_synthesized_res(mut &this, def: DefId) -> void {
         if (def.is_valid()) {
             this.set_scope_res(Res::TypeRelative(ResBase::Def(def), 1));
         }
@@ -1767,12 +1783,18 @@ public:
         return this.scope_res.require(site);
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    set_scope_generic_args(args: [TypeAnnotation*]) -> void {
+    set_scope_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.scope_generic_args = args;
+    }
+}
+
+implement trait Allocate for struct ScopeResolutionExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

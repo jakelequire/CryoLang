@@ -65,7 +65,7 @@ import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr, CallExprNode,
     CastExpr, DeleteExpr, ExpressionNode, FieldInit, IdentifierExpr, IfExpr,
     LambdaExpr, MatchExpr, MemberAccessNode, NewExpr,
-    ScopeResolutionNode, StaticMatchExpr, StructExpr, TernaryExpr,
+    ScopeResolutionExpr, StaticMatchExpr, StructExpr, TernaryExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode };
@@ -944,11 +944,12 @@ type struct AsyncLower {
     /// keeps every consumer on the same move set.
     variant_call1(&this, scope_name: SymbolStr, member_name: string, value: ExpressionNode*,
                   ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
+        const scope_e: ExpressionNode* = ExpressionNode::scope_resolution_expr(
             scope_name, this.intern.intern(member_name), span);
-        scope.set_synthesized_ref(ty, this.ctx.decl_index.def_of(ty, this.ctx.type_arena));
+        mut scope: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(scope_e);
+        scope.set_synthesized_ref(scope_e, ty, this.ctx.decl_index.def_of(ty, this.ctx.type_arena));
         scope.set_resolved_member(this.variant_pin(ty, scope.member_name, span));
-        mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
+        mut call: CallExprNode* = new CallExprNode(scope_e, span);
         if (value != null) { value.arg_binding = ArgBinding::ByValue; }
         call.add_argument(value);
         call.set_resolved_type(ty);
@@ -1608,20 +1609,22 @@ type struct AsyncLower {
 
     /// `Option::None` typed `opt_ty`.
     option_none(&this, opt_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
+        const scope_e: ExpressionNode* = ExpressionNode::scope_resolution_expr(
             this.option_identity(), this.intern.intern("None"), span);
-        scope.set_synthesized_ref(opt_ty, this.ctx.decl_index.def_of(opt_ty, this.ctx.type_arena));
+        mut scope: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(scope_e);
+        scope.set_synthesized_ref(scope_e, opt_ty, this.ctx.decl_index.def_of(opt_ty, this.ctx.type_arena));
         scope.set_resolved_member(this.variant_pin(opt_ty, scope.member_name, span));
-        return scope as ExpressionNode*;
+        return scope_e;
     }
 
     /// `Poll::Pending` typed `poll_ty`.
     poll_pending(&this, poll_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
+        const scope_e: ExpressionNode* = ExpressionNode::scope_resolution_expr(
             this.poll_identity(), this.intern.intern("Pending"), span);
-        scope.set_synthesized_ref(poll_ty, this.ctx.decl_index.def_of(poll_ty, this.ctx.type_arena));
+        mut scope: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(scope_e);
+        scope.set_synthesized_ref(scope_e, poll_ty, this.ctx.decl_index.def_of(poll_ty, this.ctx.type_arena));
         scope.set_resolved_member(this.variant_pin(poll_ty, scope.member_name, span));
-        return scope as ExpressionNode*;
+        return scope_e;
     }
 
     /// Declare a synthetic local nothing needs to name by identity afterwards.
@@ -2816,10 +2819,8 @@ type struct AsyncLower {
         if (c.resolved_template.is_valid()) {
             return this.ctx.generic_registry.template_of_type(c.resolved_template);
         }
-        if (c.callee == null || (c.callee as ASTNode*).kind != NodeKind::ScopeResolution) {
-            return null;
-        }
-        const sr: ScopeResolutionNode* = c.callee as ScopeResolutionNode*;
+        const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(c.callee);
+        if (sr == null) { return null; }
         if (!sr.scope_name.is_valid() || !sr.member_name.is_valid()) { return null; }
         const owner: DefId =
             match (sr.require_scope_res("async_lower: combinator callee owner")) {
@@ -4944,12 +4945,14 @@ type struct AsyncLower {
         }
     }
 
-    /// Whether `scope` is the language's `Poll` variant `leaf`: typed with the
-    /// `Poll` declaration, and pinned to the ordinal the variant door gives
-    /// `leaf` there.  The lowering pins every variant path it builds.
-    is_poll_variant(&this, scope: ScopeResolutionNode*, leaf: string) -> boolean {
+    /// Whether `e` is the path to the language's `Poll` variant `leaf`: typed
+    /// with the `Poll` declaration, and pinned to the ordinal the variant door
+    /// gives `leaf` there.  The lowering pins every variant path it builds.
+    is_poll_variant(&this, e: ExpressionNode*, leaf: string) -> boolean {
+        const scope: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(e);
+        if (scope == null) { return false; }
         const poll_def: DefId = this.ctx.generic_registry.wellknown(LangItem::Poll);
-        const ty: TypeRef = scope.resolved_type;
+        const ty: TypeRef = e.resolved_type;
         if (!poll_def.is_valid() || !ty.is_valid()) { return false; }
         const d: DefId = this.ctx.decl_index.def_of(ty, this.ctx.type_arena);
         if (!d.equals(poll_def)) { return false; }
@@ -4976,8 +4979,8 @@ type struct AsyncLower {
     /// so the variant alone tells them apart.
     is_pending_return(&this, s: Stmt*) -> boolean {
         const e: ExpressionNode* = this.returned_value(s);
-        if (e == null || (e as ASTNode*).kind != NodeKind::ScopeResolution) { return false; }
-        return this.is_poll_variant(e as ScopeResolutionNode*, "Pending");
+        if (e == null) { return false; }
+        return this.is_poll_variant(e, "Pending");
     }
 
     /// The `Poll::Ready(<value>)` call a completion return carries - the shape
@@ -4986,8 +4989,8 @@ type struct AsyncLower {
         const e: ExpressionNode* = this.returned_value(s);
         if (e == null || (e as ASTNode*).kind != NodeKind::CallExpression) { return null; }
         const callee: ExpressionNode* = (e as CallExprNode*).callee;
-        if (callee == null || (callee as ASTNode*).kind != NodeKind::ScopeResolution) { return null; }
-        if (!this.is_poll_variant(callee as ScopeResolutionNode*, "Ready")) { return null; }
+        if (callee == null) { return null; }
+        if (!this.is_poll_variant(callee, "Ready")) { return null; }
         return e as CallExprNode*;
     }
 
@@ -5796,7 +5799,7 @@ type struct AsyncLower {
         if (e == null) { return true; }
         const k: NodeKind = (e as ASTNode*).kind;
         if (ExpressionNode::literal_of(e) != null || ExpressionNode::identifier_of(e) != null ||
-            k == NodeKind::ScopeResolution || ExpressionNode::sizeof_of(e) != null ||
+            ExpressionNode::scope_resolution_of(e) != null || ExpressionNode::sizeof_of(e) != null ||
             ExpressionNode::alignof_of(e) != null) { return true; }
         if (k == NodeKind::MemberAccess) {
             return this.await_transparent((e as MemberAccessNode*).object);
@@ -7253,11 +7256,12 @@ type struct AsyncLower {
         mut body: Stmt* = Stmt::block(span);
 
         // `mut ex: Executor = Executor::new();`
-        mut ex_scope: ScopeResolutionNode* = new ScopeResolutionNode(
+        const ex_scope: ExpressionNode* = ExpressionNode::scope_resolution_expr(
             this.ctx.defs.leaf_of(exec_id).spelling(), this.intern.intern("new"), span);
-        ex_scope.set_synthesized_ref(exec_ty, this.ctx.decl_index.def_of(exec_ty, this.ctx.type_arena));
+        ExpressionNode::scope_resolution_of(ex_scope).set_synthesized_ref(ex_scope, exec_ty,
+            this.ctx.decl_index.def_of(exec_ty, this.ctx.type_arena));
         mut ex_new: CallExprNode* = new CallExprNode(
-            ex_scope as ExpressionNode*, span);
+            ex_scope, span);
         mut ex_decl: VarDecl* = VarDecl::new(ex_sym);
         ex_decl.set_sym_id(this.resolver.alloc_synthetic_binding());
         ex_decl.set_mutable(true);

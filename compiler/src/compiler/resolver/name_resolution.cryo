@@ -50,7 +50,7 @@ import compiler::ast::expression::{
     AlignofExpr,
     CallExprNode, CastExpr, ExpressionNode, IdentifierExpr,
     LambdaExpr, MemberAccessNode, NewExpr,
-    ScopeResolutionNode, SizeofExpr, StaticMatchExpr, StructExpr,
+    ScopeResolutionExpr, SizeofExpr, StaticMatchExpr, StructExpr,
     TypeofExpr
 };
 import compiler::ast::node::{ ASTNode, ProgramNode, StaticAssertItem };
@@ -167,7 +167,7 @@ type struct NameResolver {
     /// the parameter it is, here, where `This` is written: the owner's name
     /// is never written into the path to be looked up a second time.  True
     /// when it stamped.
-    stamp_this_scope(mut &this, node: ScopeResolutionNode*) -> boolean {
+    stamp_this_scope(mut &this, e: ExpressionNode*, node: ScopeResolutionExpr*) -> boolean {
         if (!node.scope_is_this_type) { return false; }
         if (this.this_owner_decl == null || this.this_trait.is_valid()) { return false; }
         if (node.scope_generic_args.length > 0) { return false; }
@@ -176,12 +176,12 @@ type struct NameResolver {
         for (mut i: i64 = 0; i < params.length; i++) {
             const p_decl: DeclarationNode* = params[i];
             const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
-            args.push(TypeAnnotation::answered(p.name, Res::GenericParam(p.sym_id), node.span));
+            args.push(TypeAnnotation::answered(p.name, Res::GenericParam(p.sym_id), e.span));
         }
         node.set_scope_generic_args(args);
         node.set_scope_res(Res::TypeRelative(this.this_owner, 1));
         if (this.this_owner_sym.is_valid()) {
-            this.resolver.record_resolution(node.span, this.this_owner_sym);
+            this.resolver.record_resolution(e.span, this.this_owner_sym);
         }
         return true;
     }
@@ -1526,11 +1526,11 @@ type struct NameResolver {
         };
     }
 
-    answer_type_scope(&this, node: ScopeResolutionNode*, base: ResBase, trailing: u32) -> void {
+    answer_type_scope(&this, e: ExpressionNode*, node: ScopeResolutionExpr*, base: ResBase, trailing: u32) -> void {
         match (base) {
             ResBase::Def(d) => {
                 if (NameResolutionPass::alias_decl(this.ctx, d) != null) {
-                    if (node.defer_to_alias(d)) { this.ctx.note_alias_path(node as ASTNode*); }
+                    if (node.defer_to_alias(d)) { this.ctx.note_alias_path(e as ASTNode*); }
                     return;
                 }
             }
@@ -1539,7 +1539,7 @@ type struct NameResolver {
         node.set_scope_res(Res::TypeRelative(base, trailing));
     }
 
-    stamp_module_scope(&this, node: ScopeResolutionNode*,
+    stamp_module_scope(&this, e: ExpressionNode*, node: ScopeResolutionExpr*,
                        scope_sym: SymbolID) -> void {
         const binds_in_scope: boolean = scope_sym.is_valid();
         if (this.ctx == null || this.ctx.module_graph == null) {
@@ -1576,7 +1576,7 @@ type struct NameResolver {
         // at, because a base invented here is a claim the type layer cannot
         // check.
         //
-        // A `ScopeResolutionNode` is exactly `scope :: member`, so whatever the
+        // A `ScopeResolutionExpr` is exactly `scope :: member`, so whatever the
         // scope segment names, the one member is what is left for the type
         // layer to finish.
         const trailing: u32 = 1;
@@ -1621,7 +1621,7 @@ type struct NameResolver {
         if (binds_in_scope && have_base) {
             const bound: Symbol = this.resolver.get_symbol(scope_sym);
             if (bound.kind == SymbolKind::GenericParam || this.symbol_names_type(&bound)) {
-                this.answer_type_scope(node, base, trailing);
+                this.answer_type_scope(e, node, base, trailing);
                 return;
             }
             // A refused import in the scope position owns nothing; its
@@ -1676,7 +1676,7 @@ type struct NameResolver {
                     ErrorCode::E0155_AMBIGUOUS_BARE_NAME,
                     fmt::format("`%s` is offered by `%s` from more than one module, so it names nothing",
                         leaf_str, written));
-                d = d.at_with_label(node.span, "ambiguous through this path");
+                d = d.at_with_label(e.span, "ambiguous through this path");
                 d = d.with_note(
                     "name the declaring module instead; a re-export offers what its children offer, and two of them offer this");
                 this.ctx.emit_diagnostic(d);
@@ -1720,7 +1720,7 @@ type struct NameResolver {
                 // The segment binds in scope, so it names a TYPE and the module
                 // spellings never applied to it.  No diagnostic was emitted, so
                 // `Err` would be a refusal nobody reported.
-                this.answer_type_scope(node, base, trailing);
+                this.answer_type_scope(e, node, base, trailing);
             }
             return;
         }
@@ -1746,7 +1746,7 @@ type struct NameResolver {
                 // Binds in scope: a type wearing a module's spelling.  The
                 // module was never what this path named, so its unreachability
                 // is not this node's answer.
-                this.answer_type_scope(node, base, trailing);
+                this.answer_type_scope(e, node, base, trailing);
             }
             return;
         }
@@ -1784,7 +1784,7 @@ type struct NameResolver {
             }
             return;
         }
-        this.answer_type_scope(node, base, trailing);
+        this.answer_type_scope(e, node, base, trailing);
     }
 
     /// Stamp the written types in a `where` clause.
@@ -3580,13 +3580,13 @@ implement trait Walk for struct NameResolver {
         this.stamp_annotation_list(&node.generic_args);
     }
 
-    walk_scope_resolution(mut &this, node: ScopeResolutionNode*) -> void {
-        if (!this.stamp_this_scope(node)) {
+    walk_scope_resolution(mut &this, e: ExpressionNode*, node: ScopeResolutionExpr*) -> void {
+        if (!this.stamp_this_scope(e, node)) {
             // Look up the scope name (e.g., "Foo" in "Foo::Bar")
             const scope_sym: SymbolID = this.resolver.lookup(
                 node.scope_name, this.resolver.current_scope);
             if (scope_sym.is_valid()) {
-                this.resolver.record_resolution(node.span, scope_sym);
+                this.resolver.record_resolution(e.span, scope_sym);
             }
             // A segment that already binds in scope names a TYPE (or a value), and
             // what its members are is sema's question, not this one.  Passing the
@@ -3595,7 +3595,7 @@ implement trait Walk for struct NameResolver {
             // program, and it is also the base a type-relative answer records - so
             // the stamp is built from the lookup already performed rather than from
             // a second one asking the same question.
-            this.stamp_module_scope(node, scope_sym);
+            this.stamp_module_scope(e, node, scope_sym);
         }
         // The scope segment's own arguments (`Pair<String, String>::new`) and
         // the member's (`Layout::of<Entry<K, V>>`) are written types in their
@@ -4054,11 +4054,12 @@ type struct NameResolutionPass {
     /// the alias, which owns nothing.
     static settle_alias_paths(ctx: CompilationContext*) -> void {
         for (mut i: i64 = 0; i < ctx.alias_paths.length; i++) {
-            const node: ScopeResolutionNode* = ctx.alias_paths[i].node as ScopeResolutionNode*;
+            const node_e: ExpressionNode* = ExpressionNode::with_shape(ctx.alias_paths[i].node);
+            const node: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(node_e);
             mut alias: TypeAliasDecl* = NameResolutionPass::alias_decl(ctx, node.scope_res.pending_alias());
             mut answer: Res = Res::TypeRelative(ResBase::Def(node.scope_res.pending_alias()), 1);
             if (alias != null && alias.generic_params.length == 0 && node.scope_generic_args.length > 0) {
-                NameResolutionPass::refuse_alias_type_args(ctx, node);
+                NameResolutionPass::refuse_alias_type_args(ctx, node_e, node);
                 node.scope_res.settle_alias(Res::Err);
                 continue;
             }
@@ -4103,7 +4104,7 @@ type struct NameResolutionPass {
                 alias = NameResolutionPass::alias_decl(ctx, next);
             }
             if (alias != null && alias.generic_params.length > 0) {
-                NameResolutionPass::refuse_generic_alias_path(ctx, node);
+                NameResolutionPass::refuse_generic_alias_path(ctx, node_e, node);
                 answer = Res::Err;
             }
             node.scope_res.settle_alias(answer);
@@ -4117,10 +4118,10 @@ type struct NameResolutionPass {
     /// alias's arguments, which nothing substitutes yet, so it is refused
     /// where it is written rather than answered with the alias, which owns
     /// no member.
-    static refuse_generic_alias_path(ctx: CompilationContext*, node: ScopeResolutionNode*) -> void {
+    static refuse_generic_alias_path(ctx: CompilationContext*, e: ExpressionNode*, node: ScopeResolutionExpr*) -> void {
         const written: string = ctx.resolver.intern_table.resolve(node.scope_name);
         const member: string = ctx.resolver.intern_table.resolve(node.member_name);
-        const span: SourceSpan = if (node.scope_span.has_location()) { node.scope_span } else { node.span };
+        const span: SourceSpan = if (node.scope_span.has_location()) { node.scope_span } else { e.span };
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
             fmt::format("cannot find `%s::%s`: `%s` is a generic type alias, and a path through one is not supported",
                 written, member, written));
@@ -4147,11 +4148,11 @@ type struct NameResolutionPass {
     /// `PI::<u8>::size()` with `type PI = Pl<i32>;`: the alias fixes its
     /// target's arguments, so arguments written on it are too many rather
     /// than a second choice of the target's.
-    static refuse_alias_type_args(ctx: CompilationContext*, node: ScopeResolutionNode*) -> void {
+    static refuse_alias_type_args(ctx: CompilationContext*, e: ExpressionNode*, node: ScopeResolutionExpr*) -> void {
         const written: string = ctx.resolver.intern_table.resolve(node.scope_name);
         const n: i64 = node.scope_generic_args.length;
         const plural: string = if (n == 1) { "" } else { "s" };
-        const span: SourceSpan = if (node.scope_span.has_location()) { node.scope_span } else { node.span };
+        const span: SourceSpan = if (node.scope_span.has_location()) { node.scope_span } else { e.span };
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
             fmt::format("`%s` is a type alias with no type parameters, and %lld type argument%s %s written",
                 written, n, plural, if (n == 1) { "is" } else { "are" }));

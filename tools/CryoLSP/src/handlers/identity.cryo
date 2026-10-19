@@ -33,7 +33,7 @@ import compiler::ast::declaration::{
 import compiler::module_graph::{ ModulePath };
 import compiler::ast::expression::{
     CallExprNode, CalleePin, ExprKind, ExpressionNode, IdentifierExpr,
-    MemberAccessNode, ScopeResolutionNode, StructExpr
+    MemberAccessNode, ScopeResolutionExpr, StructExpr
 };
 import compiler::ast::pattern::{ EnumPattern, Pattern, PatternKind };
 import compiler::decl_index::{ DeclarationIndex, OverloadId };
@@ -270,12 +270,12 @@ type struct Locator {
         const n: ASTNode* = this.innermost();
         if (n == null) { return Answer::nothing(); }
         match (n.kind) {
-            NodeKind::ScopeResolution => { return this.path(n as ScopeResolutionNode*); }
             NodeKind::MemberAccess => { return this.member(n as MemberAccessNode*); }
             NodeKind::Expression => {
                 const e: ExpressionNode* = n as ExpressionNode*;
                 match (e.shape) {
                     ExprKind::Identifier(id) => { return this.identifier(e, id); }
+                    ExprKind::ScopeResolution(s) => { return this.path(e, s); }
                     ExprKind::New(ne) => {
                         return Answer::of(this.res_target(&ne.res), n.span, e.resolved_type);
                     }
@@ -347,18 +347,18 @@ type struct Locator {
         return Answer::of(this.res_target(&id.res), at, e.resolved_type);
     }
 
-    path(&this, s: ScopeResolutionNode*) -> Answer {
-        const ty: TypeRef = (s as ExpressionNode*).resolved_type;
+    path(&this, e: ExpressionNode*, s: ScopeResolutionExpr*) -> Answer {
+        const ty: TypeRef = e.resolved_type;
         if (this.holds(s.scope_span)) {
             return Answer::of(this.res_target(&s.scope_res), s.scope_span, TypeRef::invalid());
         }
         if (!this.holds(s.member_span)) { return Answer::nothing(); }
-        return Answer::of(this.path_member(s, this.call_of(s as ASTNode*)), s.member_span, ty);
+        return Answer::of(this.path_member(s, this.call_of(e as ASTNode*)), s.member_span, ty);
     }
 
     /// What a path's member segment names; `call` is the call the path is
     /// the callee of, or null.
-    path_member(&this, s: ScopeResolutionNode*, call: CallExprNode*) -> Target {
+    path_member(&this, s: ScopeResolutionExpr*, call: CallExprNode*) -> Target {
         if (s.member_def.is_valid()) { return Target::Def(s.member_def); }
         if (call != null) {
             const t: Target = this.call_target(call);
