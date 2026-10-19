@@ -76,7 +76,7 @@ import compiler::ast::expression::{
     CalleePin,
     ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
-    IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExpr,
+    IfExprNode, LambdaExprNode, LiteralExpr, MatchExprNode, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExprNode, StructExpr,
     TernaryExprNode, TryExpr, TupleExpr, UnaryExprNode
 };
@@ -1316,13 +1316,13 @@ type struct SemaVisitor {
                     {
                         const orig_init: ExpressionNode* = var_node.initializer;
                         const sp: SourceSpan = orig_init.span;
-                        const zero_lit: LiteralNode* = new LiteralNode("0", LiteralKind::Integer, sp);
-                        const idx: ArrayAccessNode* = new ArrayAccessNode(orig_init, zero_lit as ExpressionNode*, sp);
+                        const zero_lit: ExpressionNode* = ExpressionNode::literal("0", LiteralKind::Integer, sp);
+                        const idx: ArrayAccessNode* = new ArrayAccessNode(orig_init, zero_lit, sp);
                         const amp_tok: Token = Token::new(TokenType::Amp, "&", sp.start_line as int, sp.start_col as int);
                         mut amp: UnaryExprNode* = new UnaryExprNode(amp_tok, idx as ExpressionNode*, sp);
                         amp.is_synthetic = true;
                         const n_str: string = fmt::format("%ld", at.size);
-                        const n_lit: LiteralNode* = new LiteralNode(n_str, LiteralKind::Integer, sp);
+                        const n_lit: ExpressionNode* = ExpressionNode::literal(n_str, LiteralKind::Integer, sp);
                         const slice_sym: SymbolStr = this.intern.intern("Slice");
                         const from_raw_sym: SymbolStr = this.intern.intern("from_raw");
                         mut sr: ScopeResolutionNode* = new ScopeResolutionNode(slice_sym, from_raw_sym, sp);
@@ -1344,7 +1344,7 @@ type struct SemaVisitor {
                         sr.set_scope_generic_args(gen_args);
                         mut call: CallExprNode* = new CallExprNode(sr as ExpressionNode*, sp);
                         call.add_argument(amp as ExpressionNode*);
-                        call.add_argument(n_lit as ExpressionNode*);
+                        call.add_argument(n_lit);
                         var_node.set_initializer(call as ExpressionNode*);
                         init_type = this.resolve_expr(var_node.initializer);
                     }
@@ -1663,7 +1663,7 @@ type struct SemaVisitor {
             NodeKind::Program                => { this.visit_program(n as ProgramNode*); }
 
             NodeKind::Expression
-            | NodeKind::Literal | NodeKind::Identifier | NodeKind::BinaryExpression
+            | NodeKind::Identifier | NodeKind::BinaryExpression
             | NodeKind::UnaryExpression | NodeKind::TernaryExpression | NodeKind::IfExpression
             | NodeKind::MatchExpression | NodeKind::StaticMatchExpression
             | NodeKind::CallExpression
@@ -1715,7 +1715,6 @@ type struct SemaVisitor {
         }
         const n: ASTNode* = expr as ASTNode*;
         const result: TypeRef = match (n.kind) {
-            NodeKind::Literal           => { this.literals.resolve_literal(expr as LiteralNode*) }
             NodeKind::Identifier        => {
                 this.calls.located_value_checked(expr, this.resolve_identifier(expr as IdentifierNode*))
             }
@@ -1774,6 +1773,7 @@ type struct SemaVisitor {
             ExprKind::Tuple(t) => { this.resolve_tuple_literal(t) }
             ExprKind::Array(a) => { this.resolve_array_literal(expr, a) }
             ExprKind::Struct(s) => { this.resolve_struct_literal(expr, s) }
+            ExprKind::Literal(l) => { this.literals.resolve_literal(expr, l) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -2700,9 +2700,11 @@ type struct SemaVisitor {
                 if (this.symbolic.symbolic_type_unresolved(aa.array.resolved_type)) { return; }
                 this.check_assignment_lvalue(aa.array);
             }
-            NodeKind::Literal => {
-                this.ctx.emit_error_at(ErrorCode::E0232_INVALID_ASSIGNMENT_TARGET,
-                    "cannot assign to a literal; the left-hand side of an assignment must be a place (variable, field, or index)", lhs.span);
+            NodeKind::Expression => {
+                if (ExpressionNode::literal_of(lhs) != null) {
+                    this.ctx.emit_error_at(ErrorCode::E0232_INVALID_ASSIGNMENT_TARGET,
+                        "cannot assign to a literal; the left-hand side of an assignment must be a place (variable, field, or index)", lhs.span);
+                }
             }
             _ => {}
         }
@@ -2725,20 +2727,20 @@ type struct SemaVisitor {
         // numeric literals are touched; a real place keeps its own type.
         mut operand_type: TypeRef = TypeRef::invalid();
         if (unary.op.kind == TokenType::Amp && unary.operand != null
-            && unary.operand.kind == NodeKind::Literal
+            && ExpressionNode::literal_of(unary.operand) != null
             && this.state.expected_type.is_valid()) {
             const exp_t0: Type* = this.arena.lookup(this.state.expected_type);
             if (exp_t0 != null && exp_t0.kind == TypeKind::Reference) {
                 const ref_ty0: TypeRef = exp_t0.as_reference().referent;
                 const rt0: Type* = this.arena.lookup(ref_ty0);
-                const lit0: LiteralNode* = unary.operand as LiteralNode*;
+                const lit0: LiteralExpr* = ExpressionNode::literal_of(unary.operand);
                 const numeric_match: boolean = rt0 != null
                     && ((rt0.kind == TypeKind::Int && lit0.literal_kind == LiteralKind::Integer)
                      || (rt0.kind == TypeKind::Float && lit0.literal_kind == LiteralKind::Float));
                 if (numeric_match) {
                     const saved_exp0: TypeRef = this.state.expected_type;
                     this.state.expected_type = ref_ty0;
-                    const lit_ty0: TypeRef = this.literals.resolve_literal(lit0);
+                    const lit_ty0: TypeRef = this.literals.resolve_literal(unary.operand, lit0);
                     this.state.expected_type = saved_exp0;
                     if (lit_ty0.is_valid()) {
                         unary.operand.set_resolved_type(lit_ty0);
@@ -2750,7 +2752,7 @@ type struct SemaVisitor {
         if (!operand_type.is_valid()) { operand_type = this.resolve_expr(unary.operand); }
         if (!operand_type.is_valid()) { return TypeRef::invalid(); }
         if (unary.op.kind == TokenType::Amp && !unary.is_synthetic && unary.operand != null
-            && unary.operand.kind == NodeKind::Literal) {
+            && ExpressionNode::literal_of(unary.operand) != null) {
             this.ctx.emit_error_at(ErrorCode::E0223_INVALID_ADDRESS_OF,
                 "cannot take the address of a literal; `&` requires a place (variable, field, or index)", unary.span);
             return TypeRef::invalid();

@@ -24,7 +24,7 @@ import compiler::ast;
 import compiler::ast::{ LiteralKind, NodeKind };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::expression;
-import compiler::ast::expression::{ BinaryExprNode, ExpressionNode, LiteralNode, UnaryExprNode };
+import compiler::ast::expression::{ BinaryExprNode, ExpressionNode, LiteralExpr, UnaryExprNode };
 import compiler::diag;
 import compiler::diag::{ ErrorCode };
 import compiler::compilation_context;
@@ -59,10 +59,10 @@ type struct LiteralResolver {
     }
 
     /// Type a literal of any kind.
-    resolve_literal(&this, lit: LiteralNode*) -> TypeRef {
+    resolve_literal(&this, e: ExpressionNode*, lit: LiteralExpr*) -> TypeRef {
         return match (lit.literal_kind) {
-            LiteralKind::Integer => { this.resolve_integer_literal(lit) }
-            LiteralKind::Float   => { this.resolve_float_literal(lit) }
+            LiteralKind::Integer => { this.resolve_integer_literal(e, lit) }
+            LiteralKind::Float   => { this.resolve_float_literal(e, lit) }
             LiteralKind::String  => { this.arena.get_string() }
             LiteralKind::Char    => { this.arena.get_char() }
             LiteralKind::Boolean => { this.arena.get_bool() }
@@ -107,7 +107,7 @@ type struct LiteralResolver {
 
     /// Type an integer literal.  Adopts an integer `expected_type` (bounds-checked
     /// against its width); otherwise falls back to the default width.
-    resolve_integer_literal(&this, lit: LiteralNode*) -> TypeRef {
+    resolve_integer_literal(&this, e: ExpressionNode*, lit: LiteralExpr*) -> TypeRef {
         // A type suffix names the literal's type outright, so it settles the
         // question before either the expected-type adoption or the magnitude
         // default: `7u64` is a u64 wherever it appears.  The width bound is
@@ -128,10 +128,10 @@ type struct LiteralResolver {
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
                         fmt::format("integer literal `%s` is out of range for type `%s`",
                             lit.value, sit.to_string()),
-                        lit.span);
+                        e.span);
                 }
             }
-            this.warn_if_suffix_redundant(lit, suffixed);
+            this.warn_if_suffix_redundant(e, lit, suffixed);
             return suffixed;
         }
         if (this.state.expected_type.is_valid()) {
@@ -149,7 +149,7 @@ type struct LiteralResolver {
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
                         fmt::format("integer literal `%s` is out of range for type `%s`",
                             lit.value, it.to_string()),
-                        lit.span);
+                        e.span);
                 } else if (max_mag != 0 && it.is_signed()) {
                     // The literal fits the width's bit pattern but, for a signed
                     // type, exceeds the representable signed range: a bare
@@ -167,7 +167,7 @@ type struct LiteralResolver {
                             ErrorCode::W0012_SIGNED_LITERAL_OUT_OF_RANGE,
                             fmt::format("integer literal `%s` is outside the range of signed type `%s`; it is stored as its two's-complement bit pattern (wraps to a negative value)",
                                 lit.value, it.to_string()));
-                        diag = diag.at(lit.span);
+                        diag = diag.at(e.span);
                         this.ctx.emit_diagnostic(diag);
                     }
                 }
@@ -188,7 +188,7 @@ type struct LiteralResolver {
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
                         fmt::format("integer literal `%s` is out of range for type `char`",
                             lit.value),
-                        lit.span);
+                        e.span);
                 }
                 return this.state.expected_type;
             }
@@ -200,10 +200,10 @@ type struct LiteralResolver {
 
     /// Type a float literal: a type suffix settles it, else adopt a float
     /// `expected_type`, else default to f64.
-    resolve_float_literal(&this, lit: LiteralNode*) -> TypeRef {
+    resolve_float_literal(&this, e: ExpressionNode*, lit: LiteralExpr*) -> TypeRef {
         const suffixed: TypeRef = sema_numeric_suffix_type(this.arena, Keyword::new(lit.suffix));
         if (suffixed.is_valid()) {
-            this.warn_if_suffix_redundant(lit, suffixed);
+            this.warn_if_suffix_redundant(e, lit, suffixed);
             return suffixed;
         }
         if (this.state.expected_type.is_valid()) {
@@ -223,7 +223,7 @@ type struct LiteralResolver {
     /// Where it does NOT - a bare `mut x = 7u64`, or a generic parameter
     /// reachable from no other argument - the suffix is load-bearing and stays
     /// silent.
-    warn_if_suffix_redundant(&this, lit: LiteralNode*, suffixed: TypeRef) -> void {
+    warn_if_suffix_redundant(&this, e: ExpressionNode*, lit: LiteralExpr*, suffixed: TypeRef) -> void {
         // Judge only the FIRST resolution. An un-annotated `mut x = 7u64` is
         // typed by resolving its initializer, after which the declaration
         // re-resolves that same literal with the now-known type as the expected
@@ -232,7 +232,7 @@ type struct LiteralResolver {
         // local. On a re-resolution the node already carries its type, which is
         // exactly the signal that the surrounding context is no longer
         // independent of it.
-        if (lit.has_resolved_type()) { return; }
+        if (e.has_resolved_type()) { return; }
         const contextual: TypeRef = this.type_without_suffix(lit);
         if (!contextual.is_valid()) { return; }
         if (!contextual.equals(suffixed)) { return; }
@@ -240,12 +240,12 @@ type struct LiteralResolver {
             ErrorCode::W0014_REDUNDANT_NUMERIC_SUFFIX,
             fmt::format("redundant type suffix `%s` on numeric literal `%s`; the surrounding context already types it",
                 lit.suffix, lit.value));
-        diag = diag.at(lit.span);
+        diag = diag.at(e.span);
         this.ctx.emit_diagnostic(diag);
     }
 
     /// The type this literal would take with its suffix removed.
-    type_without_suffix(&this, lit: LiteralNode*) -> TypeRef {
+    type_without_suffix(&this, lit: LiteralExpr*) -> TypeRef {
         if (lit.literal_kind == LiteralKind::Float) {
             if (this.state.expected_type.is_valid()) {
                 const fexp: Type* = this.arena.lookup(this.state.expected_type);
@@ -275,7 +275,7 @@ type struct LiteralResolver {
     /// Whether an integer-literal argument fits the target integer type's width.
     int_literal_fits_target(&this, arg: ExpressionNode*, target: TypeRef) -> boolean {
         if (!is_numeric_literal_expr(arg)) { return false; }
-        const lit: LiteralNode* = arg as LiteralNode*;
+        const lit: LiteralExpr* = ExpressionNode::literal_of(arg);
         if (lit.literal_kind != LiteralKind::Integer) { return false; }
         const t: Type* = this.arena.lookup(target);
         if (t == null || t.kind != TypeKind::Int) { return false; }

@@ -43,7 +43,7 @@ import compiler::ast;
 import compiler::ast::{ declaration, LiteralKind, MemberPin, node, NodeKind, TypeAnnotation, Visibility };
 import compiler::ast::expression;
 import compiler::ast::expression::{
-    CallExprNode, CastExprNode, ExpressionNode, FieldInit, IdentifierNode, LiteralNode,
+    CallExprNode, CastExprNode, ExpressionNode, FieldInit, IdentifierNode, LiteralExpr,
     StructExpr
 };
 import compiler::ast::statement;
@@ -550,8 +550,8 @@ type struct Importer {
     widen_integer_init(mut &this, type_annotation: TypeAnnotation*,
                        init: ExpressionNode*) -> ExpressionNode* {
         if (init == null || type_annotation == null) { return init; }
-        if ((init as ASTNode*).kind != NodeKind::Literal) { return init; }
-        if ((init as LiteralNode*).literal_kind != LiteralKind::Integer) { return init; }
+        const lit: LiteralExpr* = ExpressionNode::literal_of(init);
+        if (lit == null || lit.literal_kind != LiteralKind::Integer) { return init; }
         // The declaration owns `type_annotation`; the cast needs its own copy.
         const target: TypeAnnotation* = TypeAnnotation::clone_ptr(type_annotation);
         if (target == null) { return init; }
@@ -1244,9 +1244,9 @@ type struct Importer {
             const dval:  i64       = this.cur_enum_dup_values[i];
             const ty: TypeAnnotation* =
                 this.types.named(name_sym);
-            mut lit: LiteralNode* = new LiteralNode(
+            mut lit: ExpressionNode* = ExpressionNode::literal(
                 fmt::format("%llu", dval as u64), LiteralKind::Integer, SourceSpan::none());
-            this.emit_alias_const(dname, ty, lit as ExpressionNode*);
+            this.emit_alias_const(dname, ty, lit);
             this.ec_names.push(dname);
             this.ec_values.push(dval);
             this.ec_enum_tags.push(name_sym);
@@ -1299,8 +1299,8 @@ type struct Importer {
         // reproducing C's value exactly (-1 in an `int` enum -> 0xFFFFFFFF).
         const v: i64 = clang::clang_getEnumConstantDeclValue(cursor);
         const v_str: string = fmt::format("%llu", v as u64);
-        mut lit: LiteralNode* = new LiteralNode(v_str, LiteralKind::Integer, SourceSpan::none());
-        this.emit_alias_const(cname, this.types.map(*this.cur_enum_int), lit as ExpressionNode*);
+        mut lit: ExpressionNode* = ExpressionNode::literal(v_str, LiteralKind::Integer, SourceSpan::none());
+        this.emit_alias_const(cname, this.types.map(*this.cur_enum_int), lit);
         // W2: record (empty owning tag => an alias resolves it as a plain int).
         this.ec_names.push(cname);
         this.ec_values.push(v);
@@ -1472,8 +1472,8 @@ type struct Importer {
             // fail to re-parse without this.
             const ftext: string = if (neg) { "-" + Importer::strip_float_suffix(spell) }
                                   else      { Importer::strip_float_suffix(spell) };
-            mut flit: LiteralNode* = new LiteralNode(ftext, LiteralKind::Float, SourceSpan::none());
-            this.emit_alias_const(name_sym, this.types.prim("f64"), flit as ExpressionNode*);
+            mut flit: ExpressionNode* = ExpressionNode::literal(ftext, LiteralKind::Float, SourceSpan::none());
+            this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
             this.record_macro_const(name_sym, "f64", ftext, true);
             clang::clang_disposeTokens(this.tu, toks, ntok);
             return;
@@ -1498,9 +1498,9 @@ type struct Importer {
                         else { if (mag <= 9223372036854775807) { "i64" } else { "u64" } };
         }
         const itext: string = fmt::format("%llu", value_u64);
-        mut ilit: LiteralNode* =
-            new LiteralNode(itext, LiteralKind::Integer, SourceSpan::none());
-        this.emit_alias_const(name_sym, this.types.prim(type_name), ilit as ExpressionNode*);
+        mut ilit: ExpressionNode* =
+            ExpressionNode::literal(itext, LiteralKind::Integer, SourceSpan::none());
+        this.emit_alias_const(name_sym, this.types.prim(type_name), ilit);
         this.record_macro_const(name_sym, type_name, itext, false);
         clang::clang_disposeTokens(this.tu, toks, ntok);
     }
@@ -1748,16 +1748,16 @@ type struct Importer {
                 type_name = if (wide) { "i64" } else { "i32" };
             }
             const itext: string = fmt::format("%llu", value_u64);
-            mut ilit: LiteralNode* =
-                new LiteralNode(itext, LiteralKind::Integer, SourceSpan::none());
-            this.emit_alias_const(name_sym, this.types.prim(type_name), ilit as ExpressionNode*);
+            mut ilit: ExpressionNode* =
+                ExpressionNode::literal(itext, LiteralKind::Integer, SourceSpan::none());
+            this.emit_alias_const(name_sym, this.types.prim(type_name), ilit);
             this.record_macro_const(name_sym, type_name, itext, false);
         } else if (kind == clang::EVAL_FLOAT) {
             mut ftext: string = fmt::format("%.17g", clang::clang_EvalResult_getAsDouble(ev));
             if (!Importer::has_float_marker(ftext)) { ftext = ftext + ".0"; }
-            mut flit: LiteralNode* =
-                new LiteralNode(ftext, LiteralKind::Float, SourceSpan::none());
-            this.emit_alias_const(name_sym, this.types.prim("f64"), flit as ExpressionNode*);
+            mut flit: ExpressionNode* =
+                ExpressionNode::literal(ftext, LiteralKind::Float, SourceSpan::none());
+            this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
             this.record_macro_const(name_sym, "f64", ftext, true);
         } else if (kind == clang::EVAL_STRLIT) {
             const raw: u8* = clang::clang_EvalResult_getAsStr(ev);
@@ -1766,10 +1766,10 @@ type struct Importer {
                 // table copies, and the serializer re-escapes on the way out.
                 const text: string = this.ctx.intern_table.resolve(
                     this.ctx.intern_table.intern(raw as string));
-                mut slit: LiteralNode* =
-                    new LiteralNode(text, LiteralKind::String, SourceSpan::none());
+                mut slit: ExpressionNode* =
+                    ExpressionNode::literal(text, LiteralKind::String, SourceSpan::none());
                 this.emit_alias_const(name_sym, this.types.prim("string"),
-                                      slit as ExpressionNode*);
+                                      slit);
             } else {
                 bound = false;
             }
@@ -1811,9 +1811,9 @@ type struct Importer {
             } else {
                 this.types.named(tag)
             };
-            mut lit: LiteralNode* =
-                new LiteralNode(fmt::format("%llu", value as u64), LiteralKind::Integer, SourceSpan::none());
-            this.emit_alias_const(name_sym, ty, lit as ExpressionNode*);
+            mut lit: ExpressionNode* =
+                ExpressionNode::literal(fmt::format("%llu", value as u64), LiteralKind::Integer, SourceSpan::none());
+            this.emit_alias_const(name_sym, ty, lit);
             return true;
         }
 
@@ -1822,9 +1822,9 @@ type struct Importer {
             if (!this.mac_names[i].equals(tsym)) { continue; }
             const kind: LiteralKind =
                 if (this.mac_floats[i]) { LiteralKind::Float } else { LiteralKind::Integer };
-            mut lit: LiteralNode* =
-                new LiteralNode(this.mac_texts[i], kind, SourceSpan::none());
-            this.emit_alias_const(name_sym, this.types.prim(this.mac_types[i]), lit as ExpressionNode*);
+            mut lit: ExpressionNode* =
+                ExpressionNode::literal(this.mac_texts[i], kind, SourceSpan::none());
+            this.emit_alias_const(name_sym, this.types.prim(this.mac_types[i]), lit);
             this.record_macro_const(name_sym, this.mac_types[i], this.mac_texts[i], this.mac_floats[i]);
             return true;
         }
@@ -1978,10 +1978,10 @@ type struct Importer {
             mut text: string = raw;
             if (raw.is_text_literal()) { return false; } // not a numeric color value
             if (raw.is_float_literal()) { lk = LiteralKind::Float; text = Importer::strip_float_suffix(raw); }
-            mut vlit: LiteralNode* = new LiteralNode(text, lk, SourceSpan::none());
+            mut vlit: ExpressionNode* = ExpressionNode::literal(text, lk, SourceSpan::none());
             slit.add_field_init(FieldInit {
                 field_name: DeclarationNode::field_of(struct_node.fields[i]).name,
-                value:      vlit as ExpressionNode*,
+                value:      vlit,
                 span:        SourceSpan::none(),
                 pin:         MemberPin::None,
                 pin_carried: false,
@@ -2060,8 +2060,8 @@ type struct Importer {
         const type_name: string =
             if (acc >= -2147483648 && acc <= 2147483647) { "i32" } else { "i64" };
         const text: string = fmt::format("%llu", acc as u64);
-        mut ilit: LiteralNode* = new LiteralNode(text, LiteralKind::Integer, SourceSpan::none());
-        this.emit_alias_const(name_sym, this.types.prim(type_name), ilit as ExpressionNode*);
+        mut ilit: ExpressionNode* = ExpressionNode::literal(text, LiteralKind::Integer, SourceSpan::none());
+        this.emit_alias_const(name_sym, this.types.prim(type_name), ilit);
         this.record_macro_const(name_sym, type_name, text, false);
         return true;
     }
@@ -2089,8 +2089,8 @@ type struct Importer {
         // or exponent) so it doesn't re-lex as an integer.
         mut text: string = fmt::format("%.17g", acc);
         if (!Importer::has_float_marker(text)) { text = text + ".0"; }
-        mut flit: LiteralNode* = new LiteralNode(text, LiteralKind::Float, SourceSpan::none());
-        this.emit_alias_const(name_sym, this.types.prim("f64"), flit as ExpressionNode*);
+        mut flit: ExpressionNode* = ExpressionNode::literal(text, LiteralKind::Float, SourceSpan::none());
+        this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
         this.record_macro_const(name_sym, "f64", text, true);
         return true;
     }
@@ -2203,15 +2203,15 @@ type struct Importer {
         if (q == '"') {
             const decoded: String = Lexer::process_escape_sequences(inner);
             const byte_length: i64 = decoded.length() as i64;
-            mut slit: LiteralNode* =
-                new LiteralNode(decoded.into_raw(), LiteralKind::String, SourceSpan::none());
-            slit.byte_length = byte_length;
-            this.emit_alias_const(name_sym, this.types.prim("string"), slit as ExpressionNode*);
+            mut slit: ExpressionNode* =
+                ExpressionNode::literal(decoded.into_raw(), LiteralKind::String, SourceSpan::none());
+            ExpressionNode::literal_of(slit).byte_length = byte_length;
+            this.emit_alias_const(name_sym, this.types.prim("string"), slit);
         } else {
             const cp: u64 = Lexer::char_literal_value(inner) as u64;
-            mut clit: LiteralNode* =
-                new LiteralNode(fmt::format("%llu", cp), LiteralKind::Integer, SourceSpan::none());
-            this.emit_alias_const(name_sym, this.types.prim("char"), clit as ExpressionNode*);
+            mut clit: ExpressionNode* =
+                ExpressionNode::literal(fmt::format("%llu", cp), LiteralKind::Integer, SourceSpan::none());
+            this.emit_alias_const(name_sym, this.types.prim("char"), clit);
         }
     }
 

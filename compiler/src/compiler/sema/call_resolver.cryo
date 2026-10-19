@@ -64,7 +64,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    BinaryExprNode, CallExprNode, ExpressionNode, IdentifierNode, LiteralNode,
+    BinaryExprNode, CallExprNode, ExpressionNode, IdentifierNode, LiteralExpr,
     MemberAccessNode, ScopeResolutionNode, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode };
@@ -1071,7 +1071,7 @@ type struct CallResolver {
                             || is_narrow_float_type(this.arena, slot)
                             || this.literals.const_expr_fits_target(arg, slot))) {
                     push_expected = true;
-                } else if (arg_node.kind == NodeKind::Literal
+                } else if (ExpressionNode::literal_of(arg_node) != null
                         && is_adoptable_numeric_type(this.arena, slot)) {
                     // A numeric literal argument adopts the PARAMETER's type, the
                     // same way one adopts a declaration's annotation.  The `else`
@@ -1114,7 +1114,7 @@ type struct CallResolver {
                     const u_arg: UnaryExprNode* = arg as UnaryExprNode*;
                     const pt_ref: Type* = this.arena.lookup(slot);
                     if (u_arg.op.kind == TokenType::Amp && u_arg.operand != null
-                        && u_arg.operand.kind == NodeKind::Literal
+                        && ExpressionNode::literal_of(u_arg.operand) != null
                         && pt_ref != null && pt_ref.kind == TypeKind::Reference) {
                         push_expected = true;
                     }
@@ -1325,11 +1325,10 @@ type struct CallResolver {
         if (call.arguments.length == 0) { return; }
         const fmt_arg: ExpressionNode* = call.arguments[0];
         if (fmt_arg == null) { return; }
-        const fmt_ast: ASTNode* = fmt_arg as ASTNode*;
-        if (fmt_ast.kind != NodeKind::Literal) { return; }   // runtime format: not checkable
-        const lit: LiteralNode* = fmt_arg as LiteralNode*;
+        const lit: LiteralExpr* = ExpressionNode::literal_of(fmt_arg);
+        if (lit == null) { return; }   // runtime format: not checkable
         if (lit.literal_kind != LiteralKind::String) { return; }
-        this.check_printf_directives(call, lit);
+        this.check_printf_directives(call, lit, fmt_arg.span);
     }
 
     /// Whether `callee` is a function whose calls have their format
@@ -1346,7 +1345,7 @@ type struct CallResolver {
 
     /// Walk the format string's `%` conversions, checking each against the
     /// corresponding variadic argument, then report a count mismatch.
-    check_printf_directives(mut &this, call: CallExprNode*, lit: LiteralNode*) -> void {
+    check_printf_directives(mut &this, call: CallExprNode*, lit: LiteralExpr*, span: SourceSpan) -> void {
         const fmt: string = lit.value;
         const n: i64 = fmt.length() as i64;
         const provided: i64 = call.arguments.length - 1;
@@ -1395,7 +1394,7 @@ type struct CallResolver {
         // Truncation can only ever undercount conversions, so it
         // never produces a false shortfall.
         if (arg_idx > provided) {
-            this.emit_printf_too_few(lit, arg_idx, provided);
+            this.emit_printf_too_few(span, arg_idx, provided);
         }
     }
 
@@ -1498,13 +1497,13 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(d);
     }
 
-    emit_printf_too_few(mut &this, lit: LiteralNode*,
+    emit_printf_too_few(mut &this, span: SourceSpan,
                         expected: i64, provided: i64) -> void {
         mut d: Diagnostic = Diagnostic::warning(
             ErrorCode::W0013_FORMAT_STRING_MISMATCH,
             fmt::format("format string needs %lld argument(s), but only %lld were provided",
                 expected, provided));
-        d = d.at(lit.span);
+        d = d.at(span);
         d = d.with_note("a `%` conversion with no matching argument reads a garbage value at runtime");
         this.ctx.emit_diagnostic(d);
     }
@@ -1568,8 +1567,8 @@ type struct CallResolver {
         // magnitude default instead, silently returning a wrong answer.
         if (sema_expr_has_numeric_suffix(expr)) { return false; }
         const node: ASTNode* = expr as ASTNode*;
-        if (node.kind == NodeKind::Literal) {
-            const lit: LiteralNode* = expr as LiteralNode*;
+        const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
+        if (lit != null) {
             return lit.literal_kind == LiteralKind::Integer || lit.literal_kind == LiteralKind::Float;
         }
         if (node.kind == NodeKind::UnaryExpression) {
@@ -1601,9 +1600,8 @@ type struct CallResolver {
     /// invalid `getelementptr(void, ..)` that crashes LLVM instruction selection).
     sema_arg_is_null_literal(&this, expr: ExpressionNode*) -> boolean {
         if (expr == null) { return false; }
-        const node: ASTNode* = expr as ASTNode*;
-        if (node.kind != NodeKind::Literal) { return false; }
-        return (expr as LiteralNode*).literal_kind == LiteralKind::Null;
+        const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
+        return lit != null && lit.literal_kind == LiteralKind::Null;
     }
 
     /// True when `t` bottoms out fully concrete (no open generic/bounded param,
@@ -4920,8 +4918,8 @@ type struct CallResolver {
         // `HashMap<T, ()>::insert(value, ())`).
         if (pt != null && pt.kind == TypeKind::Unit
                 && ai < call.arguments.length && call.arguments[ai] != null
-                && call.arguments[ai].kind == NodeKind::Literal) {
-            const lit: LiteralNode* = call.arguments[ai] as LiteralNode*;
+                && ExpressionNode::literal_of(call.arguments[ai]) != null) {
+            const lit: LiteralExpr* = ExpressionNode::literal_of(call.arguments[ai]);
             if (lit.literal_kind == LiteralKind::Null && lit.value == "void") { return true; }
         }
         if (pt != null) {
