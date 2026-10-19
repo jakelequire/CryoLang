@@ -81,7 +81,7 @@ import compiler::ast::declaration::{
     UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessNode, ArrayExpr, BinaryExpr, CallExprNode, CalleePin, CastExpr,
+    ArrayAccessExpr, ArrayExpr, BinaryExpr, CallExprNode, CalleePin, CastExpr,
     ExprKind, ExpressionNode, IdentifierNode, IfExpr, LambdaExprNode, LiteralExpr,
     MemberAccessNode, NewExpr, StructExpr, TernaryExpr,
     TupleExpr, UnaryExpr
@@ -3286,12 +3286,12 @@ type struct DropInserter {
                 const idx_lit: ExpressionNode* = ExpressionNode::literal(
                     fmt::format("%u", pkey), LiteralKind::Integer, span);
                 idx_lit.set_resolved_type(this.arena.get_i64());
-                const aa: ArrayAccessNode* = new ArrayAccessNode(
+                const aa: ExpressionNode* = ExpressionNode::array_access_expr(
                     cur, idx_lit, span);
                 aa.set_resolved_type(next_ty);
                 idx_lit.generated = true;
                 aa.generated = true;
-                cur = aa as ExpressionNode*;
+                cur = aa;
             }
             cur_ty = next_ty;
         }
@@ -3468,11 +3468,6 @@ type struct DropInserter {
             NodeKind::MemberAccess => {
                 this.disq_scan_expr((expr as MemberAccessNode*).object);
             }
-            NodeKind::ArrayAccess => {
-                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
-                this.disq_scan_expr(aa.array);
-                this.disq_scan_expr(aa.index);
-            }
             NodeKind::CallExpression => {
                 const c: CallExprNode* = expr as CallExprNode*;
                 this.disq_scan_expr(c.callee);
@@ -3483,6 +3478,10 @@ type struct DropInserter {
             NodeKind::Expression => {
                 match (expr.shape) {
                     ExprKind::Cast(ce) => { this.disq_scan_expr(ce.expression); }
+                    ExprKind::ArrayAccess(aa) => {
+                        this.disq_scan_expr(aa.array);
+                        this.disq_scan_expr(aa.index);
+                    }
                     ExprKind::Unary(ue) => {
                         if (ue.op.kind == TokenType::Amp) {
                             // `&r` / `&r.f`: the callee can initialize through the
@@ -3570,17 +3569,30 @@ type struct DropInserter {
                     }
                 }
             }
-            NodeKind::ArrayAccess => {
-                if (!escaping && this.record_init_place(expr)) { return; }
-                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
-                if (aa.array != null) {
-                    if (aa.array.kind == NodeKind::Identifier) {
-                        this.disqualify_init(aa.array as IdentifierNode*);
-                    } else {
-                        this.disq_scan_place(aa.array, escaping);
+            NodeKind::Expression => {
+                match (expr.shape) {
+                    ExprKind::ArrayAccess(aa) => {
+                        if (!escaping && this.record_init_place(expr)) { return; }
+                        if (aa.array != null) {
+                            if (aa.array.kind == NodeKind::Identifier) {
+                                this.disqualify_init(aa.array as IdentifierNode*);
+                            } else {
+                                this.disq_scan_place(aa.array, escaping);
+                            }
+                        }
+                        this.disq_scan_expr(aa.index);
+                    }
+                    // Not a place rooted in a local, as the default below.
+                    ExprKind::Alignof(_) | ExprKind::Array(_) | ExprKind::Binary(_)
+                    | ExprKind::Cast(_) | ExprKind::Delete(_) | ExprKind::If(_)
+                    | ExprKind::Literal(_) | ExprKind::Match(_) | ExprKind::New(_)
+                    | ExprKind::Sizeof(_) | ExprKind::StaticMatch(_) | ExprKind::Struct(_)
+                    | ExprKind::Ternary(_) | ExprKind::Try(_) | ExprKind::Tuple(_)
+                    | ExprKind::Typeof(_) | ExprKind::Unary(_) | ExprKind::Yield(_)
+                    | ExprKind::Legacy => {
+                        this.disq_scan_expr(expr);
                     }
                 }
-                this.disq_scan_expr(aa.index);
             }
             _ => {
                 // Not a place rooted in a local (`*p = v`, `f().x = v`, ...):
@@ -3670,8 +3682,8 @@ type struct DropInserter {
             out_key.push(ma.member.id);
             return root;
         }
-        if (expr.kind == NodeKind::ArrayAccess) {
-            const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(expr);
+        if (aa != null) {
             if (aa.array == null || aa.index == null) { return SymbolID::invalid(); }
             const idx: i64 = this.const_index_of(aa.index);
             if (idx < 0) { return SymbolID::invalid(); }
@@ -4072,7 +4084,6 @@ type struct DropInserter {
                 if (this.ctx.options.unwinds()) { this.populate_unwind_cleanup(c); }
             }
             NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);             }
-            NodeKind::ArrayAccess        => { this.read_array_access(expr as ArrayAccessNode*);        }
             NodeKind::Expression         => {
                 match (expr.shape) {
                     // A match used as an expression, including the desugars
@@ -4129,6 +4140,7 @@ type struct DropInserter {
                     ExprKind::Cast(cv) => { this.read_cast(cv); }
                     ExprKind::Unary(u) => { this.read_unary(u); }
                     ExprKind::Binary(b) => { this.read_binary(expr, b); }
+                    ExprKind::ArrayAccess(aa) => { this.read_array_access(aa); }
                     ExprKind::Ternary(t) => { this.read_ternary(t); }
                     ExprKind::If(ie) => { this.read_if_expr(ie); }
                     // Not walked by this pass.
@@ -4338,7 +4350,7 @@ type struct DropInserter {
         if (ma.object != null) { this.walk_expr_read(ma.object); }
     }
 
-    read_array_access(mut &this, aa: ArrayAccessNode*) -> void {
+    read_array_access(mut &this, aa: ArrayAccessExpr*) -> void {
         if (aa == null) { return; }
         if (aa.array != null) { this.walk_expr_read(aa.array); }
         if (aa.index != null) { this.walk_expr_read(aa.index); }

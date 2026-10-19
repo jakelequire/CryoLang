@@ -49,7 +49,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    AlignofExpr, ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExpr,
+    AlignofExpr, ArrayAccessExpr, ArrayExpr, AwaitExprNode, BinaryExpr,
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     LambdaExprNode, LiteralExpr, MatchExpr, MemberAccessNode,
     ScopeResolutionNode, SizeofExpr, StaticMatchExpr, StructExpr,
@@ -203,7 +203,6 @@ type struct IRGeneratorVisitor {
             NodeKind::Identifier             => { return this.visit_identifier(n as IdentifierNode*); }
             NodeKind::CallExpression         => { return this.visit_call(n as CallExprNode*); }
             NodeKind::LambdaExpression       => { return this.visit_lambda(n as LambdaExprNode*); }
-            NodeKind::ArrayAccess            => { return this.visit_array_access(n as ArrayAccessNode*); }
             NodeKind::MemberAccess           => { return this.visit_member_access(n as MemberAccessNode*); }
             NodeKind::ScopeResolution        => { return this.visit_scope_resolution(n as ScopeResolutionNode*); }
             NodeKind::AwaitExpression        => { return this.visit_await(n as AwaitExprNode*); }
@@ -261,6 +260,7 @@ type struct IRGeneratorVisitor {
                     ExprKind::Cast(c) => { return this.visit_cast(c); }
                     ExprKind::Unary(u) => { return this.visit_unary(u); }
                     ExprKind::Binary(b) => { return this.visit_binary(e, b); }
+                    ExprKind::ArrayAccess(a) => { return this.visit_array_access(e, a); }
                     ExprKind::If(i) => {
                         return this.emit_conditional(e, i.condition, i.then_expr, i.else_expr);
                     }
@@ -1583,7 +1583,7 @@ type struct IRGeneratorVisitor {
                                           node.span);
     }
 
-    visit_array_access(mut &this, node: ArrayAccessNode*) -> Emitted {
+    visit_array_access(mut &this, e: ExpressionNode*, node: ArrayAccessExpr*) -> Emitted {
         // Index operator overloading: sema rewrote `a[i]` on a user type (or a
         // generic param bounded by `Index`) into `*(a.index(i))` and hung it on
         // `desugared_call`.  Delegate to that expression with a plain
@@ -1600,8 +1600,8 @@ type struct IRGeneratorVisitor {
         // here and skip codegen_array_access entirely (which is sized
         // around dynamic-index arrays/strings/pointers).
         match (this.places.try_codegen_tuple_index(this, node)) {
-            Option::Some(e) => { return e; }
-            Option::None    => { }
+            Option::Some(tuple_e) => { return tuple_e; }
+            Option::None          => { }
         }
         // The array as it was emitted, a place or a value: `f()[i]` gives a
         // value, telling the array access to skip the load it does for a
@@ -1610,7 +1610,7 @@ type struct IRGeneratorVisitor {
         const idx: LValue = this.dispatch.codegen_rvalue(this,node.index);
         return this.places.codegen_array_access(arr_e.value, node.array.resolved_type,
                                          arr_e.is_lvalue, idx,
-                                         node.span, this, &node.unwind_cleanup);
+                                         e.span, this, &node.unwind_cleanup);
     }
 
     visit_cast(mut &this, node: CastExpr*) -> Emitted {

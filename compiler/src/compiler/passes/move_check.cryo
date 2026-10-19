@@ -58,7 +58,7 @@ import compiler::ast::declaration::{
     VarDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessNode, ArrayExpr, BinaryExpr, CallExprNode, CastExpr,
+    ArrayAccessExpr, ArrayExpr, BinaryExpr, CallExprNode, CastExpr,
     ExprKind, ExpressionNode, IdentifierNode, IfExpr, LambdaExprNode, MatchExpr,
     MemberAccessNode, NewExpr, StructExpr, TernaryExpr,
     TupleExpr, UnaryExpr
@@ -1283,7 +1283,6 @@ type struct MoveChecker {
             NodeKind::Identifier         => { this.handle_ident(expr as IdentifierNode*, false, false); }
             NodeKind::CallExpression     => { this.read_call(expr as CallExprNode*);                 }
             NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);           }
-            NodeKind::ArrayAccess        => { this.read_array_access(expr as ArrayAccessNode*);      }
             NodeKind::Expression         => {
                 match (expr.shape) {
                     // Reduced to one live arm by the monomorphizer; walk it as
@@ -1292,6 +1291,7 @@ type struct MoveChecker {
                     ExprKind::Cast(cv) => { this.read_cast(cv); }
                     ExprKind::Unary(u) => { this.read_unary(u); }
                     ExprKind::Binary(b) => { this.read_binary(b); }
+                    ExprKind::ArrayAccess(aa) => { this.read_array_access(aa); }
                     ExprKind::StaticMatch(sme) => {
                         if (sme.arms.length > 0 && sme.arms[0] != null && sme.arms[0].body != null) {
                             this.walk_stmt(sme.arms[0].body);
@@ -1494,7 +1494,7 @@ type struct MoveChecker {
         return;
     }
 
-    read_array_access(mut &this, aa: ArrayAccessNode*) -> void {
+    read_array_access(mut &this, aa: ArrayAccessExpr*) -> void {
         if (aa == null) { return; }
         if (aa.array != null) { this.walk_expr_read(aa.array); }
         if (aa.index != null) { this.walk_expr_read(aa.index); }
@@ -2001,9 +2001,8 @@ type struct MoveChecker {
     /// (`ptr[i]`, where `ptr: T*`) is borrowed/heap storage the caller
     /// manages and is deliberately allowed - mirrors `is_owned_value_place`.
     check_array_move_out(mut &this, expr: ExpressionNode*) -> void {
-        if (expr == null || expr.kind != NodeKind::ArrayAccess) { return; }
-        const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
-        if (aa.array == null) { return; }
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(expr);
+        if (aa == null || aa.array == null) { return; }
         // Only a droppable element double-frees; Copy / non-owning elements
         // are bitwise-independent of the array and safe to duplicate.
         const elem_ty: TypeRef = expr.resolved_type;
@@ -2012,14 +2011,14 @@ type struct MoveChecker {
         // not a raw-pointer deref the caller is responsible for.
         const arr_ty: TypeRef = aa.array.resolved_type;
         if (!arr_ty.is_valid() || this.is_ptr_or_ref(arr_ty)) { return; }
-        this.emit_array_move_out_error(aa);
+        this.emit_array_move_out_error(expr.span);
     }
 
-    emit_array_move_out_error(mut &this, aa: ArrayAccessNode*) -> void {
+    emit_array_move_out_error(mut &this, span: SourceSpan) -> void {
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0453_DOUBLE_FREE,
             "cannot move an element out of an array that owns a destructor");
-        diag = diag.at_with_label(aa.span,
+        diag = diag.at_with_label(span,
             "copying this element out leaves the array to drop it again at scope exit (double free)");
         diag = diag.help(
             "borrow the element instead (`const x: &T = &arr[i];`); or clone it when an owned copy is required");

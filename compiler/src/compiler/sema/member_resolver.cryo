@@ -37,7 +37,7 @@ import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, FieldDecl, ImplBlock, MethodDecl, StructDecl, UnionDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessNode, CallExprNode, ExpressionNode, MemberAccessNode
+    ArrayAccessExpr, CallExprNode, ExpressionNode, MemberAccessNode
 };
 import compiler::sema::sema;
 import compiler::sema::sema::{ SemaVisitor };
@@ -654,7 +654,8 @@ type struct MemberResolver {
 
     // -- Index access (`arr[i]` / `tup[0]`) --
 
-    resolve_array_access(mut &this, visitor: SemaVisitor*, access: ArrayAccessNode*) -> TypeRef {
+    resolve_array_access(mut &this, visitor: SemaVisitor*, e: ExpressionNode*,
+                         access: ArrayAccessExpr*) -> TypeRef {
         // Idempotent: a prior resolution may have rewritten `a[i]` into
         // `*(a.index(i))`.  Return its type without re-running
         // `check_index_access`, which would re-reject the user-typed base.
@@ -698,13 +699,13 @@ type struct MemberResolver {
             if (idx < 0) {
                 this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
                     "tuple index must be a non-negative integer literal; runtime indices are not supported on tuples",
-                    access.span);
+                    e.span);
                 return TypeRef::invalid();
             }
             if (idx >= tup.elements.length) {
                 this.ctx.emit_error_at(ErrorCode::E0204_UNDEFINED_FIELD,
                     fmt::format("tuple index %lld is out of bounds for tuple with %lld elements",
-                           idx, tup.elements.length), access.span);
+                           idx, tup.elements.length), e.span);
                 return TypeRef::invalid();
             }
             return tup.elements[idx];
@@ -720,12 +721,12 @@ type struct MemberResolver {
             // (`&Array<T>`) is indexed through its own implementation, here
             // as for a concrete base: the copies specialize the call the
             // desugar holds and build no desugar of their own.
-            const bounded: ExpressionNode* = this.try_bounded_index(visitor, access, array_type);
+            const bounded: ExpressionNode* = this.try_bounded_index(visitor, e, access, array_type);
             if (bounded != null) {
                 access.desugared_call = bounded;
                 return bounded.resolved_type;
             }
-            const owned: ExpressionNode* = this.try_index_overload(visitor, access, array_type);
+            const owned: ExpressionNode* = this.try_index_overload(visitor, e, access, array_type);
             if (owned != null) {
                 access.desugared_call = owned;
                 return owned.resolved_type;
@@ -740,16 +741,16 @@ type struct MemberResolver {
         // place, so the one desugar serves read / write / compound assignment.
         // Fixed arrays, strings, pointers and references to them all succeed
         // above and never reach here.
-        const de: ExpressionNode* = this.try_index_overload(visitor, access, array_type);
+        const de: ExpressionNode* = this.try_index_overload(visitor, e, access, array_type);
         if (de != null) {
             access.desugared_call = de;
             return de.resolved_type;
         }
-        if (this.emit_index_missing_impl(array_type, access.span)) {
+        if (this.emit_index_missing_impl(array_type, e.span)) {
             return TypeRef::invalid();
         }
         if (result.error_message != null && result.error_message.length() > 0) {
-            this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH, result.error_message, access.span);
+            this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH, result.error_message, e.span);
         }
         return TypeRef::invalid();
     }
@@ -763,7 +764,7 @@ type struct MemberResolver {
     /// applies.  Deliberately does NOT unwrap pointers / references: a raw
     /// pointer or `&T` keeps its primitive indexing rule (which already
     /// succeeded in `check_index_access`), mirroring the arithmetic desugar.
-    try_index_overload(mut &this, visitor: SemaVisitor*, access: ArrayAccessNode*,
+    try_index_overload(mut &this, visitor: SemaVisitor*, e: ExpressionNode*, access: ArrayAccessExpr*,
                        ty: TypeRef) -> ExpressionNode* {
         mut base_ty: TypeRef = ty;
         mut t: Type* = this.arena.lookup(base_ty);
@@ -793,35 +794,36 @@ type struct MemberResolver {
             return null;
         }
         if (this.trait_checker().select_impl(index_id, base_ty, 0) == null) { return null; }
-        return this.build_index_desugar(visitor, access);
+        return this.build_index_desugar(visitor, e, access);
     }
 
     /// The index desugar for a base that is a type parameter of the body
     /// being walked, when a bound in scope gives the parameter
     /// `std::core::ops::Index` - itself or as a supertrait of the trait it
     /// names.  Null for any other base.
-    try_bounded_index(mut &this, visitor: SemaVisitor*, access: ArrayAccessNode*,
+    try_bounded_index(mut &this, visitor: SemaVisitor*, e: ExpressionNode*, access: ArrayAccessExpr*,
                       ty: TypeRef) -> ExpressionNode* {
         const param: GenericParamType* = this.binding.receiver_type_param(ty);
         if (param == null) { return null; }
         const index_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Index);
         if (!index_id.is_valid() || !this.binding.param_bounded_by(param, index_id)) { return null; }
-        return this.build_index_desugar(visitor, access);
+        return this.build_index_desugar(visitor, e, access);
     }
 
     /// Build and resolve `*(a.index(i))` for `access`; null when it does not
     /// type.
-    build_index_desugar(mut &this, visitor: SemaVisitor*, access: ArrayAccessNode*) -> ExpressionNode* {
+    build_index_desugar(mut &this, visitor: SemaVisitor*, e: ExpressionNode*,
+                        access: ArrayAccessExpr*) -> ExpressionNode* {
         // The index expression is passed BY VALUE - the trait is
         // `index(&this, idx: Idx)`, not `&Idx` - so no synthetic `&`.
-        const member: MemberAccessNode* = this.lang_method_callee(access.array, LangItem::IndexIndex, access.span);
+        const member: MemberAccessNode* = this.lang_method_callee(access.array, LangItem::IndexIndex, e.span);
         if (member == null) { return null; }
-        mut call: CallExprNode* = new CallExprNode(member as ExpressionNode*, access.span);
+        mut call: CallExprNode* = new CallExprNode(member as ExpressionNode*, e.span);
         call.add_argument(access.index);
         const star_tok: Token = Token::new(TokenType::Star, "*",
-            access.span.start_line as int, access.span.start_col as int);
+            e.span.start_line as int, e.span.start_col as int);
         const de: ExpressionNode* =
-            ExpressionNode::synthetic_unary(star_tok, call as ExpressionNode*, access.span);
+            ExpressionNode::synthetic_unary(star_tok, call as ExpressionNode*, e.span);
         const rty: TypeRef = visitor.resolve_expr(de);
         if (!rty.is_valid()) { return null; }
         return de;

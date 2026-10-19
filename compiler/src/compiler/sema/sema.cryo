@@ -74,7 +74,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExpr,
+    ArrayAccessExpr, ArrayExpr, AwaitExprNode, BinaryExpr,
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExpr, LambdaExprNode, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr,
@@ -1317,10 +1317,10 @@ type struct SemaVisitor {
                         const orig_init: ExpressionNode* = var_node.initializer;
                         const sp: SourceSpan = orig_init.span;
                         const zero_lit: ExpressionNode* = ExpressionNode::literal("0", LiteralKind::Integer, sp);
-                        const idx: ArrayAccessNode* = new ArrayAccessNode(orig_init, zero_lit, sp);
+                        const idx: ExpressionNode* = ExpressionNode::array_access_expr(orig_init, zero_lit, sp);
                         const amp_tok: Token = Token::new(TokenType::Amp, "&", sp.start_line as int, sp.start_col as int);
                         const amp: ExpressionNode* =
-                            ExpressionNode::synthetic_unary(amp_tok, idx as ExpressionNode*, sp);
+                            ExpressionNode::synthetic_unary(amp_tok, idx, sp);
                         const n_str: string = fmt::format("%ld", at.size);
                         const n_lit: ExpressionNode* = ExpressionNode::literal(n_str, LiteralKind::Integer, sp);
                         const slice_sym: SymbolStr = this.intern.intern("Slice");
@@ -1666,7 +1666,7 @@ type struct SemaVisitor {
             | NodeKind::Identifier
             | NodeKind::CallExpression
             | NodeKind::LambdaExpression
-            | NodeKind::ArrayAccess | NodeKind::MemberAccess | NodeKind::ScopeResolution
+            | NodeKind::MemberAccess | NodeKind::ScopeResolution
             | NodeKind::AwaitExpression => {
                 this.resolve_expr(n as ExpressionNode*);
             }
@@ -1717,7 +1717,6 @@ type struct SemaVisitor {
             }
             NodeKind::CallExpression    => { this.calls.resolve_call(this, expr as CallExprNode*) }
             NodeKind::MemberAccess      => { this.member.resolve_member_access(this, expr as MemberAccessNode*) }
-            NodeKind::ArrayAccess       => { this.member.resolve_array_access(this, expr as ArrayAccessNode*) }
             NodeKind::ScopeResolution   => {
                 this.calls.located_value_checked(expr, this.resolve_scope_resolution(expr as ScopeResolutionNode*))
             }
@@ -1771,6 +1770,7 @@ type struct SemaVisitor {
             ExprKind::Cast(c) => { this.resolve_cast(expr, c) }
             ExprKind::Unary(u) => { this.resolve_unary(expr, u) }
             ExprKind::Binary(b) => { this.resolve_binary(expr, b) }
+            ExprKind::ArrayAccess(a) => { this.member.resolve_array_access(this, expr, a) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -2685,18 +2685,18 @@ type struct SemaVisitor {
                 if (this.symbolic.symbolic_type_unresolved(ma.object.resolved_type)) { return; }
                 this.check_assignment_lvalue(ma.object);
             }
-            NodeKind::ArrayAccess => {
-                const aa: ArrayAccessNode* = lhs as ArrayAccessNode*;
-                if (aa.array == null) { return; }
-                const arr_t: Type* = this.arena.lookup(aa.array.resolved_type);
-                if (arr_t != null && (arr_t.kind == TypeKind::Pointer || arr_t.kind == TypeKind::Reference)) { return; }
-                if (this.symbolic.symbolic_type_unresolved(aa.array.resolved_type)) { return; }
-                this.check_assignment_lvalue(aa.array);
-            }
             NodeKind::Expression => {
                 if (ExpressionNode::literal_of(lhs) != null) {
                     this.ctx.emit_error_at(ErrorCode::E0232_INVALID_ASSIGNMENT_TARGET,
                         "cannot assign to a literal; the left-hand side of an assignment must be a place (variable, field, or index)", lhs.span);
+                }
+                const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(lhs);
+                if (aa != null) {
+                    if (aa.array == null) { return; }
+                    const arr_t: Type* = this.arena.lookup(aa.array.resolved_type);
+                    if (arr_t != null && (arr_t.kind == TypeKind::Pointer || arr_t.kind == TypeKind::Reference)) { return; }
+                    if (this.symbolic.symbolic_type_unresolved(aa.array.resolved_type)) { return; }
+                    this.check_assignment_lvalue(aa.array);
                 }
             }
             _ => {}
@@ -4470,8 +4470,9 @@ type struct SemaVisitor {
         if (k == NodeKind::MemberAccess) {
             return this.subject_is_caller_backed((e as MemberAccessNode*).object);
         }
-        if (k == NodeKind::ArrayAccess) {
-            return this.subject_is_caller_backed((e as ArrayAccessNode*).array);
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
+        if (aa != null) {
+            return this.subject_is_caller_backed(aa.array);
         }
         return false;
     }

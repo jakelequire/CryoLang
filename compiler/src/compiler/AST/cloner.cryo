@@ -30,7 +30,7 @@ import compiler::ast::declaration::{
     VarDecl
 };
 import compiler::ast::expression::{
-    AlignofExpr, ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExpr,
+    AlignofExpr, ArrayAccessExpr, ArrayExpr, AwaitExprNode, BinaryExpr,
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     LambdaExprNode, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, SizeofExpr, StaticMatchExpr, StructExpr,
@@ -119,7 +119,6 @@ type struct ASTCloner {
             NodeKind::Identifier                => { return this.visit_identifier(n as IdentifierNode*); }
             NodeKind::CallExpression            => { return this.visit_call(n as CallExprNode*); }
             NodeKind::LambdaExpression          => { return this.visit_lambda(n as LambdaExprNode*); }
-            NodeKind::ArrayAccess               => { return this.visit_array_access(n as ArrayAccessNode*); }
             NodeKind::MemberAccess              => { return this.visit_member_access(n as MemberAccessNode*); }
             NodeKind::ScopeResolution           => { return this.visit_scope_resolution(n as ScopeResolutionNode*); }
             NodeKind::AwaitExpression           => { return this.visit_await(n as AwaitExprNode*); }
@@ -378,6 +377,18 @@ type struct ASTCloner {
                                                  this.clone_expr(n.true_expr),
                                                  this.clone_expr(n.false_expr), node.span);
             }
+            ExprKind::ArrayAccess(n) => {
+                c = ExpressionNode::array_access_expr(this.clone_expr(n.array),
+                                                      this.clone_expr(n.index), node.span);
+                // Carry an index-operator-overload desugar (`*(a.index(i))`,
+                // built at sema for a bounded-param or generic container) into
+                // the specialization so the substituter can concretize its
+                // type-args and codegen finds it.
+                if (n.desugared_call != null) {
+                    mut ca: ArrayAccessExpr* = ExpressionNode::array_access_of(c);
+                    ca.desugared_call = this.clone_expr(n.desugared_call);
+                }
+            }
             ExprKind::Binary(n) => {
                 c = ExpressionNode::binary_expr(n.op, this.clone_expr(n.left),
                                                 this.clone_expr(n.right), node.span);
@@ -495,21 +506,6 @@ type struct ASTCloner {
         return c;
     }
 
-    visit_array_access(mut &this, node: ArrayAccessNode*) -> ASTNode* {
-        mut c: ArrayAccessNode* = new ArrayAccessNode(
-            this.clone_expr(node.array),
-            this.clone_expr(node.index),
-            node.span
-        );
-        c.has_error = node.has_error;
-        // Carry an index-operator-overload desugar (`*(a.index(i))`, built at
-        // sema for a bounded-param or generic container) into the specialization
-        // so the substituter can concretize its type-args and codegen finds it.
-        if (node.desugared_call != null) {
-            c.desugared_call = this.clone_expr(node.desugared_call);
-        }
-        return c;
-    }
 
     visit_member_access(mut &this, node: MemberAccessNode*) -> ASTNode* {
         mut c: MemberAccessNode* = new MemberAccessNode(
