@@ -74,7 +74,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    ArrayAccessExpr, ArrayExpr, AwaitExprNode, BinaryExpr,
+    ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr,
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExpr, LambdaExpr, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr,
@@ -1664,8 +1664,7 @@ type struct SemaVisitor {
             NodeKind::Expression
             | NodeKind::Identifier
             | NodeKind::CallExpression
-            | NodeKind::MemberAccess | NodeKind::ScopeResolution
-            | NodeKind::AwaitExpression => {
+            | NodeKind::MemberAccess | NodeKind::ScopeResolution => {
                 this.resolve_expr(n as ExpressionNode*);
             }
 
@@ -1719,7 +1718,6 @@ type struct SemaVisitor {
                 this.calls.located_value_checked(expr, this.resolve_scope_resolution(expr as ScopeResolutionNode*))
             }
             NodeKind::Expression        => { this.resolve_expr_shape(expr) }
-            NodeKind::AwaitExpression   => { this.resolve_await(expr as AwaitExprNode*) }
             _ => { TypeRef::invalid() }
         };
         if (result.is_valid()) { expr.set_resolved_type(result); }
@@ -1769,6 +1767,7 @@ type struct SemaVisitor {
             ExprKind::Binary(b) => { this.resolve_binary(expr, b) }
             ExprKind::ArrayAccess(a) => { this.member.resolve_array_access(this, expr, a) }
             ExprKind::Lambda(l) => { this.lambda.resolve_lambda(this, expr, l) }
+            ExprKind::Await(a) => { this.resolve_await(expr, a) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -1780,7 +1779,7 @@ type struct SemaVisitor {
     /// at the right type, and (b) leaves the projected type cached on the node
     /// so the lowering can read the awaited future type (`operand`) and its
     /// result type (this node) without re-projecting.
-    resolve_await(mut &this, node: AwaitExprNode*) -> TypeRef {
+    resolve_await(mut &this, e: ExpressionNode*, node: AwaitExpr*) -> TypeRef {
         if (node == null || node.operand == null) { return TypeRef::invalid(); }
         const fut_ty: TypeRef = this.resolve_expr(node.operand);
         if (!fut_ty.is_valid()) { return TypeRef::invalid(); }
@@ -1815,7 +1814,7 @@ type struct SemaVisitor {
             const disp: string = this.arena.resolve_display_name(fut_ty);
             this.ctx.emit_error_at(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
                 fmt::format("`await` requires an expression whose type implements `Future`; `%s` does not", disp),
-                node.span);
+                e.span);
             return TypeRef::invalid();
         }
         return out_ty;

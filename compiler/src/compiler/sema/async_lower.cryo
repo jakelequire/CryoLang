@@ -62,7 +62,7 @@ import compiler::ast::declaration::{
     VarDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessExpr, ArrayExpr, AwaitExprNode, BinaryExpr, CallExprNode,
+    ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr, CallExprNode,
     CastExpr, DeleteExpr, ExpressionNode, FieldInit, IdentifierNode, IfExpr,
     LambdaExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr, TernaryExpr,
@@ -1149,8 +1149,9 @@ type struct AsyncLower {
             }
             return;
         }
-        if (k == NodeKind::AwaitExpression) {
-            this.rewrite_returns_expr((e as AwaitExprNode*).operand, poll_out, span);
+        const rr_aw: AwaitExpr* = ExpressionNode::await_of(e);
+        if (rr_aw != null) {
+            this.rewrite_returns_expr(rr_aw.operand, poll_out, span);
             return;
         }
     }
@@ -1165,8 +1166,9 @@ type struct AsyncLower {
     expr_await_count(&this, e: ExpressionNode*) -> i64 {
         if (e == null) { return 0; }
         const k: NodeKind = (e as ASTNode*).kind;
-        if (k == NodeKind::AwaitExpression) {
-            return 1 + this.expr_await_count((e as AwaitExprNode*).operand);
+        const count_aw: AwaitExpr* = ExpressionNode::await_of(e);
+        if (count_aw != null) {
+            return 1 + this.expr_await_count(count_aw.operand);
         }
         const await_try: TryExpr* = ExpressionNode::try_of(e);
         if (await_try != null) {
@@ -1340,10 +1342,10 @@ type struct AsyncLower {
     }
 
     /// If `stmt`'s TOP-LEVEL expression is an `await`, return that node; else
-    /// null. The three carriers Inc 2 supports: `const/mut x = await e;`,
-    /// `return await e;`, and a bare `await e;`. An await nested deeper in an
-    /// expression is intentionally not a carrier (the count gate rejects it).
-    stmt_toplevel_await(&this, stmt: Stmt*) -> AwaitExprNode* {
+    /// null. The three carriers: `const/mut x = await e;`, `return await e;`,
+    /// and a bare `await e;`. An await nested deeper in an expression is
+    /// intentionally not a carrier (the count gate rejects it).
+    stmt_toplevel_await(&this, stmt: Stmt*) -> ExpressionNode* {
         if (stmt == null) { return null; }
         mut e: ExpressionNode* = null;
         match (stmt.shape) {
@@ -1355,8 +1357,8 @@ type struct AsyncLower {
             StmtKind::Expr(es)   => { e = es.expression; }
             _                    => {}
         }
-        if (e != null && e.kind == NodeKind::AwaitExpression) {
-            return e as AwaitExprNode*;
+        if (ExpressionNode::await_of(e) != null) {
+            return e;
         }
         return null;
     }
@@ -1790,8 +1792,9 @@ type struct AsyncLower {
         if (read_delete != null) {
             return this.name_read_in_expr(read_delete.operand, key);
         }
-        if (k == NodeKind::AwaitExpression) {
-            return this.name_read_in_expr((e as AwaitExprNode*).operand, key);
+        const read_aw: AwaitExpr* = ExpressionNode::await_of(e);
+        if (read_aw != null) {
+            return this.name_read_in_expr(read_aw.operand, key);
         }
         const read_try: TryExpr* = ExpressionNode::try_of(e);
         if (read_try != null) {
@@ -2130,8 +2133,8 @@ type struct AsyncLower {
             sl.field_inits = newf;
             return e;
         }
-        if (k == NodeKind::AwaitExpression) {
-            const aw: AwaitExprNode* = e as AwaitExprNode*;
+        mut aw: AwaitExpr* = ExpressionNode::await_of(e);
+        if (aw != null) {
             // The operand is MOVED into the sub-future field the resume state
             // polls (`this.fut_N = Option::Some(<operand>)`), so awaiting a
             // future held in a local hands that future over.
@@ -2588,7 +2591,7 @@ type struct AsyncLower {
             sm.blocks[cur].as_block().add_statement(stmt);
             return cur;
         }
-        const aw: AwaitExprNode* = this.stmt_toplevel_await(stmt);
+        const aw: ExpressionNode* = this.stmt_toplevel_await(stmt);
         if (aw != null) { return this.lower_carrier_sm(sm, stmt, aw, cur); }
         match (stmt.shape) {
             // A bare `{ … await … }` block is just a nested statement sequence:
@@ -3090,15 +3093,16 @@ type struct AsyncLower {
     /// `return await e;`, `await e;`): stash the sub-future in `cur`, allocate a
     /// resume state that polls it (suspending on `Pending`, re-entering itself),
     /// and run the carrier there with its `await` replaced by the ready result.
-    lower_carrier_sm(mut &this, sm: PollSm*, stmt: Stmt*, aw: AwaitExprNode*, cur: i64) -> i64 {
+    lower_carrier_sm(mut &this, sm: PollSm*, stmt: Stmt*, aw_e: ExpressionNode*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
+        const aw: AwaitExpr* = ExpressionNode::await_of(aw_e);
         if (aw.operand == null) {
             this.ctx.emit_error_at(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
                 "async: malformed `await` (no operand)", span);
             sm.ok = false; return cur;
         }
         const fi: TypeRef = aw.operand.resolved_type;
-        const ao: TypeRef = aw.resolved_type;
+        const ao: TypeRef = aw_e.resolved_type;
         if (!fi.is_valid() || !ao.is_valid()) {
             this.ctx.emit_error_at(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
                 "async: could not resolve an awaited future's type (its operand must implement `Future`)", span);
@@ -3113,7 +3117,7 @@ type struct AsyncLower {
             this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
                 fmt::format("async: this `await` hands the address of the local or parameter `%s` to a future that outlives the current step; each poll runs on a fresh frame, so the address is dangling when the future resumes — have the caller own the storage and pass a pointer parameter, or use an operation that owns the buffer itself",
                        this.intern.resolve(this.source_name(this.local_key(op_root as ExpressionNode*), op_root.name))),
-                aw.span);
+                aw_e.span);
             sm.ok = false; return cur;
         }
 
@@ -3126,7 +3130,7 @@ type struct AsyncLower {
         if (this.future_reaches(fi.key(), sm.struct_ref.key())) {
             this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                 "async: this `await` would make the state machine contain itself, which has no finite size (the awaited future leads back to this one); rewrite the recursion as a loop",
-                aw.span);
+                aw_e.span);
             sm.ok = false; return cur;
         }
         // Recorded before the operand is stashed, so `promote_cross_state` can
@@ -3183,7 +3187,7 @@ type struct AsyncLower {
         // stale pointer from the second poll onwards, silently.
         if (!this.emit_recv_refresh(sm, resume, aw.operand,
                                     this.ident_bound(subp_sym, subp_id, fi_ptr, span),
-                                    aw.span, span)) {
+                                    aw_e.span, span)) {
             sm.ok = false; return cur;
         }
 
@@ -4123,8 +4127,9 @@ type struct AsyncLower {
             }
             return false;
         }
-        if (k == NodeKind::AwaitExpression) {
-            return this.expr_has_free_edge((e as AwaitExprNode*).operand, break_only);
+        const edge_aw: AwaitExpr* = ExpressionNode::await_of(e);
+        if (edge_aw != null) {
+            return this.expr_has_free_edge(edge_aw.operand, break_only);
         }
         const edge_try: TryExpr* = ExpressionNode::try_of(e);
         if (edge_try != null) {
@@ -5328,8 +5333,9 @@ type struct AsyncLower {
             }
             return null;
         }
-        if (k == NodeKind::AwaitExpression) {
-            return this.frame_addr_root_expr(sm, (e as AwaitExprNode*).operand);
+        const root_aw: AwaitExpr* = ExpressionNode::await_of(e);
+        if (root_aw != null) {
+            return this.frame_addr_root_expr(sm, root_aw.operand);
         }
         const addr_try: TryExpr* = ExpressionNode::try_of(e);
         if (addr_try != null) {
@@ -5884,10 +5890,10 @@ type struct AsyncLower {
             return e;
         }
 
-        if (k == NodeKind::AwaitExpression) {
-            mut aw: AwaitExprNode* = e as AwaitExprNode*;
-            aw.operand = this.hoist_expr(aw.operand, pre);
-            const ao: TypeRef = aw.resolved_type;
+        mut hoist_aw: AwaitExpr* = ExpressionNode::await_of(e);
+        if (hoist_aw != null) {
+            hoist_aw.operand = this.hoist_expr(hoist_aw.operand, pre);
+            const ao: TypeRef = e.resolved_type;
             if (!ao.is_valid()) { return e; }
             const t: MintedLocal = this.mint_temp("__aw");
             pre.push(this.var_decl_stmt_bound(t.name, t.sym, false, ao, e, span));
@@ -6296,8 +6302,8 @@ type struct AsyncLower {
         // A `?` is never the top-level `await` shape the state machine explodes:
         // its own `await` sits inside the operand and must be lifted out, which
         // is `hoist_expr`'s `?` arm.
-        if ((e as ASTNode*).kind == NodeKind::AwaitExpression) {
-            mut aw: AwaitExprNode* = e as AwaitExprNode*;
+        mut aw: AwaitExpr* = ExpressionNode::await_of(e);
+        if (aw != null) {
             aw.operand = this.hoist_expr(aw.operand, pre);
             return e;
         }
@@ -6631,8 +6637,9 @@ type struct AsyncLower {
         if (rn_delete != null) {
             this.rn_expr(map, rn_delete.operand); return;
         }
-        if (k == NodeKind::AwaitExpression) {
-            this.rn_expr(map, (e as AwaitExprNode*).operand); return;
+        const rn_aw: AwaitExpr* = ExpressionNode::await_of(e);
+        if (rn_aw != null) {
+            this.rn_expr(map, rn_aw.operand); return;
         }
         const rn_try: TryExpr* = ExpressionNode::try_of(e);
         if (rn_try != null) {
@@ -6946,8 +6953,9 @@ type struct AsyncLower {
         if (rb_delete != null) {
             this.rb_expr(ctx, rb_delete.operand); return;
         }
-        if (k == NodeKind::AwaitExpression) {
-            this.rb_expr(ctx, (e as AwaitExprNode*).operand); return;
+        const rb_aw: AwaitExpr* = ExpressionNode::await_of(e);
+        if (rb_aw != null) {
+            this.rb_expr(ctx, rb_aw.operand); return;
         }
         const rb_try: TryExpr* = ExpressionNode::try_of(e);
         if (rb_try != null) {

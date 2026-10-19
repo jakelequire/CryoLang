@@ -49,7 +49,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    AlignofExpr, ArrayAccessExpr, ArrayExpr, AwaitExprNode, BinaryExpr,
+    AlignofExpr, ArrayAccessExpr, ArrayExpr, BinaryExpr,
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     LambdaExpr, LiteralExpr, MatchExpr, MemberAccessNode,
     ScopeResolutionNode, SizeofExpr, StaticMatchExpr, StructExpr,
@@ -204,7 +204,6 @@ type struct IRGeneratorVisitor {
             NodeKind::CallExpression         => { return this.visit_call(n as CallExprNode*); }
             NodeKind::MemberAccess           => { return this.visit_member_access(n as MemberAccessNode*); }
             NodeKind::ScopeResolution        => { return this.visit_scope_resolution(n as ScopeResolutionNode*); }
-            NodeKind::AwaitExpression        => { return this.visit_await(n as AwaitExprNode*); }
 
             NodeKind::Statement              => { return this.emit_stmt(n as Stmt*); }
 
@@ -261,6 +260,7 @@ type struct IRGeneratorVisitor {
                     ExprKind::Binary(b) => { return this.visit_binary(e, b); }
                     ExprKind::ArrayAccess(a) => { return this.visit_array_access(e, a); }
                     ExprKind::Lambda(l) => { return this.visit_lambda(e, l); }
+                    ExprKind::Await(_) => { return this.visit_await(e); }
                     ExprKind::If(i) => {
                         return this.emit_conditional(e, i.condition, i.then_expr, i.else_expr);
                     }
@@ -2127,11 +2127,11 @@ type struct IRGeneratorVisitor {
     // clear diagnostic and give no value, so downstream code fails loudly
     // rather than wrongly.
 
-    visit_await(mut &this, node: AwaitExprNode*) -> Emitted {
+    visit_await(mut &this, e: ExpressionNode*) -> Emitted {
         mut out: Emitted = Emitted::none();
         // The async lowering (`sema/async_lower.cryo`) rewrites every `await` in
-        // an `async function` into an explicit poll state machine, so a surviving
-        // `AwaitExprNode` here was never lowered. Two causes: an `await` outside
+        // an `async function` into an explicit poll state machine, so an
+        // `await` reaching codegen was never lowered. Two causes: an `await` outside
         // an `async function` (a lambda body is its own function, so an `await`
         // there is this case), or one enclosed in a form the lowering's walkers
         // do not descend into - never counted as a suspension, so the body is
@@ -2142,7 +2142,7 @@ type struct IRGeneratorVisitor {
         // stale value.
         this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: this `await` was never lowered; it is either outside an `async function` (a lambda body is its own function) or inside a `switch`, which the async lowering does not walk - lift it out of that form, or bind it to a `const` before it",
-            node.span);
+            e.span);
         out.value     = LValue::null();
         out.is_lvalue = false;
         return out;
