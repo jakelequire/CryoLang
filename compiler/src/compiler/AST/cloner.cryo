@@ -32,7 +32,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     AlignofExpr, ArrayAccessExpr, ArrayExpr, AwaitExprNode, BinaryExpr,
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
-    LambdaExprNode, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
+    LambdaExpr, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, SizeofExpr, StaticMatchExpr, StructExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExpr
 };
@@ -118,7 +118,6 @@ type struct ASTCloner {
 
             NodeKind::Identifier                => { return this.visit_identifier(n as IdentifierNode*); }
             NodeKind::CallExpression            => { return this.visit_call(n as CallExprNode*); }
-            NodeKind::LambdaExpression          => { return this.visit_lambda(n as LambdaExprNode*); }
             NodeKind::MemberAccess              => { return this.visit_member_access(n as MemberAccessNode*); }
             NodeKind::ScopeResolution           => { return this.visit_scope_resolution(n as ScopeResolutionNode*); }
             NodeKind::AwaitExpression           => { return this.visit_await(n as AwaitExprNode*); }
@@ -377,6 +376,32 @@ type struct ASTCloner {
                                                  this.clone_expr(n.true_expr),
                                                  this.clone_expr(n.false_expr), node.span);
             }
+            ExprKind::Lambda(n) => {
+                c = ExpressionNode::lambda_expr(node.span);
+                mut cl: LambdaExpr* = ExpressionNode::lambda_of(c);
+                for (mut i: i64 = 0; i < n.parameters.length; i++) {
+                    cl.add_parameter(this.clone_var_decl(n.parameters[i]));
+                }
+                if (n.return_type.is_valid()) {
+                    cl.set_return_type(n.return_type);
+                }
+                if (n.return_type_ann != null) {
+                    cl.set_return_type_ann(n.return_type_ann.clone());
+                }
+                if (n.body != null) {
+                    cl.set_body(this.clone_stmt(n.body));
+                }
+                // Captures are normally populated during Sema, which runs after
+                // cloning, so this loop is a no-op in practice; defensive in
+                // case an already-sema'd lambda is ever cloned later.
+                for (mut k: i64 = 0; k < n.captured_names.length; k++) {
+                    cl.add_capture(n.captured_names[k],
+                                   n.captured_syms[k],
+                                   n.captured_types[k],
+                                   n.captured_spans[k]);
+                }
+                cl.is_move = n.is_move;
+            }
             ExprKind::ArrayAccess(n) => {
                 c = ExpressionNode::array_access_expr(this.clone_expr(n.array),
                                                       this.clone_expr(n.index), node.span);
@@ -477,34 +502,6 @@ type struct ASTCloner {
         return c;
     }
 
-
-    visit_lambda(mut &this, node: LambdaExprNode*) -> ASTNode* {
-        mut c: LambdaExprNode* = new LambdaExprNode(node.span);
-        for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            c.add_parameter(this.clone_var_decl(node.parameters[i]));
-        }
-        if (node.return_type.is_valid()) {
-            c.set_return_type(node.return_type);
-        }
-        if (node.return_type_ann != null) {
-            c.set_return_type_ann(node.return_type_ann.clone());
-        }
-        if (node.body != null) {
-            c.set_body(this.clone_stmt(node.body));
-        }
-        // Captures are normally populated during Sema, which runs after
-        // cloning, so this loop is a no-op in practice; defensive in case
-        // an already-sema'd lambda is ever cloned later.
-        for (mut k: i64 = 0; k < node.captured_names.length; k++) {
-            c.add_capture(node.captured_names[k],
-                          node.captured_syms[k],
-                          node.captured_types[k],
-                          node.captured_spans[k]);
-        }
-        c.is_move   = node.is_move;
-        c.has_error = node.has_error;
-        return c;
-    }
 
 
     visit_member_access(mut &this, node: MemberAccessNode*) -> ASTNode* {

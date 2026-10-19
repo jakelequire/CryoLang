@@ -44,7 +44,7 @@ import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::ast::expression::{
     CalleePin,
-    CallExprNode, ExpressionNode, IdentifierNode, LambdaExprNode, MemberAccessNode
+    CallExprNode, ExpressionNode, IdentifierNode, LambdaExpr, MemberAccessNode
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
@@ -112,12 +112,12 @@ type struct LambdaSynth {
     /// Type a lambda: resolve its param/return types, walk its body in a fresh
     /// per-function frame (capturing free variables), and return either the
     /// synthesised closure-struct type (capturing) or a function type (non-capturing).
-    resolve_lambda(mut &this, visitor: SemaVisitor*, node: LambdaExprNode*) -> TypeRef {
+    resolve_lambda(mut &this, visitor: SemaVisitor*, e: ExpressionNode*, node: LambdaExpr*) -> TypeRef {
         // One-shot guard: a capturing lambda an earlier walk already lowered
         // carries its closure-struct type - return it, don't re-lower.
-        if (node.is_capturing() && node.has_resolved_type()
-                && this.is_closure_struct_type(node.resolved_type)) {
-            return node.resolved_type;
+        if (node.is_capturing() && e.has_resolved_type()
+                && this.is_closure_struct_type(e.resolved_type)) {
+            return e.resolved_type;
         }
 
         mut res_ctx: ResolutionContext = ResolutionContext::new("");
@@ -158,7 +158,7 @@ type struct LambdaSynth {
         const saved_expected:  TypeRef         = this.state.expected_type;
         const saved_loop:      i32             = this.state.loop_depth;
         const saved_lambda_depth: i32                   = this.state.in_lambda_depth;
-        const saved_current_lam:  LambdaExprNode*       = this.state.current_lambda;
+        const saved_current_lam:  LambdaExpr*           = this.state.current_lambda;
         mut saved_bindings: HashMap<SymbolKey, LocalBinding> = HashMap::<SymbolKey, LocalBinding>::new();
         mut saved_binding_undo: [SymbolKey] = [];
         mut saved_binding_prev: [LocalBinding] = [];
@@ -256,7 +256,7 @@ type struct LambdaSynth {
         }
 
         if (node.is_capturing()) {
-            return this.synthesize_closure_struct(node);
+            return this.synthesize_closure_struct(node, e.span);
         }
         return this.arena.get_function(ret_ty, param_types, false);
     }
@@ -306,13 +306,13 @@ type struct LambdaSynth {
     }
 
     /// Synthesise the closure-struct + `__call__` (+ `Drop` for non-Copy captures)
-    /// for a capturing lambda; returns the closure struct's TypeRef.
-    synthesize_closure_struct(mut &this, lambda: LambdaExprNode*) -> TypeRef {
+    /// for a capturing lambda written at `span`; returns the closure struct's
+    /// TypeRef.
+    synthesize_closure_struct(mut &this, lambda: LambdaExpr*, span: SourceSpan) -> TypeRef {
         const ctx_ptr: CompilationContext* = this.ctx;
         const intern_ptr: InternTable* = this.intern;
         const arena_ptr: TypeArena* = this.arena;
 
-        const span: SourceSpan = lambda.span;
         const closure_def: DefId = this.mint_closure_def(span);
         const qual_name: SymbolStr = ctx_ptr.defs.path_of(closure_def).spelling();
 
@@ -473,7 +473,7 @@ type struct LambdaSynth {
     /// after its `drop` runs, as any aggregate's are.  Being the closure's
     /// destructor, it is what a written `f.drop()` and the scope-exit
     /// release both reach.
-    closure_drop_impl(mut &this, lambda: LambdaExprNode*, struct_decl: StructDecl*,
+    closure_drop_impl(mut &this, lambda: LambdaExpr*, struct_decl: StructDecl*,
                       struct_ref: TypeRef, span: SourceSpan) -> DeclarationNode* {
         const registry_ptr: GenericRegistry* = this.ctx.get_generic_registry();
         mut has_noncopy_capture: boolean = false;

@@ -243,6 +243,22 @@ public:
         }), span);
     }
 
+    /// A lambda at `span` with no parameters, return type or body yet; the
+    /// parser and the cloner fill them in.
+    static lambda_expr(span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Lambda(new LambdaExpr {
+            parameters:      [],
+            return_type:     TypeRef::invalid(),
+            return_type_ann: null,
+            body:            null,
+            captured_names:  [],
+            captured_syms:   [],
+            captured_types:  [],
+            captured_spans:  [],
+            is_move:         false,
+        }), span);
+    }
+
     /// `array[index]` at `span`.
     static array_access_expr(array: ExpressionNode*, index: ExpressionNode*,
                              span: SourceSpan) -> ExpressionNode* {
@@ -437,6 +453,16 @@ public:
         };
     }
 
+    /// The lambda `n` is, or null.
+    static lambda_of(n: ASTNode*) -> LambdaExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::Lambda(l) => { l }
+            _                   => { null }
+        };
+    }
+
     /// The indexing `n` is, or null.
     static array_access_of(n: ASTNode*) -> ArrayAccessExpr* {
         const e: ExpressionNode* = ExpressionNode::with_shape(n);
@@ -511,6 +537,7 @@ type enum ExprKind {
     Cast(CastExpr*);
     Delete(DeleteExpr*);
     If(IfExpr*);
+    Lambda(LambdaExpr*);
     Literal(LiteralExpr*);
     Match(MatchExpr*);
     New(NewExpr*);
@@ -1291,8 +1318,8 @@ implement trait Allocate for struct TupleExpr {
 }
 
 
-type class LambdaExprNode : ExpressionNode {
-public:
+/// `(parameters) -> return_type_ann { body }`, `move` or not.
+type struct LambdaExpr {
     parameters:      [DeclarationNode*];
     return_type:     TypeRef;
     return_type_ann: TypeAnnotation*;
@@ -1317,39 +1344,33 @@ public:
     // Drop method that drops each non-Copy field.
     is_move:         boolean;
 
-    LambdaExprNode(span: SourceSpan)
-        : ExpressionNode(NodeKind::LambdaExpression, span) {
-        this.parameters      = [];
-        this.return_type     = TypeRef::invalid();
-        this.return_type_ann = null;
-        this.body            = null;
-        this.captured_names  = [];
-        this.captured_syms   = [];
-        this.captured_types  = [];
-        this.captured_spans  = [];
-        this.is_move         = false;
+    static walk_children<V>(n: LambdaExpr*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.parameters.length; i++) {
+            v.walk_decl(n.parameters[i] as DeclarationNode*);
+        }
+        v.walk_stmt(n.body);
     }
 
-    add_parameter(param: DeclarationNode*) -> void {
+    add_parameter(mut &this, param: DeclarationNode*) -> void {
         this.parameters.push(param);
     }
 
-    set_return_type(t: TypeRef) -> void {
+    set_return_type(mut &this, t: TypeRef) -> void {
         this.return_type = t;
     }
 
-    set_return_type_ann(ann: TypeAnnotation*) -> void {
+    set_return_type_ann(mut &this, ann: TypeAnnotation*) -> void {
         this.return_type_ann = ann;
     }
 
-    set_body(b: Stmt*) -> void {
+    set_body(mut &this, b: Stmt*) -> void {
         this.body = b;
     }
 
     /// Record a free-variable use of an outer-scope binding.  Idempotent:
     /// a binding already in `captured_syms` is not re-added (the body may
     /// reference the same outer local multiple times).
-    add_capture(name: SymbolStr, sym: SymbolID, ty: TypeRef, span: SourceSpan) -> void {
+    add_capture(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef, span: SourceSpan) -> void {
         for (mut i: i64 = 0; i < this.captured_syms.length; i++) {
             if (this.captured_syms[i].equals(sym)) { return; }
         }
@@ -1359,8 +1380,14 @@ public:
         this.captured_spans.push(span);
     }
 
-    is_capturing() -> boolean {
+    is_capturing(&this) -> boolean {
         return this.captured_names.length > 0;
+    }
+}
+
+implement trait Allocate for struct LambdaExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

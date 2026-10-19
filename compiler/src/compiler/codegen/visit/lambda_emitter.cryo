@@ -33,7 +33,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{ DeclarationNode, VarDecl };
 import compiler::ast::expression::{
-    ExpressionNode, FieldInit, IdentifierNode, LambdaExprNode, StructExpr
+    ExpressionNode, FieldInit, IdentifierNode, LambdaExpr, StructExpr
 };
 import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::codegen::visit::ir_generator;
@@ -92,7 +92,7 @@ type struct LambdaEmitter {
     /// so this module doesn't have to import the concrete visitor type
     /// (cycle-avoidance - `ir_generator.cryo` already imports this module
     /// to hold a `LambdaEmitter` field).
-    emit(mut &this, visitor: IRGeneratorVisitor*, node: LambdaExprNode*) -> Emitted {
+    emit(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: LambdaExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         if (node == null) {
             out.value     = LValue::null();
@@ -101,7 +101,7 @@ type struct LambdaEmitter {
         }
 
         if (node.is_capturing()) {
-            return this.emit_capturing(visitor, node);
+            return this.emit_capturing(visitor, e, node);
         }
 
         const ctx_ptr: CompilationContext* = this.cg.ctx;
@@ -286,7 +286,7 @@ type struct LambdaEmitter {
     }
 
     /// Capturing-lambda codegen: materialise a value of the closure struct
-    /// type stamped on `node.resolved_type` by Sema, with each field
+    /// type Sema stamped as the lambda's resolved type, with each field
     /// initialised from the corresponding captured local in scope.  Built
     /// as a transient struct literal so the normal struct-literal
     /// codegen path handles the alloca + GEP-store sequence; we just
@@ -297,9 +297,10 @@ type struct LambdaEmitter {
     /// lives on the synthesised `<closure_struct>::__call__` method,
     /// emitted by ordinary method codegen when the StructDecl Sema
     /// injected reaches Phase 7's codegen sweep.
-    emit_capturing(mut &this, visitor: IRGeneratorVisitor*, node: LambdaExprNode*) -> Emitted {
+    emit_capturing(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*,
+                   node: LambdaExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
-        const closure_ty: TypeRef = node.resolved_type;
+        const closure_ty: TypeRef = e.resolved_type;
         if (!closure_ty.is_valid()) {
             // Sema should have set this; if not, fall back to a null value
             // and let downstream verification catch the bug.
@@ -311,14 +312,14 @@ type struct LambdaEmitter {
         const arena: TypeArena* = this.cg.ctx.type_arena;
         const struct_name: SymbolStr = arena.get_qualified_name(closure_ty).spelling();
 
-        mut lit_e: ExpressionNode* = ExpressionNode::struct_expr(struct_name, node.span);
+        mut lit_e: ExpressionNode* = ExpressionNode::struct_expr(struct_name, e.span);
         lit_e.set_resolved_type(closure_ty);
         mut lit: StructExpr* = ExpressionNode::struct_of(lit_e);
 
         for (mut i: i64 = 0; i < node.captured_names.length; i++) {
             const cap_name: SymbolStr = node.captured_names[i];
             const cap_ty:   TypeRef   = node.captured_types[i];
-            mut ident: IdentifierNode* = new IdentifierNode(cap_name, node.span);
+            mut ident: IdentifierNode* = new IdentifierNode(cap_name, e.span);
             ident.set_res(Res::Local(node.captured_syms[i]));
             ident.set_resolved_type(cap_ty);
             // The closure struct's fields ARE the captures, in this order
@@ -328,7 +329,7 @@ type struct LambdaEmitter {
             const init: FieldInit = FieldInit {
                 field_name: cap_name,
                 value:      ident as ExpressionNode*,
-                span:        node.span,
+                span:        e.span,
                 pin:         MemberPin::Field(0, i),
                 pin_carried: false,
             };
