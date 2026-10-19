@@ -65,7 +65,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     CalleePin,
     BinaryExprNode, CallExprNode, ExpressionNode, IdentifierNode, LiteralExpr,
-    MemberAccessNode, ScopeResolutionNode, UnaryExprNode
+    MemberAccessNode, ScopeResolutionNode, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::lex::{ TokenType };
@@ -766,8 +766,8 @@ type struct CallResolver {
     /// it: the operand of `(*q).drop()`, the address of `x` in `x.drop()`.
     /// A receiver that is not a name or a field path reads `p`.
     pointer_to_receiver_text(&this, recv: ExpressionNode*) -> string {
-        if (recv != null && recv.kind == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = recv as UnaryExprNode*;
+        const u: UnaryExpr* = ExpressionNode::unary_of(recv);
+        if (u != null) {
             if (u.op.kind == TokenType::Star) {
                 const inner: string = this.place_text(u.operand);
                 return if (inner.length() > 0) { inner } else { "p" };
@@ -1068,7 +1068,7 @@ type struct CallResolver {
                             || is_narrow_float_type(this.arena, slot))) {
                     push_expected = true;
                 } else if ((arg_node.kind == NodeKind::BinaryExpression
-                            || arg_node.kind == NodeKind::UnaryExpression)
+                            || ExpressionNode::unary_of(arg_node) != null)
                         && is_constant_numeric_expr(arg)
                         && !is_negative_numeric_literal_expr(arg)
                         && (is_wide_int_type(this.arena, slot)
@@ -1105,7 +1105,7 @@ type struct CallResolver {
                     // other argument changes which type it takes - in particular
                     // a `null` bound to a `T*` parameter still must not pin `T`.
                     push_expected = true;
-                } else if (arg_node.kind == NodeKind::UnaryExpression) {
+                } else if (ExpressionNode::unary_of(arg_node) != null) {
                     // Address-of-a-literal arg (`&<literal>`) bound to a `&T`
                     // parameter: forward the reference type so `resolve_unary`
                     // hints the referent `T` to the literal. A synthetic
@@ -1115,7 +1115,7 @@ type struct CallResolver {
                     // temp and the callee's `*rhs` reads uninitialised high
                     // bytes. Scoped to a literal operand so `&place` / `&mut`
                     // argument typing is untouched.
-                    const u_arg: UnaryExprNode* = arg as UnaryExprNode*;
+                    const u_arg: UnaryExpr* = ExpressionNode::unary_of(arg_node);
                     const pt_ref: Type* = this.arena.lookup(slot);
                     if (u_arg.op.kind == TokenType::Amp && u_arg.operand != null
                         && ExpressionNode::literal_of(u_arg.operand) != null
@@ -1576,8 +1576,8 @@ type struct CallResolver {
         if (lit != null) {
             return lit.literal_kind == LiteralKind::Integer || lit.literal_kind == LiteralKind::Float;
         }
-        if (node.kind == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = expr as UnaryExprNode*;
+        const u: UnaryExpr* = ExpressionNode::unary_of(node);
+        if (u != null) {
             if (u.op.kind == TokenType::Minus || u.op.kind == TokenType::Plus || u.op.kind == TokenType::Tilde) {
                 return this.sema_arg_is_polymorphic_literal(u.operand);
             }
@@ -6664,8 +6664,9 @@ type struct CallResolver {
             const arg: ExpressionNode* = call.arguments[first_shared];
             // The borrowed binding's name, when the argument is `&name`.
             mut borrowed: string = "";
-            if ((arg as ASTNode*).kind == NodeKind::UnaryExpression) {
-                const operand: ExpressionNode* = (arg as UnaryExprNode*).operand;
+            const arg_un: UnaryExpr* = ExpressionNode::unary_of(arg);
+            if (arg_un != null) {
+                const operand: ExpressionNode* = arg_un.operand;
                 if (operand != null && (operand as ASTNode*).kind == NodeKind::Identifier) {
                     borrowed = this.intern.resolve((operand as IdentifierNode*).name);
                 }

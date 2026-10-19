@@ -133,6 +133,14 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-19
+
+452. **Indexing a call's fixed-size array result (`pair()[1]`) and an
+     `Array` whose elements are fixed-size arrays are fixed after the
+     expressions finish converting to payloads,** not before: both fail at
+     LLVM verification on the parent compiler too, and neither blocks the
+     conversion.  (Delegated)
+
 ### 2026-10-18
 
 438. **A `Location` constant keeps its pointers, and the growth of the

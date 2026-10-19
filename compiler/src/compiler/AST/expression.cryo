@@ -243,6 +243,27 @@ public:
         }), span);
     }
 
+    /// The prefix `op operand` at `span`, written by the user.
+    static unary_expr(op: Token, operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Unary(new UnaryExpr {
+            op:               op,
+            operand:          operand,
+            is_postfix:       false,
+            is_synthetic:     false,
+            desugared_call:   null,
+            desugar_by_bound: false,
+        }), span);
+    }
+
+    /// The prefix `op operand` at `span`, built by the compiler, which the
+    /// checks that constrain user syntax skip.
+    static synthetic_unary(op: Token, operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        const e: ExpressionNode* = ExpressionNode::unary_expr(op, operand, span);
+        mut u: UnaryExpr* = ExpressionNode::unary_of(e);
+        u.is_synthetic = true;
+        return e;
+    }
+
     /// `match (subject) { }` at `span`; its arms are added after.
     static match_expr(subject: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::Match(new MatchExpr {
@@ -391,6 +412,16 @@ public:
         };
     }
 
+    /// The unary operation `n` is, or null.
+    static unary_of(n: ASTNode*) -> UnaryExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::Unary(u) => { u }
+            _                  => { null }
+        };
+    }
+
     /// The `match` expression `n` is, or null.
     static match_of(n: ASTNode*) -> MatchExpr* {
         const e: ExpressionNode* = ExpressionNode::with_shape(n);
@@ -443,6 +474,7 @@ type enum ExprKind {
     Try(TryExpr*);
     Tuple(TupleExpr*);
     Typeof(TypeofExpr*);
+    Unary(UnaryExpr*);
     Yield(YieldExpr*);
 }
 
@@ -628,8 +660,8 @@ public:
 }
 
 
-type class UnaryExprNode : ExpressionNode {
-public:
+/// `op operand`, or `operand op` for a postfix `++`/`--`.
+type struct UnaryExpr {
     op:         Token;
     operand:    ExpressionNode*;
     /// True for postfix ++/-- (`a++`, `a--`), false for prefix and all
@@ -658,14 +690,14 @@ public:
     /// monomorphization drops the desugar there.
     desugar_by_bound: boolean;
 
-    UnaryExprNode(op: Token, operand: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::UnaryExpression, span) {
-        this.op           = op;
-        this.operand      = operand;
-        this.is_postfix   = false;
-        this.is_synthetic = false;
-        this.desugared_call = null;
-        this.desugar_by_bound = false;
+    static walk_children<V>(n: UnaryExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
+    }
+}
+
+implement trait Allocate for struct UnaryExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

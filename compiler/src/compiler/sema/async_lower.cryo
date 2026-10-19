@@ -66,7 +66,7 @@ import compiler::ast::expression::{
     CastExpr, DeleteExpr, ExpressionNode, FieldInit, IdentifierNode, IfExpr,
     LambdaExprNode, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr, TernaryExpr,
-    TryExpr, TupleExpr, TypeofExpr, UnaryExprNode
+    TryExpr, TupleExpr, TypeofExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
@@ -1094,8 +1094,9 @@ type struct AsyncLower {
             this.rewrite_returns_expr(b.right, poll_out, span);
             return;
         }
-        if (k == NodeKind::UnaryExpression) {
-            this.rewrite_returns_expr((e as UnaryExprNode*).operand, poll_out, span);
+        const rr_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (rr_un != null) {
+            this.rewrite_returns_expr(rr_un.operand, poll_out, span);
             return;
         }
         if (k == NodeKind::CallExpression) {
@@ -1175,8 +1176,9 @@ type struct AsyncLower {
             const b: BinaryExprNode* = e as BinaryExprNode*;
             return this.expr_await_count(b.left) + this.expr_await_count(b.right);
         }
-        if (k == NodeKind::UnaryExpression) {
-            return this.expr_await_count((e as UnaryExprNode*).operand);
+        const count_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (count_un != null) {
+            return this.expr_await_count(count_un.operand);
         }
         if (k == NodeKind::CallExpression) {
             const c: CallExprNode* = e as CallExprNode*;
@@ -1436,10 +1438,9 @@ type struct AsyncLower {
     deref(&this, e: ExpressionNode*, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         const star: Token = Token::new(TokenType::Star, "*",
                                        span.start_line as int, span.start_col as int);
-        mut u: UnaryExprNode* = new UnaryExprNode(star, e, span);
-        u.is_synthetic = true;
+        mut u: ExpressionNode* = ExpressionNode::synthetic_unary(star, e, span);
         u.set_resolved_type(ty);
-        return u as ExpressionNode*;
+        return u;
     }
 
     /// `&(<e>)`, typed as the type check types a written `&e` stored into a
@@ -1449,12 +1450,11 @@ type struct AsyncLower {
     addr_of(&this, e: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         const amp: Token = Token::new(TokenType::Amp, "&",
                                       span.start_line as int, span.start_col as int);
-        mut u: UnaryExprNode* = new UnaryExprNode(amp, e, span);
-        u.is_synthetic = true;
+        mut u: ExpressionNode* = ExpressionNode::synthetic_unary(amp, e, span);
         if (e.resolved_type.is_valid()) {
             u.set_resolved_type(this.arena.get_reference_to(e.resolved_type, RefMutability::Immutable));
         }
-        return u as ExpressionNode*;
+        return u;
     }
 
     /// `this.<field>` on the future struct `struct_ref` this lowering lays
@@ -1727,8 +1727,9 @@ type struct AsyncLower {
             const b: BinaryExprNode* = e as BinaryExprNode*;
             return this.name_read_in_expr(b.left, key) || this.name_read_in_expr(b.right, key);
         }
-        if (k == NodeKind::UnaryExpression) {
-            return this.name_read_in_expr((e as UnaryExprNode*).operand, key);
+        const read_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (read_un != null) {
+            return this.name_read_in_expr(read_un.operand, key);
         }
         if (k == NodeKind::CallExpression) {
             const c: CallExprNode* = e as CallExprNode*;
@@ -2049,10 +2050,10 @@ type struct AsyncLower {
             b.desugared_call = this.subst_name_expr(b.desugared_call, key, field, struct_ref, ty, span, false);
             return e;
         }
-        if (k == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = e as UnaryExprNode*;
-            u.operand = this.subst_name_expr(u.operand, key, field, struct_ref, ty, span, false);
-            u.desugared_call = this.subst_name_expr(u.desugared_call, key, field, struct_ref, ty, span, false);
+        mut subst_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (subst_un != null) {
+            subst_un.operand = this.subst_name_expr(subst_un.operand, key, field, struct_ref, ty, span, false);
+            subst_un.desugared_call = this.subst_name_expr(subst_un.desugared_call, key, field, struct_ref, ty, span, false);
             return e;
         }
         if (k == NodeKind::CallExpression) {
@@ -2945,12 +2946,12 @@ type struct AsyncLower {
             if (!ma.resolved_member.is_some() && this.is_own_access(ma)) { this.own_accesses.push(copy); }
             return copy as ExpressionNode*;
         }
-        if (k == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = e as UnaryExprNode*;
+        const place_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (place_un != null) {
             // Only `*p` is a place: `&x` names no storage of its own, `++`/`--`
             // write, and an overloaded operator is a call.
-            if (u.op.kind != TokenType::Star || u.desugared_call != null) { return null; }
-            mut inner: ExpressionNode* = this.rebuild_place(u.operand);
+            if (place_un.op.kind != TokenType::Star || place_un.desugared_call != null) { return null; }
+            mut inner: ExpressionNode* = this.rebuild_place(place_un.operand);
             if (inner == null) { return null; }
             return this.deref(inner, ty, span);
         }
@@ -4079,8 +4080,9 @@ type struct AsyncLower {
             return this.expr_has_free_edge(b.left, break_only)
                 || this.expr_has_free_edge(b.right, break_only);
         }
-        if (k == NodeKind::UnaryExpression) {
-            return this.expr_has_free_edge((e as UnaryExprNode*).operand, break_only);
+        const edge_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (edge_un != null) {
+            return this.expr_has_free_edge(edge_un.operand, break_only);
         }
         if (k == NodeKind::CallExpression) {
             const c: CallExprNode* = e as CallExprNode*;
@@ -4540,8 +4542,9 @@ type struct AsyncLower {
             this.mark_last_use_expr((e as MemberAccessNode*).object, key, false, out);
             return;
         }
-        if (k == NodeKind::UnaryExpression) {
-            this.mark_last_use_expr((e as UnaryExprNode*).operand, key, false, out);
+        const use_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (use_un != null) {
+            this.mark_last_use_expr(use_un.operand, key, false, out);
             return;
         }
         const use_cast: CastExpr* = ExpressionNode::cast_of(e);
@@ -5262,13 +5265,13 @@ type struct AsyncLower {
     frame_addr_root_expr(&this, sm: PollSm*, e: ExpressionNode*) -> IdentifierNode* {
         if (e == null) { return null; }
         const k: NodeKind = (e as ASTNode*).kind;
-        if (k == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = e as UnaryExprNode*;
-            if (u.op.kind == TokenType::Amp && !u.is_synthetic) {
-                const root: IdentifierNode* = this.addr_place_root(sm, u.operand);
+        const root_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (root_un != null) {
+            if (root_un.op.kind == TokenType::Amp && !root_un.is_synthetic) {
+                const root: IdentifierNode* = this.addr_place_root(sm, root_un.operand);
                 if (root != null) { return root; }
             }
-            return this.frame_addr_root_expr(sm, u.operand);
+            return this.frame_addr_root_expr(sm, root_un.operand);
         }
         if (k == NodeKind::BinaryExpression) {
             const b: BinaryExprNode* = e as BinaryExprNode*;
@@ -5765,10 +5768,9 @@ type struct AsyncLower {
     not_expr(&this, e: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         const bang: Token = Token::new(TokenType::Exclaim, "!",
                                        span.start_line as int, span.start_col as int);
-        mut u: UnaryExprNode* = new UnaryExprNode(bang, e, span);
-        u.is_synthetic = true;
+        mut u: ExpressionNode* = ExpressionNode::synthetic_unary(bang, e, span);
         u.set_resolved_type(this.arena.get_bool());
-        return u as ExpressionNode*;
+        return u;
     }
 
     /// True when evaluating `e` produces no effect the surrounding order can
@@ -5800,14 +5802,14 @@ type struct AsyncLower {
             if (aa.desugared_call != null) { return false; }
             return this.await_transparent(aa.array) && this.await_transparent(aa.index);
         }
-        if (k == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = e as UnaryExprNode*;
+        const tr_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (tr_un != null) {
             // `++`/`--` write, and an overloaded operator is a call.
-            if (u.op.kind == TokenType::PlusPlus || u.op.kind == TokenType::MinusMinus) {
+            if (tr_un.op.kind == TokenType::PlusPlus || tr_un.op.kind == TokenType::MinusMinus) {
                 return false;
             }
-            if (u.desugared_call != null) { return false; }
-            return this.await_transparent(u.operand);
+            if (tr_un.desugared_call != null) { return false; }
+            return this.await_transparent(tr_un.operand);
         }
         if (k == NodeKind::BinaryExpression) {
             const b: BinaryExprNode* = e as BinaryExprNode*;
@@ -5935,9 +5937,9 @@ type struct AsyncLower {
             return e;
         }
 
-        if (k == NodeKind::UnaryExpression) {
-            mut u: UnaryExprNode* = e as UnaryExprNode*;
-            u.operand = this.hoist_expr(u.operand, pre);
+        mut hoist_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (hoist_un != null) {
+            hoist_un.operand = this.hoist_expr(hoist_un.operand, pre);
             return e;
         }
 
@@ -6053,9 +6055,9 @@ type struct AsyncLower {
             m.object = this.hoist_place(m.object, force, pre);
             return e;
         }
-        if (k == NodeKind::UnaryExpression) {
-            mut u: UnaryExprNode* = e as UnaryExprNode*;
-            u.operand = this.hoist_operand(u.operand, force, pre);
+        mut op_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (op_un != null) {
+            op_un.operand = this.hoist_operand(op_un.operand, force, pre);
             return e;
         }
         return this.hoist_expr(e, pre);
@@ -6556,10 +6558,10 @@ type struct AsyncLower {
             this.rn_expr(map, b.desugared_call);
             return;
         }
-        if (k == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = e as UnaryExprNode*;
-            this.rn_expr(map, u.operand);
-            this.rn_expr(map, u.desugared_call);
+        const rn_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (rn_un != null) {
+            this.rn_expr(map, rn_un.operand);
+            this.rn_expr(map, rn_un.desugared_call);
             return;
         }
         const rn_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
@@ -6870,10 +6872,10 @@ type struct AsyncLower {
             this.rb_expr(ctx, b.desugared_call);
             return;
         }
-        if (k == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = e as UnaryExprNode*;
-            this.rb_expr(ctx, u.operand);
-            this.rb_expr(ctx, u.desugared_call);
+        const rb_un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (rb_un != null) {
+            this.rb_expr(ctx, rb_un.operand);
+            this.rb_expr(ctx, rb_un.desugared_call);
             return;
         }
         const rb_tern: TernaryExpr* = ExpressionNode::ternary_of(e);

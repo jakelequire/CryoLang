@@ -84,7 +84,7 @@ import compiler::ast::expression::{
     ArrayAccessNode, ArrayExpr, BinaryExprNode, CallExprNode, CalleePin, CastExpr,
     ExprKind, ExpressionNode, IdentifierNode, IfExpr, LambdaExprNode, LiteralExpr,
     MemberAccessNode, NewExpr, StructExpr, TernaryExpr,
-    TupleExpr, UnaryExprNode
+    TupleExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
@@ -3018,7 +3018,7 @@ type struct DropInserter {
         const flag_ident: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const not_tok: Token = Token::new(TokenType::Exclaim, "!",
             span.start_line as int, span.start_col as int);
-        const cond: UnaryExprNode* = new UnaryExprNode(
+        const cond: ExpressionNode* = ExpressionNode::unary_expr(
             not_tok, flag_ident as ExpressionNode*, span);
         cond.set_resolved_type(this.arena.get_bool());
         // Body: `{ <binding>.drop(); }`
@@ -3026,7 +3026,7 @@ type struct DropInserter {
         if (drop_stmt == null) { return null; }
         const body: Stmt* = Stmt::block(span);
         body.as_block().statements.push(drop_stmt);
-        const if_stmt: Stmt* = Stmt::if_stmt(cond as ExpressionNode*, body, null, span);
+        const if_stmt: Stmt* = Stmt::if_stmt(cond, body, null, span);
         cond.generated = true;
         body.generated = true;
         if_stmt.generated = true;
@@ -3473,16 +3473,6 @@ type struct DropInserter {
                 this.disq_scan_expr(aa.array);
                 this.disq_scan_expr(aa.index);
             }
-            NodeKind::UnaryExpression => {
-                const ue: UnaryExprNode* = expr as UnaryExprNode*;
-                if (ue.op.kind == TokenType::Amp) {
-                    // `&r` / `&r.f`: the callee can initialize through the
-                    // pointer, which no whole-binding flag can observe.
-                    this.disq_scan_place(ue.operand, true);
-                } else {
-                    this.disq_scan_expr(ue.operand);
-                }
-            }
             NodeKind::BinaryExpression => {
                 const b: BinaryExprNode* = expr as BinaryExprNode*;
                 if (b.op.kind == TokenType::Equal) {
@@ -3502,6 +3492,15 @@ type struct DropInserter {
             NodeKind::Expression => {
                 match (expr.shape) {
                     ExprKind::Cast(ce) => { this.disq_scan_expr(ce.expression); }
+                    ExprKind::Unary(ue) => {
+                        if (ue.op.kind == TokenType::Amp) {
+                            // `&r` / `&r.f`: the callee can initialize through the
+                            // pointer, which no whole-binding flag can observe.
+                            this.disq_scan_place(ue.operand, true);
+                        } else {
+                            this.disq_scan_expr(ue.operand);
+                        }
+                    }
                     ExprKind::Struct(sl) => {
                         for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
                             this.disq_scan_expr(sl.field_inits[i].value);
@@ -3921,15 +3920,14 @@ type struct DropInserter {
         const flag_ident: IdentifierNode* = this.local_ident(flag, this.arena.get_bool(), span);
         const not_tok: Token = Token::new(TokenType::Exclaim, "!",
             span.start_line as int, span.start_col as int);
-        const cond: UnaryExprNode* = new UnaryExprNode(
+        const cond: ExpressionNode* = ExpressionNode::unary_expr(
             not_tok, flag_ident as ExpressionNode*, span);
         cond.set_resolved_type(this.arena.get_bool());
         const body: Stmt* = Stmt::block(span);
         for (mut i: i64 = 0; i < core.length; i++) {
             body.as_block().statements.push(core[i]);
         }
-        const if_stmt: Stmt* = Stmt::if_stmt(
-            cond as ExpressionNode*, body, null, span);
+        const if_stmt: Stmt* = Stmt::if_stmt(cond, body, null, span);
         cond.generated = true;
         body.generated = true;
         if_stmt.generated = true;
@@ -4011,11 +4009,10 @@ type struct DropInserter {
         if (!target_ty.is_valid()) { return; }
         const deref_tok: Token = Token::new(TokenType::Star, "*",
             c.span.start_line as int, c.span.start_col as int);
-        const target: UnaryExprNode* = new UnaryExprNode(deref_tok, p, c.span);
-        target.is_synthetic = true;
+        const target: ExpressionNode* = ExpressionNode::synthetic_unary(deref_tok, p, c.span);
         target.set_resolved_type(target_ty);
         const member: MemberAccessNode* = new MemberAccessNode(
-            target as ExpressionNode*, this.drop_sym, c.span, c.span);
+            target, this.drop_sym, c.span, c.span);
         c.callee = member as ExpressionNode*;
         c.arguments = [];
         c.resolved_callee = CalleePin::None;
@@ -4076,7 +4073,6 @@ type struct DropInserter {
                 if (this.ctx.options.unwinds()) { this.populate_unwind_cleanup(c); }
             }
             NodeKind::BinaryExpression   => { this.read_binary(expr as BinaryExprNode*);               }
-            NodeKind::UnaryExpression    => { this.read_unary(expr as UnaryExprNode*);                 }
             NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);             }
             NodeKind::ArrayAccess        => { this.read_array_access(expr as ArrayAccessNode*);        }
             NodeKind::Expression         => {
@@ -4133,6 +4129,7 @@ type struct DropInserter {
                     ExprKind::Array(al) => { this.read_array_lit(al); }
                     ExprKind::Struct(sl) => { this.read_struct_lit(sl); }
                     ExprKind::Cast(cv) => { this.read_cast(cv); }
+                    ExprKind::Unary(u) => { this.read_unary(u); }
                     ExprKind::Ternary(t) => { this.read_ternary(t); }
                     ExprKind::If(ie) => { this.read_if_expr(ie); }
                     // Not walked by this pass.
@@ -4332,7 +4329,7 @@ type struct DropInserter {
         }
     }
 
-    read_unary(mut &this, u: UnaryExprNode*) -> void {
+    read_unary(mut &this, u: UnaryExpr*) -> void {
         if (u == null) { return; }
         if (u.operand != null) { this.walk_expr_read(u.operand); }
     }

@@ -61,7 +61,7 @@ import compiler::ast::expression::{
     ArrayAccessNode, ArrayExpr, BinaryExprNode, CallExprNode, CastExpr,
     ExprKind, ExpressionNode, IdentifierNode, IfExpr, LambdaExprNode, MatchExpr,
     MemberAccessNode, NewExpr, StructExpr, TernaryExpr,
-    TupleExpr, UnaryExprNode
+    TupleExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
@@ -1283,7 +1283,6 @@ type struct MoveChecker {
             NodeKind::Identifier         => { this.handle_ident(expr as IdentifierNode*, false, false); }
             NodeKind::CallExpression     => { this.read_call(expr as CallExprNode*);                 }
             NodeKind::BinaryExpression   => { this.read_binary(expr as BinaryExprNode*);             }
-            NodeKind::UnaryExpression    => { this.read_unary(expr as UnaryExprNode*);               }
             NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);           }
             NodeKind::ArrayAccess        => { this.read_array_access(expr as ArrayAccessNode*);      }
             NodeKind::Expression         => {
@@ -1292,6 +1291,7 @@ type struct MoveChecker {
                     // a block.
                     ExprKind::Match(m) => { this.read_match(m); }
                     ExprKind::Cast(cv) => { this.read_cast(cv); }
+                    ExprKind::Unary(u) => { this.read_unary(u); }
                     ExprKind::StaticMatch(sme) => {
                         if (sme.arms.length > 0 && sme.arms[0] != null && sme.arms[0].body != null) {
                             this.walk_stmt(sme.arms[0].body);
@@ -1482,7 +1482,7 @@ type struct MoveChecker {
         return;
     }
 
-    read_unary(mut &this, u: UnaryExprNode*) -> void {
+    read_unary(mut &this, u: UnaryExpr*) -> void {
         if (u == null) { return; }
         if (u.operand != null) { this.walk_expr_read(u.operand); }
         return;
@@ -1948,9 +1948,9 @@ type struct MoveChecker {
     /// never takes.
     check_deref_move_out(mut &this, expr: ExpressionNode*) -> void {
         if (this.unsafe_depth > 0) { return; }
-        if (expr == null || expr.kind != NodeKind::UnaryExpression) { return; }
+        const u: UnaryExpr* = ExpressionNode::unary_of(expr);
+        if (u == null) { return; }
         if (this.arg_binding_unknown) { return; }
-        const u: UnaryExprNode* = expr as UnaryExprNode*;
         if (u.is_postfix || u.op.kind != TokenType::Star) { return; }
         if (u.operand == null) { return; }
         // Only a pointee that owns a resource can be freed twice.  A Copy or
@@ -1959,13 +1959,13 @@ type struct MoveChecker {
         if (!pointee_ty.is_valid() || this.is_copy(pointee_ty)) { return; }
         if (!this.type_needs_drop(pointee_ty)) { return; }
         if (this.suppress_emit) { return; }
-        this.emit_deref_move_out_error(u);
+        this.emit_deref_move_out_error(expr.span);
     }
 
-    emit_deref_move_out_error(mut &this, u: UnaryExprNode*) -> void {
+    emit_deref_move_out_error(mut &this, span: SourceSpan) -> void {
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
             "cannot move a value that owns a destructor out of a pointer");
-        diag = diag.at_with_label(u.span,
+        diag = diag.at_with_label(span,
             "reading the pointee by value copies its owning handle; the storage this points at is still dropped by its owner (double free)");
         diag = diag.help(
             "borrow it instead (`p.field`, `p.method()`), or clone it; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");

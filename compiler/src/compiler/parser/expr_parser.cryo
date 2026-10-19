@@ -54,7 +54,7 @@ import compiler::ast::expression::{
     CallExprNode, ExpressionNode, FieldInit, IdentifierNode,
     LambdaExprNode, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr,
-    TupleExpr, UnaryExprNode
+    TupleExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::pattern::{
@@ -393,13 +393,10 @@ implement struct Parser {
                 // `Ordering`.  `&b` matches `compare`'s `other: &This`.
                 const amp_tok: Token = Token::new(
                     TokenType::Amp, "&", op.line, op.column);
-                mut ref_right_node: UnaryExprNode* =
-                    new UnaryExprNode(amp_tok, right, right.span);
                 // Compiler-synthesized address-of a temporary: exempt from
                 // the user-facing "no address-of a literal" check (E0223).
-                ref_right_node.is_synthetic = true;
                 const ref_right: ExpressionNode* =
-                    ref_right_node as ExpressionNode*;
+                    ExpressionNode::synthetic_unary(amp_tok, right, right.span);
                 const compare_name: SymbolStr = this.ctx.intern("compare");
                 const member: MemberAccessNode* = new MemberAccessNode(
                     left, compare_name, this.span_from_token(op), span);
@@ -513,7 +510,7 @@ implement struct Parser {
             }
             const span: SourceSpan = Parser::merge_spans(
                 this.span_from_token(op), operand.span);
-            return new UnaryExprNode(op, operand, span);
+            return ExpressionNode::unary_expr(op, operand, span);
         }
 
         return this.parse_primary_with_postfix();
@@ -657,9 +654,9 @@ implement struct Parser {
                 // updated value.
                 const op: Token        = this.advance();
                 const span: SourceSpan = Parser::merge_spans(expr.span, this.span_from_token(op));
-                mut un: UnaryExprNode* = new UnaryExprNode(op, expr, span);
+                expr = ExpressionNode::unary_expr(op, expr, span);
+                mut un: UnaryExpr* = ExpressionNode::unary_of(expr);
                 un.is_postfix = true;
-                expr = un;
             } else if (this.check(TokenType::Question)
                        && this.peek_at(1).kind.question_terminates()) {
                 // Postfix try operator `expr?`.  The lookahead distinguishes
@@ -1012,17 +1009,16 @@ implement struct Parser {
                 // &inner: synthetic address-of, exempt from the user-facing
                 // no-address-of-a-literal check (E0223) so `f"{42}"` works.
                 const amp: Token = Token::new(TokenType::Amp, "&", tok.line, tok.column);
-                mut ref_node: UnaryExprNode* = new UnaryExprNode(amp, inner, this.fstr_span);
-                ref_node.is_synthetic = true;
+                mut ref_node: ExpressionNode* = ExpressionNode::synthetic_unary(amp, inner, this.fstr_span);
                 ref_node.generated = true;
 
                 if (helper_kind == 2) {
-                    acc = this.fstr_call_fmt(acc, ref_node as ExpressionNode*, spec_src);
+                    acc = this.fstr_call_fmt(acc, ref_node, spec_src);
                 } else {
                     const helper: string =
                         if (helper_kind == 1) { "fmt_append_debug" }
                         else { "fmt_append_display" };
-                    acc = this.fstr_call2(helper, acc, ref_node as ExpressionNode*);
+                    acc = this.fstr_call2(helper, acc, ref_node);
                 }
                 continue;
             }

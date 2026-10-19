@@ -78,7 +78,7 @@ import compiler::ast::expression::{
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExpr, LambdaExprNode, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr,
-    TernaryExpr, TryExpr, TupleExpr, UnaryExprNode
+    TernaryExpr, TryExpr, TupleExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::node_locator::{ annotation_span };
@@ -1319,8 +1319,8 @@ type struct SemaVisitor {
                         const zero_lit: ExpressionNode* = ExpressionNode::literal("0", LiteralKind::Integer, sp);
                         const idx: ArrayAccessNode* = new ArrayAccessNode(orig_init, zero_lit, sp);
                         const amp_tok: Token = Token::new(TokenType::Amp, "&", sp.start_line as int, sp.start_col as int);
-                        mut amp: UnaryExprNode* = new UnaryExprNode(amp_tok, idx as ExpressionNode*, sp);
-                        amp.is_synthetic = true;
+                        const amp: ExpressionNode* =
+                            ExpressionNode::synthetic_unary(amp_tok, idx as ExpressionNode*, sp);
                         const n_str: string = fmt::format("%ld", at.size);
                         const n_lit: ExpressionNode* = ExpressionNode::literal(n_str, LiteralKind::Integer, sp);
                         const slice_sym: SymbolStr = this.intern.intern("Slice");
@@ -1343,7 +1343,7 @@ type struct SemaVisitor {
                         gen_args.push(elt_ann);
                         sr.set_scope_generic_args(gen_args);
                         mut call: CallExprNode* = new CallExprNode(sr as ExpressionNode*, sp);
-                        call.add_argument(amp as ExpressionNode*);
+                        call.add_argument(amp);
                         call.add_argument(n_lit);
                         var_node.set_initializer(call as ExpressionNode*);
                         init_type = this.resolve_expr(var_node.initializer);
@@ -1664,7 +1664,6 @@ type struct SemaVisitor {
 
             NodeKind::Expression
             | NodeKind::Identifier | NodeKind::BinaryExpression
-            | NodeKind::UnaryExpression
             | NodeKind::CallExpression
             | NodeKind::LambdaExpression
             | NodeKind::ArrayAccess | NodeKind::MemberAccess | NodeKind::ScopeResolution
@@ -1717,7 +1716,6 @@ type struct SemaVisitor {
                 this.calls.located_value_checked(expr, this.resolve_identifier(expr as IdentifierNode*))
             }
             NodeKind::BinaryExpression  => { this.resolve_binary(expr as BinaryExprNode*) }
-            NodeKind::UnaryExpression   => { this.resolve_unary(expr as UnaryExprNode*) }
             NodeKind::CallExpression    => { this.calls.resolve_call(this, expr as CallExprNode*) }
             NodeKind::MemberAccess      => { this.member.resolve_member_access(this, expr as MemberAccessNode*) }
             NodeKind::ArrayAccess       => { this.member.resolve_array_access(this, expr as ArrayAccessNode*) }
@@ -1772,6 +1770,7 @@ type struct SemaVisitor {
             ExprKind::StaticMatch(s) => { this.resolve_static_match_expr(expr, s) }
             ExprKind::Match(m) => { this.resolve_match_expr(expr, m) }
             ExprKind::Cast(c) => { this.resolve_cast(expr, c) }
+            ExprKind::Unary(u) => { this.resolve_unary(expr, u) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -2006,9 +2005,7 @@ type struct SemaVisitor {
                 call.add_argument(rhs);
             } else {
                 const amp: Token = Token::new(TokenType::Amp, "&", op_tok.line, op_tok.column);
-                mut ref_rhs: UnaryExprNode* = new UnaryExprNode(amp, rhs, rhs.span);
-                ref_rhs.is_synthetic = true;
-                call.add_argument(ref_rhs as ExpressionNode*);
+                call.add_argument(ExpressionNode::synthetic_unary(amp, rhs, rhs.span));
             }
         }
         return call as ExpressionNode*;
@@ -2132,8 +2129,8 @@ type struct SemaVisitor {
     /// bound licenses, built where the operator is written.  A reference to
     /// the parameter is looked through, as the concrete path does once the
     /// primitive operator refused it.  Null on any other operand.  A copy whose operand is not a user type applies the
-    /// primitive operator instead (`UnaryExprNode::desugar_by_bound`).
-    bound_unary_desugar(mut &this, unary: UnaryExprNode*, ty: TypeRef) -> ExpressionNode* {
+    /// primitive operator instead (`UnaryExpr::desugar_by_bound`).
+    bound_unary_desugar(mut &this, e: ExpressionNode*, unary: UnaryExpr*, ty: TypeRef) -> ExpressionNode* {
         if (!this.state.in_symbolic_check) { return null; }
         // A pointer keeps the primitive operator, as it does on the concrete path.
         const t: Type* = this.arena.lookup(ty);
@@ -2144,7 +2141,7 @@ type struct SemaVisitor {
         if (!trait_id.is_valid()) { return null; }
         const param: GenericParamType* = this.binding.receiver_type_param(ty);
         if (param == null || !this.binding.param_bounded_by(param, trait_id)) { return null; }
-        return this.operator_desugar(unary.operand, null, map, trait_id, unary.op, unary.span);
+        return this.operator_desugar(unary.operand, null, map, trait_id, unary.op, e.span);
     }
 
     /// `a + b` on a left operand that is a type parameter whose bound gives
@@ -2191,7 +2188,7 @@ type struct SemaVisitor {
         }
         if (map.negate) {
             const bang: Token = Token::new(TokenType::Exclaim, "!", op_tok.line, op_tok.column);
-            desugared = new UnaryExprNode(bang, desugared, span) as ExpressionNode*;
+            desugared = ExpressionNode::unary_expr(bang, desugared, span);
         }
         // Deref: wrap the `b.deref()` call (which returns `Target*`) in an outer
         // `*` so `*b` yields the pointee.  The inner call's `Target*` is a real
@@ -2200,9 +2197,7 @@ type struct SemaVisitor {
         // reads (`v = *b`), writes (`*b = x`), and compound (`*b += x`).
         if (map.deref_wrap) {
             const star: Token = Token::new(TokenType::Star, "*", op_tok.line, op_tok.column);
-            mut star_node: UnaryExprNode* = new UnaryExprNode(star, desugared, span);
-            star_node.is_synthetic = true;
-            desugared = star_node as ExpressionNode*;
+            desugared = ExpressionNode::synthetic_unary(star, desugared, span);
         }
         const snap: DiagnosticSnapshot = this.ctx.diagnostics.snapshot();
         const rty: TypeRef = this.resolve_expr(desugared);
@@ -2708,7 +2703,7 @@ type struct SemaVisitor {
         }
     }
 
-    resolve_unary(mut &this, unary: UnaryExprNode*) -> TypeRef {
+    resolve_unary(mut &this, e: ExpressionNode*, unary: UnaryExpr*) -> TypeRef {
         // Idempotent (see resolve_binary): a prior resolution may have rewritten
         // `-x` into `x.neg()`; return its type rather than re-rejecting.
         if (unary.desugared_call != null) {
@@ -2752,7 +2747,7 @@ type struct SemaVisitor {
         if (unary.op.kind == TokenType::Amp && !unary.is_synthetic && unary.operand != null
             && ExpressionNode::literal_of(unary.operand) != null) {
             this.ctx.emit_error_at(ErrorCode::E0223_INVALID_ADDRESS_OF,
-                "cannot take the address of a literal; `&` requires a place (variable, field, or index)", unary.span);
+                "cannot take the address of a literal; `&` requires a place (variable, field, or index)", e.span);
             return TypeRef::invalid();
         }
         if (unary.op.kind == TokenType::Star && unary.operand != null && unary.operand.kind == NodeKind::Identifier) {
@@ -2762,10 +2757,10 @@ type struct SemaVisitor {
         const result: TypeCheckResult = this.checker.check_unary_op(unary.op.kind, operand_type);
         if (!result.success) {
             if (this.symbolic.symbolic_type_unresolved(operand_type)) {
-                if (this.refuse_unlicensed_param_operator(unary.op.kind, true, operand_type, TypeRef::invalid(), unary.span)) {
+                if (this.refuse_unlicensed_param_operator(unary.op.kind, true, operand_type, TypeRef::invalid(), e.span)) {
                     return operand_type;
                 }
-                const bde: ExpressionNode* = this.bound_unary_desugar(unary, operand_type);
+                const bde: ExpressionNode* = this.bound_unary_desugar(e, unary, operand_type);
                 if (bde != null) {
                     unary.desugared_call = bde;
                     unary.desugar_by_bound = true;
@@ -2779,13 +2774,13 @@ type struct SemaVisitor {
             const map: OperatorTraitMap = OperatorTraitMap::for_unary(unary.op.kind);
             if (map.valid && unary.desugared_call == null) {
                 const de: ExpressionNode* = this.operator_overload_expr(
-                    unary.operand, operand_type, null, map, unary.op, unary.span, true);
+                    unary.operand, operand_type, null, map, unary.op, e.span, true);
                 if (de != null) { unary.desugared_call = de; return de.resolved_type; }
-                if (this.emit_operator_missing_impl(operand_type, map, unary.op.kind, unary.span)) {
+                if (this.emit_operator_missing_impl(operand_type, map, unary.op.kind, e.span)) {
                     return operand_type;
                 }
             }
-            this.ctx.emit_error_at(ErrorCode::E0230_INVALID_UNARY_OP, result.error_message, unary.span);
+            this.ctx.emit_error_at(ErrorCode::E0230_INVALID_UNARY_OP, result.error_message, e.span);
             return operand_type;
         }
         if (unary.op.kind == TokenType::Amp) {
@@ -4466,8 +4461,8 @@ type struct SemaVisitor {
         }
         // `&subject` / `*subject` keep naming the same storage; a member or
         // element of caller-backed storage is caller-backed too.
-        if (k == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = e as UnaryExprNode*;
+        const u: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (u != null) {
             if (u.desugared_call != null) { return false; }
             if (u.op.kind != TokenType::Amp && u.op.kind != TokenType::Star) { return false; }
             return this.subject_is_caller_backed(u.operand);
@@ -4516,8 +4511,8 @@ type struct SemaVisitor {
             }
             return;
         }
-        if (e.kind == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = e as UnaryExprNode*;
+        const u: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (u != null) {
             if (u.op.kind == TokenType::Amp && u.operand != null && u.operand.kind == NodeKind::Identifier) {
                 const id: IdentifierNode* = u.operand as IdentifierNode*;
                 // A payload binding over a caller-backed subject names the
