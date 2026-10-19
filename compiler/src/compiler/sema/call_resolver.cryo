@@ -1013,8 +1013,12 @@ type struct CallResolver {
             if (i < owner_hints.length && owner_hints[i].is_valid()) { slot = owner_hints[i]; }
             // A slot naming the callee's own parameters (`d: Option<T>`
             // before `T` is inferred) is no type in this body; the argument
-            // types itself, and its type is what infers `T`.
+            // types itself, and its type is what infers `T`.  Its array kind
+            // still holds: a literal in an `[T]` slot is an `Array`, which
+            // only the slot says.
+            mut open_dynamic_slot: boolean = false;
             if (slot.is_valid() && this.symbolic.names_param_out_of_scope(slot)) {
+                open_dynamic_slot = this.arena.default_array_element(slot).is_valid();
                 slot = TypeRef::invalid();
                 push_expected = false;
             }
@@ -1126,6 +1130,7 @@ type struct CallResolver {
                 this.state.expected_type = TypeRef::invalid();
             }
             visitor.resolve_expr(arg);
+            if (open_dynamic_slot) { this.adopt_dynamic_array_kind(arg); }
         }
         this.state.expected_type = saved_expected;
 
@@ -1589,6 +1594,20 @@ type struct CallResolver {
                 && this.sema_arg_is_polymorphic_literal(b.right);
         }
         return false;
+    }
+
+    /// An array literal argument bound to an `[T]` parameter whose `T` the
+    /// call has yet to infer is the `Array` of its own element type: the
+    /// slot gave no element hint, so the literal typed itself as a fixed
+    /// array, a kind no `[T]` parameter accepts and inference cannot read
+    /// `T` from.  The element type is the literal's own, which is what binds
+    /// `T`.  Every other argument keeps its type.
+    adopt_dynamic_array_kind(mut &this, arg: ExpressionNode*) -> void {
+        if (ExpressionNode::array_of(arg) == null || !arg.resolved_type.is_valid()) { return; }
+        const t: Type* = this.arena.lookup(arg.resolved_type);
+        if (t == null || t.kind != TypeKind::Array) { return; }
+        const dynamic: TypeRef = this.ctx.type_resolver.dynamic_array_type(t.as_array().element);
+        if (dynamic.is_valid()) { arg.set_resolved_type(dynamic); }
     }
 
     /// A `null` literal argument carries NO pointee-type information: it adopts

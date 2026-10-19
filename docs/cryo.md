@@ -352,7 +352,7 @@ A fixed array does not convert to a dynamic one: `const d: [int] = buf;` is refu
 
 Diagnostics and the editor spell an array the way the annotation that declared it wrote it: one written `[i32]` shows as `[i32]`, one written `Array<i32>` as `Array<i32>`.  The spelling is for display only.  A type no annotation wrote, an inferred one, shows as `[T]` when its allocator is the default and as `Array<T, A>` otherwise.
 
-An array literal written where an `Array<T>` with the default allocator is expected builds that array, in every form: `[a, b]`, `[]`, and `[value; n]` with `n` fixed or known only at run time.  The literal allocates the storage, so an `Array<T, A>` with another allocator is not initialised by one.
+An array literal written where an `Array<T>` with the default allocator is expected builds that array, in every form: `[a, b]`, `[]`, and `[value; n]` with `n` fixed or known only at run time.  The literal allocates the storage, so an `Array<T, A>` with another allocator is not initialised by one.  A literal passed for a `[T]` parameter whose `T` the call infers is the `Array` of its own element type, and its elements are what bind `T`: for `function generic_len<T>(xs: [T]) -> i64`, `generic_len([true, false])` calls `generic_len::<boolean>`.
 
 An array's `length` and `capacity`, read as fields or through `length()` and `capacity()`, are `i64`.  `Array`'s methods take an index or an element count as a `u64`.
 
