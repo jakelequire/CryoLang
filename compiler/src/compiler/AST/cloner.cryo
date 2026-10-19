@@ -30,7 +30,7 @@ import compiler::ast::declaration::{
     VarDecl
 };
 import compiler::ast::expression::{
-    AlignofExpr, ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
+    AlignofExpr, ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExpr,
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     LambdaExprNode, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, SizeofExpr, StaticMatchExpr, StructExpr,
@@ -117,7 +117,6 @@ type struct ASTCloner {
             NodeKind::Program                   => { return this.visit_program(n as ProgramNode*); }
 
             NodeKind::Identifier                => { return this.visit_identifier(n as IdentifierNode*); }
-            NodeKind::BinaryExpression          => { return this.visit_binary(n as BinaryExprNode*); }
             NodeKind::CallExpression            => { return this.visit_call(n as CallExprNode*); }
             NodeKind::LambdaExpression          => { return this.visit_lambda(n as LambdaExprNode*); }
             NodeKind::ArrayAccess               => { return this.visit_array_access(n as ArrayAccessNode*); }
@@ -240,24 +239,6 @@ type struct ASTCloner {
         return c;
     }
 
-    visit_binary(mut &this, node: BinaryExprNode*) -> ASTNode* {
-        mut c: BinaryExprNode* = new BinaryExprNode(
-            node.op,
-            this.clone_expr(node.left),
-            this.clone_expr(node.right),
-            node.span
-        );
-        c.has_error = node.has_error;
-        // Carry an operator-overload desugar (built at sema for a bounded-param
-        // operand) into the specialization so the substituter can concretize
-        // its stashed type-args and codegen finds the trait-method call.
-        if (node.desugared_call != null) {
-            c.desugared_call = this.clone_expr(node.desugared_call);
-        }
-        c.desugar_by_bound = node.desugar_by_bound;
-        c.append_entry = node.append_entry;
-        return c;
-    }
 
 
     visit_call(mut &this, node: CallExprNode*) -> ASTNode* {
@@ -396,6 +377,20 @@ type struct ASTCloner {
                 c = ExpressionNode::ternary_expr(this.clone_expr(n.condition),
                                                  this.clone_expr(n.true_expr),
                                                  this.clone_expr(n.false_expr), node.span);
+            }
+            ExprKind::Binary(n) => {
+                c = ExpressionNode::binary_expr(n.op, this.clone_expr(n.left),
+                                                this.clone_expr(n.right), node.span);
+                mut cb: BinaryExpr* = ExpressionNode::binary_of(c);
+                // Carry an operator-overload desugar (built at sema for a
+                // bounded-param operand) into the specialization so the
+                // substituter can concretize its stashed type-args and codegen
+                // finds the trait-method call.
+                if (n.desugared_call != null) {
+                    cb.desugared_call = this.clone_expr(n.desugared_call);
+                }
+                cb.desugar_by_bound = n.desugar_by_bound;
+                cb.append_entry = n.append_entry;
             }
             ExprKind::Unary(n) => {
                 c = ExpressionNode::unary_expr(n.op, this.clone_expr(n.operand), node.span);

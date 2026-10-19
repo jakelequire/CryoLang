@@ -47,7 +47,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    ArrayAccessNode, BinaryExprNode, CallExprNode,
+    ArrayAccessNode, CallExprNode,
     ExprKind, ExpressionNode, IdentifierNode, LambdaExprNode,
     MemberAccessNode, ScopeResolutionNode
 };
@@ -426,22 +426,6 @@ type struct MonoCallSpecializer {
                     this.unpinned_calls.push(UnpinnedCall { call: call, func: this.current_fn });
                 }
             }
-            NodeKind::BinaryExpression => {
-                mut be: BinaryExprNode* = expr as BinaryExprNode*;
-                this.walk_expr(be.left, res_ctx, subst);
-                this.walk_expr(be.right, res_ctx, subst);
-                if (be.desugar_by_bound && be.desugared_call != null
-                        && this.operand_takes_primitive_operator(be.left, subst, true)) {
-                    be.desugared_call = null;
-                }
-                // An operator-overload desugar (`a.add(&b)`) is a method call
-                // that may need specialization (e.g. `Vec<i32>::add`); walk it
-                // so nested/generic instantiations are discovered.
-                if (be.desugared_call != null) {
-                    this.walk_expr(be.desugared_call, res_ctx, subst);
-                }
-            }
-
             NodeKind::MemberAccess => {
                 const ma: MemberAccessNode* = expr as MemberAccessNode*;
                 this.walk_expr(ma.object, res_ctx, subst);
@@ -475,6 +459,20 @@ type struct MonoCallSpecializer {
                         this.walk_expr(te.false_expr, res_ctx, subst);
                     }
                     ExprKind::Cast(ce) => { this.walk_expr(ce.expression, res_ctx, subst); }
+                    ExprKind::Binary(be) => {
+                        this.walk_expr(be.left, res_ctx, subst);
+                        this.walk_expr(be.right, res_ctx, subst);
+                        if (be.desugar_by_bound && be.desugared_call != null
+                                && this.operand_takes_primitive_operator(be.left, subst, true)) {
+                            be.desugared_call = null;
+                        }
+                        // An operator-overload desugar (`a.add(&b)`) is a method
+                        // call that may need specialization (e.g. `Vec<i32>::add`);
+                        // walk it so nested/generic instantiations are discovered.
+                        if (be.desugared_call != null) {
+                            this.walk_expr(be.desugared_call, res_ctx, subst);
+                        }
+                    }
                     ExprKind::Unary(ue) => {
                         this.walk_expr(ue.operand, res_ctx, subst);
                         if (ue.desugar_by_bound && ue.desugared_call != null

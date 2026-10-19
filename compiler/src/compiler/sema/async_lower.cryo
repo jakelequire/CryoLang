@@ -62,7 +62,7 @@ import compiler::ast::declaration::{
     VarDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode, CallExprNode,
+    ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExpr, CallExprNode,
     CastExpr, DeleteExpr, ExpressionNode, FieldInit, IdentifierNode, IfExpr,
     LambdaExprNode, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr, TernaryExpr,
@@ -1088,8 +1088,8 @@ type struct AsyncLower {
             }
             return;
         }
-        if (k == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             this.rewrite_returns_expr(b.left, poll_out, span);
             this.rewrite_returns_expr(b.right, poll_out, span);
             return;
@@ -1172,8 +1172,8 @@ type struct AsyncLower {
         if (await_try != null) {
             return this.expr_await_count(await_try.live());
         }
-        if (k == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             return this.expr_await_count(b.left) + this.expr_await_count(b.right);
         }
         const count_un: UnaryExpr* = ExpressionNode::unary_of(e);
@@ -1559,13 +1559,13 @@ type struct AsyncLower {
     /// typed.
     assign_stmt(&this, lhs: ExpressionNode*, rhs: ExpressionNode*, span: SourceSpan) -> Stmt* {
         const eq: Token = Token::new(TokenType::Equal, "=", span.start_line as int, span.start_col as int);
-        mut assign: BinaryExprNode* = new BinaryExprNode(eq, lhs, rhs, span);
+        mut assign: ExpressionNode* = ExpressionNode::binary_expr(eq, lhs, rhs, span);
         // Typed only when both sides are: a side left for the type check to
         // answer is reached only through an untyped parent.
         if (lhs.has_resolved_type() && rhs != null && rhs.has_resolved_type()) {
             assign.set_resolved_type(lhs.resolved_type);
         }
-        mut es: Stmt* = Stmt::expr_stmt(assign as ExpressionNode*, span);
+        mut es: Stmt* = Stmt::expr_stmt(assign, span);
         return es;
     }
 
@@ -1723,8 +1723,8 @@ type struct AsyncLower {
         if (k == NodeKind::Identifier) {
             return this.names_binding(e, key);
         }
-        if (k == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             return this.name_read_in_expr(b.left, key) || this.name_read_in_expr(b.right, key);
         }
         const read_un: UnaryExpr* = ExpressionNode::unary_of(e);
@@ -2018,8 +2018,8 @@ type struct AsyncLower {
             }
             return e;
         }
-        if (k == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             if (b.op.kind == TokenType::Equal) {
                 // The right-hand side is handed to the name; the left is the
                 // place being written, which reaches into the value rather
@@ -2036,7 +2036,7 @@ type struct AsyncLower {
                 if (this.subst_carrier_armed() && this.name_is_whole_place(b.left, key)) {
                     b.right = this.option_some(b.right, this.subst_carrier_opt, span);
                     b.left  = this.carrier_field_expr(span);
-                    b.set_resolved_type(this.subst_carrier_opt);
+                    e.set_resolved_type(this.subst_carrier_opt);
                     // The value lives in its field again, so later mentions go
                     // back to reaching it there.
                     this.subst_hoist_name = SymbolStr::empty();
@@ -4075,8 +4075,8 @@ type struct AsyncLower {
             }
             return false;
         }
-        if (k == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             return this.expr_has_free_edge(b.left, break_only)
                 || this.expr_has_free_edge(b.right, break_only);
         }
@@ -4257,8 +4257,8 @@ type struct AsyncLower {
             if (this.names_binding(e, key)) { return 1; }
             return 0;
         }
-        if (k == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             if (b.op.kind == TokenType::Equal) {
                 // The right side is evaluated first; only a bare `name = ...`
                 // is a write, while `name.f = ...` or `name[i] = ...` reads it.
@@ -4500,8 +4500,8 @@ type struct AsyncLower {
             }
             return;
         }
-        if (k == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             if (b.op.kind == TokenType::Equal) {
                 this.mark_last_use_expr(b.right, key, true, out);
                 // Assigning to the name replaces whatever it held: the state
@@ -4664,7 +4664,7 @@ type struct AsyncLower {
         const blk: BlockStmt* = blk_stmt.as_block();
         const i: i64 = this.top_level_assignment_index(blk_stmt, key);
         if (i < 0) { return MintedLocal { name: SymbolStr::empty(), sym: SymbolID::invalid() }; }
-        const b: BinaryExprNode* = this.top_level_assignment(blk.statements[i]);
+        const b: BinaryExpr* = this.top_level_assignment(blk.statements[i]);
         const sym: SymbolID = this.resolver.alloc_synthetic_binding();
         const fresh: SymbolStr = this.mint_local(this.source_name(key, shown), sym);
         blk.statements[i] = this.var_decl_stmt_bound(fresh, sym, true, lty, b.right, span);
@@ -4684,14 +4684,14 @@ type struct AsyncLower {
     }
 
     /// The `<lhs> = <rhs>` statement `s` is, or null for any other statement.
-    top_level_assignment(&this, s: Stmt*) -> BinaryExprNode* {
+    top_level_assignment(&this, s: Stmt*) -> BinaryExpr* {
         if (s == null) { return null; }
         const e: ExpressionNode* = match (s.shape) {
             StmtKind::Expr(es) => { es.expression }
             _                  => { null }
         };
-        if (e == null || (e as ASTNode*).kind != NodeKind::BinaryExpression) { return null; }
-        const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b == null) { return null; }
         if (b.op.kind != TokenType::Equal) { return null; }
         return b;
     }
@@ -4703,7 +4703,7 @@ type struct AsyncLower {
     top_level_assignment_index(&this, blk_stmt: Stmt*, key: SymbolID) -> i64 {
         const blk: BlockStmt* = blk_stmt.as_block();
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            const b: BinaryExprNode* = this.top_level_assignment(blk.statements[i]);
+            const b: BinaryExpr* = this.top_level_assignment(blk.statements[i]);
             if (b == null || !this.names_binding(b.left, key)) { continue; }
             return i;
         }
@@ -5273,8 +5273,8 @@ type struct AsyncLower {
             }
             return this.frame_addr_root_expr(sm, root_un.operand);
         }
-        if (k == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             const l: IdentifierNode* = this.frame_addr_root_expr(sm, b.left);
             if (l != null) { return l; }
             return this.frame_addr_root_expr(sm, b.right);
@@ -5376,7 +5376,7 @@ type struct AsyncLower {
     assigned_frame_addr_root(&this, sm: PollSm*, blk_stmt: Stmt*, key: SymbolID) -> IdentifierNode* {
         const blk: BlockStmt* = blk_stmt.as_block();
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            const b: BinaryExprNode* = this.top_level_assignment(blk.statements[i]);
+            const b: BinaryExpr* = this.top_level_assignment(blk.statements[i]);
             if (b == null || !this.names_binding(b.left, key)) { continue; }
             const r: IdentifierNode* = this.frame_addr_root_expr(sm, b.right);
             if (r != null) { return r; }
@@ -5811,8 +5811,8 @@ type struct AsyncLower {
             if (tr_un.desugared_call != null) { return false; }
             return this.await_transparent(tr_un.operand);
         }
-        if (k == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             if (b.op.kind.is_assignment_op() || b.desugared_call != null) { return false; }
             return this.await_transparent(b.left) && this.await_transparent(b.right);
         }
@@ -5894,14 +5894,14 @@ type struct AsyncLower {
             return this.ident_bound(t.name, t.sym, ao, span);
         }
 
-        if (k == NodeKind::BinaryExpression) {
-            mut b: BinaryExprNode* = e as BinaryExprNode*;
+        mut b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             // `&&`/`||` only evaluate their right operand for some values of the
             // left, so lifting an `await` out of it would run the suspend
             // unconditionally. Becomes a branch instead.
             if ((b.op.kind == TokenType::AmpAmp || b.op.kind == TokenType::PipePipe) &&
                 this.expr_await_count(b.right) > 0) {
-                return this.hoist_short_circuit(b, pre);
+                return this.hoist_short_circuit(e, b, pre);
             }
             if (b.op.kind.is_assignment_op()) {
                 b.left  = this.hoist_place(b.left, this.expr_await_count(b.right) > 0, pre);
@@ -6070,8 +6070,8 @@ type struct AsyncLower {
     ///
     /// `R`'s own lifted statements go INSIDE the branch, which is what keeps the
     /// suspend conditional.
-    hoist_short_circuit(mut &this, b: BinaryExprNode*, pre: HoistPre*) -> ExpressionNode* {
-        const span: SourceSpan = (b as ASTNode*).span;
+    hoist_short_circuit(mut &this, e: ExpressionNode*, b: BinaryExpr*, pre: HoistPre*) -> ExpressionNode* {
+        const span: SourceSpan = e.span;
         const bool_ty: TypeRef = this.arena.get_bool();
         mut left: ExpressionNode* = this.hoist_expr(b.left, pre);
         const t: MintedLocal = this.mint_temp("__sc");
@@ -6551,8 +6551,8 @@ type struct AsyncLower {
             if (f.is_valid()) { (e as IdentifierNode*).name = f; }
             return;
         }
-        if (k == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             this.rn_expr(map, b.left);
             this.rn_expr(map, b.right);
             this.rn_expr(map, b.desugared_call);
@@ -6865,8 +6865,8 @@ type struct AsyncLower {
             if (found && s.is_valid()) { id.rebind_local(s); }
             return;
         }
-        if (k == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
             this.rb_expr(ctx, b.left);
             this.rb_expr(ctx, b.right);
             this.rb_expr(ctx, b.desugared_call);

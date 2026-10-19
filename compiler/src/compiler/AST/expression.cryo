@@ -243,6 +243,20 @@ public:
         }), span);
     }
 
+    /// `left op right` at `span`.
+    static binary_expr(op: Token, left: ExpressionNode*, right: ExpressionNode*,
+                       span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Binary(new BinaryExpr {
+            op:               op,
+            left:             left,
+            right:            right,
+            desugared_call:   null,
+            desugar_by_bound: false,
+            append_entry:     OverloadId::invalid(),
+            unwind_cleanup:   [],
+        }), span);
+    }
+
     /// The prefix `op operand` at `span`, written by the user.
     static unary_expr(op: Token, operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::Unary(new UnaryExpr {
@@ -412,6 +426,16 @@ public:
         };
     }
 
+    /// The binary operation `n` is, or null.
+    static binary_of(n: ASTNode*) -> BinaryExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::Binary(b) => { b }
+            _                   => { null }
+        };
+    }
+
     /// The unary operation `n` is, or null.
     static unary_of(n: ASTNode*) -> UnaryExpr* {
         const e: ExpressionNode* = ExpressionNode::with_shape(n);
@@ -461,6 +485,7 @@ type enum ExprKind {
     Legacy;
     Alignof(AlignofExpr*);
     Array(ArrayExpr*);
+    Binary(BinaryExpr*);
     Cast(CastExpr*);
     Delete(DeleteExpr*);
     If(IfExpr*);
@@ -612,8 +637,8 @@ public:
 }
 
 
-type class BinaryExprNode : ExpressionNode {
-public:
+/// `left op right`, an assignment and a compound assignment among them.
+type struct BinaryExpr {
     op:    Token;
     left:  ExpressionNode*;
     right: ExpressionNode*;
@@ -647,15 +672,15 @@ public:
     /// `CallExprNode.unwind_cleanup`.  Empty on the default abort path.
     unwind_cleanup: [ASTNode*];
 
-    BinaryExprNode(op: Token, left: ExpressionNode*, right: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::BinaryExpression, span) {
-        this.op    = op;
-        this.left  = left;
-        this.right = right;
-        this.desugared_call = null;
-        this.desugar_by_bound = false;
-        this.append_entry = OverloadId::invalid();
-        this.unwind_cleanup = [];
+    static walk_children<V>(n: BinaryExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.left);
+        v.walk_expr(n.right);
+    }
+}
+
+implement trait Allocate for struct BinaryExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -680,7 +705,7 @@ type struct UnaryExpr {
     /// Unary operator-overloading desugar target (currently only `-x` for a
     /// user type or a `Neg`-bounded generic param, rewritten to `x.neg()`), or
     /// null for the ordinary numeric-negation / deref / addr-of / inc-dec path.
-    /// Same discipline as `BinaryExprNode.desugared_call`: type-directed, built
+    /// Same discipline as `BinaryExpr.desugared_call`: type-directed, built
     /// in sema after `check_unary_op` rejects, and delegated to by codegen.
     desugared_call: ExpressionNode*;
     /// The desugar was built in a generic body, on an operand that is a type
@@ -1327,7 +1352,7 @@ public:
     /// is a user type (or a generic param bounded by `Index`) that has no
     /// primitive indexing rule, sema rewrites `a[i]` into `*(a.index(i))` - a
     /// deref of the `Output*` the trait method returns - and hangs the resolved
-    /// expression here.  Same discipline as `BinaryExprNode.desugared_call`:
+    /// expression here.  Same discipline as `BinaryExpr.desugared_call`:
     /// type-directed, built after `check_index_access` rejects a user/bounded
     /// base.  Because `*ptr` is itself a place, the one desugar serves reads,
     /// writes, and compound assignment: codegen delegates to it and lets the

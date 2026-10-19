@@ -81,7 +81,7 @@ import compiler::ast::declaration::{
     UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessNode, ArrayExpr, BinaryExprNode, CallExprNode, CalleePin, CastExpr,
+    ArrayAccessNode, ArrayExpr, BinaryExpr, CallExprNode, CalleePin, CastExpr,
     ExprKind, ExpressionNode, IdentifierNode, IfExpr, LambdaExprNode, LiteralExpr,
     MemberAccessNode, NewExpr, StructExpr, TernaryExpr,
     TupleExpr, UnaryExpr
@@ -2631,7 +2631,7 @@ type struct DropInserter {
     /// Every "cannot tell" answer declines.  Declining leaks the displaced
     /// value, which is what this pass did for every assignment before; a wrong
     /// release is a double free.
-    record_assign_drop(mut &this, b: BinaryExprNode*) -> void {
+    record_assign_drop(mut &this, e: ExpressionNode*, b: BinaryExpr*) -> void {
         this.pend_assign_node = null;
         this.pend_assign_guard_moved = false;
         if (b == null || b.left == null) { return; }
@@ -2667,7 +2667,7 @@ type struct DropInserter {
             if (this.binding_definit[slot] != (1 as u8)) { return; }
             if (this.moved_since(this.stmt_move_snap, root.key())) { return; }
             this.pend_assign_guard_moved = true;
-            this.pend_assign(b, slot, move_flag, place_ty, kind, key);
+            this.pend_assign(e, slot, move_flag, place_ty, kind, key);
             return;
         }
         if (this.is_moved(root)) { return; }
@@ -2706,14 +2706,14 @@ type struct DropInserter {
                 return;
             }
         }
-        this.pend_assign(b, slot, guard, place_ty, kind, key);
+        this.pend_assign(e, slot, guard, place_ty, kind, key);
     }
 
     /// Stash the release `record_assign_drop` decided on for the enclosing
     /// expression statement to emit.
-    pend_assign(mut &this, b: BinaryExprNode*, slot: i64, guard: PassLocal,
+    pend_assign(mut &this, assign: ExpressionNode*, slot: i64, guard: PassLocal,
                 place_ty: TypeRef, kind: [u8], key: [u32]) -> void {
-        this.pend_assign_node  = b as ExpressionNode*;
+        this.pend_assign_node  = assign;
         this.pend_assign_guard = guard;
         this.pend_assign_ty    = place_ty;
         this.pend_assign_base    = this.local_at(slot);
@@ -2767,8 +2767,8 @@ type struct DropInserter {
     /// whole, or an invalid one.  A member assignment leaves the binding's
     /// whole-value state as it was.
     move_flag_for_assignment_target(&this, expr: ExpressionNode*) -> PassLocal {
-        if (expr == null || expr.kind != NodeKind::BinaryExpression) { return PassLocal::none(); }
-        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(expr);
+        if (b == null) { return PassLocal::none(); }
         if (b.op.kind != TokenType::Equal || b.left == null) { return PassLocal::none(); }
         if (b.left.kind != NodeKind::Identifier) { return PassLocal::none(); }
         const sym: SymbolID = (b.left as IdentifierNode*).res.local_sym();
@@ -2997,10 +2997,10 @@ type struct DropInserter {
         rhs.set_resolved_type(this.arena.get_bool());
         const eq_tok: Token = Token::new(TokenType::Equal, "=",
             span.start_line as int, span.start_col as int);
-        const assign: BinaryExprNode* = new BinaryExprNode(
+        const assign: ExpressionNode* = ExpressionNode::binary_expr(
             eq_tok, lhs as ExpressionNode*, rhs, span);
         assign.set_resolved_type(this.arena.get_bool());
-        const stmt: Stmt* = Stmt::expr_stmt(assign as ExpressionNode*, span);
+        const stmt: Stmt* = Stmt::expr_stmt(assign, span);
         rhs.generated = true;
         assign.generated = true;
         stmt.generated = true;
@@ -3473,15 +3473,6 @@ type struct DropInserter {
                 this.disq_scan_expr(aa.array);
                 this.disq_scan_expr(aa.index);
             }
-            NodeKind::BinaryExpression => {
-                const b: BinaryExprNode* = expr as BinaryExprNode*;
-                if (b.op.kind == TokenType::Equal) {
-                    this.disq_scan_place(b.left, false);
-                } else {
-                    this.disq_scan_expr(b.left);
-                }
-                this.disq_scan_expr(b.right);
-            }
             NodeKind::CallExpression => {
                 const c: CallExprNode* = expr as CallExprNode*;
                 this.disq_scan_expr(c.callee);
@@ -3500,6 +3491,14 @@ type struct DropInserter {
                         } else {
                             this.disq_scan_expr(ue.operand);
                         }
+                    }
+                    ExprKind::Binary(b) => {
+                        if (b.op.kind == TokenType::Equal) {
+                            this.disq_scan_place(b.left, false);
+                        } else {
+                            this.disq_scan_expr(b.left);
+                        }
+                        this.disq_scan_expr(b.right);
                     }
                     ExprKind::Struct(sl) => {
                         for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
@@ -3862,8 +3861,8 @@ type struct DropInserter {
     /// can't be the initializing write.
     init_flag_for_assignment_target(&this, expr: ExpressionNode*) -> PassLocal {
         if (expr == null) { return PassLocal::none(); }
-        if (expr.kind != NodeKind::BinaryExpression) { return PassLocal::none(); }
-        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(expr);
+        if (b == null) { return PassLocal::none(); }
         if (b.op.kind != TokenType::Equal) { return PassLocal::none(); }
         if (b.left == null) { return PassLocal::none(); }
         if (b.left.kind == NodeKind::Identifier) {
@@ -3898,8 +3897,8 @@ type struct DropInserter {
     /// false positive costs an empty block and a false negative loses the
     /// release, so it deliberately answers before the moved-set is consulted.
     assignment_may_displace(&this, expr: ExpressionNode*) -> boolean {
-        if (expr == null || expr.kind != NodeKind::BinaryExpression) { return false; }
-        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(expr);
+        if (b == null) { return false; }
         if (b.op.kind != TokenType::Equal || b.left == null) { return false; }
         mut kind: [u8]  = [];
         mut key:  [u32] = [];
@@ -4072,7 +4071,6 @@ type struct DropInserter {
                 // excluded (the callee owns it now).
                 if (this.ctx.options.unwinds()) { this.populate_unwind_cleanup(c); }
             }
-            NodeKind::BinaryExpression   => { this.read_binary(expr as BinaryExprNode*);               }
             NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);             }
             NodeKind::ArrayAccess        => { this.read_array_access(expr as ArrayAccessNode*);        }
             NodeKind::Expression         => {
@@ -4130,6 +4128,7 @@ type struct DropInserter {
                     ExprKind::Struct(sl) => { this.read_struct_lit(sl); }
                     ExprKind::Cast(cv) => { this.read_cast(cv); }
                     ExprKind::Unary(u) => { this.read_unary(u); }
+                    ExprKind::Binary(b) => { this.read_binary(expr, b); }
                     ExprKind::Ternary(t) => { this.read_ternary(t); }
                     ExprKind::If(ie) => { this.read_if_expr(ie); }
                     // Not walked by this pass.
@@ -4283,7 +4282,7 @@ type struct DropInserter {
         if (this.ctx.options.unwinds()) { this.close_pending_arg_frame(); }
     }
 
-    read_binary(mut &this, b: BinaryExprNode*) -> void {
+    read_binary(mut &this, e: ExpressionNode*, b: BinaryExpr*) -> void {
         if (b == null) { return; }
         if (b.left != null) { this.walk_expr_read(b.left); }
         if (b.right != null) {
@@ -4296,7 +4295,7 @@ type struct DropInserter {
                 this.walk_expr_move(b.right);
                 // Decide here, before the revive below erases the move state
                 // this needs; see record_assign_drop.
-                this.record_assign_drop(b);
+                this.record_assign_drop(e, b);
                 // Plain `=` to a bare identifier reinitializes that
                 // binding: it now owns the rhs result and must be dropped
                 // at scope exit.  Clear any stale moved state for the lhs

@@ -74,7 +74,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
+    ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExpr,
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExpr, LambdaExprNode, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr,
@@ -1663,7 +1663,7 @@ type struct SemaVisitor {
             NodeKind::Program                => { this.visit_program(n as ProgramNode*); }
 
             NodeKind::Expression
-            | NodeKind::Identifier | NodeKind::BinaryExpression
+            | NodeKind::Identifier
             | NodeKind::CallExpression
             | NodeKind::LambdaExpression
             | NodeKind::ArrayAccess | NodeKind::MemberAccess | NodeKind::ScopeResolution
@@ -1715,7 +1715,6 @@ type struct SemaVisitor {
             NodeKind::Identifier        => {
                 this.calls.located_value_checked(expr, this.resolve_identifier(expr as IdentifierNode*))
             }
-            NodeKind::BinaryExpression  => { this.resolve_binary(expr as BinaryExprNode*) }
             NodeKind::CallExpression    => { this.calls.resolve_call(this, expr as CallExprNode*) }
             NodeKind::MemberAccess      => { this.member.resolve_member_access(this, expr as MemberAccessNode*) }
             NodeKind::ArrayAccess       => { this.member.resolve_array_access(this, expr as ArrayAccessNode*) }
@@ -1771,6 +1770,7 @@ type struct SemaVisitor {
             ExprKind::Match(m) => { this.resolve_match_expr(expr, m) }
             ExprKind::Cast(c) => { this.resolve_cast(expr, c) }
             ExprKind::Unary(u) => { this.resolve_unary(expr, u) }
+            ExprKind::Binary(b) => { this.resolve_binary(expr, b) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -2018,7 +2018,7 @@ type struct SemaVisitor {
     /// the entry chosen by its signature: a program's own `append` on
     /// `string` taking anything else is another overload, and not it.
     /// Nothing for any other operator or operand.
-    pin_string_append(mut &this, bin: BinaryExprNode*, op: TokenType, lhs: TypeRef) -> void {
+    pin_string_append(mut &this, bin: BinaryExpr*, op: TokenType, lhs: TypeRef) -> void {
         if (op != TokenType::Plus) { return; }
         const lt: Type* = this.arena.lookup(lhs);
         if (lt == null || lt.kind != TypeKind::String) { return; }
@@ -2151,8 +2151,8 @@ type struct SemaVisitor {
     /// concrete path builds it for a user type or a reference to one.  Null
     /// on any other left operand.  A copy whose operand is not a user type,
     /// or a reference to one, applies the primitive operator instead
-    /// (`BinaryExprNode::desugar_by_bound`).
-    bound_binary_desugar(mut &this, bin: BinaryExprNode*, lhs: TypeRef) -> ExpressionNode* {
+    /// (`BinaryExpr::desugar_by_bound`).
+    bound_binary_desugar(mut &this, e: ExpressionNode*, bin: BinaryExpr*, lhs: TypeRef) -> ExpressionNode* {
         if (!this.state.in_symbolic_check) { return null; }
         mut t: Type* = this.arena.lookup(lhs);
         mut depth: i32 = 0;
@@ -2167,7 +2167,7 @@ type struct SemaVisitor {
         if (!trait_id.is_valid()) { return null; }
         const param: GenericParamType* = this.binding.receiver_type_param(lhs);
         if (param == null || !this.binding.param_bounded_by(param, trait_id)) { return null; }
-        return this.operator_desugar(bin.left, bin.right, map, trait_id, bin.op, bin.span);
+        return this.operator_desugar(bin.left, bin.right, map, trait_id, bin.op, e.span);
     }
 
     /// The operator's call on `trait_id`'s method, wrapped as `map` says,
@@ -2365,7 +2365,7 @@ type struct SemaVisitor {
     ///
     /// Suppressible by code through `DiagConfig` like any other warning, which
     /// matters while the tree still carries mixed-width integer arithmetic.
-    warn_implicit_numeric_conversion(mut &this, bin: BinaryExprNode*,
+    warn_implicit_numeric_conversion(mut &this, e: ExpressionNode*,
                                      lhs: TypeRef, rhs: TypeRef) -> void {
         if (!lhs.is_valid() || !rhs.is_valid()) { return; }
         if (lhs.equals(rhs)) { return; }
@@ -2380,11 +2380,11 @@ type struct SemaVisitor {
             fmt::format("implicit conversion between `%s` and `%s`; the narrower operand widens to the wider one. Write it with `as` - this is accepted for now and will become an error before v1.0.0",
                 this.types.type_display_name(lhs),
                 this.types.type_display_name(rhs)));
-        diag = diag.at(bin.span);
+        diag = diag.at(e.span);
         this.ctx.emit_diagnostic(diag);
     }
 
-    resolve_binary(mut &this, bin: BinaryExprNode*) -> TypeRef {
+    resolve_binary(mut &this, e: ExpressionNode*, bin: BinaryExpr*) -> TypeRef {
         // Idempotent: if a previous resolution already rewrote this operator
         // into a trait-method call, return its type without re-running
         // `check_binary_op` (which would re-reject the user-typed operands and
@@ -2418,13 +2418,13 @@ type struct SemaVisitor {
             this.check_assignment_lvalue(bin.left);
             if (bin.op.kind == TokenType::Equal) {
                 this.lambda.refuse_stored_closure(rhs, lhs,
-                    if (bin.right != null) { bin.right.span } else { bin.span }, "an assigned place");
+                    if (bin.right != null) { bin.right.span } else { e.span }, "an assigned place");
             }
             if (bin.op.kind == TokenType::Equal && lhs.is_valid() && rhs.is_valid()
                 && this.assignment_judgeable(lhs) && this.assignment_judgeable(rhs)
                 && !this.checker.can_assign(rhs, lhs)
                 && !this.types.indirection_spelling_compatible(rhs, lhs)) {
-                const value_span: SourceSpan = if (bin.right != null) { bin.right.span } else { bin.span };
+                const value_span: SourceSpan = if (bin.right != null) { bin.right.span } else { e.span };
                 this.diag.emit_type_mismatch_with_value(
                     ErrorCode::E0200_TYPE_MISMATCH, value_span, lhs, rhs,
                     "the value assigned here doesn't match the type of the assignment target",
@@ -2443,7 +2443,7 @@ type struct SemaVisitor {
             const base_op: TokenType = bin.op.kind.compound_base();
             if (base_op != TokenType::Unknown && lhs.is_valid() && rhs.is_valid()
                 && (this.symbolic.symbolic_type_unresolved(lhs) || this.symbolic.symbolic_type_unresolved(rhs))) {
-                this.refuse_unlicensed_param_operator(base_op, false, lhs, rhs, bin.span);
+                this.refuse_unlicensed_param_operator(base_op, false, lhs, rhs, e.span);
             }
             if (base_op != TokenType::Unknown && lhs.is_valid() && rhs.is_valid()
                 && !this.symbolic.symbolic_type_unresolved(lhs)
@@ -2457,7 +2457,7 @@ type struct SemaVisitor {
                 if (cres.success) {
                     if (map.valid && bin.desugared_call == null) {
                         const de: ExpressionNode* = this.operator_overload_expr(
-                            bin.left, lhs, bin.right, map, bin.op, bin.span, false);
+                            bin.left, lhs, bin.right, map, bin.op, e.span, false);
                         if (de != null) { bin.desugared_call = de; }
                     }
                     if (bin.desugared_call == null) { this.pin_string_append(bin, base_op, lhs); }
@@ -2465,13 +2465,13 @@ type struct SemaVisitor {
                     mut overloaded: boolean = false;
                     if (map.valid && bin.desugared_call == null) {
                         const de: ExpressionNode* = this.operator_overload_expr(
-                            bin.left, lhs, bin.right, map, bin.op, bin.span, true);
+                            bin.left, lhs, bin.right, map, bin.op, e.span, true);
                         if (de != null) { bin.desugared_call = de; overloaded = true; }
                     }
                     if (!overloaded
-                        && !this.emit_operator_missing_impl(lhs, map, base_op, bin.span)) {
+                        && !this.emit_operator_missing_impl(lhs, map, base_op, e.span)) {
                         this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP,
-                            cres.error_message, bin.span);
+                            cres.error_message, e.span);
                     }
                 }
             }
@@ -2480,13 +2480,13 @@ type struct SemaVisitor {
 
         if ((bin.op.kind == TokenType::Slash || bin.op.kind == TokenType::Percent) && is_zero_int_literal(bin.right)) {
             this.ctx.emit_error_at(ErrorCode::E0226_DIVISION_BY_ZERO,
-                if (bin.op.kind == TokenType::Slash) { "division by zero" } else { "remainder with a zero divisor" }, bin.span);
+                if (bin.op.kind == TokenType::Slash) { "division by zero" } else { "remainder with a zero divisor" }, e.span);
         }
 
         mut force_wide: TypeRef = TypeRef::invalid();
         if (!this.literals.expected_type_is_int_type()) {
             mut folded: i64 = 0;
-            if (try_fold_const_i64(bin as ExpressionNode*, &folded)) {
+            if (try_fold_const_i64(e, &folded)) {
                 const mag: u64 = if (folded < 0) { (0 - folded) as u64 } else { folded as u64 };
                 if (mag > sema_i32_max_mag()) { force_wide = this.arena.get_i64(); }
             }
@@ -2554,10 +2554,10 @@ type struct SemaVisitor {
 
         if ((this.symbolic.symbolic_type_unresolved(lhs) || this.symbolic.symbolic_type_unresolved(rhs))
                 && !this.pointer_rule_settles(lhs, rhs)) {
-            if (this.refuse_unlicensed_param_operator(bin.op.kind, false, lhs, rhs, bin.span)) {
+            if (this.refuse_unlicensed_param_operator(bin.op.kind, false, lhs, rhs, e.span)) {
                 return TypeRef::invalid();
             }
-            const bde: ExpressionNode* = this.bound_binary_desugar(bin, lhs);
+            const bde: ExpressionNode* = this.bound_binary_desugar(e, bin, lhs);
             if (bde != null) {
                 bin.desugared_call = bde;
                 bin.desugar_by_bound = true;
@@ -2570,13 +2570,13 @@ type struct SemaVisitor {
                 this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
                     fmt::format("cannot compare `%s` with `%s`: they are unrelated types",
                         this.arena.format_display(this.arena.lookup(lhs)),
-                        this.arena.format_display(this.arena.lookup(rhs))), bin.span);
+                        this.arena.format_display(this.arena.lookup(rhs))), e.span);
                 return this.arena.get_bool();
             }
             const result: TypeCheckResult = this.checker.check_binary_op(bin.op.kind, lhs, rhs);
             const map: OperatorTraitMap = OperatorTraitMap::for_binary(bin.op.kind);
             if (result.success) {
-                this.warn_implicit_numeric_conversion(bin, lhs, rhs);
+                this.warn_implicit_numeric_conversion(e, lhs, rhs);
                 // Phase 2: a bounded-param operand (`T: Add`) still overloads,
                 // even though `check_binary_op` passed the generic param through.
                 // Concrete primitives fall straight through (no user impl).
@@ -2594,7 +2594,7 @@ type struct SemaVisitor {
                         (map.lang == LangItem::Eq || map.lang == LangItem::Ord)
                         && this.comparison_unwraps_reference(lhs, rhs);
                     const de: ExpressionNode* = this.operator_overload_expr(
-                        bin.left, lhs, bin.right, map, bin.op, bin.span, succ_deref);
+                        bin.left, lhs, bin.right, map, bin.op, e.span, succ_deref);
                     if (de != null) { bin.desugared_call = de; return de.resolved_type; }
                 }
                 this.pin_string_append(bin, bin.op.kind, lhs);
@@ -2604,20 +2604,20 @@ type struct SemaVisitor {
             // registered impl overloads; otherwise it is a genuine type error.
             if (map.valid && bin.desugared_call == null) {
                 const de: ExpressionNode* = this.operator_overload_expr(
-                    bin.left, lhs, bin.right, map, bin.op, bin.span, true);
+                    bin.left, lhs, bin.right, map, bin.op, e.span, true);
                 if (de != null) { bin.desugared_call = de; return de.resolved_type; }
                 // Reflected: a PRIMITIVE left operand with the trait implemented
                 // on it (`2 * vec` => `(2).mul(&vec)`).  LHS-driven dispatch skips
                 // primitives, so this is the one place the right operand's user
                 // type can pull in an impl hung on the primitive.
                 const rde: ExpressionNode* = this.reflected_operator_overload_expr(
-                    bin.left, lhs, bin.right, map, bin.op, bin.span);
+                    bin.left, lhs, bin.right, map, bin.op, e.span);
                 if (rde != null) { bin.desugared_call = rde; return rde.resolved_type; }
-                if (this.emit_operator_missing_impl(lhs, map, bin.op.kind, bin.span)) {
+                if (this.emit_operator_missing_impl(lhs, map, bin.op.kind, e.span)) {
                     return TypeRef::invalid();
                 }
             }
-            this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP, result.error_message, bin.span);
+            this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP, result.error_message, e.span);
         }
         // A refused comparison, or one over an operand already reported, is
         // still a `boolean`, so the condition holding it reports nothing more.

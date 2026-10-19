@@ -29,7 +29,7 @@ import compiler::ast::{ node, expression };
 import compiler::lex;
 import compiler::lex::{ TokenType };
 import std::ffi::libc;
-import compiler::ast::expression::{ BinaryExprNode, UnaryExpr };
+import compiler::ast::expression::{ BinaryExpr, ExpressionNode, UnaryExpr };
 import compiler::codegen::visit::ir_generator;
 import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
@@ -73,7 +73,7 @@ type struct BinaryUnaryEmitter {
 
     // Binary expressions
 
-    emit_binary(mut &this, visitor: IRGeneratorVisitor*, node: BinaryExprNode*) -> Emitted {
+    emit_binary(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: BinaryExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const op: TokenType = node.op.kind;
 
@@ -109,7 +109,7 @@ type struct BinaryUnaryEmitter {
                 mut diag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0614_ASSIGNMENT_ERROR,
                     "codegen: assignment: target or value produced null");
-                diag = diag.at(node.span);
+                diag = diag.at(e.span);
                 if (!addr.is_valid()) {
                     diag = diag.also_at(node.left.span, "left-hand side did not produce a valid lvalue");
                 }
@@ -163,11 +163,9 @@ type struct BinaryUnaryEmitter {
         // `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`) loads the LHS, computes the
         // arithmetic / bitwise / shift result using its base operator, then
         // stores the narrowed result back.  Bitwise (`&=`/`|=`/`^=`) and
-        // shift (`<<=`/`>>=`) were silently miscompiled before; the
-        // BinaryExprNode fell through to the "regular binary" path below,
-        // which calls codegen_rvalue(left) (a load) and codegen_binary
-        // with the compound op kind, producing an expression result but
-        // never storing it back.
+        // shift (`<<=`/`>>=`) must not reach the "regular binary" path below,
+        // which loads the left side and computes with the compound op kind,
+        // producing an expression result but never storing it back.
         const base_op: TokenType = op.compound_base();
         if (base_op != TokenType::Unknown) {
             const addr: LValue = this.dispatch.codegen_lvalue(visitor,node.left);
@@ -175,7 +173,7 @@ type struct BinaryUnaryEmitter {
                 mut diag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0614_ASSIGNMENT_ERROR,
                     "codegen: compound assignment target produced null lvalue");
-                diag = diag.at(node.span);
+                diag = diag.at(e.span);
                 diag = diag.also_at(node.left.span, "this expression must be assignable");
                 this.cg.diag.emit(diag);
                 out.value = LValue::null();
@@ -194,8 +192,8 @@ type struct BinaryUnaryEmitter {
             const lhs_loaded: LValue = this.cg.builder.build_load(lhs_ty, addr, "compoundlhs");
             const rhs: LValue = this.dispatch.codegen_rvalue(visitor, node.right);
             mut result: LValue = LValue::null();
-            result = this.cg.expr_ops.codegen_binary(lhs_loaded, rhs, base_op, node.resolved_type, node.right.resolved_type,
-                node.append_entry, visitor, &node.unwind_cleanup, node.span);
+            result = this.cg.expr_ops.codegen_binary(lhs_loaded, rhs, base_op, e.resolved_type, node.right.resolved_type,
+                node.append_entry, visitor, &node.unwind_cleanup, e.span);
             // Narrow-store fix: codegen_binary normalizes operand widths to
             // the wider of lhs/rhs, so when the LHS slot is a narrow int
             // (char / i8 / u8) and the RHS is wider, `result` is wider than
@@ -232,7 +230,7 @@ type struct BinaryUnaryEmitter {
         const rhs: LValue = this.dispatch.codegen_rvalue(visitor, node.right);
         mut result: LValue = LValue::null();
         result = this.cg.expr_ops.codegen_binary(lhs, rhs, op, node.left.resolved_type, node.right.resolved_type,
-            node.append_entry, visitor, &node.unwind_cleanup, node.span);
+            node.append_entry, visitor, &node.unwind_cleanup, e.span);
         out.value = result;
         out.is_lvalue = false;
         return out;
@@ -403,7 +401,7 @@ type struct BinaryUnaryEmitter {
     // Short-circuit && / ||
 
     /// Short-circuit evaluation for && and ||.
-    short_circuit(mut &this, visitor: IRGeneratorVisitor*, node: BinaryExprNode*) -> Emitted {
+    short_circuit(mut &this, visitor: IRGeneratorVisitor*, node: BinaryExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const is_and: boolean = node.op.kind == TokenType::AmpAmp;
 
