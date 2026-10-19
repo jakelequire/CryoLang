@@ -52,7 +52,7 @@ import compiler::ast::declaration::{ DeclarationNode, DeclKind, VarDecl };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExpressionNode, FieldInit, IdentifierNode,
-    LambdaExprNode, MatchExprNode, MemberAccessNode, NewExpr,
+    LambdaExprNode, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr,
     TupleExpr, UnaryExprNode
 };
@@ -242,7 +242,8 @@ implement struct Parser {
         const bind_str:  string    = fmt::format("__cryo_coalesce_%u", g_coalesce_counter);
         const bind_name: SymbolStr = this.ctx.intern(bind_str);
 
-        mut match_expr: MatchExprNode* = new MatchExprNode(left, span);
+        const match_expr: ExpressionNode* = ExpressionNode::match_expr(left, span);
+        mut coalesce: MatchExpr* = ExpressionNode::match_of(match_expr);
 
         // Some(v) => { v }
         const some_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "Some", op_span);
@@ -257,7 +258,7 @@ implement struct Parser {
         const some_block: Stmt* = Stmt::block(op_span);
         some_block.as_block().add_statement(Stmt::expr_stmt(some_ident as ExpressionNode*, op_span));
         some_arm.set_body(some_block);
-        match_expr.add_arm(some_arm);
+        coalesce.add_arm(some_arm);
 
         // None => { b }
         const none_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "None", op_span);
@@ -266,9 +267,9 @@ implement struct Parser {
         const none_block: Stmt* = Stmt::block(right.span);
         none_block.as_block().add_statement(Stmt::expr_stmt(right, right.span));
         none_arm.set_body(none_block);
-        match_expr.add_arm(none_arm);
+        coalesce.add_arm(none_arm);
 
-        return match_expr as ExpressionNode*;
+        return match_expr;
     }
 
     /// `Item::variant` as a pattern, where `item` is an enum the language
@@ -1985,13 +1986,14 @@ implement struct Parser {
         const subject: ExpressionNode* = this.parse_paren_condition();
         this.consume(TokenType::LBrace, "'{'");
 
-        mut match_expr: MatchExprNode* = new MatchExprNode(subject, this.span_from_token(start));
+        mut match_expr: ExpressionNode* = ExpressionNode::match_expr(subject, this.span_from_token(start));
+        mut payload: MatchExpr* = ExpressionNode::match_of(match_expr);
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
             const arm: MatchArmNode* = this.parse_expr_match_arm();
             if (arm != null) {
-                match_expr.add_arm(arm);
+                payload.add_arm(arm);
             }
             if (this.panic_mode) {
                 this.synchronize();
@@ -2184,7 +2186,8 @@ implement struct Parser {
     /// across by pointer and keep their bindings, guards and bodies (and
     /// their identity, which later passes rely on).
     match_stmt_as_expr(s: Stmt*, ms: MatchStmt*) -> Stmt* {
-        mut me: MatchExprNode* = new MatchExprNode(ms.subject, s.span);
+        const me_node: ExpressionNode* = ExpressionNode::match_expr(ms.subject, s.span);
+        mut me: MatchExpr* = ExpressionNode::match_of(me_node);
         for (mut i: i64 = 0; i < ms.arms.length; i++) {
             const a: MatchArmNode* = ms.arms[i];
             // These arms were parsed in STATEMENT context, so their own bodies
@@ -2198,7 +2201,7 @@ implement struct Parser {
             }
             me.add_arm(a);
         }
-        return Stmt::expr_stmt(me as ExpressionNode*, s.span);
+        return Stmt::expr_stmt(me_node, s.span);
     }
 
 

@@ -232,6 +232,15 @@ public:
         }), span);
     }
 
+    /// `match (subject) { }` at `span`; its arms are added after.
+    static match_expr(subject: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Match(new MatchExpr {
+            subject:        subject,
+            arms:           [],
+            unwind_cleanup: [],
+        }), span);
+    }
+
     /// `static match (scrutinee) { }` at `span`; its arms are added after.
     static static_match_expr(scrutinee: TypeAnnotation*, span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::StaticMatch(new StaticMatchExpr {
@@ -361,6 +370,16 @@ public:
         };
     }
 
+    /// The `match` expression `n` is, or null.
+    static match_of(n: ASTNode*) -> MatchExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::Match(m) => { m }
+            _                  => { null }
+        };
+    }
+
     /// The `static match` expression `n` is, or null.
     static static_match_of(n: ASTNode*) -> StaticMatchExpr* {
         const e: ExpressionNode* = ExpressionNode::with_shape(n);
@@ -393,6 +412,7 @@ type enum ExprKind {
     Delete(DeleteExpr*);
     If(IfExpr*);
     Literal(LiteralExpr*);
+    Match(MatchExpr*);
     New(NewExpr*);
     Sizeof(SizeofExpr*);
     StaticMatch(StaticMatchExpr*);
@@ -668,8 +688,8 @@ implement trait Allocate for struct IfExpr {
 }
 
 
-type class MatchExprNode : ExpressionNode {
-public:
+/// `match (subject) { arms }` as a value.
+type struct MatchExpr {
     subject: ExpressionNode*;
     arms:    [MatchArmNode*];
 
@@ -678,15 +698,19 @@ public:
     /// destructors on unwind.  See `CallExprNode.unwind_cleanup`.
     unwind_cleanup: [ASTNode*];
 
-    MatchExprNode(subject: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::MatchExpression, span) {
-        this.subject = subject;
-        this.arms    = [];
-        this.unwind_cleanup = [];
+    static walk_children<V>(n: MatchExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.subject);
+        for (mut i: i64 = 0; i < n.arms.length; i++) { v.walk_node(n.arms[i] as ASTNode*); }
     }
 
-    add_arm(arm: MatchArmNode*) -> void {
+    add_arm(mut &this, arm: MatchArmNode*) -> void {
         this.arms.push(arm);
+    }
+}
+
+implement trait Allocate for struct MatchExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -1661,7 +1685,7 @@ implement trait Allocate for struct YieldExpr {
 // `match` expression (with a `return` in the failure arm) and stores it
 // in `desugared`.  Every post-sema consumer (codegen, drop insertion,
 // move check) forwards through `desugared`, so they only ever deal with
-// an ordinary `MatchExprNode`.  `desugared` is null until sema runs.
+// an ordinary `match` expression.  `desugared` is null until sema runs.
 type struct TryExpr {
     operand:   ExpressionNode*;
     desugared: ExpressionNode*;
@@ -1706,9 +1730,9 @@ type struct TryExpr {
     /// lowering has two: hoisting an `await` out of the subject, and promoting
     /// a carried local there to a frame field.
     resync_operand(mut &this) -> void {
-        if (this.desugared == null) { return; }
-        if ((this.desugared as ASTNode*).kind != NodeKind::MatchExpression) { return; }
-        this.operand = (this.desugared as MatchExprNode*).subject;
+        const m: MatchExpr* = ExpressionNode::match_of(this.desugared);
+        if (m == null) { return; }
+        this.operand = m.subject;
     }
 }
 

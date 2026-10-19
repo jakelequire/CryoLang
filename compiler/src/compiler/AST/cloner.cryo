@@ -32,7 +32,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     AlignofExpr, ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
-    LambdaExprNode, LiteralExpr, MatchExprNode, MemberAccessNode, NewExpr,
+    LambdaExprNode, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, SizeofExpr, StaticMatchExpr, StructExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExprNode
 };
@@ -119,7 +119,6 @@ type struct ASTCloner {
             NodeKind::Identifier                => { return this.visit_identifier(n as IdentifierNode*); }
             NodeKind::BinaryExpression          => { return this.visit_binary(n as BinaryExprNode*); }
             NodeKind::UnaryExpression           => { return this.visit_unary(n as UnaryExprNode*); }
-            NodeKind::MatchExpression           => { return this.visit_match_expr(n as MatchExprNode*); }
             NodeKind::CallExpression            => { return this.visit_call(n as CallExprNode*); }
             NodeKind::CastExpression            => { return this.visit_cast(n as CastExprNode*); }
             NodeKind::LambdaExpression          => { return this.visit_lambda(n as LambdaExprNode*); }
@@ -278,17 +277,6 @@ type struct ASTCloner {
         return c;
     }
 
-    visit_match_expr(mut &this, node: MatchExprNode*) -> ASTNode* {
-        mut c: MatchExprNode* = new MatchExprNode(
-            this.clone_expr(node.subject), node.span
-        );
-        for (mut i: i64 = 0; i < node.arms.length; i++) {
-            c.add_arm(this.clone_match_arm(node.arms[i]));
-        }
-        c.has_error = node.has_error;
-        return c;
-    }
-
 
     visit_call(mut &this, node: CallExprNode*) -> ASTNode* {
         mut c: CallExprNode* = new CallExprNode(
@@ -427,6 +415,13 @@ type struct ASTCloner {
                                                  this.clone_expr(n.true_expr),
                                                  this.clone_expr(n.false_expr), node.span);
             }
+            ExprKind::Match(n) => {
+                c = ExpressionNode::match_expr(this.clone_expr(n.subject), node.span);
+                mut cm: MatchExpr* = ExpressionNode::match_of(c);
+                for (mut i: i64 = 0; i < n.arms.length; i++) {
+                    cm.add_arm(this.clone_match_arm(n.arms[i]));
+                }
+            }
             ExprKind::StaticMatch(n) => {
                 c = ExpressionNode::static_match_expr(this.clone_type_annotation(n.scrutinee),
                                                       node.span);
@@ -462,9 +457,10 @@ type struct ASTCloner {
                     // The async lowering deliberately breaks the sharing (it
                     // hoists an `await` out of the subject into a temp), so
                     // this only re-points when the original still holds it.
-                    if (n.desugared.kind == NodeKind::MatchExpression
-                            && (n.desugared as MatchExprNode*).subject == n.operand) {
-                        (ct.desugared as MatchExprNode*).subject = ct.operand;
+                    const om: MatchExpr* = ExpressionNode::match_of(n.desugared);
+                    if (om != null && om.subject == n.operand) {
+                        mut cm: MatchExpr* = ExpressionNode::match_of(ct.desugared);
+                        cm.subject = ct.operand;
                     }
                 }
             }

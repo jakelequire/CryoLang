@@ -51,7 +51,7 @@ import compiler::ast::expression::{
     CalleePin,
     AlignofExpr, ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
-    LambdaExprNode, LiteralExpr, MatchExprNode, MemberAccessNode,
+    LambdaExprNode, LiteralExpr, MatchExpr, MemberAccessNode,
     ScopeResolutionNode, SizeofExpr, StaticMatchExpr, StructExpr,
     TryExpr, TupleExpr, UnaryExprNode
 };
@@ -203,7 +203,6 @@ type struct IRGeneratorVisitor {
             NodeKind::Identifier             => { return this.visit_identifier(n as IdentifierNode*); }
             NodeKind::BinaryExpression       => { return this.visit_binary(n as BinaryExprNode*); }
             NodeKind::UnaryExpression        => { return this.visit_unary(n as UnaryExprNode*); }
-            NodeKind::MatchExpression        => { return this.visit_match_expr(n as MatchExprNode*); }
             NodeKind::CallExpression         => { return this.visit_call(n as CallExprNode*); }
             NodeKind::CastExpression         => { return this.visit_cast(n as CastExprNode*); }
             NodeKind::LambdaExpression       => { return this.visit_lambda(n as LambdaExprNode*); }
@@ -261,6 +260,7 @@ type struct IRGeneratorVisitor {
                         return this.emit_conditional(e, t.condition, t.true_expr, t.false_expr);
                     }
                     ExprKind::StaticMatch(s) => { return this.visit_static_match_expr(e, s); }
+                    ExprKind::Match(m) => { return this.visit_match_expr(e, m); }
                     ExprKind::If(i) => {
                         return this.emit_conditional(e, i.condition, i.then_expr, i.else_expr);
                     }
@@ -1873,7 +1873,7 @@ type struct IRGeneratorVisitor {
         return this.dispatch.generate_statement(this, node.arms[0].body);
     }
 
-    visit_match_expr(mut &this, node: MatchExprNode*) -> Emitted {
+    visit_match_expr(mut &this, e: ExpressionNode*, node: MatchExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         if (node.subject == null || node.arms.length == 0) {
             out.value = LValue::null();
@@ -1924,7 +1924,7 @@ type struct IRGeneratorVisitor {
 
         // Generate arm bodies and collect values + end blocks for phi.
         // Allocate num_arms + 1 for the default block entry.
-        const result_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        const result_ty: LType = this.cg.type_mapper.map_type(e.resolved_type);
         mut phi_vals: void* = libc::malloc((num_arms + 1) as u64 * 8);
         mut phi_blks: void* = libc::malloc((num_arms + 1) as u64 * 8);
         const phi_vals_arr: void** = phi_vals as void**;
@@ -1963,7 +1963,7 @@ type struct IRGeneratorVisitor {
             mut coerced_val: LValue = LValue::null();
             if (!arm_terminated && arm_end.is_valid() && arm_val.is_valid()) {
                 coerced_val = IRGeneratorVisitor::coerce_to_phi_type(this.cg, arm_val, result_ty,
-                                                 node.resolved_type);
+                                                 e.resolved_type);
             }
             if (!arm_terminated && arm_end.is_valid()) {
                 this.cg.builder.build_br(merge_bb);
@@ -1997,11 +1997,11 @@ type struct IRGeneratorVisitor {
             this.cg.builder.position_at_end(default_bb);
             // `--panic=unwind` (hosted): raise + cleanup instead of abort.
             if (this.cg.ctx.options.unwinds() && !this.cg.intrinsics.no_runtime) {
-                this.emit_no_match_raise(node.span, &node.unwind_cleanup);
+                this.emit_no_match_raise(e.span, &node.unwind_cleanup);
             } else {
                 mut no_ops_e: [LValue] = [];
                 this.cg.intrinsics.emit_check_sink(MangledName::new("__cryo_panic_no_match"),
-                                                   node.span, &no_ops_e);
+                                                   e.span, &no_ops_e);
             }
         }
 

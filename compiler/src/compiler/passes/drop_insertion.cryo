@@ -82,7 +82,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayExpr, BinaryExprNode, CallExprNode, CalleePin, CastExprNode,
-    ExprKind, ExpressionNode, IdentifierNode, IfExpr, LambdaExprNode, LiteralExpr, MatchExprNode,
+    ExprKind, ExpressionNode, IdentifierNode, IfExpr, LambdaExprNode, LiteralExpr,
     MemberAccessNode, NewExpr, StructExpr, TernaryExpr,
     TupleExpr, UnaryExprNode
 };
@@ -1510,7 +1510,7 @@ type struct DropInserter {
     /// paths (intersection/union move-join, generalised over N arms;
     /// the same shape as `walk_if`).  Shared by match *statements*
     /// (`walk_match`, `is_expr == false`) and match *expressions*
-    /// (`walk_expr_read`'s `MatchExpression`/`TryExpression` arms,
+    /// (`walk_expr_read`'s `ExprKind::Match`/`ExprKind::Try` arms,
     /// `is_expr == true`; this is what the `?` and `??` operators
     /// desugar to).
     ///
@@ -3519,7 +3519,7 @@ type struct DropInserter {
                     | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Try(_)
                     | ExprKind::New(_) | ExprKind::Array(_) | ExprKind::Literal(_)
                     | ExprKind::Ternary(_) | ExprKind::If(_) | ExprKind::StaticMatch(_)
-                    | ExprKind::Legacy => { }
+                    | ExprKind::Match(_) | ExprKind::Legacy => { }
                 }
             }
             _ => {
@@ -4082,27 +4082,28 @@ type struct DropInserter {
             NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);             }
             NodeKind::ArrayAccess        => { this.read_array_access(expr as ArrayAccessNode*);        }
             NodeKind::CastExpression     => { this.read_cast(expr as CastExprNode*);                   }
-            NodeKind::MatchExpression    => {
-                // A match used as an expression, including the desugars
-                // of `?` and `??`.  Route through the shared arm walker
-                // in expression mode so an early `return` inside an arm
-                // (the failure arm of a `?`) gets the cumulative drops of
-                // every live local, and yielded values are move-tracked.
-                const me: MatchExprNode* = expr as MatchExprNode*;
-                // No hoist buffer at expression position - the
-                // enclosing statement-list isn't reachable from here.
-                // A throwaway out buffer plus a null match node tells
-                // walk_match_arms to skip flag synthesis and fall back
-                // to E0456 for conditional moves (rare in practice for
-                // match expressions: stdlib uses Option/Result here,
-                // whose payload consumption is tracked via
-                // link_payload, not outer-scope move detection).
-                mut throwaway_out: [Stmt*] = [];
-                this.walk_match_arms(null, me.subject, me.arms, true,
-                    &throwaway_out, &me.unwind_cleanup);
-            }
             NodeKind::Expression         => {
                 match (expr.shape) {
+                    // A match used as an expression, including the desugars
+                    // of `?` and `??`.  Route through the shared arm walker
+                    // in expression mode so an early `return` inside an arm
+                    // (the failure arm of a `?`) gets the cumulative drops
+                    // of every live local, and yielded values are
+                    // move-tracked.
+                    ExprKind::Match(me) => {
+                        // No hoist buffer at expression position - the
+                        // enclosing statement-list isn't reachable from
+                        // here.  A throwaway out buffer plus a null match
+                        // node tells walk_match_arms to skip flag synthesis
+                        // and fall back to E0456 for conditional moves (rare
+                        // in practice for match expressions: stdlib uses
+                        // Option/Result here, whose payload consumption is
+                        // tracked via link_payload, not outer-scope move
+                        // detection).
+                        mut throwaway_out: [Stmt*] = [];
+                        this.walk_match_arms(null, me.subject, me.arms, true,
+                            &throwaway_out, &me.unwind_cleanup);
+                    }
                     // Single live arm post-monomorphization: instrument its
                     // block.  This is an *expression* arm - its trailing
                     // statement is the yielded value that flows out (e.g. as
@@ -4111,8 +4112,8 @@ type struct DropInserter {
                     // treat that trailing owned temp as a discarded statement
                     // and synthesize a scope-exit drop, freeing the very value
                     // being returned (an sret aggregate then comes back empty /
-                    // use-after-free).  Mirrors how `MatchExpression` arms are
-                    // walked in expression mode.
+                    // use-after-free).  Mirrors how a `match` expression's arms
+                    // are walked in expression mode.
                     ExprKind::StaticMatch(sme) => {
                         if (sme.arms.length > 0 && sme.arms[0] != null && sme.arms[0].body != null) {
                             match (sme.arms[0].body.shape) {

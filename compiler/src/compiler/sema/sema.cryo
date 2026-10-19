@@ -76,7 +76,7 @@ import compiler::ast::expression::{
     CalleePin,
     ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
-    IfExpr, LambdaExprNode, LiteralExpr, MatchExprNode, MemberAccessNode, NewExpr,
+    IfExpr, LambdaExprNode, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr,
     TernaryExpr, TryExpr, TupleExpr, UnaryExprNode
 };
@@ -1665,7 +1665,6 @@ type struct SemaVisitor {
             NodeKind::Expression
             | NodeKind::Identifier | NodeKind::BinaryExpression
             | NodeKind::UnaryExpression
-            | NodeKind::MatchExpression
             | NodeKind::CallExpression
             | NodeKind::CastExpression
             | NodeKind::LambdaExpression
@@ -1724,7 +1723,6 @@ type struct SemaVisitor {
             NodeKind::MemberAccess      => { this.member.resolve_member_access(this, expr as MemberAccessNode*) }
             NodeKind::ArrayAccess       => { this.member.resolve_array_access(this, expr as ArrayAccessNode*) }
             NodeKind::CastExpression    => { this.resolve_cast(expr as CastExprNode*) }
-            NodeKind::MatchExpression   => { this.resolve_match_expr(expr as MatchExprNode*) }
             NodeKind::ScopeResolution   => {
                 this.calls.located_value_checked(expr, this.resolve_scope_resolution(expr as ScopeResolutionNode*))
             }
@@ -1774,6 +1772,7 @@ type struct SemaVisitor {
             ExprKind::Ternary(t) => { this.resolve_ternary(t) }
             ExprKind::If(i) => { this.resolve_if_expr(i) }
             ExprKind::StaticMatch(s) => { this.resolve_static_match_expr(expr, s) }
+            ExprKind::Match(m) => { this.resolve_match_expr(expr, m) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -3035,13 +3034,13 @@ type struct SemaVisitor {
         return this.branch_result_type(ternary.true_expr, true_type, false_type);
     }
 
-    resolve_match_expr(mut &this, match_expr: MatchExprNode*) -> TypeRef {
+    resolve_match_expr(mut &this, e: ExpressionNode*, match_expr: MatchExpr*) -> TypeRef {
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(match_expr.subject);
         this.patterns.check_duplicate_default_arm(match_expr.arms);
         const outer_expected: TypeRef = this.state.expected_type;
         mut result_type: TypeRef = TypeRef::invalid();
-        mut result_span: SourceSpan = match_expr.span;
+        mut result_span: SourceSpan = e.span;
         for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
             const arm: MatchArmNode* = match_expr.arms[i];
             if (arm == null || arm.body == null) { continue; }
@@ -3080,7 +3079,7 @@ type struct SemaVisitor {
             this.scopes.restore_scope(save);
         }
         this.state.expected_type = outer_expected;
-        this.patterns.check_match_exhaustive(match_expr.subject, subject_type, match_expr.arms, match_expr.span);
+        this.patterns.check_match_exhaustive(match_expr.subject, subject_type, match_expr.arms, e.span);
         this.patterns.check_literal_patterns(match_expr.arms, subject_type);
         if (outer_expected.is_valid()) { return outer_expected; }
         return result_type;
@@ -3320,7 +3319,7 @@ type struct SemaVisitor {
     /// rejects a mismatch) but not necessarily on instantiation, and only the
     /// returned one is what the synthesized reference refers to.
     build_try_desugar(mut &this, e: ExpressionNode*, node: TryExpr*, is_result: boolean,
-                      operand_ty: TypeRef, ret_ty: TypeRef) -> MatchExprNode* {
+                      operand_ty: TypeRef, ret_ty: TypeRef) -> ExpressionNode* {
         const span: SourceSpan = e.span;
         this.state.try_counter += 1;
         const enum_name: SymbolStr = this.intern.intern(if (is_result) { "Result" } else { "Option" });
@@ -3328,7 +3327,8 @@ type struct SemaVisitor {
         const err_variant: SymbolStr = this.intern.intern(if (is_result) { "Err" } else { "None" });
         const ok_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_%u", this.state.try_counter));
 
-        mut match_expr: MatchExprNode* = new MatchExprNode(node.operand, span);
+        const desugar: ExpressionNode* = ExpressionNode::match_expr(node.operand, span);
+        mut match_expr: MatchExpr* = ExpressionNode::match_of(desugar);
         const ok_node: Pattern* = Pattern::enum_variant(enum_name, ok_variant, span);
         mut ok_pat: EnumPattern* = ok_node.enum_payload();
         ok_pat.set_res(Res::Def(this.ctx.decl_index.def_of(operand_ty, this.ctx.type_arena)));
@@ -3392,7 +3392,7 @@ type struct SemaVisitor {
         err_block.as_block().add_statement(Stmt::return_stmt(ret_value, span));
         err_arm.set_body(err_block);
         match_expr.add_arm(err_arm);
-        return match_expr;
+        return desugar;
     }
 
     resolve_try_expr(mut &this, e: ExpressionNode*, node: TryExpr*) -> TypeRef {
@@ -3454,9 +3454,9 @@ type struct SemaVisitor {
             this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();
         }
-        mut desugared: MatchExprNode* = this.build_try_desugar(e, node, operand_shape == 1, operand_type, fn_ret);
-        node.set_desugared(desugared as ExpressionNode*);
-        return this.resolve_expr(desugared as ExpressionNode*);
+        const desugared: ExpressionNode* = this.build_try_desugar(e, node, operand_shape == 1, operand_type, fn_ret);
+        node.set_desugared(desugared);
+        return this.resolve_expr(desugared);
     }
 
     /// Resolve a struct/union/class literal's TYPE through the SAME canonical path
@@ -4395,8 +4395,8 @@ type struct SemaVisitor {
             }
             return;
         }
-        if (e.kind == NodeKind::MatchExpression) {
-            const me: MatchExprNode* = e as MatchExprNode*;
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 const arm: MatchArmNode* = me.arms[i];
                 if (arm == null) { continue; }
@@ -4499,8 +4499,8 @@ type struct SemaVisitor {
             this.check_return_stack_address(ie.else_expr);
             return;
         }
-        if (e.kind == NodeKind::MatchExpression) {
-            const me: MatchExprNode* = e as MatchExprNode*;
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 const arm: MatchArmNode* = me.arms[i];
                 if (arm == null) { continue; }

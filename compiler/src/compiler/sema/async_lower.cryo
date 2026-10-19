@@ -64,7 +64,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode, CallExprNode,
     CastExprNode, DeleteExpr, ExpressionNode, FieldInit, IdentifierNode, IfExpr,
-    LambdaExprNode, MatchExprNode, MemberAccessNode, NewExpr,
+    LambdaExprNode, MatchExpr, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExpr, StructExpr, TernaryExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExprNode
 };
@@ -1077,8 +1077,8 @@ type struct AsyncLower {
             this.rewrite_returns_expr(rr_try.live(), poll_out, span);
             return;
         }
-        if (k == NodeKind::MatchExpression) {
-            const me: MatchExprNode* = e as MatchExprNode*;
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             this.rewrite_returns_expr(me.subject, poll_out, span);
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] != null) {
@@ -1249,12 +1249,12 @@ type struct AsyncLower {
         // A lambda body is a separate function: an `await` in one belongs to
         // that function, not to this one, and counting it here would make this
         // body try to explode a suspend it does not contain.
-        if (k == NodeKind::MatchExpression) {
-            // A `match` expression holds statement bodies, so an `await` can hide
-            // in an arm. Counting it is what routes the shape to the E0600 for an
-            // await nested in an expression, instead of leaving the `await` in
-            // place for codegen to reject with no source context.
-            const me: MatchExprNode* = e as MatchExprNode*;
+        // A `match` expression holds statement bodies, so an `await` can hide
+        // in an arm. Counting it is what routes the shape to the E0600 for an
+        // await nested in an expression, instead of leaving the `await` in
+        // place for codegen to reject with no source context.
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             mut n: i64 = this.expr_await_count(me.subject);
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] != null) {
@@ -1793,8 +1793,8 @@ type struct AsyncLower {
         if (read_try != null) {
             return this.name_read_in_expr(read_try.live(), key);
         }
-        if (k == NodeKind::MatchExpression) {
-            const me: MatchExprNode* = e as MatchExprNode*;
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             if (this.name_read_in_expr(me.subject, key)) { return true; }
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] == null) { continue; }
@@ -2149,8 +2149,8 @@ type struct AsyncLower {
             }
             return e;
         }
-        if (k == NodeKind::MatchExpression) {
-            const me: MatchExprNode* = e as MatchExprNode*;
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             // A match-arm binding copies the payload out of the subject, so the
             // subject is consumed — the same reading `mark_last_use_expr` takes.
             me.subject = this.subst_name_expr(me.subject, key, field, struct_ref, ty, span, true);
@@ -3994,8 +3994,8 @@ type struct AsyncLower {
     /// costs a dead store, never a missing one.
     expr_diverges(&this, e: ExpressionNode*) -> boolean {
         if (e == null) { return false; }
-        if ((e as ASTNode*).kind != NodeKind::MatchExpression) { return false; }
-        const me: MatchExprNode* = e as MatchExprNode*;
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me == null) { return false; }
         if (me.arms.length == 0) { return false; }
         if (!this.patterns.match_is_exhaustive(me.subject, me.arms)) { return false; }
         for (mut i: i64 = 0; i < me.arms.length; i++) {
@@ -4063,8 +4063,8 @@ type struct AsyncLower {
     expr_has_free_edge(&this, e: ExpressionNode*, break_only: boolean) -> boolean {
         if (e == null) { return false; }
         const k: NodeKind = (e as ASTNode*).kind;
-        if (k == NodeKind::MatchExpression) {
-            const me: MatchExprNode* = e as MatchExprNode*;
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             if (this.expr_has_free_edge(me.subject, break_only)) { return true; }
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] != null && this.has_free_edge(me.arms[i].body, break_only)) { return true; }
@@ -4267,12 +4267,12 @@ type struct AsyncLower {
             if (l != 0) { return l; }
             return this.expr_first_use(b.right, key);
         }
-        if (k == NodeKind::MatchExpression) {
-            // Same shape as the statement form: the subject runs first, then the
-            // arm that matched. Distinguishing a write in an arm from a read is
-            // what lets `block_cond_write` see it as a branch-nested write, whose
-            // skipped path still needs the previous state's value.
-            const me: MatchExprNode* = e as MatchExprNode*;
+        // Same shape as the statement form: the subject runs first, then the
+        // arm that matched. Distinguishing a write in an arm from a read is
+        // what lets `block_cond_write` see it as a branch-nested write, whose
+        // skipped path still needs the previous state's value.
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             const r: i64 = this.expr_first_use(me.subject, key);
             if (r != 0) { return r; }
             for (mut i: i64 = 0; i < me.arms.length; i++) {
@@ -4583,8 +4583,8 @@ type struct AsyncLower {
             this.mark_last_use_expr(use_try.live(), key, by_value, out);
             return;
         }
-        if (k == NodeKind::MatchExpression) {
-            const me: MatchExprNode* = e as MatchExprNode*;
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             this.mark_last_use_expr(me.subject, key, true, out);
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] == null) { continue; }
@@ -5326,8 +5326,8 @@ type struct AsyncLower {
         if (addr_try != null) {
             return this.frame_addr_root_expr(sm, addr_try.live());
         }
-        if (k == NodeKind::MatchExpression) {
-            const me: MatchExprNode* = e as MatchExprNode*;
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             const s: IdentifierNode* = this.frame_addr_root_expr(sm, me.subject);
             if (s != null) { return s; }
             for (mut i: i64 = 0; i < me.arms.length; i++) {
@@ -5959,8 +5959,8 @@ type struct AsyncLower {
             return e;
         }
 
-        if (k == NodeKind::MatchExpression) {
-            mut me: MatchExprNode* = e as MatchExprNode*;
+        mut me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             mut in_arms: i64 = 0;
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] != null) {
@@ -5976,7 +5976,7 @@ type struct AsyncLower {
                 me.subject = this.hoist_expr(me.subject, pre);
                 return e;
             }
-            return this.hoist_match_expr(me, pre);
+            return this.hoist_match_expr(e, me, pre);
         }
 
         if (k == NodeKind::ArrayAccess) {
@@ -6117,10 +6117,10 @@ type struct AsyncLower {
     /// what an awaiting arm needs. The value has to become the assignment BEFORE
     /// the arm block is rewritten: a bare `await f()` in value position would
     /// otherwise lift into a carrier whose result nothing reads.
-    hoist_match_expr(mut &this, me: MatchExprNode*, pre: HoistPre*) -> ExpressionNode* {
-        const span: SourceSpan = (me as ASTNode*).span;
-        const vty: TypeRef = (me as ExpressionNode*).resolved_type;
-        if (!vty.is_valid()) { return me as ExpressionNode*; }
+    hoist_match_expr(mut &this, e: ExpressionNode*, me: MatchExpr*, pre: HoistPre*) -> ExpressionNode* {
+        const span: SourceSpan = e.span;
+        const vty: TypeRef = e.resolved_type;
+        if (!vty.is_valid()) { return e; }
         // A guard is left ON its arm rather than lifted: it runs per arm, after
         // that arm's pattern matched, so it cannot be evaluated above the
         // `match`. One that suspends is why the statement this becomes may lower
@@ -6631,8 +6631,8 @@ type struct AsyncLower {
             this.rn_expr(map, rn_try.live());
             return;
         }
-        if (k == NodeKind::MatchExpression) {
-            const me: MatchExprNode* = e as MatchExprNode*;
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             this.rn_expr(map, me.subject);
             for (mut i: i64 = 0; i < me.arms.length; i++) { this.rn_arm(map, me.arms[i]); }
             return;
@@ -6942,8 +6942,8 @@ type struct AsyncLower {
             this.rb_expr(ctx, rb_try.live());
             return;
         }
-        if (k == NodeKind::MatchExpression) {
-            const me: MatchExprNode* = e as MatchExprNode*;
+        const me: MatchExpr* = ExpressionNode::match_of(e);
+        if (me != null) {
             this.rb_expr(ctx, me.subject);
             for (mut i: i64 = 0; i < me.arms.length; i++) { this.rb_arm(ctx, me.arms[i]); }
             return;
