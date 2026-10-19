@@ -74,7 +74,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExprNode, StructLiteralNode,
@@ -1668,7 +1668,7 @@ type struct SemaVisitor {
             | NodeKind::MatchExpression | NodeKind::StaticMatchExpression
             | NodeKind::CallExpression
             | NodeKind::CastExpression | NodeKind::StructLiteral
-            | NodeKind::ArrayLiteral | NodeKind::LambdaExpression
+            | NodeKind::LambdaExpression
             | NodeKind::ArrayAccess | NodeKind::MemberAccess | NodeKind::ScopeResolution
             | NodeKind::AwaitExpression => {
                 this.resolve_expr(n as ExpressionNode*);
@@ -1733,7 +1733,6 @@ type struct SemaVisitor {
             NodeKind::ScopeResolution   => {
                 this.calls.located_value_checked(expr, this.resolve_scope_resolution(expr as ScopeResolutionNode*))
             }
-            NodeKind::ArrayLiteral      => { this.resolve_array_literal(expr as ArrayLiteralNode*) }
             NodeKind::Expression        => { this.resolve_expr_shape(expr) }
             NodeKind::LambdaExpression  => { this.lambda.resolve_lambda(this, expr as LambdaExprNode*) }
             NodeKind::AwaitExpression   => { this.resolve_await(expr as AwaitExprNode*) }
@@ -1774,6 +1773,7 @@ type struct SemaVisitor {
             ExprKind::Try(t)   => { this.resolve_try_expr(expr, t) }
             ExprKind::New(ne)  => { this.resolve_new_expr(expr, ne) }
             ExprKind::Tuple(t) => { this.resolve_tuple_literal(t) }
+            ExprKind::Array(a) => { this.resolve_array_literal(expr, a) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -4041,7 +4041,7 @@ type struct SemaVisitor {
     /// its initializer sharing one name for their length is the whole point of
     /// naming it.  No arena: a repeat count is fixed before TypeLowering, the
     /// same position an array annotation's size is fixed at.
-    const_repeat_count(&this, arr: ArrayLiteralNode*) -> i64 {
+    const_repeat_count(&this, arr: ArrayExpr*) -> i64 {
         if (this.ctx == null) { return -1; }
         const ev: ConstEval = ConstEval::new(this.ctx.const_table, this.ctx.intern_table, null);
         mut n: i64 = 0;
@@ -4050,7 +4050,7 @@ type struct SemaVisitor {
         return n;
     }
 
-    resolve_array_literal(mut &this, arr: ArrayLiteralNode*) -> TypeRef {
+    resolve_array_literal(mut &this, e: ExpressionNode*, arr: ArrayExpr*) -> TypeRef {
         const dynamic_elem: TypeRef = this.expected_dynamic_element();
         mut elem_expected: TypeRef = dynamic_elem;
         if (!elem_expected.is_valid() && this.state.expected_type.is_valid()) {
@@ -4111,7 +4111,7 @@ type struct SemaVisitor {
             this.ctx.emit_error_at(ErrorCode::E0453_DOUBLE_FREE,
                 fmt::format("`[value; n]` stores one value in every slot, so its element must be a plain-copy type; `%s` is not, and the one value would be released once per slot",
                     this.arena.resolve_display_name_short(elem_type)),
-                arr.span);
+                e.span);
         }
         if (!elem_type.is_valid() && this.state.expected_type.is_valid()
             && arr.elements.length == 0 && arr.repeat_count == 0 && arr.repeat_count_expr == null) {
