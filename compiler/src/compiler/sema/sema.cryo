@@ -76,9 +76,9 @@ import compiler::ast::expression::{
     CalleePin,
     ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
-    IfExprNode, LambdaExprNode, LiteralExpr, MatchExprNode, MemberAccessNode, NewExpr,
+    IfExpr, LambdaExprNode, LiteralExpr, MatchExprNode, MemberAccessNode, NewExpr,
     ScopeResolutionNode, StaticMatchExprNode, StructExpr,
-    TernaryExprNode, TryExpr, TupleExpr, UnaryExprNode
+    TernaryExpr, TryExpr, TupleExpr, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::node_locator::{ annotation_span };
@@ -1664,7 +1664,7 @@ type struct SemaVisitor {
 
             NodeKind::Expression
             | NodeKind::Identifier | NodeKind::BinaryExpression
-            | NodeKind::UnaryExpression | NodeKind::TernaryExpression | NodeKind::IfExpression
+            | NodeKind::UnaryExpression
             | NodeKind::MatchExpression | NodeKind::StaticMatchExpression
             | NodeKind::CallExpression
             | NodeKind::CastExpression
@@ -1724,8 +1724,6 @@ type struct SemaVisitor {
             NodeKind::MemberAccess      => { this.member.resolve_member_access(this, expr as MemberAccessNode*) }
             NodeKind::ArrayAccess       => { this.member.resolve_array_access(this, expr as ArrayAccessNode*) }
             NodeKind::CastExpression    => { this.resolve_cast(expr as CastExprNode*) }
-            NodeKind::IfExpression      => { this.resolve_if_expr(expr as IfExprNode*) }
-            NodeKind::TernaryExpression => { this.resolve_ternary(expr as TernaryExprNode*) }
             NodeKind::MatchExpression   => { this.resolve_match_expr(expr as MatchExprNode*) }
             NodeKind::StaticMatchExpression => { this.resolve_static_match_expr(expr as StaticMatchExprNode*) }
             NodeKind::ScopeResolution   => {
@@ -1774,6 +1772,8 @@ type struct SemaVisitor {
             ExprKind::Array(a) => { this.resolve_array_literal(expr, a) }
             ExprKind::Struct(s) => { this.resolve_struct_literal(expr, s) }
             ExprKind::Literal(l) => { this.literals.resolve_literal(expr, l) }
+            ExprKind::Ternary(t) => { this.resolve_ternary(t) }
+            ExprKind::If(i) => { this.resolve_if_expr(i) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -3005,7 +3005,7 @@ type struct SemaVisitor {
             second_span, first, second, context_msg, first_span);
     }
 
-    resolve_if_expr(mut &this, if_expr: IfExprNode*) -> TypeRef {
+    resolve_if_expr(mut &this, if_expr: IfExpr*) -> TypeRef {
         this.resolve_condition(if_expr.condition);
         const then_type: TypeRef = this.resolve_expr(if_expr.then_expr);
         const else_type: TypeRef = this.resolve_expr(if_expr.else_expr);
@@ -3025,7 +3025,7 @@ type struct SemaVisitor {
         return first;
     }
 
-    resolve_ternary(mut &this, ternary: TernaryExprNode*) -> TypeRef {
+    resolve_ternary(mut &this, ternary: TernaryExpr*) -> TypeRef {
         this.resolve_condition(ternary.condition);
         const true_type: TypeRef = this.resolve_expr(ternary.true_expr);
         const false_type: TypeRef = this.resolve_expr(ternary.false_expr);
@@ -4413,8 +4413,8 @@ type struct SemaVisitor {
             }
             return;
         }
-        if (e.kind == NodeKind::IfExpression) {
-            const ie: IfExprNode* = e as IfExprNode*;
+        const ie: IfExpr* = ExpressionNode::if_of(e);
+        if (ie != null) {
             this.check_return_payload_escape(ie.then_expr, ret_ty);
             this.check_return_payload_escape(ie.else_expr, ret_ty);
             return;
@@ -4493,8 +4493,8 @@ type struct SemaVisitor {
 
     check_return_stack_address(mut &this, e: ExpressionNode*) -> void {
         if (e == null) { return; }
-        if (e.kind == NodeKind::IfExpression) {
-            const ie: IfExprNode* = e as IfExprNode*;
+        const ie: IfExpr* = ExpressionNode::if_of(e);
+        if (ie != null) {
             this.check_return_stack_address(ie.then_expr);
             this.check_return_stack_address(ie.else_expr);
             return;

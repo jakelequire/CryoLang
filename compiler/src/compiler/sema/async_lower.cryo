@@ -63,9 +63,9 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode, CallExprNode,
-    CastExprNode, DeleteExpr, ExpressionNode, FieldInit, IdentifierNode, IfExprNode,
+    CastExprNode, DeleteExpr, ExpressionNode, FieldInit, IdentifierNode, IfExpr,
     LambdaExprNode, MatchExprNode, MemberAccessNode, NewExpr,
-    ScopeResolutionNode, StaticMatchExprNode, StructExpr, TernaryExprNode,
+    ScopeResolutionNode, StaticMatchExprNode, StructExpr, TernaryExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode };
@@ -1120,11 +1120,11 @@ type struct AsyncLower {
             this.rewrite_returns_expr(a.index, poll_out, span);
             return;
         }
-        if (k == NodeKind::TernaryExpression) {
-            const t: TernaryExprNode* = e as TernaryExprNode*;
-            this.rewrite_returns_expr(t.condition, poll_out, span);
-            this.rewrite_returns_expr(t.true_expr, poll_out, span);
-            this.rewrite_returns_expr(t.false_expr, poll_out, span);
+        const rr_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
+        if (rr_tern != null) {
+            this.rewrite_returns_expr(rr_tern.condition, poll_out, span);
+            this.rewrite_returns_expr(rr_tern.true_expr, poll_out, span);
+            this.rewrite_returns_expr(rr_tern.false_expr, poll_out, span);
             return;
         }
         // `if` used as an EXPRESSION is the ternary's block-bodied twin — same
@@ -1133,11 +1133,11 @@ type struct AsyncLower {
         // out at each site rather than normalized once because each walker's
         // per-arm treatment differs (see the condition-depth guard in
         // `subst_name_expr` and the await lift in `hoist_expr`).
-        if (k == NodeKind::IfExpression) {
-            const ife: IfExprNode* = e as IfExprNode*;
-            this.rewrite_returns_expr(ife.condition, poll_out, span);
-            this.rewrite_returns_expr(ife.then_expr, poll_out, span);
-            this.rewrite_returns_expr(ife.else_expr, poll_out, span);
+        const rr_if: IfExpr* = ExpressionNode::if_of(e);
+        if (rr_if != null) {
+            this.rewrite_returns_expr(rr_if.condition, poll_out, span);
+            this.rewrite_returns_expr(rr_if.then_expr, poll_out, span);
+            this.rewrite_returns_expr(rr_if.else_expr, poll_out, span);
             return;
         }
         const sl: StructExpr* = ExpressionNode::struct_of(e);
@@ -1188,17 +1188,17 @@ type struct AsyncLower {
         if (k == NodeKind::MemberAccess) {
             return this.expr_await_count((e as MemberAccessNode*).object);
         }
-        if (k == NodeKind::TernaryExpression) {
-            const t: TernaryExprNode* = e as TernaryExprNode*;
-            return this.expr_await_count(t.condition)
-                 + this.expr_await_count(t.true_expr)
-                 + this.expr_await_count(t.false_expr);
+        const count_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
+        if (count_tern != null) {
+            return this.expr_await_count(count_tern.condition)
+                 + this.expr_await_count(count_tern.true_expr)
+                 + this.expr_await_count(count_tern.false_expr);
         }
-        if (k == NodeKind::IfExpression) {
-            const ife: IfExprNode* = e as IfExprNode*;
-            return this.expr_await_count(ife.condition)
-                 + this.expr_await_count(ife.then_expr)
-                 + this.expr_await_count(ife.else_expr);
+        const count_if: IfExpr* = ExpressionNode::if_of(e);
+        if (count_if != null) {
+            return this.expr_await_count(count_if.condition)
+                 + this.expr_await_count(count_if.then_expr)
+                 + this.expr_await_count(count_if.else_expr);
         }
         if (k == NodeKind::CastExpression) {
             return this.expr_await_count((e as CastExprNode*).expression);
@@ -1746,17 +1746,17 @@ type struct AsyncLower {
             const a: ArrayAccessNode* = e as ArrayAccessNode*;
             return this.name_read_in_expr(a.array, key) || this.name_read_in_expr(a.index, key);
         }
-        if (k == NodeKind::TernaryExpression) {
-            const t: TernaryExprNode* = e as TernaryExprNode*;
-            return this.name_read_in_expr(t.condition, key)
-                || this.name_read_in_expr(t.true_expr, key)
-                || this.name_read_in_expr(t.false_expr, key);
+        const read_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
+        if (read_tern != null) {
+            return this.name_read_in_expr(read_tern.condition, key)
+                || this.name_read_in_expr(read_tern.true_expr, key)
+                || this.name_read_in_expr(read_tern.false_expr, key);
         }
-        if (k == NodeKind::IfExpression) {
-            const ife: IfExprNode* = e as IfExprNode*;
-            return this.name_read_in_expr(ife.condition, key)
-                || this.name_read_in_expr(ife.then_expr, key)
-                || this.name_read_in_expr(ife.else_expr, key);
+        const read_if: IfExpr* = ExpressionNode::if_of(e);
+        if (read_if != null) {
+            return this.name_read_in_expr(read_if.condition, key)
+                || this.name_read_in_expr(read_if.then_expr, key)
+                || this.name_read_in_expr(read_if.else_expr, key);
         }
         const sl: StructExpr* = ExpressionNode::struct_of(e);
         if (sl != null) {
@@ -2091,23 +2091,23 @@ type struct AsyncLower {
             a.desugared_call = this.subst_name_expr(a.desugared_call, key, field, struct_ref, ty, span, false);
             return e;
         }
-        if (k == NodeKind::TernaryExpression) {
-            const t: TernaryExprNode* = e as TernaryExprNode*;
-            t.condition  = this.subst_name_expr(t.condition, key, field, struct_ref, ty, span, false);
+        mut subst_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
+        if (subst_tern != null) {
+            subst_tern.condition  = this.subst_name_expr(subst_tern.condition, key, field, struct_ref, ty, span, false);
             // Only one arm runs, so neither may hoist its take out to the
             // enclosing statement.
             this.subst_cond_depth = this.subst_cond_depth + 1;
-            t.true_expr  = this.subst_name_expr(t.true_expr, key, field, struct_ref, ty, span, by_value);
-            t.false_expr = this.subst_name_expr(t.false_expr, key, field, struct_ref, ty, span, by_value);
+            subst_tern.true_expr  = this.subst_name_expr(subst_tern.true_expr, key, field, struct_ref, ty, span, by_value);
+            subst_tern.false_expr = this.subst_name_expr(subst_tern.false_expr, key, field, struct_ref, ty, span, by_value);
             this.subst_cond_depth = this.subst_cond_depth - 1;
             return e;
         }
-        if (k == NodeKind::IfExpression) {
-            const ife: IfExprNode* = e as IfExprNode*;
-            ife.condition = this.subst_name_expr(ife.condition, key, field, struct_ref, ty, span, false);
+        mut subst_if: IfExpr* = ExpressionNode::if_of(e);
+        if (subst_if != null) {
+            subst_if.condition = this.subst_name_expr(subst_if.condition, key, field, struct_ref, ty, span, false);
             this.subst_cond_depth = this.subst_cond_depth + 1;
-            ife.then_expr = this.subst_name_expr(ife.then_expr, key, field, struct_ref, ty, span, by_value);
-            ife.else_expr = this.subst_name_expr(ife.else_expr, key, field, struct_ref, ty, span, by_value);
+            subst_if.then_expr = this.subst_name_expr(subst_if.then_expr, key, field, struct_ref, ty, span, by_value);
+            subst_if.else_expr = this.subst_name_expr(subst_if.else_expr, key, field, struct_ref, ty, span, by_value);
             this.subst_cond_depth = this.subst_cond_depth - 1;
             return e;
         }
@@ -4098,17 +4098,17 @@ type struct AsyncLower {
             return this.expr_has_free_edge(a.array, break_only)
                 || this.expr_has_free_edge(a.index, break_only);
         }
-        if (k == NodeKind::TernaryExpression) {
-            const t: TernaryExprNode* = e as TernaryExprNode*;
-            return this.expr_has_free_edge(t.condition, break_only)
-                || this.expr_has_free_edge(t.true_expr, break_only)
-                || this.expr_has_free_edge(t.false_expr, break_only);
+        const edge_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
+        if (edge_tern != null) {
+            return this.expr_has_free_edge(edge_tern.condition, break_only)
+                || this.expr_has_free_edge(edge_tern.true_expr, break_only)
+                || this.expr_has_free_edge(edge_tern.false_expr, break_only);
         }
-        if (k == NodeKind::IfExpression) {
-            const ife: IfExprNode* = e as IfExprNode*;
-            return this.expr_has_free_edge(ife.condition, break_only)
-                || this.expr_has_free_edge(ife.then_expr, break_only)
-                || this.expr_has_free_edge(ife.else_expr, break_only);
+        const edge_if: IfExpr* = ExpressionNode::if_of(e);
+        if (edge_if != null) {
+            return this.expr_has_free_edge(edge_if.condition, break_only)
+                || this.expr_has_free_edge(edge_if.then_expr, break_only)
+                || this.expr_has_free_edge(edge_if.else_expr, break_only);
         }
         const sl: StructExpr* = ExpressionNode::struct_of(e);
         if (sl != null) {
@@ -4550,18 +4550,18 @@ type struct AsyncLower {
             this.mark_last_use_expr(a.index, key, false, out);
             return;
         }
-        if (k == NodeKind::TernaryExpression) {
-            const t: TernaryExprNode* = e as TernaryExprNode*;
-            this.mark_last_use_expr(t.condition, key, false, out);
-            this.mark_last_use_expr(t.true_expr, key, by_value, out);
-            this.mark_last_use_expr(t.false_expr, key, by_value, out);
+        const use_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
+        if (use_tern != null) {
+            this.mark_last_use_expr(use_tern.condition, key, false, out);
+            this.mark_last_use_expr(use_tern.true_expr, key, by_value, out);
+            this.mark_last_use_expr(use_tern.false_expr, key, by_value, out);
             return;
         }
-        if (k == NodeKind::IfExpression) {
-            const ife: IfExprNode* = e as IfExprNode*;
-            this.mark_last_use_expr(ife.condition, key, false, out);
-            this.mark_last_use_expr(ife.then_expr, key, by_value, out);
-            this.mark_last_use_expr(ife.else_expr, key, by_value, out);
+        const use_if: IfExpr* = ExpressionNode::if_of(e);
+        if (use_if != null) {
+            this.mark_last_use_expr(use_if.condition, key, false, out);
+            this.mark_last_use_expr(use_if.then_expr, key, by_value, out);
+            this.mark_last_use_expr(use_if.else_expr, key, by_value, out);
             return;
         }
         const sl: StructExpr* = ExpressionNode::struct_of(e);
@@ -5295,21 +5295,21 @@ type struct AsyncLower {
             if (av != null) { return av; }
             return this.frame_addr_root_expr(sm, aa.index);
         }
-        if (k == NodeKind::TernaryExpression) {
-            const t: TernaryExprNode* = e as TernaryExprNode*;
-            const c1: IdentifierNode* = this.frame_addr_root_expr(sm, t.condition);
+        const addr_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
+        if (addr_tern != null) {
+            const c1: IdentifierNode* = this.frame_addr_root_expr(sm, addr_tern.condition);
             if (c1 != null) { return c1; }
-            const c2: IdentifierNode* = this.frame_addr_root_expr(sm, t.true_expr);
+            const c2: IdentifierNode* = this.frame_addr_root_expr(sm, addr_tern.true_expr);
             if (c2 != null) { return c2; }
-            return this.frame_addr_root_expr(sm, t.false_expr);
+            return this.frame_addr_root_expr(sm, addr_tern.false_expr);
         }
-        if (k == NodeKind::IfExpression) {
-            const ife: IfExprNode* = e as IfExprNode*;
-            const i1: IdentifierNode* = this.frame_addr_root_expr(sm, ife.condition);
+        const addr_if: IfExpr* = ExpressionNode::if_of(e);
+        if (addr_if != null) {
+            const i1: IdentifierNode* = this.frame_addr_root_expr(sm, addr_if.condition);
             if (i1 != null) { return i1; }
-            const i2: IdentifierNode* = this.frame_addr_root_expr(sm, ife.then_expr);
+            const i2: IdentifierNode* = this.frame_addr_root_expr(sm, addr_if.then_expr);
             if (i2 != null) { return i2; }
-            return this.frame_addr_root_expr(sm, ife.else_expr);
+            return this.frame_addr_root_expr(sm, addr_if.else_expr);
         }
         const sl: StructExpr* = ExpressionNode::struct_of(e);
         if (sl != null) {
@@ -5904,25 +5904,27 @@ type struct AsyncLower {
             return e;
         }
 
-        if (k == NodeKind::TernaryExpression) {
-            mut t: TernaryExprNode* = e as TernaryExprNode*;
+        mut hoist_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
+        if (hoist_tern != null) {
             // Same reason as `&&`: an arm runs only for one value of the
             // condition, so its `await` cannot be lifted above the test.
-            if (this.expr_await_count(t.true_expr) > 0 ||
-                this.expr_await_count(t.false_expr) > 0) {
-                return this.hoist_branch_expr(e, t.condition, t.true_expr, t.false_expr, pre);
+            if (this.expr_await_count(hoist_tern.true_expr) > 0 ||
+                this.expr_await_count(hoist_tern.false_expr) > 0) {
+                return this.hoist_branch_expr(e, hoist_tern.condition, hoist_tern.true_expr,
+                                              hoist_tern.false_expr, pre);
             }
-            t.condition = this.hoist_expr(t.condition, pre);
+            hoist_tern.condition = this.hoist_expr(hoist_tern.condition, pre);
             return e;
         }
 
-        if (k == NodeKind::IfExpression) {
-            mut ife: IfExprNode* = e as IfExprNode*;
-            if (this.expr_await_count(ife.then_expr) > 0 ||
-                this.expr_await_count(ife.else_expr) > 0) {
-                return this.hoist_branch_expr(e, ife.condition, ife.then_expr, ife.else_expr, pre);
+        mut hoist_if: IfExpr* = ExpressionNode::if_of(e);
+        if (hoist_if != null) {
+            if (this.expr_await_count(hoist_if.then_expr) > 0 ||
+                this.expr_await_count(hoist_if.else_expr) > 0) {
+                return this.hoist_branch_expr(e, hoist_if.condition, hoist_if.then_expr,
+                                              hoist_if.else_expr, pre);
             }
-            ife.condition = this.hoist_expr(ife.condition, pre);
+            hoist_if.condition = this.hoist_expr(hoist_if.condition, pre);
             return e;
         }
 
@@ -6553,18 +6555,18 @@ type struct AsyncLower {
             this.rn_expr(map, u.desugared_call);
             return;
         }
-        if (k == NodeKind::TernaryExpression) {
-            const t: TernaryExprNode* = e as TernaryExprNode*;
-            this.rn_expr(map, t.condition);
-            this.rn_expr(map, t.true_expr);
-            this.rn_expr(map, t.false_expr);
+        const rn_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
+        if (rn_tern != null) {
+            this.rn_expr(map, rn_tern.condition);
+            this.rn_expr(map, rn_tern.true_expr);
+            this.rn_expr(map, rn_tern.false_expr);
             return;
         }
-        if (k == NodeKind::IfExpression) {
-            const ie: IfExprNode* = e as IfExprNode*;
-            this.rn_expr(map, ie.condition);
-            this.rn_expr(map, ie.then_expr);
-            this.rn_expr(map, ie.else_expr);
+        const rn_if: IfExpr* = ExpressionNode::if_of(e);
+        if (rn_if != null) {
+            this.rn_expr(map, rn_if.condition);
+            this.rn_expr(map, rn_if.then_expr);
+            this.rn_expr(map, rn_if.else_expr);
             return;
         }
         if (k == NodeKind::CallExpression) {
@@ -6866,18 +6868,18 @@ type struct AsyncLower {
             this.rb_expr(ctx, u.desugared_call);
             return;
         }
-        if (k == NodeKind::TernaryExpression) {
-            const t: TernaryExprNode* = e as TernaryExprNode*;
-            this.rb_expr(ctx, t.condition);
-            this.rb_expr(ctx, t.true_expr);
-            this.rb_expr(ctx, t.false_expr);
+        const rb_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
+        if (rb_tern != null) {
+            this.rb_expr(ctx, rb_tern.condition);
+            this.rb_expr(ctx, rb_tern.true_expr);
+            this.rb_expr(ctx, rb_tern.false_expr);
             return;
         }
-        if (k == NodeKind::IfExpression) {
-            const ie: IfExprNode* = e as IfExprNode*;
-            this.rb_expr(ctx, ie.condition);
-            this.rb_expr(ctx, ie.then_expr);
-            this.rb_expr(ctx, ie.else_expr);
+        const rb_if: IfExpr* = ExpressionNode::if_of(e);
+        if (rb_if != null) {
+            this.rb_expr(ctx, rb_if.condition);
+            this.rb_expr(ctx, rb_if.then_expr);
+            this.rb_expr(ctx, rb_if.else_expr);
             return;
         }
         if (k == NodeKind::CallExpression) {

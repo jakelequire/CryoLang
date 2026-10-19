@@ -51,9 +51,9 @@ import compiler::ast::expression::{
     CalleePin,
     AlignofExpr, ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
-    IfExprNode, LambdaExprNode, LiteralExpr, MatchExprNode, MemberAccessNode,
+    LambdaExprNode, LiteralExpr, MatchExprNode, MemberAccessNode,
     ScopeResolutionNode, SizeofExpr, StaticMatchExprNode, StructExpr,
-    TernaryExprNode, TryExpr, TupleExpr, UnaryExprNode
+    TryExpr, TupleExpr, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, Pattern };
@@ -203,8 +203,6 @@ type struct IRGeneratorVisitor {
             NodeKind::Identifier             => { return this.visit_identifier(n as IdentifierNode*); }
             NodeKind::BinaryExpression       => { return this.visit_binary(n as BinaryExprNode*); }
             NodeKind::UnaryExpression        => { return this.visit_unary(n as UnaryExprNode*); }
-            NodeKind::TernaryExpression      => { return this.visit_ternary(n as TernaryExprNode*); }
-            NodeKind::IfExpression           => { return this.visit_if_expr(n as IfExprNode*); }
             NodeKind::MatchExpression        => { return this.visit_match_expr(n as MatchExprNode*); }
             NodeKind::StaticMatchExpression  => { return this.visit_static_match_expr(n as StaticMatchExprNode*); }
             NodeKind::CallExpression         => { return this.visit_call(n as CallExprNode*); }
@@ -260,6 +258,12 @@ type struct IRGeneratorVisitor {
                     ExprKind::Array(a)   => { return this.visit_array_literal(e, a); }
                     ExprKind::Struct(s)  => { return this.visit_struct_literal(e, s); }
                     ExprKind::Literal(l) => { return this.codegen_literal(e, l); }
+                    ExprKind::Ternary(t) => {
+                        return this.emit_conditional(e, t.condition, t.true_expr, t.false_expr);
+                    }
+                    ExprKind::If(i) => {
+                        return this.emit_conditional(e, i.condition, i.then_expr, i.else_expr);
+                    }
                     ExprKind::Legacy     => { return Emitted::none(); }
                 }
             }
@@ -1686,12 +1690,6 @@ type struct IRGeneratorVisitor {
         return out;
     }
 
-    visit_if_expr(mut &this, node: IfExprNode*) -> Emitted {
-        // IfExpr has the same field layout as TernaryExpr; delegate
-        // to keep a single codegen path for both shapes.
-        return this.visit_ternary(node as TernaryExprNode*);
-    }
-
 
     // Expression visitors
 
@@ -2023,9 +2021,12 @@ type struct IRGeneratorVisitor {
         return out;
     }
 
-    visit_ternary(mut &this, node: TernaryExprNode*) -> Emitted {
+    /// `?:` and a value `if`: `condition` picks `then_expr` or `else_expr`,
+    /// and the value is the phi of the arms that reach the merge.
+    emit_conditional(mut &this, node: ExpressionNode*, condition: ExpressionNode*,
+                     then_expr: ExpressionNode*, else_expr: ExpressionNode*) -> Emitted {
         mut out: Emitted = Emitted::none();
-        const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
+        const cond: LValue = this.dispatch.codegen_rvalue(this,condition);
         const current_fn: LValue = this.get_current_function();
         const then_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.then");
         const else_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.else");
@@ -2055,7 +2056,7 @@ type struct IRGeneratorVisitor {
         mut n: u32 = 0;
 
         this.cg.builder.position_at_end(then_bb);
-        mut then_val: LValue = this.dispatch.codegen_rvalue(this,node.true_expr);
+        mut then_val: LValue = this.dispatch.codegen_rvalue(this,then_expr);
         const then_end: LBasicBlock = this.cg.builder.get_insert_block();
         const then_live: boolean = then_end.is_valid() && !then_end.has_terminator();
         if (then_live && then_val.is_valid()) {
@@ -2071,7 +2072,7 @@ type struct IRGeneratorVisitor {
         }
 
         this.cg.builder.position_at_end(else_bb);
-        mut else_val: LValue = this.dispatch.codegen_rvalue(this,node.false_expr);
+        mut else_val: LValue = this.dispatch.codegen_rvalue(this,else_expr);
         const else_end: LBasicBlock = this.cg.builder.get_insert_block();
         const else_live: boolean = else_end.is_valid() && !else_end.has_terminator();
         if (else_live && else_val.is_valid()) {

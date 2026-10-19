@@ -198,6 +198,19 @@ yet is recorded with the change that builds it, not here.
      priority (`void*` and `char*` where C has them, not `u8*`); recorded
      in the roadmap, not done with the pointer check.
 
+449. **A generic call whose type parameter only an array literal argument
+     fixes is inferred from the literal's element type** (`generic_len([true,
+     false])` for `generic_len<T>(xs: [T])` binds `T = boolean`), fixed as a
+     unit of its own after the value-producing control forms convert, with a
+     project the parent compiler fails.
+
+450. **`()` is a value.**  `const unit: () = ();` being refused ("expected
+     `()`, found `void*`") is a defect, logged with a repro and fixed only if
+     the fix turns out trivial and safe.
+
+451. **A literal is built by one factory,** `ExpressionNode::literal(value,
+     kind, span)`, not one per literal kind.
+
 ### 2026-10-17
 
 405. **A `return` inside an await-free `unsafe` block or `static match`
