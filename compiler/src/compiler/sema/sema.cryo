@@ -77,7 +77,7 @@ import compiler::ast::expression::{
     ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExpr,
-    ScopeResolutionNode, StaticMatchExprNode, StructLiteralNode,
+    ScopeResolutionNode, StaticMatchExprNode, StructExpr,
     TernaryExprNode, TryExpr, TupleExpr, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -1667,7 +1667,7 @@ type struct SemaVisitor {
             | NodeKind::UnaryExpression | NodeKind::TernaryExpression | NodeKind::IfExpression
             | NodeKind::MatchExpression | NodeKind::StaticMatchExpression
             | NodeKind::CallExpression
-            | NodeKind::CastExpression | NodeKind::StructLiteral
+            | NodeKind::CastExpression
             | NodeKind::LambdaExpression
             | NodeKind::ArrayAccess | NodeKind::MemberAccess | NodeKind::ScopeResolution
             | NodeKind::AwaitExpression => {
@@ -1729,7 +1729,6 @@ type struct SemaVisitor {
             NodeKind::TernaryExpression => { this.resolve_ternary(expr as TernaryExprNode*) }
             NodeKind::MatchExpression   => { this.resolve_match_expr(expr as MatchExprNode*) }
             NodeKind::StaticMatchExpression => { this.resolve_static_match_expr(expr as StaticMatchExprNode*) }
-            NodeKind::StructLiteral     => { this.resolve_struct_literal(expr as StructLiteralNode*) }
             NodeKind::ScopeResolution   => {
                 this.calls.located_value_checked(expr, this.resolve_scope_resolution(expr as ScopeResolutionNode*))
             }
@@ -1774,6 +1773,7 @@ type struct SemaVisitor {
             ExprKind::New(ne)  => { this.resolve_new_expr(expr, ne) }
             ExprKind::Tuple(t) => { this.resolve_tuple_literal(t) }
             ExprKind::Array(a) => { this.resolve_array_literal(expr, a) }
+            ExprKind::Struct(s) => { this.resolve_struct_literal(expr, s) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -3467,7 +3467,7 @@ type struct SemaVisitor {
     /// unresolved method generic) would materialize a `Foo<?>` instantiation that
     /// GenericValidation flags (E0900), so those return invalid and the caller
     /// keeps the demand-free name-based path.
-    resolve_struct_literal_type(mut &this, lit: StructLiteralNode*) -> TypeRef {
+    resolve_struct_literal_type(mut &this, e: ExpressionNode*, lit: StructExpr*) -> TypeRef {
         if (lit.generic_args.length == 0) {
             return TypeRef::invalid();
         }
@@ -3507,10 +3507,10 @@ type struct SemaVisitor {
         // a type built from it mentions no parameter at all, so specialization
         // would leave it untouched.
         return this.calls.resolve_generic_scope_type(base_ref, lit.generic_args,
-                                                     lit.span);
+                                                     e.span);
     }
 
-    resolve_struct_literal(mut &this, lit: StructLiteralNode*) -> TypeRef {
+    resolve_struct_literal(mut &this, e: ExpressionNode*, lit: StructExpr*) -> TypeRef {
         mut struct_ref: TypeRef = TypeRef::invalid();
         // Monomorphization records a specialized literal's instantiation as the
         // arena id itself, which IS `(definition, arguments)` already resolved.
@@ -3518,7 +3518,7 @@ type struct SemaVisitor {
         // instead would ask the same question from strictly less information:
         // the spelling deliberately keeps what the source wrote, so it names a
         // definition and can never name a specialization.
-        if (lit.resolved_type.is_valid()) { struct_ref = lit.resolved_type; }
+        if (e.resolved_type.is_valid()) { struct_ref = e.resolved_type; }
         // The pair answers next: a base named by the stamp plus this node's own
         // substituted arguments, keyed through the arena's canonical
         // instantiation slot.  It runs BEFORE any name is minted because it is
@@ -3526,7 +3526,7 @@ type struct SemaVisitor {
         // spec name minted from an already-mangled spelling names nothing at
         // all, which is what made this lookup miss three times in four.
         if (!struct_ref.is_valid() && lit.generic_args.length > 0) {
-            struct_ref = this.resolve_struct_literal_type(lit);
+            struct_ref = this.resolve_struct_literal_type(e, lit);
         }
         // A literal with no arguments has no pair to resolve, so neither branch
         // above applies and the stamp is the whole answer: it names one
@@ -3562,7 +3562,7 @@ type struct SemaVisitor {
         mut field_owner: TypeRef = struct_ref;
         mut infer_from: TemplateEntry* = null;
         if (!this.state.in_symbolic_check && lit.generic_args.length == 0
-                && !lit.resolved_type.is_valid() && lit_type.equals(struct_ref) && struct_ref.is_valid()) {
+                && !e.resolved_type.is_valid() && lit_type.equals(struct_ref) && struct_ref.is_valid()) {
             const lt: TemplateEntry* = this.ctx.generic_registry.template_of_type(struct_ref);
             if (lt != null && lt.param_types.length > 0
                     && (lt.kind == TemplateKind::Struct || lt.kind == TemplateKind::Class)) {
@@ -3650,7 +3650,7 @@ type struct SemaVisitor {
                 mut udiag: Diagnostic = Diagnostic::error(ErrorCode::E0363_UNION_LITERAL_ARITY,
                     fmt::format("union literal of `%s` must initialize exactly one field, found %lld",
                         un_name, lit.field_inits.length));
-                udiag = udiag.at_with_label(lit.span,
+                udiag = udiag.at_with_label(e.span,
                     if (lit.field_inits.length == 0) { "no field initialized" } else { "more than one field initialized" });
                 this.ctx.emit_diagnostic(udiag);
             }
@@ -3680,13 +3680,13 @@ type struct SemaVisitor {
                     // A literal sets every field, the ones it leaves to their
                     // defaults included, so one the writer may not reach
                     // refuses the literal whether it is named or not.
-                    this.member.enforce_field_visibility(&fields_ptr[k], struct_t, decl_name, lit.span);
+                    this.member.enforce_field_visibility(&fields_ptr[k], struct_t, decl_name, e.span);
                     // An omitted field carrying a `= default` is filled in: clone the
                     // default, resolve + type-check it, and append it as a synthetic
                     // field-init so codegen materializes it.  Only an omitted field
                     // WITHOUT a default is a missing-field error (E0355).
                     if (fields_ptr[k].has_default()) {
-                        this.fill_field_default(lit, &fields_ptr[k], k, decl_name);
+                        this.fill_field_default(e, lit, &fields_ptr[k], k, decl_name);
                     } else {
                         missing_names.push(decl_name);
                     }
@@ -3703,7 +3703,7 @@ type struct SemaVisitor {
                     mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0355_MISSING_FIELD_INIT,
                         fmt::format("missing field%s %s in initializer of `%s`",
                             if (missing_names.length == 1) { "" } else { "s" }, names_str, ty_name));
-                    diag = diag.at_with_label(lit.span,
+                    diag = diag.at_with_label(e.span,
                         if (missing_names.length == 1) { fmt::format("missing field %s", names_str) } else { fmt::format("missing fields %s", names_str) });
                     this.ctx.emit_diagnostic(diag);
                 }
@@ -3717,7 +3717,7 @@ type struct SemaVisitor {
     /// and type-check it against the field type (E0200 on mismatch), then append
     /// it to the literal as a synthetic field-init so codegen fills the field.
     /// The default is a standalone expression - it never sees the other fields.
-    fill_field_default(mut &this, lit: StructLiteralNode*, field: FieldInfo*,
+    fill_field_default(mut &this, e: ExpressionNode*, lit: StructExpr*, field: FieldInfo*,
                        index: i64, name: SymbolStr) -> void {
         if (field.default_value == null) { return; }
         mut cloner: ASTCloner = ASTCloner::new();
@@ -3743,7 +3743,7 @@ type struct SemaVisitor {
         lit.add_field_init(FieldInit {
             field_name: name,
             value:      cloned,
-            span:        lit.span,
+            span:        e.span,
             pin:         MemberPin::Field(0, index),
             pin_carried: false,
         });
@@ -3973,7 +3973,9 @@ type struct SemaVisitor {
 
     resolve_new_expr(mut &this, expr: ExpressionNode*, new_expr: NewExpr*) -> TypeRef {
         for (mut i: i64 = 0; i < new_expr.arguments.length; i++) { this.resolve_expr(new_expr.arguments[i]); }
-        if (new_expr.has_struct_init()) { this.resolve_struct_literal(new_expr.struct_init); }
+        if (new_expr.has_struct_init()) {
+            this.resolve_struct_literal(new_expr.struct_init, ExpressionNode::struct_of(new_expr.struct_init));
+        }
         if (new_expr.has_array_size()) { this.resolve_expr(new_expr.array_size); }
         // The name layer's own answer for the written type name, and the only
         // one: a primitive (`new u8[n]`, and `new int[100]` folded to `i32`)

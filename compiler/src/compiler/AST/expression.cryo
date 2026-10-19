@@ -169,6 +169,17 @@ public:
         }), span);
     }
 
+    /// A `struct_type { }` literal at `span`; its fields and type arguments
+    /// are added after.
+    static struct_expr(struct_type: SymbolStr, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Struct(new StructExpr {
+            struct_type:  struct_type,
+            generic_args: [],
+            field_inits:  [],
+            res:          ResSlot::Pending,
+        }), span);
+    }
+
     /// An empty array literal at `span`; its elements are added after.
     static array_expr(span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::Array(new ArrayExpr {
@@ -252,6 +263,16 @@ public:
         };
     }
 
+    /// The struct literal `n` is, or null.
+    static struct_of(n: ASTNode*) -> StructExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::Struct(s) => { s }
+            _                   => { null }
+        };
+    }
+
     /// The array literal `n` is, or null.
     static array_of(n: ASTNode*) -> ArrayExpr* {
         const e: ExpressionNode* = ExpressionNode::with_shape(n);
@@ -294,6 +315,7 @@ type enum ExprKind {
     Delete(DeleteExpr*);
     New(NewExpr*);
     Sizeof(SizeofExpr*);
+    Struct(StructExpr*);
     Try(TryExpr*);
     Tuple(TupleExpr*);
     Typeof(TypeofExpr*);
@@ -795,7 +817,8 @@ type struct NewExpr {
     generic_args: [TypeAnnotation*];
     arguments:    [ExpressionNode*];
     array_size:   ExpressionNode*;
-    struct_init:  StructLiteralNode*;
+    /// The `{ field: value, ... }` after the name, a struct literal.
+    struct_init:  ExpressionNode*;
 
     /// `--panic=unwind` cleanup schedule for the synthesized `new T[n]`
     /// size-overflow guard (populated only for the array form), so the guard's
@@ -822,7 +845,7 @@ type struct NewExpr {
     static walk_children<V>(n: NewExpr*, v: mut &V) -> void where V: Walk {
         for (mut i: i64 = 0; i < n.arguments.length; i++) { v.walk_expr(n.arguments[i]); }
         v.walk_expr(n.array_size);
-        v.walk_expr(n.struct_init as ExpressionNode*);
+        v.walk_expr(n.struct_init);
     }
 
     /// Record what the expression's type name refers to.  First answer wins.
@@ -950,8 +973,8 @@ type struct FieldInit {
     pin_carried: boolean;
 }
 
-type class StructLiteralNode : ExpressionNode {
-public:
+/// `Name { field: value, ... }`, or `Name::<Args> { ... }`.
+type struct StructExpr {
     struct_type:  SymbolStr;
     generic_args: [TypeAnnotation*];
     field_inits:  [FieldInit];
@@ -961,16 +984,12 @@ public:
     /// no trailing segment and `TypeRelative` never appears here.
     res:          ResSlot;
 
-    StructLiteralNode(struct_type: SymbolStr, span: SourceSpan)
-        : ExpressionNode(NodeKind::StructLiteral, span) {
-        this.struct_type  = struct_type;
-        this.generic_args = [];
-        this.field_inits  = [];
-        this.res          = ResSlot::Pending;
+    static walk_children<V>(n: StructExpr*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.field_inits.length; i++) { v.walk_expr(n.field_inits[i].value); }
     }
 
     /// Record what the literal's type name refers to.  First answer wins.
-    set_res(r: Res) -> void {
+    set_res(mut &this, r: Res) -> void {
         this.res.answer(r);
     }
 
@@ -986,17 +1005,23 @@ public:
     /// the spelling it happened to write.  An empty one leaves the slot
     /// unanswered rather than inventing a base, so the stage that needed the
     /// answer reports it instead of this absorbing it.
-    set_synthesized_res(def: DefId) -> void {
+    set_synthesized_res(mut &this, def: DefId) -> void {
         if (!def.is_valid()) { return; }
         this.set_res(Res::Def(def));
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    add_field_init(init: FieldInit) -> void {
+    add_field_init(mut &this, init: FieldInit) -> void {
         this.field_inits.push(init);
+    }
+}
+
+implement trait Allocate for struct StructExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

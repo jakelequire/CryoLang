@@ -33,7 +33,7 @@ import compiler::ast::expression::{
     AlignofExpr, ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExpr,
-    ScopeResolutionNode, SizeofExpr, StaticMatchExprNode, StructLiteralNode,
+    ScopeResolutionNode, SizeofExpr, StaticMatchExprNode, StructExpr,
     TernaryExprNode, TryExpr, TupleExpr, TypeofExpr, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -126,7 +126,6 @@ type struct ASTCloner {
             NodeKind::StaticMatchExpression     => { return this.visit_static_match_expr(n as StaticMatchExprNode*); }
             NodeKind::CallExpression            => { return this.visit_call(n as CallExprNode*); }
             NodeKind::CastExpression            => { return this.visit_cast(n as CastExprNode*); }
-            NodeKind::StructLiteral             => { return this.visit_struct_literal(n as StructLiteralNode*); }
             NodeKind::LambdaExpression          => { return this.visit_lambda(n as LambdaExprNode*); }
             NodeKind::ArrayAccess               => { return this.visit_array_access(n as ArrayAccessNode*); }
             NodeKind::MemberAccess              => { return this.visit_member_access(n as MemberAccessNode*); }
@@ -406,6 +405,22 @@ type struct ASTCloner {
             ExprKind::Delete(n) => {
                 c = ExpressionNode::delete_expr(this.clone_expr(n.operand), node.span);
             }
+            ExprKind::Struct(n) => {
+                c = ExpressionNode::struct_expr(n.struct_type, node.span);
+                mut cs: StructExpr* = ExpressionNode::struct_of(c);
+                cs.generic_args = this.clone_type_annotations(n.generic_args);
+                cs.res          = n.res;
+                for (mut i: i64 = 0; i < n.field_inits.length; i++) {
+                    const fi: FieldInit = n.field_inits[i];
+                    cs.add_field_init(FieldInit {
+                        field_name: fi.field_name,
+                        value:      this.clone_expr(fi.value),
+                        span:        fi.span,
+                        pin:         fi.pin,
+                        pin_carried: fi.pin_carried,
+                    });
+                }
+            }
             ExprKind::Array(n) => {
                 c = ExpressionNode::array_expr(node.span);
                 mut ca: ArrayExpr* = ExpressionNode::array_of(c);
@@ -439,7 +454,7 @@ type struct ASTCloner {
                     cn.set_array_size(this.clone_expr(n.array_size));
                 }
                 if (n.has_struct_init()) {
-                    cn.struct_init = this.clone_expr(n.struct_init) as StructLiteralNode*;
+                    cn.struct_init = this.clone_expr(n.struct_init);
                 }
             }
             ExprKind::Yield(n) => {
@@ -488,24 +503,6 @@ type struct ASTCloner {
         // The target the walk decided, carried as every other type is; a copy's
         // substitution rewrites it with the annotation.
         c.set_resolved_target(node.resolved_target);
-        c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_struct_literal(mut &this, node: StructLiteralNode*) -> ASTNode* {
-        mut c: StructLiteralNode* = new StructLiteralNode(node.struct_type, node.span);
-        c.generic_args = this.clone_type_annotations(node.generic_args);
-        c.res          = node.res;
-        for (mut i: i64 = 0; i < node.field_inits.length; i++) {
-            const fi: FieldInit = node.field_inits[i];
-            c.add_field_init(FieldInit {
-                field_name: fi.field_name,
-                value:      this.clone_expr(fi.value),
-                span:        fi.span,
-                pin:         fi.pin,
-                pin_carried: fi.pin_carried,
-            });
-        }
         c.has_error = node.has_error;
         return c;
     }

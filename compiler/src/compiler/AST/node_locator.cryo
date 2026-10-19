@@ -34,8 +34,8 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     ArrayAccessNode, AwaitExprNode, BinaryExprNode, CallExprNode,
-    CastExprNode, ExprKind, ExpressionNode, IfExprNode, LambdaExprNode,
-    MatchExprNode, MemberAccessNode, StaticMatchExprNode, StructLiteralNode,
+    CastExprNode, ExprKind, ExpressionNode, FieldInit, IfExprNode, LambdaExprNode,
+    MatchExprNode, MemberAccessNode, StaticMatchExprNode,
     TernaryExprNode, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode };
@@ -203,23 +203,6 @@ type struct NodeLocator {
                 return NodeLocator::pick(e.array as ASTNode*, e.index as ASTNode*, null, null,
                             line, character);
             }
-            NodeKind::StructLiteral => {
-                // StructLiteral fields are name=expr pairs.  Descend into
-                // each `FieldInit.value` so the cursor on a value
-                // expression (an identifier, a `Foo::Bar` ScopeResolution,
-                // a literal) reaches the inner node.  When the cursor is
-                // on the field name itself the descent finds nothing and
-                // the caller falls back to the StructLiteral hover branch
-                // which classifies cursor-on-name vs cursor-on-head.
-                const e: StructLiteralNode* = node as StructLiteralNode*;
-                for (mut i: i64 = 0; i < e.field_inits.length; i++) {
-                    const v: ExpressionNode* = e.field_inits[i].value;
-                    if (v != null && span_contains(v.span, line, character)) {
-                        return v as ASTNode*;
-                    }
-                }
-                return null;
-            }
             NodeKind::Expression => {
                 // `sizeof` and `alignof` hold a type annotation, no child
                 // expression to descend into.
@@ -232,6 +215,9 @@ type struct NodeLocator {
                     }
                     ExprKind::Array(e) => {
                         NodeLocator::pick_array_expr(e.elements, line, character)
+                    }
+                    ExprKind::Struct(e) => {
+                        NodeLocator::pick_field_value(e.field_inits, line, character)
                     }
                     ExprKind::Tuple(e) => {
                         NodeLocator::pick_array_expr(e.elements, line, character)
@@ -480,6 +466,21 @@ type struct NodeLocator {
         for (mut i: i64 = 0; i < arr.length; i++) {
             const hit: ASTNode* = NodeLocator::pick_one(arr[i] as ASTNode*, line, character);
             if (hit != null) { return hit; }
+        }
+        return null;
+    }
+
+    /// The struct literal field VALUE holding the position, itself rather
+    /// than a node inside it: the cursor on a value expression (an
+    /// identifier, a `Foo::Bar` path, a literal) reaches it.  On a field
+    /// name nothing holds the position, and the caller falls back to the
+    /// literal's hover, which tells cursor-on-name from cursor-on-head.
+    static pick_field_value(fields: &[FieldInit], line: u32, character: u32) -> ASTNode* {
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const v: ExpressionNode* = fields[i].value;
+            if (v != null && span_contains(v.span, line, character)) {
+                return v as ASTNode*;
+            }
         }
         return null;
     }
