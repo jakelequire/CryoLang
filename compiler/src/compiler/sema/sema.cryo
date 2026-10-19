@@ -77,7 +77,7 @@ import compiler::ast::expression::{
     ArrayAccessNode, ArrayExpr, AwaitExprNode, BinaryExprNode,
     CallExprNode, CastExprNode, ExprKind, ExpressionNode, FieldInit, IdentifierNode,
     IfExpr, LambdaExprNode, LiteralExpr, MatchExprNode, MemberAccessNode, NewExpr,
-    ScopeResolutionNode, StaticMatchExprNode, StructExpr,
+    ScopeResolutionNode, StaticMatchExpr, StructExpr,
     TernaryExpr, TryExpr, TupleExpr, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -1665,7 +1665,7 @@ type struct SemaVisitor {
             NodeKind::Expression
             | NodeKind::Identifier | NodeKind::BinaryExpression
             | NodeKind::UnaryExpression
-            | NodeKind::MatchExpression | NodeKind::StaticMatchExpression
+            | NodeKind::MatchExpression
             | NodeKind::CallExpression
             | NodeKind::CastExpression
             | NodeKind::LambdaExpression
@@ -1725,7 +1725,6 @@ type struct SemaVisitor {
             NodeKind::ArrayAccess       => { this.member.resolve_array_access(this, expr as ArrayAccessNode*) }
             NodeKind::CastExpression    => { this.resolve_cast(expr as CastExprNode*) }
             NodeKind::MatchExpression   => { this.resolve_match_expr(expr as MatchExprNode*) }
-            NodeKind::StaticMatchExpression => { this.resolve_static_match_expr(expr as StaticMatchExprNode*) }
             NodeKind::ScopeResolution   => {
                 this.calls.located_value_checked(expr, this.resolve_scope_resolution(expr as ScopeResolutionNode*))
             }
@@ -1774,6 +1773,7 @@ type struct SemaVisitor {
             ExprKind::Literal(l) => { this.literals.resolve_literal(expr, l) }
             ExprKind::Ternary(t) => { this.resolve_ternary(t) }
             ExprKind::If(i) => { this.resolve_if_expr(i) }
+            ExprKind::StaticMatch(s) => { this.resolve_static_match_expr(expr, s) }
             // Built with its own `NodeKind`, which `resolve_expr` dispatched.
             ExprKind::Legacy => { TypeRef::invalid() }
         };
@@ -3086,12 +3086,12 @@ type struct SemaVisitor {
         return result_type;
     }
 
-    resolve_static_match_expr(mut &this, sm: StaticMatchExprNode*) -> TypeRef {
+    resolve_static_match_expr(mut &this, e: ExpressionNode*, sm: StaticMatchExpr*) -> TypeRef {
         if (sm == null || sm.arms.length == 0) { return TypeRef::invalid(); }
         if (sm.arms.length > 1 && !this.state.in_symbolic_check) {
             this.ctx.emit_error_at(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
                 "`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)",
-                sm.span);
+                e.span);
         }
         const outer_expected: TypeRef = this.state.expected_type;
         mut result_type: TypeRef = TypeRef::invalid();
@@ -4404,8 +4404,8 @@ type struct SemaVisitor {
             }
             return;
         }
-        if (e.kind == NodeKind::StaticMatchExpression) {
-            const sme: StaticMatchExprNode* = e as StaticMatchExprNode*;
+        const sme: StaticMatchExpr* = ExpressionNode::static_match_of(e);
+        if (sme != null) {
             for (mut i: i64 = 0; i < sme.arms.length; i++) {
                 const arm: StaticMatchArmNode* = sme.arms[i];
                 if (arm == null) { continue; }
@@ -4508,8 +4508,8 @@ type struct SemaVisitor {
             }
             return;
         }
-        if (e.kind == NodeKind::StaticMatchExpression) {
-            const sme: StaticMatchExprNode* = e as StaticMatchExprNode*;
+        const sme: StaticMatchExpr* = ExpressionNode::static_match_of(e);
+        if (sme != null) {
             for (mut i: i64 = 0; i < sme.arms.length; i++) {
                 const arm: StaticMatchArmNode* = sme.arms[i];
                 if (arm == null) { continue; }

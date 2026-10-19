@@ -232,6 +232,14 @@ public:
         }), span);
     }
 
+    /// `static match (scrutinee) { }` at `span`; its arms are added after.
+    static static_match_expr(scrutinee: TypeAnnotation*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::StaticMatch(new StaticMatchExpr {
+            scrutinee: scrutinee,
+            arms:      [],
+        }), span);
+    }
+
     /// `yield operand` at `span`; a bare `yield` when `operand` is null.
     static yield_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::Yield(new YieldExpr { operand: operand }), span);
@@ -353,6 +361,16 @@ public:
         };
     }
 
+    /// The `static match` expression `n` is, or null.
+    static static_match_of(n: ASTNode*) -> StaticMatchExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::StaticMatch(s) => { s }
+            _                        => { null }
+        };
+    }
+
     /// The `?` expression `n` is, or null.
     static try_of(n: ASTNode*) -> TryExpr* {
         const e: ExpressionNode* = ExpressionNode::with_shape(n);
@@ -377,6 +395,7 @@ type enum ExprKind {
     Literal(LiteralExpr*);
     New(NewExpr*);
     Sizeof(SizeofExpr*);
+    StaticMatch(StaticMatchExpr*);
     Struct(StructExpr*);
     Ternary(TernaryExpr*);
     Try(TryExpr*);
@@ -679,19 +698,22 @@ public:
 /// does not match, BEFORE type-checking, leaving a single live arm. Sema and
 /// codegen then treat the reduced node as "evaluate the one arm's block, yield
 /// its trailing expression" - see StaticMatchArmNode.
-type class StaticMatchExprNode : ExpressionNode {
-public:
+type struct StaticMatchExpr {
     scrutinee: TypeAnnotation*;
     arms:      [StaticMatchArmNode*];
 
-    StaticMatchExprNode(scrutinee: TypeAnnotation*, span: SourceSpan)
-        : ExpressionNode(NodeKind::StaticMatchExpression, span) {
-        this.scrutinee = scrutinee;
-        this.arms      = [];
+    static walk_children<V>(n: StaticMatchExpr*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.arms.length; i++) { v.walk_node(n.arms[i] as ASTNode*); }
     }
 
-    add_arm(arm: StaticMatchArmNode*) -> void {
+    add_arm(mut &this, arm: StaticMatchArmNode*) -> void {
         this.arms.push(arm);
+    }
+}
+
+implement trait Allocate for struct StaticMatchExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

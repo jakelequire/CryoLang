@@ -83,7 +83,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayExpr, BinaryExprNode, CallExprNode, CalleePin, CastExprNode,
     ExprKind, ExpressionNode, IdentifierNode, IfExpr, LambdaExprNode, LiteralExpr, MatchExprNode,
-    MemberAccessNode, NewExpr, StaticMatchExprNode, StructExpr, TernaryExpr,
+    MemberAccessNode, NewExpr, StructExpr, TernaryExpr,
     TupleExpr, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -3518,7 +3518,7 @@ type struct DropInserter {
                     ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
                     | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Try(_)
                     | ExprKind::New(_) | ExprKind::Array(_) | ExprKind::Literal(_)
-                    | ExprKind::Ternary(_) | ExprKind::If(_)
+                    | ExprKind::Ternary(_) | ExprKind::If(_) | ExprKind::StaticMatch(_)
                     | ExprKind::Legacy => { }
                 }
             }
@@ -4101,28 +4101,28 @@ type struct DropInserter {
                 this.walk_match_arms(null, me.subject, me.arms, true,
                     &throwaway_out, &me.unwind_cleanup);
             }
-            NodeKind::StaticMatchExpression => {
-                // Single live arm post-monomorphization: instrument its block.
-                // This is an *expression* arm - its trailing statement is the
-                // yielded value that flows out (e.g. as the enclosing
-                // `return`'s result), so route through `walk_value_block`, not
-                // `walk_block`.  `walk_block` would treat that trailing owned
-                // temp as a discarded statement and synthesize a scope-exit
-                // drop, freeing the very value being returned (an sret
-                // aggregate then comes back empty / use-after-free).  Mirrors
-                // how `MatchExpression` arms are walked in expression mode.
-                const sme: StaticMatchExprNode* = expr as StaticMatchExprNode*;
-                if (sme.arms.length > 0 && sme.arms[0] != null && sme.arms[0].body != null) {
-                    match (sme.arms[0].body.shape) {
-                        StmtKind::Block(_) => {
-                            const _smd: boolean = this.walk_value_block(sme.arms[0].body);
-                        }
-                        _ => {}
-                    }
-                }
-            }
             NodeKind::Expression         => {
                 match (expr.shape) {
+                    // Single live arm post-monomorphization: instrument its
+                    // block.  This is an *expression* arm - its trailing
+                    // statement is the yielded value that flows out (e.g. as
+                    // the enclosing `return`'s result), so route through
+                    // `walk_value_block`, not `walk_block`.  `walk_block` would
+                    // treat that trailing owned temp as a discarded statement
+                    // and synthesize a scope-exit drop, freeing the very value
+                    // being returned (an sret aggregate then comes back empty /
+                    // use-after-free).  Mirrors how `MatchExpression` arms are
+                    // walked in expression mode.
+                    ExprKind::StaticMatch(sme) => {
+                        if (sme.arms.length > 0 && sme.arms[0] != null && sme.arms[0].body != null) {
+                            match (sme.arms[0].body.shape) {
+                                StmtKind::Block(_) => {
+                                    const _smd: boolean = this.walk_value_block(sme.arms[0].body);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     // `expr?` is lowered by sema to a `match` expression;
                     // route through the same path.  (`desugared` is null
                     // only when sema rejected the operand; a diagnostic
