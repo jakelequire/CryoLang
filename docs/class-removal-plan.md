@@ -761,7 +761,7 @@ Concrete places, each a candidate to confirm as its slice reaches it:
 | a missing slot is silent: the whole table is skipped | 0007 | the early return at `declaration_emitter.cryo:886-892` | The table is built from the trait's positions after E0312 has passed, so every position has a method or a default.  An empty position is an internal error (E0900), never a skipped table or a direct call. |
 | slots are matched by name | 0008 | `collect_vtable_slots`/`find_vtable_slot_impl` compare name text | Slots are trait item positions, read by `DefId` (rule 4: identity text never becomes a key).  Two methods of one name in two traits are two tables. |
 | `delete` through a base pointer runs the static type's `Drop` | 0009, ruling 295 | `bind_destructor` from `new_delete_emitter.cryo:479` | Borrowed objects are not deleted.  The owning box, when it comes, takes drop, size and alignment from the table (roadmap). |
-| `Allocate` on a generic class fails to link | 0001, ruling 292 | `allocator_of` never asks for the generic instance | Moot with classes.  It still needs measuring for a generic **struct**'s `Allocate`, as the roadmap says.  That gets a project test in slice 9, and a bug-log file if it fails. |
+| `Allocate` on a generic class fails to link | 0001, ruling 292 | `new` sized, filled and allocated by the template, not the instance its arguments name | Fixed before slice 9: `new G<A> ..` allocates the instance, and `new G { .. }` the instance its literal binds (projects `generic_struct_allocate_instance`, `new_generic_struct_layout`, `new_generic_enum_variant`). |
 
 Each row gets a negative or project test in the trait-object slices:
 an implementation with a missing method refused; one with a mismatched

@@ -455,6 +455,9 @@ error / missing check / cosmetic / infrastructure) and where it came from.
   split across files (`Parser`) uses `implement struct` blocks in the other
   files; the ones in its own file are inline.  A bound only some methods
   need is a `where` on those methods, which works inline on a generic struct.
+- Names are written out in full, not abbreviated: `ExpressionNode`, not
+  `Expr`; `declaration`, not `decl`, in new names.  It is the same reason the
+  keyword is `implement` and not a shortening of it.
 - No parallel/mirrored module structures; extend the module that exists.
 - Commit messages are plain, with no trailers. That includes `Co-Authored-By:`,
   which some agent harnesses append automatically - turn it off at the source

@@ -3974,24 +3974,40 @@ type struct SemaVisitor {
 
     resolve_new_expr(mut &this, expr: ExpressionNode*, new_expr: NewExpr*) -> TypeRef {
         for (mut i: i64 = 0; i < new_expr.arguments.length; i++) { this.resolve_expr(new_expr.arguments[i]); }
-        if (new_expr.has_struct_init()) {
-            this.resolve_struct_literal(new_expr.struct_init, ExpressionNode::struct_of(new_expr.struct_init));
-        }
         if (new_expr.has_array_size()) { this.resolve_expr(new_expr.array_size); }
+        // `new T { .. }` places the literal it holds, so the literal's type is
+        // the type allocated: the instance its written arguments name, or the
+        // one its expected type or field values bind (`new Cell { v: 1 }`).
+        if (new_expr.has_struct_init()) {
+            const saved_expected: TypeRef = this.state.expected_type;
+            this.state.expected_type = this.arena.pointer_pointee_of(saved_expected);
+            const lit_type: TypeRef = this.resolve_struct_literal(new_expr.struct_init, ExpressionNode::struct_of(new_expr.struct_init));
+            this.state.expected_type = saved_expected;
+            if (!lit_type.is_valid()) { return TypeRef::invalid(); }
+            return this.arena.get_pointer_to(lit_type);
+        }
         // The name layer's own answer for the written type name, and the only
         // one: a primitive (`new u8[n]`, and `new int[100]` folded to `i32`)
         // is `PrimTy`, a declared type its definition.  A self-reference
         // inside the specialized body never reaches here: the substituter
         // records the instantiation's arena id on the node, and
         // `resolve_expr` returns that before this runs.
-        const base: TypeRef = this.types.spelling_type(new_expr.res);
+        //
+        // The type allocated is that name with the arguments written on it
+        // (`new Cell<i32> { .. }` is a `Cell<i32>`), as a type annotation's
+        // is: the template itself has no layout, and an allocation sized
+        // and initialized by it, or served by its `Allocate`, is wrong.
+        const named: TypeRef = this.types.spelling_type(new_expr.res);
+        const base: TypeRef = this.calls.resolve_generic_scope_type(named, &new_expr.generic_args, expr.span);
         if (!base.is_valid()) { return TypeRef::invalid(); }
         // `new E::V(..)`: the variant is found here, once, inside the enum the
         // stamp names, and its ordinal recorded for codegen to build from.  A
         // leaf the enum does not declare is refused as `E::V` in value
         // position is (`validate_enum_scope_member`).
         if (new_expr.has_variant()) {
-            const e: Type* = this.types.unwrap_to_enum(base);
+            // An instantiation's variants are its declaration's, at the same
+            // ordinals.
+            const e: Type* = this.types.unwrap_to_enum(named);
             if (e != null && e.kind == TypeKind::Enum) {
                 const et: EnumType* = e.as_enum();
                 const vi: i64 = et.variant_index(new_expr.variant_name);

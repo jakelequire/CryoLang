@@ -135,6 +135,29 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-10-20
 
+465. **The removed class syntax is refused with E0117,** "`<form>` is not
+     part of Cryo", with one help line per form: `type class` - declare a
+     struct and implement a trait; a base list - hold the shared part in a
+     field, its methods in a trait; `virtual` / `override` - declare the
+     method in a trait and implement it; `protected:` - `private:` or
+     `public:`; a base-constructor initializer - build the shared field in
+     the factory; `implement class` - `implement struct`; a constructor - a
+     `static new` factory; a destructor - implement `Drop`.  (Jake)
+
+466. **`()` is only the unit value:** it is not a null pointer, and `()`
+     used where a pointer is wanted is a type error.  (Jake)
+
+467. **Assigning an array to an array of a different element type is
+     refused.**  (Jake)
+
+468. **`This::missing()` in a trait's default body, and `T::missing()` in a
+     generic function, are refused at the trait or the function itself,**
+     even when nothing implements the trait or calls the function.  (Jake)
+
+469. **Node type names stay unabbreviated** (`ExpressionNode`, not
+     `Expr`): names in the compiler are written out in full, as the keyword
+     is `implement` and not a shortening of it.  (Jake)
+
 462. **A path through a bounded type parameter naming a member no bound
      declares (`T::missing()` in a generic function that is instantiated)
      is refused with a diagnostic where it is written,** not left for

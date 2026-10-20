@@ -545,15 +545,6 @@ only a separate closure-value type does; who owns an escaping closure's
 captures and when they are released; and whether a non-capturing function
 keeps its single-pointer form across the C boundary.
 
-## `Allocate` on a generic class
-
-`implement<T> trait Allocate for class G<T>` type-checks, and then `new
-G<i64>(77)` fails at link time: the allocator is never instantiated for
-`G<i64>`, and the linker reports the missing symbol.  It is refused late,
-not miscompiled (ruling 292: left for after the merge).  It may become
-moot with the class removal.  Whether a generic struct's `Allocate` fails
-the same way has not been measured.
-
 ## Moving a value out from behind a reference
 
 A field moved out of a place reached through a reference or a pointer -
