@@ -1685,7 +1685,7 @@ type struct SemaVisitor {
                 TypeRef::invalid()
             }
             ExprKind::Delete(d) => {
-                this.refuse_delete_of_object(d.operand, this.resolve_expr(d.operand));
+                this.refuse_delete_of_non_pointer(d.operand, this.resolve_expr(d.operand));
                 this.arena.get_void()
             }
             // A `yield` has no type: codegen refuses it.
@@ -2786,17 +2786,26 @@ type struct SemaVisitor {
         TypeAnnotation::refused(ann);
     }
 
-    /// E0200 at `delete` of a trait object: what the object points at has a
-    /// size and a destructor only its table knows, and the table holds
-    /// neither yet.
-    refuse_delete_of_object(&this, operand: ExpressionNode*, operand_type: TypeRef) -> void {
+    /// E0200 at `delete` of an operand that is not a pointer: `delete`
+    /// releases a pointee and frees its block, and any other value has
+    /// neither.  A trait object is refused with its own note: what it
+    /// points at has a size and a destructor only its table knows, and the
+    /// table holds neither yet.  An error-typed operand stays silent, its
+    /// error already reported.
+    refuse_delete_of_non_pointer(&this, operand: ExpressionNode*, operand_type: TypeRef) -> void {
         const t: Type* = this.arena.lookup(operand_type);
-        if (t == null || t.kind != TypeKind::Object) { return; }
-        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,
-            fmt::format("`delete` takes a pointer, and `%s` is a trait object", this.arena.format_display(t)));
-        d = d.at(operand.span);
-        d = d.with_note("a trait object's value has a size and a destructor that are not known where the object is used");
-        this.ctx.emit_diagnostic(d);
+        if (t == null || t.is_error() || t.kind == TypeKind::Pointer) { return; }
+        if (t.kind == TypeKind::Object) {
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,
+                fmt::format("`delete` takes a pointer, and `%s` is a trait object", this.arena.format_display(t)));
+            d = d.at(operand.span);
+            d = d.with_note("a trait object's value has a size and a destructor that are not known where the object is used");
+            this.ctx.emit_diagnostic(d);
+            return;
+        }
+        this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
+            fmt::format("`delete` takes a pointer, and `%s` is not a pointer", this.arena.format_display(t)),
+            operand.span);
     }
 
     resolve_cast(mut &this, e: ExpressionNode*, cast: CastExpr*) -> TypeRef {
