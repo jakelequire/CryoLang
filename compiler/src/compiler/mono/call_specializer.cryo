@@ -49,7 +49,7 @@ import compiler::ast::expression::{
     CalleePin,
     CallExprNode,
     ExprKind, ExpressionNode, IdentifierExpr,
-    MemberAccessNode, ScopeResolutionExpr
+    MemberAccessExpr, ScopeResolutionExpr
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
@@ -426,12 +426,9 @@ type struct MonoCallSpecializer {
                     this.unpinned_calls.push(UnpinnedCall { call: call, func: this.current_fn });
                 }
             }
-            NodeKind::MemberAccess => {
-                const ma: MemberAccessNode* = expr as MemberAccessNode*;
-                this.walk_expr(ma.object, res_ctx, subst);
-            }
             NodeKind::Expression => {
                 match (expr.shape) {
+                    ExprKind::MemberAccess(ma) => { this.walk_expr(ma.object, res_ctx, subst); }
                     ExprKind::ScopeResolution(sr) => {
                         this.specialize_path_fn_value(sr, subst);
                         this.bind_path_value(expr, sr, subst);
@@ -837,11 +834,11 @@ type struct MonoCallSpecializer {
         // call `Owner::m(recv, args)` passes it first, and sema recorded the
         // generic method's definition the path names (`path_method`): the
         // method is that declaration, not one found again by name here.
-        mut ma: MemberAccessNode* = null;
+        mut ma: MemberAccessExpr* = null;
         mut recv_expr: ExpressionNode* = null;
         mut path_method: DeclarationNode* = null;
-        if (callee_node.kind == NodeKind::MemberAccess) {
-            ma = call.callee as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(callee_node) != null) {
+            ma = ExpressionNode::member_access_of(call.callee);
             recv_expr = ma.object;
         } else if (ExpressionNode::scope_resolution_of(callee_node) != null) {
             const recorded: ASTNode* = this.decl_index.method_decl_of(call.template_method);
@@ -1234,7 +1231,7 @@ type struct MonoCallSpecializer {
     /// under it, where the instances its calls ask for are added and
     /// emitted; any other receiver's are the registry's heads selected for
     /// it.
-    trait_item_on(&this, call: CallExprNode*, ma: MemberAccessNode*, recv_type: TypeRef,
+    trait_item_on(&this, call: CallExprNode*, ma: MemberAccessExpr*, recv_type: TypeRef,
                   out_impl: DeclarationNode**) -> DeclarationNode* {
         if (this.generic_registry == null) { return null; }
         const heads: [DeclarationNode*] = this.trait_heads_on(ma.resolved_trait, recv_type);
@@ -1553,7 +1550,7 @@ type struct MonoCallSpecializer {
         const m: MethodDecl* = DeclarationNode::method_of(m_decl);
         mut params: [TypeRef] = [];
         if (m != null && m.func != null) {
-            const on_receiver: boolean = (call.callee as ASTNode*).kind == NodeKind::MemberAccess;
+            const on_receiver: boolean = ExpressionNode::member_access_of((call.callee as ASTNode*)) != null;
             for (mut i: i64 = 0; i < DeclarationNode::fn_of(m.func).parameters.length; i++) {
                 const p_decl: DeclarationNode* = DeclarationNode::fn_of(m.func).parameters[i];
                 const p: VarDecl* = DeclarationNode::var_of(p_decl);
@@ -1574,7 +1571,6 @@ type struct MonoCallSpecializer {
     /// name of something declared: a local, or a field.
     callee_is_value(&this, callee: ExpressionNode*) -> boolean {
         if (callee == null) { return false; }
-        const k: NodeKind = (callee as ASTNode*).kind;
         const id: IdentifierExpr* = ExpressionNode::identifier_of(callee);
         if (id != null) {
             return match (id.res) {
@@ -1587,8 +1583,9 @@ type struct MonoCallSpecializer {
                 _ => { false }
             };
         }
-        if (k == NodeKind::MemberAccess) {
-            return match ((callee as MemberAccessNode*).resolved_member) {
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(callee);
+        if (ma != null) {
+            return match (ma.resolved_member) {
                 MemberPin::Field(_, _) => { true }
                 _                      => { false }
             };
@@ -1636,7 +1633,7 @@ type struct MonoCallSpecializer {
                 this.pin_plain(call, this.receiver_method_of(call.template_method, owner, &id_impl, &id_owner));
             } else {
                 mut item_impl: DeclarationNode* = null;
-                this.pin_plain(call, this.trait_item_on(call, call.callee as MemberAccessNode*, owner, &item_impl));
+                this.pin_plain(call, this.trait_item_on(call, ExpressionNode::member_access_of(call.callee), owner, &item_impl));
             }
         }
         this.queued_binds = still;
@@ -1713,17 +1710,13 @@ type struct MonoCallSpecializer {
             }
             return t != null && t.kind == TypeKind::Enum;
         }
-        match (callee.kind) {
-            NodeKind::MemberAccess => {
-                const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
-                if (ma.resolved_member.is_some() && this.is_function_value(ma.resolved_type)) { return true; }
-                return call.named_method.is_valid()
-                    && call.named_method.equals(this.generic_registry.wellknown(LangItem::DropDrop));
-            }
-            _ => {
-                return this.is_function_value(call.callee.resolved_type);
-            }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(callee);
+        if (ma != null) {
+            if (ma.resolved_member.is_some() && this.is_function_value(call.callee.resolved_type)) { return true; }
+            return call.named_method.is_valid()
+                && call.named_method.equals(this.generic_registry.wellknown(LangItem::DropDrop));
         }
+        return this.is_function_value(call.callee.resolved_type);
     }
 
     /// Whether `ty` is a function, through one pointer or reference.
@@ -1749,12 +1742,10 @@ type struct MonoCallSpecializer {
         if (id != null) { leaf = this.intern_table.resolve(id.name); }
         const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(callee);
         if (sr != null) { leaf = this.intern_table.resolve(sr.member_name); }
-        match (callee.kind) {
-            NodeKind::MemberAccess    => {
-                leaf = this.intern_table.resolve((call.callee as MemberAccessNode*).member);
-                what = "method";
-            }
-            _ => {}
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(callee);
+        if (ma != null) {
+            leaf = this.intern_table.resolve(ma.member);
+            what = "method";
         }
         const where_fn: string = if (func != null) { this.intern_table.resolve(func.name) } else { "<no function>" };
         const file: string = call.span.file;

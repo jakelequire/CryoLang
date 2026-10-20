@@ -153,6 +153,16 @@ yet is recorded with the change that builds it, not here.
      converting to payloads, beside the two fixed-size-array defects of
      ruling 452.  (Delegated)
 
+455. **`This` names the self type wherever there is one:** `This::member`
+     resolves inside a generic struct's own body and inside a trait impl
+     as it does inside a non-generic struct's body.  Refusing it there
+     (E0203) is a defect, fixed after the expressions finish converting to
+     payloads, with the defects of rulings 452 and 454.  (Jake)
+
+456. **The expression codemod (`scripts/expr-kind-codemod.py`) is kept
+     through the member-access and call conversions,** and deleted in the
+     first change after the call conversion lands.  (Jake)
+
 ### 2026-10-18
 
 438. **A `Location` constant keeps its pointers, and the growth of the

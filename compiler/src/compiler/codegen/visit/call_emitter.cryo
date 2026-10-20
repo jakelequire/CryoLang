@@ -50,7 +50,7 @@ import compiler::ast::declaration::{ FunctionDecl, MethodDecl, DeclarationNode, 
 import compiler::ast::expression::{
     CalleePin,
     CallExprNode, ExpressionNode, IdentifierExpr,
-    MemberAccessNode, ScopeResolutionExpr
+    MemberAccessExpr, ScopeResolutionExpr
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::statement::{ Stmt };
@@ -530,13 +530,13 @@ type struct CallEmitter {
                     }
                 }
             }
-        } else if (node.callee.kind == NodeKind::MemberAccess) {
+        } else if (ExpressionNode::member_access_of(node.callee) != null) {
             // Member access: sema's overload selection (or mono's, for a
             // specialization) pins the mangled LLVM callee on
             // `resolved_callee`.  Codegen detects the function-pointer-field
             // shortcut, picks up virtual-dispatch state for class receivers,
             // then routes the pin through `resolve_pinned`.
-            const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(node.callee);
 
             // Function-pointer field call: `receiver.field(args)` where
             // `field` has a Function type.  What the member IS is its pin:
@@ -546,7 +546,7 @@ type struct CallEmitter {
             // typed by the method's return, which may itself be a function.
             // The field is loaded and called through.
             mut ma_callee_t: Type* = null;
-            if (ma.resolved_member.is_some()) { ma_callee_t = this.cg.arena_type(ma.resolved_type); }
+            if (ma.resolved_member.is_some()) { ma_callee_t = this.cg.arena_type(node.callee.resolved_type); }
             // Unwrap pointer/reference to match how function-typed fields
             // land; `fn(...) -> T` stores as a raw function-pointer so the
             // member may resolve to a Function type directly.
@@ -572,7 +572,7 @@ type struct CallEmitter {
                 // Load the fn-pointer value from the field (rvalue).  No
                 // implicit `this`: the field holds a plain function, not a
                 // bound method.
-                const fn_ptr: LValue = this.dispatch.codegen_rvalue(visitor,ma);
+                const fn_ptr: LValue = this.dispatch.codegen_rvalue(visitor,node.callee);
                 if (!fn_ptr.is_valid()) {
                     out.value = LValue::null();
                     out.is_lvalue = false;
@@ -703,8 +703,8 @@ type struct CallEmitter {
             // surfaces.
             const releases: boolean = node.named_method.is_valid()
                 && node.named_method.equals(this.cg.ctx.generic_registry.wellknown(LangItem::DropDrop));
-            if (releases && node.callee.kind == NodeKind::MemberAccess) {
-                const dma: MemberAccessNode* = node.callee as MemberAccessNode*;
+            if (releases && ExpressionNode::member_access_of(node.callee) != null) {
+                const dma: MemberAccessExpr* = ExpressionNode::member_access_of(node.callee);
                 if (OwnershipQuery::is_copy(this.cg.get_arena(),
                                this.cg.ctx.generic_registry,
                                this.cg.get_intern(),
@@ -757,8 +757,8 @@ type struct CallEmitter {
         // receiver temp joins this frame.
         if (this.cg.ctx.options.unwinds()) { this.cg.expr_ops.open_arg_temp_frame(); }
         mut args: [Pair<LValue, TypeRef>] = [];
-        if (node.callee.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(node.callee) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(node.callee);
             // For pointer/reference receivers (e.g. `runner: Runner*`),
             // the receiver value is itself the `this` pointer; load it
             // out of the local slot.  For value receivers (`runner: Runner`),
@@ -998,10 +998,10 @@ type struct CallEmitter {
         // A destructor is the method of an implementation of `Drop`, which the
         // call's pin names; a method merely named `drop` is not one, and runs
         // no glue after it.
-        if (node.callee.kind == NodeKind::MemberAccess && node.arguments.length == 0
+        if (ExpressionNode::member_access_of(node.callee) != null && node.arguments.length == 0
                 && this.cg.get_decl_index().entry_trait(node.resolved_callee.decl_entry()).equals(
                        this.cg.ctx.defs.parent_of(this.cg.ctx.generic_registry.wellknown(LangItem::DropDrop)))) {
-            const gma: MemberAccessNode* = node.callee as MemberAccessNode*;
+            const gma: MemberAccessExpr* = ExpressionNode::member_access_of(node.callee);
             if (gma.object != null
                     && OwnershipQuery::needs_drop(this.cg.get_arena(),
                            this.cg.ctx.generic_registry,
@@ -1051,9 +1051,9 @@ type struct CallEmitter {
         ExpressionNode::identifier_of(id_node).set_res(Res::Local(nm_sym));
         id_node.set_resolved_type(ty);
         const drop_sym: SymbolStr = intern.intern("drop");
-        mut da: MemberAccessNode* = new MemberAccessNode(
+        mut da: ExpressionNode* = ExpressionNode::member_access_expr(
             id_node, drop_sym, span, span);
-        mut call: CallExprNode* = new CallExprNode(da as ExpressionNode*, span);
+        mut call: CallExprNode* = new CallExprNode(da, span);
         this.cg.bind_destructor_call(call);
         mut stmt: Stmt* = Stmt::expr_stmt(call as ExpressionNode*, span);
         this.cg.expr_ops.push_arg_temp_drop(stmt as ASTNode*);
@@ -1079,7 +1079,7 @@ type struct CallEmitter {
         if (arg_expr == null || !arg_val.is_valid()) { return; }
         if (arg_expr.kind != NodeKind::CallExpression
             && ExpressionNode::struct_of(arg_expr) == null
-            && arg_expr.kind != NodeKind::MemberAccess) { return; }
+            && ExpressionNode::member_access_of(arg_expr) == null) { return; }
         const ty: TypeRef = arg_expr.resolved_type;
         if (!ty.is_valid()) { return; }
         const arena: TypeArena* = this.cg.get_arena();
@@ -1490,16 +1490,16 @@ type struct CallEmitter {
                 continue;
             }
             const idx_sym: SymbolStr = intern.intern(fmt::format("%ld", i));
-            mut elem_access: MemberAccessNode* = new MemberAccessNode(
+            mut elem_access: ExpressionNode* = ExpressionNode::member_access_expr(
                 receiver, idx_sym, receiver.span, receiver.span);
             elem_access.set_resolved_type(elem_type);
             // Minted after the last sema walk: the element is the i-th.
-            elem_access.set_resolved_member(MemberPin::Field(0, i));
-            mut drop_access: MemberAccessNode* = new MemberAccessNode(
-                elem_access as ExpressionNode*, drop_sym,
+            ExpressionNode::member_access_of(elem_access).set_resolved_member(MemberPin::Field(0, i));
+            mut drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
+                elem_access, drop_sym,
                 receiver.span, receiver.span);
             mut call: CallExprNode* = new CallExprNode(
-                drop_access as ExpressionNode*, receiver.span);
+                drop_access, receiver.span);
             this.cg.bind_destructor_call(call);
             mut stmt: Stmt* = Stmt::expr_stmt(
                 call as ExpressionNode*, receiver.span);
@@ -1528,11 +1528,11 @@ type struct CallEmitter {
             mut arr_access: ExpressionNode* = ExpressionNode::array_access_expr(
                 receiver, idx_lit, receiver.span);
             arr_access.set_resolved_type(at.element);
-            mut drop_access: MemberAccessNode* = new MemberAccessNode(
+            mut drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
                 arr_access, drop_sym,
                 receiver.span, receiver.span);
             mut call: CallExprNode* = new CallExprNode(
-                drop_access as ExpressionNode*, receiver.span);
+                drop_access, receiver.span);
             this.cg.bind_destructor_call(call);
             mut stmt: Stmt* = Stmt::expr_stmt(
                 call as ExpressionNode*, receiver.span);
@@ -1556,17 +1556,17 @@ type struct CallEmitter {
             if (!OwnershipQuery::needs_drop(arena, registry, intern, f.field_type)) {
                 continue;
             }
-            mut field_access: MemberAccessNode* = new MemberAccessNode(
+            mut field_access: ExpressionNode* = ExpressionNode::member_access_expr(
                 receiver, f.decl_name().spelling(), receiver.span, receiver.span);
             field_access.set_resolved_type(f.field_type);
             // Minted after the last sema walk: the field is the i-th of the
             // aggregate's own list, which is the list walked here.
-            field_access.set_resolved_member(MemberPin::Field(0, i));
-            mut drop_access: MemberAccessNode* = new MemberAccessNode(
-                field_access as ExpressionNode*, drop_sym,
+            ExpressionNode::member_access_of(field_access).set_resolved_member(MemberPin::Field(0, i));
+            mut drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
+                field_access, drop_sym,
                 receiver.span, receiver.span);
             mut call: CallExprNode* = new CallExprNode(
-                drop_access as ExpressionNode*, receiver.span);
+                drop_access, receiver.span);
             this.cg.bind_destructor_call(call);
             mut stmt: Stmt* = Stmt::expr_stmt(
                 call as ExpressionNode*, receiver.span);
@@ -1666,10 +1666,10 @@ type struct CallEmitter {
                     const id_node: ExpressionNode* = ExpressionNode::identifier_expr(nm, receiver.span);
                     ExpressionNode::identifier_of(id_node).set_res(Res::Local(nm_sym));
                     id_node.set_resolved_type(pt);
-                    mut da: MemberAccessNode* = new MemberAccessNode(
+                    mut da: ExpressionNode* = ExpressionNode::member_access_expr(
                         id_node, drop_sym, receiver.span, receiver.span);
                     mut call: CallExprNode* = new CallExprNode(
-                        da as ExpressionNode*, receiver.span);
+                        da, receiver.span);
                     this.cg.bind_destructor_call(call);
                     mut stmt: Stmt* = Stmt::expr_stmt(
                         call as ExpressionNode*, receiver.span);

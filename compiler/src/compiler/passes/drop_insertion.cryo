@@ -83,7 +83,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, BinaryExpr, CallExprNode, CalleePin, CastExpr,
     ExprKind, ExpressionNode, IdentifierExpr, IfExpr, LambdaExpr, LiteralExpr,
-    MemberAccessNode, NewExpr, StructExpr, TernaryExpr,
+    MemberAccessExpr, NewExpr, StructExpr, TernaryExpr,
     TupleExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -2437,7 +2437,7 @@ type struct DropInserter {
     /// live local of a non-`Drop` struct/class value.  `sym_is_live`
     /// excludes match/pattern payload bindings (registered type-only, never in
     /// the scope stack), matching MoveCheck's "real let/param local" rule.
-    partial_move_allowed(&this, ma: MemberAccessNode*) -> boolean {
+    partial_move_allowed(&this, ma: MemberAccessExpr*) -> boolean {
         if (this.branch_depth != 0) { return false; }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
         if (id == null) {
@@ -2457,9 +2457,9 @@ type struct DropInserter {
     /// qualifies (identical predicate to MoveCheck).  Called from
     /// `walk_expr_move` on every real-move site, so it mirrors MoveCheck's
     /// `check_field_move_out` classification exactly.
-    classify_field_move_out(mut &this, ma: MemberAccessNode*) -> void {
+    classify_field_move_out(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*) -> void {
         if (ma == null || ma.object == null) { return; }
-        const field_ty: TypeRef = ma.resolved_type;
+        const field_ty: TypeRef = e.resolved_type;
         // Only a droppable field matters for drop-skip; a Copy / non-owning
         // field is bitwise-independent and never double-freed.
         if (!this.type_needs_drop(field_ty)) { return; }
@@ -2517,16 +2517,15 @@ type struct DropInserter {
                          field_name: SymbolStr, field_index: i64, field_ty: TypeRef,
                          span: SourceSpan) -> Stmt* {
         const ident: ExpressionNode* = this.local_ident(name, ty, span);
-        const field_access: MemberAccessNode* = new MemberAccessNode(
+        const field_access: ExpressionNode* = ExpressionNode::member_access_expr(
             ident, field_name, span, span);
         field_access.set_resolved_type(field_ty);
         // A node minted after the last sema walk carries its own answer:
         // the field is the `field_index`-th of the aggregate's own list.
-        field_access.set_resolved_member(MemberPin::Field(0, field_index));
-        const drop_access: MemberAccessNode* = new MemberAccessNode(
-            field_access as ExpressionNode*, this.drop_sym, span, span);
-        const call: CallExprNode* = new CallExprNode(
-            drop_access as ExpressionNode*, span);
+        ExpressionNode::member_access_of(field_access).set_resolved_member(MemberPin::Field(0, field_index));
+        const drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
+            field_access, this.drop_sym, span, span);
+        const call: CallExprNode* = new CallExprNode(drop_access, span);
         this.sema.bind_destructor_call(call);
         const stmt: Stmt* = Stmt::expr_stmt(call as ExpressionNode*, span);
         field_access.generated = true;
@@ -3274,14 +3273,14 @@ type struct DropInserter {
             const next_ty: TypeRef = this.project_type(cur_ty, pkind, pkey, &next_index);
             if (!next_ty.is_valid()) { return null as ExpressionNode*; }
             if (pkind == (0 as u8)) {
-                const ma: MemberAccessNode* = new MemberAccessNode(
+                const ma: ExpressionNode* = ExpressionNode::member_access_expr(
                     cur, SymbolStr::from_id(pkey), span, span);
                 ma.set_resolved_type(next_ty);
                 // Minted after the last sema walk: the field's coordinates
                 // are the projection's own answer.
-                ma.set_resolved_member(MemberPin::Field(0, next_index));
+                ExpressionNode::member_access_of(ma).set_resolved_member(MemberPin::Field(0, next_index));
                 ma.generated = true;
-                cur = ma as ExpressionNode*;
+                cur = ma;
             } else {
                 const idx_lit: ExpressionNode* = ExpressionNode::literal(
                     fmt::format("%u", pkey), LiteralKind::Integer, span);
@@ -3305,10 +3304,10 @@ type struct DropInserter {
             base, base_ty, &this.mem_proj_kind, &this.mem_proj_key,
             this.mem_pstart[idx], this.mem_plen[idx], span);
         if (place == null) { return null; }
-        const drop_access: MemberAccessNode* = new MemberAccessNode(
+        const drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
             place, this.drop_sym, span, span);
         const call: CallExprNode* = new CallExprNode(
-            drop_access as ExpressionNode*, span);
+            drop_access, span);
         this.sema.bind_destructor_call(call);
         const stmt: Stmt* = Stmt::expr_stmt(call as ExpressionNode*, span);
         drop_access.generated = true;
@@ -3464,9 +3463,6 @@ type struct DropInserter {
     disq_scan_expr(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::MemberAccess => {
-                this.disq_scan_expr((expr as MemberAccessNode*).object);
-            }
             NodeKind::CallExpression => {
                 const c: CallExprNode* = expr as CallExprNode*;
                 this.disq_scan_expr(c.callee);
@@ -3476,6 +3472,7 @@ type struct DropInserter {
             }
             NodeKind::Expression => {
                 match (expr.shape) {
+                    ExprKind::MemberAccess(ma) => { this.disq_scan_expr(ma.object); }
                     ExprKind::Cast(ce) => { this.disq_scan_expr(ce.expression); }
                     ExprKind::ArrayAccess(aa) => {
                         this.disq_scan_expr(aa.array);
@@ -3541,25 +3538,24 @@ type struct DropInserter {
     disq_scan_place(mut &this, expr: ExpressionNode*, escaping: boolean) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::MemberAccess => {
-                // A member write is an initialization at MEMBER granularity
-                // when the place is carved out of the local's own storage.
-                // When it isn't - a hop through a pointer, a dynamic index -
-                // no flag can name the slot, so fall through and let the local
-                // keep its unconditional whole-binding drop.
-                if (!escaping && this.record_init_place(expr)) { return; }
-                const ma: MemberAccessNode* = expr as MemberAccessNode*;
-                if (ma.object != null) {
-                    const obj_id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
-                    if (obj_id != null) {
-                        this.disqualify_init(obj_id);
-                    } else {
-                        this.disq_scan_place(ma.object, escaping);
-                    }
-                }
-            }
             NodeKind::Expression => {
                 match (expr.shape) {
+                    ExprKind::MemberAccess(ma) => {
+                        // A member write is an initialization at MEMBER granularity
+                        // when the place is carved out of the local's own storage.
+                        // When it isn't - a hop through a pointer, a dynamic index -
+                        // no flag can name the slot, so fall through and let the local
+                        // keep its unconditional whole-binding drop.
+                        if (!escaping && this.record_init_place(expr)) { return; }
+                        if (ma.object != null) {
+                            const obj_id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
+                            if (obj_id != null) {
+                                this.disqualify_init(obj_id);
+                            } else {
+                                this.disq_scan_place(ma.object, escaping);
+                            }
+                        }
+                    }
                     ExprKind::Identifier(id) => {
                         if (escaping) {
                             this.disqualify_init(id);
@@ -3676,8 +3672,8 @@ type struct DropInserter {
         if (id != null) {
             return id.res.local_sym();
         }
-        if (expr.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = expr as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(expr) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(expr);
             if (ma.object == null) { return SymbolID::invalid(); }
             const root: SymbolID =
                 this.collect_place_chain(ma.object, out_kind, out_key);
@@ -4027,9 +4023,9 @@ type struct DropInserter {
             c.span.start_line as int, c.span.start_col as int);
         const target: ExpressionNode* = ExpressionNode::synthetic_unary(deref_tok, p, c.span);
         target.set_resolved_type(target_ty);
-        const member: MemberAccessNode* = new MemberAccessNode(
+        const member: ExpressionNode* = ExpressionNode::member_access_expr(
             target, this.drop_sym, c.span, c.span);
-        c.callee = member as ExpressionNode*;
+        c.callee = member;
         c.arguments = [];
         c.resolved_callee = CalleePin::None;
         this.sema.bind_destructor_call(c);
@@ -4043,9 +4039,9 @@ type struct DropInserter {
     make_drop_call(mut &this, name: PassLocal, ty: TypeRef,
                     span: SourceSpan) -> Stmt* {
         const ident: ExpressionNode* = this.local_ident(name, ty, span);
-        const member: MemberAccessNode* = new MemberAccessNode(
+        const member: ExpressionNode* = ExpressionNode::member_access_expr(
             ident, this.drop_sym, span, span);
-        const call: CallExprNode* = new CallExprNode(member as ExpressionNode*, span);
+        const call: CallExprNode* = new CallExprNode(member, span);
         this.sema.bind_destructor_call(call);
         const stmt: Stmt* = Stmt::expr_stmt(call as ExpressionNode*, span);
         member.generated = true;
@@ -4065,8 +4061,9 @@ type struct DropInserter {
         // `check_field_move_out` (both are reached from the identical real-move
         // sites - var-decl init, return, by-value call/new arg, assignment RHS,
         // aggregate-literal element).
-        if (expr.kind == NodeKind::MemberAccess) {
-            this.classify_field_move_out(expr as MemberAccessNode*);
+        const moved_field: MemberAccessExpr* = ExpressionNode::member_access_of(expr);
+        if (moved_field != null) {
+            this.classify_field_move_out(expr, moved_field);
         }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
         if (id != null) {
@@ -4088,10 +4085,10 @@ type struct DropInserter {
                 // excluded (the callee owns it now).
                 if (this.ctx.options.unwinds()) { this.populate_unwind_cleanup(c); }
             }
-            NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);             }
             NodeKind::Expression         => {
                 match (expr.shape) {
                     ExprKind::Identifier(id) => { this.handle_ident(expr, id, false); }
+                    ExprKind::MemberAccess(ma) => { this.read_member(ma); }
                     // A match used as an expression, including the desugars
                     // of `?` and `??`.  Route through the shared arm walker
                     // in expression mode so an early `return` inside an arm
@@ -4224,8 +4221,8 @@ type struct DropInserter {
         // applies post-stdlib-migration for user code that opts out of
         // auto-drop with an explicit consume.
         if (c.callee != null && c.arguments.length == 0 &&
-            c.callee.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
+            ExpressionNode::member_access_of(c.callee) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
             const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
             if (this.registry.names_lang_method(ma.member, LangItem::DropDrop) && id != null) {
                 // Only treat as a move when the identifier is a binding
@@ -4257,8 +4254,8 @@ type struct DropInserter {
         // method (e.g. `Box::into_raw`).  This tells the synthesiser
         // not to emit a drop for the consumed binding.
         mut receiver_moved: boolean = false;
-        if (c.callee != null && c.callee.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
+        if (c.callee != null && ExpressionNode::member_access_of(c.callee) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
             // Does this method consume its receiver (`![sink]` or by-value
             // `this`)?  The method the call was pinned to answers, and nothing
             // else: a lookup of the member's name on the receiver type finds
@@ -4352,7 +4349,7 @@ type struct DropInserter {
         if (u.operand != null) { this.walk_expr_read(u.operand); }
     }
 
-    read_member(mut &this, ma: MemberAccessNode*) -> void {
+    read_member(mut &this, ma: MemberAccessExpr*) -> void {
         if (ma == null) { return; }
         if (ma.object != null) { this.walk_expr_read(ma.object); }
     }

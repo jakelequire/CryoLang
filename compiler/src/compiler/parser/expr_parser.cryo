@@ -52,7 +52,7 @@ import compiler::ast::declaration::{ DeclarationNode, DeclKind, VarDecl };
 import compiler::ast::expression::{
     ArrayExpr, BinaryExpr,
     CallExprNode, ExpressionNode, FieldInit, IdentifierExpr,
-    LambdaExpr, MatchExpr, MemberAccessNode, NewExpr,
+    LambdaExpr, MatchExpr, MemberAccessExpr, NewExpr,
     ScopeResolutionExpr, StaticMatchExpr, StructExpr,
     TupleExpr, UnaryExpr
 };
@@ -399,10 +399,10 @@ implement struct Parser {
                 const ref_right: ExpressionNode* =
                     ExpressionNode::synthetic_unary(amp_tok, right, right.span);
                 const compare_name: SymbolStr = this.ctx.intern("compare");
-                const member: MemberAccessNode* = new MemberAccessNode(
+                const member: ExpressionNode* = ExpressionNode::member_access_expr(
                     left, compare_name, this.span_from_token(op), span);
                 mut call: CallExprNode* =
-                    new CallExprNode(member as ExpressionNode*, span);
+                    new CallExprNode(member, span);
                 call.add_argument(ref_right);
                 left = call as ExpressionNode*;
             } else if (op.kind == TokenType::DotDot ||
@@ -2466,8 +2466,8 @@ implement struct Parser {
         // If the callee is a member access whose name carried explicit type
         // arguments (`obj.method<T>`), promote those onto the call so the
         // sema/mono layers see a generic call rather than a bare member ref.
-        if (callee.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = callee as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(callee) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(callee);
             if (ma.generic_args.length > 0) {
                 // Independent DEEP copy: `set_generic_args` stores and owns the
                 // array, and `TypeAnnotation*[]` owns its pointees, so the call
@@ -2517,7 +2517,7 @@ implement struct Parser {
     }
 
     /// Parse member access: object.member or object.method<T, U>
-    parse_member_access_expr(object: ExpressionNode*) -> MemberAccessNode* {
+    parse_member_access_expr(object: ExpressionNode*) -> ExpressionNode* {
         this.advance(); // consume '.'
         // Tuple field access: `t.0`, `t.1`, etc. Accept a numeric constant
         // as the member name. The lexeme ("0", "1", ...) is interned as a
@@ -2557,23 +2557,22 @@ implement struct Parser {
                 const tok_span: SourceSpan = this.span_from_token(member_tok);
                 const inner_span: SourceSpan = Parser::merge_spans(
                     object.span, tok_span);
-                const inner: MemberAccessNode* = new MemberAccessNode(
+                const inner: ExpressionNode* = ExpressionNode::member_access_expr(
                     object, first_sym, tok_span, inner_span);
-                return new MemberAccessNode(
-                    inner as ExpressionNode*, rest_sym, tok_span, inner_span);
+                return ExpressionNode::member_access_expr(inner, rest_sym, tok_span, inner_span);
             }
         }
 
         const member: SymbolStr = this.intern_lexeme(member_tok);
         const member_span: SourceSpan = this.span_from_token(member_tok);
         const span: SourceSpan = Parser::merge_spans(object.span, member_span);
-        mut node: MemberAccessNode* = new MemberAccessNode(object, member, member_span, span);
+        const node: ExpressionNode* = ExpressionNode::member_access_expr(object, member, member_span, span);
 
         // Explicit type arguments on the member: `obj.method::<T, U>(...)`.
         if (this.at_turbofish()) {
             this.advance(); // consume '::'
             const member_gen_args: [TypeAnnotation*] = this.parse_generic_args();
-            node.set_generic_args(member_gen_args);
+            ExpressionNode::member_access_of(node).set_generic_args(member_gen_args);
         }
 
         return node;

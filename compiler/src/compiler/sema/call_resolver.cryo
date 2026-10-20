@@ -65,7 +65,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     CalleePin,
     BinaryExpr, CallExprNode, ExpressionNode, IdentifierExpr, LiteralExpr,
-    MemberAccessNode, ScopeResolutionExpr, UnaryExpr
+    MemberAccessExpr, ScopeResolutionExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::lex::{ TokenType };
@@ -382,7 +382,7 @@ type struct CallResolver {
     /// Arity-matching method overloads' non-receiver param types for `member`, as
     /// an expected-type hint (a position-wise merge where all overloads agree).
     lookup_method_param_types(mut &this, visitor: SemaVisitor*, call: CallExprNode*,
-                              member: MemberAccessNode*, arg_count: i64) -> [TypeRef] {
+                              member: MemberAccessExpr*, arg_count: i64) -> [TypeRef] {
         const obj_type: TypeRef = visitor.resolve_expr(member.object);
         if (!obj_type.is_valid()) { return []; }
         mut base_ref: TypeRef = obj_type;
@@ -627,8 +627,8 @@ type struct CallResolver {
         mut tmpl: TemplateEntry* = null;
         mut owner_args: [TypeRef] = [];
         const callee_node: ASTNode* = call.callee as ASTNode*;
-        if (callee_node.kind == NodeKind::MemberAccess) {
-            const member: MemberAccessNode* = call.callee as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(callee_node) != null) {
+            const member: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
             if (member.object == null) { return out; }
             const recv: TypeRef = member.object.resolved_type;
             // Generic-identity view, not a raw kind test: the receiver may be a
@@ -727,8 +727,8 @@ type struct CallResolver {
     /// Whether `call` is an explicit destructor call `x.drop()` as written.
     is_explicit_drop_call(mut &this, call: CallExprNode*) -> boolean {
         if (call.arguments.length != 0) { return false; }
-        if (call.callee == null || call.callee.kind != NodeKind::MemberAccess) { return false; }
-        const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
+        if (call.callee == null || ExpressionNode::member_access_of(call.callee) == null) { return false; }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
         return this.ctx.get_generic_registry().names_lang_method(ma.member, LangItem::DropDrop);
     }
 
@@ -739,11 +739,11 @@ type struct CallResolver {
     /// method.  An explicit destructor call (`(*p).drop()`) is not one a
     /// bound licenses: its help names the function that runs a pointee's
     /// destructor.
-    report_param_receiver_call(mut &this, member: MemberAccessNode*, param: GenericParamType*,
-                               bounded: boolean, call: CallExprNode*) -> void {
+    report_param_receiver_call(mut &this, member_e: ExpressionNode*, member: MemberAccessExpr*,
+                               param: GenericParamType*, bounded: boolean, call: CallExprNode*) -> void {
         const method_name: string = this.intern.resolve(member.member);
         const param_display: string = this.arena.format_generic_param(param);
-        const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+        const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
             fmt::format("no method named `%s` found on type `%s`", method_name, param_display));
@@ -785,8 +785,8 @@ type struct CallResolver {
         if (id != null) {
             return this.intern.resolve(id.name);
         }
-        if (e.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = e as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(e) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(e);
             const base: string = this.place_text(ma.object);
             if (base.length() == 0) { return ""; }
             return fmt::format("%s.%s", base, this.intern.resolve(ma.member));
@@ -955,9 +955,9 @@ type struct CallResolver {
         }
         if (param_types.length == 0) {
             const callee_node: ASTNode* = call.callee as ASTNode*;
-            if (callee_node.kind == NodeKind::MemberAccess) {
+            if (ExpressionNode::member_access_of(callee_node) != null) {
                 param_types = this.lookup_method_param_types(
-                    visitor, call, call.callee as MemberAccessNode*, call.arguments.length);
+                    visitor, call, ExpressionNode::member_access_of(call.callee), call.arguments.length);
             }
         }
         if (param_types.length == 0) {
@@ -1226,15 +1226,16 @@ type struct CallResolver {
             }
             return this.resolve_direct_call(call, ident);
         }
-        if (callee_node.kind == NodeKind::MemberAccess) {
+        const callee_member: MemberAccessExpr* = ExpressionNode::member_access_of(callee_node);
+        if (callee_member != null) {
             const arg_snap: DiagnosticSnapshot = this.ctx.diagnostics.snapshot();
             this.lambda.reject_closure_struct_args_in_non_free_call(call,
                 "passing a capturing closure as a method-call argument");
-            const selected: Selection = this.resolve_method_overload(visitor, call, callee as MemberAccessNode*);
-            this.check_method_call_arg_types(visitor, call, callee as MemberAccessNode*, selected.chosen);
-            this.check_symbolic_method_bounds(callee as MemberAccessNode*, selected.chosen);
+            const selected: Selection = this.resolve_method_overload(visitor, call, callee_member);
+            this.check_method_call_arg_types(visitor, call, callee_member, selected.chosen);
+            this.check_symbolic_method_bounds(callee, callee_member, selected.chosen);
             const args_refused: boolean = this.ctx.diagnostics.errors_since(arg_snap) > 0;
-            const mret: TypeRef = this.resolve_method_call(visitor, callee as MemberAccessNode*, call,
+            const mret: TypeRef = this.resolve_method_call(visitor, callee_member, call,
                                                            selected, args_refused);
             // A pinned non-generic method's return type overrides `mret` for a
             // genuine overload, but NOT when `mret` is a generic method's per-call
@@ -1250,8 +1251,7 @@ type struct CallResolver {
                         && DeclarationNode::fn_of(ovl_rm.func).generic_params.length == 0
                         && DeclarationNode::fn_of(ovl_rm.func).resolved_return_type.is_valid()
                         && !DeclarationNode::fn_of(ovl_rm.func).resolved_return_type.equals(mret)) {
-                    const ovl_mem: MemberAccessNode* = callee as MemberAccessNode*;
-                    ovl_mem.set_resolved_type(DeclarationNode::fn_of(ovl_rm.func).resolved_return_type);
+                    callee.set_resolved_type(DeclarationNode::fn_of(ovl_rm.func).resolved_return_type);
                     return DeclarationNode::fn_of(ovl_rm.func).resolved_return_type;
                 }
             }
@@ -1300,10 +1300,9 @@ type struct CallResolver {
     /// a declaration is selected for - rather than a value an expression
     /// computes.
     static callee_is_named(callee: ExpressionNode*) -> boolean {
-        const kind: NodeKind = (callee as ASTNode*).kind;
         return ExpressionNode::identifier_of(callee) != null
             || ExpressionNode::scope_resolution_of(callee) != null
-            || kind == NodeKind::MemberAccess;
+            || ExpressionNode::member_access_of(callee) != null;
     }
 
     /// Record how each argument binds to the parameter it lands on
@@ -1998,7 +1997,7 @@ type struct CallResolver {
         // default -- and a wrongly typed argument then resolves the call to a
         // SIBLING instantiation of the same method rather than the one the
         // turbofish named.
-        if (callee_node.kind == NodeKind::MemberAccess) {
+        if (ExpressionNode::member_access_of(callee_node) != null) {
             return this.substitute_explicit_method_param_types(call, &out, forced);
         }
         if (ExpressionNode::scope_resolution_of(callee_node) != null) {
@@ -2135,7 +2134,7 @@ type struct CallResolver {
                                            param_types: &[TypeRef],
                                            forced: mut &[boolean]) -> [TypeRef] {
         mut out: [TypeRef] = sema_copy_type_refs(param_types);
-        const member: MemberAccessNode* = call.callee as MemberAccessNode*;
+        const member: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
         if (member == null || member.generic_args.length == 0) { return out; }
         if (member.object == null) { return out; }
         const recv_type: TypeRef = member.object.resolved_type;
@@ -2882,7 +2881,7 @@ type struct CallResolver {
     /// Silent unless every argument has a concrete type - an abstract one has
     /// nothing to judge, and the same guard is why `check_args_against_params`
     /// skips those positions.
-    emit_no_matching_overload(mut &this, call: CallExprNode*, member: MemberAccessNode*,
+    emit_no_matching_overload(mut &this, call: CallExprNode*, member: MemberAccessExpr*,
                               recv: TypeRef, cand_params: &[TypeRef], argc: i64) -> void {
         if (this.state.in_symbolic_check) { return; }
         mut argstr: string = "";
@@ -2922,7 +2921,7 @@ type struct CallResolver {
     /// do; flags two-trait ambiguity / arity.  `chosen_method` is the method
     /// the selection bound the call to, null when it bound none.
     check_method_call_arg_types(mut &this, visitor: SemaVisitor*, call: CallExprNode*,
-                                member: MemberAccessNode*, chosen_method_decl: DeclarationNode*) -> void {
+                                member: MemberAccessExpr*, chosen_method_decl: DeclarationNode*) -> void {
         const chosen_method: MethodDecl* = DeclarationNode::method_of(chosen_method_decl);
         const obj_type: TypeRef = member.object.resolved_type;
         if (!obj_type.is_valid()) { return; }
@@ -3162,7 +3161,7 @@ type struct CallResolver {
     /// checks the arguments against its parameters, as on a minted receiver;
     /// several is an overload set none of which took them.
     check_args_on_template(mut &this, visitor: SemaVisitor*, call: CallExprNode*,
-                           member: MemberAccessNode*, owner_inst: TypeRef) -> void {
+                           member: MemberAccessExpr*, owner_inst: TypeRef) -> void {
         mut found: ArgCandidates = ArgCandidates::new(call.arguments.length);
         if (!this.collect_on_template(visitor, call, member, owner_inst, &found)) { return; }
         if (found.count == 1) {
@@ -3181,7 +3180,7 @@ type struct CallResolver {
     /// impls selected for the instantiation, each with its parameters seen
     /// through it.  False when `owner_inst` names no template.
     collect_on_template(mut &this, visitor: SemaVisitor*, call: CallExprNode*,
-                        member: MemberAccessNode*, owner_inst: TypeRef, found: ArgCandidates*) -> boolean {
+                        member: MemberAccessExpr*, owner_inst: TypeRef, found: ArgCandidates*) -> boolean {
         const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(
             this.arena.inst_generic_base(owner_inst));
         if (tmpl == null) { return false; }
@@ -3683,7 +3682,7 @@ type struct CallResolver {
     /// it unset on no match.
     /// Returns what `bind_method_on_receiver` returns.
     resolve_method_overload(mut &this, visitor: SemaVisitor*, call: CallExprNode*,
-                            member: MemberAccessNode*) -> Selection {
+                            member: MemberAccessExpr*) -> Selection {
         const obj_type: TypeRef = visitor.resolve_expr(member.object);
         if (!obj_type.is_valid()) { return Selection::none(); }
         return this.bind_method_on_receiver(visitor, call, member, obj_type);
@@ -3703,7 +3702,7 @@ type struct CallResolver {
     /// pin is left to the pass that sees the minted type: a template method
     /// pinned here reads to mono as a call needing no specialization.
     bind_method_on_receiver(mut &this, visitor: SemaVisitor*, call: CallExprNode*,
-                            member: MemberAccessNode*, obj_type: TypeRef) -> Selection {
+                            member: MemberAccessExpr*, obj_type: TypeRef) -> Selection {
         // A member answered as a function-typed field where it was written
         // - in this body, or in the template a copy was made from - is a
         // call through that field's value; no method is selected for it.
@@ -3856,7 +3855,7 @@ type struct CallResolver {
         }
         if (want_trait.is_valid() && this.select_in_set(visitor, call, member, base_ref, base_t, start_cls,
                 methods_ref, &arg_types, tmpl, want_trait, true, &sel)) {
-            if (tmpl == null) { this.check_trait_item_table(member, base_ref, sel.chosen); }
+            if (tmpl == null) { this.check_trait_item_table(call, member, base_ref, sel.chosen); }
             this.pin_minted_method(call, sel, base_ref);
             return this.commit_selection(visitor, call, sel);
         }
@@ -3957,7 +3956,7 @@ type struct CallResolver {
     /// name.  A receiver still written in a generic body's parameters has no
     /// method set of its own: the call is bound in each copy of the body
     /// that substitutes them, and left alone here.
-    bind_named_method(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+    bind_named_method(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessExpr*,
                       recv: TypeRef, owner_inst: TypeRef) -> Selection {
         const d: DefId = call.named_method;
         const subject: TypeRef = if (owner_inst.is_valid()) { owner_inst } else { recv };
@@ -3979,7 +3978,7 @@ type struct CallResolver {
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 fmt::format("code the compiler generated calls `%s` by its definition, and the receiver's type has no method for it",
                     this.intern.shown(this.ctx.defs.leaf_of(d))));
-            diag = diag.at_with_label(member.span, "generated call");
+            diag = diag.at_with_label(call.callee.span, "generated call");
             this.ctx.emit_diagnostic(diag);
             return Selection::none();
         }
@@ -4012,7 +4011,7 @@ type struct CallResolver {
     /// Stamp the call `member` is the callee of with the trait a bound
     /// answered it through and the position of the method it names among
     /// that trait's declared ones, found where the call is written.
-    stamp_trait_item(&this, member: MemberAccessNode*, trait_def: DefId) -> void {
+    stamp_trait_item(&this, member: MemberAccessExpr*, trait_def: DefId) -> void {
         member.set_resolved_trait_item(trait_def, this.trait_slot_of(trait_def, member.member));
     }
 
@@ -4029,7 +4028,7 @@ type struct CallResolver {
     /// written.  The method is the trait's declared one at the position the
     /// call recorded.  `ret` unchanged when the call carries no type
     /// arguments for it.
-    bound_return_at_call_args(&this, member: MemberAccessNode*, call: CallExprNode*, ret: TypeRef) -> TypeRef {
+    bound_return_at_call_args(&this, member: MemberAccessExpr*, call: CallExprNode*, ret: TypeRef) -> TypeRef {
         if (call.resolved_type_args.length == 0 || member.resolved_trait_slot < 0) { return ret; }
         const decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(member.resolved_trait);
         if (decl == null || member.resolved_trait_slot >= decl.methods.length) { return ret; }
@@ -4053,7 +4052,7 @@ type struct CallResolver {
     /// implemented at several arguments (`Mul<f32, V>` and `Mul<V, V>` for
     /// `V`) has an implementation, and an answer, for each.  Empty when the
     /// call recorded no position or no implementation is selected.
-    trait_item_answers(&this, member: MemberAccessNode*, recv: TypeRef) -> [DeclarationNode*] {
+    trait_item_answers(&this, member: MemberAccessExpr*, recv: TypeRef) -> [DeclarationNode*] {
         mut out: [DeclarationNode*] = [];
         if (member.resolved_trait_slot < 0) { return out; }
         const heads: [DeclarationNode*] = this.ctx.generic_registry.heads_for(
@@ -4118,7 +4117,8 @@ type struct CallResolver {
     /// among the receiver's methods and the implementations' tables by
     /// position; a disagreement is a defect in one of them, reported as an
     /// internal error rather than compiled.
-    check_trait_item_table(mut &this, member: MemberAccessNode*, recv: TypeRef, chosen_decl: DeclarationNode*) -> void {
+    check_trait_item_table(mut &this, call: CallExprNode*, member: MemberAccessExpr*, recv: TypeRef,
+                           chosen_decl: DeclarationNode*) -> void {
         const chosen: MethodDecl* = DeclarationNode::method_of(chosen_decl);
         if (member.resolved_trait_slot < 0) { return; }
         const items: [DeclarationNode*] = this.trait_item_answers(member, recv);
@@ -4128,7 +4128,7 @@ type struct CallResolver {
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
             fmt::format("`%s` was selected by name as a trait's method, and the method table of the implementation the trait and the receiver select answers %s",
                 this.intern.resolve(member.member), if (items.length == 0) { "no method" } else { "a different one" }));
-        d = d.at_with_label(member.span, "the two ways of finding this call's method disagree");
+        d = d.at_with_label(call.callee.span, "the two ways of finding this call's method disagree");
         this.ctx.emit_diagnostic(d);
     }
 
@@ -4137,7 +4137,7 @@ type struct CallResolver {
     /// valid - the non-generic methods before the generic ones.  `tmpl`,
     /// when not null, is the template of the instantiation not yet minted
     /// the receiver is (`sel.owner_inst`), whose candidates are read off it.
-    select_in_set(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+    select_in_set(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessExpr*,
                   base_ref: TypeRef, base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
                   arg_types: &[TypeRef], tmpl: TemplateEntry*, only_trait: DefId,
                   from_trait: boolean, sel: Selection*) -> boolean {
@@ -4158,7 +4158,7 @@ type struct CallResolver {
     /// to as well: neither outranks the other for being non-generic, so the
     /// call is ambiguous (E0154).  Silent when `chosen` is itself generic -
     /// no non-generic method applied - or when no generic one applies.
-    report_generic_tie(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+    report_generic_tie(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessExpr*,
                        base_ref: TypeRef, base_t: Type*, start_cls: ClassType*,
                        methods_ref: Slice<MethodInfo>, arg_types: &[TypeRef],
                        tmpl: TemplateEntry*, owner_inst: TypeRef, from_trait: boolean,
@@ -4181,7 +4181,7 @@ type struct CallResolver {
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0154_AMBIGUOUS_CALL,
             fmt::format("`%s` is ambiguous: a non-generic and a generic method of `%s` both accept these arguments",
                 leaf, this.arena.resolve_display_name_short(subject)));
-        d = d.at_with_label(member.span, "both methods apply here");
+        d = d.at_with_label(call.callee.span, "both methods apply here");
         const f1_decl: DeclarationNode* = chosen.func;
         const f2_decl: DeclarationNode* = DeclarationNode::method_of(alt.chosen).func;
         d = d.with_note_at(fmt::format("candidate #1: `%s`, not generic", leaf),
@@ -4201,7 +4201,7 @@ type struct CallResolver {
     /// when no trait method applies.  Reported in a generic body's walk too:
     /// the receiver is a minted type, whose call is pinned here and not
     /// selected again for an instantiation.
-    report_inherent_trait_tie(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+    report_inherent_trait_tie(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessExpr*,
                               base_ref: TypeRef, base_t: Type*, start_cls: ClassType*,
                               methods_ref: Slice<MethodInfo>, arg_types: &[TypeRef],
                               tmpl: TemplateEntry*, owner_inst: TypeRef, inherent_decl: DeclarationNode*) -> void {
@@ -4237,10 +4237,10 @@ type struct CallResolver {
     /// E0156 for a method call `recv.member(args)` on `owner`: the tie's
     /// help quotes the call's receiver and arguments as the impl-qualified
     /// form takes them.  See `report_trait_method_tie`.
-    report_method_call_tie(mut &this, call: CallExprNode*, member: MemberAccessNode*, owner: TypeRef,
+    report_method_call_tie(mut &this, call: CallExprNode*, member: MemberAccessExpr*, owner: TypeRef,
                            traits: &[DefId], decl_spans: &[SourceSpan], inherent_decl: DeclarationNode*) -> void {
         const args_text: string = this.receiver_call_args_text(call, member);
-        this.report_trait_method_tie(member.span, member.member, owner,
+        this.report_trait_method_tie(call.callee.span, member.member, owner,
             traits, decl_spans, args_text, true, inherent_decl);
     }
 
@@ -4248,7 +4248,7 @@ type struct CallResolver {
     /// the receiver first - by reference when it is not one already, as
     /// the method form's auto-ref made it - and the call's own arguments
     /// after it, quoted from the source.
-    receiver_call_args_text(mut &this, call: CallExprNode*, member: MemberAccessNode*) -> string {
+    receiver_call_args_text(mut &this, call: CallExprNode*, member: MemberAccessExpr*) -> string {
         mut args_text: string = this.source_text(member.object.span);
         if (args_text.length() == 0) { args_text = "receiver"; }
         const recv_t: Type* = this.arena.lookup(member.object.resolved_type);
@@ -4439,8 +4439,8 @@ type struct CallResolver {
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
         mut targs: &[TypeAnnotation*] = &call.generic_args;
         const callee_node: ASTNode* = call.callee as ASTNode*;
-        if (targs.length == 0 && callee_node != null && callee_node.kind == NodeKind::MemberAccess) {
-            targs = &(call.callee as MemberAccessNode*).generic_args;
+        if (targs.length == 0 && callee_node != null && ExpressionNode::member_access_of(callee_node) != null) {
+            targs = &ExpressionNode::member_access_of(call.callee).generic_args;
         }
         if (targs.length > 0) {
             if (targs.length != func.generic_params.length) { return sema_copy_type_refs(params); }
@@ -4505,7 +4505,7 @@ type struct CallResolver {
     /// when the call was bound.  For an instantiation not yet minted,
     /// `base_ref` is its template, and its trait impls are the ones
     /// selected for the instantiation.
-    select_method(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+    select_method(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessExpr*,
                   base_ref: TypeRef, base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
                   arg_types: &[TypeRef], only_trait: DefId, from_trait: boolean,
                   generic: boolean, sel: Selection*) -> boolean {
@@ -4557,7 +4557,7 @@ type struct CallResolver {
     /// a trait impl delivers, or the inherent ones.  With `only_trait`, only
     /// that trait's methods are candidates; `generic` takes the generic
     /// methods, the others otherwise.  Writes the tier it bound at.
-    pick_own_method(mut &this, call: CallExprNode*, member: MemberAccessNode*, owner: TypeRef,
+    pick_own_method(mut &this, call: CallExprNode*, member: MemberAccessExpr*, owner: TypeRef,
                     start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
                     arg_types: &[TypeRef], only_trait: DefId, from_trait: boolean, generic: boolean,
                     out_tier: i32*) -> MethodInfo* {
@@ -4609,7 +4609,7 @@ type struct CallResolver {
     /// set is the methods written in the declaration and in its inherent
     /// impl blocks, the trait set the trait impls selected for the
     /// instantiation.
-    select_on_template(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+    select_on_template(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessExpr*,
                        tmpl: TemplateEntry*, arg_types: &[TypeRef],
                        only_trait: DefId, from_trait: boolean, generic: boolean,
                        sel: Selection*) -> boolean {
@@ -4653,7 +4653,7 @@ type struct CallResolver {
     }
 
     /// Select among one impl block's methods; see `bind_on_methods`.
-    bind_on_impl_block(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+    bind_on_impl_block(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessExpr*,
                        block: ImplBlock*, arg_types: &[TypeRef],
                        generic: boolean, sel: Selection*) -> boolean {
         if (block == null) { return false; }
@@ -4735,7 +4735,7 @@ type struct CallResolver {
     /// `generic` takes its generic methods, the others otherwise.  `view`,
     /// when not null, is how the receiver sees the parameters the list is
     /// written in.  Returns true when the call was bound.
-    bind_on_methods(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+    bind_on_methods(mut &this, visitor: SemaVisitor*, call: CallExprNode*, member: MemberAccessExpr*,
                     methods: &[DeclarationNode*], named: &[DeclarationNode*], arg_types: &[TypeRef],
                     generic: boolean, sel: Selection*, view: TypeSubstitution*) -> boolean {
         // A self-returning default (an iterator adapter's `take`) is a
@@ -4882,8 +4882,8 @@ type struct CallResolver {
         if (n_own > 0) {
             mut targs: &[TypeAnnotation*] = &call.generic_args;
             const callee_node: ASTNode* = call.callee as ASTNode*;
-            if (targs.length == 0 && callee_node != null && callee_node.kind == NodeKind::MemberAccess) {
-                targs = &(call.callee as MemberAccessNode*).generic_args;
+            if (targs.length == 0 && callee_node != null && ExpressionNode::member_access_of(callee_node) != null) {
+                targs = &ExpressionNode::member_access_of(call.callee).generic_args;
             }
             if (targs.length > 0) {
                 if (targs.length != n_own) { return false; }
@@ -5013,8 +5013,9 @@ type struct CallResolver {
     /// The type of a method call.  Which method it names was answered by
     /// the selection (`bind_method_on_receiver`), whose answer is `selected`;
     /// `args_refused` is whether the argument check reported this call.
-    resolve_method_call(mut &this, visitor: SemaVisitor*, member: MemberAccessNode*,
+    resolve_method_call(mut &this, visitor: SemaVisitor*, member: MemberAccessExpr*,
                         call: CallExprNode*, selected: Selection, args_refused: boolean) -> TypeRef {
+        const member_e: ExpressionNode* = call.callee;
         const obj_type: TypeRef = visitor.resolve_expr(member.object);
         if (!obj_type.is_valid()) {
             return TypeRef::invalid();
@@ -5047,10 +5048,10 @@ type struct CallResolver {
             if (mret.is_valid() && member.generic_args.length > 0) {
                 mret = this.binding.resolve_method_return_with_explicit_args(obj_type, member, selected.chosen, mret);
             }
-            if (mret.is_valid()) { member.set_resolved_type(mret); return mret; }
+            if (mret.is_valid()) { member_e.set_resolved_type(mret); return mret; }
             // No method of the name: a call through a function-typed field,
             // pinned here so every copy of the body carries the field.
-            return this.member.try_field_function_call(obj_type, member);
+            return this.member.try_field_function_call(obj_type, member_e, member);
         }
         if (this.symbolic.symbolic_type_unresolved(obj_type)) {
             this.binding.stash_abstract_receiver_method(obj_type, member, call);
@@ -5104,12 +5105,12 @@ type struct CallResolver {
                     call.template_recv = obj_type;
                 }
                 const typed_ret: TypeRef = this.bound_return_at_call_args(member, call, abs_ret);
-                member.set_resolved_type(typed_ret);
+                member_e.set_resolved_type(typed_ret);
                 return typed_ret;
             }
             const param: GenericParamType* = this.binding.receiver_type_param(obj_type);
             if (param != null) {
-                this.report_param_receiver_call(member, param, this.binding.param_is_bounded(param), call);
+                this.report_param_receiver_call(member_e, member, param, this.binding.param_is_bounded(param), call);
             }
             return TypeRef::invalid();
         }
@@ -5168,7 +5169,7 @@ type struct CallResolver {
             DeclarationNode::fn_of(named.func).resolved_return_type
         } else { TypeRef::invalid() } };
         if (ret.is_valid() && !proj_blocked) {
-            const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+            const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
             this.member.enforce_method_visibility(lookup_ref, member.member, acc_span);
             const refined: TypeRef = if (member.generic_args.length > 0) {
                 this.binding.resolve_method_return_with_explicit_args(obj_type, member, named_decl, ret)
@@ -5195,18 +5196,18 @@ type struct CallResolver {
                 if (this.generic_canonical_return(call, grt)) { final_ret = grt; }
             }
             final_ret = this.binding.finalize_assoc_return(obj_type, member, final_ret);
-            member.set_resolved_type(final_ret);
+            member_e.set_resolved_type(final_ret);
             return final_ret;
         }
 
-        const field_ret: TypeRef = this.member.try_field_function_call(lookup_ref, member);
+        const field_ret: TypeRef = this.member.try_field_function_call(lookup_ref, member_e, member);
         if (field_ret.is_valid()) {
             return field_ret;
         }
 
         if (this.ctx.get_generic_registry().names_lang_method(member.member, LangItem::DropDrop)
                 && OwnershipQuery::is_copy(this.arena, this.ctx.get_generic_registry(), this.intern, lookup_ref)) {
-            member.set_resolved_type(this.arena.get_void());
+            member_e.set_resolved_type(this.arena.get_void());
             return this.arena.get_void();
         }
 
@@ -5216,13 +5217,13 @@ type struct CallResolver {
         // resolver rewrites `member.object` into the `*(b.deref())` place and
         // returns the method's type; re-stash the call bindings against the
         // coerced receiver so mono/codegen bind the method on `Target`.
-        const coerced: TypeRef = this.member.try_deref_coercion(visitor, member);
+        const coerced: TypeRef = this.member.try_deref_coercion(visitor, member_e, member);
         if (coerced.is_valid()) {
             // The call names the method on the coerced receiver, bound here
             // where it is written.
             this.bind_method_on_receiver(visitor, call, member, member.object.resolved_type);
             this.binding.stash_method_call_bindings(member.object.resolved_type, member, call, null);
-            member.set_resolved_type(coerced);
+            member_e.set_resolved_type(coerced);
             return coerced;
         }
 
@@ -5244,7 +5245,7 @@ type struct CallResolver {
         const method_name: string = this.intern.resolve(member.member);
         const recv_t: Type* = this.arena.lookup(lookup_ref);
         const type_display: string = if (recv_t != null) { this.arena.format_display(recv_t) } else { this.intern.resolve(type_sym) };
-        const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+        const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
 
         const failed_trait: DeclName = this.trait_checker().diagnose_method_bounds_failure(lookup_ref, member.member);
         if (failed_trait.is_valid()) {
@@ -5261,7 +5262,7 @@ type struct CallResolver {
             this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();
         }
-        if (this.try_diagnose_method_bound_failure(obj_type, member)) { return TypeRef::invalid(); }
+        if (this.try_diagnose_method_bound_failure(obj_type, member_e, member)) { return TypeRef::invalid(); }
 
         // The method is declared and its signature was refused where it was
         // written; it registered none, and the call reports nothing more.
@@ -5274,7 +5275,7 @@ type struct CallResolver {
         // field is a value, and a value of no function type is not called.
         const nf: FieldAnswer = this.member.field_of(lookup_ref, member.member);
         if (nf.found() && nf.index >= 0) {
-            this.refuse_call_of_non_function(member.span, nf.ty);
+            this.refuse_call_of_non_function(member_e.span, nf.ty);
             return TypeRef::invalid();
         }
 
@@ -5314,7 +5315,8 @@ type struct CallResolver {
     }
 
     /// E0358: a method gated behind a `where` bound the concrete type args don't satisfy.
-    try_diagnose_method_bound_failure(mut &this, obj_type: TypeRef, member: MemberAccessNode*) -> boolean {
+    try_diagnose_method_bound_failure(mut &this, obj_type: TypeRef, member_e: ExpressionNode*,
+                                      member: MemberAccessExpr*) -> boolean {
         const reg: GenericRegistry* = this.ctx.get_generic_registry();
         if (reg == null) { return false; }
         mut t: Type* = this.arena.lookup(obj_type);
@@ -5346,7 +5348,7 @@ type struct CallResolver {
                 const tref: &TraitRef = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
                 if (this.trait_checker().type_implements_trait(concrete, tref.definition(), 0)) { continue; }
-                this.emit_method_bound_unmet(member, bound, tref, concrete);
+                this.emit_method_bound_unmet(member_e, member, bound, tref, concrete);
                 return true;
             }
         }
@@ -5356,13 +5358,13 @@ type struct CallResolver {
     /// E0358 at `member`: its method requires `bound`'s subject to have the
     /// trait `tref`, and `concrete`, the subject as the receiver binds it,
     /// does not.
-    emit_method_bound_unmet(mut &this, member: MemberAccessNode*, bound: &TraitBound, tref: &TraitRef,
-                            concrete: TypeRef) -> void {
+    emit_method_bound_unmet(mut &this, member_e: ExpressionNode*, member: MemberAccessExpr*,
+                            bound: &TraitBound, tref: &TraitRef, concrete: TypeRef) -> void {
         const method_str: string = this.intern.resolve(member.member);
         const trait_str:  string = this.intern.resolve(tref.path[tref.path.length - 1]);
         const param_str:  string = this.intern.resolve(bound.type_parameter);
         const conc_str:   string = this.types.type_display_name(concrete);
-        const primary: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+        const primary: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
             fmt::format("the trait bound `%s: %s` is not satisfied", conc_str, trait_str));
@@ -5385,7 +5387,8 @@ type struct CallResolver {
     /// the argument there, a parameter of the body by the bounds in scope.
     /// The body's copies are not checked, so a bound unmet here is never
     /// reported, and a copy calls a method its element type does not offer.
-    check_symbolic_method_bounds(mut &this, member: MemberAccessNode*, chosen_decl: DeclarationNode*) -> void {
+    check_symbolic_method_bounds(mut &this, member_e: ExpressionNode*, member: MemberAccessExpr*,
+                                 chosen_decl: DeclarationNode*) -> void {
         const chosen: MethodDecl* = DeclarationNode::method_of(chosen_decl);
         if (!this.state.in_symbolic_check || chosen == null || chosen.func == null) { return; }
         const func_decl: DeclarationNode* = chosen.func;
@@ -5428,7 +5431,7 @@ type struct CallResolver {
                     this.trait_checker().type_implements_trait(arg, tref.definition(), 0)
                 };
                 if (holds) { continue; }
-                this.emit_method_bound_unmet(member, bound, tref, arg);
+                this.emit_method_bound_unmet(member_e, member, bound, tref, arg);
                 return;
             }
         }

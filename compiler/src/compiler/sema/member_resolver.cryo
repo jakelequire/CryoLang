@@ -37,7 +37,7 @@ import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, FieldDecl, ImplBlock, MethodDecl, StructDecl, UnionDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessExpr, CallExprNode, ExpressionNode, MemberAccessNode
+    ArrayAccessExpr, CallExprNode, ExpressionNode, MemberAccessExpr
 };
 import compiler::sema::sema;
 import compiler::sema::sema::{ SemaVisitor };
@@ -124,7 +124,8 @@ type struct MemberResolver {
 
     // -- Member access (`obj.field` / `obj.0` / `obj.method`) --
 
-    resolve_member_access(mut &this, visitor: SemaVisitor*, member: MemberAccessNode*) -> TypeRef {
+    resolve_member_access(mut &this, visitor: SemaVisitor*, member_e: ExpressionNode*,
+                          member: MemberAccessExpr*) -> TypeRef {
         const obj_type: TypeRef = visitor.resolve_expr(member.object);
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
 
@@ -140,11 +141,11 @@ type struct MemberResolver {
             const through: FieldAnswer = this.field_of(obj_type, member.member);
             if (!through.found()) {
                 const param: GenericParamType* = this.binding.receiver_type_param(obj_type);
-                if (param != null) { this.report_param_receiver_field(member, param); }
+                if (param != null) { this.report_param_receiver_field(member_e, member, param); }
                 return TypeRef::invalid();
             }
             this.pin_field(member, &through,
-                if (member.member_span.has_location()) { member.member_span } else { member.span });
+                if (member.member_span.has_location()) { member.member_span } else { member_e.span });
             return through.ty;
         }
 
@@ -179,7 +180,7 @@ type struct MemberResolver {
             const m_span: SourceSpan = if (member.member_span.has_location()) {
                 member.member_span
             } else {
-                member.span
+                member_e.span
             };
             if (idx < 0) {
                 this.ctx.emit_error_at(ErrorCode::E0204_UNDEFINED_FIELD,
@@ -199,7 +200,7 @@ type struct MemberResolver {
         const acc_span: SourceSpan = if (member.member_span.has_location()) {
             member.member_span
         } else {
-            member.span
+            member_e.span
         };
         const fa: FieldAnswer = this.field_of(obj_type, member.member);
         if (fa.found()) {
@@ -228,7 +229,7 @@ type struct MemberResolver {
             // is a place, coerced access serves reads and writes uniformly, and
             // codegen needs nothing new.  The pointee answering with a method
             // (no field pinned) is the same misreading as above.
-            const coerced: TypeRef = this.try_deref_coercion(visitor, member);
+            const coerced: TypeRef = this.try_deref_coercion(visitor, member_e, member);
             if (coerced.is_valid()) {
                 if (!member.resolved_member.is_some()) {
                     this.report_method_read(member, type_name, acc_span);
@@ -241,7 +242,7 @@ type struct MemberResolver {
             const m_span: SourceSpan = if (member.member_span.has_location()) {
                 member.member_span
             } else {
-                member.span
+                member_e.span
             };
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0204_UNDEFINED_FIELD,
@@ -258,7 +259,7 @@ type struct MemberResolver {
     /// `obj.m` read as a value where `m` names a method of the receiver's
     /// type and no field: a method is reached only by calling it, so the
     /// read names nothing a value can be taken from.
-    report_method_read(mut &this, member: MemberAccessNode*, type_name: string,
+    report_method_read(mut &this, member: MemberAccessExpr*, type_name: string,
                        span: SourceSpan) -> void {
         const name: string = this.intern.resolve(member.member);
         mut d: Diagnostic = Diagnostic::error(
@@ -274,10 +275,11 @@ type struct MemberResolver {
     /// walked: a bound gives a parameter methods, never fields, so the read
     /// names nothing in the body that declares the parameter, whatever each
     /// copy's type argument happens to declare.
-    report_param_receiver_field(mut &this, member: MemberAccessNode*, param: GenericParamType*) -> void {
+    report_param_receiver_field(mut &this, member_e: ExpressionNode*, member: MemberAccessExpr*,
+                                param: GenericParamType*) -> void {
         const field_name: string = this.intern.resolve(member.member);
         const param_display: string = this.intern.resolve(param.param_name);
-        const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+        const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0204_UNDEFINED_FIELD,
             fmt::format("no field `%s` on type `%s`", field_name, param_display));
@@ -303,7 +305,8 @@ type struct MemberResolver {
     /// original `member.object` is left untouched and `invalid` returned.
     /// Restricted to concrete user receivers; a bounded `T: Deref` param is not
     /// coerced (its abstract pointee has no field/method to bind pre-mono).
-    try_deref_coercion(mut &this, visitor: SemaVisitor*, member: MemberAccessNode*) -> TypeRef {
+    try_deref_coercion(mut &this, visitor: SemaVisitor*, member_e: ExpressionNode*,
+                       member: MemberAccessExpr*) -> TypeRef {
         if (member.object == null) { return TypeRef::invalid(); }
         mut cur_obj: ExpressionNode* = member.object;
         mut cur_ty:  TypeRef         = member.object.resolved_type;
@@ -328,20 +331,20 @@ type struct MemberResolver {
                 this.ctx.generic_registry.wellknown(LangItem::Deref), base_ty, 0);
             if (impl_block == null) { return TypeRef::invalid(); }
             // Build `*(cur_obj.deref())` and resolve it to the pointee `Target`.
-            const member_acc: MemberAccessNode* = this.lang_method_callee(cur_obj, LangItem::DerefDeref, member.span);
+            const member_acc: ExpressionNode* = this.lang_method_callee(cur_obj, LangItem::DerefDeref, member_e.span);
             if (member_acc == null) { return TypeRef::invalid(); }
-            mut call: CallExprNode* = new CallExprNode(member_acc as ExpressionNode*, member.span);
+            mut call: CallExprNode* = new CallExprNode(member_acc, member_e.span);
             const star_tok: Token = Token::new(TokenType::Star, "*",
-                member.span.start_line as int, member.span.start_col as int);
+                member_e.span.start_line as int, member_e.span.start_col as int);
             const star_expr: ExpressionNode* =
-                ExpressionNode::synthetic_unary(star_tok, call as ExpressionNode*, member.span);
+                ExpressionNode::synthetic_unary(star_tok, call as ExpressionNode*, member_e.span);
             const target_ty: TypeRef = visitor.resolve_expr(star_expr);
             if (!target_ty.is_valid()) { return TypeRef::invalid(); }
             // Re-attempt the field / method lookup on `Target`.
-            const r: TypeRef = this.member_type_on(member, target_ty);
+            const r: TypeRef = this.member_type_on(member_e, member, target_ty);
             if (r.is_valid()) {
                 member.object = star_expr;
-                member.set_resolved_type(r);
+                member_e.set_resolved_type(r);
                 return r;
             }
             // Chain deeper: the pointee may itself implement `Deref`.
@@ -362,11 +365,12 @@ type struct MemberResolver {
     /// visibility on success.  Returns the member's type, or `invalid` on a
     /// genuine miss - emits no diagnostic.  Used by Deref coercion to probe each
     /// pointee in the chain without perturbing the direct-access path.
-    member_type_on(mut &this, member: MemberAccessNode*, obj_type: TypeRef) -> TypeRef {
+    member_type_on(mut &this, member_e: ExpressionNode*, member: MemberAccessExpr*,
+                   obj_type: TypeRef) -> TypeRef {
         const acc_span: SourceSpan = if (member.member_span.has_location()) {
             member.member_span
         } else {
-            member.span
+            member_e.span
         };
         const fa: FieldAnswer = this.field_of(obj_type, member.member);
         if (fa.found()) {
@@ -414,7 +418,7 @@ type struct MemberResolver {
     /// for that owner and leaf.  Invalid when no owner in the chain has the
     /// family, or when its overloads return different types: only the
     /// call's selection can choose between those.
-    method_return_through_door(&this, ty: TypeRef, member: MemberAccessNode*) -> TypeRef {
+    method_return_through_door(&this, ty: TypeRef, member: MemberAccessExpr*) -> TypeRef {
         mut owner: TypeRef = this.types.method_owner_ref(ty);
         mut depth: i32 = 0;
         while (owner.is_valid() && depth < 16) {
@@ -629,7 +633,7 @@ type struct MemberResolver {
     /// Record the field the door found on the access, and ask its
     /// visibility of the entry the door found.  A template's field has no
     /// entry; an array's `length` has no slot.
-    pin_field(mut &this, member: MemberAccessNode*, fa: &FieldAnswer, acc_span: SourceSpan) -> void {
+    pin_field(mut &this, member: MemberAccessExpr*, fa: &FieldAnswer, acc_span: SourceSpan) -> void {
         if (fa.index >= 0) { member.set_resolved_member(MemberPin::Field(fa.depth, fa.index)); }
         if (fa.entry != null) {
             this.enforce_field_visibility(fa.entry, fa.owner, member.member, acc_span);
@@ -640,13 +644,14 @@ type struct MemberResolver {
     /// that type (so codegen emits an indirect call) and return its return type.
     /// Calling the field reads it, so it is gated as a read is: a private or
     /// protected field is refused outside the module that may reach it.
-    try_field_function_call(mut &this, obj_type: TypeRef, member: MemberAccessNode*) -> TypeRef {
+    try_field_function_call(mut &this, obj_type: TypeRef, member_e: ExpressionNode*,
+                            member: MemberAccessExpr*) -> TypeRef {
         const fa: FieldAnswer = this.field_of(obj_type, member.member);
         if (!fa.found() || fa.index < 0) { return TypeRef::invalid(); }
         const ft: Type* = this.arena.lookup(fa.ty);
         if (ft == null || ft.kind != TypeKind::Function) { return TypeRef::invalid(); }
-        member.set_resolved_type(fa.ty);
-        const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+        member_e.set_resolved_type(fa.ty);
+        const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
         this.pin_field(member, &fa, acc_span);
         return ft.as_function().return_type;
     }
@@ -816,9 +821,9 @@ type struct MemberResolver {
                         access: ArrayAccessExpr*) -> ExpressionNode* {
         // The index expression is passed BY VALUE - the trait is
         // `index(&this, idx: Idx)`, not `&Idx` - so no synthetic `&`.
-        const member: MemberAccessNode* = this.lang_method_callee(access.array, LangItem::IndexIndex, e.span);
+        const member: ExpressionNode* = this.lang_method_callee(access.array, LangItem::IndexIndex, e.span);
         if (member == null) { return null; }
-        mut call: CallExprNode* = new CallExprNode(member as ExpressionNode*, e.span);
+        mut call: CallExprNode* = new CallExprNode(member, e.span);
         call.add_argument(access.index);
         const star_tok: Token = Token::new(TokenType::Star, "*",
             e.span.start_line as int, e.span.start_col as int);
@@ -834,11 +839,13 @@ type struct MemberResolver {
     /// method's position in it as an operator's call is: the trait's
     /// method answers it, and an inherent method of the same name cannot.
     /// Null when no declaration in this program claimed `item`.
-    lang_method_callee(&this, recv: ExpressionNode*, item: LangItem, span: SourceSpan) -> MemberAccessNode* {
+    lang_method_callee(&this, recv: ExpressionNode*, item: LangItem, span: SourceSpan) -> ExpressionNode* {
         const d: DefId = this.ctx.generic_registry.wellknown(item);
         if (!d.is_valid()) { return null; }
-        mut m: MemberAccessNode* = new MemberAccessNode(recv, this.ctx.defs.leaf_of(d).spelling(), span, span);
-        m.set_resolved_trait_item(this.ctx.defs.parent_of(d), this.ctx.generic_registry.trait_item_position(d));        return m;
+        const m: ExpressionNode* = ExpressionNode::member_access_expr(recv, this.ctx.defs.leaf_of(d).spelling(), span, span);
+        ExpressionNode::member_access_of(m).set_resolved_trait_item(
+            this.ctx.defs.parent_of(d), this.ctx.generic_registry.trait_item_position(d));
+        return m;
     }
 
     /// When `[]` hits a user type lacking an `Index` impl, emit a diagnostic that

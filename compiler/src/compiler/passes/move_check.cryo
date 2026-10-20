@@ -60,7 +60,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, BinaryExpr, CallExprNode, CastExpr,
     ExprKind, ExpressionNode, IdentifierExpr, IfExpr, LambdaExpr, MatchExpr,
-    MemberAccessNode, NewExpr, StructExpr, TernaryExpr,
+    MemberAccessExpr, NewExpr, StructExpr, TernaryExpr,
     TupleExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -500,8 +500,8 @@ type struct MoveChecker {
     /// binding this pass can see moved.
     note_poll_receiver(mut &this, c: CallExprNode*) -> void {
         if (c == null || c.callee == null || this.intern == null) { return; }
-        if (c.callee.kind != NodeKind::MemberAccess) { return; }
-        const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(c.callee) == null) { return; }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
         if (ma.member.id != this.intern.intern("poll").id) { return; }
         const obj_id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
         if (obj_id == null) { return; }
@@ -1283,10 +1283,10 @@ type struct MoveChecker {
         if (expr == null) { return; }
         match (expr.kind) {
             NodeKind::CallExpression     => { this.read_call(expr as CallExprNode*);                 }
-            NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);           }
             NodeKind::Expression         => {
                 match (expr.shape) {
                     ExprKind::Identifier(id) => { this.handle_ident(expr, id, false, false); }
+                    ExprKind::MemberAccess(ma) => { this.read_member(ma); }
                     // Reduced to one live arm by the monomorphizer; walk it as
                     // a block.
                     ExprKind::Match(m) => { this.read_match(m); }
@@ -1375,8 +1375,8 @@ type struct MoveChecker {
         // the special case syntactic (no false positives on method
         // chains or .drop()-with-args overloads).
         if (c.callee != null && c.arguments.length == 0 &&
-            c.callee.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
+            ExpressionNode::member_access_of(c.callee) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
             if (this.intern != null &&
                 ma.member.id == this.intern.intern("drop").id &&
                 ExpressionNode::identifier_of(ma.object) != null) {
@@ -1403,9 +1403,9 @@ type struct MoveChecker {
         const pinned_decl: DeclarationNode* = this.ctx.decl_index.entry_method(c.resolved_callee.decl_entry());
         const pinned: MethodDecl* = DeclarationNode::method_of(pinned_decl);
         if (pinned != null && c.callee != null
-                && c.callee.kind == NodeKind::MemberAccess) {
+                && ExpressionNode::member_access_of(c.callee) != null) {
             if (OwnershipQuery::method_consumes_receiver(this.arena, this.intern, pinned_decl)) {
-                const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
+                const ma: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
                 if (ma.object != null) {
                     // A consuming receiver (`mut this` / `![sink]`) is a
                     // real move: the value is taken and dropped by the
@@ -1492,7 +1492,7 @@ type struct MoveChecker {
         return;
     }
 
-    read_member(mut &this, ma: MemberAccessNode*) -> void {
+    read_member(mut &this, ma: MemberAccessExpr*) -> void {
         if (ma == null) { return; }
         if (ma.object != null) { this.walk_expr_read(ma.object); }
         return;
@@ -1697,7 +1697,7 @@ type struct MoveChecker {
     /// v1 allow-rule for a field-move-out `ma` (`p.field`): permit (and track)
     /// it ONLY when the owner is a straight-line bare local of a non-`Drop`
     /// struct/class value.  Anything else keeps the conservative E0453.
-    partial_move_allowed(&this, ma: MemberAccessNode*) -> boolean {
+    partial_move_allowed(&this, ma: MemberAccessExpr*) -> boolean {
         // Unconditional only: drop-skip without per-field flags is sound only
         // for a definitely-moved field.
         if (this.branch_depth != 0) { return false; }
@@ -1706,7 +1706,7 @@ type struct MoveChecker {
 
     /// The owner shape `partial_move_allowed` accepts, whatever the branch
     /// depth: a bare owned local of a non-`Drop` struct or class.
-    partial_move_shape(&this, ma: MemberAccessNode*) -> boolean {
+    partial_move_shape(&this, ma: MemberAccessExpr*) -> boolean {
         const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
         if (id == null) {
             return false;
@@ -1725,13 +1725,13 @@ type struct MoveChecker {
         return true;
     }
 
-    emit_double_field_move(mut &this, ma: MemberAccessNode*) -> void {
+    emit_double_field_move(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*) -> void {
         const field: string = this.intern.resolve(ma.member);
         const headline: string = fmt::format(
             "field '%s' moved out of a value more than once", field);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0452_USE_AFTER_MOVE, headline);
-        diag = diag.at_with_label(ma.span,
+        diag = diag.at_with_label(e.span,
             "this field was already moved out of the value (double free)");
         diag = diag.help(
             "a value can be moved out of a given field only once");
@@ -1777,11 +1777,11 @@ type struct MoveChecker {
             }
             return false;
         }
-        if (obj.kind == NodeKind::MemberAccess) {
+        if (ExpressionNode::member_access_of(obj) != null) {
             // An intermediate field that is itself a pointer/reference
             // derefs into heap or borrowed storage managed elsewhere.
             if (this.is_ptr_or_ref(obj.resolved_type)) { return false; }
-            return this.is_owned_value_place((obj as MemberAccessNode*).object);
+            return this.is_owned_value_place(ExpressionNode::member_access_of(obj).object);
         }
         // Array elements, call results, casts, temporaries: not a simple
         // owned-value place we can prove is glue-dropped at this scope.
@@ -1804,8 +1804,8 @@ type struct MoveChecker {
     /// except out of a destructor's own receiver
     /// (`check_destructor_field_move_out`).
     check_field_move_out(mut &this, expr: ExpressionNode*) -> void {
-        if (expr == null || expr.kind != NodeKind::MemberAccess) { return; }
-        const ma: MemberAccessNode* = expr as MemberAccessNode*;
+        if (expr == null || ExpressionNode::member_access_of(expr) == null) { return; }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(expr);
         if (ma.object == null) { return; }
         // The projected field must itself own a resource.  A Copy field is
         // bitwise-independent of the source and safe to duplicate.
@@ -1813,7 +1813,7 @@ type struct MoveChecker {
         if (!field_ty.is_valid() || this.is_copy(field_ty)) { return; }
         // The source must be an owned, glue-dropped value place.
         if (!this.is_owned_value_place(ma.object)) {
-            this.check_destructor_field_move_out(ma, field_ty);
+            this.check_destructor_field_move_out(expr, ma, field_ty);
             return;
         }
         // Partial-move model ("allow + track" half): a non-Copy *droppable*
@@ -1828,7 +1828,7 @@ type struct MoveChecker {
             if (!this.suppress_emit) {
                 const owner: string = this.intern.resolve(ExpressionNode::identifier_of(ma.object).name);
                 this.emit_loop_carried_text(
-                    fmt::format("%s.%s", owner, this.intern.resolve(ma.member)), ma.span);
+                    fmt::format("%s.%s", owner, this.intern.resolve(ma.member)), expr.span);
             }
             return;
         }
@@ -1837,14 +1837,14 @@ type struct MoveChecker {
             const field_id: u32 = ma.member.id;
             if (this.pm_has(owner_id, field_id)) {
                 // Moving the SAME field out twice is a double free.
-                if (!this.suppress_emit) { this.emit_double_field_move(ma); }
+                if (!this.suppress_emit) { this.emit_double_field_move(expr, ma); }
                 return;
             }
             this.pm_binding.push(owner_id);
             this.pm_field.push(field_id);
             return;
         }
-        this.emit_move_out_error(ma);
+        this.emit_move_out_error(expr, ma);
     }
 
     /// Reject moving a field of the receiver out inside a `Drop`
@@ -1856,7 +1856,8 @@ type struct MoveChecker {
     /// when `drop` returns.  `mem::drop(this.inner)` and `match (this.opt)`
     /// both copy the field's owning handle into a second owner, so the value
     /// is released twice.
-    check_destructor_field_move_out(mut &this, ma: MemberAccessNode*, field_ty: TypeRef) -> void {
+    check_destructor_field_move_out(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*,
+                                    field_ty: TypeRef) -> void {
         if (!this.drop_receiver.is_valid()) { return; }
         if (!this.is_receiver_value_place(ma.object)) { return; }
         if (!this.type_needs_drop(field_ty)) { return; }
@@ -1865,7 +1866,7 @@ type struct MoveChecker {
             "cannot move field '%s' out of `this` in a destructor", field);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0453_DOUBLE_FREE, headline);
-        diag = diag.at_with_label(ma.span,
+        diag = diag.at_with_label(e.span,
             "the field is released again when the destructor returns (double free)");
         diag = diag.help(
             "leave the field alone: it is released when `drop` returns; to release it earlier, swap a replacement into it with `core::mem::swap` and drop what comes out");
@@ -1883,9 +1884,9 @@ type struct MoveChecker {
         if (id != null) {
             return id.res.local_sym().equals(this.drop_receiver);
         }
-        if (obj.kind == NodeKind::MemberAccess) {
+        if (ExpressionNode::member_access_of(obj) != null) {
             if (this.is_ptr_or_ref(obj.resolved_type)) { return false; }
-            return this.is_receiver_value_place((obj as MemberAccessNode*).object);
+            return this.is_receiver_value_place(ExpressionNode::member_access_of(obj).object);
         }
         return false;
     }
@@ -1980,13 +1981,13 @@ type struct MoveChecker {
         this.fatal += 1;
     }
 
-    emit_move_out_error(mut &this, ma: MemberAccessNode*) -> void {
+    emit_move_out_error(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*) -> void {
         const field: string = this.intern.resolve(ma.member);
         const headline: string = fmt::format(
             "cannot move field '%s' out of a value that owns a destructor", field);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0453_DOUBLE_FREE, headline);
-        diag = diag.at_with_label(ma.span,
+        diag = diag.at_with_label(e.span,
             "moving this field out leaves the source to drop it again at scope exit (double free)");
         diag = diag.help(
             "swap the field out with `core::mem::swap`, leaving a valid value to be dropped in place; or use a `Copy` field type");
@@ -2041,8 +2042,8 @@ type struct MoveChecker {
     /// how it's reached, so the bitwise-copied handle is freed twice.  Borrow
     /// it (`&node.fields`) or clone it.
     check_array_field_move_out(mut &this, expr: ExpressionNode*) -> void {
-        if (expr == null || expr.kind != NodeKind::MemberAccess) { return; }
-        const ma: MemberAccessNode* = expr as MemberAccessNode*;
+        if (expr == null || ExpressionNode::member_access_of(expr) == null) { return; }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(expr);
         if (ma.object == null) { return; }
         const field_ty: TypeRef = expr.resolved_type;
         if (!field_ty.is_valid()) { return; }
@@ -2056,7 +2057,7 @@ type struct MoveChecker {
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0453_DOUBLE_FREE,
             "cannot move an owning array out of a value that owns a destructor");
-        diag = diag.at_with_label(ma.span,
+        diag = diag.at_with_label(expr.span,
             "copying this array field out aliases the buffer the source still owns (double free)");
         diag = diag.help(
             "borrow it (`const x: &[T] = &place.field;`) or clone it when an owned copy is required");

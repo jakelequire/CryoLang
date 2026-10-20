@@ -33,7 +33,7 @@ import compiler::ast::declaration::{
 import compiler::module_graph::{ ModulePath };
 import compiler::ast::expression::{
     CallExprNode, CalleePin, ExprKind, ExpressionNode, IdentifierExpr,
-    MemberAccessNode, ScopeResolutionExpr, StructExpr
+    MemberAccessExpr, ScopeResolutionExpr, StructExpr
 };
 import compiler::ast::pattern::{ EnumPattern, Pattern, PatternKind };
 import compiler::decl_index::{ DeclarationIndex, OverloadId };
@@ -270,10 +270,10 @@ type struct Locator {
         const n: ASTNode* = this.innermost();
         if (n == null) { return Answer::nothing(); }
         match (n.kind) {
-            NodeKind::MemberAccess => { return this.member(n as MemberAccessNode*); }
             NodeKind::Expression => {
                 const e: ExpressionNode* = n as ExpressionNode*;
                 match (e.shape) {
+                    ExprKind::MemberAccess(m) => { return this.member(e, m); }
                     ExprKind::Identifier(id) => { return this.identifier(e, id); }
                     ExprKind::ScopeResolution(s) => { return this.path(e, s); }
                     ExprKind::New(ne) => {
@@ -374,15 +374,15 @@ type struct Locator {
         return this.pin_target(&s.resolved_callee);
     }
 
-    member(&this, m: MemberAccessNode*) -> Answer {
+    member(&this, e: ExpressionNode*, m: MemberAccessExpr*) -> Answer {
         if (!this.holds(m.member_span)) { return Answer::nothing(); }
-        const ty: TypeRef = (m as ExpressionNode*).resolved_type;
-        return Answer::of(this.member_target(m, this.call_of(m as ASTNode*)), m.member_span, ty);
+        const ty: TypeRef = e.resolved_type;
+        return Answer::of(this.member_target(m, this.call_of(e as ASTNode*)), m.member_span, ty);
     }
 
     /// What a member access names: the method the call it is the callee of
     /// names, or the field its pin holds.
-    member_target(&this, m: MemberAccessNode*, call: CallExprNode*) -> Target {
+    member_target(&this, m: MemberAccessExpr*, call: CallExprNode*) -> Target {
         if (call != null) { return this.call_target(call); }
         match (&m.resolved_member) {
             MemberPin::Field(depth, index) => {
@@ -415,8 +415,8 @@ type struct Locator {
         if (!pinned.is_nothing()) { return pinned; }
         if (call.template_method.is_valid()) { return Target::Def(call.template_method); }
         const ck: ASTNode* = call.callee as ASTNode*;
-        if (ck != null && ck.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
+        if (ck != null && ExpressionNode::member_access_of(ck) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
             if (ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
                 const decl: ASTNode* = this.di.declaration_of(ma.resolved_trait);
                 const td: TraitDecl* = DeclarationNode::trait_of(decl);

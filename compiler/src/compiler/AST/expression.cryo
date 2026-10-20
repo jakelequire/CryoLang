@@ -367,6 +367,22 @@ public:
         }), span);
     }
 
+    /// `object.member` at `span`, the member's own token at `member_span`,
+    /// not yet resolved.
+    static member_access_expr(object: ExpressionNode*, member: SymbolStr,
+                              member_span: SourceSpan, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::MemberAccess(new MemberAccessExpr {
+            object:              object,
+            member:              member,
+            member_span:         member_span,
+            generic_args:        [],
+            resolved_trait:      DefId::invalid(),
+            resolved_trait_slot: -1,
+            resolved_member:     MemberPin::None,
+            pin_carried:         false,
+        }), span);
+    }
+
     /// `yield operand` at `span`; a bare `yield` when `operand` is null.
     static yield_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::Yield(new YieldExpr { operand: operand }), span);
@@ -578,6 +594,16 @@ public:
         };
     }
 
+    /// The member access `n` is, or null.
+    static member_access_of(n: ASTNode*) -> MemberAccessExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::MemberAccess(m) => { m }
+            _                         => { null }
+        };
+    }
+
     /// The path `n` is, or null.
     static scope_resolution_of(n: ASTNode*) -> ScopeResolutionExpr* {
         const e: ExpressionNode* = ExpressionNode::with_shape(n);
@@ -617,6 +643,7 @@ type enum ExprKind {
     Lambda(LambdaExpr*);
     Literal(LiteralExpr*);
     Match(MatchExpr*);
+    MemberAccess(MemberAccessExpr*);
     New(NewExpr*);
     ScopeResolution(ScopeResolutionExpr*);
     Sizeof(SizeofExpr*);
@@ -1496,8 +1523,8 @@ implement trait Allocate for struct ArrayAccessExpr {
 }
 
 
-type class MemberAccessNode : ExpressionNode {
-public:
+/// `object.member`, a field read or a method call's callee.
+type struct MemberAccessExpr {
     object:       ExpressionNode*;
     member:       SymbolStr;
     member_span:  SourceSpan;
@@ -1541,41 +1568,38 @@ public:
     /// carriage rule.
     pin_carried: boolean;
 
-    MemberAccessNode(object: ExpressionNode*, member: SymbolStr,
-                     member_span: SourceSpan, span: SourceSpan)
-        : ExpressionNode(NodeKind::MemberAccess, span) {
-        this.object          = object;
-        this.member          = member;
-        this.member_span     = member_span;
-        this.generic_args    = [];
-        this.resolved_trait  = DefId::invalid();
-        this.resolved_trait_slot = -1;
-        this.resolved_member = MemberPin::None;
-        this.pin_carried     = false;
+    static walk_children<V>(n: MemberAccessExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.object);
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    set_resolved_trait(t: DefId) -> void {
+    set_resolved_trait(mut &this, t: DefId) -> void {
         this.resolved_trait = t;
     }
 
     /// The trait and the position of its declared method the call names.
-    set_resolved_trait_item(t: DefId, slot: i64) -> void {
+    set_resolved_trait_item(mut &this, t: DefId, slot: i64) -> void {
         this.resolved_trait      = t;
         this.resolved_trait_slot = slot;
     }
 
-    set_resolved_member(pin: MemberPin) -> void {
+    set_resolved_member(mut &this, pin: MemberPin) -> void {
         this.resolved_member = pin;
         this.pin_carried     = false;
     }
 
     /// Keep the pin a clone inherited and mark it carried.
-    carry_resolved_member() -> void {
+    carry_resolved_member(mut &this) -> void {
         this.pin_carried = this.resolved_member.is_some();
+    }
+}
+
+implement trait Allocate for struct MemberAccessExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -1667,7 +1691,7 @@ type struct ScopeResolutionExpr {
 
     /// The trait a BOUND directs this path through, `T::make()` under
     /// `where T: Beta`: the bound's identity, stamped before
-    /// monomorphization erases the parameter, as `MemberAccessNode`'s
+    /// monomorphization erases the parameter, as `MemberAccessExpr`'s
     /// `resolved_trait` is for `t.go()`.  A direction, not a refusal: the
     /// concrete type's implementation of THAT trait delivers the member
     /// when it has one.  Empty on a path no bound directs.

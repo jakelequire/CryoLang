@@ -64,7 +64,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr, CallExprNode,
     CastExpr, DeleteExpr, ExpressionNode, FieldInit, IdentifierExpr, IfExpr,
-    LambdaExpr, MatchExpr, MemberAccessNode, NewExpr,
+    LambdaExpr, MatchExpr, MemberAccessExpr, NewExpr,
     ScopeResolutionExpr, StaticMatchExpr, StructExpr, TernaryExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExpr
 };
@@ -394,7 +394,7 @@ type struct AsyncLower {
     // The accesses `own_field` built into the future struct being lowered,
     // pinned when its layout is settled.  A node that carries its type is
     // never walked again, so nothing after this lowering would pin them.
-    own_accesses: [MemberAccessNode*];
+    own_accesses: [MemberAccessExpr*];
     counter:  u64;
     // The binding of every local `mint_local` and `mint_temp` hand out for the
     // async body currently being lowered — i.e. exactly the body's locals and
@@ -1108,8 +1108,8 @@ type struct AsyncLower {
             }
             return;
         }
-        if (k == NodeKind::MemberAccess) {
-            this.rewrite_returns_expr((e as MemberAccessNode*).object, poll_out, span);
+        if (ExpressionNode::member_access_of(e) != null) {
+            this.rewrite_returns_expr(ExpressionNode::member_access_of(e).object, poll_out, span);
             return;
         }
         const rr_cast: CastExpr* = ExpressionNode::cast_of(e);
@@ -1191,8 +1191,8 @@ type struct AsyncLower {
             }
             return n;
         }
-        if (k == NodeKind::MemberAccess) {
-            return this.expr_await_count((e as MemberAccessNode*).object);
+        if (ExpressionNode::member_access_of(e) != null) {
+            return this.expr_await_count(ExpressionNode::member_access_of(e).object);
         }
         const count_tern: TernaryExpr* = ExpressionNode::ternary_of(e);
         if (count_tern != null) {
@@ -1466,10 +1466,10 @@ type struct AsyncLower {
     /// fields are settled only once the whole body is built - so the access
     /// is recorded and `pin_own_accesses` pins it then.
     own_field(mut &this, struct_ref: TypeRef, field: SymbolStr, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        mut m: MemberAccessNode* = new MemberAccessNode(this.this_ident(struct_ref, span), field, span, span);
+        const m: ExpressionNode* = ExpressionNode::member_access_expr(this.this_ident(struct_ref, span), field, span, span);
         m.set_resolved_type(ty);
-        this.own_accesses.push(m);
-        return m as ExpressionNode*;
+        this.own_accesses.push(ExpressionNode::member_access_of(m));
+        return m;
     }
 
     /// Pin every access `own_field` recorded, by the field door, now that the
@@ -1479,7 +1479,7 @@ type struct AsyncLower {
     /// than left for codegen to meet with no pin.
     pin_own_accesses(mut &this, span: SourceSpan) -> void {
         for (mut i: i64 = 0; i < this.own_accesses.length; i++) {
-            mut m: MemberAccessNode* = this.own_accesses[i];
+            mut m: MemberAccessExpr* = this.own_accesses[i];
             m.set_resolved_member(this.own_field_pin(m.object.resolved_type, m.member, span));
         }
         this.own_accesses = [];
@@ -1501,7 +1501,7 @@ type struct AsyncLower {
     }
 
     /// Whether `m` is an access `own_field` built and has not pinned yet.
-    is_own_access(&this, m: MemberAccessNode*) -> boolean {
+    is_own_access(&this, m: MemberAccessExpr*) -> boolean {
         for (mut i: i64 = 0; i < this.own_accesses.length; i++) {
             if (this.own_accesses[i] == m) { return true; }
         }
@@ -1522,8 +1522,8 @@ type struct AsyncLower {
     /// tree only.
     method_call0(&this, recv: ExpressionNode*, item: LangItem, ret_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         const d: DefId = this.method_item(item, span);
-        mut m: MemberAccessNode* = new MemberAccessNode(recv, this.ctx.defs.leaf_of(d).spelling(), span, span);
-        mut c: CallExprNode* = new CallExprNode(m as ExpressionNode*, span);
+        mut m: ExpressionNode* = ExpressionNode::member_access_expr(recv, this.ctx.defs.leaf_of(d).spelling(), span, span);
+        mut c: CallExprNode* = new CallExprNode(m, span);
         c.named_method = d;
         c.template_recv = recv.resolved_type;
         c.set_resolved_type(ret_ty);
@@ -1534,8 +1534,8 @@ type struct AsyncLower {
     method_call1(&this, recv: ExpressionNode*, item: LangItem, arg: ExpressionNode*,
                  ret_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         const d: DefId = this.method_item(item, span);
-        mut m: MemberAccessNode* = new MemberAccessNode(recv, this.ctx.defs.leaf_of(d).spelling(), span, span);
-        mut c: CallExprNode* = new CallExprNode(m as ExpressionNode*, span);
+        mut m: ExpressionNode* = ExpressionNode::member_access_expr(recv, this.ctx.defs.leaf_of(d).spelling(), span, span);
+        mut c: CallExprNode* = new CallExprNode(m, span);
         c.named_method = d;
         c.template_recv = recv.resolved_type;
         c.add_argument(arg);
@@ -1745,8 +1745,8 @@ type struct AsyncLower {
             }
             return false;
         }
-        if (k == NodeKind::MemberAccess) {
-            return this.name_read_in_expr((e as MemberAccessNode*).object, key);
+        if (ExpressionNode::member_access_of(e) != null) {
+            return this.name_read_in_expr(ExpressionNode::member_access_of(e).object, key);
         }
         const read_cast: CastExpr* = ExpressionNode::cast_of(e);
         if (read_cast != null) {
@@ -2082,8 +2082,8 @@ type struct AsyncLower {
             }
             return e;
         }
-        if (k == NodeKind::MemberAccess) {
-            const m: MemberAccessNode* = e as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(e) != null) {
+            const m: MemberAccessExpr* = ExpressionNode::member_access_of(e);
             m.object = this.subst_name_expr(m.object, key, field, struct_ref, ty, span, false);
             return e;
         }
@@ -2735,10 +2735,10 @@ type struct AsyncLower {
         if (slot_ty.is_valid()) { return true; }
         if (e == null || (e as ASTNode*).kind != NodeKind::CallExpression) { return false; }
         const c: CallExprNode* = e as CallExprNode*;
-        if (c.callee == null || (c.callee as ASTNode*).kind != NodeKind::MemberAccess) {
+        if (c.callee == null || ExpressionNode::member_access_of((c.callee as ASTNode*)) == null) {
             return false;
         }
-        const mname: SymbolStr = (c.callee as MemberAccessNode*).member;
+        const mname: SymbolStr = ExpressionNode::member_access_of(c.callee).member;
         if (!mname.is_valid()) { return false; }
 
         // A call on a receiver of still-generic type is left unpinned -
@@ -2918,10 +2918,10 @@ type struct AsyncLower {
     awaited_recv_place(&this, e: ExpressionNode*) -> ExpressionNode* {
         if (e == null || (e as ASTNode*).kind != NodeKind::CallExpression) { return null; }
         const c: CallExprNode* = e as CallExprNode*;
-        if (c.callee == null || (c.callee as ASTNode*).kind != NodeKind::MemberAccess) {
+        if (c.callee == null || ExpressionNode::member_access_of((c.callee as ASTNode*)) == null) {
             return null;
         }
-        return (c.callee as MemberAccessNode*).object;
+        return ExpressionNode::member_access_of(c.callee).object;
     }
 
     /// A fresh copy of the pure-read place `e`, or null when `e` is not one.
@@ -2933,26 +2933,26 @@ type struct AsyncLower {
     /// assignment would repeat its effect.
     rebuild_place(mut &this, e: ExpressionNode*) -> ExpressionNode* {
         if (e == null) { return null; }
-        const k: NodeKind = (e as ASTNode*).kind;
         const ty: TypeRef = e.resolved_type;
         const span: SourceSpan = (e as ASTNode*).span;
         const place_id: IdentifierExpr* = ExpressionNode::identifier_of(e);
         if (place_id != null) {
             return this.ident_bound(place_id.name, this.local_key(e), ty, span);
         }
-        if (k == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = e as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(e) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(e);
             mut obj: ExpressionNode* = this.rebuild_place(ma.object);
             if (obj == null) { return null; }
             // A copy of an answered place carries the answer, as a clone
             // does; a copy of an access this lowering has not pinned yet is
             // pinned with it.
-            mut copy: MemberAccessNode* = new MemberAccessNode(obj, ma.member, span, span);
+            const copy: ExpressionNode* = ExpressionNode::member_access_expr(obj, ma.member, span, span);
             if (ty.is_valid()) { copy.set_resolved_type(ty); }
-            copy.resolved_member = ma.resolved_member;
-            copy.carry_resolved_member();
-            if (!ma.resolved_member.is_some() && this.is_own_access(ma)) { this.own_accesses.push(copy); }
-            return copy as ExpressionNode*;
+            const copy_ma: MemberAccessExpr* = ExpressionNode::member_access_of(copy);
+            copy_ma.resolved_member = ma.resolved_member;
+            copy_ma.carry_resolved_member();
+            if (!ma.resolved_member.is_some() && this.is_own_access(ma)) { this.own_accesses.push(copy_ma); }
+            return copy;
         }
         const place_un: UnaryExpr* = ExpressionNode::unary_of(e);
         if (place_un != null) {
@@ -2973,10 +2973,10 @@ type struct AsyncLower {
     /// can be found for it here, and none is needed.
     assign_recv_slot_stmt(&this, fut: ExpressionNode*, slot_ty: TypeRef,
                           rhs: ExpressionNode*, span: SourceSpan) -> Stmt* {
-        mut m: MemberAccessNode* = new MemberAccessNode(fut, this.recv_sym, span, span);
+        const m: ExpressionNode* = ExpressionNode::member_access_expr(fut, this.recv_sym, span, span);
         m.set_resolved_type(slot_ty);
-        m.set_resolved_member(MemberPin::RecvSlot);
-        return this.assign_stmt(m as ExpressionNode*, rhs, span);
+        ExpressionNode::member_access_of(m).set_resolved_member(MemberPin::RecvSlot);
+        return this.assign_stmt(m, rhs, span);
     }
 
     /// Emit into state `resume` the receiver refreshes for every `async`-method
@@ -3076,11 +3076,11 @@ type struct AsyncLower {
                 // The field the combinator's literal stores the child in,
                 // with the pin that literal carries: a field's position is
                 // the same in the template and every instantiation.
-                mut into_m: MemberAccessNode* = new MemberAccessNode(nb, fld.field_name, span, span);
-                into_m.set_resolved_type(a.resolved_type);
-                into_m.resolved_member = fld.pin;
-                into_m.carry_resolved_member();
-                mut into: ExpressionNode* = into_m as ExpressionNode*;
+                const into: ExpressionNode* = ExpressionNode::member_access_expr(nb, fld.field_name, span, span);
+                into.set_resolved_type(a.resolved_type);
+                const into_ma: MemberAccessExpr* = ExpressionNode::member_access_of(into);
+                into_ma.resolved_member = fld.pin;
+                into_ma.carry_resolved_member();
                 if (!this.emit_recv_refresh(sm, resume, a, into, err_span, span)) {
                     return false;
                 }
@@ -4101,8 +4101,8 @@ type struct AsyncLower {
             }
             return false;
         }
-        if (k == NodeKind::MemberAccess) {
-            return this.expr_has_free_edge((e as MemberAccessNode*).object, break_only);
+        if (ExpressionNode::member_access_of(e) != null) {
+            return this.expr_has_free_edge(ExpressionNode::member_access_of(e).object, break_only);
         }
         const edge_cast: CastExpr* = ExpressionNode::cast_of(e);
         if (edge_cast != null) {
@@ -4547,8 +4547,8 @@ type struct AsyncLower {
             }
             return;
         }
-        if (k == NodeKind::MemberAccess) {
-            this.mark_last_use_expr((e as MemberAccessNode*).object, key, false, out);
+        if (ExpressionNode::member_access_of(e) != null) {
+            this.mark_last_use_expr(ExpressionNode::member_access_of(e).object, key, false, out);
             return;
         }
         const use_un: UnaryExpr* = ExpressionNode::unary_of(e);
@@ -5214,13 +5214,12 @@ type struct AsyncLower {
     /// the frame at the first indirection it passes through.
     addr_place_root(&this, sm: PollSm*, e: ExpressionNode*) -> ExpressionNode* {
         if (e == null) { return null; }
-        const k: NodeKind = (e as ASTNode*).kind;
         if (ExpressionNode::identifier_of(e) != null) {
             if (this.is_frame_key(sm, this.local_key(e))) { return e; }
             return null;
         }
-        if (k == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = e as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(e) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(e);
             if (this.place_leaves_frame(ma.object)) { return null; }
             return this.addr_place_root(sm, ma.object);
         }
@@ -5260,10 +5259,10 @@ type struct AsyncLower {
             return null;
         }
         if (c.callee == null) { return null; }
-        if ((c.callee as ASTNode*).kind != NodeKind::MemberAccess) {
+        if (ExpressionNode::member_access_of((c.callee as ASTNode*)) == null) {
             return null;
         }
-        const recv: ExpressionNode* = (c.callee as MemberAccessNode*).object;
+        const recv: ExpressionNode* = ExpressionNode::member_access_of(c.callee).object;
         if (this.place_leaves_frame(recv)) { return null; }
         return this.addr_place_root(sm, recv);
     }
@@ -5302,8 +5301,8 @@ type struct AsyncLower {
             }
             return null;
         }
-        if (k == NodeKind::MemberAccess) {
-            return this.frame_addr_root_expr(sm, (e as MemberAccessNode*).object);
+        if (ExpressionNode::member_access_of(e) != null) {
+            return this.frame_addr_root_expr(sm, ExpressionNode::member_access_of(e).object);
         }
         const addr_cast: CastExpr* = ExpressionNode::cast_of(e);
         if (addr_cast != null) {
@@ -5797,12 +5796,11 @@ type struct AsyncLower {
     /// into it held across the `await`, which `E0455` rejects.
     await_transparent(&this, e: ExpressionNode*) -> boolean {
         if (e == null) { return true; }
-        const k: NodeKind = (e as ASTNode*).kind;
         if (ExpressionNode::literal_of(e) != null || ExpressionNode::identifier_of(e) != null ||
             ExpressionNode::scope_resolution_of(e) != null || ExpressionNode::sizeof_of(e) != null ||
             ExpressionNode::alignof_of(e) != null) { return true; }
-        if (k == NodeKind::MemberAccess) {
-            return this.await_transparent((e as MemberAccessNode*).object);
+        if (ExpressionNode::member_access_of(e) != null) {
+            return this.await_transparent(ExpressionNode::member_access_of(e).object);
         }
         const clear_cast: CastExpr* = ExpressionNode::cast_of(e);
         if (clear_cast != null) {
@@ -5974,8 +5972,8 @@ type struct AsyncLower {
             return e;
         }
 
-        if (k == NodeKind::MemberAccess) {
-            mut m: MemberAccessNode* = e as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(e) != null) {
+            mut m: MemberAccessExpr* = ExpressionNode::member_access_of(e);
             m.object = this.hoist_expr(m.object, pre);
             return e;
         }
@@ -6055,15 +6053,14 @@ type struct AsyncLower {
     hoist_place(mut &this, e: ExpressionNode*, force: boolean,
                 pre: HoistPre*) -> ExpressionNode* {
         if (e == null) { return null; }
-        const k: NodeKind = (e as ASTNode*).kind;
         mut place_hoist_aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
         if (place_hoist_aa != null) {
             place_hoist_aa.array = this.hoist_place(place_hoist_aa.array, force, pre);
             place_hoist_aa.index = this.hoist_operand(place_hoist_aa.index, force, pre);
             return e;
         }
-        if (k == NodeKind::MemberAccess) {
-            mut m: MemberAccessNode* = e as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(e) != null) {
+            mut m: MemberAccessExpr* = ExpressionNode::member_access_of(e);
             m.object = this.hoist_place(m.object, force, pre);
             return e;
         }
@@ -6633,8 +6630,8 @@ type struct AsyncLower {
             this.rn_expr(map, rn_aa.desugared_call);
             return;
         }
-        if (k == NodeKind::MemberAccess) {
-            this.rn_expr(map, (e as MemberAccessNode*).object); return;
+        if (ExpressionNode::member_access_of(e) != null) {
+            this.rn_expr(map, ExpressionNode::member_access_of(e).object); return;
         }
         const rn_typeof: TypeofExpr* = ExpressionNode::typeof_of(e);
         if (rn_typeof != null) {
@@ -6949,8 +6946,8 @@ type struct AsyncLower {
             this.rb_expr(ctx, rb_aa.desugared_call);
             return;
         }
-        if (k == NodeKind::MemberAccess) {
-            this.rb_expr(ctx, (e as MemberAccessNode*).object); return;
+        if (ExpressionNode::member_access_of(e) != null) {
+            this.rb_expr(ctx, ExpressionNode::member_access_of(e).object); return;
         }
         const rb_typeof: TypeofExpr* = ExpressionNode::typeof_of(e);
         if (rb_typeof != null) {
@@ -7280,7 +7277,7 @@ type struct AsyncLower {
         const ex_use: ExpressionNode* = ExpressionNode::identifier_expr(ex_sym, span);
         ExpressionNode::identifier_of(ex_use).set_res(Res::Local(ex_decl.sym_id));
         mut drive: CallExprNode* = new CallExprNode(
-            new MemberAccessNode(ex_use,
+            ExpressionNode::member_access_expr(ex_use,
                                  this.intern.intern("block_on"), span, span) as ExpressionNode*, span);
         drive.add_argument(root as ExpressionNode*);
 

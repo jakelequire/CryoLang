@@ -76,7 +76,7 @@ import compiler::ast::expression::{
     CalleePin,
     ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr,
     CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierExpr,
-    IfExpr, LambdaExpr, LiteralExpr, MatchExpr, MemberAccessNode, NewExpr,
+    IfExpr, LambdaExpr, LiteralExpr, MatchExpr, MemberAccessExpr, NewExpr,
     ScopeResolutionExpr, StaticMatchExpr, StructExpr,
     TernaryExpr, TryExpr, TupleExpr, UnaryExpr
 };
@@ -307,8 +307,8 @@ type struct SemaVisitor {
     /// reaches its pointee's.
     bind_destructor_call(mut &this, call: CallExprNode*) -> void {
         if (call == null || call.callee == null) { return; }
-        if (call.callee.kind != NodeKind::MemberAccess) { return; }
-        const member: MemberAccessNode* = call.callee as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(call.callee) == null) { return; }
+        const member: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
         if (member.object == null || !member.object.resolved_type.is_valid()) { return; }
         this.calls.bind_destructor(this as SemaVisitor*, call, member.object.resolved_type);
     }
@@ -1362,8 +1362,8 @@ type struct SemaVisitor {
                                 FamilyOwner::Type(owner_ref), this.intern.intern("iter")).length > 0) {
                             const orig_init: ExpressionNode* = var_node.initializer;
                             const wrap_span: SourceSpan = orig_init.span;
-                            mut iter_member: MemberAccessNode* = new MemberAccessNode(orig_init, this.intern.intern("iter"), wrap_span, wrap_span);
-                            mut iter_call: CallExprNode* = new CallExprNode(iter_member as ExpressionNode*, wrap_span);
+                            mut iter_member: ExpressionNode* = ExpressionNode::member_access_expr(orig_init, this.intern.intern("iter"), wrap_span, wrap_span);
+                            mut iter_call: CallExprNode* = new CallExprNode(iter_member, wrap_span);
                             var_node.set_initializer(iter_call as ExpressionNode*);
                             init_type = this.resolve_expr(var_node.initializer);
                         }
@@ -1663,8 +1663,7 @@ type struct SemaVisitor {
             NodeKind::Program                => { this.visit_program(n as ProgramNode*); }
 
             NodeKind::Expression
-            | NodeKind::CallExpression
-            | NodeKind::MemberAccess => {
+            | NodeKind::CallExpression => {
                 this.resolve_expr(n as ExpressionNode*);
             }
 
@@ -1710,7 +1709,6 @@ type struct SemaVisitor {
         const n: ASTNode* = expr as ASTNode*;
         const result: TypeRef = match (n.kind) {
             NodeKind::CallExpression    => { this.calls.resolve_call(this, expr as CallExprNode*) }
-            NodeKind::MemberAccess      => { this.member.resolve_member_access(this, expr as MemberAccessNode*) }
             NodeKind::Expression        => { this.resolve_expr_shape(expr) }
             _ => { TypeRef::invalid() }
         };
@@ -1752,6 +1750,7 @@ type struct SemaVisitor {
             ExprKind::ScopeResolution(s) => {
                 this.calls.located_value_checked(expr, this.resolve_scope_resolution(expr, s))
             }
+            ExprKind::MemberAccess(m) => { this.member.resolve_member_access(this, expr, m) }
             ExprKind::Try(t)   => { this.resolve_try_expr(expr, t) }
             ExprKind::New(ne)  => { this.resolve_new_expr(expr, ne) }
             ExprKind::Tuple(t) => { this.resolve_tuple_literal(t) }
@@ -1989,9 +1988,9 @@ type struct SemaVisitor {
     build_operator_call(mut &this, receiver: ExpressionNode*, method: SymbolStr,
                         trait_id: DefId, rhs: ExpressionNode*, op_tok: Token,
                         span: SourceSpan) -> ExpressionNode* {
-        const member: MemberAccessNode* = new MemberAccessNode(receiver, method, span, span);
-        this.calls.stamp_trait_item(member, trait_id);
-        mut call: CallExprNode* = new CallExprNode(member as ExpressionNode*, span);
+        const member: ExpressionNode* = ExpressionNode::member_access_expr(receiver, method, span, span);
+        this.calls.stamp_trait_item(ExpressionNode::member_access_of(member), trait_id);
+        mut call: CallExprNode* = new CallExprNode(member, span);
         if (rhs != null) {
             // The trait method takes `rhs: &Rhs`.  When the operand is already a
             // reference (`&Rhs`, e.g. a by-reference parameter or `&scratch[0]`),
@@ -2179,9 +2178,9 @@ type struct SemaVisitor {
         // predicate - `a < b` -> `a.compare(&b).is_lt()`.
         if (map.ord_pred != "") {
             const pred_sym: SymbolStr = this.intern.intern(map.ord_pred);
-            const pred_member: MemberAccessNode* =
-                new MemberAccessNode(desugared, pred_sym, span, span);
-            desugared = new CallExprNode(pred_member as ExpressionNode*, span) as ExpressionNode*;
+            const pred_member: ExpressionNode* =
+                ExpressionNode::member_access_expr(desugared, pred_sym, span, span);
+            desugared = new CallExprNode(pred_member, span) as ExpressionNode*;
         }
         if (map.negate) {
             const bang: Token = Token::new(TokenType::Exclaim, "!", op_tok.line, op_tok.column);
@@ -2675,15 +2674,16 @@ type struct SemaVisitor {
             return;
         }
         match (lhs.kind) {
-            NodeKind::MemberAccess => {
-                const ma: MemberAccessNode* = lhs as MemberAccessNode*;
-                if (ma.object == null) { return; }
-                const recv_t: Type* = this.arena.lookup(ma.object.resolved_type);
-                if (recv_t != null && (recv_t.kind == TypeKind::Pointer || recv_t.kind == TypeKind::Reference)) { return; }
-                if (this.symbolic.symbolic_type_unresolved(ma.object.resolved_type)) { return; }
-                this.check_assignment_lvalue(ma.object);
-            }
             NodeKind::Expression => {
+                const ma: MemberAccessExpr* = ExpressionNode::member_access_of(lhs);
+                if (ma != null) {
+                    if (ma.object == null) { return; }
+                    const recv_t: Type* = this.arena.lookup(ma.object.resolved_type);
+                    if (recv_t != null && (recv_t.kind == TypeKind::Pointer || recv_t.kind == TypeKind::Reference)) { return; }
+                    if (this.symbolic.symbolic_type_unresolved(ma.object.resolved_type)) { return; }
+                    this.check_assignment_lvalue(ma.object);
+                    return;
+                }
                 if (ExpressionNode::literal_of(lhs) != null) {
                     this.ctx.emit_error_at(ErrorCode::E0232_INVALID_ASSIGNMENT_TARGET,
                         "cannot assign to a literal; the left-hand side of an assignment must be a place (variable, field, or index)", lhs.span);
@@ -4455,7 +4455,6 @@ type struct SemaVisitor {
     /// local, so a pointer into its payload dangles once the frame is gone.
     subject_is_caller_backed(&this, e: ExpressionNode*) -> boolean {
         if (e == null) { return false; }
-        const k: NodeKind = e.kind;
         const id: IdentifierExpr* = ExpressionNode::identifier_of(e);
         if (id != null) {
             if (this.names_receiver(id)) { return this.state.this_is_by_ref; }
@@ -4470,8 +4469,9 @@ type struct SemaVisitor {
             if (u.op.kind != TokenType::Amp && u.op.kind != TokenType::Star) { return false; }
             return this.subject_is_caller_backed(u.operand);
         }
-        if (k == NodeKind::MemberAccess) {
-            return this.subject_is_caller_backed((e as MemberAccessNode*).object);
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(e);
+        if (ma != null) {
+            return this.subject_is_caller_backed(ma.object);
         }
         const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
         if (aa != null) {
