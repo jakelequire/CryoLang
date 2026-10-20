@@ -30,7 +30,7 @@ import compiler::ast::expression::{
     CallExpr, ExprKind, ExpressionNode,
     MemberAccessExpr, ScopeResolutionExpr
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, Pattern, PatternKind, StaticMatchArmNode };
 import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::source_span::{ SourceSpan };
@@ -114,7 +114,7 @@ type struct StampCheck {
     check_program(mut &this, program: ProgramNode*) -> void {
         if (program == null) { return; }
         for (mut i: i64 = 0; i < program.statements.length; i++) {
-            this.node(program.statements[i].as_ast());
+            this.node(program.statements[i]);
         }
         for (mut i: i64 = 0; i < program.static_asserts.length; i++) {
             this.expr(program.static_asserts[i].cond);
@@ -187,80 +187,85 @@ type struct StampCheck {
 
     // -- Declarations, statements, expressions --
 
-    node(mut &this, n: ASTNode*) -> void {
-        if (n == null) { return; }
-        match (n.kind) {
-            NodeKind::Declaration => {
-                match ((n as DeclarationNode*).shape) {
-                    DeclKind::Method(_) => { this.method(DeclarationNode::with_shape(n)); }
-                    DeclKind::Function(_) => { this.function(DeclarationNode::with_shape(n)); }
-                    DeclKind::Trait(d) => {
-                        this.generic_params(&d.generic_params);
-                        for (mut i: i64 = 0; i < d.methods.length; i++) { this.function(d.methods[i]); }
-                        this.trait_refs(&d.base_traits);
-                        for (mut i: i64 = 0; i < d.assoc_types.length; i++) {
-                            if (d.assoc_types[i] != null) { this.trait_refs(&d.assoc_types[i].bounds); }
-                        }
-                    }
-                    DeclKind::Intrinsic(d) => {
-                        for (mut i: i64 = 0; i < d.parameters.length; i++) {
-                            this.var_decl(DeclarationNode::var_of(d.parameters[i]));
-                        }
-                        this.annotation(d.return_type_annotation);
-                        this.node(d.body as ASTNode*);
-                    }
-                    DeclKind::Destructure(d) => {
-                        this.annotation(d.type_annotation);
-                        this.expr(d.initializer);
-                    }
-                    DeclKind::Variable(d) => { this.var_decl(d); }
-                    DeclKind::Extern(d) => {
-                        for (mut i: i64 = 0; i < d.functions.length; i++) { this.function(d.functions[i]); }
-                        for (mut i: i64 = 0; i < d.globals.length; i++) {
-                            this.var_decl(DeclarationNode::var_of(d.globals[i]));
-                        }
-                    }
-                    DeclKind::TypeAlias(d) => {
-                        this.generic_params(&d.generic_params);
-                        this.annotation(d.target_annotation);
-                    }
-                    DeclKind::Enum(d) => {
-                        this.generic_params(&d.generic_params);
-                        this.annotation(d.discriminant_annotation);
-                        for (mut i: i64 = 0; i < d.variants.length; i++) {
-                            const v: EnumVariant* = DeclarationNode::variant_of(d.variants[i]);
-                            if (v != null) { this.annotations(&v.associated_types); }
-                        }
-                        this.bounds(&d.where_bounds);
-                    }
-                    DeclKind::Union(d) => {
-                        this.generic_params(&d.generic_params);
-                        this.fields(&d.fields);
-                        this.methods(&d.methods);
-                        this.bounds(&d.where_bounds);
-                    }
-                    DeclKind::Struct(d) => {
-                        this.generic_params(&d.generic_params);
-                        this.fields(&d.fields);
-                        this.methods(&d.methods);
-                        this.bounds(&d.where_bounds);
-                    }
-                    DeclKind::Impl(d) => {
-                        this.note(&d.res, StampSite::ImplTarget, d.target_type_span);
-                        this.generic_params(&d.generic_params);
-                        this.annotations(&d.target_args);
-                        this.annotation(d.trait_annotation);
-                        this.bounds(&d.where_bounds);
-                        this.annotations(&d.assoc_binding_annotations);
-                        this.methods(&d.methods);
-                    }
-                    // A variant's, a field's or a generic parameter's
-                    // annotations are checked with its owner.
-                    DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Variant(_)
-                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Legacy => {}
+    node(mut &this, item: Node) -> void {
+        if (item.is_null()) { return; }
+        match (item) {
+            Node::Decl(d) => { this.decl(d); }
+            Node::Stmt(s) => { this.stmt(s); }
+            Node::Expr(e) => { this.expr(e); }
+            _ => { }
+        }
+    }
+
+    decl(mut &this, n: DeclarationNode*) -> void {
+        match (n.shape) {
+            DeclKind::Method(_) => { this.method(DeclarationNode::with_shape(n)); }
+            DeclKind::Function(_) => { this.function(DeclarationNode::with_shape(n)); }
+            DeclKind::Trait(d) => {
+                this.generic_params(&d.generic_params);
+                for (mut i: i64 = 0; i < d.methods.length; i++) { this.function(d.methods[i]); }
+                this.trait_refs(&d.base_traits);
+                for (mut i: i64 = 0; i < d.assoc_types.length; i++) {
+                    if (d.assoc_types[i] != null) { this.trait_refs(&d.assoc_types[i].bounds); }
                 }
             }
-            NodeKind::ClassDeclaration => {
+            DeclKind::Intrinsic(d) => {
+                for (mut i: i64 = 0; i < d.parameters.length; i++) {
+                    this.var_decl(DeclarationNode::var_of(d.parameters[i]));
+                }
+                this.annotation(d.return_type_annotation);
+                this.node(Node::Stmt(d.body));
+            }
+            DeclKind::Destructure(d) => {
+                this.annotation(d.type_annotation);
+                this.expr(d.initializer);
+            }
+            DeclKind::Variable(d) => { this.var_decl(d); }
+            DeclKind::Extern(d) => {
+                for (mut i: i64 = 0; i < d.functions.length; i++) { this.function(d.functions[i]); }
+                for (mut i: i64 = 0; i < d.globals.length; i++) {
+                    this.var_decl(DeclarationNode::var_of(d.globals[i]));
+                }
+            }
+            DeclKind::TypeAlias(d) => {
+                this.generic_params(&d.generic_params);
+                this.annotation(d.target_annotation);
+            }
+            DeclKind::Enum(d) => {
+                this.generic_params(&d.generic_params);
+                this.annotation(d.discriminant_annotation);
+                for (mut i: i64 = 0; i < d.variants.length; i++) {
+                    const v: EnumVariant* = DeclarationNode::variant_of(d.variants[i]);
+                    if (v != null) { this.annotations(&v.associated_types); }
+                }
+                this.bounds(&d.where_bounds);
+            }
+            DeclKind::Union(d) => {
+                this.generic_params(&d.generic_params);
+                this.fields(&d.fields);
+                this.methods(&d.methods);
+                this.bounds(&d.where_bounds);
+            }
+            DeclKind::Struct(d) => {
+                this.generic_params(&d.generic_params);
+                this.fields(&d.fields);
+                this.methods(&d.methods);
+                this.bounds(&d.where_bounds);
+            }
+            DeclKind::Impl(d) => {
+                this.note(&d.res, StampSite::ImplTarget, d.target_type_span);
+                this.generic_params(&d.generic_params);
+                this.annotations(&d.target_args);
+                this.annotation(d.trait_annotation);
+                this.bounds(&d.where_bounds);
+                this.annotations(&d.assoc_binding_annotations);
+                this.methods(&d.methods);
+            }
+            // A variant's, a field's or a generic parameter's
+            // annotations are checked with its owner.
+            DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Variant(_)
+            | DeclKind::Field(_) | DeclKind::GenericParam(_) => {}
+            DeclKind::Legacy => {
                 const d: ClassDeclNode* = n as ClassDeclNode*;
                 if (d.base_class.is_valid()) { this.note(&d.base_res, StampSite::BaseClass, d.base_span); }
                 this.generic_params(&d.generic_params);
@@ -268,19 +273,15 @@ type struct StampCheck {
                 this.methods(&d.methods);
                 this.bounds(&d.where_bounds);
             }
-            NodeKind::Statement => { this.stmt(n as Stmt*); }
-            _ => {
-                if (n.kind.is_expression()) { this.expr(n as ExpressionNode*); }
-            }
         }
     }
 
     stmt(mut &this, s: Stmt*) -> void {
         match (s.shape) {
             StmtKind::Block(b) => {
-                for (mut i: i64 = 0; i < b.statements.length; i++) { this.node(b.statements[i] as ASTNode*); }
+                for (mut i: i64 = 0; i < b.statements.length; i++) { this.node(Node::Stmt(b.statements[i])); }
             }
-            StmtKind::UnsafeBlock(u) => { this.node(u.block as ASTNode*); }
+            StmtKind::UnsafeBlock(u) => { this.node(Node::Stmt(u.block)); }
             StmtKind::Asm(a) => {
                 for (mut i: i64 = 0; i < a.operands.length; i++) {
                     this.expr(a.operands[i].expr);
@@ -289,22 +290,22 @@ type struct StampCheck {
             StmtKind::Return(r) => { this.expr(r.expression); }
             StmtKind::If(i) => {
                 this.expr(i.condition);
-                this.node(i.then_stmt as ASTNode*);
-                this.node(i.else_stmt as ASTNode*);
+                this.node(Node::Stmt(i.then_stmt));
+                this.node(Node::Stmt(i.else_stmt));
             }
             StmtKind::While(w) => {
                 this.expr(w.condition);
-                this.node(w.body as ASTNode*);
+                this.node(Node::Stmt(w.body));
             }
             StmtKind::DoWhile(d) => {
-                this.node(d.body as ASTNode*);
+                this.node(Node::Stmt(d.body));
                 this.expr(d.condition);
             }
             StmtKind::For(f) => {
-                this.node(f.init.as_ast());
+                this.node(f.init);
                 this.expr(f.condition);
                 this.expr(f.update);
-                this.node(f.body as ASTNode*);
+                this.node(Node::Stmt(f.body));
             }
             StmtKind::Match(m) => {
                 this.expr(m.subject);
@@ -315,8 +316,8 @@ type struct StampCheck {
                 this.static_arms(&m.arms);
             }
             StmtKind::Expr(e) => { this.expr(e.expression); }
-            StmtKind::Decl(d) => { this.node(d.declaration as ASTNode*); }
-            StmtKind::Loop(l) => { this.node(l.body as ASTNode*); }
+            StmtKind::Decl(d) => { this.node(Node::Decl(d.declaration)); }
+            StmtKind::Loop(l) => { this.node(Node::Stmt(l.body)); }
             StmtKind::Break | StmtKind::Continue => {}
         }
     }
@@ -336,7 +337,7 @@ type struct StampCheck {
         this.generic_params(&f.generic_params);
         this.bounds(&f.trait_bounds);
         this.annotation(f.return_type_annotation);
-        this.node(f.body as ASTNode*);
+        this.node(Node::Stmt(f.body));
     }
 
     method(mut &this, m_decl: DeclarationNode*) -> void {
@@ -365,7 +366,7 @@ type struct StampCheck {
             if (arm == null) { continue; }
             for (mut p: i64 = 0; p < arm.patterns.length; p++) { this.pattern(arm.patterns[p]); }
             this.expr(arm.guard);
-            this.node(arm.body as ASTNode*);
+            this.node(Node::Stmt(arm.body));
         }
     }
 
@@ -374,7 +375,7 @@ type struct StampCheck {
             const arm: StaticMatchArmNode* = arms[i];
             if (arm == null) { continue; }
             this.annotations(&arm.type_patterns);
-            this.node(arm.body as ASTNode*);
+            this.node(Node::Stmt(arm.body));
         }
     }
 
@@ -405,7 +406,7 @@ type struct StampCheck {
 
     expr(mut &this, e: ExpressionNode*) -> void {
         if (e == null) { return; }
-        const n: ASTNode* = e as ASTNode*;
+        const n: ExpressionNode* = e;
         match (n.kind) {
             NodeKind::Expression => {
                 match (e.shape) {
@@ -488,7 +489,7 @@ type struct StampCheck {
                             this.var_decl(DeclarationNode::var_of(l.parameters[i]));
                         }
                         this.annotation(l.return_type_ann);
-                        this.node(l.body as ASTNode*);
+                        this.node(Node::Stmt(l.body));
                     }
                     ExprKind::Literal(_)  => { }
                 }

@@ -18,9 +18,10 @@ import compiler::mono::monomorphizer::{ Monomorphizer };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, DefTable, DefKind, FamilyOwner, ResBase };
-import compiler::ast::node::{ ASTNode };
-import compiler::ast::{ NamedAnnotation, NodeKind };
+import compiler::ast::node::{ Node };
+import compiler::ast::{ NamedAnnotation };
 import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, MethodDecl };
+import compiler::ast::expression::{ ExpressionNode };
 import compiler::types::generic_registry::{ TemplateEntry };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
@@ -168,13 +169,20 @@ type struct InjectedOrigin {
 /// A node a desugaring wrote naming a language item (its slot holds
 /// `ResSlot::Lang`) before the item was claimed.
 type struct LangRef {
-    node: ASTNode*;
+    /// An expression or a pattern.
+    node: Node;
     item: LangItem;
 }
 
-/// A node another list refers to without owning it.
-type struct AstRef {
-    node: ASTNode*;
+/// A type alias's declaration, which the list refers to without owning it.
+type struct AliasDeclRef {
+    decl: DeclarationNode*;
+}
+
+/// A path whose scope segment names a type alias, which the list refers to
+/// without owning it.
+type struct AliasPathRef {
+    path: ExpressionNode*;
 }
 
 /// A reference a C import made to one of its own records: the import's
@@ -315,10 +323,10 @@ public:
 
     /// Every type alias declared, and every path whose scope segment names
     /// one (`NameResolutionPass::settle_alias_paths` answers the paths once
-    /// every module's names are resolved).  Each is an `ASTNode*` held in a
-    /// struct, so the lists own none of the nodes.
-    alias_decls: [AstRef];
-    alias_paths: [AstRef];
+    /// every module's names are resolved).  Each node is held in a struct,
+    /// so the lists own none of the nodes.
+    alias_decls: [AliasDeclRef];
+    alias_paths: [AliasPathRef];
 
     /// References a C import made to its own records before the name layer
     /// declared anything (`NameDeclarationPass::settle_c_refs` answers them).
@@ -461,16 +469,16 @@ public:
         return this.generic_registry;
     }
 
-    note_lang_ref(mut &this, node: ASTNode*, item: LangItem) -> void {
+    note_lang_ref(mut &this, node: Node, item: LangItem) -> void {
         this.lang_refs.push(LangRef { node: node, item: item });
     }
 
-    note_alias_decl(mut &this, node: ASTNode*) -> void {
-        this.alias_decls.push(AstRef { node: node });
+    note_alias_decl(mut &this, decl: DeclarationNode*) -> void {
+        this.alias_decls.push(AliasDeclRef { decl: decl });
     }
 
-    note_alias_path(mut &this, node: ASTNode*) -> void {
-        this.alias_paths.push(AstRef { node: node });
+    note_alias_path(mut &this, path: ExpressionNode*) -> void {
+        this.alias_paths.push(AliasPathRef { path: path });
     }
 
     /// Record that an injected AST node came from a specific template module.
@@ -480,7 +488,7 @@ public:
 
     /// Look up the template module for an injected AST node.
     /// Returns no module if the node wasn't injected.
-    lookup_injected_origin(&this, node: ASTNode*) -> ModulePath {
+    lookup_injected_origin(&this, node: DeclarationNode*) -> ModulePath {
         for (mut i: i64 = 0; i < this.injected_origins.length; i++) {
             if (this.injected_origins[i].node == node) {
                 return this.injected_origins[i].module;

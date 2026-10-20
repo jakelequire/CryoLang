@@ -47,7 +47,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     CallExpr, ExpressionNode, MemberAccessExpr
 };
-import compiler::ast::node::{ ASTNode, Node, ProgramNode, StaticAssertItem };
+import compiler::ast::node::{ Node, ProgramNode, StaticAssertItem };
 import compiler::ast::pattern::{
     DirectiveArg, DirectiveArgKind, DirectiveNode, MatchArmNode, Pattern, StaticMatchArmNode
 };
@@ -125,9 +125,9 @@ implement struct Parser {
                 this.check(TokenType::KwStatic) &&
                 this.peek_at(1).kind == TokenType::KwMatch;
             if (this.is_declaration_start() && !is_static_match) {
-                const decl: ASTNode* = this.parse_declaration(false, "");
-                if (decl != null) {
-                    body.add_statement(Stmt::decl_stmt(decl as DeclarationNode*, decl.span));
+                const item: Stmt* = Parser::block_item(this.parse_declaration(false, ""));
+                if (item != null) {
+                    body.add_statement(item);
                 }
             } else if (is_static_match || this.is_statement_keyword()) {
                 const stmt: Stmt* = this.parse_statement();
@@ -172,27 +172,30 @@ implement struct Parser {
         );
     }
 
-    /// True if the AST node is a declaration that can carry attached
-    /// directives (i.e. inherits from `DeclarationNode`).
-    static is_attachable_decl(node: ASTNode*) -> boolean {
-        if (node == null) { return false; }
-        return match (node.kind) {
-            NodeKind::ClassDeclaration      => { true }
-            NodeKind::Declaration           => { true }
-            _                               => { false }
-        };
+    /// What `parse_declaration` parsed where a statement stands, as a
+    /// statement of the block: a declaration wrapped in a declaration
+    /// statement, the statement it fell back to as itself, null for nothing.
+    static block_item(item: Node) -> Stmt* {
+        match (item) {
+            Node::Decl(d) => {
+                if (d != null) { return Stmt::decl_stmt(d, d.span); }
+            }
+            Node::Stmt(s) => { return s; }
+            _ => { }
+        }
+        return null;
     }
 
     /// Record a leading modifier keyword (`public` / `private`) on a
     /// declaration that has just been parsed.  The keyword is consumed
     /// before the declaration's own parse begins, so it falls outside the
     /// node's `span`; `DeclarationNode::outer_span` folds it back in for
-    /// consumers that need the full written extent.  Nodes that can't carry
-    /// one (a recovery `null`, a non-declaration) are ignored - the same
-    /// gate `is_attachable_decl` applies to directives.
-    static note_decl_modifier(node: ASTNode*, span: SourceSpan) -> void {
-        if (!Parser::is_attachable_decl(node)) { return; }
-        const decl: DeclarationNode* = node as DeclarationNode*;
+    /// consumers that need the full written extent.  An item that can't
+    /// carry one (a recovery null, a non-declaration) is ignored, as it is
+    /// for attached directives.
+    static note_decl_modifier(node: Node, span: SourceSpan) -> void {
+        const decl: DeclarationNode* = node.as_decl();
+        if (decl == null) { return; }
         decl.note_modifier_span(span);
     }
 
@@ -243,10 +246,10 @@ implement struct Parser {
                 continue;
             }
 
-            const node: ASTNode* = this.parse_top_level();
-            if (node != null) {
-                if (pending.length > 0 && Parser::is_attachable_decl(node)) {
-                    const decl: DeclarationNode* = node as DeclarationNode*;
+            const node: Node = this.parse_top_level();
+            if (!node.is_null()) {
+                const decl: DeclarationNode* = node.as_decl();
+                if (pending.length > 0 && decl != null) {
                     for (mut i: i64 = 0; i < pending.length; i++) {
                         decl.add_directive(pending[i]);
                     }
@@ -255,8 +258,8 @@ implement struct Parser {
                         program.add_statement(Node::Directive(pending[i]));
                     }
                 }
-                program.add_statement(Node::of(node));
-                Parser::hoist_extern_globals(program, node);
+                program.add_statement(node);
+                Parser::hoist_extern_globals(program, decl);
             } else if (pending.length > 0) {
                 for (mut i: i64 = 0; i < pending.length; i++) {
                     program.add_statement(Node::Directive(pending[i]));
@@ -278,10 +281,13 @@ implement struct Parser {
         // keeps `![config(...)]`-prefixed files producing the right
         // `namespace_name`.
         for (mut i: i64 = 0; i < program.statements.length; i++) {
-            const s: ASTNode* = program.statements[i].as_ast();
-            if (s == null) { continue; }
-            if (s.kind == NodeKind::Directive) { continue; }
-            const m: ModuleDecl* = DeclarationNode::module_of(s);
+            const s: Node = program.statements[i];
+            if (s.is_null()) { continue; }
+            match (s) {
+                Node::Directive(_) => { continue; }
+                _                  => { }
+            }
+            const m: ModuleDecl* = DeclarationNode::module_of(s.as_decl());
             if (m != null) {
                 program.set_namespace_name(m.path);
             }
@@ -327,7 +333,7 @@ implement struct Parser {
 
     /// Dispatch to the appropriate declaration or statement parser based on
     /// the current token.
-    parse_top_level() -> ASTNode* {
+    parse_top_level() -> Node {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_top_level() token='%s'", this.current().lexeme);
         const tok: Token = this.current();
         const doc: string = this.take_documentation();
@@ -336,11 +342,11 @@ implement struct Parser {
         // `namespace X::Y;` line is the module's documentation; attach
         // it so the LSP can surface it on hover.
         if (tok.kind == TokenType::KwNamespace) {
-            const ns: ASTNode* = this.parse_namespace_declaration();
+            const ns: DeclarationNode* = this.parse_namespace_declaration();
             if (ns != null && doc != "") {
-                (ns as DeclarationNode*).set_documentation(doc);
+                ns.set_documentation(doc);
             }
-            return ns;
+            return Node::Decl(ns);
         }
 
         // Module declaration (public module Foo;)
@@ -349,14 +355,14 @@ implement struct Parser {
             if (md != null && doc != "") {
                 md.set_documentation(doc);
             }
-            return md;
+            return Node::Decl(md);
         }
 
         // Public declarations
         if (tok.kind == TokenType::KwPublic) {
             const vis_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'public'
-            const decl: ASTNode* = this.parse_declaration(true, doc);
+            const decl: Node = this.parse_declaration(true, doc);
             Parser::note_decl_modifier(decl, vis_span);
             return decl;
         }
@@ -365,7 +371,7 @@ implement struct Parser {
         if (tok.kind == TokenType::KwPrivate) {
             const vis_span: SourceSpan = this.span_from_token(tok);
             this.advance();
-            const decl: ASTNode* = this.parse_declaration(false, doc);
+            const decl: Node = this.parse_declaration(false, doc);
             Parser::note_decl_modifier(decl, vis_span);
             return decl;
         }
@@ -376,7 +382,7 @@ implement struct Parser {
             if (imp != null && doc != "") {
                 imp.set_documentation(doc);
             }
-            return imp;
+            return Node::Decl(imp);
         }
 
         // Export declaration (symbol re-export).
@@ -385,7 +391,7 @@ implement struct Parser {
             if (exp != null && doc != "") {
                 exp.set_documentation(doc);
             }
-            return exp;
+            return Node::Decl(exp);
         }
 
         // Extern block, or the C-header import form `extern module name := "C"`.
@@ -395,13 +401,13 @@ implement struct Parser {
                 if (cext != null && doc != "") {
                     cext.set_documentation(doc);
                 }
-                return cext;
+                return Node::Decl(cext);
             }
             const ext: DeclarationNode* = this.parse_extern_block();
             if (ext != null && doc != "") {
                 ext.set_documentation(doc);
             }
-            return ext;
+            return Node::Decl(ext);
         }
 
         // Implement block
@@ -410,21 +416,21 @@ implement struct Parser {
             if (impl_blk != null && doc != "") {
                 impl_blk.set_documentation(doc);
             }
-            return impl_blk;
+            return Node::Decl(impl_blk);
         }
 
         // Directive: ![name] or ![name(args)]
         if (tok.kind == TokenType::BangBracket) {
-            return this.parse_directive();
+            return Node::Directive(this.parse_directive());
         }
 
         // `static_assert(cond)` / `static_assert(cond, "message")` at module
         // scope. `static_assert` is a reserved keyword. The item is stashed on
         // the parser and attached to the ProgramNode; nothing is added to the
-        // statement stream, so this returns null.
+        // statement stream, so this returns an absent item.
         if (tok.kind == TokenType::KwStaticAssert) {
             this.parse_static_assert();
-            return null;
+            return Node::Decl(null);
         }
 
         // Regular declaration (function, type, const, mut, etc.).
@@ -440,7 +446,7 @@ implement struct Parser {
     }
 
     /// Parse a declaration based on the current token.
-    parse_declaration(is_public: boolean, doc_text: string) -> ASTNode* {
+    parse_declaration(is_public: boolean, doc_text: string) -> Node {
         const doc: string = doc_text;
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_declaration() token='%s'", this.current().lexeme);
         const tok: Token = this.current();
@@ -452,7 +458,7 @@ implement struct Parser {
             if (func != null && doc != "") {
                 func_decl.set_documentation(doc_text);
             }
-            return func_decl;
+            return Node::Decl(func_decl);
         }
 
         // `async function` - an async fn is parsed as an ordinary function
@@ -468,7 +474,7 @@ implement struct Parser {
                 func_decl.note_modifier_span(async_span);
                 if (doc != "") { func_decl.set_documentation(doc_text); }
             }
-            return func_decl;
+            return Node::Decl(func_decl);
         }
 
         // Variable declaration: const or mut.  If the next-after token is `{`
@@ -477,14 +483,14 @@ implement struct Parser {
         // the VarDecl form.
         if (tok.kind == TokenType::KwConst || tok.kind == TokenType::KwMut) {
             if (this.peek_at(1).kind == TokenType::LBrace && this.scope_depth > 0) {
-                return this.parse_destructure_decl();
+                return Node::Decl(this.parse_destructure_decl());
             }
             const vd: DeclarationNode* = this.parse_variable_declaration();
             if (vd != null) {
                 if (doc != "") { vd.set_documentation(doc_text); }
                 if (this.scope_depth == 0) { DeclarationNode::var_of(vd).set_global(true); }
             }
-            return vd;
+            return Node::Decl(vd);
         }
 
         // Type declarations: type struct/class/enum/trait/alias
@@ -497,7 +503,7 @@ implement struct Parser {
                     DeclarationNode::struct_of(sd).is_public = is_public;
                     if (doc != "") { sd.set_documentation(doc_text); }
                 }
-                return sd;
+                return Node::Decl(sd);
             }
             if (next.kind == TokenType::KwUnion) {
                 const ud: DeclarationNode* = this.parse_union_declaration();
@@ -505,7 +511,7 @@ implement struct Parser {
                     DeclarationNode::union_of(ud).is_public = is_public;
                     if (doc != "") { ud.set_documentation(doc_text); }
                 }
-                return ud;
+                return Node::Decl(ud);
             }
             if (next.kind == TokenType::KwClass) {
                 const cd: ClassDeclNode* = this.parse_class_declaration();
@@ -513,7 +519,7 @@ implement struct Parser {
                     cd.set_public(is_public);
                     if (doc != "") { cd.set_documentation(doc_text); }
                 }
-                return cd;
+                return Node::Decl(cd);
             }
             if (next.kind == TokenType::KwEnum) {
                 const ed: DeclarationNode* = this.parse_enum_declaration();
@@ -521,16 +527,16 @@ implement struct Parser {
                     DeclarationNode::enum_of(ed).is_public = is_public;
                     if (doc != "") { ed.set_documentation(doc_text); }
                 }
-                return ed;
+                return Node::Decl(ed);
             }
             if (next.kind == TokenType::KwTrait) {
                 const td: DeclarationNode* = this.parse_trait_declaration();
                 if (td != null && doc != "") { td.set_documentation(doc_text); }
-                return td;
+                return Node::Decl(td);
             }
 
             // Type alias: type Alias = Target;
-            return this.parse_type_alias_declaration();
+            return Node::Decl(this.parse_type_alias_declaration());
         }
 
         // Static keyword before function
@@ -544,7 +550,7 @@ implement struct Parser {
                 func_decl.note_modifier_span(static_span);
                 if (doc != "") { func_decl.set_documentation(doc_text); }
             }
-            return func_decl;
+            return Node::Decl(func_decl);
         }
 
         // Intrinsic function declaration
@@ -553,15 +559,15 @@ implement struct Parser {
                 const gi_decl: DeclarationNode* = this.parse_generic_intrinsic_declaration();
                 const gi: FunctionDecl* = DeclarationNode::fn_of(gi_decl);
                 if (gi != null && doc != "") { gi_decl.set_documentation(doc_text); }
-                return gi_decl;
+                return Node::Decl(gi_decl);
             }
             const intr: DeclarationNode* = this.parse_intrinsic_declaration();
             if (intr != null && doc != "") { intr.set_documentation(doc_text); }
-            return intr;
+            return Node::Decl(intr);
         }
 
         // Fall through to statement
-        return this.parse_statement();
+        return Node::Stmt(this.parse_statement());
     }
 
 
@@ -2056,7 +2062,7 @@ implement struct Parser {
 
     /// Parse a namespace declaration: namespace A::B;
     /// Accepts keywords as path segments (e.g., std::collections::string).
-    parse_namespace_declaration() -> ASTNode* {
+    parse_namespace_declaration() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'namespace'
         mut qn: QualifiedName = QualifiedName::empty();
         mut seg_names: [SymbolStr] = [];
@@ -2657,7 +2663,7 @@ implement struct Parser {
     /// elsewhere - so hoisting lets the declaration index, name resolution, type
     /// resolution and codegen reach them through the paths that already handle
     /// globals, instead of each learning to look inside an extern block.
-    static hoist_extern_globals(program: ProgramNode*, node: ASTNode*) -> void {
+    static hoist_extern_globals(program: ProgramNode*, node: DeclarationNode*) -> void {
         if (program == null || node == null) { return; }
         const blk: ExternBlock* = DeclarationNode::extern_of(node);
         if (blk == null) { return; }
@@ -3239,9 +3245,9 @@ implement struct Parser {
                 this.check(TokenType::KwStatic) &&
                 this.peek_at(1).kind == TokenType::KwMatch;
             if (this.is_declaration_start() && !is_static_match) {
-                const decl: ASTNode* = this.parse_declaration(false, doc);
-                if (decl != null) {
-                    body.add_statement(Stmt::decl_stmt(decl as DeclarationNode*, decl.span));
+                const item: Stmt* = Parser::block_item(this.parse_declaration(false, doc));
+                if (item != null) {
+                    body.add_statement(item);
                 }
             } else {
                 const stmt: Stmt* = this.parse_statement();
@@ -3440,7 +3446,7 @@ implement struct Parser {
         const next_name:   SymbolStr          = this.ctx.intern("next");
         mut next_member:   ExpressionNode*  = ExpressionNode::member_access_expr(
             iter_ident, next_name, full_span, full_span);
-        this.ctx.note_lang_ref(next_member as ASTNode*, LangItem::Iterator);
+        this.ctx.note_lang_ref(Node::Expr(next_member), LangItem::Iterator);
         const next_call:   ExpressionNode*      = ExpressionNode::call_expr(
             next_member, full_span);
 

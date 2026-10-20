@@ -15,7 +15,7 @@ import std::json::value;
 
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast::{ NodeKind, PatternBinding, PatternElement };
-import compiler::ast::node::{ ASTNode, Node, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::ast::node_locator;
 import compiler::ast::declaration::{ DeclarationNode, VarDecl };
 import compiler::ast::pattern::{ EnumPattern, Pattern, PatternKind };
@@ -73,7 +73,7 @@ type struct Declared {
                 const program: ProgramNode* = ctx.module_graph.get_module_ast(i as u32);
                 if (program != null) {
                     for (mut s: i64 = 0; s < program.statements.length; s++) {
-                        const stmt: ASTNode* = program.statements[s].as_ast();
+                        const stmt: DeclarationNode* = program.statements[s].as_decl();
                         if (DeclarationNode::module_of(stmt) != null && stmt.span.start_line != 0) {
                             return stmt.span;
                         }
@@ -93,30 +93,47 @@ type struct Declared {
     /// at the span the name layer declared it with.
     static binding_span(ctx: CompilationContext*, s: SymbolID) -> SourceSpan {
         const at: SourceSpan = ctx.resolver.get_symbol(s).declaring_span;
-        const n: ASTNode* = Declared::binding_node(ctx, s);
-        const h: DeclarationNode* = DeclarationNode::with_shape(n);
+        const h: DeclarationNode* = Declared::binding_decl(ctx, s);
         const v: VarDecl* = DeclarationNode::var_of(h);
         if (v != null && v.sym_id.equals(s) && h.name_span.start_line != 0) { return h.name_span; }
         return at;
     }
 
     /// The innermost node at the span the name layer declared binding `s`
-    /// with: its variable declaration, parameter or pattern.
-    static binding_node(ctx: CompilationContext*, s: SymbolID) -> ASTNode* {
+    /// with: its variable declaration, parameter or pattern; none when the
+    /// binding has no written span.
+    static binding_node(ctx: CompilationContext*, s: SymbolID) -> Node? {
         const at: SourceSpan = ctx.resolver.get_symbol(s).declaring_span;
-        if (at.start_line == 0) { return null; }
+        if (at.start_line == 0) { return Option::None; }
         const m: i64 = ctx.module_graph.find_module_by_path(at.file);
-        if (m < 0) { return null; }
+        if (m < 0) { return Option::None; }
         const program: ProgramNode* = ctx.module_graph.get_module_ast(m as u32);
         return Locator::node_at(ctx, program, at.start_line, at.start_col);
+    }
+
+    /// `binding_node` when it is a declaration, else null.
+    static binding_decl(ctx: CompilationContext*, s: SymbolID) -> DeclarationNode* {
+        const n: Node? = Declared::binding_node(ctx, s);
+        if (n.is_none()) { return null; }
+        return n.unwrap().as_decl();
+    }
+
+    /// `binding_node` when it is a pattern, else null.
+    static binding_pattern(ctx: CompilationContext*, s: SymbolID) -> Pattern* {
+        const n: Node? = Declared::binding_node(ctx, s);
+        if (n.is_none()) { return null; }
+        return match (n.unwrap()) {
+            Node::Pattern(p) => { p }
+            _                => { null }
+        };
     }
 
     /// Whether a binding is one a pattern declares: a match arm's name, or
     /// a name inside a variant's pattern.
     static is_pattern_binding(ctx: CompilationContext*, s: SymbolID) -> boolean {
-        const n: ASTNode* = Declared::binding_node(ctx, s);
-        if (n == null || n.kind != NodeKind::Pattern) { return false; }
-        return match ((n as Pattern*).shape) {
+        const p: Pattern* = Declared::binding_pattern(ctx, s);
+        if (p == null) { return false; }
+        return match (p.shape) {
             PatternKind::Binding(b) => { b.binding_sym.equals(s) }
             PatternKind::Enum(e)    => { Declared::element_binding(e, s) != null }
             _                       => { false }
@@ -139,15 +156,20 @@ type struct Declared {
     /// The type the compiler gave binding `s` where it is declared;
     /// invalid when it gave none.
     static binding_type(ctx: CompilationContext*, s: SymbolID) -> TypeRef {
-        const n: ASTNode* = Declared::binding_node(ctx, s);
-        if (n == null) { return TypeRef::invalid(); }
-        if (DeclarationNode::var_of(n) != null) {
-            const v: VarDecl* = DeclarationNode::var_of(n);
+        const at: Node? = Declared::binding_node(ctx, s);
+        if (at.is_none()) { return TypeRef::invalid(); }
+        const n: Node = at.unwrap();
+        const v: VarDecl* = DeclarationNode::var_of(n.as_decl());
+        if (v != null) {
             if (v.sym_id.equals(s)) { return v.resolved_type; }
             return TypeRef::invalid();
         }
-        if (n.kind != NodeKind::Pattern) { return TypeRef::invalid(); }
-        match ((n as Pattern*).shape) {
+        const p: Pattern* = match (n) {
+            Node::Pattern(pat) => { pat }
+            _                  => { null }
+        };
+        if (p == null) { return TypeRef::invalid(); }
+        match (p.shape) {
             PatternKind::Binding(b) => {
                 if (b.binding_sym.equals(s)) { return b.binding_type; }
             }

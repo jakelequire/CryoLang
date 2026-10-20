@@ -80,7 +80,7 @@ import compiler::ast::expression::{
     ScopeResolutionExpr, StaticMatchExpr, StructExpr,
     TernaryExpr, TryExpr, TupleExpr, UnaryExpr
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ ProgramNode };
 import compiler::ast::node_locator::{ annotation_span };
 import compiler::ast::pattern::{
     EnumPattern, MatchArmNode, Pattern, StaticMatchArmNode
@@ -328,8 +328,8 @@ type struct SemaVisitor {
         this.type_unwritten_globals(node);
         this.state.unbound_variants.clear();
         for (mut i: i64 = 0; i < node.statements.length; i++) {
-            const stmt: ASTNode* = node.statements[i].as_ast();
-            if (stmt == null) { continue; }
+            const stmt: Node = node.statements[i];
+            if (stmt.is_null()) { continue; }
             // An item is outside every function until its own visit enters
             // one; a global's initializer must not read the last body's.
             this.state.current_func = null;
@@ -353,7 +353,7 @@ type struct SemaVisitor {
     /// and `declare` is idempotent per node.
     declare_async_futures(mut &this, node: ProgramNode*) -> void {
         for (mut i: i64 = 0; i < node.statements.length; i++) {
-            const stmt: ASTNode* = node.statements[i].as_ast();
+            const stmt: DeclarationNode* = node.statements[i].as_decl();
             if (stmt == null) { continue; }
             match (stmt.kind) {
                 // A declaration's owner is its own registered type and the
@@ -364,7 +364,7 @@ type struct SemaVisitor {
                         this.ctx.decl_index.type_of_decl(c.def, "sema/async declare class"), c.name, null);
                 }
                 NodeKind::Declaration => {
-                    match ((stmt as DeclarationNode*).shape) {
+                    match (stmt.shape) {
                         DeclKind::Function(f) => {
                             const f_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
                             // A lowered one has already had `is_async` cleared.
@@ -382,7 +382,7 @@ type struct SemaVisitor {
                             mut owner_params: [DeclarationNode*] = this.impl_owner_params(ib);
                             this.declare_async_methods(ib.methods, owner_params,
                                 this.ctx.decl_index.impl_owner(ib, "sema/async declare"), ib.target_type,
-                                stmt as DeclarationNode*);
+                                stmt);
                         }
                         DeclKind::Struct(s) => {
                             this.declare_async_methods(s.methods, s.generic_params,
@@ -529,12 +529,12 @@ type struct SemaVisitor {
 
     /// Dispatch a top-level node, swapping to the template's module/namespace
     /// while walking an injected specialization (so qualified-name lookups land).
-    dispatch_top_level(mut &this, stmt: ASTNode*) -> void {
+    dispatch_top_level(mut &this, stmt: Node) -> void {
         mut saved_scope: u64 = 0;
         mut saved_module: ModulePath = ModulePath::none();
         mut saved_unit: ModulePath = ModulePath::none();
         mut needs_restore: boolean = false;
-        const template_mod: ModulePath = this.types.find_template_module(stmt);
+        const template_mod: ModulePath = this.types.find_template_module(stmt.as_decl());
         if (template_mod.is_valid()) {
             const resolver: Resolver* = this.ctx.get_resolver();
             if (resolver != null) {
@@ -1210,7 +1210,7 @@ type struct SemaVisitor {
 
     visit_decl_stmt(mut &this, stmt: Stmt*, node: DeclStmt*) -> void {
         if (node.declaration == null) { return; }
-        const decl: ASTNode* = node.declaration;
+        const decl: DeclarationNode* = node.declaration;
         const dd: DestructureDecl* = DeclarationNode::destructure_of(node.declaration);
         if (dd != null) {
             this.visit_destructure(node.declaration, dd);
@@ -1252,7 +1252,7 @@ type struct SemaVisitor {
     /// only through its registration.
     type_unwritten_globals(mut &this, root: ProgramNode*) -> void {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null || DeclarationNode::var_of(stmt) == null) { continue; }
             const var_node: VarDecl* = DeclarationNode::var_of(stmt);
             if (!var_node.is_global || !this.typed_before_bodies(var_node)) { continue; }
@@ -1662,26 +1662,22 @@ type struct SemaVisitor {
     /// `resolve_expr` returns.  The kinds with no check of their own are
     /// reached through their owners (a method through its implement block, a
     /// match arm through its match) or need none.
-    dispatch_node(mut &this, n: ASTNode*) -> void {
-        if (n == null) { return; }
-        match (n.kind) {
-            NodeKind::Program                => { this.visit_program(n as ProgramNode*); }
+    dispatch_node(mut &this, n: Node) -> void {
+        if (n.is_null()) { return; }
+        match (n) {
+            Node::Program(p) => { this.visit_program(p); }
 
-            NodeKind::Expression => {
-                this.resolve_expr(n as ExpressionNode*);
+            Node::Expr(e) => {
+                this.resolve_expr(e);
             }
 
-            NodeKind::Statement              => { this.dispatch_stmt(n as Stmt*); }
+            Node::Stmt(s) => { this.dispatch_stmt(s); }
 
-            NodeKind::ClassDeclaration       => { this.visit_class(n as ClassDeclNode*); }
+            Node::Arm(_) | Node::StaticArm(_) | Node::Pattern(_) | Node::Directive(_) => { }
 
-            NodeKind::MatchArm | NodeKind::StaticMatchArm | NodeKind::Pattern
-            | NodeKind::Directive => { }
-
-            NodeKind::Declaration => {
-                const d: DeclarationNode* = n as DeclarationNode*;
+            Node::Decl(d) => {
                 match (d.shape) {
-                    DeclKind::Function(_) => { this.visit_function(DeclarationNode::with_shape(n)); }
+                    DeclKind::Function(_) => { this.visit_function(d); }
                     DeclKind::Destructure(dd) => { this.visit_destructure(d, dd); }
                     DeclKind::Variable(v)     => { this.visit_var(d, v); }
                     DeclKind::Trait(t)        => { this.visit_trait(t); }
@@ -1694,11 +1690,9 @@ type struct SemaVisitor {
                     | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Extern(_)
                     | DeclKind::TypeAlias(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
                     | DeclKind::Enum(_) => { }
-                    DeclKind::Legacy => { }
+                    DeclKind::Legacy => { this.visit_class(d as ClassDeclNode*); }
                 }
             }
-
-            NodeKind::Unknown => { }
         }
     }
 
@@ -1710,7 +1704,7 @@ type struct SemaVisitor {
         if (expr.has_resolved_type()) {
             return expr.resolved_type;
         }
-        const n: ASTNode* = expr as ASTNode*;
+        const n: ExpressionNode* = expr;
         const result: TypeRef = match (n.kind) {
             NodeKind::Expression        => { this.resolve_expr_shape(expr) }
             _ => { TypeRef::invalid() }

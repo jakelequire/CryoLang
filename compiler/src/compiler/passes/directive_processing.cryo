@@ -63,7 +63,7 @@ import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDecl,
     ImplBlock, MethodDecl, StructDecl, UnionDecl, VarDecl
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ DirectiveArg, DirectiveArgKind, DirectiveNode };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::edit_distance::{ find_best_candidate };
@@ -153,35 +153,29 @@ type enum DirectiveTarget {
 
 implement enum DirectiveTarget {
     /// Map a declaration to the target category a directive is attached
-    /// to.  A module declaration (and a null/absent owner) classify as
-    /// `Module`; anything not in the declaration vocabulary falls through
-    /// to `Other`.
-    static from_node(n: ASTNode*) -> DirectiveTarget {
-        return match (n.kind) {
-            NodeKind::ClassDeclaration      => { DirectiveTarget::Class    }
-            NodeKind::Declaration => {
-                match ((n as DeclarationNode*).shape) {
-                    DeclKind::Method(_) => { DirectiveTarget::Method   }
-                    DeclKind::Function(_) => { DirectiveTarget::Function }
-                    DeclKind::Enum(_)           => { DirectiveTarget::Enum   }
-                    DeclKind::Extern(_)         => { DirectiveTarget::Extern }
-                    DeclKind::Import(_)         => { DirectiveTarget::Import }
-                    DeclKind::Module(_)         => { DirectiveTarget::Module }
-                    DeclKind::Trait(_)          => { DirectiveTarget::Trait  }
-                    DeclKind::TypeAlias(_)      => { DirectiveTarget::TypeAlias }
-                    DeclKind::Union(_)          => { DirectiveTarget::Union  }
-                    DeclKind::Struct(_)         => { DirectiveTarget::Struct }
-                    DeclKind::Impl(_)           => { DirectiveTarget::Impl   }
-                    DeclKind::Field(_)          => { DirectiveTarget::Field  }
-                    DeclKind::Variable(_)       => { DirectiveTarget::Variable }
-                    DeclKind::Variant(_)        => { DirectiveTarget::Other  }
-                    DeclKind::GenericParam(_)   => { DirectiveTarget::Other  }
-                    DeclKind::Destructure(_)    => { DirectiveTarget::Other  }
-                    DeclKind::Intrinsic(_)      => { DirectiveTarget::Other  }
-                    DeclKind::Legacy            => { DirectiveTarget::Other  }
-                }
-            }
-            _                               => { DirectiveTarget::Other    }
+    /// to.  A module declaration classifies as `Module`, a class (the one
+    /// kind still declared as a subclass) as `Class`; a kind no directive
+    /// targets is `Other`.
+    static from_decl(d: DeclarationNode*) -> DirectiveTarget {
+        return match (d.shape) {
+            DeclKind::Method(_)         => { DirectiveTarget::Method   }
+            DeclKind::Function(_)       => { DirectiveTarget::Function }
+            DeclKind::Enum(_)           => { DirectiveTarget::Enum   }
+            DeclKind::Extern(_)         => { DirectiveTarget::Extern }
+            DeclKind::Import(_)         => { DirectiveTarget::Import }
+            DeclKind::Module(_)         => { DirectiveTarget::Module }
+            DeclKind::Trait(_)          => { DirectiveTarget::Trait  }
+            DeclKind::TypeAlias(_)      => { DirectiveTarget::TypeAlias }
+            DeclKind::Union(_)          => { DirectiveTarget::Union  }
+            DeclKind::Struct(_)         => { DirectiveTarget::Struct }
+            DeclKind::Impl(_)           => { DirectiveTarget::Impl   }
+            DeclKind::Field(_)          => { DirectiveTarget::Field  }
+            DeclKind::Variable(_)       => { DirectiveTarget::Variable }
+            DeclKind::Variant(_)        => { DirectiveTarget::Other  }
+            DeclKind::GenericParam(_)   => { DirectiveTarget::Other  }
+            DeclKind::Destructure(_)    => { DirectiveTarget::Other  }
+            DeclKind::Intrinsic(_)      => { DirectiveTarget::Other  }
+            DeclKind::Legacy            => { DirectiveTarget::Class  }
         };
     }
 
@@ -1234,7 +1228,7 @@ type struct DirectiveProcessingPasses {
             DirectiveProcessingPasses::apply_layout_effects_class(ctx, dir, cd, dir.directive_kind);
             return;
         }
-        const ed: EnumDecl* = DeclarationNode::enum_of(decl as ASTNode*);
+        const ed: EnumDecl* = DeclarationNode::enum_of(decl);
         if (ed != null) {
             DirectiveProcessingPasses::apply_layout_effects_enum(ctx, dir, ed, dir.directive_kind);
             return;
@@ -1445,12 +1439,12 @@ type struct DirectiveProcessingPasses {
         mut first_test_dir_name: Keyword = Keyword::new("");
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
-            if (stmt == null) { continue; }
+            const item: Node = root.statements[i];
+            if (item.is_null()) { continue; }
 
             // Standalone (module-level) directives: no owner decl.
-            if (stmt.kind == NodeKind::Directive) {
-                const d: DirectiveNode* = stmt as DirectiveNode*;
+            if (item.as_directive() != null) {
+                const d: DirectiveNode* = item.as_directive();
                 DirectiveProcessingPasses::validate_builtin(ctx, d, DirectiveTarget::Module);
                 const rec: DirectiveRecord = DirectiveRecord {
                     kind: d.directive_kind,
@@ -1470,10 +1464,11 @@ type struct DirectiveProcessingPasses {
             }
 
             // Attached directives on declarations.
-            const t: DirectiveTarget = DirectiveTarget::from_node(stmt);
+            const decl: DeclarationNode* = item.as_decl();
+            if (decl == null) { continue; }
+            const t: DirectiveTarget = DirectiveTarget::from_decl(decl);
             if (t == DirectiveTarget::Other) { continue; }
 
-            const decl: DeclarationNode* = stmt as DeclarationNode*;
             const ad_count: i64 = decl.attached_directives.length;
             // Note: do NOT `continue` when ad_count == 0; the method
             // descent below still needs to run for struct/class/impl decls
@@ -1620,7 +1615,7 @@ type struct DirectiveProcessingPasses {
             // Descend into extern-block functions so per-function directives
             // like `![symbol("sym")]` are validated + applied; the block is the
             // top-level statement, its functions aren't otherwise visited here.
-            const eb: ExternBlock* = DeclarationNode::extern_of(stmt);
+            const eb: ExternBlock* = DeclarationNode::extern_of(decl);
             if (eb != null) {
                 for (mut ei: i64 = 0; ei < eb.functions.length; ei++) {
                     const ef_decl: DeclarationNode* = eb.functions[ei];
@@ -1689,7 +1684,7 @@ type struct DirectiveProcessingPasses {
                                           root: ProgramNode*) -> void {
         if (root == null) { return; }
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
             match (stmt.kind) {
                 NodeKind::ClassDeclaration => {
@@ -1697,7 +1692,7 @@ type struct DirectiveProcessingPasses {
                     DirectiveProcessingPasses::register_converter_methods(ctx, &cd.methods);
                 }
                 NodeKind::Declaration => {
-                    match ((stmt as DeclarationNode*).shape) {
+                    match (stmt.shape) {
                         DeclKind::Function(_) => {
                             DirectiveProcessingPasses::register_converter_fn(ctx, DeclarationNode::with_shape(stmt));
                         }
@@ -1768,7 +1763,7 @@ type struct DirectiveProcessingPasses {
         if (arena == null) { return; }
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
@@ -1788,7 +1783,7 @@ type struct DirectiveProcessingPasses {
                     ct.set_min_alignment(node.min_alignment);
                 }
                 NodeKind::Declaration => {
-                    match ((stmt as DeclarationNode*).shape) {
+                    match (stmt.shape) {
                         DeclKind::Struct(node) => {
                             if (node.is_generic()) {
                                 // Generic struct definitions have no concrete Type

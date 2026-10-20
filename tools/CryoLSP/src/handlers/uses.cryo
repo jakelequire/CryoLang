@@ -12,7 +12,7 @@ import std::core::mem;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast;
 import compiler::ast::{ MemberPin, NodeKind, PatternElement, TypeAnnotation };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind,
     FieldDecl, FunctionDecl, ImplBlock, MethodDecl,
@@ -88,7 +88,7 @@ type struct Uses {
         };
         const program: ProgramNode* = ctx.module_graph.get_module_ast(m as u32);
         if (program != null) {
-            for (mut i: i64 = 0; i < program.statements.length; i++) { w.node(program.statements[i].as_ast()); }
+            for (mut i: i64 = 0; i < program.statements.length; i++) { w.node(program.statements[i]); }
         }
         return w;
     }
@@ -144,113 +144,115 @@ type struct Uses {
 
     // -- Declarations and statements --
 
-    node(mut &this, n: ASTNode*) -> void {
-        if (n == null) { return; }
-        // A local the compiler declares names nothing written, but its
-        // initializer can be written code the compiler moved under it (a
-        // discarded call's value held for its release).
-        if (n.generated && n.kind == NodeKind::Statement) {
-            match ((n as Stmt*).shape) {
-                StmtKind::Decl(d) => {
-                    this.node(d.declaration as ASTNode*);
+    node(mut &this, item: Node) -> void {
+        if (item.is_null()) { return; }
+        match (item) {
+            Node::Stmt(s) => {
+                // A local the compiler declares names nothing written, but
+                // its initializer can be written code the compiler moved
+                // under it (a discarded call's value held for its release).
+                // Any other statement it wrote is walked where it is written.
+                if (s.generated) {
+                    match (s.shape) {
+                        StmtKind::Decl(d) => { this.decl(d.declaration); }
+                        _ => {}
+                    }
                     return;
                 }
-                _ => {}
+                this.stmt(s);
             }
+            Node::Decl(d) => { this.decl(d); }
+            Node::Expr(e) => { this.expr(e, null); }
+            _ => { }
         }
-        if (n.generated && DeclarationNode::var_of(n) != null) {
-            this.expr((DeclarationNode::var_of(n)).initializer, null);
+    }
+
+    decl(mut &this, h: DeclarationNode*) -> void {
+        if (h == null) { return; }
+        if (h.generated && DeclarationNode::var_of(h) != null) {
+            this.expr((DeclarationNode::var_of(h)).initializer, null);
             return;
         }
         // Any other declaration the compiler wrote holds copies of written
         // code (a closure struct's method holds the lambda's body), which is
         // walked where it is written.
-        if (n.generated && !n.kind.is_expression()) { return; }
-        match (n.kind) {
-            NodeKind::Statement => { this.stmt(n as Stmt*); }
-            NodeKind::Declaration => {
-                const h: DeclarationNode* = n as DeclarationNode*;
-                match (h.shape) {
-                    DeclKind::Method(_) => { this.method(DeclarationNode::with_shape(n)); }
-                    DeclKind::Function(_) => { this.function(DeclarationNode::with_shape(n), false); }
-                    DeclKind::Trait(d) => {
-                        this.add(h.name_span, Locator::def_target(d.def), true);
-                        for (mut i: i64 = 0; i < d.methods.length; i++) { this.function(d.methods[i], false); }
-                    }
-                    DeclKind::Impl(d) => {
-                        this.add(d.target_type_span, this.loc.res_target(&d.res), false);
-                        this.annotations(&d.target_args);
-                        this.annotation(d.trait_annotation);
-                        this.methods(&d.methods);
-                    }
-                    DeclKind::Destructure(d) => {
-                        this.annotation(d.type_annotation);
-                        this.expr(d.initializer, null);
-                    }
-                    DeclKind::Variable(_) => { this.var_decl(h); }
-                    DeclKind::Extern(d) => {
-                        for (mut i: i64 = 0; i < d.functions.length; i++) { this.function(d.functions[i], false); }
-                        for (mut i: i64 = 0; i < d.globals.length; i++) { this.var_decl(d.globals[i]); }
-                    }
-                    DeclKind::Import(imp) => {
-                        const last: i64 = imp.path_segment_spans.length - 1;
-                        if (last >= 0 && imp.resolved_module.is_valid()) {
-                            const d: DefId = this.loc.ctx.module_graph.module_def(imp.resolved_module);
-                            this.add(imp.path_segment_spans[last], Locator::def_target(d), false);
-                        }
-                        // A brace entry names each definition it bound, and so
-                        // does its alias, whose uses carry the same identity.
-                        for (mut k: i64 = 0; k < imp.specific_defs.length; k++) {
-                            const e: i64 = imp.specific_def_entries[k];
-                            const t: Target = Locator::def_target(imp.specific_defs[k]);
-                            this.add(imp.specific_spans[e], t, false);
-                            this.add(imp.specific_alias_spans[e], t, false);
-                        }
-                    }
-                    DeclKind::Intrinsic(d) => {
-                        this.add(h.name_span, Locator::def_target(d.def), true);
-                        for (mut i: i64 = 0; i < d.parameters.length; i++) { this.var_decl(d.parameters[i]); }
-                        this.annotation(d.return_type_annotation);
-                        this.node(d.body as ASTNode*);
-                    }
-                    DeclKind::TypeAlias(d) => {
-                        this.add(h.name_span, Locator::def_target(d.def), true);
-                        this.annotation(d.target_annotation);
-                    }
-                    DeclKind::Enum(d) => {
-                        this.add(h.name_span, Locator::def_target(d.def), true);
-                        for (mut i: i64 = 0; i < d.variants.length; i++) {
-                            if (d.variants[i] == null) { continue; }
-                            this.add(d.variants[i].name_span, Target::Variant(d.def, i), true);
-                            this.annotations(&DeclarationNode::variant_of(d.variants[i]).associated_types);
-                        }
-                    }
-                    DeclKind::Union(d) => {
-                        this.add(h.name_span, Locator::def_target(d.def), true);
-                        this.fields(&d.fields, d.def);
-                        this.methods(&d.methods);
-                    }
-                    DeclKind::Struct(d) => {
-                        this.add(h.name_span, Locator::def_target(d.def), true);
-                        this.fields(&d.fields, d.def);
-                        this.methods(&d.methods);
-                    }
-                    // Neither names a use.
-                    // A variant's uses are added with its enum, a field's with
-                    // its type; a generic parameter names no use here.
-                    DeclKind::Module(_) | DeclKind::Variant(_)
-                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Legacy => {}
+        if (h.generated) { return; }
+        match (h.shape) {
+            DeclKind::Method(_) => { this.method(h); }
+            DeclKind::Function(_) => { this.function(h, false); }
+            DeclKind::Trait(d) => {
+                this.add(h.name_span, Locator::def_target(d.def), true);
+                for (mut i: i64 = 0; i < d.methods.length; i++) { this.function(d.methods[i], false); }
+            }
+            DeclKind::Impl(d) => {
+                this.add(d.target_type_span, this.loc.res_target(&d.res), false);
+                this.annotations(&d.target_args);
+                this.annotation(d.trait_annotation);
+                this.methods(&d.methods);
+            }
+            DeclKind::Destructure(d) => {
+                this.annotation(d.type_annotation);
+                this.expr(d.initializer, null);
+            }
+            DeclKind::Variable(_) => { this.var_decl(h); }
+            DeclKind::Extern(d) => {
+                for (mut i: i64 = 0; i < d.functions.length; i++) { this.function(d.functions[i], false); }
+                for (mut i: i64 = 0; i < d.globals.length; i++) { this.var_decl(d.globals[i]); }
+            }
+            DeclKind::Import(imp) => {
+                const last: i64 = imp.path_segment_spans.length - 1;
+                if (last >= 0 && imp.resolved_module.is_valid()) {
+                    const d: DefId = this.loc.ctx.module_graph.module_def(imp.resolved_module);
+                    this.add(imp.path_segment_spans[last], Locator::def_target(d), false);
+                }
+                // A brace entry names each definition it bound, and so
+                // does its alias, whose uses carry the same identity.
+                for (mut k: i64 = 0; k < imp.specific_defs.length; k++) {
+                    const e: i64 = imp.specific_def_entries[k];
+                    const t: Target = Locator::def_target(imp.specific_defs[k]);
+                    this.add(imp.specific_spans[e], t, false);
+                    this.add(imp.specific_alias_spans[e], t, false);
                 }
             }
-            NodeKind::ClassDeclaration => {
-                const d: ClassDeclNode* = n as ClassDeclNode*;
+            DeclKind::Intrinsic(d) => {
+                this.add(h.name_span, Locator::def_target(d.def), true);
+                for (mut i: i64 = 0; i < d.parameters.length; i++) { this.var_decl(d.parameters[i]); }
+                this.annotation(d.return_type_annotation);
+                this.node(Node::Stmt(d.body));
+            }
+            DeclKind::TypeAlias(d) => {
+                this.add(h.name_span, Locator::def_target(d.def), true);
+                this.annotation(d.target_annotation);
+            }
+            DeclKind::Enum(d) => {
+                this.add(h.name_span, Locator::def_target(d.def), true);
+                for (mut i: i64 = 0; i < d.variants.length; i++) {
+                    if (d.variants[i] == null) { continue; }
+                    this.add(d.variants[i].name_span, Target::Variant(d.def, i), true);
+                    this.annotations(&DeclarationNode::variant_of(d.variants[i]).associated_types);
+                }
+            }
+            DeclKind::Union(d) => {
+                this.add(h.name_span, Locator::def_target(d.def), true);
+                this.fields(&d.fields, d.def);
+                this.methods(&d.methods);
+            }
+            DeclKind::Struct(d) => {
+                this.add(h.name_span, Locator::def_target(d.def), true);
+                this.fields(&d.fields, d.def);
+                this.methods(&d.methods);
+            }
+            // Neither names a use.
+            // A variant's uses are added with its enum, a field's with
+            // its type; a generic parameter names no use here.
+            DeclKind::Module(_) | DeclKind::Variant(_)
+            | DeclKind::Field(_) | DeclKind::GenericParam(_) => {}
+            DeclKind::Legacy => {
+                const d: ClassDeclNode* = h as ClassDeclNode*;
                 this.add(d.name_span, Locator::def_target(d.def), true);
                 this.add(d.base_span, this.loc.res_target(&d.base_res), false);
                 this.fields(&d.fields, d.def);
                 this.methods(&d.methods);
-            }
-            _ => {
-                if (n.kind.is_expression()) { this.expr(n as ExpressionNode*, null); }
             }
         }
     }
@@ -264,28 +266,28 @@ type struct Uses {
                 if (s.span.file != null && s.span.file.eq(this.file)) { this.asm.push(s); }
             }
             StmtKind::Block(b) => {
-                for (mut i: i64 = 0; i < b.statements.length; i++) { this.node(b.statements[i] as ASTNode*); }
+                for (mut i: i64 = 0; i < b.statements.length; i++) { this.node(Node::Stmt(b.statements[i])); }
             }
-            StmtKind::UnsafeBlock(u) => { this.node(u.block as ASTNode*); }
+            StmtKind::UnsafeBlock(u) => { this.node(Node::Stmt(u.block)); }
             StmtKind::Return(r) => { this.expr(r.expression, null); }
             StmtKind::If(i) => {
                 this.expr(i.condition, null);
-                this.node(i.then_stmt as ASTNode*);
-                this.node(i.else_stmt as ASTNode*);
+                this.node(Node::Stmt(i.then_stmt));
+                this.node(Node::Stmt(i.else_stmt));
             }
             StmtKind::While(w) => {
                 this.expr(w.condition, null);
-                this.node(w.body as ASTNode*);
+                this.node(Node::Stmt(w.body));
             }
             StmtKind::DoWhile(d) => {
-                this.node(d.body as ASTNode*);
+                this.node(Node::Stmt(d.body));
                 this.expr(d.condition, null);
             }
             StmtKind::For(f) => {
-                this.node(f.init.as_ast());
+                this.node(f.init);
                 this.expr(f.condition, null);
                 this.expr(f.update, null);
-                this.node(f.body as ASTNode*);
+                this.node(Node::Stmt(f.body));
             }
             StmtKind::Match(m) => {
                 this.expr(m.subject, null);
@@ -296,12 +298,12 @@ type struct Uses {
                 for (mut i: i64 = 0; i < m.arms.length; i++) {
                     if (m.arms[i] == null) { continue; }
                     this.annotations(&m.arms[i].type_patterns);
-                    this.node(m.arms[i].body as ASTNode*);
+                    this.node(Node::Stmt(m.arms[i].body));
                 }
             }
             StmtKind::Expr(e) => { this.expr(e.expression, null); }
-            StmtKind::Decl(d) => { this.node(d.declaration as ASTNode*); }
-            StmtKind::Loop(l) => { this.node(l.body as ASTNode*); }
+            StmtKind::Decl(d) => { this.node(Node::Decl(d.declaration)); }
+            StmtKind::Loop(l) => { this.node(Node::Stmt(l.body)); }
             StmtKind::Break | StmtKind::Continue => {}
         }
     }
@@ -337,7 +339,7 @@ type struct Uses {
             this.var_decl(p_decl);
         }
         this.annotation(f.return_type_annotation);
-        this.node(f.body as ASTNode*);
+        this.node(Node::Stmt(f.body));
     }
 
     method(mut &this, m_decl: DeclarationNode*) -> void {
@@ -367,7 +369,7 @@ type struct Uses {
             if (arm == null) { continue; }
             for (mut p: i64 = 0; p < arm.patterns.length; p++) { this.pattern(arm.patterns[p]); }
             this.expr(arm.guard, null);
-            this.node(arm.body as ASTNode*);
+            this.node(Node::Stmt(arm.body));
         }
     }
 
@@ -412,7 +414,7 @@ type struct Uses {
     /// An expression; `call` is the call it is the callee of, or null.
     expr(mut &this, e: ExpressionNode*, call: CallExpr*) -> void {
         if (e == null) { return; }
-        const n: ASTNode* = e as ASTNode*;
+        const n: ExpressionNode* = e;
         if (n.generated) {
             // The compiler wrote it, so it names nothing; the written code
             // it wraps - an f-string's holes, a converted operand - is
@@ -477,7 +479,7 @@ type struct Uses {
                         for (mut i: i64 = 0; i < m.arms.length; i++) {
                             if (m.arms[i] == null) { continue; }
                             this.annotations(&m.arms[i].type_patterns);
-                            this.node(m.arms[i].body as ASTNode*);
+                            this.node(Node::Stmt(m.arms[i].body));
                         }
                     }
                     ExprKind::If(t)       => {
@@ -516,7 +518,7 @@ type struct Uses {
                     ExprKind::Lambda(l)   => {
                         for (mut i: i64 = 0; i < l.parameters.length; i++) { this.var_decl(l.parameters[i]); }
                         this.annotation(l.return_type_ann);
-                        this.node(l.body as ASTNode*);
+                        this.node(Node::Stmt(l.body));
                     }
                     ExprKind::Literal(_)  => { }
                 }

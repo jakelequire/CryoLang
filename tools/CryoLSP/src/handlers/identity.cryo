@@ -22,7 +22,7 @@ import lsp::protocol::conv;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast;
 import compiler::ast::{ MemberPin, NamedAnnotation, NodeKind, PatternElement, TypeAnnotation };
-import compiler::ast::node::{ ASTNode, Node, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::ast::node_locator;
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
@@ -195,7 +195,7 @@ type struct Locator {
     col:  u32;
     /// The nodes from the top-level statement down to the innermost one
     /// holding the position.
-    chain: [ASTNode*];
+    chain: [Node];
     /// The module the position is in, when the caller named it.
     module: ModulePath;
 
@@ -214,12 +214,11 @@ type struct Locator {
         return loc.answer();
     }
 
-    /// The innermost node holding the position in `program`, or null.
-    static node_at(ctx: CompilationContext*, program: ProgramNode*, line: u32, col: u32) -> ASTNode* {
+    /// The innermost node holding the position in `program`, or none.
+    static node_at(ctx: CompilationContext*, program: ProgramNode*, line: u32, col: u32) -> Node? {
         mut loc: Locator = Locator::new(ctx, line, col);
         loc.descend(program);
-        if (loc.chain.length == 0) { return null; }
-        return loc.chain[loc.chain.length - 1];
+        return loc.innermost();
     }
 
     holds(&this, span: SourceSpan) -> boolean {
@@ -242,43 +241,44 @@ type struct Locator {
         }
         while (cur.is_some()) {
             const n: Node = cur.unwrap();
-            this.chain.push(n.as_ast());
+            this.chain.push(n);
             cur = NodeLocator::first_covering_child(n, this.line, this.col);
         }
     }
 
-    innermost(&this) -> ASTNode* {
-        if (this.chain.length == 0) { return null; }
-        return this.chain[this.chain.length - 1];
+    /// The innermost node holding the position, or none.
+    innermost(&this) -> Node? {
+        if (this.chain.length == 0) { return Option::None; }
+        return Option::Some(this.chain[this.chain.length - 1]);
     }
 
-    parent(&this) -> ASTNode* {
+    /// The declaration directly holding the innermost node, or null.
+    parent_decl(&this) -> DeclarationNode* {
         if (this.chain.length < 2) { return null; }
-        return this.chain[this.chain.length - 2];
+        return this.chain[this.chain.length - 2].as_decl();
     }
 
     /// The call `callee` is the callee of, or null.
-    call_of(&this, callee: ASTNode*) -> CallExpr* {
-        const p: ASTNode* = this.parent();
-        if (p == null || ExpressionNode::call_of(p) == null) { return null; }
-        const call: CallExpr* = ExpressionNode::call_of(p);
-        const called: ASTNode* = call.callee as ASTNode*;
+    call_of(&this, callee: ExpressionNode*) -> CallExpr* {
+        if (this.chain.length < 2) { return null; }
+        const call: CallExpr* = ExpressionNode::call_of(this.chain[this.chain.length - 2].as_expr());
+        if (call == null) { return null; }
+        const called: ExpressionNode* = call.callee;
         if (called != callee) { return null; }
         return call;
     }
 
     answer(&this) -> Answer {
-        const n: ASTNode* = this.innermost();
-        if (n == null) { return Answer::nothing(); }
-        match (n.kind) {
-            NodeKind::Expression => {
-                const e: ExpressionNode* = n as ExpressionNode*;
+        const at: Node? = this.innermost();
+        if (at.is_none()) { return Answer::nothing(); }
+        match (at.unwrap()) {
+            Node::Expr(e) => {
                 match (e.shape) {
                     ExprKind::MemberAccess(m) => { return this.member(e, m); }
                     ExprKind::Identifier(id) => { return this.identifier(e, id); }
                     ExprKind::ScopeResolution(s) => { return this.path(e, s); }
                     ExprKind::New(ne) => {
-                        return Answer::of(this.res_target(&ne.res), n.span, e.resolved_type);
+                        return Answer::of(this.res_target(&ne.res), e.span, e.resolved_type);
                     }
                     ExprKind::Struct(sl) => { return this.struct_literal(e, sl); }
                     ExprKind::Cast(c) => { return this.annotation(c.target_annotation); }
@@ -292,39 +292,37 @@ type struct Locator {
                     | ExprKind::Call(_) => { return Answer::nothing(); }
                 }
             }
-            NodeKind::Pattern => { return this.pattern(n as Pattern*); }
-            NodeKind::ClassDeclaration => {
-                return this.type_decl(n, (n as ClassDeclNode*).def);
-            }
-            NodeKind::Declaration => {
-                match ((n as DeclarationNode*).shape) {
+            Node::Pattern(p) => { return this.pattern(p); }
+            Node::Decl(d) => {
+                match (d.shape) {
                     DeclKind::Method(m) => {
                         if (m.func == null) { return Answer::nothing(); }
                         if (this.holds(m.func.name_span)) { return this.function_decl(m.func, m.func.name_span); }
                         return this.annotation(DeclarationNode::fn_of(m.func).return_type_annotation);
                     }
                     DeclKind::Function(f) => {
-                        const f_decl: DeclarationNode* = DeclarationNode::with_shape(n);
-                        if (this.holds(f_decl.name_span)) { return this.function_decl(f_decl, f_decl.name_span); }
+                        if (this.holds(d.name_span)) { return this.function_decl(d, d.name_span); }
                         return this.annotation(f.return_type_annotation);
                     }
                     DeclKind::Impl(ib) => { return this.impl_head(ib); }
                     DeclKind::TypeAlias(ta) => {
-                        if (this.holds((n as DeclarationNode*).name_span)) { return this.type_decl(n, ta.def); }
+                        if (this.holds(d.name_span)) { return this.type_decl(d, ta.def); }
                         return this.annotation(ta.target_annotation);
                     }
-                    DeclKind::Enum(en) => { return this.type_decl(n, en.def); }
-                    DeclKind::Trait(tr) => { return this.type_decl(n, tr.def); }
-                    DeclKind::Union(un) => { return this.type_decl(n, un.def); }
-                    DeclKind::Struct(sd) => { return this.type_decl(n, sd.def); }
+                    DeclKind::Enum(en) => { return this.type_decl(d, en.def); }
+                    DeclKind::Trait(tr) => { return this.type_decl(d, tr.def); }
+                    DeclKind::Union(un) => { return this.type_decl(d, un.def); }
+                    DeclKind::Struct(sd) => { return this.type_decl(d, sd.def); }
                     DeclKind::Import(imp) => { return this.import(imp); }
                     DeclKind::Module(md) => { return this.submodule(md); }
-                    DeclKind::Variant(_) => { return this.variant_decl(n as DeclarationNode*); }
-                    DeclKind::Field(f) => { return this.field_decl(n as DeclarationNode*, f); }
-                    DeclKind::Variable(v) => { return this.var_decl(n as DeclarationNode*, v); }
+                    DeclKind::Variant(_) => { return this.variant_decl(d); }
+                    DeclKind::Field(f) => { return this.field_decl(d, f); }
+                    DeclKind::Variable(v) => { return this.var_decl(d, v); }
+                    DeclKind::Legacy => {
+                        return this.type_decl(d, (d as ClassDeclNode*).def);
+                    }
                     DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Intrinsic(_)
-                    | DeclKind::GenericParam(_)
-                    | DeclKind::Legacy => {
+                    | DeclKind::GenericParam(_) => {
                         return Answer::nothing();
                     }
                 }
@@ -354,7 +352,7 @@ type struct Locator {
             return Answer::of(this.res_target(&s.scope_res), s.scope_span, TypeRef::invalid());
         }
         if (!this.holds(s.member_span)) { return Answer::nothing(); }
-        return Answer::of(this.path_member(s, this.call_of(e as ASTNode*)), s.member_span, ty);
+        return Answer::of(this.path_member(s, this.call_of(e)), s.member_span, ty);
     }
 
     /// What a path's member segment names; `call` is the call the path is
@@ -378,7 +376,7 @@ type struct Locator {
     member(&this, e: ExpressionNode*, m: MemberAccessExpr*) -> Answer {
         if (!this.holds(m.member_span)) { return Answer::nothing(); }
         const ty: TypeRef = e.resolved_type;
-        return Answer::of(this.member_target(m, this.call_of(e as ASTNode*)), m.member_span, ty);
+        return Answer::of(this.member_target(m, this.call_of(e)), m.member_span, ty);
     }
 
     /// What a member access names: the method the call it is the callee of
@@ -415,7 +413,7 @@ type struct Locator {
         const pinned: Target = this.pin_target(&call.resolved_callee);
         if (!pinned.is_nothing()) { return pinned; }
         if (call.template_method.is_valid()) { return Target::Def(call.template_method); }
-        const ck: ASTNode* = call.callee as ASTNode*;
+        const ck: ExpressionNode* = call.callee;
         if (ck != null && ExpressionNode::member_access_of(ck) != null) {
             const ma: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
             if (ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
@@ -607,7 +605,7 @@ type struct Locator {
 
     field_decl(&this, fd: DeclarationNode*, f: FieldDecl*) -> Answer {
         if (!this.holds(fd.name_span)) { return this.annotation(f.type_annotation); }
-        const p: ASTNode* = this.parent();
+        const p: DeclarationNode* = this.parent_decl();
         if (p == null) { return Answer::nothing(); }
         mut owner: DefId = DefId::invalid();
         mut index: i64 = -1;
@@ -636,7 +634,7 @@ type struct Locator {
     }
 
     variant_decl(&this, v: DeclarationNode*) -> Answer {
-        const ed: EnumDecl* = DeclarationNode::enum_of(this.parent());
+        const ed: EnumDecl* = DeclarationNode::enum_of(this.parent_decl());
         if (!this.holds(v.name_span) || ed == null) {
             return Answer::nothing();
         }
@@ -648,8 +646,8 @@ type struct Locator {
         return Answer::nothing();
     }
 
-    type_decl(&this, n: ASTNode*, d: DefId) -> Answer {
-        const at: SourceSpan = (n as DeclarationNode*).name_span;
+    type_decl(&this, n: DeclarationNode*, d: DefId) -> Answer {
+        const at: SourceSpan = n.name_span;
         if (!this.holds(at)) { return Answer::nothing(); }
         return Answer::of(Locator::def_target(d), at, TypeRef::invalid());
     }

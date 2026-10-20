@@ -50,7 +50,7 @@ import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, FunctionDecl, ImplBlock, MethodDecl,
     StructDecl, UnionDecl
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ DirectiveArg, DirectiveArgKind, DirectiveNode };
 import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
 import utils::keyword::{ Keyword };
@@ -482,24 +482,16 @@ type struct ConfigGatingPasses {
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const item: Node = root.statements[i];
-            const stmt: ASTNode* = item.as_ast();
-            if (stmt == null) { continue; }
+            if (item.is_null()) { continue; }
 
-            // Only DeclarationNode subclasses carry attached_directives.
-            // Everything else passes through.
-            const k: NodeKind = stmt.kind;
-            const is_decl: boolean = match (k) {
-                NodeKind::Declaration               => { true }
-                NodeKind::ClassDeclaration          => { true }
-                _                                   => { false }
-            };
-
-            if (!is_decl) {
+            // Only declarations carry attached directives.  Everything else
+            // passes through.
+            const decl: DeclarationNode* = item.as_decl();
+            if (decl == null) {
                 kept.push(item);
                 continue;
             }
-
-            const decl: DeclarationNode* = stmt as DeclarationNode*;
+            const k: NodeKind = decl.kind;
             if (!ConfigGatingPasses::decl_is_active(decl, env)) {
                 stripped += 1;
                 // Remember where it was before it's dropped from the AST, so
@@ -524,15 +516,15 @@ type struct ConfigGatingPasses {
             // function - no more delegate-to-free-helper workaround needed.
             // Each cast sits in its own straight-line `if` (never in `match`
             // arms) to dodge the historic consecutive-cast-and-call miscompile.
-            if (DeclarationNode::fn_of(stmt) != null) {
-                const fd: FunctionDecl* = DeclarationNode::fn_of(stmt);
+            if (DeclarationNode::fn_of(decl) != null) {
+                const fd: FunctionDecl* = DeclarationNode::fn_of(decl);
                 const body: Stmt* = fd.body;
                 if (body != null) {
                     ConfigGatingPasses::process_block(body, env, ctx);
                 }
             }
-            if (DeclarationNode::method_of(stmt) != null) {
-                const md: MethodDecl* = DeclarationNode::method_of(stmt);
+            if (DeclarationNode::method_of(decl) != null) {
+                const md: MethodDecl* = DeclarationNode::method_of(decl);
                 if (md.func != null) {
                     const mbody: Stmt* = DeclarationNode::fn_of(md.func).body;
                     if (mbody != null) {
@@ -540,14 +532,14 @@ type struct ConfigGatingPasses {
                     }
                 }
             }
-            const sd: StructDecl* = DeclarationNode::struct_of(stmt);
+            const sd: StructDecl* = DeclarationNode::struct_of(decl);
             if (sd != null) {
                 if (ConfigGatingPasses::methods_need_filter(&sd.methods, env)) {
                     sd.methods = ConfigGatingPasses::active_methods(&sd.methods, env, ctx);
                 }
                 ConfigGatingPasses::walk_method_bodies(&sd.methods, env, ctx);
             }
-            const ud: UnionDecl* = DeclarationNode::union_of(stmt);
+            const ud: UnionDecl* = DeclarationNode::union_of(decl);
             if (ud != null) {
                 if (ConfigGatingPasses::methods_need_filter(&ud.methods, env)) {
                     ud.methods = ConfigGatingPasses::active_methods(&ud.methods, env, ctx);
@@ -555,13 +547,13 @@ type struct ConfigGatingPasses {
                 ConfigGatingPasses::walk_method_bodies(&ud.methods, env, ctx);
             }
             if (k == NodeKind::ClassDeclaration) {
-                const cd: ClassDeclNode* = stmt as ClassDeclNode*;
+                const cd: ClassDeclNode* = decl as ClassDeclNode*;
                 if (ConfigGatingPasses::methods_need_filter(&cd.methods, env)) {
                     cd.methods = ConfigGatingPasses::active_methods(&cd.methods, env, ctx);
                 }
                 ConfigGatingPasses::walk_method_bodies(&cd.methods, env, ctx);
             }
-            const ib: ImplBlock* = DeclarationNode::impl_of(stmt);
+            const ib: ImplBlock* = DeclarationNode::impl_of(decl);
             if (ib != null) {
                 if (ConfigGatingPasses::methods_need_filter(&ib.methods, env)) {
                     ib.methods = ConfigGatingPasses::active_methods(&ib.methods, env, ctx);
@@ -582,7 +574,7 @@ type struct ConfigGatingPasses {
         } else {
             // Nothing stripped: `root.statements` keeps its original array and
             // the freshly-built `kept` copy is discarded.  Release its array
-            // spine (the ASTNode* elements are arena-owned and unaffected).
+            // spine (the nodes it holds are arena-owned and unaffected).
             mem::drop(kept);
         }
 

@@ -68,7 +68,7 @@ import compiler::ast::expression::{
     ScopeResolutionExpr, StaticMatchExpr, StructExpr, TernaryExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExpr
 };
-import compiler::ast::node::{ ASTNode, Node };
+import compiler::ast::node::{ Node };
 import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::ast::statement::{
     BlockStmt, DeclStmt, DoWhileStmt, ExprStmt, ForStmt, IfStmt, LoopStmt, MatchStmt,
@@ -1993,7 +1993,7 @@ type struct AsyncLower {
             if (this.names_binding(e, key)) {
                 // The mention's OWN span, so a later use is reported where the
                 // programmer wrote it rather than at the function header.
-                const use_span: SourceSpan = (e as ASTNode*).span;
+                const use_span: SourceSpan = e.span;
                 mut target: ExpressionNode* = null;
                 if (this.subst_hoist_active()) {
                     // Already handed out of its field earlier in this run, so
@@ -2729,9 +2729,9 @@ type struct AsyncLower {
     /// answer lets them through and drops the refresh, silently either way.
     awaited_keeps_recv_ptr(&this, e: ExpressionNode*, slot_ty: TypeRef) -> boolean {
         if (slot_ty.is_valid()) { return true; }
-        if (e == null || ExpressionNode::call_of((e as ASTNode*)) == null) { return false; }
+        if (e == null || ExpressionNode::call_of(e) == null) { return false; }
         const c: CallExpr* = ExpressionNode::call_of(e);
-        if (c.callee == null || ExpressionNode::member_access_of((c.callee as ASTNode*)) == null) {
+        if (c.callee == null || ExpressionNode::member_access_of(c.callee) == null) {
             return false;
         }
         const mname: SymbolStr = ExpressionNode::member_access_of(c.callee).member;
@@ -2789,7 +2789,7 @@ type struct AsyncLower {
         if (this.awaited_keeps_recv_ptr(e, this.awaited_recv_ptr_type(e.resolved_type))) {
             return true;
         }
-        if (ExpressionNode::call_of((e as ASTNode*)) == null) { return false; }
+        if (ExpressionNode::call_of(e) == null) { return false; }
         const c: CallExpr* = ExpressionNode::call_of(e);
         for (mut i: i64 = 0; i < c.arguments.length; i++) {
             if (this.expr_has_recv_call(c.arguments[i])) { return true; }
@@ -2912,9 +2912,9 @@ type struct AsyncLower {
     /// implicit in the call ABI. The place itself is therefore what has to be
     /// re-addressed; there is no `&` node to find.
     awaited_recv_place(&this, e: ExpressionNode*) -> ExpressionNode* {
-        if (e == null || ExpressionNode::call_of((e as ASTNode*)) == null) { return null; }
+        if (e == null || ExpressionNode::call_of(e) == null) { return null; }
         const c: CallExpr* = ExpressionNode::call_of(e);
-        if (c.callee == null || ExpressionNode::member_access_of((c.callee as ASTNode*)) == null) {
+        if (c.callee == null || ExpressionNode::member_access_of(c.callee) == null) {
             return null;
         }
         return ExpressionNode::member_access_of(c.callee).object;
@@ -2930,7 +2930,7 @@ type struct AsyncLower {
     rebuild_place(mut &this, e: ExpressionNode*) -> ExpressionNode* {
         if (e == null) { return null; }
         const ty: TypeRef = e.resolved_type;
-        const span: SourceSpan = (e as ASTNode*).span;
+        const span: SourceSpan = e.span;
         const place_id: IdentifierExpr* = ExpressionNode::identifier_of(e);
         if (place_id != null) {
             return this.ident_bound(place_id.name, this.local_key(e), ty, span);
@@ -3046,7 +3046,7 @@ type struct AsyncLower {
         // re-address and `base` goes unused.
         if (!this.expr_has_recv_call(e)) { return true; }
 
-        if (ExpressionNode::call_of((e as ASTNode*)) != null) {
+        if (ExpressionNode::call_of(e) != null) {
             const c: CallExpr* = ExpressionNode::call_of(e);
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
                 mut a: ExpressionNode* = c.arguments[i];
@@ -4981,7 +4981,7 @@ type struct AsyncLower {
     /// the lowering rewrites every user `return` into - or null.
     ready_call(&this, s: Stmt*) -> CallExpr* {
         const e: ExpressionNode* = this.returned_value(s);
-        if (e == null || ExpressionNode::call_of((e as ASTNode*)) == null) { return null; }
+        if (e == null || ExpressionNode::call_of(e) == null) { return null; }
         const callee: ExpressionNode* = ExpressionNode::call_of(e).callee;
         if (callee == null) { return null; }
         if (!this.is_poll_variant(callee, "Ready")) { return null; }
@@ -5253,7 +5253,7 @@ type struct AsyncLower {
             return null;
         }
         if (c.callee == null) { return null; }
-        if (ExpressionNode::member_access_of((c.callee as ASTNode*)) == null) {
+        if (ExpressionNode::member_access_of(c.callee) == null) {
             return null;
         }
         const recv: ExpressionNode* = ExpressionNode::member_access_of(c.callee).object;
@@ -5836,8 +5836,8 @@ type struct AsyncLower {
         // real diagnostic stand instead of adding a confusing second one.
         if (!ty.is_valid()) { return r; }
         const t: MintedLocal = this.mint_temp("__ord");
-        pre.push(this.var_decl_stmt_bound(t.name, t.sym, false, ty, r, (r as ASTNode*).span));
-        return this.ident_bound(t.name, t.sym, ty, (r as ASTNode*).span);
+        pre.push(this.var_decl_stmt_bound(t.name, t.sym, false, ty, r, r.span));
+        return this.ident_bound(t.name, t.sym, ty, r.span);
     }
 
     /// True when any of `args[from..]` holds an `await`, i.e. whether evaluating
@@ -5863,7 +5863,7 @@ type struct AsyncLower {
         // arm can carry. Left an expression it would compile to a native break
         // out of the state-dispatch loop rather than the user's.
         if (this.expr_await_count(e) == 0 && !this.expr_has_free_edge(e, false)) { return e; }
-        const span: SourceSpan = (e as ASTNode*).span;
+        const span: SourceSpan = e.span;
 
         // Hoist INTO the `?` node rather than replacing it with its desugar: the
         // node stays the one that types the expression, and sema derives that
@@ -6102,7 +6102,7 @@ type struct AsyncLower {
     hoist_branch_expr(mut &this, e: ExpressionNode*, cond_in: ExpressionNode*,
                       then_in: ExpressionNode*, else_in: ExpressionNode*,
                       pre: HoistPre*) -> ExpressionNode* {
-        const span: SourceSpan = (e as ASTNode*).span;
+        const span: SourceSpan = e.span;
         const vty: TypeRef = e.resolved_type;
         if (!vty.is_valid()) { return e; }
         mut cond: ExpressionNode* = this.hoist_expr(cond_in, pre);
@@ -7308,7 +7308,7 @@ type struct AsyncLower {
         // it leaves the synthesized entry point the only `main` a caller or
         // codegen can resolve.
         this.ctx.decl_index.retire_entry(node.overload_entry);
-        TypeResolutionPasses::register_decl_in_index(wrapper_decl as ASTNode*, this.ctx, true);
+        TypeResolutionPasses::register_decl_in_index(wrapper_decl, this.ctx, true);
         return true;
     }
 
@@ -7650,7 +7650,7 @@ type struct AsyncLower {
             // goes back afterwards, because the body is still typed and
             // `check_function_returns`-checked against it.
             this.ctx.decl_index.retire_entry(node.overload_entry);
-            TypeResolutionPasses::register_decl_in_index(node_decl as ASTNode*, this.ctx, true);
+            TypeResolutionPasses::register_decl_in_index(node_decl, this.ctx, true);
             node.set_resolved_return_type(declared_ref);
         }
 
@@ -8069,7 +8069,7 @@ type struct AsyncLower {
         // entry with the same mangled symbol.
         if (method == null) {
             this.ctx.decl_index.retire_entry(node.overload_entry);
-            TypeResolutionPasses::register_decl_in_index(node_decl as ASTNode*, this.ctx, true);
+            TypeResolutionPasses::register_decl_in_index(node_decl, this.ctx, true);
         }
 
         // The record has served its purpose; `is_async` is now false, so nothing

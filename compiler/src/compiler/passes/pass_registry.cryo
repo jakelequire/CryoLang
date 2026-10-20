@@ -61,7 +61,7 @@ import compiler::ast::declaration::{
     MethodDecl, StructDecl,
     TraitDecl, UnionDecl
 };
-import compiler::ast::node::{ ASTNode, Node, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::compilation_context::{ CompilationContext, LangRef, SourceOverride };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
@@ -682,7 +682,7 @@ type struct PassRegistry {
         // pre-pass with a module-local seen set.
         mut seen_types: [u64] = [];
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
             mut def: DefId = DefId::invalid();
             mut leaf: SymbolStr = SymbolStr::empty();
@@ -693,7 +693,7 @@ type struct PassRegistry {
                     def = n.def; leaf = n.name; tspan = n.span;
                 }
                 NodeKind::Declaration => {
-                    match ((stmt as DeclarationNode*).shape) {
+                    match (stmt.shape) {
                         DeclKind::Struct(n)    => { def = n.def; leaf = n.name; tspan = stmt.span; }
                         DeclKind::Enum(n)      => { def = n.def; leaf = n.name; tspan = stmt.span; }
                         DeclKind::Trait(n)     => { def = n.def; leaf = n.name; tspan = stmt.span; }
@@ -722,7 +722,7 @@ type struct PassRegistry {
         // Walk top-level statements and create types for declarations
         mut type_count: i64 = 0;
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
             cdebug("[TypeDecl] stmt[%lld] kind=%d\n", i, stmt.kind as i32);
@@ -738,7 +738,7 @@ type struct PassRegistry {
                     type_count++;
                 }
                 NodeKind::Declaration => {
-                    match ((stmt as DeclarationNode*).shape) {
+                    match (stmt.shape) {
                         DeclKind::Struct(node) => {
                             const _intern: InternTable* = ctx.get_intern_table();
                             const _dbg: string = _intern.resolve(node.name);
@@ -937,15 +937,18 @@ type struct PassRegistry {
                 kept++;
                 continue;
             }
-            const node: ASTNode* = r.node;
-            if (node.kind == NodeKind::Pattern) {
+            match (r.node) {
                 // A lang ref on a pattern is the desugarings' `Item::variant`.
-                (node as Pattern*).enum_payload().res.settle(Res::Def(id));
-            } else if (ExpressionNode::scope_resolution_of(node) != null) {
-                ExpressionNode::scope_resolution_of(node).scope_res.settle(
-                    Res::TypeRelative(ResBase::Def(id), 1));
-            } else if (ExpressionNode::member_access_of(node) != null) {
-                ExpressionNode::member_access_of(node).set_resolved_trait(id);
+                Node::Pattern(p) => { p.enum_payload().res.settle(Res::Def(id)); }
+                Node::Expr(e) => {
+                    if (ExpressionNode::scope_resolution_of(e) != null) {
+                        ExpressionNode::scope_resolution_of(e).scope_res.settle(
+                            Res::TypeRelative(ResBase::Def(id), 1));
+                    } else if (ExpressionNode::member_access_of(e) != null) {
+                        ExpressionNode::member_access_of(e).set_resolved_trait(id);
+                    }
+                }
+                _ => { }
             }
         }
         while (ctx.lang_refs.length > kept) {
@@ -1028,7 +1031,7 @@ type struct PassRegistry {
         // no diagnostic of its own.
         const prelude_path: SymbolStr = ctx.intern_table.intern(LangModule::Prelude.path());
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             const imp: ImportDecl* = DeclarationNode::import_of(stmt);
             if (imp != null) {
                 if (LangModule::Prelude.is_written(imp.module_path, ctx.intern_table)
@@ -1092,7 +1095,7 @@ type struct PassRegistry {
             "", ctx.source_file, ctx.options.stdlib_root, ctx.options.no_std, []);
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
             const import_node: ImportDecl* = DeclarationNode::import_of(stmt);
             if (import_node == null) { continue; }

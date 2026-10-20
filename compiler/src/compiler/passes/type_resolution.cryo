@@ -60,7 +60,7 @@ import compiler::ast::expression::{
     MemberAccessExpr, ScopeResolutionExpr, SizeofExpr,
     UnaryExpr
 };
-import compiler::ast::node::{ ASTNode, ProgramNode, StaticAssertItem };
+import compiler::ast::node::{ ProgramNode, StaticAssertItem };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
 import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
@@ -891,21 +891,20 @@ type struct TypeResolutionRunner {
 
     // Recursive statement walker for variable/expression types
 
-    /// Recursively walks a statement, resolving VarDecl.type_annotation and
-    /// CastExpr.target_annotation within function bodies.  `stmt` is a
-    /// statement, or a for-loop's initializer.
-    resolve_var_types_in_statement(&this, stmt: ASTNode*,
-                                   res_ctx: ResolutionContext*) -> void {
-        if (stmt == null) { return; }
+    /// Resolve the annotation of a `for` loop's initializer when it is a
+    /// variable declaration; an expression initializer has none to resolve.
+    resolve_var_types_in_for_init(&this, init: Node,
+                                  res_ctx: ResolutionContext*) -> void {
+        if (init.is_null()) { return; }
 
-        match (stmt.kind) {
-            NodeKind::Statement => {
-                this.resolve_var_types_in_stmt(stmt as Stmt*, res_ctx);
+        match (init) {
+            Node::Stmt(s) => {
+                this.resolve_var_types_in_stmt(s, res_ctx);
             }
-            NodeKind::Declaration => {
-                // Raw VarDecl (not wrapped in DeclStmt): produced by
-                // the parser for C-style for-loop initializers: for (mut i: int = 0; ...)
-                const var_node: VarDecl* = DeclarationNode::var_of(stmt);
+            Node::Decl(d) => {
+                // A bare variable declaration (not wrapped in a declaration
+                // statement): `for (mut i: int = 0; ...)`.
+                const var_node: VarDecl* = DeclarationNode::var_of(d);
                 if (var_node != null && var_node.type_annotation != null
                         && !var_node.resolved_type.is_valid()) {
                     const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
@@ -989,7 +988,7 @@ type struct TypeResolutionRunner {
             }
             StmtKind::For(for_stmt) => {
                 // Resolve init if it's a var declaration
-                this.resolve_var_types_in_statement(for_stmt.init.as_ast(), res_ctx);
+                this.resolve_var_types_in_for_init(for_stmt.init, res_ctx);
                 this.resolve_var_types_in_stmt(for_stmt.body, res_ctx);
             }
             StmtKind::Match(match_stmt) => {
@@ -1046,7 +1045,7 @@ type struct TypeResolutionRunner {
     resolve_var_types_in_expression(&this, expr: ExpressionNode*,
                                      res_ctx: ResolutionContext*) -> void {
         if (expr == null) { return; }
-        const n: ASTNode* = expr as ASTNode*;
+        const n: ExpressionNode* = expr;
         match (n.kind) {
             NodeKind::Expression => {
                 match (expr.shape) {
@@ -1060,7 +1059,7 @@ type struct TypeResolutionRunner {
                         for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
                             const arm: MatchArmNode* = match_expr.arms[i];
                             if (arm != null && arm.body != null) {
-                                this.resolve_var_types_in_statement(arm.body as ASTNode*, res_ctx);
+                                this.resolve_var_types_in_stmt(arm.body, res_ctx);
                             }
                         }
                     }
@@ -1068,7 +1067,7 @@ type struct TypeResolutionRunner {
                         for (mut i: i64 = 0; i < sm_expr.arms.length; i++) {
                             const arm: StaticMatchArmNode* = sm_expr.arms[i];
                             if (arm != null && arm.body != null) {
-                                this.resolve_var_types_in_statement(arm.body as ASTNode*, res_ctx);
+                                this.resolve_var_types_in_stmt(arm.body, res_ctx);
                             }
                         }
                     }
@@ -1124,7 +1123,7 @@ type struct TypeResolutionRunner {
                         }
                         // Walk body for variable declarations.
                         if (lam.body != null) {
-                            this.resolve_var_types_in_statement(lam.body as ASTNode*, res_ctx);
+                            this.resolve_var_types_in_stmt(lam.body, res_ctx);
                         }
                     }
                 }
@@ -1224,7 +1223,7 @@ type struct TypeResolutionRunner {
     collect_generic_fn_calls_in_expr(&this, expr: ExpressionNode*,
                                      res_ctx: ResolutionContext*) -> void {
         if (expr == null) { return; }
-        const node: ASTNode* = expr as ASTNode*;
+        const node: ExpressionNode* = expr;
 
         match (node.kind) {
             NodeKind::Expression => {
@@ -1385,7 +1384,7 @@ type struct TypeResolutionPasses {
     /// cross-module trait-impl coherence check; spec clones share canonical
     /// targets across the modules that instantiate them and would otherwise
     /// false-positive.
-    static register_decl_in_index(stmt: ASTNode*, ctx: CompilationContext*,
+    static register_decl_in_index(stmt: DeclarationNode*, ctx: CompilationContext*,
                                   is_source_decl: boolean) -> void {
         if (stmt == null) { return; }
         const arena: TypeArena* = ctx.type_arena;
@@ -1400,7 +1399,7 @@ type struct TypeResolutionPasses {
                     }
                 }
                 NodeKind::Declaration => {
-                    match ((stmt as DeclarationNode*).shape) {
+                    match (stmt.shape) {
                         DeclKind::Struct(node) => {
                             if (ctx.generic_registry.template_of(node.def) != null) {
                                 ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
@@ -1437,7 +1436,7 @@ type struct TypeResolutionPasses {
                 ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register class methods"), node.methods, ctx.intern_table, arena, "type_resolution/register class methods");
             }
             NodeKind::Declaration => {
-                match ((stmt as DeclarationNode*).shape) {
+                match (stmt.shape) {
                     DeclKind::Function(func) => {
                         const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
                         // A signature the name layer refused registers nothing: with
@@ -3018,7 +3017,7 @@ type struct TypeResolutionPasses {
                          resolver: TypeResolver*) -> i64 {
         mut alias_count: i64 = 0;
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
             const node: TypeAliasDecl* = DeclarationNode::alias_of(stmt);
             if (node == null) { continue; }
@@ -3084,7 +3083,7 @@ type struct TypeResolutionPasses {
 
         // Walk top-level statements
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
             cdebug("[FuncSig] stmt[%lld] kind=%d\n", i, stmt.kind as i32);
 
@@ -3099,7 +3098,7 @@ type struct TypeResolutionPasses {
                     sig_count += node.methods.length;
                 }
                 NodeKind::Declaration => {
-                    const decl: DeclarationNode* = stmt as DeclarationNode*;
+                    const decl: DeclarationNode* = stmt;
                     match (decl.shape) {
                         DeclKind::Function(func) => {
                             const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
@@ -3373,7 +3372,7 @@ type struct TypeResolutionPasses {
         // -- Phase 2: Declaration field types --------------------------------
         mut field_count: i64 = 0;
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
@@ -3387,7 +3386,7 @@ type struct TypeResolutionPasses {
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::Declaration => {
-                    match ((stmt as DeclarationNode*).shape) {
+                    match (stmt.shape) {
                         DeclKind::Impl(node) => {
                             mut impl_ctx: ResolutionContext = runner.make_generic_context(
                                 node.generic_params, &runner.res_ctx);
@@ -3426,7 +3425,7 @@ type struct TypeResolutionPasses {
                             runner.resolve_method_signatures(node.methods, &impl_ctx,
                                 ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def(), &impl_args);
                             runner.emit_method_signature_diagnostics(node.methods);
-                            runner.check_impl_conformance(stmt as DeclarationNode*, node, &impl_ctx);
+                            runner.check_impl_conformance(stmt, node, &impl_ctx);
                         }
                         DeclKind::Struct(node) => {
                             mut struct_ctx: ResolutionContext = runner.make_generic_context(
@@ -3481,7 +3480,7 @@ type struct TypeResolutionPasses {
         // -- Phase 3: Variable and expression types in function bodies -------
         mut body_count: i64 = 0;
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
@@ -3494,18 +3493,18 @@ type struct TypeResolutionPasses {
                             if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                 mut m_ctx: ResolutionContext = runner.make_generic_context(
                                     DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
-                                runner.resolve_var_types_in_statement(
-                                    DeclarationNode::fn_of(method.func).body as ASTNode*, &m_ctx);
+                                runner.resolve_var_types_in_stmt(
+                                    DeclarationNode::fn_of(method.func).body, &m_ctx);
                                 body_count++;
                             }
                         }
                     }
                 }
                 NodeKind::Declaration => {
-                    match ((stmt as DeclarationNode*).shape) {
+                    match (stmt.shape) {
                         DeclKind::Function(func) => {
                             if (func.body != null && !func.is_generic()) {
-                                runner.resolve_var_types_in_statement(func.body as ASTNode*, &runner.res_ctx);
+                                runner.resolve_var_types_in_stmt(func.body, &runner.res_ctx);
                                 body_count++;
                             }
                         }
@@ -3523,8 +3522,8 @@ type struct TypeResolutionPasses {
                                         // perfectly legal generic param.
                                         mut m_ctx: ResolutionContext = runner.make_generic_context(
                                             DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
-                                        runner.resolve_var_types_in_statement(
-                                            DeclarationNode::fn_of(method.func).body as ASTNode*, &m_ctx);
+                                        runner.resolve_var_types_in_stmt(
+                                            DeclarationNode::fn_of(method.func).body, &m_ctx);
                                         body_count++;
                                     }
                                 }
@@ -3538,8 +3537,8 @@ type struct TypeResolutionPasses {
                                     if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                         mut m_ctx: ResolutionContext = runner.make_generic_context(
                                             DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
-                                        runner.resolve_var_types_in_statement(
-                                            DeclarationNode::fn_of(method.func).body as ASTNode*, &m_ctx);
+                                        runner.resolve_var_types_in_stmt(
+                                            DeclarationNode::fn_of(method.func).body, &m_ctx);
                                         body_count++;
                                     }
                                 }
@@ -3553,8 +3552,8 @@ type struct TypeResolutionPasses {
                                     if (func != null && func.body != null) {
                                         mut m_ctx: ResolutionContext = runner.make_generic_context(
                                             func.generic_params, &runner.res_ctx);
-                                        runner.resolve_var_types_in_statement(
-                                            func.body as ASTNode*, &m_ctx);
+                                        runner.resolve_var_types_in_stmt(
+                                            func.body, &m_ctx);
                                         body_count++;
                                     }
                                 }
@@ -3582,8 +3581,8 @@ type struct TypeResolutionPasses {
                                     if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
                                         mut m_ctx: ResolutionContext = runner.make_generic_context(
                                             DeclarationNode::fn_of(method.func).generic_params, &impl_ctx);
-                                        runner.resolve_var_types_in_statement(
-                                            DeclarationNode::fn_of(method.func).body as ASTNode*, &m_ctx);
+                                        runner.resolve_var_types_in_stmt(
+                                            DeclarationNode::fn_of(method.func).body, &m_ctx);
                                         body_count++;
                                     }
                                 }
@@ -3608,7 +3607,7 @@ type struct TypeResolutionPasses {
         // For each, resolve the generic args and register an InstantiatedType
         // so the Monomorphizer can discover and specialize the function.
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
@@ -3625,7 +3624,7 @@ type struct TypeResolutionPasses {
                     }
                 }
                 NodeKind::Declaration => {
-                    match ((stmt as DeclarationNode*).shape) {
+                    match (stmt.shape) {
                         DeclKind::Function(func) => {
                             if (func.body != null && !func.is_generic()) {
                                 runner.collect_generic_fn_calls_in_stmt(func.body, &runner.res_ctx);
@@ -3677,7 +3676,7 @@ type struct TypeResolutionPasses {
         // -- Phase 4: Register declarations in the DeclarationIndex, and
         //    resolve and register top-level global variables
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
             // Register in DeclarationIndex (shared logic with Specialization).
@@ -3736,7 +3735,7 @@ type struct TypeResolutionPasses {
     static resolve_const_operand_types(expr: ExpressionNode*, resolver: TypeResolver*,
                                        res_ctx: ResolutionContext*) -> void {
         if (expr == null) { return; }
-        const node: ASTNode* = expr as ASTNode*;
+        const node: ExpressionNode* = expr;
         const c: CastExpr* = ExpressionNode::cast_of(node);
         if (c != null) {
             TypeResolutionPasses::resolve_const_operand_types(c.expression, resolver, res_ctx);
@@ -3823,7 +3822,7 @@ type struct TypeResolutionPasses {
         mut class_count: i64 = 0;
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i].as_ast();
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
@@ -3949,7 +3948,7 @@ type struct TypeResolutionPasses {
                     class_count++;
                 }
                 NodeKind::Declaration => {
-                    match ((stmt as DeclarationNode*).shape) {
+                    match (stmt.shape) {
                         DeclKind::Struct(sn) => {
                             if (TypeResolutionPasses::sync_struct_members(sn, ctx, arena)) { struct_count++; }
                             continue;

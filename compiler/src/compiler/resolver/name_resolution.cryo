@@ -53,7 +53,7 @@ import compiler::ast::expression::{
     ScopeResolutionExpr, SizeofExpr, StaticMatchExpr, StructExpr,
     TypeofExpr
 };
-import compiler::ast::node::{ ASTNode, Node, ProgramNode, StaticAssertItem };
+import compiler::ast::node::{ Node, ProgramNode, StaticAssertItem };
 import compiler::ast::pattern::{
     BindingPattern, ConstantPattern, DirectiveArgKind, DirectiveNode, EnumPattern, MatchArmNode,
     Pattern, PatternKind, StaticMatchArmNode
@@ -252,8 +252,29 @@ type struct NameResolver {
     forward_declare(mut &this, program: ProgramNode*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] forward_declare() with %d statements", program.statements.length);
         for (mut i: i64 = 0; i < program.statements.length; i++) {
-            const stmt: ASTNode* = program.statements[i].as_ast();
-            this.forward_declare_node(stmt);
+            this.forward_declare_item(program.statements[i]);
+        }
+    }
+
+    /// Forward-declare a program item: a declaration, or the declaration a
+    /// declaration statement holds; any other item declares nothing.
+    forward_declare_item(mut &this, item: Node) -> void {
+        match (item) {
+            Node::Decl(d) => {
+                if (d != null) { this.forward_declare_node(d); }
+            }
+            Node::Stmt(s) => {
+                if (s == null) { return; }
+                match (s.shape) {
+                    StmtKind::Decl(decl_stmt) => {
+                        if (decl_stmt.declaration != null) {
+                            this.forward_declare_node(decl_stmt.declaration);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
 
@@ -409,7 +430,7 @@ type struct NameResolver {
         }
     }
 
-    forward_declare_node(mut &this, node: ASTNode*) -> void {
+    forward_declare_node(mut &this, node: DeclarationNode*) -> void {
         match (node.kind) {
             NodeKind::ClassDeclaration => {
                 const class_node: ClassDeclNode* = node as ClassDeclNode*;
@@ -430,7 +451,7 @@ type struct NameResolver {
                 }
             }
             NodeKind::Declaration => {
-                const decl: DeclarationNode* = node as DeclarationNode*;
+                const decl: DeclarationNode* = node;
                 match (decl.shape) {
                     DeclKind::Function(fn_node) => {
                         const fn_node_decl: DeclarationNode* = DeclarationNode::with_shape(node);
@@ -577,7 +598,7 @@ type struct NameResolver {
                         }
                     }
                     DeclKind::TypeAlias(alias_node) => {
-                        this.ctx.note_alias_decl(node);
+                        this.ctx.note_alias_decl(decl);
                         if (!alias_node.binding_namespace.is_valid()) {
                             const sym_id: SymbolID = this.resolver.declare_type(
                                 alias_node.alias_name, decl.span, true);
@@ -598,19 +619,7 @@ type struct NameResolver {
                     | DeclKind::Destructure(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
             }
-            NodeKind::Statement => {
-                match ((node as Stmt*).shape) {
-                    StmtKind::Decl(decl_stmt) => {
-                        if (decl_stmt.declaration != null) {
-                            this.forward_declare_node(decl_stmt.declaration as ASTNode*);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            _ => {
-                // Other nodes don't introduce module-level names, skip
-            }
+            _ => { }
         }
         this.keep_declared(node);
     }
@@ -619,14 +628,14 @@ type struct NameResolver {
     /// definition was registered for (`DeclarationIndex::declaration_of`),
     /// once the declaring walk has stamped it.  Functions are kept where
     /// they are stamped, extern ones included (`stamp_function_def`).
-    keep_declared(&this, node: ASTNode*) -> void {
+    keep_declared(&this, node: DeclarationNode*) -> void {
         match (node.kind) {
             NodeKind::ClassDeclaration => {
                 const class_node: ClassDeclNode* = node as ClassDeclNode*;
                 this.ctx.decl_index.keep_declaration(class_node.def, class_node);
             }
             NodeKind::Declaration => {
-                const decl: DeclarationNode* = node as DeclarationNode*;
+                const decl: DeclarationNode* = node;
                 const d: DefId = match (decl.shape) {
                     DeclKind::Variable(v)        => { v.def }
                     DeclKind::Intrinsic(i)       => { i.def }
@@ -1536,7 +1545,7 @@ type struct NameResolver {
         match (base) {
             ResBase::Def(d) => {
                 if (NameResolutionPass::alias_decl(this.ctx, d) != null) {
-                    if (node.defer_to_alias(d)) { this.ctx.note_alias_path(e as ASTNode*); }
+                    if (node.defer_to_alias(d)) { this.ctx.note_alias_path(e); }
                     return;
                 }
             }
@@ -3617,7 +3626,7 @@ implement trait Walk for struct NameResolver {
     }
 
     walk_call(mut &this, e: ExpressionNode*, node: CallExpr*) -> void {
-        const callee_node: ASTNode* = node.callee as ASTNode*;
+        const callee_node: ExpressionNode* = node.callee;
         // A bare callee is visited as the callee it is, so one that binds to
         // nothing is refused as a function rather than as a value.  Set for
         // the callee's own visit only: an argument is not a callee.
@@ -4058,7 +4067,7 @@ type struct NameResolutionPass {
     /// the alias, which owns nothing.
     static settle_alias_paths(ctx: CompilationContext*) -> void {
         for (mut i: i64 = 0; i < ctx.alias_paths.length; i++) {
-            const node_e: ExpressionNode* = ExpressionNode::with_shape(ctx.alias_paths[i].node);
+            const node_e: ExpressionNode* = ctx.alias_paths[i].path;
             const node: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(node_e);
             mut alias: TypeAliasDecl* = NameResolutionPass::alias_decl(ctx, node.scope_res.pending_alias());
             mut answer: Res = Res::TypeRelative(ResBase::Def(node.scope_res.pending_alias()), 1);
@@ -4169,7 +4178,7 @@ type struct NameResolutionPass {
     static alias_decl(ctx: CompilationContext*, d: DefId) -> TypeAliasDecl* {
         if (!d.is_valid()) { return null; }
         for (mut i: i64 = 0; i < ctx.alias_decls.length; i++) {
-            const a: TypeAliasDecl* = DeclarationNode::alias_of(ctx.alias_decls[i].node);
+            const a: TypeAliasDecl* = DeclarationNode::alias_of(ctx.alias_decls[i].decl);
             if (a.def.equals(d)) { return a; }
         }
         return null;

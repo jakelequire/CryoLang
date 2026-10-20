@@ -55,7 +55,7 @@ import compiler::ast::expression::{
     ScopeResolutionExpr, SizeofExpr, StaticMatchExpr, StructExpr,
     TryExpr, TupleExpr, UnaryExpr
 };
-import compiler::ast::node::{ ASTNode, Node, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, Pattern };
 import compiler::ast::statement::{
     AsmBlockStmt, AsmConstraintKind, AsmDialect, AsmOpDir, AsmOperand, AsmPiece, BlockStmt,
@@ -197,23 +197,20 @@ type struct IRGeneratorVisitor {
     /// kinds with no emitter of their own are emitted through their owners
     /// (a method through its implement block, a match arm through its match)
     /// or emit nothing.
-    dispatch_node(mut &this, n: ASTNode*) -> Emitted {
-        if (n == null) { return Emitted::none(); }
-        match (n.kind) {
-            NodeKind::Statement              => { return this.emit_stmt(n as Stmt*); }
+    dispatch_node(mut &this, n: Node) -> Emitted {
+        if (n.is_null()) { return Emitted::none(); }
+        match (n) {
+            Node::Stmt(s) => { return this.emit_stmt(s); }
 
-            NodeKind::ClassDeclaration       => { return this.visit_class(n as ClassDeclNode*); }
-
-            NodeKind::Program
-            | NodeKind::MatchArm | NodeKind::StaticMatchArm
-            | NodeKind::Pattern | NodeKind::Directive => {
+            Node::Program(_) | Node::Arm(_) | Node::StaticArm(_)
+            | Node::Pattern(_) | Node::Directive(_) => {
                 return Emitted::none();
             }
 
-            NodeKind::Declaration => {
-                match ((n as DeclarationNode*).shape) {
-                    DeclKind::Function(_) => { return this.visit_function(DeclarationNode::with_shape(n)); }
-                    DeclKind::Variable(v) => { return this.visit_var(n as DeclarationNode*, v); }
+            Node::Decl(d) => {
+                match (d.shape) {
+                    DeclKind::Function(_) => { return this.visit_function(d); }
+                    DeclKind::Variable(v) => { return this.visit_var(d, v); }
                     DeclKind::Destructure(dd) => { return this.visit_destructure(dd); }
                     DeclKind::Union(u) => { return this.visit_union(u); }
                     DeclKind::Struct(s) => { return this.visit_struct(s); }
@@ -227,12 +224,11 @@ type struct IRGeneratorVisitor {
                     | DeclKind::Enum(_) | DeclKind::Trait(_) => {
                         return Emitted::none();
                     }
-                    DeclKind::Legacy => { return Emitted::none(); }
+                    DeclKind::Legacy => { return this.visit_class(d as ClassDeclNode*); }
                 }
             }
 
-            NodeKind::Expression => {
-                const e: ExpressionNode* = n as ExpressionNode*;
+            Node::Expr(e) => {
                 match (e.shape) {
                     ExprKind::Alignof(a) => { return this.visit_alignof(e, a); }
                     ExprKind::Sizeof(s)  => { return this.visit_sizeof(e, s); }
@@ -265,8 +261,6 @@ type struct IRGeneratorVisitor {
                     ExprKind::Call(c) => { return this.calls.emit(this, e, c); }
                 }
             }
-
-            NodeKind::Unknown => { return Emitted::none(); }
         }
     }
 
@@ -331,8 +325,8 @@ type struct IRGeneratorVisitor {
         cdebug("[IRGen] Phase 3: generate bodies (%lld stmts)...\n", program.statements.length); libc::fflush(null);
         const stmts: &[Node] = &program.statements;
         for (mut i: i64 = 0; i < stmts.length; i++) {
-            const stmt: ASTNode* = stmts[i].as_ast();
-            if (stmt == null) { continue; }
+            const stmt: Node = stmts[i];
+            if (stmt.is_null()) { continue; }
             // Top-level dispatch: the visit methods for FunctionDecl /
             // ImplBlock / StructDecl / ClassDeclNode handle their own
             // emission.  A kind with none (TypeAlias, Enum, Trait, Namespace,
@@ -702,13 +696,13 @@ type struct IRGeneratorVisitor {
             const val: LValue = this.dispatch.codegen_rvalue(this,node.expression);
             for (mut i: i64 = 0; i < node.synth_drops.length; i++) {
                 const d: Stmt* = node.synth_drops[i];
-                if (d != null) { this.dispatch_node(d); }
+                if (d != null) { this.dispatch_node(Node::Stmt(d)); }
             }
             this.cg.expr_ops.codegen_return(val, true, node.expression.resolved_type);
         } else {
             for (mut i: i64 = 0; i < node.synth_drops.length; i++) {
                 const d: Stmt* = node.synth_drops[i];
-                if (d != null) { this.dispatch_node(d); }
+                if (d != null) { this.dispatch_node(Node::Stmt(d)); }
             }
             this.cg.expr_ops.codegen_return(LValue::null(), false, TypeRef::invalid());
         }
@@ -757,7 +751,7 @@ type struct IRGeneratorVisitor {
         const current_fn: LValue = this.get_current_function();
         this.cg.values.push_scope();
         if (!node.init.is_null()) {
-            this.dispatch_node(node.init.as_ast());
+            this.dispatch_node(node.init);
         }
         const blocks: ForBlocks = this.cg.flow.codegen_for_header(current_fn);
         this.cg.builder.build_br(blocks.cond_bb);
@@ -1096,7 +1090,7 @@ type struct IRGeneratorVisitor {
             // The declaration's kind picks `visit_var` or
             // `visit_destructure`; other declaration kinds inside a
             // stmt-level decl emit nothing.
-            this.dispatch_node(node.declaration);
+            this.dispatch_node(Node::Decl(node.declaration));
         }
         return out;
     }
@@ -2099,7 +2093,7 @@ type struct IRGeneratorVisitor {
     visit_try(mut &this, e: ExpressionNode*, node: TryExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         if (node.desugared != null) {
-            return this.dispatch_node(node.desugared);
+            return this.dispatch_node(Node::Expr(node.desugared));
         }
         this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: `?` operator was not lowered by semantic analysis",
