@@ -109,13 +109,15 @@ type struct NameResolver {
     /// implements.  Invalid everywhere else, an inherent impl included.
     this_trait: DefId;
     /// The type `This::` names in the body being walked - an impl's target,
-    /// inherent or trait, or a type declaration's own definition - and the
-    /// declaration whose parameters it is written with.  `this_owner_decl`
-    /// is null elsewhere, a trait declaration's body included.
+    /// inherent or trait, a type declaration's own definition, or in a
+    /// trait declaration whichever type implements it - and the declaration
+    /// whose parameters it is written with.  `this_owner_decl` is null
+    /// outside every such body.
     this_owner:      ResBase;
     this_owner_decl: DeclarationNode*;
-    /// The owner's symbol, for the resolution map: the impl head's binding.
-    /// Invalid in a type declaration's own body, which holds none.
+    /// The owner's symbol, for the resolution map: the impl head's binding,
+    /// or a trait declaration's own.  Invalid in a type declaration's own
+    /// body, which holds none.
     this_owner_sym:  SymbolID;
     /// Each projection written on a type parameter (`I::Item`) in the
     /// module being walked, checked against the parameter's bounds once the
@@ -146,7 +148,8 @@ type struct NameResolver {
     }
 
     /// The parameters `This` is written with in the body of `decl`: an
-    /// inherent impl's, or a struct declaration's own.
+    /// impl's, or a struct declaration's own.  None in a trait declaration,
+    /// where `This` is the implementor and is written with none.
     static this_owner_params_of(decl: DeclarationNode*) -> [DeclarationNode*] {
         mut out: [DeclarationNode*] = [];
         if (decl == null) { return out; }
@@ -163,25 +166,17 @@ type struct NameResolver {
     /// `This::member` written where `This` names a type - an impl's target,
     /// inherent or trait, or a type declaration's own - is that type with
     /// its own parameters as its arguments - `Pair::<T>::member` in
-    /// `implement struct Pair<T>`.  In a trait declaration `This` is no
-    /// type yet and there is no owner to stamp.  The
-    /// scope is stamped with the owner's definition and each argument with
-    /// the parameter it is, here, where `This` is written: the owner's name
-    /// is never written into the path to be looked up a second time.  True
-    /// when it stamped.
+    /// `implement struct Pair<T>`.  In a trait declaration `This` is
+    /// whichever type implements the trait, stamped as the trait's
+    /// implementor with no arguments.  Stamped here, where `This` is
+    /// written (`ScopeResolutionExpr::name_self_type`).  True when it
+    /// stamped.
     stamp_this_scope(mut &this, e: ExpressionNode*, node: ScopeResolutionExpr*) -> boolean {
         if (!node.scope_is_this_type) { return false; }
         if (this.this_owner_decl == null) { return false; }
         if (node.scope_generic_args.length > 0) { return false; }
         const params: [DeclarationNode*] = NameResolver::this_owner_params_of(this.this_owner_decl);
-        mut args: [TypeAnnotation*] = [];
-        for (mut i: i64 = 0; i < params.length; i++) {
-            const p_decl: DeclarationNode* = params[i];
-            const p: GenericParamDecl* = DeclarationNode::generic_param_of(p_decl);
-            args.push(TypeAnnotation::answered(p.name, Res::GenericParam(p.sym_id), e.span));
-        }
-        node.set_scope_generic_args(args);
-        node.set_scope_res(Res::TypeRelative(this.this_owner, 1));
+        node.name_self_type(this.this_owner, &params, e.span);
         if (this.this_owner_sym.is_valid()) {
             this.resolver.record_resolution(e.span, this.this_owner_sym);
         }
@@ -3299,9 +3294,19 @@ implement trait Walk for struct NameResolver {
         // it spells to be re-derived from wherever the compiler is standing at
         // instantiation time.  A method with no default has no body, and
         // `visit(FunctionDecl*)` already walks one only when it exists.
+        // `This::` in a default names the trait's implementor.
+        const outer_owner: ResBase = this.this_owner;
+        const outer_owner_decl: DeclarationNode* = this.this_owner_decl;
+        const outer_owner_sym: SymbolID = this.this_owner_sym;
+        this.this_owner = ResBase::TraitThis(this.this_trait);
+        this.this_owner_decl = if (this.this_trait.is_valid()) { d } else { null };
+        this.this_owner_sym = node.sym_id;
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.walk_decl(node.methods[i]);
         }
+        this.this_owner = outer_owner;
+        this.this_owner_decl = outer_owner_decl;
+        this.this_owner_sym = outer_owner_sym;
 
         this.this_trait = outer_trait;
         this.resolver.exit_scope();
@@ -3335,16 +3340,8 @@ implement trait Walk for struct NameResolver {
         const outer_owner_sym: SymbolID = this.this_owner_sym;
         this.this_owner_decl = null;
         this.this_owner_sym = target_id;
-        match (node.res) {
-            ResSlot::Answered(Res::Def(d)) => {
-                this.this_owner = ResBase::Def(d);
-                this.this_owner_decl = decl;
-            }
-            ResSlot::Answered(Res::PrimTy(p)) => {
-                this.this_owner = ResBase::PrimTy(p);
-                this.this_owner_decl = decl;
-            }
-            _ => { }
+        if (node.self_type(&this.this_owner)) {
+            this.this_owner_decl = decl;
         }
 
         // The trait an impl head names. After `declare_generics`, for the same

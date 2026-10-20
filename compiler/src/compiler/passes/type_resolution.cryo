@@ -48,6 +48,7 @@ import std::collections::pair::{ Pair };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::cloner::{ ASTCloner };
+import compiler::ast::walk::{ Walk };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDecl, EnumDecl,
     EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl,
@@ -125,6 +126,21 @@ type struct ImplTerms {
     self_args: [TypeRef];
     subst:     TypeSubstitution;
     assoc:     [TypeRef];
+}
+
+/// The walk over one implementation's copy of a trait's default body that
+/// answers each `This::member` the trait stamped as its implementor with
+/// the implementing type, `owner`, written with the block's own parameters
+/// `params` (`ScopeResolutionExpr::name_implementor`).
+type struct ImplementorStamp {
+    owner:  ResBase;
+    params: [DeclarationNode*];
+}
+
+implement trait Walk for struct ImplementorStamp {
+    walk_scope_resolution(mut &this, e: ExpressionNode*, node: ScopeResolutionExpr*) -> void {
+        node.name_implementor(this.owner, &this.params, e.span);
+    }
 }
 
 
@@ -2558,6 +2574,16 @@ type struct TypeResolutionPasses {
         // `This` annotations resolve to the implementing type.
         mut cloner: ASTCloner = ASTCloner::new();
         mut synthesized: i64 = 0;
+        // `This::member` in a default's body names the trait's implementor,
+        // which in this block's copy is the type the block is for.
+        mut stamp: ImplementorStamp = ImplementorStamp {
+            owner:  ResBase::Def(DefId::invalid()),
+            params: [],
+        };
+        const has_self: boolean = impl_node.self_type(&stamp.owner);
+        for (mut gi: i64 = 0; gi < impl_node.generic_params.length; gi++) {
+            stamp.params.push(impl_node.generic_params[gi]);
+        }
 
         for (mut ti: i64 = 0; ti < trait_decl.methods.length; ti++) {
             const tfunc_decl: DeclarationNode* = trait_decl.methods[ti];
@@ -2614,6 +2640,7 @@ type struct TypeResolutionPasses {
             TypeResolutionPasses::rewrite_default_method_signature(
                 cloned_decl, impl_node.target_type, impl_node.target_args,
                 trait_param_syms, args_ref, this_home_span, impl_node.res);
+            if (has_self) { stamp.walk_decl(cloned_decl); }
             mut method: MethodDecl* = MethodDecl::new(cloned_decl);
             const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), cloned_decl.span);
             method.set_static(cloned.is_static);

@@ -122,12 +122,20 @@ type struct SymbolicChecker {
     /// impl on a concrete instantiation walks its methods over the
     /// TEMPLATE's parameters, so `A::f()` beside a `type struct A` stamps
     /// the struct, and by spelling it would pass for the parameter.
+    ///
+    /// `This::` in a trait's own default body names the trait's implementor,
+    /// which is a parameter of that body in all but name: abstract, and
+    /// bounded by the trait.
     symbolic_scope_is_generic_param(&this, scope: ScopeResolutionExpr*) -> boolean {
         if (!this.state.in_symbolic_check) { return false; }
         return match (scope.require_scope_res("symbolic scope segment")) {
             Res::TypeRelative(b, _) => {
                 match (b) {
                     ResBase::GenericParam(s) => { this.symbolic_param_in_scope(s) }
+                    ResBase::TraitThis(t)    => {
+                        this.state.symbolic_trait.is_valid()
+                            && this.state.symbolic_trait.equals(this.ctx.decl_index.type_of_def(t))
+                    }
                     _                        => { false }
                 }
             }
@@ -138,9 +146,18 @@ type struct SymbolicChecker {
     /// The abstract type of the generic parameter a qualified path's scope
     /// segment names (`T` in `T::make()`), by the segment's stamp; invalid
     /// when the segment names no parameter in scope for the body under
-    /// symbolic check.
+    /// symbolic check.  A trait's implementor is the `This` placeholder.
     symbolic_scope_param_type(&this, scope: ScopeResolutionExpr*) -> TypeRef {
         if (!this.symbolic_scope_is_generic_param(scope)) { return TypeRef::invalid(); }
+        match (scope.require_scope_res("symbolic scope segment")) {
+            Res::TypeRelative(b, _) => {
+                match (b) {
+                    ResBase::TraitThis(_) => { return this.arena.this_placeholder(this.ctx.intern("This")); }
+                    _                     => { }
+                }
+            }
+            _ => { }
+        }
         const sid: SymbolID = scope.scope_res.relative_param_sym();
         for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
             const p_decl: DeclarationNode* = this.state.symbolic_owner_param_nodes[i];

@@ -2509,6 +2509,15 @@ implement struct Pair<T> {
 }
 ```
 
+In a trait's own declaration `This` is whichever type implements the trait. `This::member` in a default body names the trait's member, typed by the trait's declaration of it, and each implementation's copy of the default calls that implementation's member, its own or the trait's default:
+
+```cryo
+type trait Seven {
+    static base() -> i64;
+    static build_default() -> i64 { return This::base() + 1; }   // the implementor's base()
+}
+```
+
 A parameter a method introduces must not spell one its owner already declares: `map<T>` inside `Result<T, E>` is refused at the method's `T` (`E0311`), as is a second `T` in one list, a trait method's `<T>` inside `trait Conv<T>`, and an impl method's `<T>` inside `implement<T>`. An enclosing generic parameter is in scope for every declaration nested in its owner, so an inner one of the same name could only be that parameter again - there is nothing for the inner declaration to mean. A method's parameter that shadows a *type* of the same spelling, or a value parameter spelled like a generic one, is ordinary shadowing and is allowed.
 
 ### 12.6 Monomorphisation

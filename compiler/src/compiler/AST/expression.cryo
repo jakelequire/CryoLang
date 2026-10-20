@@ -27,7 +27,7 @@ import compiler::intrinsic_kind::{ IntrinsicKind };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast::declaration;
-import compiler::ast::declaration::{ DeclarationNode, VarDecl };
+import compiler::ast::declaration::{ DeclarationNode, GenericParamDecl, VarDecl };
 import compiler::ast::pattern;
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
 import compiler::ast::statement;
@@ -1816,6 +1816,47 @@ type struct ScopeResolutionExpr {
 
     set_scope_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.scope_generic_args = args;
+    }
+
+    /// Answer a `This::member` path's scope segment with the self type
+    /// `owner`, its arguments the parameters `params` it is written with
+    /// (`Pair::<T>::member` in `implement struct Pair<T>`), each stamped
+    /// with the parameter it is: the owner's name is never written into the
+    /// path to be looked up a second time.
+    name_self_type(mut &this, owner: ResBase, params: &[DeclarationNode*], span: SourceSpan) -> void {
+        mut args: [TypeAnnotation*] = [];
+        for (mut i: i64 = 0; i < params.length; i++) {
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(params[i]);
+            args.push(TypeAnnotation::answered(p.name, Res::GenericParam(p.sym_id), span));
+        }
+        this.set_scope_generic_args(args);
+        this.set_scope_res(Res::TypeRelative(owner, 1));
+    }
+
+    /// In an implementation's copy of a trait's default body, answer a
+    /// `This::member` the trait's own body stamped as "the implementor"
+    /// with the implementing type, as `name_self_type` does.  The one
+    /// answer a copy replaces: the trait's stamp says only that the type
+    /// is not known where the default is written.  False, and nothing
+    /// changed, for any other path.
+    name_implementor(mut &this, owner: ResBase, params: &[DeclarationNode*], span: SourceSpan) -> boolean {
+        match (this.scope_res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::TypeRelative(b, _) => {
+                        match (b) {
+                            ResBase::TraitThis(_) => { }
+                            _                     => { return false; }
+                        }
+                    }
+                    _ => { return false; }
+                }
+            }
+            _ => { return false; }
+        }
+        this.scope_res = ResSlot::Pending;
+        this.name_self_type(owner, params, span);
+        return true;
     }
 }
 
