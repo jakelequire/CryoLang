@@ -1,7 +1,7 @@
 /// AST Declaration Nodes
 ///
-/// DeclarationNode base, the declaration classes not yet converted to a
-/// payload, and the payload structs of the kinds that are (`DeclKind`).
+/// DeclarationNode header and the payload struct of each declaration kind
+/// (`DeclKind`).
 ///
 /// String type convention:
 ///   SymbolStr: identifiers and names that may be looked up (e.g., variable
@@ -42,11 +42,8 @@ import compiler::ast::walk::{ Walk };
 import compiler::codegen::ast_arena::{ cryo_ast_arena_alloc };
 import utils::keyword::{ Keyword };
 
-/// Every declaration: what all kinds share, and which kind it is.  Still a
-/// class: a class declaration (`ClassDeclNode`) is its one subclass, until
-/// the class feature is deleted.
-type class DeclarationNode {
-public:
+/// Every declaration: what all kinds share, and which kind it is.
+type struct DeclarationNode {
     span:                SourceSpan;
     has_error:           boolean;
     /// The compiler wrote this declaration where the source spells nothing
@@ -60,60 +57,34 @@ public:
     /// declaration in source order.
     attached_directives: [DirectiveNode*];
     /// Extent of the leading modifier keywords (`public` / `private` /
-    /// `protected` / `async` / `static`) the parser consumed before reaching
-    /// this declaration's own first token.  `span` starts at that first
-    /// token (`function`, `type`, the method name), so the modifiers fall
-    /// outside it; `outer_span()` folds them back in.  `none()` when the
-    /// declaration carries no modifier.
+    /// `async` / `static`) the parser consumed before reaching this
+    /// declaration's own first token.  `span` starts at that first token
+    /// (`function`, `type`, the method name), so the modifiers fall outside
+    /// it; `outer_span()` folds them back in.  `none()` when the declaration
+    /// carries no modifier.
     modifier_span:       SourceSpan;
-    /// Which declaration this is, for a kind whose fields live in a payload;
-    /// `Legacy` for a class, the one kind still declared as a subclass of
-    /// this header.
-    shape:               DeclKind;
+    /// Which declaration this is, with its kind's own fields.
+    kind:                DeclKind;
 
-    DeclarationNode(span: SourceSpan) {
-        this.span                = span;
-        this.has_error           = false;
-        this.generated           = false;
-        this.documentation       = "";
-        this.source_file         = "";
-        this.name_span           = SourceSpan::none();
-        this.attached_directives = [];
-        this.modifier_span       = SourceSpan::none();
-        this.shape               = DeclKind::Legacy;
-    }
-
-    /// A declaration of `shape` at `span`, with the header's defaults.
-    static of(shape: DeclKind, span: SourceSpan) -> DeclarationNode* {
-        const d: DeclarationNode* = new DeclarationNode(span);
-        d.shape = shape;
-        return d;
-    }
-
-    /// Whether this is a class declaration (`ClassDeclNode`).
-    is_class() -> boolean {
-        return match (this.shape) {
-            DeclKind::Legacy => { true }
-            _                => { false }
+    /// A declaration of `kind` at `span`, with the header's defaults.
+    static of(kind: DeclKind, span: SourceSpan) -> DeclarationNode* {
+        return new DeclarationNode {
+            span:                span,
+            has_error:           false,
+            generated:           false,
+            documentation:       "",
+            source_file:         "",
+            name_span:           SourceSpan::none(),
+            attached_directives: [],
+            modifier_span:       SourceSpan::none(),
+            kind:                kind,
         };
-    }
-
-    /// The name debug output gives this declaration's category.
-    kind_name() -> string {
-        if (this.is_class()) { return "ClassDeclaration"; }
-        return "Declaration";
-    }
-
-    /// `d` when its kind has a payload; null for a class and for null.
-    static with_shape(d: DeclarationNode*) -> DeclarationNode* {
-        if (d == null || d.is_class()) { return null; }
-        return d;
     }
 
     /// The module declaration `d` is, or null.
     static module_of(d: DeclarationNode*) -> ModuleDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Module(m) => { m }
             _                   => { null }
         };
@@ -123,7 +94,7 @@ public:
     /// list holds nothing else.
     static variant_of(d: DeclarationNode*) -> EnumVariant* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Variant(v) => { v }
             _                    => { null }
         };
@@ -133,7 +104,7 @@ public:
     /// nothing else.
     static field_of(d: DeclarationNode*) -> FieldDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Field(f) => { f }
             _                  => { null }
         };
@@ -143,7 +114,7 @@ public:
     /// generic parameter list holds nothing else.
     static generic_param_of(d: DeclarationNode*) -> GenericParamDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::GenericParam(p) => { p }
             _                         => { null }
         };
@@ -153,7 +124,7 @@ public:
     /// statement holds is a variable or one of these.
     static destructure_of(d: DeclarationNode*) -> DestructureDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Destructure(dd) => { dd }
             _                         => { null }
         };
@@ -162,7 +133,7 @@ public:
     /// The extern block `d` is, or null.
     static extern_of(d: DeclarationNode*) -> ExternBlock* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Extern(e) => { e }
             _                   => { null }
         };
@@ -171,7 +142,7 @@ public:
     /// The type alias `d` is, or null.
     static alias_of(d: DeclarationNode*) -> TypeAliasDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::TypeAlias(a) => { a }
             _                      => { null }
         };
@@ -180,7 +151,7 @@ public:
     /// The enum declaration `d` is, or null.
     static enum_of(d: DeclarationNode*) -> EnumDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Enum(e) => { e }
             _                 => { null }
         };
@@ -189,7 +160,7 @@ public:
     /// The trait declaration `d` is, or null.
     static trait_of(d: DeclarationNode*) -> TraitDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Trait(t) => { t }
             _                  => { null }
         };
@@ -198,7 +169,7 @@ public:
     /// The implement block `d` is, or null.
     static impl_of(d: DeclarationNode*) -> ImplBlock* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Impl(i) => { i }
             _                 => { null }
         };
@@ -207,7 +178,7 @@ public:
     /// The struct declaration `d` is, or null.
     static struct_of(d: DeclarationNode*) -> StructDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Struct(s) => { s }
             _                   => { null }
         };
@@ -216,7 +187,7 @@ public:
     /// The union declaration `d` is, or null.
     static union_of(d: DeclarationNode*) -> UnionDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Union(u) => { u }
             _                  => { null }
         };
@@ -225,7 +196,7 @@ public:
     /// The method `d` is, or null.
     static method_of(d: DeclarationNode*) -> MethodDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Method(m) => { m }
             _                   => { null }
         };
@@ -234,7 +205,7 @@ public:
     /// The function `d` is, or null.
     static fn_of(d: DeclarationNode*) -> FunctionDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Function(f) => { f }
             _                     => { null }
         };
@@ -243,7 +214,7 @@ public:
     /// The variable `d` is (a local, a global or a parameter), or null.
     static var_of(d: DeclarationNode*) -> VarDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Variable(v) => { v }
             _                     => { null }
         };
@@ -252,18 +223,18 @@ public:
     /// The import (or export) declaration `d` is, or null.
     static import_of(d: DeclarationNode*) -> ImportDecl* {
         if (d == null) { return null; }
-        return match (d.shape) {
+        return match (d.kind) {
             DeclKind::Import(i) => { i }
             _                   => { null }
         };
     }
 
-    has_name_span() -> boolean     { return this.name_span.has_location(); }
+    has_name_span(&this) -> boolean     { return this.name_span.has_location(); }
 
-    set_documentation(doc_text: string) -> void  { const doc: string = doc_text; this.documentation = doc; }
-    set_source_file(file: string) -> void  { this.source_file = file; }
-    set_name_span(span: SourceSpan) -> void { this.name_span = span; }
-    add_directive(d: DirectiveNode*) -> void {
+    set_documentation(mut &this, doc_text: string) -> void  { const doc: string = doc_text; this.documentation = doc; }
+    set_source_file(mut &this, file: string) -> void  { this.source_file = file; }
+    set_name_span(mut &this, span: SourceSpan) -> void { this.name_span = span; }
+    add_directive(mut &this, d: DirectiveNode*) -> void {
         if (d != null) { this.attached_directives.push(d); }
     }
 
@@ -271,7 +242,7 @@ public:
     /// keyword as the parser consumes it, so the recorded extent grows to
     /// cover all of them however they nest (`public async function` records
     /// `async` from the inner parse, then `public` from the outer one).
-    note_modifier_span(span: SourceSpan) -> void {
+    note_modifier_span(mut &this, span: SourceSpan) -> void {
         this.modifier_span = SourceSpan::covering(this.modifier_span, span);
     }
 
@@ -321,10 +292,9 @@ public:
     }
 }
 
-/// `new` of a declaration (a class declaration included) takes its storage
-/// from the AST arena; `delete` of one releases nothing, since the arena is
-/// reclaimed whole.
-implement trait Allocate for class DeclarationNode {
+/// `new` of a declaration takes its storage from the AST arena; `delete` of
+/// one releases nothing, since the arena is reclaimed whole.
+implement trait Allocate for struct DeclarationNode {
     static allocate(size: u64, align: u64) -> void* {
         return cryo_ast_arena_alloc(size, align);
     }
@@ -510,7 +480,7 @@ implement trait Allocate for struct VarDecl {
 
 // DestructureDecl: `const { f1, f2: alias, mut f3 }: T = expr;`
 //
-// Binds individual fields of a struct/class value to fresh locals.  Full
+// Binds individual fields of a struct value to fresh locals.  Full
 // destructure (every field of T bound) consumes the RHS, which the move-
 // checker treats as a composite move; drop is suppressed on the RHS root.
 
@@ -704,8 +674,7 @@ type struct FunctionDecl {
     /// registered under - its key, function type and linker symbol - written
     /// by registration, which is the one place the symbol is computed.  The
     /// definition is emitted under the entry's symbol, a call sema or mono
-    /// binds to the declaration pins the entry, and a vtable slot names it;
-    /// none of them mangles.  Invalid until registered (a template whose
+    /// binds to the declaration pins the entry; none of them mangles.  Invalid until registered (a template whose
     /// signature cannot be resolved, a deferred combinator).
     overload_entry:         OverloadId;
     /// True on a function/method that the monomorphizer produced by cloning a
@@ -805,7 +774,7 @@ type struct FunctionDecl {
     static caller_located(decl: DeclarationNode*) -> boolean {
         if (decl == null) { return false; }
         if (DeclarationNode::method_of(decl) != null) {
-            const m_decl: DeclarationNode* = DeclarationNode::with_shape(decl);
+            const m_decl: DeclarationNode* = decl;
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             return m.func != null && DeclarationNode::fn_of(m.func).is_caller_located;
         }
@@ -866,20 +835,13 @@ implement trait Allocate for struct FunctionDecl {
 type struct MethodDecl {
     func:                  DeclarationNode*;
     visibility:            Visibility;
-    is_constructor:        boolean;
-    is_destructor:         boolean;
     is_static:             boolean;
-    is_default_destructor: boolean;
-    is_virtual:            boolean;
-    is_override:           boolean;
     /// `![sink]` was applied to this method.  Set by
     /// directive_processing.  Tells move-check + drop-insertion to
     /// treat the call as moving the receiver, even when the receiver
     /// is syntactically `&this` / `mut &this`.  See the
     /// `OwnershipQuery::method_consumes_receiver` helper.
     is_sink:               boolean;
-    base_ctor_name:        SymbolStr;
-    base_ctor_args:        [ExpressionNode*];
     /// The generic method this one is a specialization of - its own type
     /// parameters bound by the monomorphizer - or null for a method written
     /// or copied from a trait default.  A copy of the block holding the
@@ -891,42 +853,23 @@ type struct MethodDecl {
         return new MethodDecl {
             func:                  func,
             visibility:            Visibility::Public,
-            is_constructor:        false,
-            is_destructor:         false,
             is_static:             false,
-            is_default_destructor: false,
-            is_virtual:            false,
-            is_override:           false,
             is_sink:               false,
-            base_ctor_name:        SymbolStr::empty(),
-            base_ctor_args:        [],
             spec_of:               null,
         };
     }
 
-    has_base_ctor(&this) -> boolean { return this.base_ctor_name.is_valid(); }
-
     set_visibility(mut &this, v: Visibility) -> void       { this.visibility = v; }
-    set_constructor(mut &this, v: boolean) -> void         { this.is_constructor = v; }
-    set_destructor(mut &this, v: boolean) -> void          { this.is_destructor = v; }
     set_static(mut &this, v: boolean) -> void              { this.is_static = v; }
-    set_default_destructor(mut &this, v: boolean) -> void  { this.is_default_destructor = v; }
-    set_virtual(mut &this, v: boolean) -> void             { this.is_virtual = v; }
-    set_override(mut &this, v: boolean) -> void            { this.is_override = v; }
     set_sink(mut &this, v: boolean) -> void                { this.is_sink = v; }
-    set_base_ctor_name(mut &this, name: SymbolStr) -> void { this.base_ctor_name = name; }
-
-    add_base_ctor_arg(mut &this, arg: ExpressionNode*) -> void {
-        this.base_ctor_args.push(arg);
-    }
 
     static walk_children<V>(n: MethodDecl*, v: mut &V) -> void where V: Walk {
         v.walk_decl(n.func);
     }
 
     /// Whether the very method `m` is one of the methods `decl` holds: a
-    /// struct's, union's or class's own, or an impl block's.  Compared by
-    /// identity, never by name.
+    /// struct's or union's own, or an impl block's.  Compared by identity,
+    /// never by name.
     static is_method_of(m: DeclarationNode*, decl: DeclarationNode*) -> boolean {
         if (decl == null) { return false; }
         const empty: [DeclarationNode*] = [];
@@ -935,8 +878,6 @@ type struct MethodDecl {
             methods = &(DeclarationNode::struct_of(decl)).methods;
         } else if (DeclarationNode::union_of(decl) != null) {
             methods = &(DeclarationNode::union_of(decl)).methods;
-        } else if (decl.is_class()) {
-            methods = &(decl as ClassDeclNode*).methods;
         } else if (DeclarationNode::impl_of(decl) != null) {
             methods = &(DeclarationNode::impl_of(decl)).methods;
         }
@@ -954,11 +895,8 @@ implement trait Allocate for struct MethodDecl {
 }
 
 
-/// What a declaration is, for the kinds whose fields live in a payload.
-/// `Legacy` is the bridge for the kinds still declared as a subclass of
-/// `DeclarationNode`; it goes when the last kind converts.
+/// What a declaration is: each kind's own fields, in its payload.
 type enum DeclKind {
-    Legacy;
     Destructure(DestructureDecl*);
     Enum(EnumDecl*);
     Extern(ExternBlock*);
@@ -1075,7 +1013,7 @@ type struct ImportDecl {
     /// `export` rather than `import`: the same form, granting the same names,
     /// but granting them to this module's importers as well as to this module.
     /// One node kind for both because an export form IS an import form minus
-    /// the wildcard - a second class would duplicate the visitor, cloner,
+    /// the wildcard - a second kind would duplicate the visitor, cloner,
     /// dumper and validator arms to say the same thing twice.
     ///
     /// The wildcard is rejected in the parser, not represented and filtered
@@ -1371,99 +1309,6 @@ type struct UnionDecl {
 implement trait Allocate for struct UnionDecl {
     static allocate(size: u64, align: u64) -> void* {
         return cryo_ast_arena_alloc(size, align);
-    }
-}
-
-
-type class ClassDeclNode : DeclarationNode {
-public:
-    name:           SymbolStr;
-    generic_params: [DeclarationNode*];
-    /// Each a declaration whose shape is `DeclKind::Field`, read through
-    /// `DeclarationNode::field_of`.
-    fields:         [DeclarationNode*];
-    methods:        [DeclarationNode*];
-    base_class:     SymbolStr;
-    /// What `base_class` refers to, stamped by NameResolution from the scope
-    /// ENCLOSING the class - the class body would shadow the base's own name.
-    ///
-    /// The spelling alone cannot answer: the parser accepts one identifier, so
-    /// a base is always a bare leaf, and the declaration it names may live in a
-    /// module whose own last segment repeats it (`compiler::types::type_base::Type`).
-    /// Only the scope the class was WRITTEN in distinguishes those.
-    base_res:       ResSlot;
-    /// The base spelling's own span, so a diagnostic about it underlines the
-    /// base rather than the whole declaration.
-    base_span:      SourceSpan;
-    /// Layout attributes - see StructDecl for the full description.
-    repr_c:           boolean;
-    repr_packed:      boolean;
-    repr_transparent: boolean;
-    min_alignment:    u64;
-    /// `public`/`private` - see StructDecl.is_public.
-    is_public:        boolean;
-    /// `where T: Bound` constraints on the declaration's own parameters;
-    /// checked once per instantiation.
-    where_bounds:     [TraitBound];
-    /// The id this declaration registered under, stamped by the type-
-    /// declaration stage (a specialization's by its injector, a synthesized
-    /// declaration's by its synthesizer).  Invalid until then.  A reader
-    /// that holds the node asks the index by this id; it never re-derives
-    /// the key from the name and the file.
-    def:               DefId;
-
-    ClassDeclNode(name: SymbolStr, span: SourceSpan)
-        : DeclarationNode(span) {
-        this.name             = name;
-        this.generic_params   = [];
-        this.fields           = [];
-        this.methods          = [];
-        this.base_class       = SymbolStr::empty();
-        this.base_res         = ResSlot::Pending;
-        this.base_span        = SourceSpan::none();
-        this.repr_c           = false;
-        this.repr_packed      = false;
-        this.repr_transparent = false;
-        this.min_alignment    = 0;
-        this.is_public        = true;
-        this.where_bounds     = [];
-        this.def              = DefId::invalid();
-    }
-
-    is_generic() -> boolean     { return this.generic_params.length > 0; }
-    add_where_bound(mut &this, bound: TraitBound) -> void { this.where_bounds.push(bound); }
-    has_base_class() -> boolean { return this.base_class.is_valid(); }
-    set_public(p: boolean) -> void { this.is_public = p; }
-
-    add_generic_param(param: DeclarationNode*) -> void {
-        this.generic_params.push(param);
-    }
-
-    add_field(field: DeclarationNode*) -> void {
-        this.fields.push(field);
-    }
-
-    add_method(method_decl: DeclarationNode*) -> void {
-        this.methods.push(method_decl);
-    }
-
-    /// The span is taken with the name so a base cannot be recorded without
-    /// the location a diagnostic about it needs.
-    set_base_class(name: SymbolStr, span: SourceSpan) -> void {
-        this.base_class = name;
-        this.base_span  = span;
-    }
-
-    /// Record what the base-class spelling refers to.  First answer wins, for
-    /// the reason every `Res` slot does: it states what the file that WROTE
-    /// the name can see, and a later walk stands in a different module.
-    set_base_res(r: Res) -> void {
-        this.base_res.answer(r);
-    }
-
-    /// What this class's base refers to, for a stage that needs it.
-    require_base_res(&this, site: string) -> Res {
-        return this.base_res.require(site);
     }
 }
 
@@ -2148,7 +1993,7 @@ implement trait Allocate for struct ExternBlock {
 }
 
 
-/// A field of a struct, union or class.  The type's `fields` hold the
+/// A field of a struct or union.  The type's `fields` hold the
 /// headers, read through `DeclarationNode::field_of`.
 type struct FieldDecl {
     name:            SymbolStr;

@@ -8,7 +8,7 @@
 ///! - `is_copy(arena, registry, intern, ty)`: true when a value of `ty`
 ///!   may be bitwise duplicated on assignment / argument-pass / return
 ///!   without ownership transfer. Primitives, pointers, references and
-///!   function pointers are always Copy. Aggregates (struct/class/enum/
+///!   function pointers are always Copy. Aggregates (struct/enum/
 ///!   tuple) are Copy if every component is Copy AND the type carries
 ///!   no user-written `Drop` impl. Generic params and unresolved types
 ///!   are conservatively non-Copy (the worst that happens is an extra
@@ -31,7 +31,7 @@ namespace compiler::types::ownership;
 
 import compiler::ast::declaration;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, FieldDecl, ImplBlock, MethodDecl, StructDecl, UnionDecl,
+    DeclarationNode, FieldDecl, ImplBlock, MethodDecl, StructDecl, UnionDecl,
     VarDecl
 };
 import compiler::types;
@@ -58,7 +58,7 @@ import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, EnumType, EnumVariantInfo, FieldInfo, StructType, TypeAliasType
+    EnumType, EnumVariantInfo, FieldInfo, StructType, TypeAliasType
 };
 
 
@@ -137,14 +137,6 @@ type struct OwnershipQuery {
             }
             return OwnershipQuery::all_fields_copy(arena, registry, intern,
                                                     st.fields, depth + 1);
-        }
-        if (k == TypeKind::Class) {
-            const ct: ClassType* = t.as_class();
-            if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
-                return false;
-            }
-            return OwnershipQuery::all_fields_copy(arena, registry, intern,
-                                                    ct.fields, depth + 1);
         }
         if (k == TypeKind::Enum) {
             const et: EnumType* = t.as_enum();
@@ -236,7 +228,7 @@ type struct OwnershipQuery {
     //     that genuinely aren't thread-safe (Rc, MutexGuard) go on
     //     the explicit deny-list below, keyed by their leaf name.
     //   - Arrays / Optional / Tuple: Send/Sync if every component is.
-    //   - Struct / Class / Enum aggregates: Send/Sync if every field
+    //   - Struct / Enum aggregates: Send/Sync if every field
     //     (or every variant payload, for enums) is, AND the type isn't
     //     on the deny-list.
     //   - InstantiatedType: deny-list check on the template's leaf name
@@ -321,14 +313,6 @@ type struct OwnershipQuery {
             return OwnershipQuery::all_fields_thread_safe(arena, registry, intern,
                                                            st.fields, depth + 1);
         }
-        if (k == TypeKind::Class) {
-            const ct: ClassType* = t.as_class();
-            if (OwnershipQuery::is_thread_safety_denied(arena, registry, intern, ty)) {
-                return false;
-            }
-            return OwnershipQuery::all_fields_thread_safe(arena, registry, intern,
-                                                           ct.fields, depth + 1);
-        }
         if (k == TypeKind::Enum) {
             const et: EnumType* = t.as_enum();
             if (OwnershipQuery::is_thread_safety_denied(arena, registry, intern, ty)) {
@@ -375,7 +359,7 @@ type struct OwnershipQuery {
     /// template's declaration plus the instantiation's type args.  Required
     /// now that sema (which owns `where`-bound satisfaction) runs BEFORE the
     /// monomorphizer creates the concrete spec the resolved-type walk needs.
-    /// Struct/class fields come from the AST (their `resolved_type` carries the
+    /// Struct fields come from the AST (their `resolved_type` carries the
     /// abstract field types post-TypeResolution); enum variant payloads come
     /// from the template's arena type.  Each component type is substituted
     /// (`T -> u32`) and recursed.  Returns false when the template or a
@@ -412,20 +396,6 @@ type struct OwnershipQuery {
             const un: UnionDecl* = DeclarationNode::union_of(tmpl.ast_node);
             for (mut i: i64 = 0; i < un.fields.length; i++) {
                 const f_decl: DeclarationNode* = un.fields[i];
-                const f: FieldDecl* = DeclarationNode::field_of(f_decl);
-                if (f == null || !f.resolved_type.is_valid()) { return false; }
-                const ft: TypeRef = subst.apply(f.resolved_type, arena);
-                if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
-                                                              ft, depth + 1)) {
-                    return false;
-                }
-            }
-            return true;
-        }
-        if (tmpl.kind == TemplateKind::Class && tmpl.ast_node != null) {
-            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
-            for (mut i: i64 = 0; i < cn.fields.length; i++) {
-                const f_decl: DeclarationNode* = cn.fields[i];
                 const f: FieldDecl* = DeclarationNode::field_of(f_decl);
                 if (f == null || !f.resolved_type.is_valid()) { return false; }
                 const ft: TypeRef = subst.apply(f.resolved_type, arena);
@@ -600,11 +570,6 @@ type struct OwnershipQuery {
             }
             return OwnershipQuery::any_field_needs_drop(arena, registry, intern,
                                                         st.fields, depth + 1);
-        }
-        if (k == TypeKind::Class) {
-            const ct: ClassType* = t.as_class();
-            return OwnershipQuery::any_field_needs_drop(arena, registry, intern,
-                                                        ct.fields, depth + 1);
         }
         if (k == TypeKind::Enum) {
             const et: EnumType* = t.as_enum();

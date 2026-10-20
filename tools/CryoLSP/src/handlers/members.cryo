@@ -2,7 +2,7 @@
 ///!
 ///! A type's members are what its declaration holds - fields, methods,
 ///! variants - then what every implementation block whose stamped target is
-///! the type adds, then, for a class, its base's.  A module's contents are
+///! the type adds.  A module's contents are
 ///! its export list and the modules nested under it.  Nothing here asks for
 ///! a member by its name: completion and the extended hover list them all.
 namespace lsp::handlers::members;
@@ -11,11 +11,11 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, ImplBlock, MethodDecl,
+    DeclarationNode, DeclKind, EnumDecl, ImplBlock, MethodDecl,
     StructDecl, UnionDecl
 };
 import compiler::module_graph::{ ModulePath };
-import compiler::resolver::res::{ DefId, Res, ResSlot };
+import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID };
 
@@ -34,30 +34,19 @@ type struct Members {
     ctx: CompilationContext*;
     out: [Member];
 
-    /// Every member of the type `d`: its own, its implementation blocks',
-    /// then its base classes'.  Empty for a definition that is no type.
+    /// Every member of the type `d`: its own, then its implementation
+    /// blocks'.  Empty for a definition that is no type.
     static of_type(ctx: CompilationContext*, d: DefId) -> [Member] {
         mut m: Members = Members { ctx: ctx, out: [] };
-        mut cur: DefId = d;
-        for (mut depth: i64 = 0; depth < 16 && cur.is_valid(); depth++) {
-            cur = m.add_type(cur);
-        }
+        if (d.is_valid()) { m.add_type(d); }
         return m.out;
     }
 
-    /// Add the members `d` declares and its blocks add; the base class to
-    /// continue with, or invalid.
-    add_type(mut &this, d: DefId) -> DefId {
+    /// Add the members `d` declares and its blocks add.
+    add_type(mut &this, d: DefId) -> void {
         const decl: DeclarationNode* = this.ctx.decl_index.declaration_of(d);
-        if (decl == null) { return DefId::invalid(); }
-        mut base: DefId = DefId::invalid();
-        match (decl.shape) {
-            DeclKind::Legacy => {
-                const cd: ClassDeclNode* = decl as ClassDeclNode*;
-                this.add_fields(d, &cd.fields);
-                this.add_methods(&cd.methods);
-                base = Members::def_of_slot(&cd.base_res);
-            }
+        if (decl == null) { return; }
+        match (decl.kind) {
             DeclKind::Enum(ed) => {
                 for (mut i: i64 = 0; i < ed.variants.length; i++) {
                     this.out.push(Member::Variant(d, i));
@@ -75,10 +64,9 @@ type struct Members {
             | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
             | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
             | DeclKind::GenericParam(_) | DeclKind::Trait(_) | DeclKind::Variable(_)
-            | DeclKind::Function(_) | DeclKind::Method(_) => { return DefId::invalid(); }
+            | DeclKind::Function(_) | DeclKind::Method(_) => { return; }
         }
         this.add_blocks(d);
-        return base;
     }
 
     add_fields(mut &this, owner: DefId, fields: &[DeclarationNode*]) -> void {
@@ -91,7 +79,7 @@ type struct Members {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m_decl: DeclarationNode* = methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-            if (m == null || m.func == null || m.is_destructor) { continue; }
+            if (m == null || m.func == null) { continue; }
             this.out.push(Member::Method(m));
         }
     }
@@ -112,17 +100,6 @@ type struct Members {
         }
     }
 
-    static def_of_slot(slot: &ResSlot) -> DefId {
-        match (slot) {
-            ResSlot::Answered(r) => {
-                return match (r) {
-                    Res::Def(d) => { d }
-                    _           => { DefId::invalid() }
-                };
-            }
-            _ => { return DefId::invalid(); }
-        }
-    }
 
     /// The declaration of field `index` of the type `owner`, or null.  The
     /// header: a field carries its spans and documentation there.
@@ -132,9 +109,6 @@ type struct Members {
         if (DeclarationNode::struct_of(decl) != null) {
             const sd: StructDecl* = DeclarationNode::struct_of(decl);
             if (index < sd.fields.length) { return sd.fields[index]; }
-        } else if (decl.is_class()) {
-            const cd: ClassDeclNode* = decl as ClassDeclNode*;
-            if (index < cd.fields.length) { return cd.fields[index]; }
         } else if (DeclarationNode::union_of(decl) != null) {
             const ud: UnionDecl* = DeclarationNode::union_of(decl);
             if (index < ud.fields.length) { return ud.fields[index]; }
@@ -156,7 +130,7 @@ type struct Members {
         return match (m) {
             Member::Field(_, _)   => { true }
             Member::Variant(_, _) => { false }
-            Member::Method(md)    => { !md.is_static && !md.is_constructor }
+            Member::Method(md)    => { !md.is_static }
         };
     }
 

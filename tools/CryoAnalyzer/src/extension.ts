@@ -20,7 +20,7 @@ import { initInactiveRegions, registerInactiveRegions } from './inactiveRegions'
 let client: LanguageClient | undefined;
 let outputChannel: vscode.OutputChannel;
 
-// Hover verbosity: when true, struct/class type hovers additionally list the
+// Hover verbosity: when true, struct type hovers additionally list the
 // type's method signatures.  VS Code's native Hover Verbosity API is still a
 // proposed API (unavailable to a normally-installed extension), so we emulate
 // it with a keybinding.  The trick that makes "mouse-hover a struct, press the
@@ -38,13 +38,13 @@ let lastHoverPosition: { uri: string; line: number; character: number } | undefi
 // package.json contribution.
 const TOGGLE_HINT_KEY = 'Shift+Alt+M';
 
-/** True when a hover's markdown looks like a struct/class type declaration -
+/** True when a hover's markdown looks like a struct type declaration -
  *  i.e. the only kind the "expand methods" toggle is meaningful for. */
 function isTypeHover(hover: vscode.Hover | null | undefined): boolean {
     if (!hover || !hover.contents) { return false; }
     return hover.contents.some((c) => {
         const v = typeof c === 'string' ? c : (c as vscode.MarkdownString).value;
-        return v.includes('type struct ') || v.includes('type class ');
+        return v.includes('type struct ');
     });
 }
 

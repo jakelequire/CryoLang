@@ -49,7 +49,7 @@ import std::core::hash::{ Hash, Hasher };
 import std::core::cmp::{ Eq };
 import compiler::types::type_ref::{ TypeKey };
 import compiler::types::user_defined;
-import compiler::types::user_defined::{ ClassType, EnumType, MethodInfo, StructType };
+import compiler::types::user_defined::{ EnumType, MethodInfo, StructType };
 import std::core::intrinsics;
 
 
@@ -182,11 +182,9 @@ implement trait Eq for struct FamilySlot {
 
 /// What a module emitting its own copy of an `![inline]` body needs
 /// besides the declaration: the type a method is on (invalid for a
-/// function), and a class method's base, which its constructor's
-/// `: Base(args)` names (null otherwise).
+/// function).
 type struct InlineBody {
     owner: TypeRef;
-    base:  ResSlot*;
 }
 
 /// The key of an owner's copy of a method definition: the owner type and
@@ -246,10 +244,6 @@ type struct DeclarationIndex {
     // The definition's slot in `defs` -> the entry its signature was
     // registered as; invalid for a slot no function registration reached.
     def_entries:    [OverloadId];
-
-    // A type definition's slot in `defs` -> the family its constructors
-    // are registered in (`family_slot`); 0 for a type that registered none.
-    ctor_families:  [FamilySlot];
 
     // The definition's slot in `defs` -> the declaration it was registered
     // for: a method's `MethodDecl`, a trait's declared method's
@@ -419,7 +413,6 @@ public:
             type_reverse:        HashMap::<TypeKey, DefId>::new(),
             def_types:           [],
             def_entries:         [],
-            ctor_families:       [],
             declarations:        [],
             copy_entries:        HashMap::<CopyKey, OverloadId>::new(),
             instance_entries:    HashMap::<TypeKey, OverloadId>::new(),
@@ -651,7 +644,7 @@ public:
     entry_method(&this, id: OverloadId) -> DeclarationNode* {
         const d: DeclarationNode* = this.entry_decl(id);
         if (d == null || DeclarationNode::method_of(d) == null) { return null; }
-        return DeclarationNode::with_shape(d);
+        return d;
     }
 
     /// The linker symbol of entry `id`: the name the declaration is known
@@ -723,14 +716,6 @@ public:
         return this.entries_in_family(this.overload_func_family[this.slot_of(e)]);
     }
 
-    /// Every constructor entry of the type definition `d`, in registration
-    /// order; empty for a type that registered none.
-    constructor_entries_of(&this, d: DefId) -> [OverloadId] {
-        if (!d.is_valid()) { return []; }
-        const slot: i64 = this.defs.slot(d);
-        if (slot >= this.ctor_families.length || this.ctor_families[slot].is_none()) { return []; }
-        return this.entries_in_family(this.ctor_families[slot]);
-    }
 
     /// The entries registered in the family stored under `slot`.
     entries_in_family(&this, slot: FamilySlot) -> [OverloadId] {
@@ -806,7 +791,7 @@ public:
         const decl: DeclarationNode* = this.method_decl_of(d);
         if (decl == null) { return null; }
         if (DeclarationNode::method_of(decl) != null) { return DeclarationNode::method_of(decl).func; }
-        if (DeclarationNode::fn_of(decl) != null) { return DeclarationNode::with_shape(decl); }
+        if (DeclarationNode::fn_of(decl) != null) { return decl; }
         return null;
     }
 
@@ -941,7 +926,7 @@ public:
         };
     }
 
-    /// Register the named type (struct, class, enum, trait, alias) that the
+    /// Register the named type (struct, enum, trait, alias) that the
     /// definition `def` is, with its visibility verdict.  The verdict is
     /// recorded here, with the key, so no registered type is ever asked
     /// about before it has one.
@@ -1159,8 +1144,8 @@ public:
                 func.resolved_return_type, param_types, func.is_variadic);
 
             // Compute the mangled LLVM symbol name.  The
-            // receiver-kind / non-receiver-params split is shared with the
-            // codegen vtable-resolution path (see method_receiver_kind).
+            // receiver-kind / non-receiver-params split is shared with
+            // codegen (see method_receiver_kind).
             const type_qname: QualifiedName = QualifiedName::from_symbol(type_sym);
             const receiver_kind: ReceiverKind = DeclarationIndex::method_receiver_kind(
                 func_decl, method.is_static, intern);
@@ -1191,22 +1176,12 @@ public:
             };
             // The entry is the declaration's identity: stamped on the node
             // so every consumer holding the node - the definition emitter,
-            // a call sema or mono binds to it, a vtable slot - reads the
-            // symbol and signature registration wrote, and mangles nothing.
+            // a call sema or mono binds to it - reads the symbol and
+            // signature registration wrote, and mangles nothing.
             const entry: OverloadId = this.keep_def_entry(func.def, this.register_signature(
                 FamilyOwner::Type(owner), func.name, func_type_ref, ret, eff_mangled, func.origin_trait,
                 if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span }, method_decl));
             func.set_overload_entry(entry);
-            // A constructor's family is its type's: `Node(1)` and `new
-            // Node(1)` name the type, and its constructors are asked by it.
-            if (method.is_constructor && entry.is_valid()) {
-                const td: DefId = this.registered_def(owner);
-                if (td.is_valid()) {
-                    const ts: i64 = this.defs.slot(td);
-                    while (this.ctor_families.length <= ts) { this.ctor_families.push(FamilySlot::none()); }
-                    this.ctor_families[ts] = this.overload_func_family[this.slot_of(entry)];
-                }
-            }
             // A copy is the owner's method for the definition it stands for.
             // A specialization of a generic method is that definition AND
             // its own type arguments, an instance this table does not hold,
@@ -1296,8 +1271,7 @@ public:
 
     /// The method type `ty` holds for its family under `leaf`: the first of
     /// the type's own method records whose declaration the member-function
-    /// door answers for `(ty, leaf)`, or null.  A struct's, a class's own
-    /// (its bases hold theirs) or an enum's.
+    /// door answers for `(ty, leaf)`, or null.  A struct's or an enum's.
     type_method(&this, ty: TypeRef, leaf: SymbolStr, arena: TypeArena*) -> MethodInfo* {
         const named: [DeclarationNode*] = this.methods_named(FamilyOwner::Type(ty), leaf);
         return this.type_method_among(ty, &named, arena);
@@ -1312,15 +1286,13 @@ public:
         mut methods: &[MethodInfo] = &no_methods;
         if (t.kind == TypeKind::Struct) {
             methods = &t.as_struct().methods;
-        } else if (t.kind == TypeKind::Class) {
-            methods = &t.as_class().methods;
         } else if (t.kind == TypeKind::Enum) {
             methods = &t.as_enum().methods;
         } else {
             return null;
         }
         for (mut i: i64 = 0; i < methods.length; i++) {
-            if (DeclarationIndex::holds_method(named, DeclarationNode::with_shape(methods[i].ast_node))) { return &methods[i]; }
+            if (DeclarationIndex::holds_method(named, methods[i].ast_node)) { return &methods[i]; }
         }
         return null;
     }

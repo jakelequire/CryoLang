@@ -44,7 +44,7 @@ import std::collections::{ pair, hashmap };
 import compiler::resolver::intern_table;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, FunctionDecl, GenericParamDecl,
+    DeclarationNode, FunctionDecl, GenericParamDecl,
     ImplBlock, MethodDecl, StructDecl, TraitDecl, UnionDecl
 };
 import compiler::types::arena::{ TypeArena };
@@ -65,7 +65,6 @@ type enum TemplateKind {
     Function;
     Struct;
     Union;
-    Class;
     Enum;
     Trait;
     TypeAlias;
@@ -142,14 +141,13 @@ type struct TemplateEntry {
     }
 
     /// The `where` bounds written on this template's own declaration - a
-    /// struct, union, class or enum; null for anything else, a function
-    /// template's bounds being its declaration's.
+    /// struct, union or enum; null for anything else, a function template's
+    /// bounds being its declaration's.
     declared_where_bounds(&this) -> [ast::TraitBound]* {
         if (this.ast_node == null) { return null; }
         return match (this.kind) {
             TemplateKind::Struct    => { &(DeclarationNode::struct_of(this.ast_node)).where_bounds }
             TemplateKind::Union     => { &(DeclarationNode::union_of(this.ast_node)).where_bounds }
-            TemplateKind::Class     => { &(this.ast_node as ClassDeclNode*).where_bounds }
             TemplateKind::Enum      => { &DeclarationNode::enum_of(this.ast_node).where_bounds }
             TemplateKind::Function  => { null }
             TemplateKind::Trait     => { null }
@@ -208,15 +206,11 @@ type struct TemplateEntry {
                 const decl: UnionDecl* = DeclarationNode::union_of(this.ast_node);
                 decl.generic_params
             }
-            TemplateKind::Class => {
-                const decl: ClassDeclNode* = this.ast_node as ClassDeclNode*;
-                decl.generic_params
-            }
             TemplateKind::Enum => {
                 DeclarationNode::enum_of(this.ast_node).generic_params
             }
             TemplateKind::Function => {
-                const decl_decl: DeclarationNode* = DeclarationNode::with_shape(this.ast_node);
+                const decl_decl: DeclarationNode* = this.ast_node;
                 const decl: FunctionDecl* = DeclarationNode::fn_of(decl_decl);
                 decl.generic_params
             }
@@ -361,15 +355,15 @@ type struct GenericRegistry {
     trait_decl_keys:    [DefId];
 
     // -- Inherent-owner registry --
-    // Maps a type's arena id to the StructDecl* /
-    // ClassDeclNode* that owns inline generic methods on a NON-generic
+    // Maps a type's arena id to the StructDecl* that owns inline generic
+    // methods on a NON-generic
     // type.  Lets `try_infer_method_call` find the AST for receivers like
     // `Request` or `Response` whose generic method declarations
     // (`parse<R>`, `write_to<W>`) live inline on the struct rather than
     // in an `implement` block; those never go through monomorphization
     // themselves and therefore have no spec_entries row to walk.
     // Populated during TemplateRegistration for any non-generic
-    // struct/class that has at least one generic method (static or not).
+    // struct that has at least one generic method (static or not).
     inherent_owner_index: HashMap<TypeKey, i64>;
     inherent_owner_nodes: [DeclarationNode*];
 
@@ -1395,7 +1389,7 @@ type struct GenericRegistry {
     /// with it, so every other reader asks by the `LangItem`.
     ///
     /// Record `def` when its path is a `LangItem`'s. Called once per trait,
-    /// enum, struct and class declaration and per function signature, at the
+    /// enum and struct declaration and per function signature, at the
     /// registration site, with the id that registration made - so a claim is
     /// always a declaration's own identity, never one built from a name.
     ///
@@ -1463,7 +1457,7 @@ type struct GenericRegistry {
         return DeclName::empty();
     }
 
-    /// Register a non-generic struct/class declaration as an "inherent
+    /// Register a non-generic struct declaration as an "inherent
     /// owner": a type whose inline `methods[]` array carries one or
     /// more generic methods.  Indexed by the type itself, so an inference
     /// path holding a receiver's TypeRef asks by it and a same-leaf type in

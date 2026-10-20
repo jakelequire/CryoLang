@@ -81,7 +81,7 @@ or reads the store by identity.  Locked so far:
 | an enum type's variants (`EnumVariantInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-variant` (`EnumType::variant_index`) | text for a message: `EnumVariantInfo::display_name` |
 | the declaration index's families and module globals (`overload_index`, `func_type_refs`, `refused_methods`, `overload_func_family`, `overload_func_mangled`, `module_global_leaves`, `module_global_extern_syms`, `extern_symbol_first`, `family_slot`) | `compiler/src/compiler/decl_index.cryo` | `member-function`, `member-global` | none |
 | the interner (`strings`, `lookup`) | `compiler/src/compiler/resolver/intern_table.cryo` | `intern` | `resolve`, `shown` |
-| a struct's or class's fields (`FieldInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-field` (`StructType::field_position`, `ClassType::own_field_position`; `MemberResolver::field_of` asks them) | by position; the name sealed for a message or a synthesized node: `FieldInfo::decl_name` |
+| a struct's fields (`FieldInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-field` (`StructType::field_position`; `MemberResolver::field_of` asks it) | by position; the name sealed for a message or a synthesized node: `FieldInfo::decl_name` |
 | the loader's namespace maps (`ModuleLoader.scanned_ns`, `ns_map`) | `compiler/src/compiler/module_loader.cryo` | `loader-path` | none |
 | the module graph's names (`ModuleInfo.name`, `namespace_name`; `ModuleGraph.name_index`, `module_defs`, `def_list`, `def_paths`) and each module's import list (`ModuleInfo.visible`) | `compiler/src/compiler/module_graph.cryo` | `module-by-path` | by identity: `ModuleInfo::path`, `namespace_path`, `declares_namespace`, `ModuleGraph::imports`; a body path's modules through `ModuleGraph::modules_written_as`; text for a message, a mangled symbol or a manifest entry through `ModulePath::decl_name`; a declaration's canonical name, `module::leaf`, composed by `ModulePath::qualified` and nowhere else |
 | the template registry's names (`TemplateEntry.name`) | `compiler/src/compiler/types/generic_registry.cryo` | none: the registry is asked by definition | text for a message: `TemplateEntry::display_name`; a mangled name is spelled from `leaf_name`, a `DeclName` |
@@ -91,13 +91,12 @@ or reads the store by identity.  Locked so far:
 |---|---|---|---|
 | `scope-value` | `Resolver::lookup_value` | `compiler/src/compiler/resolver/resolver.cryo` | bare identifier to its binding, value namespace |
 | `scope-type` | `Resolver::type_binding` | `compiler/src/compiler/resolver/resolver.cryo` | written type name, or a type path's first segment, to its binding in the writer's ribs; the name layer's `NameResolver::type_spelling_res` asks it and reads the binding's kind |
-| `scope-type` | `Resolver::type_res_in_scope` | `compiler/src/compiler/resolver/resolver.cryo` | written type name's leaf, type namespace, walking outward from an explicit scope: a module's own scope, or the scope enclosing a class whose base it names |
+| `scope-type` | `Resolver::type_res_in_scope` | `compiler/src/compiler/resolver/resolver.cryo` | written type name's leaf, type namespace, walking outward from an explicit scope: a module's own scope |
 | `member-function` | `DeclarationIndex::lookup_family_entries` | `compiler/src/compiler/decl_index.cryo` | member: a function or method family, by owner and leaf; a generic type's own methods under the template itself (`FamilyOwner::Template`) |
 | `member-export` | `Resolver::exports_named` | `compiler/src/compiler/resolver/resolver.cryo` | member: a module's public declarations, by the module and leaf, read off its export list |
 | `member-global` | `DeclarationIndex::global_in_module` | `compiler/src/compiler/decl_index.cryo` | member: a module's global, by the module and leaf |
 | `member-field` | `MemberResolver::field_of` | `compiler/src/compiler/sema/member_resolver.cryo` | member: a field, by owner type and leaf |
 | `member-field` | `StructType::field_position` | `compiler/src/compiler/types/user_defined.cryo` | member: a field of a struct in hand, by leaf, to its position among the struct's fields |
-| `member-field` | `ClassType::own_field_position` | `compiler/src/compiler/types/user_defined.cryo` | member: a field of a class in hand, by leaf, to its position among the class's own fields |
 | `member-variant` | `EnumType::variant_index` | `compiler/src/compiler/types/user_defined.cryo` | member: an enum variant, by owner type and leaf |
 | `member-variant` | `EnumDecl::variant_position` | `compiler/src/compiler/AST/declaration.cryo` | member: an enum variant, by the enum's declaration and leaf, to its position among the declared variants - for a constant folded off the declaration |
 | `trait-method` | `GenericRegistry::trait_item_slot` | `compiler/src/compiler/types/generic_registry.cryo` | member: a trait's declared method, by trait identity and leaf, to its position in the trait |
@@ -157,6 +156,10 @@ yet is recorded with the change that builds it, not here.
 469. **Node type names stay unabbreviated** (`ExpressionNode`, not
      `Expr`): names in the compiler are written out in full, as the keyword
      is `implement` and not a shortening of it.  (Jake)
+
+470. **A test of the class feature is deleted with the feature, not ported
+     to a struct,** including one that used a class only incidentally; this
+     replaces ruling 386's porting of incidental ones.  (Jake)
 
 462. **A path through a bounded type parameter naming a member no bound
      declares (`T::missing()` in a generic function that is instantiated)

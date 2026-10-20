@@ -2,9 +2,8 @@
 ///
 /// Lowering for `node.callee(args)` in all its shapes:
 ///   - bare-identifier call (`foo(x)`)             -> direct call after sema's mangled-callee
-///   - method-on-object (`obj.method(x)`)          -> vtable dispatch when virtual
+///   - method-on-object (`obj.method(x)`)          -> direct call to the pinned method
 ///   - scope-resolution call (`Mod::fn(x)`)        -> qualified resolver lookup
-///   - class/struct construction (`Cls(args)`)     -> alloca + ctor invocation + load
 ///   - enum variant construction                   -> delegated to EnumVariantEmitter
 ///   - intrinsic call (`@-prefixed or builtins`)   -> inline IR via IntrinsicEmitter::try_emit
 ///   - divergent callee (`panic`)                   -> call followed by `unreachable`
@@ -82,7 +81,7 @@ import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, EnumType, EnumVariantInfo, FieldInfo, StructType
+    EnumType, EnumVariantInfo, FieldInfo, StructType
 };
 import compiler::codegen::visit::enum_variant_emitter::{ EnumVariantEmitter };
 
@@ -303,19 +302,6 @@ type struct CallEmitter {
         mut out: Emitted = Emitted::none();
         mut callee_val: LValue = LValue::null();
 
-        // Break pointer chains into locals (see the codegen helper note).
-        const intern: InternTable* = this.cg.get_intern();
-
-        // Virtual-dispatch state: populated in the MemberAccess branch when
-        // the static receiver type declares virtual methods and the called
-        // method has a vtable slot.  If set, after we emit arg evaluation
-        // and fn_ty lookup, we replace `callee_val` with a vtable-indexed
-        // function-pointer load instead of a direct call to the statically
-        // resolved function.
-        mut vtable_dispatch: boolean = false;
-        mut vtable_slot_idx: i32 = -1;
-        mut vtable_obj_ref: TypeRef = TypeRef::invalid();
-
         const id: IdentifierExpr* = ExpressionNode::identifier_of(node.callee);
         if (id != null) {
 
@@ -342,97 +328,6 @@ type struct CallEmitter {
             // names sema has already resolved.
             if (node.resolved_callee.is_some()) {
                 callee_val = this.cg.resolver.resolve_pinned(node.resolved_callee);
-            }
-
-            // 3b. Class / struct constructor call: `ClassName(args)` resolves
-            //     to the method named `ClassName` on the class itself,
-            //     registered as `{qualified_class}::ClassName`.  Sema sets
-            //     the call's resolved_type to the class type for this form.
-            //     Unlike the `new` form (which heap-allocates), this emits
-            //     a stack-local construction: alloca the object, call the
-            //     constructor with the alloca pointer as `this`, then load
-            //     the populated value so the caller sees an rvalue of the
-            //     class type.
-            if (!callee_val.is_valid()) {
-                const arena: TypeArena* = this.cg.get_arena();
-                // The class being constructed is what sema resolved the call
-                // to, read off the node; its constructor is registered under
-                // that type's own name.  Computed on every such call.
-                mut new_ref: TypeRef = TypeRef::invalid();
-                mut new_qn: SymbolStr = SymbolStr::empty();
-                if (e.has_resolved_type()) {
-                    const rt: Type* = arena.lookup(e.resolved_type);
-                    if (rt != null && (rt.kind == TypeKind::Class || rt.kind == TypeKind::Struct)) {
-                        new_ref = e.resolved_type;
-                        new_qn = arena.get_qualified_name(new_ref).spelling();
-                    }
-                }
-                const type_ref: TypeRef = new_ref;
-                const ctor_qn: SymbolStr = new_qn;
-                if (ctor_qn.is_valid() && type_ref.is_valid()) {
-                    // Constructor LLVM arity = user args + 1 for `this`.
-                    const ctor_arity: u32 = (node.arguments.length + 1) as u32;
-                    const ctor_fn: LValue = this.cg.resolver.resolve_constructor(
-                        this.cg.ctx.decl_index.registered_def(type_ref), ctor_arity as i64);
-                    if (ctor_fn.is_valid()) {
-                        const mapped: LType = this.cg.type_mapper.map_type(type_ref);
-                        const current_fn: LValue = this.get_current_function();
-                        if (mapped.is_valid() && current_fn.is_valid()) {
-                            const obj_alloca: LValue = this.cg.flow.create_entry_alloca(
-                                current_fn, "ctor.tmp", mapped);
-                            // Vtable slot for classes with virtual methods.
-                            const t_for_vtbl: Type* = this.cg.arena_type(type_ref);
-                            if (t_for_vtbl != null && t_for_vtbl.kind == TypeKind::Class) {
-                                const cls_vtbl: ClassType* = t_for_vtbl.as_class();
-                                if (cls_vtbl.has_virtual_methods) {
-                                    const qname: QualifiedName = QualifiedName::from_symbol(ctor_qn);
-                                    const vtbl_name: MangledName = MangledName::for_vtable(
-                                        intern, qname);
-                                    mut vtbl_global: LValue = this.cg.llvm_module.get_named_global(vtbl_name);
-                                    if (!vtbl_global.is_valid()) {
-                                        // Cross-module reference: declare the
-                                        // vtable as extern.  Mirrors the new-
-                                        // expression path: the placeholder type
-                                        // doesn't need to match the definition
-                                        // exactly (opaque pointers), the linker
-                                        // resolves by symbol name.  Without
-                                        // this, constructor calls into a class
-                                        // defined in another module skip the
-                                        // vptr init entirely and any virtual
-                                        // dispatch on the result reads garbage.
-                                        const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
-                                        const placeholder_ty: LType = LType::array_of(fn_ptr_ty, 1);
-                                        vtbl_global = this.cg.llvm_module.add_global(placeholder_ty, vtbl_name);
-                                    }
-                                    if (vtbl_global.is_valid()) {
-                                        const vptr_slot: LValue = this.cg.builder.build_struct_gep(
-                                            mapped, obj_alloca, 0, "vptr.slot");
-                                        if (vptr_slot.is_valid()) {
-                                            this.cg.builder.build_store(vtbl_global, vptr_slot);
-                                        }
-                                    }
-                                }
-                            }
-                            const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
-                            if (ctor_ty.is_valid() && LType::kind_of(ctor_ty.raw) == LTypeKind::Function) {
-                                mut ctor_args: [Pair<LValue, TypeRef>] = [];
-                                ctor_args.push(Pair::<LValue, TypeRef>::new(obj_alloca, e.resolved_type));
-                                for (mut ci: i64 = 0; ci < node.arguments.length; ci++) {
-                                    const carg: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ci]);
-                                    ctor_args.push(Pair::<LValue, TypeRef>::new(carg, node.arguments[ci].resolved_type));
-                                }
-                                mut ctor_res: LValue = LValue::null();
-                                ctor_res = this.cg.expr_ops.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
-                            }
-                            // Load the constructed value as the expression result.
-                            const loaded: LValue = this.cg.builder.build_load(
-                                mapped, obj_alloca, "ctor.val");
-                            out.value = loaded;
-                            out.is_lvalue = false;
-                            return out;
-                        }
-                    }
-                }
             }
 
             // 4. Function-typed parameter: look in the value table, by the
@@ -541,8 +436,7 @@ type struct CallEmitter {
             // Member access: sema's overload selection (or mono's, for a
             // specialization) pins the mangled LLVM callee on
             // `resolved_callee`.  Codegen detects the function-pointer-field
-            // shortcut, picks up virtual-dispatch state for class receivers,
-            // then routes the pin through `resolve_pinned`.
+            // shortcut, then routes the pin through `resolve_pinned`.
             const ma: MemberAccessExpr* = ExpressionNode::member_access_of(node.callee);
 
             // Function-pointer field call: `receiver.field(args)` where
@@ -586,82 +480,6 @@ type struct CallEmitter {
                     return out;
                 }
                 return this.call_through_value(visitor, e, node, fn_ptr, plan);
-            }
-
-            // Get the object's type, unwrapping pointer/reference.
-            mut obj_ref: TypeRef = ma.object.resolved_type;
-            mut t: Type* = this.cg.arena_type(obj_ref);
-            if (t != null && t.kind == TypeKind::Pointer) {
-                const ptr_t: PointerType* = t.as_pointer();
-                obj_ref = ptr_t.pointee;
-                t = this.cg.arena_type(obj_ref);
-            } else if (t != null && t.kind == TypeKind::Reference) {
-                const ref_t: ReferenceType* = t.as_reference();
-                obj_ref = ref_t.referent;
-                t = this.cg.arena_type(obj_ref);
-            }
-
-            // Follow InstantiatedType chain to get the concrete type's TypeRef.
-            mut inst_depth: i32 = 0;
-            while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth < 5) {
-                const inst: InstantiatedType* = t.as_instantiated();
-                if (inst.has_resolved_type()) {
-                    obj_ref = inst.resolved_type;
-                    t = this.cg.arena_type(obj_ref);
-                } else { break; }
-                inst_depth += 1;
-            }
-
-            // Also unwrap pointer/reference AFTER InstantiatedType unwrap
-            // (some monomorphized types resolve to Pointer<ConcreteStruct>).
-            if (t != null && t.kind == TypeKind::Pointer) {
-                const ptr_t2: PointerType* = t.as_pointer();
-                obj_ref = ptr_t2.pointee;
-                t = this.cg.arena_type(obj_ref);
-            } else if (t != null && t.kind == TypeKind::Reference) {
-                const ref_t2: ReferenceType* = t.as_reference();
-                obj_ref = ref_t2.referent;
-                t = this.cg.arena_type(obj_ref);
-            }
-
-            // Check for virtual dispatch: if the STATIC receiver type is a
-            // class with virtual methods and the call is pinned to a
-            // specific method declaration, dispatch indirectly through
-            // the object's vtable pointer.  We use the static type (rather
-            // than walking to the most-derived type) because the vtable
-            // layout is defined by the static type's declaration order;
-            // subclass vtables are inheritance-complete, so `slot[idx]`
-            // resolves correctly at runtime to whatever override the
-            // dynamic type installed.  The slot key is (name, param_types)
-            // read directly from the pinned method's declaration; no string
-            // matching, no guessing at arg-type display names, no chance
-            // of collapsing overloads.
-            const rm_decl: DeclarationNode* = this.cg.get_decl_index().entry_method(node.resolved_callee.decl_entry());
-            const rm: MethodDecl* = DeclarationNode::method_of(rm_decl);
-            if (t != null && t.kind == TypeKind::Class && rm != null) {
-                const cls_for_vtbl: ClassType* = t.as_class();
-                if (cls_for_vtbl.has_virtual_methods) {
-                    if (rm.func != null) {
-                        const fn_node_decl: DeclarationNode* = rm.func;
-                        const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
-                        // Extract the resolved method's declared param
-                        // types (skipping self) in exact declaration order.
-                        mut rm_params: [TypeRef] = [];
-                        for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
-                            const pp_decl: DeclarationNode* = fn_node.parameters[pi];
-                            const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
-                            if (pp == null) { continue; }
-                            if (pp.is_receiver()) { continue; }
-                            rm_params.push(pp.resolved_type);
-                        }
-                        const slot_idx: i32 = this.cg.decl.vtable_slot_index(cls_for_vtbl, fn_node.name, rm_params);
-                        if (slot_idx >= 0) {
-                            vtable_dispatch = true;
-                            vtable_slot_idx = slot_idx;
-                            vtable_obj_ref = obj_ref;
-                        }
-                    }
-                }
             }
 
             // `resolved_callee` is the mangled LLVM symbol selection chose;
@@ -875,45 +693,8 @@ type struct CallEmitter {
             return out;
         }
 
-        // Virtual dispatch: replace the direct callee with a vtable-loaded
-        // function pointer.  We keep `fn_ty` from the statically resolved
-        // function; it describes the correct signature for `LLVMBuildCall2`
-        // and matches whatever override got installed in the slot at
-        // runtime (since all overrides share the base's signature).  The
-        // statically resolved function stays the one whose parameters say
-        // how the arguments pass (`declared`): the pointer loaded from the
-        // slot carries none.
+        // The function whose parameters say how the arguments pass.
         const declared: LValue = callee_val;
-        if (vtable_dispatch && args.length > 0 && args[0].first.is_valid() && vtable_obj_ref.is_valid()) {
-            const class_lty: LType = this.cg.type_mapper.map_type(vtable_obj_ref);
-            if (class_lty.is_valid()) {
-                const vptr_slot: LValue = this.cg.builder.build_struct_gep(
-                    class_lty, args[0].first, 0, "vptr.slot");
-                if (vptr_slot.is_valid()) {
-                    const i8_ptr_ty: LType = LType::pointer_to(LType::i8());
-                    const i8_ptr_ptr_ty: LType = LType::pointer_to(i8_ptr_ty);
-                    const vtbl: LValue = this.cg.builder.build_load(
-                        i8_ptr_ptr_ty, vptr_slot, "vtbl");
-                    if (vtbl.is_valid()) {
-                        const idx_val: LValue = LType::const_int(
-                            LType::i32(), vtable_slot_idx as u64, false);
-                        const idx_buf: void* = libc::malloc(8);
-                        const idx_slots: void** = idx_buf as void**;
-                        idx_slots[0] = idx_val.raw;
-                        const fn_slot: LValue = this.cg.builder.build_gep(
-                            i8_ptr_ty, vtbl, idx_buf, 1, "vtbl.slot");
-                        libc::free(idx_buf);
-                        if (fn_slot.is_valid()) {
-                            const fn_ptr: LValue = this.cg.builder.build_load(
-                                i8_ptr_ty, fn_slot, "vtbl.fn");
-                            if (fn_ptr.is_valid()) {
-                                callee_val = fn_ptr;
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         const ret_ty: LType = this.cg.type_mapper.map_type(e.resolved_type);
         const void_ty: LType = LType::void_type();
@@ -1424,7 +1205,7 @@ type struct CallEmitter {
 
     /// Drop-glue expansion for an aggregate with no user-written `drop`.
     /// Returns true when the receiver type is a kind glue handles, so the
-    /// caller suppresses the "no method" error.  Structs/classes recurse
+    /// caller suppresses the "no method" error.  Structs recurse
     /// into each droppable field in place; other aggregate kinds are not yet
     /// expanded and return true as a no-op (keeping today's behavior).
     emit_drop_glue(mut &this, visitor: IRGeneratorVisitor*, receiver: ExpressionNode*,
@@ -1448,11 +1229,6 @@ type struct CallEmitter {
         if (t.kind == TypeKind::Struct) {
             const st: StructType* = t.as_struct();
             this.emit_field_drops(visitor, receiver, st.fields);
-            return true;
-        }
-        if (t.kind == TypeKind::Class) {
-            const ct: ClassType* = t.as_class();
-            this.emit_field_drops(visitor, receiver, ct.fields);
             return true;
         }
         if (t.kind == TypeKind::Enum) {
@@ -1503,7 +1279,7 @@ type struct CallEmitter {
                 receiver, idx_sym, receiver.span, receiver.span);
             elem_access.set_resolved_type(elem_type);
             // Minted after the last sema walk: the element is the i-th.
-            ExpressionNode::member_access_of(elem_access).set_resolved_member(MemberPin::Field(0, i));
+            ExpressionNode::member_access_of(elem_access).set_resolved_member(MemberPin::Field(i));
             mut drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
                 elem_access, drop_sym,
                 receiver.span, receiver.span);
@@ -1570,7 +1346,7 @@ type struct CallEmitter {
             field_access.set_resolved_type(f.field_type);
             // Minted after the last sema walk: the field is the i-th of the
             // aggregate's own list, which is the list walked here.
-            ExpressionNode::member_access_of(field_access).set_resolved_member(MemberPin::Field(0, i));
+            ExpressionNode::member_access_of(field_access).set_resolved_member(MemberPin::Field(i));
             mut drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
                 field_access, drop_sym,
                 receiver.span, receiver.span);

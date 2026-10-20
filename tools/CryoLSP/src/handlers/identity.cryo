@@ -26,7 +26,7 @@ import compiler::ast::node::{ Node, ProgramNode };
 import compiler::ast::node_locator;
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumDecl, FieldDecl,
+    DeclarationNode, EnumDecl, FieldDecl,
     FunctionDecl, ImplBlock, ImportDecl, MethodDecl,
     DeclKind, ModuleDecl, StructDecl, TraitDecl, UnionDecl, VarDecl
 };
@@ -294,7 +294,7 @@ type struct Locator {
             }
             Node::Pattern(p) => { return this.pattern(p); }
             Node::Decl(d) => {
-                match (d.shape) {
+                match (d.kind) {
                     DeclKind::Method(m) => {
                         if (m.func == null) { return Answer::nothing(); }
                         if (this.holds(m.func.name_span)) { return this.function_decl(m.func, m.func.name_span); }
@@ -318,9 +318,6 @@ type struct Locator {
                     DeclKind::Variant(_) => { return this.variant_decl(d); }
                     DeclKind::Field(f) => { return this.field_decl(d, f); }
                     DeclKind::Variable(v) => { return this.var_decl(d, v); }
-                    DeclKind::Legacy => {
-                        return this.type_decl(d, (d as ClassDeclNode*).def);
-                    }
                     DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Intrinsic(_)
                     | DeclKind::GenericParam(_) => {
                         return Answer::nothing();
@@ -384,9 +381,9 @@ type struct Locator {
     member_target(&this, m: MemberAccessExpr*, call: CallExpr*) -> Target {
         if (call != null) { return this.call_target(call); }
         match (&m.resolved_member) {
-            MemberPin::Field(depth, index) => {
+            MemberPin::Field(index) => {
                 if (m.object == null) { return Target::Nothing; }
-                return this.field_target(m.object.resolved_type, depth, index);
+                return this.field_target(m.object.resolved_type, index);
             }
             _ => { return Target::Nothing; }
         }
@@ -397,8 +394,8 @@ type struct Locator {
         for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
             if (!this.holds(sl.field_inits[i].span)) { continue; }
             match (&sl.field_inits[i].pin) {
-                MemberPin::Field(depth, index) => {
-                    return Answer::of(this.field_target(ty, depth, index),
+                MemberPin::Field(index) => {
+                    return Answer::of(this.field_target(ty, index),
                         sl.field_inits[i].span, TypeRef::invalid());
                 }
                 _ => { return Answer::nothing(); }
@@ -444,17 +441,17 @@ type struct Locator {
         if (decl == null) { return Target::Nothing; }
         mut f: DeclarationNode* = null;
         if (DeclarationNode::method_of(decl) != null) { f = DeclarationNode::method_of(decl).func; }
-        if (DeclarationNode::fn_of(decl) != null) { f = DeclarationNode::with_shape(decl); }
-        const shaped: DeclarationNode* = DeclarationNode::with_shape(decl);
+        if (DeclarationNode::fn_of(decl) != null) { f = decl; }
+        const shaped: DeclarationNode* = decl;
         if (shaped != null) {
-            match (shaped.shape) {
+            match (shaped.kind) {
                 DeclKind::Intrinsic(i) => { return Locator::def_target(i.def); }
                 DeclKind::Import(_) | DeclKind::Module(_)
                 | DeclKind::Variant(_) | DeclKind::Extern(_) | DeclKind::Destructure(_)
                 | DeclKind::TypeAlias(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
                 | DeclKind::Enum(_) | DeclKind::Trait(_) | DeclKind::Union(_)
                 | DeclKind::Struct(_) | DeclKind::Impl(_) | DeclKind::Variable(_)
-                | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+                | DeclKind::Function(_) | DeclKind::Method(_) => {}
             }
         }
         if (f == null) { return Target::Nothing; }
@@ -467,15 +464,9 @@ type struct Locator {
         return Target::Def(d);
     }
 
-    /// Field `index` of the type `depth` steps up the base chain from the
-    /// type `ty` names.
-    field_target(&this, ty: TypeRef, depth: i64, index: i64) -> Target {
-        mut owner: DefId = this.di.def_of(this.carrier(ty), this.ctx.type_arena);
-        for (mut k: i64 = 0; k < depth && owner.is_valid(); k++) {
-            const decl: DeclarationNode* = this.di.declaration_of(owner);
-            if (decl == null || !decl.is_class()) { return Target::Nothing; }
-            owner = this.res_def(&(decl as ClassDeclNode*).base_res);
-        }
+    /// Field `index` of the type `ty` names.
+    field_target(&this, ty: TypeRef, index: i64) -> Target {
+        const owner: DefId = this.di.def_of(this.carrier(ty), this.ctx.type_arena);
         if (!owner.is_valid()) { return Target::Nothing; }
         return Target::Field(owner, index);
     }
@@ -615,10 +606,6 @@ type struct Locator {
             const sd: StructDecl* = DeclarationNode::struct_of(p);
             owner = sd.def;
             index = Locator::field_position(&sd.fields, fd);
-        } else if (p.is_class()) {
-            const cd: ClassDeclNode* = p as ClassDeclNode*;
-            owner = cd.def;
-            index = Locator::field_position(&cd.fields, fd);
         } else if (DeclarationNode::union_of(p) != null) {
             const ud: UnionDecl* = DeclarationNode::union_of(p);
             owner = ud.def;

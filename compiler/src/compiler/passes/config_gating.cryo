@@ -21,14 +21,14 @@
 /// semantics in DirectiveProcessing are independent of platform gating.
 ///
 /// Scope of stripping:
-///   * top-level declarations (functions, structs, classes, enums,
+///   * top-level declarations (functions, structs, enums,
 ///     traits, type aliases, impl/extern blocks, ...) via their attached
 ///     directives;
-///   * whole `![target(...)]`-gated METHODS inside struct/class/impl
+///   * whole `![target(...)]`-gated METHODS inside struct/impl
 ///     bodies (filtered out of the owning node's `methods` list);
 ///   * inline `![dir] { stmt; ... }` blocks inside function AND method
 ///     bodies (see `process_block`).
-/// Struct/class FIELDS and enum VARIANTS are intentionally NOT gated:
+/// Struct FIELDS and enum VARIANTS are intentionally NOT gated:
 /// gating a data member would diverge a type's layout per platform.  Gate
 /// the whole type instead (write two same-named decls, one per OS).
 
@@ -47,7 +47,7 @@ import compiler::diag::{ ErrorCode };
 import utils::logger;
 import utils::logger::{ cdebug };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, FunctionDecl, ImplBlock, MethodDecl,
+    DeclarationNode, FunctionDecl, ImplBlock, MethodDecl,
     StructDecl, UnionDecl
 };
 import compiler::ast::node::{ ProgramNode };
@@ -346,8 +346,8 @@ type struct ConfigGatingPasses {
         // Fast-path scan: most function bodies have no inline cfg-gated
         // sub-blocks at all.  Skip the rebuild loop in that case so we
         // don't touch `block.statements`; array assignment through a
-        // class-field write is a known-fragile codegen path on the
-        // current pin.
+        // field write through a pointer is a known-fragile codegen path on
+        // the current pin.
         mut needs_filter: boolean = false;
         for (mut i: i64 = 0; i < block.statements.length; i++) {
             const stmt: Stmt* = block.statements[i];
@@ -409,7 +409,7 @@ type struct ConfigGatingPasses {
     /// True if any method in `methods` carries a platform gate that evaluates
     /// Inactive for `os` - i.e. the list needs to be rebuilt.  Scans without
     /// allocating so the overwhelmingly-common no-gate case stays cheap and
-    /// never rewrites the owning node's `methods` field (a class-field array
+    /// never rewrites the owning node's `methods` field (an array field
     /// write is a heavier codegen path; mirrors `process_block`'s fast-path).
     static methods_need_filter(methods: &[DeclarationNode*], env: CfgEnv) -> boolean {
         for (mut i: i64 = 0; i < methods.length; i++) {
@@ -422,7 +422,7 @@ type struct ConfigGatingPasses {
     }
 
     /// Build a fresh method list keeping only the methods active for `os`.
-    /// The caller assigns the result back onto the owning struct/class/impl
+    /// The caller assigns the result back onto the owning struct/impl
     /// node; only invoked after `methods_need_filter` confirms a rebuild is
     /// needed.  A method survives unless one of its attached gates evaluates
     /// Inactive - the same predicate (`decl_is_active`) used for top-level
@@ -501,15 +501,14 @@ type struct ConfigGatingPasses {
                 // would leave both rendering as live code.
                 ctx.note_inactive(decl.outer_span());
                 if (ctx.options.verbose) {
-                    cdebug("[ConfigGating] stripped %s for target os\n",
-                        decl.kind_name());
+                    cdebug("[ConfigGating] stripped a declaration for target os\n");
                 }
                 continue;
             }
 
             // Recurse into function/method bodies for inline `![dir] { ... }`
             // gates, and strip whole `![target(...)]`-gated methods inside
-            // struct / class / impl bodies.  Method-list filtering uses the
+            // struct / impl bodies.  Method-list filtering uses the
             // same `decl_is_active` predicate as top-level decls, so a
             // platform gate on a method behaves identically to one on a free
             // function - no more delegate-to-free-helper workaround needed.
@@ -544,13 +543,6 @@ type struct ConfigGatingPasses {
                     ud.methods = ConfigGatingPasses::active_methods(&ud.methods, env, ctx);
                 }
                 ConfigGatingPasses::walk_method_bodies(&ud.methods, env, ctx);
-            }
-            if (decl.is_class()) {
-                const cd: ClassDeclNode* = decl as ClassDeclNode*;
-                if (ConfigGatingPasses::methods_need_filter(&cd.methods, env)) {
-                    cd.methods = ConfigGatingPasses::active_methods(&cd.methods, env, ctx);
-                }
-                ConfigGatingPasses::walk_method_bodies(&cd.methods, env, ctx);
             }
             const ib: ImplBlock* = DeclarationNode::impl_of(decl);
             if (ib != null) {

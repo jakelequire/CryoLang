@@ -56,7 +56,7 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
-import compiler::types::user_defined::{ ClassType, FieldInfo, StructType };
+import compiler::types::user_defined::{ FieldInfo, StructType };
 import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
 import std::core::mem;
 import compiler::resolver::mangled_name::{ MangledName };
@@ -688,7 +688,7 @@ type struct CodegenPasses {
         for (mut i: i64 = 0; i < arena.types.length; i++) {
             const t: Type* = arena.types[i];
             if (t == null) { continue; }
-            if (t.kind != TypeKind::Struct && t.kind != TypeKind::Class) { continue; }
+            if (t.kind != TypeKind::Struct) { continue; }
             nominal += 1;
 
             // Only types this module put through the type mapper: mapping one
@@ -735,21 +735,11 @@ type struct CodegenPasses {
             }
 
             examined += 1;
-            mut name:      string = "<anon>";
-            mut min_align: u64    = 0;
-            mut nargs:     i64    = 0;
-            mut kind:      string = "C";
-            if (t.kind == TypeKind::Struct) {
-                const st: StructType* = t.as_struct();
-                name      = ctx.intern_table.shown(st.qualified_name);
-                min_align = st.min_alignment;
-                nargs     = st.type_args.length;
-                kind      = "S";
-            } else {
-                const cl: ClassType* = t.as_class();
-                name      = ctx.intern_table.shown(cl.qualified_name);
-                min_align = cl.min_alignment;
-            }
+            const st: StructType* = t.as_struct();
+            const name:      string = ctx.intern_table.shown(st.qualified_name);
+            const min_align: u64    = st.min_alignment;
+            const nargs:     i64    = st.type_args.length;
+            const kind:      string = "S";
 
             // WHERE each field lives, not just how big the type is.  Size and
             // alignment can both agree while the offsets do not: an
@@ -759,21 +749,11 @@ type struct CodegenPasses {
             // index comes from `field_element_index` - the same routine the
             // body was built from and every field GEP addresses through - so
             // this compares the mapping against LLVM's own layout rather than
-            // re-deriving it.  A class is checked on its OWN fields: an
-            // ancestor's recorded offset is relative to that ancestor's
-            // layout, and every class is audited in its own right anyway.
+            // re-deriving it.
             mut off_bad: i64 = 0;
             {
-                const empty_fields: [FieldInfo] = [];
-                mut fields_ref: &[FieldInfo] = &empty_fields;
-                mut skip: boolean = false;
-                if (t.kind == TypeKind::Struct) {
-                    const st1: StructType* = t.as_struct();
-                    if (st1.is_union) { skip = true; }
-                    fields_ref = &st1.fields;
-                } else {
-                    fields_ref = &t.as_class().fields;
-                }
+                const fields_ref: &[FieldInfo] = &st.fields;
+                const skip: boolean = st.is_union;
                 const n_elems: i64 = llvm::LLVMCountStructElementTypes(mapped.raw) as i64;
                 if (!skip) {
                     for (mut fi: i64 = 0; fi < (*fields_ref).length; fi++) {

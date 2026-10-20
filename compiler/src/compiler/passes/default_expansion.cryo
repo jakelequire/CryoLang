@@ -51,7 +51,7 @@ import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, EnumVariant, FieldDecl, FunctionDecl,
+    DeclarationNode, DeclKind, EnumVariant, FieldDecl, FunctionDecl,
     GenericParamDecl, ImplBlock, MethodDecl, StructDecl, TraitDecl,
     UnionDecl, VarDecl
 };
@@ -157,129 +157,106 @@ type struct DefaultExpansionPasses {
     static rewrite_decl(stmt: DeclarationNode*, reg: GenericRegistry*,
                         scope: ScopeStack*) -> void {
         if (stmt == null) { return; }
-        if (stmt.is_class()) {
-            const node: ClassDeclNode* = stmt as ClassDeclNode*;
-            const is_generic: boolean = node.generic_params.length > 0;
-            if (is_generic) { scope.push(node.def); }
-            for (mut i: i64 = 0; i < node.fields.length; i++) {
-                const f_decl: DeclarationNode* = node.fields[i];
-                const f: FieldDecl* = DeclarationNode::field_of(f_decl);
-                if (f != null && f.has_type_annotation()) {
-                    DefaultExpansionPasses::rewrite_annotation_in_place(
-                        f.type_annotation, reg, scope);
-                }
+        match (stmt.kind) {
+            DeclKind::Function(_) => {
+                DefaultExpansionPasses::rewrite_function_decl(
+                    stmt, reg, scope);
             }
-            for (mut i: i64 = 0; i < node.methods.length; i++) {
-                const m_decl: DeclarationNode* = node.methods[i];
-                const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-                if (m != null && m.func != null) {
-                    DefaultExpansionPasses::rewrite_function_decl(
-                        m.func, reg, scope);
-                }
-            }
-            if (is_generic) { scope.pop(); }
-        } else {
-            match (stmt.shape) {
-                DeclKind::Function(_) => {
-                    DefaultExpansionPasses::rewrite_function_decl(
-                        DeclarationNode::with_shape(stmt), reg, scope);
-                }
-                DeclKind::Impl(node) => {
-                    // An impl block is not the template's own body: its
-                    // methods are a site that CONSUMES the type, so a bare
-                    // reference to the target inside them is expanded like
-                    // any other.  Its generic parameters need no scope
-                    // entry - a parameter's stamp is `GenericParam`, which
-                    // names no template.
-                    for (mut i: i64 = 0; i < node.methods.length; i++) {
-                        const m_decl: DeclarationNode* = node.methods[i];
-                        const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-                        if (m != null && m.func != null) {
-                            DefaultExpansionPasses::rewrite_function_decl(
-                                m.func, reg, scope);
-                        }
-                    }
-                }
-                DeclKind::Struct(node) => {
-                    const is_generic: boolean = node.generic_params.length > 0;
-                    if (is_generic) { scope.push(node.def); }
-                    for (mut i: i64 = 0; i < node.fields.length; i++) {
-                        const f_decl: DeclarationNode* = node.fields[i];
-                        const f: FieldDecl* = DeclarationNode::field_of(f_decl);
-                        if (f != null && f.has_type_annotation()) {
-                            DefaultExpansionPasses::rewrite_annotation_in_place(
-                                f.type_annotation, reg, scope);
-                        }
-                    }
-                    for (mut i: i64 = 0; i < node.methods.length; i++) {
-                        const m_decl: DeclarationNode* = node.methods[i];
-                        const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-                        if (m != null && m.func != null) {
-                            DefaultExpansionPasses::rewrite_function_decl(
-                                m.func, reg, scope);
-                        }
-                    }
-                    if (is_generic) { scope.pop(); }
-                }
-                DeclKind::Trait(node) => {
-                    const is_generic: boolean = node.generic_params.length > 0;
-                    if (is_generic) { scope.push(node.def); }
-                    for (mut i: i64 = 0; i < node.methods.length; i++) {
+            DeclKind::Impl(node) => {
+                // An impl block is not the template's own body: its
+                // methods are a site that CONSUMES the type, so a bare
+                // reference to the target inside them is expanded like
+                // any other.  Its generic parameters need no scope
+                // entry - a parameter's stamp is `GenericParam`, which
+                // names no template.
+                for (mut i: i64 = 0; i < node.methods.length; i++) {
+                    const m_decl: DeclarationNode* = node.methods[i];
+                    const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+                    if (m != null && m.func != null) {
                         DefaultExpansionPasses::rewrite_function_decl(
-                            node.methods[i], reg, scope);
+                            m.func, reg, scope);
                     }
-                    if (is_generic) { scope.pop(); }
                 }
-                DeclKind::Enum(node) => {
-                    const is_generic: boolean = node.generic_params.length > 0;
-                    if (is_generic) { scope.push(node.def); }
-                    // Enum variant payload annotations (if any).
-                    for (mut i: i64 = 0; i < node.variants.length; i++) {
-                        const v: EnumVariant* = DeclarationNode::variant_of(node.variants[i]);
-                        if (v == null) { continue; }
-                        for (mut j: i64 = 0; j < v.associated_types.length; j++) {
-                            DefaultExpansionPasses::rewrite_annotation_in_place(
-                                v.associated_types[j], reg, scope);
-                        }
-                    }
-                    if (is_generic) { scope.pop(); }
-                }
-                DeclKind::TypeAlias(node) => {
-                    const is_generic: boolean = node.generic_params.length > 0;
-                    if (is_generic) { scope.push(node.def); }
-                    if (node.target_annotation != null) {
-                        DefaultExpansionPasses::rewrite_annotation_in_place(
-                            node.target_annotation, reg, scope);
-                    }
-                    if (is_generic) { scope.pop(); }
-                }
-                DeclKind::Union(node) => {
-                    const is_generic: boolean = node.generic_params.length > 0;
-                    if (is_generic) { scope.push(node.def); }
-                    for (mut i: i64 = 0; i < node.fields.length; i++) {
-                        const f_decl: DeclarationNode* = node.fields[i];
-                        const f: FieldDecl* = DeclarationNode::field_of(f_decl);
-                        if (f != null && f.has_type_annotation()) {
-                            DefaultExpansionPasses::rewrite_annotation_in_place(
-                                f.type_annotation, reg, scope);
-                        }
-                    }
-                    for (mut i: i64 = 0; i < node.methods.length; i++) {
-                        const m_decl: DeclarationNode* = node.methods[i];
-                        const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-                        if (m != null && m.func != null) {
-                            DefaultExpansionPasses::rewrite_function_decl(
-                                m.func, reg, scope);
-                        }
-                    }
-                    if (is_generic) { scope.pop(); }
-                }
-                // No other kind with a payload holds an annotation here.
-                DeclKind::Import(_) | DeclKind::Intrinsic(_)
-                | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
-                | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
-                | DeclKind::Variable(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
             }
+            DeclKind::Struct(node) => {
+                const is_generic: boolean = node.generic_params.length > 0;
+                if (is_generic) { scope.push(node.def); }
+                for (mut i: i64 = 0; i < node.fields.length; i++) {
+                    const f_decl: DeclarationNode* = node.fields[i];
+                    const f: FieldDecl* = DeclarationNode::field_of(f_decl);
+                    if (f != null && f.has_type_annotation()) {
+                        DefaultExpansionPasses::rewrite_annotation_in_place(
+                            f.type_annotation, reg, scope);
+                    }
+                }
+                for (mut i: i64 = 0; i < node.methods.length; i++) {
+                    const m_decl: DeclarationNode* = node.methods[i];
+                    const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+                    if (m != null && m.func != null) {
+                        DefaultExpansionPasses::rewrite_function_decl(
+                            m.func, reg, scope);
+                    }
+                }
+                if (is_generic) { scope.pop(); }
+            }
+            DeclKind::Trait(node) => {
+                const is_generic: boolean = node.generic_params.length > 0;
+                if (is_generic) { scope.push(node.def); }
+                for (mut i: i64 = 0; i < node.methods.length; i++) {
+                    DefaultExpansionPasses::rewrite_function_decl(
+                        node.methods[i], reg, scope);
+                }
+                if (is_generic) { scope.pop(); }
+            }
+            DeclKind::Enum(node) => {
+                const is_generic: boolean = node.generic_params.length > 0;
+                if (is_generic) { scope.push(node.def); }
+                // Enum variant payload annotations (if any).
+                for (mut i: i64 = 0; i < node.variants.length; i++) {
+                    const v: EnumVariant* = DeclarationNode::variant_of(node.variants[i]);
+                    if (v == null) { continue; }
+                    for (mut j: i64 = 0; j < v.associated_types.length; j++) {
+                        DefaultExpansionPasses::rewrite_annotation_in_place(
+                            v.associated_types[j], reg, scope);
+                    }
+                }
+                if (is_generic) { scope.pop(); }
+            }
+            DeclKind::TypeAlias(node) => {
+                const is_generic: boolean = node.generic_params.length > 0;
+                if (is_generic) { scope.push(node.def); }
+                if (node.target_annotation != null) {
+                    DefaultExpansionPasses::rewrite_annotation_in_place(
+                        node.target_annotation, reg, scope);
+                }
+                if (is_generic) { scope.pop(); }
+            }
+            DeclKind::Union(node) => {
+                const is_generic: boolean = node.generic_params.length > 0;
+                if (is_generic) { scope.push(node.def); }
+                for (mut i: i64 = 0; i < node.fields.length; i++) {
+                    const f_decl: DeclarationNode* = node.fields[i];
+                    const f: FieldDecl* = DeclarationNode::field_of(f_decl);
+                    if (f != null && f.has_type_annotation()) {
+                        DefaultExpansionPasses::rewrite_annotation_in_place(
+                            f.type_annotation, reg, scope);
+                    }
+                }
+                for (mut i: i64 = 0; i < node.methods.length; i++) {
+                    const m_decl: DeclarationNode* = node.methods[i];
+                    const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+                    if (m != null && m.func != null) {
+                        DefaultExpansionPasses::rewrite_function_decl(
+                            m.func, reg, scope);
+                    }
+                }
+                if (is_generic) { scope.pop(); }
+            }
+            // No other kind with a payload holds an annotation here.
+            DeclKind::Import(_) | DeclKind::Intrinsic(_)
+            | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+            | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+            | DeclKind::Variable(_) | DeclKind::Method(_) => {}
         }
     }
 

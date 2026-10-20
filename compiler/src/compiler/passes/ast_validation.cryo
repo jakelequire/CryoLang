@@ -25,7 +25,7 @@ import utils::logger;
 import utils::logger::{ cdebug };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
+    EnumDecl, EnumVariant, ExternBlock, FieldDecl,
     DeclarationNode, DeclKind, FunctionDecl, GenericParamDecl, ImplBlock,
     ImportDecl, IntrinsicDecl,
     MethodDecl, StructDecl, TraitDecl, TypeAliasDecl, UnionDecl,
@@ -112,7 +112,7 @@ type struct ASTValidator {
     }
 
     validate_decl(mut &this, d: DeclarationNode*) -> void {
-        match (d.shape) {
+        match (d.kind) {
             DeclKind::Function(_)  => { this.validate_function(d); }
             DeclKind::Enum(n)      => { this.validate_enum(d, n); }
             DeclKind::Extern(n)    => { this.validate_extern_block(d, n); }
@@ -127,7 +127,6 @@ type struct ASTValidator {
             DeclKind::Module(_) | DeclKind::Variant(_)
             | DeclKind::Destructure(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
             | DeclKind::Method(_) => {}
-            DeclKind::Legacy       => { this.validate_class(d as ClassDeclNode*); }
         }
     }
 
@@ -214,7 +213,7 @@ type struct ASTValidator {
         this.validate_generic_params(node.generic_params, d.span, name);
     }
 
-    /// Reject two fields that share a name within one struct/class. A
+    /// Reject two fields that share a name within one struct. A
     /// duplicate makes field layout and member access ambiguous.
     check_duplicate_fields(mut &this, fields: &[DeclarationNode*],
                            container: string) -> void {
@@ -236,28 +235,6 @@ type struct ASTValidator {
                 seen.push(f.name.id);
             }
         }
-    }
-
-    validate_class(mut &this, node: ClassDeclNode*) -> void {
-        if (!node.name.is_valid()) {
-            this.emit(ErrorCode::E0052_MISSING_TYPE_NAME,
-                "class declaration has no name", node.span);
-            return;
-        }
-
-        const name: string = this.ctx.resolve_str(node.name);
-
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            if (node.fields[i] == null) {
-                this.emit(ErrorCode::E0054_NULL_FIELD,
-                    fmt::format("null field at index %lld in class '%s'", i, name),
-                    node.span);
-            }
-        }
-        this.check_duplicate_fields(node.fields, name);
-
-        this.validate_methods(node.methods, name, node.span);
-        this.validate_generic_params(node.generic_params, node.span, name);
     }
 
     validate_enum(mut &this, d: DeclarationNode*, node: EnumDecl*) -> void {
@@ -428,7 +405,7 @@ type struct ASTValidator {
     }
 
 
-    /// Validate a [DeclarationNode*] array (used by struct, class, impl).
+    /// Validate a [DeclarationNode*] array (used by struct, union, impl).
     validate_methods(mut &this, methods: &[DeclarationNode*], owner: string,
                      owner_span: SourceSpan) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {

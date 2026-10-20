@@ -164,7 +164,8 @@ node's (`accept`), the type's (three methods) and the parser's (two hooks).
     `class_inherited_function_field_call`,
     `generic_class_infers_from_constructor`, and `allocate_trait_routes_new`
     (a base/leaf hierarchy).
-  - Using classes incidentally, so they get ported to structs:
+  - Using classes incidentally; their class tests are deleted too, not
+    ported (ruling 470), and a file's other tests stay:
     `lang/async_method.cryo`, `lang/swap_pointer_array.cryo`,
     `lang/visibility.cryo` (protected and subclass access);
     `E0208_cast_into_other_aggregate`, `E0312_allocate_wrong_shape`,
@@ -2390,12 +2391,16 @@ their numbers so the references to "slice 9" elsewhere stay true.
   (question 7), each with a negative test.
 - **Code removed.**  Section 1.6 in full, the language server's class
   handling included.  Retired codes keep their numbers reserved.
-- **Tests.**  The class-feature tests are deleted and the incidental ones
-  ported to structs (question 5).  The roster golden is re-pinned in the
-  same commit, with the count named in the message.
+- **Tests.**  The class-feature tests are deleted, the incidental ones
+  too (ruling 470: a file's other tests stay, its class test goes).  The
+  roster golden is re-pinned in the same commit, with the count named in
+  the message.
 - **Proof:** verify with declared moves: each deleted test is gone from
-  both sides, and each ported test's objects are listed as moved by the
-  port, not by the compiler.  Selfhost; lsp-check; cross-check.
+  both sides.  Selfhost; lsp-check; cross-check.
+- **Built** in one commit: E0117 for every form above, constructors and
+  destructors included; `ClassDeclNode`, `ClassType`, the class type kind,
+  vtables, the base chain, `protected` and `DeclKind::Legacy` deleted;
+  `DeclarationNode` a struct whose `kind` names its payload.
 - **Gate pair:** the old compiler accepts `type class A {}`; the new one
   refuses it with the new code.
 
@@ -2645,7 +2650,7 @@ final audit greps for each name listed and expects none.
 
 | piece | where | written in | deleted when |
 |---|---|---|---|
-| `implement class ClassDeclNode { static walk_children ... }`, the last of the per-class walk blocks (the others moved inline into their structs) | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | with the class, in slice 9 |
+| `implement class ClassDeclNode { static walk_children ... }`, the last of the per-class walk blocks (the others moved inline into their structs) | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | deleted with the class, in slice 9 |
 | The expression projections, one per kind (`ExpressionNode::sizeof_of`, `alignof_of`, `typeof_of`, `delete_of`, `new_of`, `try_of`, `tuple_of`, `array_of`, `struct_of`, `literal_of`, `ternary_of`, `if_of`, `static_match_of`, `match_of`, `cast_of`, `unary_of`, `binary_of`, `array_access_of`, `lambda_of`, `await_of`, `identifier_of`, `scope_resolution_of`, `member_access_of`, `call_of`) | `compiler/src/compiler/AST/expression.cryo` and their callers | slice 6 (expressions) | take the header since `Program` and `Node` commit 3, and `ExpressionNode::with_shape` is deleted; a one-kind projection of a header is then a checked accessor, as `Stmt::as_block` is, not a conversion between two shapes, and they stay as accessors (ruling 460): no longer a bridge piece |
-| `DeclKind::Legacy` and every `match` arm for it, `DeclarationNode::is_class` and `kind_name`, `DeclarationNode` a class (its one subclass is `ClassDeclNode`) and its kind named `shape` | `compiler/src/compiler/AST/declaration.cryo` and every declaration consumer | slice 6 (declarations, `IntrinsicConst` and `Module`) | when slice 9 deletes the class, the one kind never converted (ruling 413): the header becomes a struct and `shape` is renamed `kind` |
-| The declaration projections (`DeclarationNode::module_of`, `import_of`, `extern_of`, `alias_of`, `enum_of`, `trait_of`, `union_of`, `struct_of`, `impl_of`, `var_of`, `fn_of`, `method_of`) and `DeclarationNode::with_shape` | `compiler/src/compiler/AST/declaration.cryo` and their callers | slice 6 (declarations) | take the header since `Program` and `Node` commit 3; `with_shape` answers null for a class, which slice 9 deletes, and goes with it.  The projections themselves stay as checked accessors (ruling 460) |
+| `DeclKind::Legacy` and every `match` arm for it, `DeclarationNode::is_class` and `kind_name`, `DeclarationNode` a class (its one subclass is `ClassDeclNode`) and its kind named `shape` | `compiler/src/compiler/AST/declaration.cryo` and every declaration consumer | slice 6 (declarations, `IntrinsicConst` and `Module`) | deleted in slice 9 with the class, the one kind never converted (ruling 413): the header is a struct and `shape` is renamed `kind` |
+| The declaration projections (`DeclarationNode::module_of`, `import_of`, `extern_of`, `alias_of`, `enum_of`, `trait_of`, `union_of`, `struct_of`, `impl_of`, `var_of`, `fn_of`, `method_of`) and `DeclarationNode::with_shape` | `compiler/src/compiler/AST/declaration.cryo` and their callers | slice 6 (declarations) | take the header since `Program` and `Node` commit 3; `with_shape` answered null for a class and was deleted with it in slice 9.  The projections themselves stay as checked accessors (ruling 460) |

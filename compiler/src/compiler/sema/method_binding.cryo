@@ -36,7 +36,7 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::{ state, type_utils, symbolic_checker, helpers };
 import std::fmt;
 import compiler::ast::declaration::{
-    AssocTypeDeclNode, ClassDeclNode, FunctionDecl, DeclarationNode, GenericParamDecl, ImplBlock,
+    AssocTypeDeclNode, FunctionDecl, DeclarationNode, GenericParamDecl, ImplBlock,
     MethodDecl, StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -71,7 +71,7 @@ import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
-import compiler::types::user_defined::{ ClassType, MethodInfo, TraitType };
+import compiler::types::user_defined::{ MethodInfo, TraitType };
 
 /// The trait a call on a bounded receiver names: every trait a bound
 /// answers the method through is noted, and the call names one only when
@@ -205,8 +205,6 @@ type struct MethodBinding {
             methods = &(DeclarationNode::struct_of(tmpl.ast_node)).methods;
         } else if (tmpl.kind == TemplateKind::Union) {
             methods = &(DeclarationNode::union_of(tmpl.ast_node)).methods;
-        } else if (tmpl.kind == TemplateKind::Class) {
-            methods = &(tmpl.ast_node as ClassDeclNode*).methods;
         }
         mut found_count: i64 = 0;
         mut abstract_ret: TypeRef = TypeRef::invalid();
@@ -1156,7 +1154,7 @@ type struct MethodBinding {
         }
 
         // Unwrap one layer of Pointer/Reference to the owning InstantiatedType /
-        // template Struct/Class.
+        // template Struct.
         mut owner_ref: TypeRef = recv_type;
         mut owner_t: Type* = this.arena.lookup(owner_ref);
         mut depth: i32 = 0;
@@ -1195,7 +1193,7 @@ type struct MethodBinding {
         }
         // Primitive / non-generic receiver whose generic method lives in an
         // inherent `implement T { ... }` block (e.g. `"42".parse_int<u64>()` on
-        // `implement string`).  There is no Struct/Class/InstantiatedType AST to
+        // `implement string`).  There is no Struct/InstantiatedType AST to
         // walk; the method is the one the selection chose.  Bind the method's
         // OWN generic params from the explicit args and resolve its return
         // annotation directly.  A trait's method is not answered here: its
@@ -1237,10 +1235,6 @@ type struct MethodBinding {
             const un: UnionDecl* = DeclarationNode::union_of(owner_ast);
             owner_params  = &un.generic_params;
             owner_def     = un.def;
-        } else if (owner_ast.is_class()) {
-            const cn: ClassDeclNode* = owner_ast as ClassDeclNode*;
-            owner_params  = &cn.generic_params;
-            owner_def     = cn.def;
         } else {
             return fallback;
         }
@@ -1550,7 +1544,7 @@ type struct MethodBinding {
         if (DeclarationNode::fn_of(chosen.func).def.is_valid() || !DeclarationNode::fn_of(chosen.func).copy_of.is_valid()) { return null; }
         const decl: DeclarationNode* = this.ctx.decl_index.method_decl_of(DeclarationNode::fn_of(chosen.func).copy_of);
         if (decl == null || DeclarationNode::method_of(decl) == null) { return null; }
-        const written_decl: DeclarationNode* = DeclarationNode::with_shape(decl);
+        const written_decl: DeclarationNode* = decl;
         const site: DeclarationNode* = this.method_site(written_decl, tmpl, recv_type);
         if (site == null) { return null; }
         *out_site = site;
@@ -1593,7 +1587,7 @@ type struct MethodBinding {
         if (member == null)                    { return owner_ctx; }
 
         // Unwrap a Pointer/Reference receiver to the underlying nominal type so
-        // every method lookup below keys off the struct/class/enum rather than
+        // every method lookup below keys off the struct/enum rather than
         // the pointer type.  A pointer/reference receiver (`h: DefaultHasher*;
         // h.fold(x)`, or a `mut &this`-style forward) otherwise matches no
         // template / owner here, so the method's type-args are never stashed and
@@ -1671,8 +1665,6 @@ type struct MethodBinding {
                 owner_params = &(DeclarationNode::struct_of(site)).generic_params;
             } else if (DeclarationNode::union_of(site) != null) {
                 owner_params = &(DeclarationNode::union_of(site)).generic_params;
-            } else if (site.is_class()) {
-                owner_params = &(site as ClassDeclNode*).generic_params;
             }
         }
 
@@ -1705,10 +1697,6 @@ type struct MethodBinding {
                 const un: UnionDecl* = DeclarationNode::union_of(tmpl.ast_node);
                 found = this.generic_method_held(&un.methods, &tmpl_named);
                 if (found != null) { owner_params = &un.generic_params; }
-            } else if (tmpl.kind == TemplateKind::Class) {
-                const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
-                found = this.generic_method_held(&cn.methods, &tmpl_named);
-                if (found != null) { owner_params = &cn.generic_params; }
             }
             if (found == null) {
                 for (mut bi: i64 = 0; bi < tmpl.impl_blocks.length; bi++) {
@@ -1737,11 +1725,6 @@ type struct MethodBinding {
                     const named: [DeclarationNode*] = this.ctx.decl_index.methods_named(
                         this.ctx.generic_registry.methods_owner_of(un.def), member.member);
                     found = this.generic_method_held(&un.methods, &named);
-                } else if (owner_ast.is_class()) {
-                    const cn: ClassDeclNode* = owner_ast as ClassDeclNode*;
-                    const named: [DeclarationNode*] = this.ctx.decl_index.methods_named(
-                        this.ctx.generic_registry.methods_owner_of(cn.def), member.member);
-                    found = this.generic_method_held(&cn.methods, &named);
                 }
             }
         }

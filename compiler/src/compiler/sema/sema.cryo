@@ -68,7 +68,7 @@ import compiler::passes::type_resolution;
 import compiler::passes::type_resolution::{ TypeResolutionPasses, TypeResolutionRunner };
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
-    AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
+    AssocTypeDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
     FunctionDecl, GenericParamDecl, ImplBlock, MethodDecl,
     StructDecl, TraitDecl, UnionDecl, VarDecl
 };
@@ -131,7 +131,7 @@ import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, EnumType, EnumVariantInfo, FieldInfo, MethodInfo, StructType, TraitType, TypeAliasType
+    EnumType, EnumVariantInfo, FieldInfo, MethodInfo, StructType, TraitType, TypeAliasType
 };
 import std::core::mem::{ swap };
 import std::core::option::{ Option };
@@ -355,44 +355,38 @@ type struct SemaVisitor {
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             const stmt: DeclarationNode* = node.statements[i].as_decl();
             if (stmt == null) { continue; }
-            if (stmt.is_class()) {
-                const c: ClassDeclNode* = stmt as ClassDeclNode*;
-                this.declare_async_methods(c.methods, c.generic_params,
-                    this.ctx.decl_index.type_of_decl(c.def, "sema/async declare class"), c.name, null);
-            } else {
-                match (stmt.shape) {
-                    DeclKind::Function(f) => {
-                        const f_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
-                        // A lowered one has already had `is_async` cleared.
-                        if (f.is_async && f.body != null) {
-                            // `async function main` is renamed out of the entry-point
-                            // slot first, so the future `declare` registers is keyed
-                            // to the renamed function and not to `main`.
-                            this.async_lower.desugar_async_main(f_decl);
-                            this.async_lower.declare(f_decl);
-                        }
+            match (stmt.kind) {
+                DeclKind::Function(f) => {
+                    const f_decl: DeclarationNode* = stmt;
+                    // A lowered one has already had `is_async` cleared.
+                    if (f.is_async && f.body != null) {
+                        // `async function main` is renamed out of the entry-point
+                        // slot first, so the future `declare` registers is keyed
+                        // to the renamed function and not to `main`.
+                        this.async_lower.desugar_async_main(f_decl);
+                        this.async_lower.declare(f_decl);
                     }
-                    DeclKind::Impl(ib) => {
-                        // The head's owner, off the stamp; the written
-                        // target is what a refusal names.
-                        mut owner_params: [DeclarationNode*] = this.impl_owner_params(ib);
-                        this.declare_async_methods(ib.methods, owner_params,
-                            this.ctx.decl_index.impl_owner(ib, "sema/async declare"), ib.target_type,
-                            stmt);
-                    }
-                    DeclKind::Struct(s) => {
-                        this.declare_async_methods(s.methods, s.generic_params,
-                            this.ctx.decl_index.type_of_decl(s.def, "sema/async declare struct"), s.name, null);
-                    }
-                    DeclKind::Union(u) => {
-                        this.declare_async_methods(u.methods, u.generic_params,
-                            this.ctx.decl_index.type_of_decl(u.def, "sema/async declare union"), u.name, null);
-                    }
-                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                 }
+                DeclKind::Impl(ib) => {
+                    // The head's owner, off the stamp; the written
+                    // target is what a refusal names.
+                    mut owner_params: [DeclarationNode*] = this.impl_owner_params(ib);
+                    this.declare_async_methods(ib.methods, owner_params,
+                        this.ctx.decl_index.impl_owner(ib, "sema/async declare"), ib.target_type,
+                        stmt);
+                }
+                DeclKind::Struct(s) => {
+                    this.declare_async_methods(s.methods, s.generic_params,
+                        this.ctx.decl_index.type_of_decl(s.def, "sema/async declare struct"), s.name, null);
+                }
+                DeclKind::Union(u) => {
+                    this.declare_async_methods(u.methods, u.generic_params,
+                        this.ctx.decl_index.type_of_decl(u.def, "sema/async declare union"), u.name, null);
+                }
+                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) => { }
             }
         }
     }
@@ -419,17 +413,6 @@ type struct SemaVisitor {
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null || DeclarationNode::fn_of(m.func).body == null) { continue; }
             if (!DeclarationNode::fn_of(m.func).is_async) { continue; }
-            // Each override lowers to its OWN future struct, so they return
-            // different types and cannot share a vtable slot. Clearing the flag
-            // keeps the method compiling as an ordinary one instead of raising a
-            // second, less informative error from the lowering.
-            if (m.is_virtual || m.is_override) {
-                this.ctx.emit_error_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
-                    "a `virtual` or `override` method cannot be `async`: each implementation returns its own future type, so the overrides have no common return type to dispatch through",
-                    m.func.span);
-                DeclarationNode::fn_of(m.func).set_async(false);
-                continue;
-            }
             mut own: AsyncOwner = AsyncOwner {
                 method: m_decl,
                 ty: this.async_owner_instance(owner_ty, owner_params),
@@ -502,9 +485,6 @@ type struct SemaVisitor {
         if (tmpl == null || tmpl.ast_node == null) { return []; }
         if (tmpl.kind == TemplateKind::Struct) {
             return this.clone_generic_params((DeclarationNode::struct_of(tmpl.ast_node)).generic_params);
-        }
-        if (tmpl.kind == TemplateKind::Class) {
-            return this.clone_generic_params((tmpl.ast_node as ClassDeclNode*).generic_params);
         }
         if (tmpl.kind == TemplateKind::Enum) {
             return this.clone_generic_params(DeclarationNode::enum_of(tmpl.ast_node).generic_params);
@@ -626,15 +606,6 @@ type struct SemaVisitor {
         this.visit_methods(node.methods, un_type);
     }
 
-    visit_class(mut &this, node: ClassDeclNode*) -> void {
-        const cl_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:ClassDeclNode");
-        if (node.is_generic()) {
-            this.symbolic_check_owner_methods(node.methods, cl_type, node.generic_params);
-            return;
-        }
-        this.visit_methods(node.methods, cl_type);
-    }
-
     visit_trait(mut &this, node: TraitDecl*) -> void {
         if (node.is_generic()) { return; }
         const this_name: SymbolStr = this.intern.intern("This");
@@ -697,9 +668,6 @@ type struct SemaVisitor {
                     if (tmpl.kind == TemplateKind::Struct) {
                         this.symbolic_check_owner_methods(node.methods, owner_ty,
                             (DeclarationNode::struct_of(tmpl.ast_node)).generic_params);
-                    } else if (tmpl.kind == TemplateKind::Class) {
-                        this.symbolic_check_owner_methods(node.methods, owner_ty,
-                            (tmpl.ast_node as ClassDeclNode*).generic_params);
                     } else if (tmpl.kind == TemplateKind::Enum) {
                         this.symbolic_check_owner_methods(node.methods, owner_ty,
                             DeclarationNode::enum_of(tmpl.ast_node).generic_params);
@@ -762,16 +730,9 @@ type struct SemaVisitor {
             // checked against the declared Output.
             const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
             this.enter_function(method.func, method_this);
-            if (method.is_constructor && method.has_base_ctor()) {
-                for (mut k: i64 = 0; k < method.base_ctor_args.length; k++) {
-                    this.resolve_expr(method.base_ctor_args[k]);
-                }
-            }
             this.visit_block(DeclarationNode::fn_of(method.func).body);
             this.state.body_count += 1;
-            if (!method.is_constructor && !method.is_destructor) {
-                this.check_function_returns(method.func);
-            }
+            this.check_function_returns(method.func);
             this.async_lower.end_body_check(method.func, displaced);
             // Lower AFTER the body is typed against the declared Output type,
             // exactly as `visit(FunctionDecl*)` does for a free function.
@@ -1251,7 +1212,7 @@ type struct SemaVisitor {
             const var_node: VarDecl* = DeclarationNode::var_of(stmt);
             if (!var_node.is_global || !this.typed_before_bodies(var_node)) { continue; }
             const registered: boolean = var_node.resolved_type.is_valid();
-            const decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+            const decl: DeclarationNode* = stmt;
             this.check_var_decl(decl, var_node);
             if (!registered && var_node.resolved_type.is_valid()) {
                 TypeResolutionRunner::register_module_global(this.ctx, decl, var_node);
@@ -1518,7 +1479,6 @@ type struct SemaVisitor {
         mut fields_ptr: &[FieldInfo] = &empty_fields;
         mut got_fields: boolean = false;
         if (ty.kind == TypeKind::Struct) { fields_ptr = &ty.as_struct().fields; got_fields = true; }
-        else if (ty.kind == TypeKind::Class) { fields_ptr = &ty.as_class().fields; got_fields = true; }
         if (!got_fields) {
             const ty_name: string = this.arena.format_display(ty);
             this.ctx.emit_error_at(ErrorCode::E0361_DESTRUCTURE_NON_STRUCT,
@@ -1670,7 +1630,7 @@ type struct SemaVisitor {
             Node::Arm(_) | Node::StaticArm(_) | Node::Pattern(_) | Node::Directive(_) => { }
 
             Node::Decl(d) => {
-                match (d.shape) {
+                match (d.kind) {
                     DeclKind::Function(_) => { this.visit_function(d); }
                     DeclKind::Destructure(dd) => { this.visit_destructure(d, dd); }
                     DeclKind::Variable(v)     => { this.visit_var(d, v); }
@@ -1684,7 +1644,6 @@ type struct SemaVisitor {
                     | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Extern(_)
                     | DeclKind::TypeAlias(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
                     | DeclKind::Enum(_) => { }
-                    DeclKind::Legacy => { this.visit_class(d as ClassDeclNode*); }
                 }
             }
         }
@@ -2080,7 +2039,7 @@ type struct SemaVisitor {
     /// build + resolve the trait-method call, returning the resolved desugar
     /// expression (its `resolved_type` set) for the caller to attach.  Returns
     /// null when no overload applies (caller keeps the primitive path or errors).
-    /// Only a concrete user type (Struct/Class/Enum/Instantiated) with a
+    /// Only a concrete user type (Struct/Enum/Instantiated) with a
     /// registered trait impl overloads.
     operator_overload_expr(mut &this, receiver: ExpressionNode*, ty: TypeRef,
                            rhs: ExpressionNode*, map: OperatorTraitMap,
@@ -2114,7 +2073,7 @@ type struct SemaVisitor {
             }
             if (t == null) { return null; }
         }
-        const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
+        const is_user: boolean = t.kind == TypeKind::Struct
                               || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
         if (!is_user) { return null; }
         // The operator's trait is the language's (`std::core::ops::Add` for
@@ -2219,7 +2178,7 @@ type struct SemaVisitor {
     /// one operand is `&T`, and NEITHER operand is void (a `null` literal), so
     /// `ref == null` keeps its pointer null-check.  The user-vs-primitive decision
     /// is left to `operator_overload_expr` (which only fires for a user referent),
-    /// so `&i32 == &i32` and pointer/class null-checks stay on the identity path.
+    /// so `&i32 == &i32` and pointer null-checks stay on the identity path.
     comparison_unwraps_reference(&this, lhs: TypeRef, rhs: TypeRef) -> boolean {
         const lt: Type* = this.arena.lookup(lhs);
         const rt: Type* = this.arena.lookup(rhs);
@@ -2289,7 +2248,7 @@ type struct SemaVisitor {
             rdepth += 1;
         }
         if (t == null) { return false; }
-        const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
+        const is_user: boolean = t.kind == TypeKind::Struct
                               || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
         if (!is_user) { return false; }
         const name: string = this.arena.format_display(t);
@@ -2866,24 +2825,17 @@ type struct SemaVisitor {
             && this.types.arg_type_is_concrete(from_ty) && this.types.arg_type_is_concrete(to_ty)
             && this.is_aggregate_scalar_cast(from_ty, to_ty)) {
             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0208_INVALID_CAST,
-                "invalid cast between an aggregate type (struct/class/tuple/array) and a scalar or pointer: there is no valid representation for this conversion");
+                "invalid cast between an aggregate type (struct/tuple/array) and a scalar or pointer: there is no valid representation for this conversion");
             d = d.at(e.span);
-            if (this.diag.kind_or_void(this.cast_subject(from_ty)) == TypeKind::Class
-                    && this.diag.kind_or_void(to_ty) == TypeKind::Pointer) {
-                d = d.help("a class value's address is written `&value`, and `&value as T*` converts it");
-            }
             this.ctx.emit_diagnostic(d);
         } else if (from_ty.is_valid() && to_ty.is_valid()
             && this.types.arg_type_is_concrete(from_ty) && this.types.arg_type_is_concrete(to_ty)
             && this.is_cast_into_other_aggregate(from_ty, to_ty)) {
             const to_name: string = this.types.type_display_name(to_ty);
             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0208_INVALID_CAST,
-                fmt::format("cannot cast `%s` to `%s`: a struct, class, tuple or array value is cast only from a value of its own type",
+                fmt::format("cannot cast `%s` to `%s`: a struct, tuple or array value is cast only from a value of its own type",
                     this.types.type_display_name(from_ty), to_name));
             d = d.at_with_label(e.span, "no conversion makes this value");
-            if (this.diag.kind_or_void(this.cast_subject(to_ty)) == TypeKind::Class) {
-                d = d.help(fmt::format("a class converts along its hierarchy by pointer, `p as %s*`; `*p` reads the value a pointer points at", to_name));
-            }
             this.ctx.emit_diagnostic(d);
         }
         if (from_ty.is_valid() && to_ty.is_valid()
@@ -2914,7 +2866,7 @@ type struct SemaVisitor {
         return this.names_receiver(id);
     }
 
-    /// True when a cast's target is a struct, class, tuple or array value and
+    /// True when a cast's target is a struct, tuple or array value and
     /// its operand is of any other type.  Such a value is laid out in memory,
     /// and no conversion builds one from a pointer, a scalar or a different
     /// aggregate: code generation has only a bitcast to offer, which is
@@ -2926,7 +2878,7 @@ type struct SemaVisitor {
         if (!f.is_valid() || !t.is_valid() || f.equals(t)) { return false; }
         const tt: Type* = this.arena.lookup(t);
         if (tt == null) { return false; }
-        return tt.kind == TypeKind::Struct || tt.kind == TypeKind::Class
+        return tt.kind == TypeKind::Struct
             || tt.kind == TypeKind::Tuple || tt.kind == TypeKind::Array;
     }
 
@@ -2942,12 +2894,9 @@ type struct SemaVisitor {
     }
 
     /// True when a cast crosses between a struct, tuple or array value and a
-    /// scalar/pointer type (no valid LLVM lowering), or casts a class value
-    /// to one.  A class local reaches the cast as the address of its storage,
-    /// so `av as void*` would hand out that address under a cast that names
-    /// a conversion of the value; the address is written `&av`.  A
-    /// by-reference `this` is an address already and is not asked here
-    /// (`cast_operand_is_byref_receiver`).  A class as the TARGET is
+    /// scalar/pointer type (no valid LLVM lowering).  A by-reference `this`
+    /// is an address already and is not asked here
+    /// (`cast_operand_is_byref_receiver`).  An aggregate as the TARGET is
     /// `is_cast_into_other_aggregate`'s.
     is_aggregate_scalar_cast(&this, from: TypeRef, to: TypeRef) -> boolean {
         mut f: Type* = this.arena.lookup(from);
@@ -2964,7 +2913,7 @@ type struct SemaVisitor {
             t = this.arena.lookup(ti.resolved_type);
         }
         if (f == null || t == null) { return false; }
-        const f_agg: boolean = f.kind == TypeKind::Struct || f.kind == TypeKind::Class
+        const f_agg: boolean = f.kind == TypeKind::Struct
                             || f.kind == TypeKind::Tuple || f.kind == TypeKind::Array;
         const t_agg: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Tuple || t.kind == TypeKind::Array;
         const f_scl: boolean = f.kind == TypeKind::Int || f.kind == TypeKind::Float || f.kind == TypeKind::Bool
@@ -3458,7 +3407,7 @@ type struct SemaVisitor {
         return this.resolve_expr(desugared);
     }
 
-    /// Resolve a struct/union/class literal's TYPE through the SAME canonical path
+    /// Resolve a struct/union literal's TYPE through the SAME canonical path
     /// a type ANNOTATION uses - `instantiate_for_module`, exactly as `resolve()`
     /// does for `x as Foo<Args>`.  ONE resolution authority: a `Foo<Args> {}`
     /// literal denotes the same canonical TypeID as the annotation `Foo<Args>`, so
@@ -3566,7 +3515,7 @@ type struct SemaVisitor {
                 && !e.resolved_type.is_valid() && lit_type.equals(struct_ref) && struct_ref.is_valid()) {
             const lt: TemplateEntry* = this.ctx.generic_registry.template_of_type(struct_ref);
             if (lt != null && lt.param_types.length > 0
-                    && (lt.kind == TemplateKind::Struct || lt.kind == TemplateKind::Class)) {
+                    && (lt.kind == TemplateKind::Struct)) {
                 const promoted: TypeRef = this.calls.promote_to_expected_instantiation(struct_ref);
                 if (!promoted.equals(struct_ref) && !this.types.contains_generic_param(promoted)) {
                     lit_type = promoted;
@@ -3585,12 +3534,11 @@ type struct SemaVisitor {
             const value_expr: ExpressionNode* = field_init.value;
             mut field_type: TypeRef = TypeRef::invalid();
             // The field this initializer names, found by the member door as a
-            // `.field` access finds it - a class's base fields included,
-            // derived-first - and recorded on the initializer by its
+            // `.field` access finds it - and recorded on the initializer by its
             // coordinates so codegen stores there.  A struct literal names a
             // field directly, so it obeys the same module-scoped visibility
             // as a `.field` access (E0353), asked of the entry the door found.
-            // Asked of a struct or class, of an instantiation not minted yet
+            // Asked of a struct, of an instantiation not minted yet
             // (`RefIter::<T> { index: 0, .. }`, `Pair::<u32, u64> { .. }`), whose
             // fields are the template's read through its arguments, and of the
             // generic OWNER inside its own body (`String { buffer:
@@ -3599,13 +3547,13 @@ type struct SemaVisitor {
             // and a generic-owner static call in the field position binds the
             // owner's arguments from it.
             if (struct_t != null
-                && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class
+                && (struct_t.kind == TypeKind::Struct
                     || struct_t.kind == TypeKind::InstantiatedType
                     || this.symbolic.symbolic_is_generic_owner_receiver(struct_ref))) {
                 const fa: FieldAnswer = this.member.field_of(field_owner, field_init.field_name);
                 field_type = fa.ty;
                 if (fa.index >= 0) {
-                    lit.field_inits[i].pin = MemberPin::Field(fa.depth, fa.index);
+                    lit.field_inits[i].pin = MemberPin::Field(fa.index);
                     lit.field_inits[i].pin_carried = false;
                 }
                 if (fa.entry != null) {
@@ -3658,12 +3606,10 @@ type struct SemaVisitor {
             return lit_type;
         }
 
-        if (struct_t != null && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
-            const empty_fields: [FieldInfo] = [];
-            mut fields_ptr: &[FieldInfo] = &empty_fields;
-            mut is_complete: boolean = false;
-            if (struct_t.kind == TypeKind::Struct) { const st: StructType* = struct_t.as_struct(); fields_ptr = &st.fields; is_complete = st.is_complete; }
-            else { const ct: ClassType* = struct_t.as_class(); fields_ptr = &ct.fields; is_complete = ct.is_complete; }
+        if (struct_t != null && struct_t.kind == TypeKind::Struct) {
+            const st: StructType* = struct_t.as_struct();
+            const fields_ptr: &[FieldInfo] = &st.fields;
+            const is_complete: boolean = st.is_complete;
             if (is_complete && fields_ptr.length > 0) {
                 mut missing_names: [SymbolStr] = [];
                 for (mut k: i64 = 0; k < fields_ptr.length; k++) {
@@ -3672,7 +3618,7 @@ type struct SemaVisitor {
                     for (mut fi: i64 = 0; fi < lit.field_inits.length; fi++) {
                         // Pinned above to the type's own field `k`.
                         const own_k: boolean = match (lit.field_inits[fi].pin) {
-                            MemberPin::Field(d, ix) => { d == 0 && ix == k }
+                            MemberPin::Field(ix) => { ix == k }
                             _                       => { false }
                         };
                         if (own_k) { covered = true; break; }
@@ -3745,7 +3691,7 @@ type struct SemaVisitor {
             field_name: name,
             value:      cloned,
             span:        e.span,
-            pin:         MemberPin::Field(0, index),
+            pin:         MemberPin::Field(index),
             pin_carried: false,
         });
     }
@@ -3761,7 +3707,7 @@ type struct SemaVisitor {
     /// `Buffer does not implement BitOr`, naming neither the constant nor the
     /// module nor anything the author can act on.
     ///
-    /// A struct or class carries no associated constants, only `methods`, so a
+    /// A struct carries no associated constants, only `methods`, so a
     /// member that names no method of it cannot be reached through the type and
     /// the qualifier must be the module.
     ///
@@ -3776,33 +3722,33 @@ type struct SemaVisitor {
     scope_member_binds_type(mut &this, ty: TypeRef, scope: ScopeResolutionExpr*) -> boolean {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return true; }
-        if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class) {
+        if (t.kind == TypeKind::Struct) {
             return this.calls.owner_declares_member(ty, scope.member_name);
         }
         return t.kind == TypeKind::Enum;
     }
 
-    /// The method `ty::member` names when `ty` is a struct or class and the
+    /// The method `ty::member` names when `ty` is a struct and the
     /// member one of its methods; null otherwise.
     scope_method(mut &this, ty: TypeRef, scope: ScopeResolutionExpr*) -> MethodInfo* {
         if (!ty.is_valid()) { return null; }
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return null; }
-        if (t.kind != TypeKind::Struct && t.kind != TypeKind::Class) { return null; }
+        if (t.kind != TypeKind::Struct) { return null; }
         return this.ctx.decl_index.type_method(ty, scope.member_name, this.arena);
     }
 
-    /// Whether `ty::member` names a method of a struct or class whose
-    /// signature the name layer refused.
+    /// Whether `ty::member` names a method of a struct whose signature the
+    /// name layer refused.
     scope_method_refused(mut &this, ty: TypeRef, scope: ScopeResolutionExpr*) -> boolean {
         if (!ty.is_valid()) { return false; }
         const t: Type* = this.arena.lookup(ty);
-        if (t == null || (t.kind != TypeKind::Struct && t.kind != TypeKind::Class)) { return false; }
+        if (t == null || t.kind != TypeKind::Struct) { return false; }
         return this.calls.scope_callee_signature_refused(scope, false);
     }
 
     /// The function type of a STATIC method named `ty::member`, or invalid when
-    /// `ty` names no struct/class, the member is not one of its methods, or the
+    /// `ty` names no struct, the member is not one of its methods, or the
     /// method takes a receiver (`scope_receiver_method_type`).  The stored
     /// `function_type` already excludes the receiver and is interned through
     /// the same `get_function` an annotation goes through, so it is the SAME id
@@ -3822,7 +3768,7 @@ type struct SemaVisitor {
     /// owner's, whose value is one instance's (`generic_owner_method_value`).
     scope_receiver_method_type(mut &this, m: MethodInfo*) -> TypeRef {
         if (m == null || m.is_static || m.ast_node == null) { return TypeRef::invalid(); }
-        const node_decl: DeclarationNode* = DeclarationNode::with_shape(m.ast_node);
+        const node_decl: DeclarationNode* = m.ast_node;
         const node: MethodDecl* = DeclarationNode::method_of(node_decl);
         if (node.func == null || DeclarationNode::fn_of(node.func).parameters.length == 0) { return TypeRef::invalid(); }
         const recv_decl: DeclarationNode* = DeclarationNode::fn_of(node.func).parameters[0];
@@ -4028,17 +3974,16 @@ type struct SemaVisitor {
                 }
             }
         }
-        // A construction's arguments meet the constructor of their arity,
-        // as the by-value `C(args)` does.
-        if (!new_expr.has_variant() && !new_expr.has_array_size() && !new_expr.has_struct_init()) {
-            const def: DefId = match (new_expr.res) {
-                ResSlot::Answered(r) => { r.def_id() }
-                _                    => { DefId::invalid() }
-            };
-            if (def.is_valid()) {
-                const ctors: [TypeRef] = this.calls.family_signatures_of(def);
-                this.calls.check_constructor_args(this, def, &ctors, &new_expr.arguments, expr.span);
-            }
+        // Arguments in parentheses build only an enum variant: a type is
+        // built by its literal or by a function, never by a constructor.
+        if (!new_expr.has_variant() && new_expr.arguments.length > 0) {
+            const shown: string = this.intern.resolve(new_expr.type_name);
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0117_REMOVED_FORM,
+                fmt::format("`new %s(..)` is not part of Cryo", shown));
+            d = d.at_with_label(expr.span, "a constructor call");
+            d = d.help(fmt::format("build it with `new %s { .. }`, or write a `static new` factory", shown));
+            this.ctx.emit_diagnostic(d);
+            return TypeRef::invalid();
         }
         return this.arena.get_pointer_to(base);
     }

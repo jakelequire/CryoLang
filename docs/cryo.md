@@ -60,7 +60,7 @@ identifier = letter { letter | digit | "_" }
 The compiler does not enforce naming, but the standard library and ecosystem use the following conventions, which the bundled TextMate grammar and LSP also assume:
 
 - `snake_case` for variables, functions, methods.
-- `PascalCase` for types (struct, class, enum, trait, alias).
+- `PascalCase` for types (struct, union, enum, trait, alias).
 - `SCREAMING_SNAKE_CASE` for compile-time constants.
 
 ### 1.2 Keywords
@@ -80,7 +80,7 @@ p.type = 2;
 
 A member position is never a declaration or an operator, so the keyword is unambiguous there: what follows the name says which member it is — `(` or `<` a method, `:` a field — and after `.` or `::` a token can only be a member name. This exists because a bound C struct's field names are not Cryo's to choose; a binding generator cannot rename `type` without breaking the ABI it exists to preserve.
 
-The exceptions are the keywords a member position reads *first*: `public`, `private` and `protected` open a visibility label, and `static`, `virtual`, `override` and `async` are member modifiers. A field with one of those seven names cannot be declared, and a C struct carrying one still needs a `![repr(C)]` shadow struct.
+The exceptions are the keywords a member position reads *first*: `public` and `private` open a visibility label, `static` and `async` are member modifiers, and `protected`, `virtual` and `override` are read there to be refused (`E0117`, [section 9](#9-classes)). A field with one of those seven names cannot be declared, and a C struct carrying one still needs a `![repr(C)]` shadow struct.
 
 A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 19 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`): a keyword is never an identifier. Keywords that open nothing (`default`, `string`) remain legal names, and a destructuring shorthand over a field named by one of the 19 needs a rename: `const { type: t }: S = s;`.
 
@@ -105,8 +105,9 @@ match (r) { R::D(static) => { .. } }     // E0100: expected a binding name
 |              | `union`         |             | `async`     |                   |                |                         |
 |              | `default`       |             |             |                   |                |                         |
 
-`default` appears in exactly one position: `~Type() = default;`, which asks the compiler to
-synthesize the destructor rather than take a written body.
+`class`, `protected`, `virtual`, `override` and `default` open no form of the language: they
+stay keywords so that a class written in Cryo is refused where it is written (`E0117`,
+[section 9](#9-classes)) rather than misread.
 
 `move` marks a closure that captures its environment by move (see [section 16.3](#163-move-checking)).
 
@@ -317,7 +318,7 @@ const pp: int** = &p;          // pointer to pointer
 const v:  void* = malloc(64);  // type-erased
 ```
 
-A pointer converts to another pointer type without a cast only when the pointee is the same type (`T*` to `const T*`, never back), when either side is `void*`, or from a derived class to its base. A pointer to any other type is written with `as`, including a pointee that converts to the wanted one: an `i32` converts to an `i64`, but an `i32*` addresses four bytes, so it is not an `i64*` (nor is an `i32**` an `i64**` or a `void**`). A value passed where a pointer parameter wants its address must be of the pointee type itself. The rule is the same wherever a value meets a declared type: an initializer, an assignment, a `return`, a struct field, and an argument of every kind of call - a method, a free or static function, a function reached by its path, a generic one and a constructor (`E0214` at an argument, `E0200` elsewhere).
+A pointer converts to another pointer type without a cast only when the pointee is the same type (`T*` to `const T*`, never back), or when either side is `void*`. A pointer to any other type is written with `as`, including a pointee that converts to the wanted one: an `i32` converts to an `i64`, but an `i32*` addresses four bytes, so it is not an `i64*` (nor is an `i32**` an `i64**` or a `void**`). A value passed where a pointer parameter wants its address must be of the pointee type itself. The rule is the same wherever a value meets a declared type: an initializer, an assignment, a `return`, a struct field, and an argument of every kind of call - a method, a free or static function, a function reached by its path and a generic one (`E0214` at an argument, `E0200` elsewhere).
 
 Raw pointers are unchecked. Validity, aliasing, and lifetime are the programmer's responsibility. For a pointer that is statically guaranteed non-null, see `core::ptr::NonNull<T>`. For owned heap allocations, prefer `Box<T>`. See [section 15](#15-pointers-and-memory).
 
@@ -463,7 +464,7 @@ const k = idf::<i64>;                // (i64) -> i64
 const n: i32 = h(3);                 // 3
 ```
 
-**A bare name in expression position is a value.** An identifier written alone in an expression is looked up among values only. A name that declares only a type is refused there - as a value (E0201) and as a callee (E0231) - so `Point(1, 2)` on a struct is an error and `Point { x: 1, y: 2 }` is the literal; a class's constructor is a value and is called by the class's name ([section 9.2](#92-constructors-and-destructors)).
+**A bare name in expression position is a value.** An identifier written alone in an expression is looked up among values only. A name that declares only a type is refused there - as a value (E0201) and as a callee (E0231) - so `Point(1, 2)` is an error and `Point { x: 1, y: 2 }` is the literal.
 
 **Calling something that is not a function.** A call whose callee has a
 non-function type is refused with E0213, whether the callee is a call's
@@ -615,9 +616,9 @@ const b: i32 = a as i32;          // narrowing: programmer's responsibility
 const p: u8* = some_string as u8*; // pointer reinterpretation
 ```
 
-A cast to a struct, class, tuple or array **value** is a cast from a value of that same type, and nothing else: `p as Point` with `p` a pointer, or one aggregate cast to another, is refused (`E0208`). A class converts along its hierarchy by pointer - `dog_ptr as Animal*` - and `*p` reads the value a pointer points at.
+A cast to a struct, tuple or array **value** is a cast from a value of that same type, and nothing else: `p as Point` with `p` a pointer, or one aggregate cast to another, is refused (`E0208`); `*p` reads the value a pointer points at.
 
-A struct, class, tuple or array value is not cast **to** a pointer or a scalar either (`E0208`): `av as void*` is refused for a class value `av`, whose address is written `&av` (and converted as `&av as void*`). Inside a method taking `&this`, `this` is that address already, so `this as void*` is allowed.
+A struct, tuple or array value is not cast **to** a pointer or a scalar either (`E0208`): `v as void*` is refused, and the value's address is written `&v` (and converted as `&v as void*`). Inside a method taking `&this`, `this` is that address already, so `this as void*` is allowed.
 
 ### 2.10 Optional Types (`T?`)
 
@@ -1513,7 +1514,7 @@ const c: Cents = Cents { n: 5 };       // E0353: field `n` of `Cents` is private
 const d: Cents = Cents::of(5);         // fine
 ```
 
-Visibility may also be declared per-field with a leading `private` / `public`. Within a struct, only `public:` and `private:` blocks are valid; `protected:` is reserved for classes, where it reaches the declaring module **and every module nested under it** (`app::net::tcp` is under `app::net`). Class members carry **no default** - every field and method must appear inside an explicit visibility block.
+Visibility may also be declared per-field with a leading `private` / `public`. Within a struct, only `public:` and `private:` blocks are valid; `protected:` is refused (`E0117`, [section 9](#9-classes)).
 
 A method is declared in the module its declaration is written in: a `private` method in an `implement` block is private to the block's module, not to the module of the type it extends.
 
@@ -1606,7 +1607,7 @@ type struct Point {
 const p: Point = Point::new(10, 20);
 ```
 
-For structs there is no `new` keyword; `static new(...)` is the idiomatic constructor and simply returns a struct literal.
+A struct has no constructor; a `static new(...)` factory is the idiom, and simply returns a struct literal.
 
 ### 8.5 Struct Literals
 
@@ -1702,170 +1703,38 @@ const e: Either<i64, f64> = Either::<i64, f64> { a: 100 };
 
 ## 9. Classes
 
-Classes are heap-allocated reference types with single inheritance, virtual dispatch, and constructor/destructor support. They cover the design space that genuinely benefits from runtime polymorphism (interpreters with heterogeneous AST nodes, GUI frameworks, plugin systems), while structs remain the default for everything else.
+Cryo has no classes.  A type is a struct, a union or an enum; behaviour a family of types shares is a trait each of them implements ([section 11](#11-traits)); a value is built by its literal or by a function, and released by its `Drop`.
 
-### 9.1 Declaration
+Each form of a class is refused where it is written (`E0117`, "`<form>` is not part of Cryo"), with a help line saying what to write instead.  The parse goes on past it, so every such form in a file is reported:
 
-A class is declared with `type class`. Members live inside visibility blocks (`public:`, `private:`, `protected:`).
+| written | help |
+|---|---|
+| `type class Shape { .. }` | declare a struct and implement a trait |
+| a base list, `type struct Square : Shape` | hold the shared part in a field, its methods in a trait |
+| a `virtual` or `override` method | declare the method in a trait and implement it |
+| `protected:` or an inline `protected` | write `private:` or `public:` |
+| a base-constructor initializer, `: Shape(args)` | build the shared field in the factory |
+| `implement class Shape`, `for class Shape` | write `implement struct` (`for struct`) |
+| a constructor, `Square(side: i32) { .. }` | write a `static new` factory |
+| a destructor, `~Square()` | implement `Drop` |
 
-```cryo
-import std::fmt::{ printf };
-
-type class Person {
-public:
-    name: string;
-    age:  i32;
-
-    Person(_name: string, _age: i32) {
-        this.name = _name;
-        this.age  = _age;
-    }
-
-    greet(&this) -> void {
-        printf("Hi, I'm %s, age %d\n", this.name, this.age);
-    }
-}
-```
-
-Class instances are always allocated on the heap with `new`, and the result is a pointer:
+`new Square(4)` passes arguments to a constructor that no type has, and is refused too (`E0117`): a struct is built on the heap by its literal, `new Square { side: 4 }`, and parentheses after `new` build only an enum variant, `new Option<i64>::Some(41)`.
 
 ```cryo
-const p: Person* = new Person("Alice", 30);
-p.greet();
-```
+type trait Shape {
+    area(&this) -> f64;
+}
 
-### 9.2 Constructors and Destructors
+type struct Square {
+    side: f64;
 
-Constructors share the class name. They are real language constructs that `new` invokes, not a naming convention as on structs. A class that declares a constructor binds it in the **value** namespace beside the class in the type namespace, so `Person("Alice", 30)` in expression position calls the constructor, while `Person` in a type position names the class.
+    static new(side: f64) -> Square { return Square { side: side }; }
+}
 
-A generic class constructed by value is the instance its written type arguments name, else the one the expected type names, else the one its constructor's arguments bind - inferred as a generic function call infers its own, a literal by its own type when nothing else binds the parameter:
-
-```cryo
-const a = Cell::<i64>(5);      // Cell<i64>
-const b: Cell<i64> = Cell(6);  // Cell<i64>, from the annotation
-const c = Cell(4);             // Cell<i32>, from the argument
-```
-
-A destructor is prefixed with `~`, takes no parameters, and runs when the instance is deallocated. It is the right place to release resources acquired in the constructor (heap memory, file handles, sockets), so the object's lifetime bounds the resource's.
-
-```cryo
-import std::core::intrinsics::{ malloc, free };
-
-type class Buffer {
-public:
-    data: u8*;
-    size: u64;
-
-    Buffer(_size: u64) {
-        this.data = malloc(_size) as u8*;
-        this.size = _size;
-    }
-
-    ~Buffer() {
-        free(this.data as void*);
-    }
+implement trait Shape for struct Square {
+    area(&this) -> f64 { return this.side * this.side; }
 }
 ```
-
-### 9.3 Inheritance
-
-A class may extend exactly one base class. The derived constructor must chain to the base constructor with `: Base(args)`:
-
-```cryo
-import std::fmt::{ printf };
-
-type class Animal {
-public:
-    kind: string;
-
-    Animal(_kind: string) { this.kind = _kind; }
-
-    describe(&this) -> void {
-        printf("Animal: %s\n", this.kind);
-    }
-}
-
-type class Dog : Animal {
-public:
-    name: string;
-
-    Dog(_name: string) : Animal("Dog") {
-        this.name = _name;
-    }
-
-    bark(&this) -> void {
-        printf("%s says: Woof!\n", this.name);
-    }
-}
-```
-
-Single inheritance avoids the diamond problem and the complexity of multiple inheritance. Composition handles the cases multiple inheritance is sometimes used for.
-
-### 9.4 Virtual Methods and Override
-
-`virtual` marks a method whose dispatch is resolved via a vtable at runtime. `override` is required on a derived method that replaces a base virtual; there is no implicit override.
-
-```cryo
-type class Shape {
-public:
-    Shape() {}
-    virtual area(&this) -> f64;
-    virtual name(&this) -> string {
-        return "Shape";
-    }
-}
-
-type class Circle : Shape {
-public:
-    radius: f64;
-
-    Circle(r: f64) : Shape() {
-        this.radius = r;
-    }
-
-    override area(&this) -> f64 {
-        return 3.14159 * this.radius * this.radius;
-    }
-
-    override name(&this) -> string {
-        return "Circle";
-    }
-}
-```
-
-A `virtual` method without a body declares an interface point that derived classes are expected to implement; a `virtual` method with a body provides a default that derived classes may override.
-
-### 9.5 Polymorphic Dispatch
-
-Code written against a base-class pointer dispatches automatically to the actual derived implementation:
-
-```cryo
-import std::fmt::{ printf };
-
-function print_area(shape: Shape*) -> void {
-    printf("%s: area = %f\n", shape.name(), shape.area());
-}
-
-function main() -> i32 {
-    const c: Circle* = new Circle(10.0);
-    print_area(c);   // Circle::name() and Circle::area()
-    return 0;
-}
-```
-
-### 9.6 Structs vs. Classes
-
-|                  | Struct                          | Class                            |
-| ---------------- | ------------------------------- | -------------------------------- |
-| Allocation       | Stack (value type)              | Heap via `new` (reference type)  |
-| Inheritance      | No                              | Single inheritance               |
-| Virtual dispatch | No                              | `virtual` / `override`           |
-| Receivers        | `&this` / `mut &this`           | `&this` / `mut &this`            |
-| Use when         | Plain data, generics, hot paths | Polymorphism, object hierarchies |
-
-**Default to structs.** Reach for a class only when you need inheritance and virtual dispatch.
-
----
 
 ## 10. Enums
 
@@ -2075,7 +1944,7 @@ Multiple bounds on the same parameter are joined with `+`. Multiple constrained 
 where T: Hash + Eq, V: Clone
 ```
 
-A `where` clause is the only way to constrain a parameter; there is no inline `<T: Bound>` form. It is written on functions and methods, on `implement` blocks, and on type declarations — a struct, class, union or enum — after the parameter list and before the body:
+A `where` clause is the only way to constrain a parameter; there is no inline `<T: Bound>` form. It is written on functions and methods, on `implement` blocks, and on type declarations — a struct, union or enum — after the parameter list and before the body:
 
 ```cryo
 type struct Holder<T> where T: Tagged {
@@ -2855,9 +2724,8 @@ const n: i32 = Tag(4);                // Labels's function
 | ------------------- | ---------------------------------------------------------------------------------------- |
 | *(none)* / `public` | Accessible to any module that imports this one. This is the default for top-level items. |
 | `private`           | Accessible only within the declaring module - for items and members alike.               |
-| `protected`         | Class members only; accessible within the declaring module and every module under it.    |
 
-Top-level items are **public by default**; mark an item `private` to confine it to its own module. For top-level types (`struct` / `class` / `enum`), `private` is enforced across modules: naming a `private` type from another module - in a type annotation, a struct literal, or a function signature - is rejected with `E0503`. A `private` type remains fully usable within its own module.
+Top-level items are **public by default**; mark an item `private` to confine it to its own module. For top-level types (`struct` / `union` / `enum`), `private` is enforced across modules: naming a `private` type from another module - in a type annotation, a struct literal, or a function signature - is rejected with `E0503`. A `private` type remains fully usable within its own module.
 
 This is the mechanism behind hiding iterator engines: a cursor struct can be `private` while its producer returns [`implement Iterator<...>`](#211-opaque-types-implement-trait), so callers consume the sequence through the trait and can never name the concrete type.
 
@@ -2983,12 +2851,16 @@ free(buf as void*);
 
 A bare `malloc`, `free` or `realloc` means a declaration in scope, as any bare name does: the module's own `intrinsic function`, an `extern "C"` it declares, or an import. With no such declaration in the writing module the bare name is an **error**, and the fix is to say which one is meant - `libc::free` for the C allocator, `heap::free` for the Cryo one. There is no freestanding exception: under `no_std` the name is declared (extern or intrinsic), so the rule holds there as everywhere.
 
-**Class instances (`new` / `delete`):**
+**Heap values (`new` / `delete`):**
 
 ```cryo
-const p: Person* = new Person("Alice", 30);
+const p: Person* = new Person { name: "Alice", age: 30 };
+const o: Option<i64>* = new Option<i64>::Some(41);
 delete p;
+delete o;
 ```
+
+`new T { .. }` places a struct literal on the heap and yields a `T*`; `new E::V(args)` does the same for an enum variant.  Parentheses after the name build only a variant: `new Point(1, 2)` is refused (`E0117`, [section 9](#9-classes)).
 
 **Array allocation (`new T[n]`):**
 
@@ -2996,7 +2868,7 @@ delete p;
 const arr: int* = new int[100];
 ```
 
-`new T[n]` allocates room for `n` contiguous `T` and yields a `T*`. The memory is **uninitialized** and no constructors run - it is the typed equivalent of `malloc(n * sizeof(T))`. Free it with `free(arr as void*)`. For constructed, growable, bounds-checked storage prefer `Array<T>`.
+`new T[n]` allocates room for `n` contiguous `T` and yields a `T*`. The memory is **uninitialized** - it is the typed equivalent of `malloc(n * sizeof(T))`. Free it with `free(arr as void*)`. For constructed, growable, bounds-checked storage prefer `Array<T>`.
 
 **Where `new` gets its memory (`Allocate`).** `new` and `delete` are sugar over the trait `std::core::ops::Allocate`, as `a[i]` is over `Index` and `*p` over `Deref`:
 
@@ -3007,21 +2879,19 @@ type trait Allocate {
 }
 ```
 
-`new T(...)` and `new T { ... }` of a struct or class that implements `Allocate` take their storage from `T::allocate(size, align)`, with `T`'s size and alignment; the vtable is then seeded and the constructor run as for any `new`. Only the root of a class hierarchy may implement it, and every class below uses the root's implementation. A class with a base class that implements `Allocate` is refused (`E0308`): `delete` through a pointer to the base releases through the base's allocator, the root's or the global one, which did not hand out the memory. `new T[n]` of such an element type takes the block from the same `allocate`, with alignment 16. A type with no implementation anywhere uses the global allocator, unchanged.
+`new T { ... }` of a struct that implements `Allocate` takes its storage from `T::allocate(size, align)`, with `T`'s size and alignment 16; the literal is then stored into it as for any `new`. `new T[n]` of such an element type takes the block from the same `allocate`. A type with no implementation uses the global allocator, unchanged.
 
-`delete p` releases `*p` as a scope exit releases a value of `p`'s static pointee type - the type the pointer is declared with, not the class of the object it points at: that type's `Drop`, if it has one, then the values its fields own, each released the same way. A `Base*` holding a `Derived` runs `Base`'s `Drop`, if `Base` has one, and never `Derived`'s, and releases only `Base`'s fields; a cleanup a subclass needs is not run through a pointer to its base. Then `delete p` hands `p` to the same implementation's `release` with the pointee type's alignment, instead of freeing it. `release` does nothing unless an implementation writes it, which is what an arena wants: its storage is reclaimed whole, never one object at a time. An allocator that does free single objects writes both methods.
+`delete p` releases `*p` as a scope exit releases a value of `p`'s pointee type: that type's `Drop`, if it has one, then the values its fields own, each released the same way. Then `delete p` hands `p` to the same implementation's `release` with the pointee type's alignment, instead of freeing it. `release` does nothing unless an implementation writes it, which is what an arena wants: its storage is reclaimed whole, never one object at a time. An allocator that does free single objects writes both methods.
 
 ```cryo
 mut g_pool: [u8; 4096] = [0; 4096];
 mut g_used: u64 = 0;
 
-type class Node {
-public:
+type struct Node {
     tag: i32;
-    Node(t: i32) { this.tag = t; }
 }
 
-implement trait Allocate for class Node {
+implement trait Allocate for struct Node {
     static allocate(size: u64, align: u64) -> void* {
         g_used = (g_used + align - 1) & ~(align - 1);
         const p: void* = (&g_pool[g_used as i64]) as void*;
@@ -3030,16 +2900,11 @@ implement trait Allocate for class Node {
     }
 }
 
-type class Leaf : Node {
-public:
-    Leaf() : Node(2) { }
-}
-
-const n: Leaf* = new Leaf();   // from g_pool, through Node's implementation
-delete n;                      // Node's release: nothing
+const n: Node* = new Node { tag: 2 };   // from g_pool, through Node's implementation
+delete n;                               // Node's release: nothing
 ```
 
-The compiler's own AST nodes are allocated this way: its base node class implements `Allocate` over the arena it reclaims at each target boundary. A struct may implement `Allocate` too; with no inheritance, only its own `new` goes through it. A generic type's implementation (`implement<T> trait Allocate for struct Cell<T>`) serves each instance's `new` and `delete`. `new Cell<i32> { .. }` allocates the instance `Cell<i32>`, and `new Cell { .. }` written without arguments allocates the instance the literal `Cell { .. }` would be: the one the expected pointer's pointee names, or else the one its field values bind. An implementation for any other type, an enum or a primitive, is refused (`E0312`), since `new` of such a type never calls one. An implementation is checked against the trait as any is ([section 11.2](#112-implementing-a-trait)): an `allocate` written with other parameters, another return type or a receiver is refused (`E0312`), and `release` may be left out, since its default does nothing.
+The compiler's own AST nodes are allocated this way: each node struct implements `Allocate` over the arena it reclaims at each target boundary. A generic type's implementation (`implement<T> trait Allocate for struct Cell<T>`) serves each instance's `new` and `delete`. `new Cell<i32> { .. }` allocates the instance `Cell<i32>`, and `new Cell { .. }` written without arguments allocates the instance the literal `Cell { .. }` would be: the one the expected pointer's pointee names, or else the one its field values bind. An implementation for any other type, an enum or a primitive, is refused (`E0312`), since `new` of such a type never calls one. An implementation is checked against the trait as any is ([section 11.2](#112-implementing-a-trait)): an `allocate` written with other parameters, another return type or a receiver is refused (`E0312`), and `release` may be left out, since its default does nothing.
 
 **Higher level (`Box<T>` and the collections).** Prefer `Box<T>` over raw `malloc` for owning a single heap value, and prefer `Array<T>` / `String` / `HashMap<K, V>` over manual allocation for collections. They handle reservation, growth, and cleanup, and they implement `Drop`.
 
@@ -3097,7 +2962,7 @@ Cryo implements a static ownership model that is enforced at compile time. The m
 A type is `Copy` if it can be duplicated by a bitwise copy of its bytes. The compiler infers `Copy` for:
 
 - All primitive types (integers, floats, `boolean`, `char`, `string` (the raw `u8*` view), pointers, references, function pointers).
-- Struct, class, enum, and tuple aggregates **iff** every field is `Copy` **and** the type does not implement `Drop`.
+- Struct, enum, and tuple aggregates **iff** every field is `Copy` **and** the type does not implement `Drop`.
 - Generic parameters are conservatively non-`Copy` unless bound by `T: Copy`.
 
 `Copy` is a marker trait declared in `stdlib/core/marker.cryo`; you do not implement it explicitly. Implementing `Drop` automatically makes a type non-`Copy`.
@@ -3277,7 +3142,7 @@ API change):
 - Primitives, references, function pointers, and **raw pointers** are `Send`
   and `Sync`.
 - Arrays, optionals, and tuples are `Send`/`Sync` if every component is.
-- Structs, classes, and enums are `Send`/`Sync` if every field - or every
+- Structs and enums are `Send`/`Sync` if every field - or every
   variant payload - is, **and** the type is not on the deny-list below.
 - Generic parameters and unresolved positions are conservatively **not**
   `Send`/`Sync`; say `where T: Send` when a generic needs it.
@@ -3356,12 +3221,12 @@ type struct AlignedData {
 | `![section("name")]`                                      | function / method                  | Place the emitted symbol in object-file section `name`.                                                                                                                                                                                                                                                                                                                                                                         |
 | `![naked]`                                                | function                           | Emit no prologue/epilogue (sets LLVM's `naked` attribute); the body must be a single `asm { … }` block that provides its own `ret`/`jmp`/exit. For a freestanding `_start` and other raw entry points. A non-`asm` body is an error (`E0151`).                                                                                                                                                                                  |
 | `![allow(name)]` / `![warn(name)]` / `![deny(name)]`      | any decl                           | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.* Each takes at most one `reason = "..."`, a non-empty string; a lint name is not checked, so an unknown one is accepted.                                                                                                                                                                                       |
-| `![derive(Trait, ...)]`                                   | struct / class / enum              | Intended to auto-derive one or more traits. *Parsed and validated; no trait is actually synthesized.* See [section 22](#22-reserved-syntax).                                                                                                                                                                                                                                                                                    |
+| `![derive(Trait, ...)]`                                   | struct / enum                      | Intended to auto-derive one or more traits. *Parsed and validated; no trait is actually synthesized.* See [section 22](#22-reserved-syntax).                                                                                                                                                                                                                                                                                    |
 | `![sink]`                                                 | method                             | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics.                                                                                                                                                                                                                        |
 | `![implicit]`                                             | generic function / method          | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f::<T>(...)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                           | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                            |
-| `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum              | Memory layout control. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                                                  |
-| `![align(N)]`                                             | struct / class / variable          | Minimum alignment in bytes; N must be a power of two. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                   |
+| `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / union / enum              | Memory layout control. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                                                  |
+| `![align(N)]`                                             | struct / union / enum / variable   | Minimum alignment in bytes; N must be a power of two. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                   |
 | `![arch(<arch>, <dialect>)]`                              | asm block                          | Required directly above an `asm { ... }` block (see [section 6.12](#612-inline-assembly)). Names the target architecture - which *gates* the block, like `![config]` - and the assembly dialect (`intel` or `att`).                                                                                                                                                                                                             |
 | `![clobber(...)]`                                         | asm block                          | Lists registers, `flags`, or `memory` that an `asm` block overwrites but does not bind as operands.                                                                                                                                                                                                                                                                                                                             |
 
@@ -3386,7 +3251,7 @@ Cryo is a systems language and gives programmers explicit control over the in-me
 
 #### 17.3.1 The Default Layout (`repr(Cryo)`)
 
-Without any explicit directive, a struct or class has the **default Cryo layout**:
+Without any explicit directive, a struct has the **default Cryo layout**:
 
 - Fields are laid out in source order.
 - Each field is placed at the lowest offset that satisfies its natural alignment.
@@ -3394,8 +3259,6 @@ Without any explicit directive, a struct or class has the **default Cryo layout*
 - Padding bytes inserted to satisfy alignment have undefined content.
 
 The default layout currently matches the platform's C ABI for primitive-typed fields. The language reserves the right to optimise the default layout in future versions (e.g. reordering fields). **Do not rely on the default layout for FFI or binary serialisation; use `![repr(C)]` for those cases.**
-
-A class with virtual methods carries an 8-byte vtable pointer at offset 0; non-virtual classes have no vtable. Inheritance is flattened in root-to-derived order so an upcast pointer is a no-op.
 
 #### 17.3.2 `![repr(C)]`
 
@@ -3794,7 +3657,7 @@ Two consequences are worth stating because they are guarantees, not implementati
 
 ### 19.5 Async Methods
 
-`async` applies to methods in `type struct`, `type class`, and `implement` blocks, with any receiver form:
+`async` applies to methods in `type struct` and `implement` blocks, with any receiver form:
 
 ```cryo
 type struct Counter {
@@ -3843,8 +3706,6 @@ where S: AsyncRead {
 }
 ```
 
-`async` may not be combined with `virtual` or `override` (`E0364`): those share a vtable slot, and each implementation's future is a distinct type.
-
 ### 19.7 Restrictions
 
 The rules below exist to keep futures free of self-references, which is what makes them movable and removes the need for a pinning discipline.
@@ -3856,7 +3717,7 @@ The rules below exist to keep futures free of self-references, which is what mak
 | An `async` method must be awaited on a receiver that names storage - a local, parameter, field, or dereference. A temporary or call result must be bound to a local first. | `E0455`    |
 | An `async` method's future must be awaited at the call, not stored and awaited later.                                                                                      | `E0455`    |
 | An `async` function may not await itself, directly or transitively - the state machine would contain itself and have no finite size. Rewrite the recursion as a loop.      | `E0600`    |
-| `async` may not be combined with `virtual` or `override`, and there are no `async` constructors, destructors, or fields.                                                   | `E0364`    |
+| There are no `async` fields.                                                                                                                                               | `E0364`    |
 | An `await`, or a `break`/`continue` leaving a loop that awaits, may not stand inside an `unsafe` block or a `static match` arm (see below).                                | `E0600`    |
 
 The last rule has a different reason: a suspend and an edge out of an awaiting loop each become a transition between states, and neither form can be split into states. An `unsafe` block's scope would end at the first state boundary, and a `static match` keeps its arm only after the body has been compiled into states. Everything else is allowed inside them, `return` included. The rewrite keeps the decision inside and the transition outside: bind the awaited value to a `const` ahead of the block, or set a flag inside it and `break` after it.
@@ -4158,7 +4019,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 | `yield`                                       | Parser accepts a `yield` expression; no generator semantics exist. `async` / `await` are fully implemented - see [section 19](#19-asynchronous-programming).                                                                                                                                     |
 | Optional chaining `?.`                        | Token reserved; not consumed by the parser.                                                                                                                                                                                                                                                      |
 | Spread `...` in calls / literals              | The token exists for variadic parameter declarations only.                                                                                                                                                                                                                                       |
-| Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point.                                                                                                                                                                                                            |
 | Macros                                        | No macro system exists, and `macro` is **not** currently a reserved word (it lexes as an ordinary identifier). A future hygienic macro system may introduce one.                                                                                                                                 |
 | `![pure]`                                     | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics).                                                                                                                                  |
 | `![const]`                                    | Reserved. Will mark a function as evaluable at compile time.                                                                                                                                                                                                                                     |
@@ -4182,7 +4042,7 @@ program         = { directive } [ namespace_decl ] { top_level_item }
 top_level_item  = import_decl | module_decl | var_declaration
                 | function_declaration | extern_function_decl | extern_block
                 | c_header_import | intrinsic_decl
-                | struct_declaration | class_declaration
+                | struct_declaration | union_declaration
                 | enum_declaration | trait_declaration
                 | type_alias_declaration | implementation_block
 ```
@@ -4191,7 +4051,7 @@ top_level_item  = import_decl | module_decl | var_declaration
 
 ```
 statement       = var_declaration | function_declaration | struct_declaration
-                | class_declaration | enum_declaration | trait_declaration
+                | union_declaration | enum_declaration | trait_declaration
                 | type_alias_declaration | implementation_block
                 | if_statement | while_statement | for_statement
                 | loop_statement | do_while_statement

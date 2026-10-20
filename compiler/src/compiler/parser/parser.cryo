@@ -37,7 +37,7 @@ import compiler::resolver::lang_item::{ LangItem };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
-    AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding,
+    AssocTypeDeclNode, DeclarationNode, DeclKind, DestructureBinding,
     DestructureDecl, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
     FunctionDecl, GenericParamDecl, ImplBlock, ImportDecl,
     IntrinsicDecl, MethodDecl, ModuleDecl, ReceiverForm,
@@ -493,11 +493,11 @@ implement struct Parser {
             return Node::Decl(vd);
         }
 
-        // Type declarations: type struct/class/enum/trait/alias
+        // Type declarations: type struct/enum/trait/alias
         if (tok.kind == TokenType::KwType) {
             const next: Token = this.peek_at(1);
 
-            if (next.kind == TokenType::KwStruct) {
+            if (next.kind == TokenType::KwStruct || next.kind == TokenType::KwClass) {
                 const sd: DeclarationNode* = this.parse_struct_declaration();
                 if (sd != null) {
                     DeclarationNode::struct_of(sd).is_public = is_public;
@@ -512,14 +512,6 @@ implement struct Parser {
                     if (doc != "") { ud.set_documentation(doc_text); }
                 }
                 return Node::Decl(ud);
-            }
-            if (next.kind == TokenType::KwClass) {
-                const cd: ClassDeclNode* = this.parse_class_declaration();
-                if (cd != null) {
-                    cd.set_public(is_public);
-                    if (doc != "") { cd.set_documentation(doc_text); }
-                }
-                return Node::Decl(cd);
             }
             if (next.kind == TokenType::KwEnum) {
                 const ed: DeclarationNode* = this.parse_enum_declaration();
@@ -772,30 +764,55 @@ implement struct Parser {
         return func_decl;
     }
 
-    /// Emit E0359 for `protected` (block or inline form) used inside a struct.
-    /// `is_block` controls the suggestion text (`public:` vs `public`).
-    emit_protected_in_struct_error(kw_tok: Token, is_block: boolean) -> void {
-        const kw_span: SourceSpan = this.span_from_token(kw_tok);
-        this.panic_mode = true;
+    /// Refuse a form the language does not have where it is written (E0117):
+    /// "`form` is not part of Cryo", the span labelled with what the form is,
+    /// and a help line saying what to write instead.  The caller consumes the
+    /// form and parses on, so what follows it is still checked.
+    refuse_removed_form(span: SourceSpan, form: string, label: string, help: string) -> void {
         this.error_count += 1;
-        const msg: string = if (is_block) {
-            "`protected:` is not allowed in structs (structs do not support inheritance)"
-        } else {
-            "`protected` is not allowed in structs (structs do not support inheritance)"
-        };
-        const sugg_text: string = if (is_block) { "public" } else { "public" };
-        const sugg_label: string = if (is_block) { "change to `public:`" } else { "change to `public`" };
-        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0359_PROTECTED_IN_STRUCT, msg);
-        diag = diag.at(kw_span);
-        diag = diag.suggest(Suggestion::single(kw_span, sugg_text, sugg_label,
-            Applicability::MaybeIncorrect));
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0117_REMOVED_FORM,
+            fmt::format("`%s` is not part of Cryo", form));
+        diag = diag.at_with_label(span, label);
+        diag = diag.help(help);
         this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Refuse `protected` (`protected:` when `is_block`) at its keyword and
+    /// consume it.
+    refuse_protected(is_block: boolean) -> void {
+        mut span: SourceSpan = this.span_from_token(this.current());
+        this.advance();
+        if (is_block) {
+            span = SourceSpan::covering(span, this.span_from_token(this.current()));
+            this.advance();
+        }
+        this.refuse_removed_form(span,
+            if (is_block) { "protected:" } else { "protected" },
+            "a visibility no declaration has",
+            if (is_block) { "write `private:` or `public:`" } else { "write `private` or `public`" });
+    }
+
+    /// At a `virtual` or `override` member modifier: refuse it and consume
+    /// it, so the method it modifies parses as an ordinary method.
+    refuse_member_modifier() -> void {
+        if (!this.at_removed_modifier(TokenType::KwVirtual) && !this.at_removed_modifier(TokenType::KwOverride)) { return; }
+        const tok: Token = this.advance();
+        this.refuse_removed_form(this.span_from_token(tok), tok.lexeme, "a method modifier",
+            "declare the method in a trait and implement it");
+    }
+
+    /// Whether the cursor is at keyword `kw` used as a modifier, not as the
+    /// name of a method (`protected()`), which a keyword may be.
+    at_removed_modifier(kw: TokenType) -> boolean {
+        if (!this.check(kw)) { return false; }
+        const next: TokenType = this.peek_at(1).kind;
+        return next != TokenType::LParen && next != TokenType::LAngle;
     }
 
     /// Parse `'(' params ')'` directly into `func`, also forwarding bare
     /// (`...`) and named (`name...`) variadic markers. Shared by free-fn,
-    /// method, and constructor parsing so the variadic-detection rules don't
-    /// drift across the three sites.
+    /// method, and refused-constructor parsing so the variadic-detection
+    /// rules don't drift across the three sites.
     parse_function_param_list_into(func_decl: DeclarationNode*) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         this.consume(TokenType::LParen, "'('");
@@ -847,7 +864,7 @@ implement struct Parser {
     }
 
     /// The type of a by-reference receiver of the type being parsed: inside a
-    /// struct/class/impl it is `&CurrentType`; inside a trait declaration it
+    /// struct/impl it is `&CurrentType`; inside a trait declaration it
     /// is `&This`, a placeholder that impl-method resolution rewrites to each
     /// concrete impl target.  A written `&this` and the receiver given to a
     /// method that wrote none are typed by this one method.
@@ -906,8 +923,7 @@ implement struct Parser {
     }
 
     /// Give a non-static method the receiver its source did not write.  Every
-    /// instance method takes one - a constructor's is the storage being
-    /// initialized - and a method that writes none takes it by reference, as
+    /// instance method takes one, and a method that writes none takes it by reference, as
     /// `&this`; synthesizing it here makes that one parameter, declared once,
     /// instead of a case every later stage re-derives.  Its span is zero-width
     /// at the method's name: a report about it points at the method, and it
@@ -957,7 +973,7 @@ implement struct Parser {
 
         // Check for &this parameter (method self reference). Synthesize the
         // reference-to-receiver type annotation so FunctionSignature can
-        // resolve the self parameter: inside a struct/class/impl the receiver
+        // resolve the self parameter: inside a struct/impl the receiver
         // is `&CurrentType`; inside a trait declaration it is `&This`, a
         // placeholder that downstream impl-method resolution rewrites to
         // each concrete impl target.
@@ -1035,11 +1051,16 @@ implement struct Parser {
         return param_decl;
     }
 
-    /// Parse a struct declaration: type struct Name<T> { fields, methods }
+    /// Parse a struct declaration: type struct Name<T> { fields, methods }.
+    /// `type class` is refused at its keywords and parsed as a struct.
     parse_struct_declaration() -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_struct_declaration()");
         const start: Token = this.advance(); // consume 'type'
-        this.advance(); // consume 'struct'
+        const kw: Token = this.advance();    // consume 'struct' (or 'class')
+        if (kw.kind == TokenType::KwClass) {
+            this.refuse_removed_form(SourceSpan::covering(this.span_from_token(start), this.span_from_token(kw)),
+                "type class", "a class", "declare a struct and implement a trait");
+        }
 
         const name_tok: Token = this.consume(TokenType::Identifier, "struct name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
@@ -1056,6 +1077,16 @@ implement struct Parser {
             }
         }
 
+        // A base list `: Base` is refused where it is written, and its type
+        // parsed so the body after it is still read.
+        if (this.check(TokenType::Colon)) {
+            const colon: Token = this.advance();
+            const base_text: string = this.current().lexeme;
+            this.parse_type_annotation();
+            this.refuse_removed_form(this.span_from(colon),
+                ": " + base_text, "a base list", "hold the shared part in a field, its methods in a trait");
+        }
+
         // Optional `where T: Bound` clause on the declaration's own
         // parameters, after the list that declares them.
         if (this.check(TokenType::KwWhere)) {
@@ -1066,7 +1097,7 @@ implement struct Parser {
         }
 
         this.consume(TokenType::LBrace, "'{'");
-        this.parse_type_body(node, null, null);
+        this.parse_type_body(node, null);
         this.consume(TokenType::RBrace, "'}'");
 
         this.current_type_name = "";
@@ -1107,7 +1138,7 @@ implement struct Parser {
         }
 
         this.consume(TokenType::LBrace, "'{'");
-        this.parse_type_body(null, null, node);
+        this.parse_type_body(null, node);
         this.consume(TokenType::RBrace, "'}'");
 
         this.current_type_name = "";
@@ -1115,138 +1146,60 @@ implement struct Parser {
         return decl;
     }
 
-    /// Parse a class declaration: type class Name<T> : Base { fields, methods }
-    parse_class_declaration() -> ClassDeclNode* {
-        LOG_DEBUG(LogComponent::Parser, "[Parser] parse_class_declaration()");
-        const start: Token = this.advance(); // consume 'type'
-        this.advance(); // consume 'class'
-
-        const name_tok: Token = this.consume(TokenType::Identifier, "class name");
-        const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: ClassDeclNode* = new ClassDeclNode(name, this.span_from_token(start));
-        node.set_name_span(this.span_from_token(name_tok));
-        this.current_type_name = name_tok.lexeme;
-
-        // Optional generic parameters
-        if (this.check(TokenType::LAngle)) {
-            const gen_params: [DeclarationNode*] = this.parse_generic_params(false);
-            for (mut i: i64 = 0; i < gen_params.length; i++) {
-                node.add_generic_param(gen_params[i]);
-            }
-        }
-
-        // Optional base class: : BaseClass
-        if (this.match_tok(TokenType::Colon)) {
-            const base_tok: Token = this.consume(TokenType::Identifier, "base class name");
-            node.set_base_class(this.intern_lexeme(base_tok),
-                                this.span_from_token(base_tok));
-        }
-
-        // Optional `where T: Bound` clause on the declaration's own
-        // parameters, after the list that declares them.
-        if (this.check(TokenType::KwWhere)) {
-            const bounds: [TraitBound] = this.parse_trait_bounds();
-            for (mut wi: i64 = 0; wi < bounds.length; wi++) {
-                node.add_where_bound(bounds[wi].clone());
-            }
-        }
-
-        this.consume(TokenType::LBrace, "'{'");
-        this.parse_type_body(null, node, null);
-        this.consume(TokenType::RBrace, "'}'");
-
-        this.current_type_name = "";
-        node.span = this.span_from(start);
-        return node;
-    }
-
-    /// Parse the body of a struct or class declaration (fields, methods, visibility).
-    ///
-    /// Visibility rules:
-    ///   Struct: all members default to public.  `public:` and `private:` blocks
-    ///            are allowed but optional.  `protected:` is an error (no inheritance).
-    ///   Class: no default visibility.  Every member MUST appear inside an explicit
-    ///            `public:`, `private:`, or `protected:` block.
-    parse_type_body(struct_node: StructDecl*, class_node: ClassDeclNode*,
-                    union_node: UnionDecl*) -> void {
-        // Unions share the struct member-grammar (default-public, no
-        // `protected`); only their layout/codegen differ.
-        const is_struct: boolean = (struct_node != null) || (union_node != null);
-
-        // Structs default to public; classes have no default (sentinel).
+    /// Parse the body of a struct or union declaration: fields, methods and
+    /// visibility.  Members default to public; a `public:` or `private:`
+    /// block sets the visibility of the members after it, and an inline
+    /// `public` or `private` that of one member.
+    parse_type_body(struct_node: StructDecl*, union_node: UnionDecl*) -> void {
         mut current_visibility: Visibility = Visibility::Public;
-        mut has_visibility_block: boolean = is_struct;  // structs implicitly "have" one
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             this.collect_doc_comments();
             if (this.check(TokenType::RBrace)) { break; }
             const doc: string = this.take_documentation();
 
-            // Visibility labels: public: / private: / protected:
+            // Visibility labels: public: / private:
             if (this.peek_at(1).kind == TokenType::Colon) {
                 mut matched: boolean = true;
                 match (this.current().kind) {
                     TokenType::KwPublic    => { current_visibility = Visibility::Public; }
                     TokenType::KwPrivate   => { current_visibility = Visibility::Private; }
-                    TokenType::KwProtected => {
-                        if (is_struct) {
-                            this.emit_protected_in_struct_error(this.current(), true);
-                            current_visibility = Visibility::Public;
-                        } else {
-                            current_visibility = Visibility::Protected;
-                        }
-                    }
                     _ => { matched = false; }
                 }
                 if (matched) {
-                    has_visibility_block = true;
                     this.advance(); this.advance(); // consume keyword + ':'
+                    continue;
+                }
+                if (this.check(TokenType::KwProtected)) {
+                    this.refuse_protected(true);
                     continue;
                 }
             }
 
             // Inline visibility for the next member: `private foo()`,
-            // `public bar: T;`, or `protected baz()`.  Distinguished
-            // from block-form labels (above) by the absence of a
-            // trailing `:`.  Applies to one member only; the block-
-            // level `current_visibility` is untouched, so a single
-            // inline opt-out doesn't shift the rest of the section.
+            // `public bar: T;`.  Distinguished from block-form labels
+            // (above) by the absence of a trailing `:`.  Applies to one
+            // member only; the block-level `current_visibility` is
+            // untouched, so a single inline opt-out doesn't shift the rest
+            // of the section.
             mut member_visibility: Visibility = current_visibility;
-            mut had_inline_visibility: boolean = false;
             // Where that inline keyword sat, for the member's `outer_span()`:
             // it is consumed here, before the member node exists, so nothing
             // else records it.  Stays `none()` for block-form visibility,
             // whose label is not part of any one member.
             mut member_modifier_span: SourceSpan = SourceSpan::none();
             if (this.peek_at(1).kind != TokenType::Colon) {
+                if (this.at_removed_modifier(TokenType::KwProtected)) { this.refuse_protected(false); }
                 mut matched: boolean = true;
                 match (this.current().kind) {
                     TokenType::KwPublic    => { member_visibility = Visibility::Public; }
                     TokenType::KwPrivate   => { member_visibility = Visibility::Private; }
-                    TokenType::KwProtected => {
-                        if (is_struct) {
-                            this.emit_protected_in_struct_error(this.current(), false);
-                            this.advance();
-                            continue;
-                        }
-                        member_visibility = Visibility::Protected;
-                    }
                     _ => { matched = false; }
                 }
                 if (matched) {
-                    had_inline_visibility = true;
                     member_modifier_span = this.span_from_token(this.current());
                     this.advance(); // consume keyword
                 }
-            }
-
-            // For classes, every member must declare visibility; either
-            // via a block marker (`public:`) or an inline keyword
-            // (`private foo()`).  Structs default to public so the
-            // check is class-only.
-            if (!has_visibility_block && !had_inline_visibility) {
-                this.report_error(ErrorCode::E0360_MISSING_VISIBILITY_BLOCK,
-                    "class members must declare visibility (block-form `public:` / `private:` / `protected:`, or inline `public` / `private` / `protected`)");
             }
 
             // Drain consecutive `![...]` directives so we can attach them
@@ -1266,13 +1219,13 @@ implement struct Parser {
             }
             if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
 
+            this.refuse_member_modifier();
+
             // A leading `async` is consumed ahead of the member head, so every
             // member kind below sees it: only a method can carry it, and the
             // kinds that cannot are rejected where they are built rather than
             // dropping the keyword silently. `static` is deliberately NOT
-            // hoisted here — `static Name()` has always meant a static method
-            // named after the type, not a constructor, and hoisting it would
-            // change that.
+            // hoisted here: `static` begins a static method's own head.
             mut member_is_async: boolean = false;
             if (this.check(TokenType::KwAsync) && this.at_method_modifier()) {
                 member_is_async = true;
@@ -1281,61 +1234,21 @@ implement struct Parser {
                 this.advance();
             }
 
-            // Constructor: ClassName(params) { body }
+            // A constructor `Name(params) { body }` and a destructor
+            // `~Name() { body }` are refused where they are written.
             if (this.check(TokenType::Identifier) && this.current().lexeme == this.current_type_name &&
                 this.peek_at(1).kind == TokenType::LParen) {
-                const method_decl: DeclarationNode* = this.parse_constructor(member_visibility);
-                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
-                if (method != null) {
-                    // A constructor runs to completion at a fixed point in an
-                    // object's lifetime: it has no caller that could hold and
-                    // poll a future, and the object does not exist until it
-                    // returns.
-                    if (member_is_async) {
-                        this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
-                            "a constructor cannot be `async`: it must produce a fully initialized object before any caller can observe it, so there is nothing to suspend into",
-                            member_modifier_span);
-                    }
-                    if (doc != "") { method_decl.set_documentation(doc); }
-                    for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method_decl.add_directive(pending_dirs[pi]);
-                    }
-                    method_decl.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.methods.push(method_decl); }
-                    if (class_node != null) { class_node.add_method(method_decl); }
-                    if (union_node != null) { union_node.methods.push(method_decl); }
-                }
+                this.refuse_constructor();
                 continue;
             }
-
-            // Destructor: ~ClassName() { body }
             if (this.check(TokenType::Tilde)) {
-                const method_decl: DeclarationNode* = this.parse_destructor(member_visibility);
-                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
-                if (method != null) {
-                    // A destructor is called by drop insertion at scope exit,
-                    // from contexts that have no executor and cannot wait.
-                    if (member_is_async) {
-                        this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
-                            "a destructor cannot be `async`: it is called by drop insertion at scope exit, where there is no executor to poll a future",
-                            member_modifier_span);
-                    }
-                    if (doc != "") { method_decl.set_documentation(doc); }
-                    for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method_decl.add_directive(pending_dirs[pi]);
-                    }
-                    method_decl.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.methods.push(method_decl); }
-                    if (class_node != null) { class_node.add_method(method_decl); }
-                    if (union_node != null) { union_node.methods.push(method_decl); }
-                }
+                this.refuse_destructor();
                 continue;
             }
 
             // Static method or static field
             if (this.check(TokenType::KwStatic)) {
-                const method_decl: DeclarationNode* = this.parse_method_with_modifiers(
-                    member_visibility, true, false, false, member_is_async);
+                const method_decl: DeclarationNode* = this.parse_static_method(member_visibility, member_is_async);
                 if (method_decl != null) {
                     if (doc != "") { method_decl.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
@@ -1343,41 +1256,6 @@ implement struct Parser {
                     }
                     method_decl.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.methods.push(method_decl); }
-                    if (class_node != null) { class_node.add_method(method_decl); }
-                    if (union_node != null) { union_node.methods.push(method_decl); }
-                }
-                continue;
-            }
-
-            // Virtual method
-            if (this.check(TokenType::KwVirtual)) {
-                const method_decl: DeclarationNode* = this.parse_method_with_modifiers(
-                    member_visibility, false, true, false, member_is_async);
-                if (method_decl != null) {
-                    if (doc != "") { method_decl.set_documentation(doc); }
-                    for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method_decl.add_directive(pending_dirs[pi]);
-                    }
-                    method_decl.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.methods.push(method_decl); }
-                    if (class_node != null) { class_node.add_method(method_decl); }
-                    if (union_node != null) { union_node.methods.push(method_decl); }
-                }
-                continue;
-            }
-
-            // Override method
-            if (this.check(TokenType::KwOverride)) {
-                const method_decl: DeclarationNode* = this.parse_method_with_modifiers(
-                    member_visibility, false, false, true, member_is_async);
-                if (method_decl != null) {
-                    if (doc != "") { method_decl.set_documentation(doc); }
-                    for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method_decl.add_directive(pending_dirs[pi]);
-                    }
-                    method_decl.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.methods.push(method_decl); }
-                    if (class_node != null) { class_node.add_method(method_decl); }
                     if (union_node != null) { union_node.methods.push(method_decl); }
                 }
                 continue;
@@ -1408,7 +1286,6 @@ implement struct Parser {
                         }
                         method_decl.note_modifier_span(member_modifier_span);
                         if (struct_node != null) { struct_node.methods.push(method_decl); }
-                        if (class_node != null) { class_node.add_method(method_decl); }
                         if (union_node != null) { union_node.methods.push(method_decl); }
                     }
                 } else if (this.check(TokenType::Identifier)
@@ -1427,7 +1304,6 @@ implement struct Parser {
                         }
                         field.note_modifier_span(member_modifier_span);
                         if (struct_node != null) { struct_node.fields.push(field); }
-                        if (class_node != null) { class_node.add_field(field); }
                         if (union_node != null) { union_node.fields.push(field); }
                     }
                 } else {
@@ -1445,93 +1321,50 @@ implement struct Parser {
         }
 
         if (struct_node != null) { this.give_receivers(&struct_node.methods); }
-        if (class_node != null)  { this.give_receivers(&class_node.methods); }
         if (union_node != null)  { this.give_receivers(&union_node.methods); }
     }
 
-    /// Parse a constructor: ClassName(params) [: BaseClass(args)] { body }
-    parse_constructor(visibility: Visibility) -> DeclarationNode* {
-        const start: Token = this.current();
-        const name_tok: Token = this.advance(); // consume class name
-        const name: SymbolStr = this.intern_lexeme(name_tok);
-
-        // Parse as function declaration
-        mut func: FunctionDecl* = FunctionDecl::new(name);
+    /// Refuse a constructor `Name(params) [: Base(args)] [-> T] { body }`
+    /// written in a type body, and consume it.  A base-constructor
+    /// initializer in it is refused as well, where it is written.
+    refuse_constructor() -> void {
+        const start: Token = this.advance(); // the type's name
+        const func: FunctionDecl* = FunctionDecl::new(this.intern_lexeme(start));
         const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
-
         this.parse_function_param_list_into(func_decl);
-
-        mut method: MethodDecl* = MethodDecl::new(func_decl);
-        const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), this.span_from_token(start));
-        method.set_constructor(true);
-        method.set_visibility(visibility);
-
-        // Optional base constructor call: : Base(args)
-        if (this.match_tok(TokenType::Colon)) {
-            const base_tok: Token = this.consume(TokenType::Identifier, "base class name");
-            method.set_base_ctor_name(this.intern_lexeme(base_tok));
+        this.refuse_removed_form(this.span_from(start), start.lexeme + "(..)", "a constructor",
+            "write a `static new` factory");
+        if (this.check(TokenType::Colon)) {
+            const colon: Token = this.advance();
+            const base_tok: Token = this.consume(TokenType::Identifier, "base name");
             this.consume(TokenType::LParen, "'('");
             while (!this.check(TokenType::RParen) && !this.is_at_end()) {
-                const arg: ExpressionNode* = this.parse_expression();
-                if (arg != null) {
-                    method.add_base_ctor_arg(arg);
-                }
+                this.parse_expression();
                 if (!this.match_tok(TokenType::Comma)) { break; }
             }
             this.consume(TokenType::RParen, "')'");
+            this.refuse_removed_form(this.span_from(colon), ": " + base_tok.lexeme + "(..)",
+                "a base-constructor initializer", "build the shared field in the factory");
         }
-
-        // Optional return type: -> Type (allowed on constructors for factory patterns)
-        if (this.match_tok(TokenType::Arrow)) {
-            const ret_ann: TypeAnnotation* = this.parse_type_annotation();
-            func.set_return_type_annotation(ret_ann);
-        }
-
-        // Body
-        if (this.check(TokenType::LBrace)) {
-            const body: Stmt* = this.parse_block_statement();
-            func.set_body(body);
-        }
-
-        method_decl.span = this.span_from(start);
-        return method_decl;
+        if (this.match_tok(TokenType::Arrow)) { this.parse_type_annotation(); }
+        if (this.check(TokenType::LBrace)) { this.parse_block_statement(); }
     }
 
-    /// Parse a destructor: ~ClassName() { body }
-    parse_destructor(visibility: Visibility) -> DeclarationNode* {
+    /// Refuse a destructor `~Name() { body }` (or `~Name() = default;`)
+    /// written in a type body, and consume it.
+    refuse_destructor() -> void {
         const start: Token = this.advance(); // consume '~'
-        const name_tok: Token = this.advance(); // consume class name
-        const name: SymbolStr = this.ctx.intern("~" + name_tok.lexeme);
-
-        mut func: FunctionDecl* = FunctionDecl::new(name);
-        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
-
+        const name_tok: Token = this.consume(TokenType::Identifier, "type name");
         this.consume(TokenType::LParen, "'('");
         this.consume(TokenType::RParen, "')'");
-
-        mut method: MethodDecl* = MethodDecl::new(func_decl);
-        const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), this.span_from_token(start));
-        method.set_destructor(true);
-        method.set_visibility(visibility);
-
-        // Check for = default
+        this.refuse_removed_form(this.span_from(start), "~" + name_tok.lexeme + "()", "a destructor",
+            "implement `Drop`");
         if (this.match_tok(TokenType::Equal)) {
-            if (this.check(TokenType::KwDefault)) {
-                this.advance();
-                method.set_default_destructor(true);
-                this.consume(TokenType::Semicolon, "';'");
-                method_decl.span = this.span_from(start);
-                return method_decl;
-            }
+            if (this.check(TokenType::KwDefault)) { this.advance(); }
+            this.consume(TokenType::Semicolon, "';'");
+            return;
         }
-
-        if (this.check(TokenType::LBrace)) {
-            const body: Stmt* = this.parse_block_statement();
-            func.set_body(body);
-        }
-
-        method_decl.span = this.span_from(start);
-        return method_decl;
+        if (this.check(TokenType::LBrace)) { this.parse_block_statement(); }
     }
 
     /// True when the current token is a method MODIFIER keyword rather than a
@@ -1563,25 +1396,17 @@ implement struct Parser {
         return m;
     }
 
-    /// Parse a method with optional modifiers (static, async, virtual, override).
-    ///
-    /// The keyword that selected this path is still at the cursor and is
-    /// consumed here; a `static` / `async` run may follow it. `virtual async` /
-    /// `override async` are accepted by the grammar and rejected by sema, which
-    /// can say why (each override would return a different future type, so they
-    /// cannot share a vtable slot) instead of leaving a parse error on `async`.
-    parse_method_with_modifiers(visibility: Visibility, is_static: boolean,
-                                 is_virtual: boolean, is_override: boolean,
-                                 is_async: boolean) -> DeclarationNode* {
-        this.advance(); // consume modifier keyword
+    /// Parse a static method.  The `static` that selected this path is still
+    /// at the cursor and is consumed here; a `static` / `async` run may
+    /// follow it.
+    parse_static_method(visibility: Visibility, is_async: boolean) -> DeclarationNode* {
+        this.advance(); // consume `static`
         const extra: MethodModifiers = this.consume_method_modifiers(SourceSpan::none());
 
         const method_decl: DeclarationNode* = this.parse_method(visibility);
         const method: MethodDecl* = DeclarationNode::method_of(method_decl);
         if (method != null) {
-            if (is_static || extra.is_static) { method.set_static(true); }
-            if (is_virtual) { method.set_virtual(true); }
-            if (is_override) { method.set_override(true); }
+            method.set_static(true);
             if ((is_async || extra.is_async) && method.func != null) { DeclarationNode::fn_of(method.func).set_async(true); }
         }
         return method_decl;
@@ -2152,11 +1977,11 @@ implement struct Parser {
     /// Parse an implementation block. Two shapes:
     ///
     ///   Inherent (existing):
-    ///     implement [enum|struct|class] Name[<T>] { ... }
+    ///     implement [enum|struct|union] Name[<T>] { ... }
     ///     implement boolean { ... }
     ///
     ///   Trait impl (G1, G2):
-    ///     implement [<T, ...>] trait <TraitPath>[<args>] for [enum|struct|class]
+    ///     implement [<T, ...>] trait <TraitPath>[<args>] for [enum|struct|union]
     ///         Name[<args>] [where T: Bound + Bound2, U: Other] { ... }
     ///
     /// The leading `<T, ...>` after `implement` carries the impl's own generic
@@ -2166,7 +1991,7 @@ implement struct Parser {
     /// `trait` keyword missing.  Returns:
     ///   0: pattern doesn't match (proceed as a normal inherent impl)
     ///   1: `<Path>[<args>] for ...` form (just `trait` missing)
-    ///   2: `<struct|enum|class> <Path>[<args>] for ...` form
+    ///   2: `<struct|enum|union> <Path>[<args>] for ...` form
     ///       (`trait` missing AND a spurious kind tag is sitting in the
     ///       trait position; kind tags belong on the target after `for`)
     detect_missing_trait_form() -> int {
@@ -2175,8 +2000,7 @@ implement struct Parser {
         const first: TokenType = this.peek_at(0).kind;
         if (first == TokenType::KwStruct
             || first == TokenType::KwUnion
-            || first == TokenType::KwEnum
-            || first == TokenType::KwClass) {
+            || first == TokenType::KwEnum) {
             had_kind_tag = true;
             off = 1;
         }
@@ -2239,7 +2063,7 @@ implement struct Parser {
             this.consume(TokenType::KwFor, "'for'");
         } else {
             // Detect trait-impl heads that are missing the `trait` keyword
-            // (and possibly carry a spurious struct/enum/class kind tag in
+            // (and possibly carry a spurious struct/enum/union kind tag in
             // the trait position).  Both shapes are common copy-paste
             // mistakes; emit a tailored diagnostic and recover by parsing
             // the path before `for` as the trait annotation, exactly as
@@ -2254,7 +2078,7 @@ implement struct Parser {
                     "missing `trait` keyword in `implement ... for ...` block");
                 diag = diag.at(sugg_span);
                 diag = diag.with_note("trait impls are written `implement trait <TraitName> for <TypeName> { ... }`; the `trait` keyword distinguishes a trait impl from an inherent impl");
-                diag = diag.with_note("inherent impls (no `for` clause) use `implement <TypeName> { ... }`, optionally with a `struct`/`enum`/`class` kind tag on the target");
+                diag = diag.with_note("inherent impls (no `for` clause) use `implement <TypeName> { ... }`, optionally with a `struct`/`enum`/`union` kind tag on the target");
                 diag = diag.suggest(Suggestion::replace(sugg_span,
                     fmt::format("trait %s", head),
                     "insert `trait` before the trait name"));
@@ -2264,7 +2088,7 @@ implement struct Parser {
                 this.consume(TokenType::KwFor, "'for'");
             } else if (detect == 2) {
                 // `implement <KindTag> <Path> for ...`: kind tag in the
-                // wrong position.  `struct`/`enum`/`class` are only valid
+                // wrong position.  `struct`/`enum`/`union` are only valid
                 // on the *target* type (after `for`), never on the trait
                 // name.  The user almost certainly meant `trait` here.
                 const tag_tok: Token = this.current();
@@ -2274,7 +2098,7 @@ implement struct Parser {
                     ErrorCode::E0101_UNEXPECTED_TOKEN,
                     fmt::format("`%s` is not valid before a trait name", tag_tok.lexeme));
                 diag = diag.at(tag_span);
-                diag = diag.with_note(fmt::format("the `struct`/`enum`/`class` kind tag is only allowed on the *target* type after `for`; on the trait side, use `trait` (you wrote `implement %s %s for ...`)",
+                diag = diag.with_note(fmt::format("the `struct`/`enum`/`union` kind tag is only allowed on the *target* type after `for`; on the trait side, use `trait` (you wrote `implement %s %s for ...`)",
                     tag_tok.lexeme, name_tok.lexeme));
                 diag = diag.with_note("the canonical form is `implement trait <TraitName> for [<KindTag>] <TypeName> { ... }`");
                 diag = diag.suggest(Suggestion::replace(tag_span, "trait",
@@ -2287,9 +2111,18 @@ implement struct Parser {
             }
         }
 
-        // Optional type keyword (enum, struct, union, class)
-        if (this.check(TokenType::KwEnum) || this.check(TokenType::KwStruct)
-            || this.check(TokenType::KwUnion) || this.check(TokenType::KwClass)) {
+        // Optional type keyword (enum, struct, union); `class` is refused
+        // and the head read on as `struct`'s.
+        if (this.check(TokenType::KwClass)) {
+            const tag: Token = this.advance();
+            if (trait_ann == null) {
+                this.refuse_removed_form(SourceSpan::covering(this.span_from_token(start), this.span_from_token(tag)),
+                    "implement class", "a class", "write `implement struct`");
+            } else {
+                this.refuse_removed_form(this.span_from_token(tag), "for class", "a class", "write `for struct`");
+            }
+        } else if (this.check(TokenType::KwEnum) || this.check(TokenType::KwStruct)
+            || this.check(TokenType::KwUnion)) {
             this.advance();
         }
 
@@ -2436,7 +2269,12 @@ implement struct Parser {
                     vis = Visibility::Private;
                     modifier_span = this.span_from_token(this.current());
                     this.advance();
+                } else if (this.at_removed_modifier(TokenType::KwProtected)) {
+                    const block: boolean = this.peek_at(1).kind == TokenType::Colon;
+                    this.refuse_protected(block);
+                    if (block) { continue; }
                 }
+                this.refuse_member_modifier();
 
                 const mods: MethodModifiers = this.consume_method_modifiers(modifier_span);
                 is_static = mods.is_static;

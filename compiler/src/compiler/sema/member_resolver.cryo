@@ -34,7 +34,7 @@ import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, Temp
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, FieldDecl, ImplBlock, MethodDecl, StructDecl, UnionDecl
+    DeclarationNode, FieldDecl, ImplBlock, MethodDecl, StructDecl, UnionDecl
 };
 import compiler::ast::expression::{
     ArrayAccessExpr, CallExpr, ExpressionNode, MemberAccessExpr
@@ -64,13 +64,12 @@ import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, FieldInfo, MethodInfo, StructType, TraitType
+    FieldInfo, MethodInfo, StructType, TraitType
 };
 
 /// A field as the member door found it: its type as seen through the
-/// receiver, and its coordinates - `index` into the field list of the type
-/// `depth` steps up a class's base chain - for the access to be pinned to.
-/// `entry` and `owner` are the arena entry and the type declaring it, for
+/// receiver, and its `index` in the owner's field list, for the access to
+/// be pinned to.  `entry` and `owner` are the arena entry and the type declaring it, for
 /// the visibility check; both are null for a field read off a generic
 /// template's declaration.  `index` is -1 for an array's `length`, which has
 /// a type and no slot.
@@ -78,11 +77,10 @@ type struct FieldAnswer {
     ty:    TypeRef;
     entry: FieldInfo*;
     owner: Type*;
-    depth: i64;
     index: i64;
 
     static none() -> FieldAnswer {
-        return FieldAnswer { ty: TypeRef::invalid(), entry: null, owner: null, depth: -1, index: -1 };
+        return FieldAnswer { ty: TypeRef::invalid(), entry: null, owner: null, index: -1 };
     }
 
     found(&this) -> boolean { return this.ty.is_valid(); }
@@ -193,7 +191,7 @@ type struct MemberResolver {
                            idx, tup.elements.length), m_span);
                 return TypeRef::invalid();
             }
-            member.set_resolved_member(MemberPin::Field(0, idx));
+            member.set_resolved_member(MemberPin::Field(idx));
             return tup.elements[idx];
         }
 
@@ -211,7 +209,7 @@ type struct MemberResolver {
         // Symbolic walk: an unwrapped `void`/abstract receiver - defer.
         if (unresolved || this.symbolic.symbolic_type_unresolved(walk_ty)) { return TypeRef::invalid(); }
 
-        // Method lookup with inheritance, from the *dereferenced* receiver symbol.
+        // Method lookup from the *dereferenced* receiver symbol.
         const type_sym: SymbolStr = this.types.lookup_type_sym(walk_ty);
         if (type_sym.is_valid()) {
             const type_name: string = this.intern.resolve(type_sym);
@@ -248,7 +246,7 @@ type struct MemberResolver {
                 ErrorCode::E0204_UNDEFINED_FIELD,
                 fmt::format("no field or method `%s` on type `%s`", member_name, type_name));
             d = d.at_with_label(m_span, "unknown field or method");
-            const cands: [string] = this.diag.collect_struct_or_class_member_names(obj_type);
+            const cands: [string] = this.diag.collect_struct_member_names(obj_type);
             d = d.did_you_mean(member_name, cands, "field or method", m_span);
             this.ctx.emit_diagnostic(d);
         }
@@ -324,7 +322,7 @@ type struct MemberResolver {
                 rd += 1;
             }
             if (t == null) { return TypeRef::invalid(); }
-            const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
+            const is_user: boolean = t.kind == TypeKind::Struct
                                   || t.kind == TypeKind::Enum   || t.kind == TypeKind::InstantiatedType;
             if (!is_user) { return TypeRef::invalid(); }
             const impl_block: ImplBlock* = this.trait_checker().select_impl(
@@ -413,25 +411,16 @@ type struct MemberResolver {
         return TypeRef::invalid();
     }
 
-    /// The return of the method `member` names on `ty`, or on the nearest
-    /// base class declaring it, read off the member-function door's entries
-    /// for that owner and leaf.  Invalid when no owner in the chain has the
-    /// family, or when its overloads return different types: only the
-    /// call's selection can choose between those.
+    /// The return of the method `member` names on `ty`, read off the
+    /// member-function door's entries for that owner and leaf.  Invalid when
+    /// the owner has no such family, or when its overloads return different
+    /// types: only the call's selection can choose between those.
     method_return_through_door(&this, ty: TypeRef, member: MemberAccessExpr*) -> TypeRef {
-        mut owner: TypeRef = this.types.method_owner_ref(ty);
-        mut depth: i32 = 0;
-        while (owner.is_valid() && depth < 16) {
-            const entries: [OverloadId] = this.ctx.decl_index.lookup_family_entries(
-                FamilyOwner::Type(owner), member.member);
-            if (entries.length > 0) { return this.shared_entry_return(&entries); }
-            const t: Type* = this.arena.lookup(owner);
-            if (t == null || t.kind != TypeKind::Class) { break; }
-            const cls: ClassType* = t.as_class();
-            if (!cls.has_base || !cls.base_class.is_valid()) { break; }
-            owner = cls.base_class;
-            depth += 1;
-        }
+        const owner: TypeRef = this.types.method_owner_ref(ty);
+        if (!owner.is_valid()) { return TypeRef::invalid(); }
+        const entries: [OverloadId] = this.ctx.decl_index.lookup_family_entries(
+            FamilyOwner::Type(owner), member.member);
+        if (entries.length > 0) { return this.shared_entry_return(&entries); }
         return TypeRef::invalid();
     }
 
@@ -458,8 +447,8 @@ type struct MemberResolver {
     /// pointer or reference layer.  An instantiation with no resolved type,
     /// and a generic template itself, is read off the template's declaration:
     /// the arena type of a template holds no fields.  Everything else - a
-    /// struct, union or class, a resolved instantiation, an array's `length` -
-    /// is read off its arena type, a class's base chain derived-first.  The
+    /// struct or union, a resolved instantiation, an array's `length` - is
+    /// read off its arena type.  The
     /// field's type is seen through the receiver: the owner's parameters are
     /// replaced by the receiver's arguments (`Pair<u32, i64>.second` is `i64`).
     field_of(&this, recv: TypeRef, leaf: SymbolStr) -> FieldAnswer {
@@ -484,8 +473,7 @@ type struct MemberResolver {
             if (t == null) { return FieldAnswer::none(); }
         }
         const reg: GenericRegistry* = this.ctx.get_generic_registry();
-        if ((t.kind == TypeKind::Struct || t.kind == TypeKind::Class)
-                && reg != null && reg.is_template(owner)) {
+        if (t.kind == TypeKind::Struct && reg != null && reg.is_template(owner)) {
             return this.template_field(owner, recv, leaf);
         }
         // A concrete type's fields, read off its arena entry.  A pointer or
@@ -507,51 +495,27 @@ type struct MemberResolver {
         if (t.kind == TypeKind::Struct) {
             mut st: StructType* = t.as_struct();
             const i: i64 = st.field_position(leaf);
-            if (i >= 0) { return this.field_answer(recv, &st.fields[i], t, 0, i); }
-            return FieldAnswer::none();
-        }
-        // A class's own field wins over a base's of the same name: the chain
-        // is searched derived-first, `depth` steps up from the class.
-        if (t.kind == TypeKind::Class) {
-            mut current_t: Type* = t;
-            mut depth: i64 = 0;
-            while (current_t != null) {
-                const current: ClassType* = current_t.as_class();
-                const i: i64 = current.own_field_position(leaf);
-                if (i >= 0) {
-                    return this.field_answer(recv, &current.fields[i], current_t, depth, i);
-                }
-                mut parent_t: Type* = null;
-                if (current.has_base && current.base_class.is_valid()) {
-                    const base_t: Type* = this.arena.lookup(current.base_class);
-                    if (base_t != null && base_t.kind == TypeKind::Class) {
-                        parent_t = base_t;
-                    }
-                }
-                current_t = parent_t;
-                depth += 1;
-            }
+            if (i >= 0) { return this.field_answer(recv, &st.fields[i], t, i); }
             return FieldAnswer::none();
         }
         // An array's `length` is an implicit `i64` field, at no position.
         if (t.kind == TypeKind::Array && this.intern.resolve(leaf).eq("length")) {
             return FieldAnswer {
                 ty:    this.types.subst_owner_params_from_receiver(recv, this.arena.get_i64()),
-                entry: null, owner: null, depth: -1, index: -1,
+                entry: null, owner: null, index: -1,
             };
         }
         return FieldAnswer::none();
     }
 
     /// The answer for field `entry`, at `index` in the field list of `owner`,
-    /// `depth` steps up a class's base chain, seen through the receiver.
+    /// seen through the receiver.
     field_answer(&this, recv: TypeRef, entry: FieldInfo*, owner: Type*,
-                 depth: i64, index: i64) -> FieldAnswer {
+                 index: i64) -> FieldAnswer {
         return FieldAnswer {
             ty:    this.types.subst_owner_params_from_receiver(recv, entry.field_type),
             entry: entry,
             owner: owner,
-            depth: depth,
             index: index,
         };
     }
@@ -581,25 +545,17 @@ type struct MemberResolver {
                 const f: FieldDecl* = DeclarationNode::field_of(f_decl);
                 if (f != null && f.name.equals(leaf) && f.resolved_type.is_valid()) { i = k; declared = f.resolved_type; break; }
             }
-        } else if (tmpl.kind == TemplateKind::Class) {
-            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
-            for (mut k: i64 = 0; k < cn.fields.length; k++) {
-                const f_decl: DeclarationNode* = cn.fields[k];
-                const f: FieldDecl* = DeclarationNode::field_of(f_decl);
-                if (f != null && f.name.equals(leaf) && f.resolved_type.is_valid()) { i = k; declared = f.resolved_type; break; }
-            }
         }
         if (i < 0) { return FieldAnswer::none(); }
         return FieldAnswer {
             ty:    this.types.subst_owner_params_from_receiver(recv, declared),
             entry: null,
             owner: null,
-            depth: 0,
             index: i,
         };
     }
 
-    /// The declared fields of the struct or class a generic body's type
+    /// The declared fields of the struct a generic body's type
     /// `recv` is an instantiation of - an instantiation not minted yet, or
     /// the generic owner itself - in declaration order, which is their order
     /// in every specialization.  False when `recv` names no such template (a
@@ -622,11 +578,6 @@ type struct MemberResolver {
             for (mut k: i64 = 0; k < sn.fields.length; k++) { out.push(DeclarationNode::field_of(sn.fields[k]).name); }
             return true;
         }
-        if (tmpl.kind == TemplateKind::Class) {
-            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
-            for (mut k: i64 = 0; k < cn.fields.length; k++) { out.push(DeclarationNode::field_of(cn.fields[k]).name); }
-            return true;
-        }
         return false;
     }
 
@@ -634,7 +585,7 @@ type struct MemberResolver {
     /// visibility of the entry the door found.  A template's field has no
     /// entry; an array's `length` has no slot.
     pin_field(mut &this, member: MemberAccessExpr*, fa: &FieldAnswer, acc_span: SourceSpan) -> void {
-        if (fa.index >= 0) { member.set_resolved_member(MemberPin::Field(fa.depth, fa.index)); }
+        if (fa.index >= 0) { member.set_resolved_member(MemberPin::Field(fa.index)); }
         if (fa.entry != null) {
             this.enforce_field_visibility(fa.entry, fa.owner, member.member, acc_span);
         }
@@ -642,8 +593,8 @@ type struct MemberResolver {
 
     /// `obj.f(args)` where `f` is a function-typed field: tag the member with
     /// that type (so codegen emits an indirect call) and return its return type.
-    /// Calling the field reads it, so it is gated as a read is: a private or
-    /// protected field is refused outside the module that may reach it.
+    /// Calling the field reads it, so it is gated as a read is: a private
+    /// field is refused outside the module that may reach it.
     try_field_function_call(mut &this, obj_type: TypeRef, member_e: ExpressionNode*,
                             member: MemberAccessExpr*) -> TypeRef {
         const fa: FieldAnswer = this.field_of(obj_type, member.member);
@@ -762,7 +713,7 @@ type struct MemberResolver {
 
     /// Build + resolve the index desugar `*(a.index(i))` when the base type
     /// `ty` overloads `[]`: a concrete user aggregate
-    /// (Struct/Class/Enum/InstantiatedType) with a registered `Index` impl, or
+    /// (Struct/Enum/InstantiatedType) with a registered `Index` impl, or
     /// a generic param bounded by `Index`.  Returns the resolved desugar
     /// expression (its `resolved_type` is the element type = the deref of the
     /// method's `Output*`) for the caller to stash, or null when no overload
@@ -794,7 +745,7 @@ type struct MemberResolver {
         // parameter is bounded by it or a type implements it.
         const index_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Index);
         if (!index_id.is_valid()) { return null; }
-        if (t.kind != TypeKind::Struct && t.kind != TypeKind::Class
+        if (t.kind != TypeKind::Struct
                 && t.kind != TypeKind::Enum && t.kind != TypeKind::InstantiatedType) {
             return null;
         }
@@ -863,7 +814,7 @@ type struct MemberResolver {
             rdepth += 1;
         }
         if (t == null) { return false; }
-        const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
+        const is_user: boolean = t.kind == TypeKind::Struct
                               || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
         if (!is_user) { return false; }
         const name: string = this.arena.format_display(t);
@@ -876,48 +827,43 @@ type struct MemberResolver {
 
     // -- Visibility enforcement --
 
-    /// Whether code written at `span` may reach a member declared in module
-    /// `decl`.  A `private` member is reachable from its declaring module
-    /// only; a `protected` one from that module and every module nested
-    /// under it.  Which module the code is in is the module that owns the
-    /// syntax's own file - never the type the walk is inside - so an
-    /// `implement` block written in another module is outside however it
-    /// names the type, a free function beside the type is inside, and a
-    /// lowered `async` body, whose statements keep the spans they were
-    /// written with, keeps the access of where it was written.
+    /// Whether code written at `span` may reach a `private` member declared
+    /// in module `decl`: only from that module.  Which module the code is in
+    /// is the module that owns the syntax's own file - never the type the
+    /// walk is inside - so an `implement` block written in another module is
+    /// outside however it names the type, a free function beside the type is
+    /// inside, and a lowered `async` body, whose statements keep the spans
+    /// they were written with, keeps the access of where it was written.
     ///
     /// An unknown use site or declaring module is not judged: reading "I do
     /// not know where this was written" as "somewhere else" is the false
     /// positive the callee gate was reverted for.
-    member_reachable(&this, decl: ModulePath, is_protected: boolean,
-                     span: SourceSpan) -> boolean {
+    member_reachable(&this, decl: ModulePath, span: SourceSpan) -> boolean {
         const use_site: ModulePath = this.ctx.module_of_file(span.file);
         if (!use_site.is_valid() || !decl.is_valid()) { return true; }
-        if (use_site.equals(decl)) { return true; }
-        return is_protected && use_site.is_within(decl, this.intern);
+        return use_site.equals(decl);
     }
 
-    /// Emit E0353 when a private or protected field is reached from outside
-    /// the module that may reach it (`member_reachable`).  A field is
-    /// declared where its type is.  `field` and `declaring_t` are the entry
-    /// and the declaring type the caller's lookup found (`field_of`);
-    /// `field_name` is the spelling, for the diagnostic alone.  Nothing here
-    /// finds the field again.
+    /// Emit E0353 when a private field is reached from outside the module
+    /// that may reach it (`member_reachable`).  A field is declared where its
+    /// type is.  `field` and `declaring_t` are the entry and the declaring
+    /// type the caller's lookup found (`field_of`); `field_name` is the
+    /// spelling, for the diagnostic alone.  Nothing here finds the field
+    /// again.
     enforce_field_visibility(mut &this, field: FieldInfo*, declaring_t: Type*,
                              field_name: SymbolStr, span: SourceSpan) -> void {
         if (field == null || declaring_t == null) { return; }
         if (field.is_public) { return; }
         const decl: ModulePath = this.arena.declared_in(declaring_t);
-        if (this.member_reachable(decl, field.is_protected, span)) { return; }
+        if (this.member_reachable(decl, span)) { return; }
 
         const declaring_name: string = declaring_t.display_name();
-        const vis_word: string = if (field.is_protected) { "protected" } else { "private" };
         const field_str: string = this.intern.resolve(field_name);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
-            fmt::format("field `%s` of `%s` is %s", field_str, declaring_name, vis_word));
-        d = d.at_with_label(span, fmt::format("%s field reached outside module `%s`",
-            vis_word, this.intern.shown(decl.decl_name())));
+            fmt::format("field `%s` of `%s` is private", field_str, declaring_name));
+        d = d.at_with_label(span, fmt::format("private field reached outside module `%s`",
+            this.intern.shown(decl.decl_name())));
         this.ctx.emit_diagnostic(d);
     }
 
@@ -933,55 +879,26 @@ type struct MemberResolver {
                               method_name: SymbolStr, span: SourceSpan) -> void {
         const base_ref: TypeRef = this.types.unwrap_to_base_ref(recv_type);
         const base: Type* = this.arena.lookup(base_ref);
-        if (base == null) { return; }
+        if (base == null || base.kind != TypeKind::Struct) { return; }
 
-        mut method: MethodInfo* = null;
-        mut declaring_name: string = "";
-
-        if (base.kind == TypeKind::Struct) {
-            mut st: StructType* = base.as_struct();
-            method = this.ctx.decl_index.type_method(base_ref, method_name, this.arena);
-            if (method != null) { declaring_name = st.display_name(); }
-        } else if (base.kind == TypeKind::Class) {
-            mut current: ClassType* = base.as_class();
-            mut current_ref: TypeRef = base_ref;
-            while (current != null) {
-                method = this.ctx.decl_index.type_method(current_ref, method_name, this.arena);
-                if (method != null) {
-                    declaring_name = current.display_name();
-                    break;
-                }
-                if (current.has_base && current.base_class.is_valid()) {
-                    const parent_t: Type* = this.arena.lookup(current.base_class);
-                    if (parent_t != null && parent_t.kind == TypeKind::Class) {
-                        current_ref = current.base_class;
-                        current = parent_t.as_class();
-                    } else {
-                        current = null;
-                    }
-                } else {
-                    current = null;
-                }
-            }
-        }
-
+        const method: MethodInfo* = this.ctx.decl_index.type_method(base_ref, method_name, this.arena);
         if (method == null) { return; }
         if (method.is_public) { return; }
         // A method no declaration was written for has no module to be
         // private to.
-        const node_decl: DeclarationNode* = DeclarationNode::with_shape(method.ast_node);
+        const node_decl: DeclarationNode* = method.ast_node;
         const node: MethodDecl* = DeclarationNode::method_of(node_decl);
         if (node == null) { return; }
         const decl: ModulePath = this.ctx.module_of_file(node_decl.span.file);
-        if (this.member_reachable(decl, method.is_protected, span)) { return; }
+        if (this.member_reachable(decl, span)) { return; }
 
-        const vis_word: string = if (method.is_protected) { "protected" } else { "private" };
+        const declaring_name: string = base.as_struct().display_name();
         const method_str: string = this.intern.resolve(method_name);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
-            fmt::format("method `%s` of `%s` is %s", method_str, declaring_name, vis_word));
-        d = d.at_with_label(span, fmt::format("%s method called outside module `%s`",
-            vis_word, this.intern.shown(decl.decl_name())));
+            fmt::format("method `%s` of `%s` is private", method_str, declaring_name));
+        d = d.at_with_label(span, fmt::format("private method called outside module `%s`",
+            this.intern.shown(decl.decl_name())));
         this.ctx.emit_diagnostic(d);
     }
 

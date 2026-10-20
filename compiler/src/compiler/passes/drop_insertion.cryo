@@ -70,13 +70,13 @@ import compiler::lex::{ Token, TokenType };
 import compiler::types::generic;
 import compiler::types::generic::{ InstantiatedType };
 import compiler::types::user_defined;
-import compiler::types::user_defined::{ ClassType, FieldInfo, StructType };
+import compiler::types::user_defined::{ FieldInfo, StructType };
 import compiler::types::compound;
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
 import compiler::intrinsic_kind::{ IntrinsicKind };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl,
+    DeclarationNode, DestructureBinding, DestructureDecl,
     DeclKind, FunctionDecl, ImplBlock, MethodDecl, StructDecl,
     UnionDecl, VarDecl
 };
@@ -331,7 +331,7 @@ type struct DropInserter {
     /// fields (`append_partial_drops`) instead of the monolithic `.drop()` that
     /// would double-free them.  MoveCheck (fatal, runs first) is the gatekeeper:
     /// it only ALLOWS such a move when the owner is a straight-line
-    /// (`branch_depth == 0`) bare local of a non-`Drop` struct/class, so by the
+    /// (`branch_depth == 0`) bare local of a non-`Drop` struct, so by the
     /// time this pass runs every recorded partial move is unconditional.  The
     /// classification predicate here is kept identical to MoveCheck's (same
     /// owner shape, non-`Drop`, droppable field, `branch_depth == 0`) so both
@@ -838,28 +838,24 @@ type struct DropInserter {
     }
 
     walk_top_level(mut &this, stmt: DeclarationNode*) -> void {
-        if (stmt.is_class()) {
-            this.walk_methods((stmt as ClassDeclNode*).methods);
-        } else {
-            match (stmt.shape) {
-                DeclKind::Function(_) => {
-                    this.walk_function(DeclarationNode::with_shape(stmt), null);
-                }
-                DeclKind::Trait(td) => {
-                    for (mut i: i64 = 0; i < td.methods.length; i++) {
-                        const m_decl: DeclarationNode* = td.methods[i];
-                        const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
-                        if (m != null) { this.walk_function(m_decl, null); }
-                    }
-                }
-                DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
-                DeclKind::Struct(sd) => { this.walk_methods(sd.methods); }
-                DeclKind::Impl(ib) => { this.walk_methods(ib.methods); }
-                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+        match (stmt.kind) {
+            DeclKind::Function(_) => {
+                this.walk_function(stmt);
             }
+            DeclKind::Trait(td) => {
+                for (mut i: i64 = 0; i < td.methods.length; i++) {
+                    const m_decl: DeclarationNode* = td.methods[i];
+                    const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
+                    if (m != null) { this.walk_function(m_decl); }
+                }
+            }
+            DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
+            DeclKind::Struct(sd) => { this.walk_methods(sd.methods); }
+            DeclKind::Impl(ib) => { this.walk_methods(ib.methods); }
+            DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+            | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+            | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+            | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) => {}
         }
     }
 
@@ -868,13 +864,11 @@ type struct DropInserter {
             const m_decl: DeclarationNode* = methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
-            this.walk_function(m.func, m_decl);
+            this.walk_function(m.func);
         }
     }
 
-    walk_function(mut &this, func_decl: DeclarationNode*,
-                  owner_method_decl: DeclarationNode*) -> void {
-        const owner_method: MethodDecl* = DeclarationNode::method_of(owner_method_decl);
+    walk_function(mut &this, func_decl: DeclarationNode*) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         if (func.is_generic()) { return; }
@@ -954,21 +948,6 @@ type struct DropInserter {
                 this.binding_dropflags.push(PassLocal::none());
                 // The caller's move-in made it live before the body runs.
                 this.binding_definit.push(1 as u8);
-            }
-        }
-        // A base-class constructor initializer (`MyCtor(...) : Base(arg, ...)`)
-        // runs before the body and consumes its arguments into the base
-        // subobject.  The init list lives on the owning MethodDecl (null for
-        // free functions / trait methods).  Walk each arg in move context so a
-        // by-value owning param forwarded to the base (e.g.
-        // `Derived(tokens) : Base(tokens)`) is marked moved here -
-        // otherwise it would be dropped again at this constructor's exit,
-        // double-freeing the buffer the base subobject now owns.
-        if (owner_method != null) {
-            const base_args_len: i64 = owner_method.base_ctor_args.length;
-            for (mut bi: i64 = 0; bi < base_args_len; bi++) {
-                const base_arg: ExpressionNode* = owner_method.base_ctor_args[bi];
-                this.walk_expr_move(base_arg);
             }
         }
         this.walk_block_body(func.body);
@@ -2400,7 +2379,7 @@ type struct DropInserter {
                                                     this.intern, ty);
     }
 
-    /// Resolve `ty` to the underlying struct/class Type* whose per-field drop
+    /// Resolve `ty` to the underlying struct Type* whose per-field drop
     /// glue we enumerate, peeling `InstantiatedType`.  Null for anything not
     /// safely field-droppable (unions, enums, arrays, primitives, unresolved
     /// generics).  Mirrors move_check::aggregate_type_of.
@@ -2422,13 +2401,12 @@ type struct DropInserter {
             if (st.is_union) { return null as Type*; }
             return t;
         }
-        if (t.kind == TypeKind::Class) { return t; }
         return null as Type*;
     }
 
     /// Mirror of move_check::partial_move_allowed: is `ma` (`p.field`) an
     /// allowed, tracked partial move?  Owner must be a straight-line bare
-    /// live local of a non-`Drop` struct/class value.  `sym_is_live`
+    /// live local of a non-`Drop` struct value.  `sym_is_live`
     /// excludes match/pattern payload bindings (registered type-only, never in
     /// the scope stack), matching MoveCheck's "real let/param local" rule.
     partial_move_allowed(&this, ma: MemberAccessExpr*) -> boolean {
@@ -2482,11 +2460,7 @@ type struct DropInserter {
             if (stmt != null) { out.push(stmt); this.inserted += 1; }
             return;
         }
-        mut fields: &[FieldInfo] = if (t.kind == TypeKind::Struct) {
-            &t.as_struct().fields
-        } else {
-            &t.as_class().fields
-        };
+        const fields: &[FieldInfo] = &t.as_struct().fields;
         for (mut i: i64 = 0; i < fields.length; i++) {
             const f: FieldInfo = fields[i];
             // Non-droppable fields have no glue drop; skip (as emit_field_drops).
@@ -2516,7 +2490,7 @@ type struct DropInserter {
         field_access.set_resolved_type(field_ty);
         // A node minted after the last sema walk carries its own answer:
         // the field is the `field_index`-th of the aggregate's own list.
-        ExpressionNode::member_access_of(field_access).set_resolved_member(MemberPin::Field(0, field_index));
+        ExpressionNode::member_access_of(field_access).set_resolved_member(MemberPin::Field(field_index));
         const drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
             field_access, this.drop_sym, span, span);
         const call: ExpressionNode* = ExpressionNode::call_expr(drop_access, span);
@@ -3272,7 +3246,7 @@ type struct DropInserter {
                 ma.set_resolved_type(next_ty);
                 // Minted after the last sema walk: the field's coordinates
                 // are the projection's own answer.
-                ExpressionNode::member_access_of(ma).set_resolved_member(MemberPin::Field(0, next_index));
+                ExpressionNode::member_access_of(ma).set_resolved_member(MemberPin::Field(next_index));
                 ma.generated = true;
                 cur = ma;
             } else {
@@ -3714,11 +3688,7 @@ type struct DropInserter {
         }
         const agg: Type* = this.aggregate_type_of(ty);
         if (agg == null) { return TypeRef::invalid(); }
-        mut fields: &[FieldInfo] = if (agg.kind == TypeKind::Struct) {
-            &agg.as_struct().fields
-        } else {
-            &agg.as_class().fields
-        };
+        const fields: &[FieldInfo] = &agg.as_struct().fields;
         const i: i64 = DropInserter::own_field_position(agg, SymbolStr::from_id(key));
         if (i < 0) { return TypeRef::invalid(); }
         *out_index = i;
@@ -3730,7 +3700,6 @@ type struct DropInserter {
     static own_field_position(agg: Type*, leaf: SymbolStr) -> i64 {
         if (agg == null) { return -1; }
         if (agg.kind == TypeKind::Struct) { return agg.as_struct().field_position(leaf); }
-        if (agg.kind == TypeKind::Class) { return agg.as_class().own_field_position(leaf); }
         return -1;
     }
 
@@ -4379,7 +4348,7 @@ type struct DropInserter {
 
     read_new(mut &this, n: NewExpr*) -> void {
         if (n == null) { return; }
-        // Constructor arguments transfer ownership exactly like call arguments,
+        // A variant's `new` arguments transfer ownership exactly like call arguments,
         // and are classified the same way - mirrors move_check::read_new so the
         // two passes track the identical move set.
         for (mut i: i64 = 0; i < n.arguments.length; i++) {

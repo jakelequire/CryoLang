@@ -16,10 +16,10 @@ language server".  From there, in order, to the v1.0 freeze:
    the postfix forms are refused.  Built, on `type-syntax-impl`.
 2. **One dynamic array type.**  `[T]` becomes `Array<T>`, which also
    removes the crash of nested builtin arrays (below).
-3. **The class removal, then borrowed trait objects** (`virtual &T`,
-   rulings 285, 288, 289), built after the class feature is deleted, with
-   the table emission copied from the class vtable code rather than shared
-   with it (ruling 415).  Owning boxes and upcasting come after v1.0;
+3. **Borrowed trait objects** (`virtual &T`, rulings 285, 288, 289),
+   now that the class feature is deleted, with the table emission copied
+   from the deleted class vtable code in the history rather than revived
+   (ruling 415).  Owning boxes and upcasting come after v1.0;
    generic implementations converted to an object are revisited before the
    freeze (ruling 425).
 4. **Associated constants on concrete types** (`i32::MAX`,
@@ -31,8 +31,7 @@ language server".  From there, in order, to the v1.0 freeze:
    today, so internals such as `Array`'s grower are public API.  The pass
    decides what stays public, and which standard-library APIs want trait
    objects.
-7. **The slice and API pass**, after the class removal and the visibility
-   pass:
+7. **The slice and API pass**, after the visibility pass:
    - first, the fix for a by-value struct parameter accepting
      `&OtherStruct` (bug 0063);
    - `&this` enforced as read-only (D37), with const pointers following;
@@ -83,10 +82,6 @@ sweep.  Counted (`grep -E '^\s*implement(<[^>]*>)? (struct|union) '`):
   `Array<T, A>`'s second block in its own file, to fold inline (its bound
   becomes a `where` on the methods that need it, or stays on the type).
 - tests: 108, converted with the tests they belong to.
-
-Not counted: the 50 `implement class` blocks holding `walk_children` in
-`AST/walk.cryo`, which are class-removal bridge pieces and move inline
-into each node struct as its category converts.
 
 ## Merge notes
 
@@ -379,35 +374,6 @@ alike first.  What stays open:
 - **The demangler prints `[T]` as the instance it is**,
   `std::collections::array::Array<i64, std::alloc::allocator::GlobalAlloc>`.
 
-## The class removal
-
-Classes are removed as a language feature before the v1.0 freeze: after
-the array syntax and the type-system update, and well before the pipeline
-work, compile-time execution and what follows them.  What remains is
-structs, enums and traits.  The compiler's AST goes straight to enums and
-`match` (ruling 290: no intermediate struct-node stage).
-
-The plan, its measured inventory and the decisions it waits on are in
-`docs/class-removal-plan.md`.  What is known now:
-
-- 109 classes, all in the compiler; the standard library, the language
-  server and the examples declare none.
-- The AST is 69 of them, at most 3 deep.
-- 6 visitors walk it (cloner, dumper, substituter, IR generator, name
-  resolver, sema).
-- Dispatch is already by tag: about 1,300 `kind` checks and 2,400 casts,
-  against 188 `accept()` calls.
-- Every hierarchy is a closed set, so each becomes an enum with no need for
-  dynamic dispatch.
-
-The class defects known today stay unfixed, since classes are going
-(ruling 291: an unchecked `override`, a silently missing vtable slot, and
-slots matched by name).  Trait objects must not repeat them.
-
-Open: how the six visitors' `visit` overloads become `match` arms without
-a flag day across the whole compiler, and what replaces `ASTNode`'s
-`Allocate` arena when the nodes are enum values.
-
 ## Build the compiler with LLVM optimisation, then derive `TypeKind`
 
 Ruling 403.  `Type` carries both a stored `kind: TypeKind` and the payload
@@ -438,11 +404,11 @@ Peak memory was unchanged (1,530 MiB).  The steps, in order:
 ## Trait objects
 
 A pointer or reference to a trait, dispatched through a table of the
-implementation's methods.  Borrowed trait objects come before v1.0, right
-after the class removal or folded into it, built on the class vtable
-machinery (ruling 360, which brings forward ruling 286's "possibly after
-v1.0"); owning boxes, upcasting and generic implementations coerced to an
-object come after v1.0.
+implementation's methods.  Borrowed trait objects come before v1.0, after
+the class removal (ruling 415), their table emission copied from the
+deleted class vtable code (ruling 360, which brings forward ruling 286's
+"possibly after v1.0"); owning boxes, upcasting and generic
+implementations coerced to an object come after v1.0.
 
 - **Spelling:** `virtual &Shape` and `virtual Shape*`, a prefix as in
   `mut &this`; there is no `dyn` (ruling 285).  Until then `&Shape` and
@@ -487,9 +453,8 @@ compile-time functions and limits on what they may touch.
 
 `with_allocator(arena) { ... }` makes `arena` the allocator for the `new`
 expressions inside the block.  It arrives with the compile-time work.  A
-class's own `Allocate` implementation wins over it (ruling 249: `new` and
-`delete` go through the `Allocate` trait, and the nearest ancestor's
-implementation wins).
+type's own `Allocate` implementation wins over it (ruling 249: `new` and
+`delete` go through the `Allocate` trait).
 
 Open: whether the scope reaches into the functions the block calls or only
 the `new` written inside it; and what `delete` does with memory allocated

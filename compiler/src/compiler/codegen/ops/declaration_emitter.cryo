@@ -1,7 +1,7 @@
 /// Declaration Emitter
 ///
 /// Phase-1 (forward-declare types) and Phase-2 (declare functions,
-/// methods, externs, globals, vtables) of the codegen pipeline; called
+/// methods, externs, globals) of the codegen pipeline; called
 /// by the Codegen pass before body emission begins.  Also owns the
 /// function-prologue / function-epilogue / method-prologue lowering
 /// that materializes parameter allocas, binds `this` / args slots, and
@@ -51,7 +51,7 @@ import compiler::resolver::lang_item::{ LangItem };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDecl,
+    DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDecl,
     ImplBlock, IntrinsicDecl, MethodDecl, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::node::{ Node, ProgramNode };
@@ -68,7 +68,7 @@ import compiler::codegen::state::global_registry::{ GlobalRegistry };
 import compiler::codegen::state::string_cache::{ StringCache };
 import compiler::codegen::state::value_table::{ ValueTable };
 import compiler::codegen::type_map::{ TypeMapper };
-import compiler::codegen::util::{ CodegenUtil, VTableSlot };
+import compiler::codegen::util::{ CodegenUtil };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
@@ -82,7 +82,7 @@ import compiler::types::generic::{ InstantiatedType };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, EnumType, EnumVariantInfo, MethodInfo, StructType
+    EnumType, EnumVariantInfo, MethodInfo, StructType
 };
 import compiler::codegen::ops::intrinsic_emitter::{ IntrinsicEmitter };
 import compiler::codegen::state::function_registry::{ FunctionRegistry };
@@ -219,10 +219,10 @@ type struct DeclarationEmitter {
 
 
     // Declaration emission.  Phase-1 (forward-declare types) and Phase-2
-    // (declare functions, methods, externs, globals, vtables) of the codegen
+    // (declare functions, methods, externs, globals) of the codegen
     // pipeline; called by the Codegen pass before body emission begins.
 
-    /// Walk the program and forward-declare all struct/class/enum types as
+    /// Walk the program and forward-declare all struct/union/enum types as
     /// named LLVM struct types.  This must run before function declarations
     /// so that parameter and return types can reference these types.
     declare_types(mut &this, program: ProgramNode*) -> void {
@@ -231,21 +231,17 @@ type struct DeclarationEmitter {
             const stmt: DeclarationNode* = stmts[i].as_decl();
             if (stmt == null) { continue; }
 
-            if (stmt.is_class()) {
-                this.declare_class_type(stmt as ClassDeclNode*);
-            } else {
-                match (stmt.shape) {
-                    DeclKind::Struct(n) => { this.declare_struct_type(n); }
-                    DeclKind::Enum(n) => { this.declare_enum_type(n); }
-                    DeclKind::Union(n) => { this.declare_union_type(n); }
-                    // An impl block declares no type; its target's
-                    // declaration does.
-                    DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::Impl(_)
-                    | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
-                    | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
-                    | DeclKind::GenericParam(_) | DeclKind::Trait(_) | DeclKind::Variable(_)
-                    | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
-                }
+            match (stmt.kind) {
+                DeclKind::Struct(n) => { this.declare_struct_type(n); }
+                DeclKind::Enum(n) => { this.declare_enum_type(n); }
+                DeclKind::Union(n) => { this.declare_union_type(n); }
+                // An impl block declares no type; its target's
+                // declaration does.
+                DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::Impl(_)
+                | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
+                | DeclKind::GenericParam(_) | DeclKind::Trait(_) | DeclKind::Variable(_)
+                | DeclKind::Function(_) | DeclKind::Method(_) => {}
             }
         }
     }
@@ -285,20 +281,6 @@ type struct DeclarationEmitter {
         this.type_mapper.map_type(type_ref);
     }
 
-    /// Forward-declare a class type.
-    declare_class_type(mut &this, node: ClassDeclNode*) -> void {
-        if (node.generic_params.length > 0) {
-            return;
-        }
-
-        const type_ref: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "codegen/declare class type");
-        if (type_ref.is_invalid()) {
-            return;
-        }
-
-        this.type_mapper.map_type(type_ref);
-    }
-
     /// Declare an enum type.
     declare_enum_type(mut &this, node: EnumDecl*) -> void {
         if (node.generic_params.length > 0) {
@@ -324,28 +306,24 @@ type struct DeclarationEmitter {
             const stmt: DeclarationNode* = stmts[i].as_decl();
             if (stmt == null) { continue; }
 
-            if (stmt.is_class()) {
-                this.declare_class_methods(stmt as ClassDeclNode*);
-            } else {
-                match (stmt.shape) {
-                    DeclKind::Function(_) => {
-                        this.declare_function(DeclarationNode::with_shape(stmt));
-                    }
-                    DeclKind::Intrinsic(n) => { this.declare_intrinsic(n); }
-                    DeclKind::Extern(n)    => { this.declare_extern_block(n); }
-                    DeclKind::Union(n)     => { this.declare_union_methods(n); }
-                    DeclKind::Struct(n)    => { this.declare_struct_methods(n); }
-                    DeclKind::Impl(n)      => { this.declare_impl_block(n); }
-                    DeclKind::Variable(n)  => {
-                        if (n.is_global) {
-                            this.codegen_global_var(stmt, n);
-                        }
-                    }
-                    DeclKind::Import(_) | DeclKind::Module(_)
-                    | DeclKind::Variant(_) | DeclKind::Destructure(_) | DeclKind::TypeAlias(_)
-                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Enum(_)
-                    | DeclKind::Trait(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+            match (stmt.kind) {
+                DeclKind::Function(_) => {
+                    this.declare_function(stmt);
                 }
+                DeclKind::Intrinsic(n) => { this.declare_intrinsic(n); }
+                DeclKind::Extern(n)    => { this.declare_extern_block(n); }
+                DeclKind::Union(n)     => { this.declare_union_methods(n); }
+                DeclKind::Struct(n)    => { this.declare_struct_methods(n); }
+                DeclKind::Impl(n)      => { this.declare_impl_block(n); }
+                DeclKind::Variable(n)  => {
+                    if (n.is_global) {
+                        this.codegen_global_var(stmt, n);
+                    }
+                }
+                DeclKind::Import(_) | DeclKind::Module(_)
+                | DeclKind::Variant(_) | DeclKind::Destructure(_) | DeclKind::TypeAlias(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Enum(_)
+                | DeclKind::Trait(_) | DeclKind::Method(_) => {}
             }
         }
     }
@@ -683,230 +661,6 @@ type struct DeclarationEmitter {
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.declare_method(node.methods[i], owner);
         }
-    }
-
-    /// Declare methods defined inline within a class declaration.
-    declare_class_methods(mut &this, node: ClassDeclNode*) -> void {
-        if (node.generic_params.length > 0) {
-            return;
-        }
-        const di_ref: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "codegen/declare class methods");
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.declare_method(node.methods[i], di_ref);
-        }
-
-        // Emit the vtable for classes with virtual methods.  Drive this from
-        // ClassType.methods + its base chain (populated by the type-resolution
-        // pass) so the vtable is inheritance-complete: a subclass's vtable has
-        // one slot per virtual method introduced anywhere in the ancestry,
-        // in the order of first introduction (root -> leaf).  The slot's
-        // implementation is the most-derived override present in the chain,
-        // falling back to the inherited base implementation when the subclass
-        // doesn't override that slot.  Layout discipline is what makes call-site
-        // dispatch work: a `Base*` callsite looks up slot N in `Base`'s layout,
-        // and any subclass's vtable guarantees slot N at the same index.
-        if (di_ref.is_valid()) {
-            const arena: TypeArena* = this.get_arena();
-            const t: Type* = arena.lookup(di_ref);
-            if (t != null && t.kind == TypeKind::Class) {
-                const cls: ClassType* = t.as_class();
-                if (cls.has_virtual_methods) {
-                    this.codegen_vtable_for_class(cls);
-                }
-            }
-        }
-    }
-
-    /// Walk the class's base chain (leaf -> root) and collect the ordered
-    /// list of virtual-method slots.  New `is_virtual` methods append a
-    /// new slot; `is_override` methods do NOT; they install into an
-    /// existing slot at vtable-emission time.  The returned list is in
-    /// root -> leaf declaration order, so every subclass's vtable extends
-    /// the base's layout with its own additions.
-    collect_vtable_slots(mut &this, cls: ClassType*) -> [VTableSlot] {
-        const arena: TypeArena* = this.get_arena();
-
-        // Build chain = [cls, ..., root].
-        mut chain: [ClassType*] = [];
-        mut walk: ClassType* = cls;
-        mut depth: i32 = 0;
-        while (walk != null && depth < 16) {
-            chain.push(walk);
-            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-            const base_t: Type* = arena.lookup(walk.base_class);
-            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
-            walk = base_t.as_class();
-            depth += 1;
-        }
-
-        mut slots: [VTableSlot] = [];
-        for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
-            const link: ClassType* = chain[ci];
-            for (mut mi: i64 = 0; mi < link.methods.length; mi++) {
-                const m: &MethodInfo = &link.methods[mi];
-                if (!m.is_virtual) { continue; }
-                mut already: boolean = false;
-                for (mut ki: i64 = 0; ki < slots.length; ki++) {
-                    // Must use the SAME param equality as `find_vtable_slot_impl`
-                    // / `vtable_slot_index`, or slot construction and slot
-                    // lookup disagree: two virtual declarations of the same
-                    // overload counted as distinct here produce two slots, while
-                    // a laxer lookup then matches both to one method - a
-                    // duplicate slot / index skew.
-                    if (slots[ki].name.equals(m.name) &&
-                        CodegenUtil::param_types_equal(
-                            slots[ki].param_types, m.param_types)) {
-                        already = true;
-                        break;
-                    }
-                }
-                if (!already) {
-                    // Own an independent copy of the param-type ids; moving
-                    // `m.param_types` out of the slice-element copy `m` would
-                    // alias the array and double-free. TypeRef is Copy.
-                    mut pt_copy: [TypeRef] = [];
-                    for (mut pk: i64 = 0; pk < m.param_types.length; pk++) {
-                        pt_copy.push(m.param_types[pk]);
-                    }
-                    slots.push(VTableSlot { name: m.name, param_types: pt_copy });
-                }
-            }
-        }
-        return slots;
-    }
-
-    /// For a given vtable slot (name + param_types), walk leaf -> root and
-    /// return the first matching method's LLVM function: the most-derived
-    /// override, falling back to the inherited base implementation when
-    /// the subclass doesn't override that specific overload.  Resolution
-    /// goes through the method's own registered entry so the correct LLVM
-    /// function is installed in the slot, not the last-registered one
-    /// under `Type::method`.
-    find_vtable_slot_impl(mut &this, cls: ClassType*, slot_name: SymbolStr, slot_params: &[TypeRef]) -> LValue {
-        const arena: TypeArena* = this.get_arena();
-        mut walk: ClassType* = cls;
-        mut depth: i32 = 0;
-        while (walk != null && depth < 16) {
-            for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
-                const m: &MethodInfo = &walk.methods[mi];
-                if (!m.name.equals(slot_name)) { continue; }
-                // Param equality must agree with `collect_vtable_slots`, which
-                // built these slots.  It relies on canonical type identity: an
-                // override's params and the virtual base's params denote the
-                // same types and therefore share arena ids, even when the two
-                // declarations resolved at different points (e.g. `IRGeneratorVisitor*`
-                // registered before vs. after the visitor module finished
-                // resolving).  If that ever stopped holding, this would miss
-                // every override and the whole vtable would bail (every
-                // `new <DerivedClass>` then skips the vtable store; runtime
-                // virtual dispatch crashes reading a null vtable pointer).
-                if (!CodegenUtil::param_types_equal(m.param_types, slot_params)) { continue; }
-                if (!m.is_virtual && !m.is_override) { continue; }
-                // Skip pure virtual declarations (virtual without body).
-                // Their LLVM function is a bare `declare` that links as an
-                // undefined reference.  Keep walking up; a concrete override
-                // must come from further up the chain, or the caller's
-                // `!impl.is_valid()` bail drops the whole vtable.
-                if (m.ast_node != null) {
-                    const mnode_ck_decl: DeclarationNode* = DeclarationNode::with_shape(m.ast_node);
-                    const mnode_ck: MethodDecl* = DeclarationNode::method_of(mnode_ck_decl);
-                    if (mnode_ck != null && mnode_ck.func != null && !DeclarationNode::fn_of(mnode_ck.func).has_body()) {
-                        continue;
-                    }
-                }
-                // The slot's function is this declaration and nothing else:
-                // an inherited base method the module has not declared yet
-                // is declared extern from its entry.  A lookup by the
-                // combined `Type::method` name would fill the slot with
-                // whichever overload registered first - right only when that
-                // is the slot's own.
-                mut slot_entry: OverloadId = OverloadId::invalid();
-                if (m.ast_node != null) {
-                    const smn_decl: DeclarationNode* = DeclarationNode::with_shape(m.ast_node);
-                    const smn: MethodDecl* = DeclarationNode::method_of(smn_decl);
-                    if (smn != null && smn.func != null) { slot_entry = DeclarationNode::fn_of(smn.func).overload_entry; }
-                }
-                return this.resolver.resolve_pinned(CalleePin::Decl(slot_entry));
-            }
-            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-            const base_t: Type* = arena.lookup(walk.base_class);
-            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
-            walk = base_t.as_class();
-            depth += 1;
-        }
-        return LValue::null();
-    }
-
-    /// Return the vtable slot index of (method_name, param_types) in this
-    /// class's layout, or -1 if no matching virtual slot exists.  Called
-    /// from codegen dispatch after the call's pin has identified the exact
-    /// overload; this function just maps that declaration to its slot
-    /// position.
-    ///
-    /// Param-type matching goes through `param_types_equal` (canonical arena-id
-    /// compare), the same relation `collect_vtable_slots` used to build the
-    /// slots.  It matters that an override's parameter `Foo*` and the base
-    /// method's `Foo*` share one id even when the two declarations resolved
-    /// before/after `Foo`'s body was sealed - that is exactly what canonical
-    /// type identity provides.  Were they to diverge, a virtual call through a
-    /// base-class pointer would fall back to a static call to the base
-    /// method, silently skipping the override.
-    vtable_slot_index(mut &this, cls: ClassType*, method_name: SymbolStr, param_types: [TypeRef]) -> i32 {
-        const slots: [VTableSlot] = this.collect_vtable_slots(cls);
-        for (mut i: i32 = 0; i < slots.length as i32; i++) {
-            if (slots[i].name.equals(method_name) &&
-                CodegenUtil::param_types_equal(
-                    slots[i].param_types, param_types)) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    /// Emit the vtable global for `cls`.  Slot layout comes from
-    /// `collect_vtable_slots` (inheritance-complete, overload-aware); each
-    /// slot's contents come from `find_vtable_slot_impl` (most-derived
-    /// override wins, inherited base implementation otherwise).
-    codegen_vtable_for_class(mut &this, cls: ClassType*) -> void {
-        const intern: InternTable* = this.get_intern();
-
-        const slots: [VTableSlot] = this.collect_vtable_slots(cls);
-        if (slots.length == 0) { return; }
-
-        mut impls: [LValue] = [];
-        for (mut i: i64 = 0; i < slots.length; i++) {
-            const impl: LValue = this.find_vtable_slot_impl(cls, slots[i].name, slots[i].param_types);
-            if (!impl.is_valid()) {
-                // If the slot's implementation isn't declared in this module,
-                // skip vtable emission entirely; a half-populated vtable would
-                // misdispatch.  Cross-module vtables are handled when the owning
-                // module's codegen runs.
-                return;
-            }
-            impls.push(impl);
-        }
-
-        const n: u32 = impls.length as u32;
-        const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
-        const vtable_ty: LType = LType::array_of(fn_ptr_ty, n);
-
-        const buf: void* = libc::malloc(n as u64 * 8);
-        const slot_ptrs: void** = buf as void**;
-        for (mut i: u32 = 0; i < n; i++) {
-            slot_ptrs[i] = llvm::LLVMConstBitCast(impls[i].raw, fn_ptr_ty.raw);
-        }
-        const init: LValue = LType::const_array(fn_ptr_ty, buf, n);
-        libc::free(buf);
-
-        const qname: QualifiedName = QualifiedName::from_symbol(cls.qualified_name.spelling());
-        const mangled: MangledName = MangledName::for_vtable(intern, qname);
-        const global: LValue = this.llvm_module.add_global(vtable_ty, mangled);
-        global.set_initializer(init);
-        global.set_global_constant(true);
-        // External linkage so cross-module `new` sites can resolve the vtable
-        // symbol at link time.  Internal linkage hides the global from the
-        // owning module's .o exports, leaving cross-module references unresolved.
-        global.set_linkage(LLinkage::External);
     }
 
     /// The LLVM symbol of a method's declaration: its registered entry's.
@@ -2547,7 +2301,6 @@ type struct DeclarationEmitter {
         // fields here would silently define the rest as zero.
         mut field_count: i64 = -1;
         if (layout.kind == TypeKind::Struct) { field_count = layout.as_struct().fields.length; }
-        else if (layout.kind == TypeKind::Class) { field_count = layout.as_class().fields.length; }
         if (field_count < 0 || sl.field_inits.length != field_count) { return LValue::null(); }
         const buf: void* = libc::malloc((n as u64) * 8);
         const slots: void** = buf as void**;

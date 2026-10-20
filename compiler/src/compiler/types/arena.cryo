@@ -4,7 +4,7 @@
 ///! and singleton primitives.  All types are created through the arena's factory
 ///! methods, which return TypeRef handles.
 ///!
-///! A user-defined type (struct, class, enum, trait, alias) is allocated
+///! A user-defined type (struct, enum, trait, alias) is allocated
 ///! once per definition, where the definition is declared, and kept under
 ///! that definition by the declaration index (`type_of_def`); a reference
 ///! reaches it through the definition its name resolved to.  The arena
@@ -45,7 +45,7 @@ import compiler::types::generic::{
 import compiler::types::type_base::{ Type, TypeData };
 import compiler::types::type_ref::{ TypeRef, TypeRefs };
 import compiler::types::user_defined::{
-    ClassType, EnumType, EnumVariantInfo, FieldInfo, FunctionTemplateType, StructType,
+    EnumType, EnumVariantInfo, FieldInfo, FunctionTemplateType, StructType,
     TraitType, TypeAliasType
 };
 import compiler::module_graph;
@@ -139,7 +139,7 @@ type struct TypeArena {
     // per-lookup allocation and no string hashing on these hot paths.
     //
     // Deliberately NOT used for:
-    //   * nominal types (Struct/Class/Enum/Trait/Alias) - one per
+    //   * nominal types (Struct/Enum/Trait/Alias) - one per
     //     definition, kept under it by the declaration index (file header).
     //   * GenericParam - keyed by NAME ONLY, dropping `index`.  That is a correctness fix, not an oversight: see
     //     `create_generic_param`.  Re-including them here would regress it.
@@ -563,12 +563,6 @@ public:
         return ref;
     }
 
-    /// Create a class type named `qualified_name`.
-    create_class(mut &this, qualified_name: SymbolStr, declared_in: ModulePath) -> TypeRef {
-        LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] create_class() name='%s'", this.intern_table.resolve(qualified_name));
-        return this.alloc_type(TypeData::Class(ClassType::new(qualified_name, declared_in, this.intern_table)));
-    }
-
     /// Create an enum type named `qualified_name`.
     create_enum(mut &this, qualified_name: SymbolStr, declared_in: ModulePath) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] create_enum() name='%s'", this.intern_table.resolve(qualified_name));
@@ -896,11 +890,6 @@ public:
             if (display.is_valid()) { et.set_display_name(display); }
             et.set_generic_origin(w_base, &w_inst.type_args);
             concrete = Type::new(w_id, TypeData::Enum(et));
-        } else if (kind == TypeKind::Class) {
-            mut ct: ClassType* = ClassType::new(qualified_spec, declared_in, this.intern_table);
-            if (display.is_valid()) { ct.set_display_name(display); }
-            ct.set_generic_origin(w_base, &w_inst.type_args);
-            concrete = Type::new(w_id, TypeData::Class(ct));
         } else {
             mut st: StructType* = StructType::new(qualified_spec, declared_in, this.intern_table);
             if (is_union) { st.set_union(true); }
@@ -1072,39 +1061,14 @@ public:
         return false;
     }
 
-    /// The class `depth` steps up `leaf`'s base chain (`leaf` itself at 0),
-    /// or null when the chain is shorter.
-    class_at_depth(&this, leaf: ClassType*, depth: i64) -> ClassType* {
-        mut walk: ClassType* = leaf;
-        mut d: i64 = 0;
-        while (walk != null && d < depth) {
-            if (!walk.has_base || !walk.base_class.is_valid()) { return null; }
-            const base_t: Type* = this.lookup(walk.base_class);
-            if (base_t == null || base_t.kind != TypeKind::Class) { return null; }
-            walk = base_t.as_class();
-            d += 1;
-        }
-        return walk;
-    }
-
-    /// The field at `(depth, index)` in `t` - the coordinates a `MemberPin`
-    /// holds: `index` into the field list of the class `depth` steps up the
-    /// base chain, or of the struct itself.  Null when the coordinates name
-    /// nothing in `t`.  The one reader of those coordinates; a base chain is
-    /// a chain of `TypeRef`s, so only something holding the arena can follow
-    /// it.
-    pinned_field(&this, t: Type*, depth: i64, index: i64) -> FieldInfo* {
-        if (t == null || depth < 0 || index < 0) { return null; }
+    /// The field at `index` in `t` - the index a `MemberPin` holds into the
+    /// struct's field list.  Null when the index names nothing in `t`.
+    pinned_field(&this, t: Type*, index: i64) -> FieldInfo* {
+        if (t == null || index < 0) { return null; }
         if (t.kind == TypeKind::Struct) {
-            if (depth != 0) { return null; }
             const st: StructType* = t.as_struct();
             if (index >= st.fields.length) { return null; }
             return &st.fields[index];
-        }
-        if (t.kind == TypeKind::Class) {
-            const owner: ClassType* = this.class_at_depth(t.as_class(), depth);
-            if (owner == null || index >= owner.fields.length) { return null; }
-            return &owner.fields[index];
         }
         return null;
     }
@@ -1115,7 +1079,7 @@ public:
         const t: Type* = this.lookup(ty);
         if (t == null) { return DeclName::empty(); }
         match (t.kind) {
-            TypeKind::Struct | TypeKind::Class | TypeKind::Enum | TypeKind::Trait | TypeKind::TypeAlias => {
+            TypeKind::Struct | TypeKind::Enum | TypeKind::Trait | TypeKind::TypeAlias => {
                 return this.declared_name(t);
             }
             TypeKind::InstantiatedType => {
@@ -1214,7 +1178,7 @@ public:
                 return this.format_generic_param(ty.as_generic_param());
             }
             TypeKind::AssocProjection => {
-                // `Base::Member` (e.g. `This::Item`).  The class-level
+                // `Base::Member` (e.g. `This::Item`).  The type's own
                 // `display_name` can only reach raw ids (`488::489`) - it
                 // has no intern table - so render it here where the base's
                 // display name and the member's interned string are both
@@ -1226,7 +1190,7 @@ public:
                 return this.resolve_display_name(proj.base) + "::"
                     + this.intern_table.resolve(proj.member);
             }
-            TypeKind::Struct | TypeKind::Class | TypeKind::Enum | TypeKind::Trait
+            TypeKind::Struct | TypeKind::Enum | TypeKind::Trait
             | TypeKind::TypeAlias | TypeKind::FunctionTemplate => {
                 const array_elem: TypeRef = this.default_array_element_of(ty);
                 if (array_elem.is_valid()) { return "[" + this.resolve_display_name(array_elem) + "]"; }
@@ -1247,13 +1211,12 @@ public:
         return this.intern_table.intern(this.resolve_display_name(ty));
     }
 
-    /// The name a struct, class, enum, trait, alias or function template is
+    /// The name a struct, enum, trait, alias or function template is
     /// declared under, read off the type: text to show, never a key.  The
     /// name of nothing for any other kind.
     declared_name(&this, ty: Type*) -> DeclName {
         return match (ty.kind) {
             TypeKind::Struct           => { ty.as_struct().qualified_name }
-            TypeKind::Class            => { ty.as_class().qualified_name }
             TypeKind::Enum             => { ty.as_enum().qualified_name }
             TypeKind::Trait            => { ty.as_trait().qualified_name }
             TypeKind::TypeAlias        => { DeclName::of(ty.as_alias().alias_name) }
@@ -1262,13 +1225,12 @@ public:
         };
     }
 
-    /// The display a specialization of a generic struct, class or enum is
-    /// given in place of its declared name (`Vec<i32>`), or the name of
-    /// nothing when it has none.
+    /// The display a specialization of a generic struct or enum is given in
+    /// place of its declared name (`Vec<i32>`), or the name of nothing when
+    /// it has none.
     custom_display_of(&this, ty: Type*) -> DeclName {
         return match (ty.kind) {
             TypeKind::Struct => { ty.as_struct().custom_display }
-            TypeKind::Class  => { ty.as_class().custom_display }
             TypeKind::Enum   => { ty.as_enum().custom_display }
             _                => { DeclName::empty() }
         };
@@ -1358,7 +1320,7 @@ public:
             }
             TypeKind::AssocProjection => {
                 // `Base::Member` (e.g. `This::Item`) - see the long-form
-                // `format_display` for why this can't live on the class's
+                // `format_display` for why this can't live on the type's
                 // `display_name`.  Base is shortened too so a qualified
                 // concrete base renders `Range<i32>::Item`, not the path.
                 const proj: AssocProjectionType* = ty.as_assoc_projection();
@@ -1427,7 +1389,7 @@ public:
                 t.kind == TypeKind::Tuple || t.kind == TypeKind::Optional) {
                 n_compound += 1;
             }
-            if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class ||
+            if (t.kind == TypeKind::Struct ||
                 t.kind == TypeKind::Enum || t.kind == TypeKind::Trait ||
                 t.kind == TypeKind::TypeAlias) {
                 n_user += 1;
@@ -1446,7 +1408,7 @@ public:
 
         cdebug("  Primitives:    %lld\n", n_primitives);
         cdebug("  Compound:      %lld  (ptr, ref, array, fn, tuple, optional)\n", n_compound);
-        cdebug("  User-defined:  %lld  (struct, class, enum, trait, alias)\n", n_user);
+        cdebug("  User-defined:  %lld  (struct, enum, trait, alias)\n", n_user);
         cdebug("  Generic:       %lld  (params + function templates)\n", n_generic);
         cdebug("  Instantiated:  %lld  (%lld resolved)\n", n_instantiated, n_resolved_inst);
         cdebug("  Total:         %lld\n", this.types.length);
@@ -1472,15 +1434,12 @@ public:
         return this.declared_in(ty).decl_name();
     }
 
-    /// The module a struct, class, enum or trait is declared in; none for
-    /// any other kind.
+    /// The module a struct, enum or trait is declared in; none for any other
+    /// kind.
     declared_in(&this, ty: Type*) -> ModulePath {
         if (ty == null) { return ModulePath::none(); }
         if (ty.kind == TypeKind::Struct) {
             return ty.as_struct().declared_in;
-        }
-        if (ty.kind == TypeKind::Class) {
-            return ty.as_class().declared_in;
         }
         if (ty.kind == TypeKind::Enum) {
             return ty.as_enum().declared_in;
@@ -1497,7 +1456,7 @@ public:
     }
 
     /// Members column: compact field/method/variant/param/element counts.
-    ///   Struct/Class: "3f 2m"  (fields, methods)
+    ///   Struct:       "3f 2m"  (fields, methods)
     ///   Enum:         "4v 1m"  (variants, methods)
     ///   Trait:        "2m 1s"  (required methods, super traits)
     ///   Function:     "3p"     (params)
@@ -1507,10 +1466,6 @@ public:
         if (ty.kind == TypeKind::Struct) {
             const st: StructType* = ty.as_struct();
             return fmt::format("%lldf %lldm", st.fields.length, st.methods.length);
-        }
-        if (ty.kind == TypeKind::Class) {
-            const cl: ClassType* = ty.as_class();
-            return fmt::format("%lldf %lldm", cl.fields.length, cl.methods.length);
         }
         if (ty.kind == TypeKind::Enum) {
             const en: EnumType* = ty.as_enum();
@@ -1540,12 +1495,6 @@ public:
         if (ty.kind == TypeKind::Struct) {
             const st: StructType* = ty.as_struct();
             return if (st.is_complete) { "complete" } else { "forward" };
-        }
-        if (ty.kind == TypeKind::Class) {
-            const cl: ClassType* = ty.as_class();
-            mut s: string = if (cl.is_complete) { "complete" } else { "forward" };
-            if (cl.has_virtual_methods) { s += " vt"; }
-            return s;
         }
         if (ty.kind == TypeKind::Enum) {
             const en: EnumType* = ty.as_enum();
@@ -1648,13 +1597,6 @@ public:
             }
             return fmt::format("base: %s => ?", base);
         }
-        if (ty.kind == TypeKind::Class) {
-            const cl: ClassType* = ty.as_class();
-            if (cl.has_base) {
-                const base_name: string = this.resolve_display_name(cl.base_class);
-                return fmt::format("extends %s (#%lu)", base_name, cl.base_class.key());
-            }
-        }
         return "";
     }
 
@@ -1676,8 +1618,6 @@ public:
         if (!wi.generic_base.is_valid()) { return; }
         if (t.kind == TypeKind::Struct) {
             t.as_struct().set_generic_origin(wi.generic_base, &wi.type_args);
-        } else if (t.kind == TypeKind::Class) {
-            t.as_class().set_generic_origin(wi.generic_base, &wi.type_args);
         } else if (t.kind == TypeKind::Enum) {
             t.as_enum().set_generic_origin(wi.generic_base, &wi.type_args);
         }
@@ -1707,7 +1647,7 @@ public:
     }
 
     /// Whether a trait can be implemented for `ty`: a primitive or unit, a
-    /// declared struct, class, enum, trait or alias, or an instantiation of
+    /// declared struct, enum, trait or alias, or an instantiation of
     /// one (pre-mono wrapper or post-mono concrete, asked through its
     /// template).
     carries_impl_key(&this, ty: TypeRef, intern: InternTable*) -> boolean {
@@ -1726,7 +1666,6 @@ public:
         if (t == null) { return TypeRef::invalid(); }
         if (t.kind == TypeKind::InstantiatedType) { return t.as_instantiated().generic_base; }
         if (t.kind == TypeKind::Struct) { return t.as_struct().generic_base; }
-        if (t.kind == TypeKind::Class)  { return t.as_class().generic_base; }
         if (t.kind == TypeKind::Enum)   { return t.as_enum().generic_base; }
         return TypeRef::invalid();
     }
@@ -1737,7 +1676,6 @@ public:
         if (t == null) { return 0; }
         if (t.kind == TypeKind::InstantiatedType) { return t.as_instantiated().type_args.length; }
         if (t.kind == TypeKind::Struct) { return t.as_struct().type_args.length; }
-        if (t.kind == TypeKind::Class)  { return t.as_class().type_args.length; }
         if (t.kind == TypeKind::Enum)   { return t.as_enum().type_args.length; }
         return 0;
     }
@@ -1758,11 +1696,6 @@ public:
             const st: StructType* = t.as_struct();
             if (i >= st.type_args.length) { return TypeRef::invalid(); }
             return st.type_args[i];
-        }
-        if (t.kind == TypeKind::Class) {
-            const ct: ClassType* = t.as_class();
-            if (i >= ct.type_args.length) { return TypeRef::invalid(); }
-            return ct.type_args[i];
         }
         if (t.kind == TypeKind::Enum) {
             const et: EnumType* = t.as_enum();

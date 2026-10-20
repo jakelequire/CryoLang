@@ -38,8 +38,8 @@ MangledName = "C$" ( TraitImpl | Tagged | Plain ) ;
 
 TraitImpl   = "tr$" Path "$f" Path Signature ;                 (* trait-impl method *)
 
-Tagged      = ( "ct" | "dt" | "op" ) "$" Path Signature        (* ctor / dtor / operator *)
-            | ( "vt" | "ti" | "mi" ) "$" Path ;                (* vtable / type-info / module-init *)
+Tagged      = "op" "$" Path Signature                          (* operator *)
+            | ( "ti" | "mi" ) "$" Path ;                       (* type-info / module-init *)
 
 Plain       = Path [ Signature ] [ Overload ] ;                (* functions, methods, data symbols *)
 
@@ -113,13 +113,13 @@ a digit.
 
 | Tag    | Symbol                  | Shape                        |
 |--------|-------------------------|------------------------------|
-| `ct`   | Constructor             | `C$ct$` Path Signature       |
-| `dt`   | Destructor              | `C$dt$` Path Signature       |
 | `op`   | Operator overload       | `C$op$` Path Signature       |
 | `tr`   | Trait-impl method       | `C$tr$` Trait `$f` Path Signature |
-| `vt`   | Vtable                  | `C$vt$` Path                 |
 | `ti`   | Type info / RTTI        | `C$ti$` Path                 |
 | `mi`   | Module initializer      | `C$mi$` Path                 |
+
+The tags `ct`, `dt` and `vt` are not emitted and stay reserved: they named class
+constructors, destructors and vtables, and `vt` is kept for trait-object tables.
 
 Plain functions, methods, global variables, and named-type symbols carry no kind tag.
 A closure carries none either: it is a synthesized type with a `__call__` method
@@ -141,9 +141,6 @@ Each identifier is encoded as its **UTF-8 byte length** in decimal followed by t
 bytes (`<length><bytes>`). Lengths count bytes, not code points, so Unicode identifiers
 require no escaping: `café` (5 bytes) -> `5café`. Length-prefixing also makes embedded
 `_` unambiguous, so identifiers need no escape rules of their own.
-
-A constructor's and destructor's member segment duplicates the owning type's leaf name
-(e.g. `C$ct$3Dog-3Dog...`).
 
 ---
 
@@ -176,7 +173,7 @@ parameter or return type.
 ## 7. Signatures
 
 Function-like symbols carry a signature: `$F` ParamList `$R` ReturnType. Data symbols
-(vtables, type info, module initializers, globals, named-type labels) omit it entirely.
+(type info, module initializers, globals, named-type labels) omit it entirely.
 
 - An empty parameter list is the literal `v`.
 - A non-static method encodes its receiver as the first parameter: `$s` for `&this`,
@@ -286,7 +283,6 @@ Data symbols carry no signature. Their forms:
 
 | Symbol                     | Encoding                          | Example                       |
 |----------------------------|-----------------------------------|-------------------------------|
-| Vtable                     | `C$vt$` Path                      | `C$vt$6Animal`                |
 | Type info                  | `C$ti$` Path                      | `C$ti$6Animal`                |
 | Module initializer         | `C$mi$` Path                      | `C$mi$4Math.6Vector`          |
 | Global / constant          | `C$` Path                         | `Math::PI` -> `C$4Math.2PI`    |

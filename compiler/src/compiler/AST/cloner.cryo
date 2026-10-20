@@ -23,7 +23,7 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, EnumDecl,
+    DeclarationNode, DestructureBinding, DestructureDecl, EnumDecl,
     EnumVariant, ExternBlock, FieldDecl, FunctionDecl, GenericParamDecl,
     DeclKind, ImplBlock, ImportDecl, IntrinsicDecl, MethodDecl,
     ModuleDecl, StructDecl, TraitDecl, TypeAliasDecl, UnionDecl,
@@ -49,7 +49,7 @@ import compiler::ast::statement::{
 
 type struct ASTCloner {
     /// One-shot specialization name applied at the first decl-level visit
-    /// (StructDecl / ClassDeclNode / EnumDecl / FunctionDecl).
+    /// (StructDecl / EnumDecl / FunctionDecl).
     /// `consume_spec_name()` reads and clears it so child decls keep their
     /// own names.
     spec_name: SymbolStr;
@@ -181,17 +181,9 @@ type struct ASTCloner {
     /// The copy of the method `m` in a type's method list; null for null.
     copy_method(mut &this, m: DeclarationNode*) -> DeclarationNode* {
         if (m == null) { return null; }
-        return this.copy_decl_shape(m);
+        return this.copy_decl(m);
     }
 
-    /// The copy of declaration `node`, made for its kind; the copy is marked
-    /// generated only by `clone_decl`.
-    copy_decl(mut &this, node: DeclarationNode*) -> DeclarationNode* {
-        return match (node.shape) {
-            DeclKind::Legacy => { this.visit_class(node as ClassDeclNode*) }
-            _                => { this.copy_decl_shape(node) }
-        };
-    }
 
 
     // Type annotation cloning: delegates to TypeAnnotation::clone()
@@ -661,30 +653,20 @@ type struct ASTCloner {
     copy_method(mut &this, node: MethodDecl*) -> MethodDecl* {
         mut c: MethodDecl* = MethodDecl::new(this.clone_func_decl(node.func));
         c.visibility            = node.visibility;
-        c.is_constructor        = node.is_constructor;
-        c.is_destructor         = node.is_destructor;
         c.is_static             = node.is_static;
-        c.is_default_destructor = node.is_default_destructor;
-        c.is_virtual            = node.is_virtual;
-        c.is_override           = node.is_override;
         // `![sink]` must survive monomorphization: a cloned generic method
         // (e.g. Option<T>::unwrap specialized for a concrete T) still
         // consumes its receiver, and drop-insertion relies on this flag to
         // suppress the receiver's scope-exit drop (otherwise glue would
         // double-free a payload the method copied out).
         c.is_sink               = node.is_sink;
-        c.base_ctor_name        = node.base_ctor_name;
-        mut cloned_args: [ExpressionNode*] = [];
-        for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
-            cloned_args.push(this.clone_expr(node.base_ctor_args[i]));
-        }
-        c.base_ctor_args = cloned_args;
         return c;
     }
 
-    /// The copy of a declaration whose kind has a payload.
-    copy_decl_shape(mut &this, node: DeclarationNode*) -> DeclarationNode* {
-        const shape: DeclKind = match (node.shape) {
+    /// The copy of declaration `node`, made for its kind; the copy is marked
+    /// generated only by `clone_decl`.
+    copy_decl(mut &this, node: DeclarationNode*) -> DeclarationNode* {
+        const kind: DeclKind = match (node.kind) {
             DeclKind::Destructure(n) => {
                 const c: DestructureDecl* = DestructureDecl::new();
                 c.is_mutable = n.is_mutable;
@@ -717,14 +699,14 @@ type struct ASTCloner {
                 c.where_bounds  = n.where_bounds;
                 if (!skip_gp) {
                     for (mut i: i64 = 0; i < n.generic_params.length; i++) {
-                        c.generic_params.push(this.copy_decl_shape(n.generic_params[i]));
+                        c.generic_params.push(this.copy_decl(n.generic_params[i]));
                     }
                 }
                 if (n.discriminant_annotation != null) {
                     c.discriminant_annotation = this.clone_type_annotation(n.discriminant_annotation);
                 }
                 for (mut i: i64 = 0; i < n.variants.length; i++) {
-                    c.variants.push(this.copy_decl_shape(n.variants[i]));
+                    c.variants.push(this.copy_decl(n.variants[i]));
                 }
                 DeclKind::Enum(c)
             }
@@ -734,7 +716,7 @@ type struct ASTCloner {
                 // left as `new` leaves them.
                 const c: TraitDecl* = TraitDecl::new(n.name);
                 for (mut i: i64 = 0; i < n.generic_params.length; i++) {
-                    c.generic_params.push(this.copy_decl_shape(n.generic_params[i]));
+                    c.generic_params.push(this.copy_decl(n.generic_params[i]));
                 }
                 for (mut i: i64 = 0; i < n.methods.length; i++) {
                     c.methods.push(this.clone_func_decl(n.methods[i]));
@@ -809,7 +791,7 @@ type struct ASTCloner {
                 // `new` leaves them.
                 const c: TypeAliasDecl* = TypeAliasDecl::new(n.alias_name);
                 for (mut i: i64 = 0; i < n.generic_params.length; i++) {
-                    c.generic_params.push(this.copy_decl_shape(n.generic_params[i]));
+                    c.generic_params.push(this.copy_decl(n.generic_params[i]));
                 }
                 if (n.target_annotation != null) {
                     c.target_annotation = this.clone_type_annotation(n.target_annotation);
@@ -831,11 +813,11 @@ type struct ASTCloner {
                 c.binding_namespace = n.binding_namespace;
                 if (!skip_gp) {
                     for (mut i: i64 = 0; i < n.generic_params.length; i++) {
-                        c.generic_params.push(this.copy_decl_shape(n.generic_params[i]));
+                        c.generic_params.push(this.copy_decl(n.generic_params[i]));
                     }
                 }
                 for (mut i: i64 = 0; i < n.fields.length; i++) {
-                    c.fields.push(this.copy_decl_shape(n.fields[i]));
+                    c.fields.push(this.copy_decl(n.fields[i]));
                 }
                 for (mut i: i64 = 0; i < n.methods.length; i++) {
                     c.methods.push(this.copy_method(n.methods[i]));
@@ -860,11 +842,11 @@ type struct ASTCloner {
                 c.binding_namespace = n.binding_namespace;
                 if (!skip_gp) {
                     for (mut i: i64 = 0; i < n.generic_params.length; i++) {
-                        c.generic_params.push(this.copy_decl_shape(n.generic_params[i]));
+                        c.generic_params.push(this.copy_decl(n.generic_params[i]));
                     }
                 }
                 for (mut i: i64 = 0; i < n.fields.length; i++) {
-                    c.fields.push(this.copy_decl_shape(n.fields[i]));
+                    c.fields.push(this.copy_decl(n.fields[i]));
                 }
                 for (mut i: i64 = 0; i < n.methods.length; i++) {
                     c.methods.push(this.copy_method(n.methods[i]));
@@ -880,7 +862,7 @@ type struct ASTCloner {
             DeclKind::Impl(n) => {
                 const c: ImplBlock* = ImplBlock::new(n.target_type);
                 for (mut i: i64 = 0; i < n.generic_params.length; i++) {
-                    c.generic_params.push(this.copy_decl_shape(n.generic_params[i]));
+                    c.generic_params.push(this.copy_decl(n.generic_params[i]));
                 }
                 if (n.trait_annotation != null) {
                     c.trait_annotation = this.clone_type_annotation(n.trait_annotation);
@@ -954,46 +936,11 @@ type struct ASTCloner {
                 c.resolved_type = n.resolved_type;
                 DeclKind::Variable(c)
             }
-            // A class, which `copy_decl` copies.
-            DeclKind::Legacy => { unreachable() }
         };
-        const c: DeclarationNode* = DeclarationNode::of(shape, node.span);
+        const c: DeclarationNode* = DeclarationNode::of(kind, node.span);
         this.copy_decl_base(node, c);
         return c;
     }
-
-
-    visit_class(mut &this, node: ClassDeclNode*) -> DeclarationNode* {
-        const name: SymbolStr = this.consume_spec_name(node.name);
-        const skip_gp: boolean = this.consume_skip_generics();
-        mut c: ClassDeclNode* = new ClassDeclNode(name, node.span);
-        this.copy_decl_base(node, c);
-        // See StructDecl clone: carry layout flags onto the spec.
-        c.repr_c           = node.repr_c;
-        c.repr_packed      = node.repr_packed;
-        c.repr_transparent = node.repr_transparent;
-        c.min_alignment    = node.min_alignment;
-        c.is_public        = node.is_public;
-        c.where_bounds     = node.where_bounds;
-        c.base_class = node.base_class;
-        c.base_res   = node.base_res;
-        c.base_span  = node.base_span;
-        if (!skip_gp) {
-            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
-            }
-        }
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            c.add_field(this.copy_decl_shape(node.fields[i]));
-        }
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            c.add_method(this.copy_method(node.methods[i]));
-        }
-        return c;
-    }
-
-
-
 
 
     // Other visitors
@@ -1179,7 +1126,7 @@ type struct ASTCloner {
         }
         if (!skip_gp) {
             for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.copy_decl_shape(node.generic_params[i]));
+                c.add_generic_param(this.copy_decl(node.generic_params[i]));
             }
         }
         // A copy owns its bounds as it owns its parameters: a bound's

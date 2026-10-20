@@ -23,7 +23,7 @@ import std::json::value;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, EnumDecl, EnumVariant, FieldDecl, FunctionDecl,
+    DeclarationNode, DeclKind, EnumDecl, EnumVariant, FieldDecl, FunctionDecl,
     ImplBlock, MethodDecl, StructDecl, UnionDecl, VarDecl
 };
 import compiler::module_graph::{ ModulePath, ModuleSpellingMatch };
@@ -39,7 +39,6 @@ import compiler::types;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::type_base;
 import compiler::types::compound;
-import compiler::types::user_defined::{ ClassType };
 
 import lsp::handlers::definition::{ Declared };
 import lsp::handlers::hover::{ Shown };
@@ -329,8 +328,7 @@ type struct Completer {
     /// invalid for any other node (null included).
     static declared_type(n: DeclarationNode*) -> DefId {
         if (n == null) { return DefId::invalid(); }
-        return match (n.shape) {
-            DeclKind::Legacy    => { (n as ClassDeclNode*).def }
+        return match (n.kind) {
             DeclKind::Impl(ib)  => { ib.target_def() }
             DeclKind::Struct(s) => { s.def }
             DeclKind::Enum(e)   => { e.def }
@@ -353,8 +351,7 @@ type struct Completer {
         return this.apply_ops(this.field_type(ty, this.intern(s.name)), &ops, 0);
     }
 
-    /// The type of field `leaf` of type `ty`, through its base classes, or
-    /// invalid when it has none.
+    /// The type of field `leaf` of type `ty`, or invalid when it has none.
     field_type(&this, ty: TypeRef, leaf: SymbolStr) -> TypeRef {
         mut types_: TypeUtils = TypeUtils { arena: this.ctx.type_arena, intern: this.ctx.intern_table,
                                             ctx: this.ctx, checker: null };
@@ -367,31 +364,21 @@ type struct Completer {
         return fa.ty;
     }
 
-    /// The return type the methods named `leaf` of type `ty` declare, through
-    /// its base classes; invalid when none or when they disagree.
+    /// The return type the methods named `leaf` of type `ty` declare;
+    /// invalid when none or when they disagree.
     method_return(&this, ty: TypeRef, leaf: SymbolStr) -> TypeRef {
         const entries: [OverloadId] = this.method_entries(ty, leaf);
         if (entries.length == 0) { return TypeRef::invalid(); }
         return this.shared_return(&entries);
     }
 
-    /// The methods named `leaf` of type `ty`, from the first of it and its
-    /// base classes that declares any.
+    /// The methods named `leaf` of type `ty`.
     method_entries(&this, ty: TypeRef, leaf: SymbolStr) -> [OverloadId] {
         mut types_: TypeUtils = TypeUtils { arena: this.ctx.type_arena, intern: this.ctx.intern_table,
                                             ctx: this.ctx, checker: null };
-        mut owner: TypeRef = types_.method_owner_ref(this.carrier(ty));
-        for (mut depth: i64 = 0; depth < 16 && owner.is_valid(); depth++) {
-            const entries: [OverloadId] = this.ctx.decl_index.lookup_family_entries(
-                FamilyOwner::Type(owner), leaf);
-            if (entries.length > 0) { return entries; }
-            const t: type_base::Type* = this.ctx.type_arena.lookup(owner);
-            if (t == null || t.kind != types::TypeKind::Class) { return []; }
-            const cls: ClassType* = t.as_class();
-            if (!cls.has_base) { return []; }
-            owner = cls.base_class;
-        }
-        return [];
+        const owner: TypeRef = types_.method_owner_ref(this.carrier(ty));
+        if (!owner.is_valid()) { return []; }
+        return this.ctx.decl_index.lookup_family_entries(FamilyOwner::Type(owner), leaf);
     }
 
     shared_return(&this, entries: &[OverloadId]) -> TypeRef {
@@ -571,7 +558,7 @@ type struct Completer {
     type_kind(&this, d: DefId) -> i64 {
         const decl: DeclarationNode* = this.ctx.decl_index.declaration_of(d);
         if (decl == null) { return CK_CLASS; }
-        return match (decl.shape) {
+        return match (decl.kind) {
             DeclKind::Struct(_) => { CK_STRUCT }
             DeclKind::Enum(_) => { CK_ENUM }
             DeclKind::Union(_) => { CK_STRUCT }
@@ -580,7 +567,7 @@ type struct Completer {
             | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
             | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
             | DeclKind::GenericParam(_) | DeclKind::Variable(_) | DeclKind::Function(_)
-            | DeclKind::Method(_) | DeclKind::Legacy => { CK_CLASS }
+            | DeclKind::Method(_) => { CK_CLASS }
         };
     }
 
@@ -604,7 +591,7 @@ type struct Completer {
             }
             Member::Method(md) => {
                 if (DeclarationNode::fn_of(md.func).def.is_valid()) { shown.def(DeclarationNode::fn_of(md.func).def); }
-                const kind: i64 = if (md.is_static || md.is_constructor) { CK_FUNCTION } else { CK_METHOD };
+                const kind: i64 = if (md.is_static) { CK_FUNCTION } else { CK_METHOD };
                 this.push(this.ctx.intern_table.resolve(DeclarationNode::fn_of(md.func).name), shown.text, kind);
             }
         }

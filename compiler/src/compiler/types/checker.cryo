@@ -23,7 +23,7 @@ import compiler::types::generic::{ InstantiatedType };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, EnumType, FieldInfo, MethodInfo, StructType, TypeAliasType
+    EnumType, FieldInfo, MethodInfo, StructType, TypeAliasType
 };
 import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::decl_index;
@@ -358,8 +358,8 @@ type struct TypeChecker {
                 return TypeCompatibility::ImplicitConvert;
             }
             // Referent and pointee are not required to be the SAME type, only a
-            // compatible one: recursing here is what admits `&Derived -> Base*`
-            // and enum equivalence.  This is a subtyping rule, not a duplicate-id
+            // compatible one: recursing here is what admits enum equivalence.
+            // This is a compatibility rule, not a duplicate-id
             // workaround.  Note it recurses rather than
             // comparing `kind`, deliberately, so unrelated structs that merely
             // share a TypeKind do not match.
@@ -469,18 +469,16 @@ type struct TypeChecker {
     }
 
     /// Whether a pointer to `from` stands for a pointer to `to` with no cast:
-    /// the same type, `void` on either side, or a class to its base.  A
-    /// pointee that only converts does not qualify: a conversion changes a
-    /// value, and nothing changes the memory a pointer addresses, so an
-    /// `i32*` read as an `i64*` reads past the value.
+    /// the same type, or `void` on either side.  A pointee that only
+    /// converts does not qualify: a conversion changes a value, and nothing
+    /// changes the memory a pointer addresses, so an `i32*` read as an
+    /// `i64*` reads past the value.
     pointee_converts(&this, from: TypeRef, to: TypeRef) -> boolean {
         if (this.is_same_type(from, to)) { return true; }
         const from_inner: Type* = this.arena.lookup(from);
         const to_inner: Type* = this.arena.lookup(to);
         if (from_inner == null || to_inner == null) { return false; }
-        if (from_inner.kind == TypeKind::Void || to_inner.kind == TypeKind::Void) { return true; }
-        return from_inner.kind == TypeKind::Class && to_inner.kind == TypeKind::Class
-            && this.is_subclass_of(from, to);
+        return from_inner.kind == TypeKind::Void || to_inner.kind == TypeKind::Void;
     }
 
     /// Whether from can be assigned to to (Identical, Compatible, or ImplicitConvert).
@@ -787,7 +785,7 @@ type struct TypeChecker {
             // `null` is a pointer, so this is also where a value compared with
             // `null` arrives; the other side must be one a pointer compares
             // with - a pointer, a function, a string, a reference - since a
-            // struct, class or enum value, a number or a boolean has no
+            // struct or enum value, a number or a boolean has no
             // address to compare, and letting one through reached the
             // backend with nothing to emit for it.
             if (lhs_type.kind == TypeKind::Pointer || rhs_type.kind == TypeKind::Pointer) {
@@ -807,16 +805,14 @@ type struct TypeChecker {
             const rhs_ref: boolean = rhs_type.kind == TypeKind::Reference;
             if (lhs_ref != rhs_ref) {
                 const other: Type* = if (lhs_ref) { rhs_type } else { lhs_type };
-                if (other.kind != TypeKind::Class && other.kind != TypeKind::Function
-                        && other.kind != TypeKind::Void) {
+                if (other.kind != TypeKind::Function && other.kind != TypeKind::Void) {
                     return TypeCheckResult::fail(fmt::format(
                         "Cannot compare %s and %s; dereference the reference to compare the value it refers to (`*x`)",
                         lhs_type.kind.to_string(), rhs_type.kind.to_string()));
                 }
             }
-            // Class/reference null checks: obj == null, &ref == null
-            if (lhs_type.kind == TypeKind::Class || rhs_type.kind == TypeKind::Class ||
-                lhs_type.kind == TypeKind::Reference || rhs_type.kind == TypeKind::Reference) {
+            // Reference comparisons: &ref == &other
+            if (lhs_type.kind == TypeKind::Reference || rhs_type.kind == TypeKind::Reference) {
                 return TypeCheckResult::ok(this.arena.get_bool());
             }
             // Function-pointer equality/inequality (e.g. `this.flush_fn != null`
@@ -1072,28 +1068,5 @@ type struct TypeChecker {
         }
 
         return a;  // Fallback
-    }
-
-
-    // Class hierarchy helpers
-
-    /// Check whether `derived` is a subclass of `base` by walking the
-    /// inheritance chain.  Both TypeRefs must point to ClassType objects.
-    /// Limits depth to 32 to prevent infinite loops from malformed data.
-    is_subclass_of(&this, derived: TypeRef, base: TypeRef) -> boolean {
-        if (derived.equals(base)) { return true; }
-
-        mut current: TypeRef = derived;
-        mut depth: i32 = 0;
-        while (depth < 32) {
-            const t: Type* = this.arena.lookup(current);
-            if (t == null || t.kind != TypeKind::Class) { return false; }
-            const ct: ClassType* = t.as_class();
-            if (!ct.has_base || !ct.base_class.is_valid()) { return false; }
-            if (ct.base_class.equals(base)) { return true; }
-            current = ct.base_class;
-            depth += 1;
-        }
-        return false;
     }
 }

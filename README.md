@@ -20,7 +20,7 @@ function main() -> int {
 }
 ```
 
-Cryo gives systems programmers explicit control over memory and data layout (manual allocation, raw pointers, no GC) alongside the language constructs that make modern programs tractable: generics, algebraic enums, pattern matching, traits, single-inheritance classes, and a module system. Generics are monomorphised, so the abstractions compile down to the same code you would write by hand.
+Cryo gives systems programmers explicit control over memory and data layout (manual allocation, raw pointers, no GC) alongside the language constructs that make modern programs tractable: generics, algebraic enums, pattern matching, traits, and a module system. Generics are monomorphised, so the abstractions compile down to the same code you would write by hand.
 
 The compiler is **self-hosted**: every line of Cryo you compile is compiled by Cryo. The standard library is written in Cryo. The bundled HTTP server, JSON parser, hash maps, and test framework are written in Cryo. Every build target drives off the pinned compiler at `bin/cryo` (committed to the repo).
 
@@ -40,7 +40,6 @@ The compiler is **self-hosted**: every line of Cryo you compile is compiled by C
   - [Variables](#variables)
   - [Control flow](#control-flow)
   - [Structs](#structs)
-  - [Classes: single inheritance, virtual dispatch](#classes-single-inheritance-virtual-dispatch)
   - [Enums and pattern matching](#enums-and-pattern-matching)
   - [Traits and generics](#traits-and-generics)
   - [Modules](#modules)
@@ -212,27 +211,6 @@ type struct Rect {
         this.width  = this.width  * factor;
         this.height = this.height * factor;
     }
-}
-```
-
-### Classes: single inheritance, virtual dispatch
-
-```cryo
-type class Animal {
-public:
-    name: string;
-    Animal(_name: string) { this.name = _name; }
-    virtual speak(&this) -> void;
-}
-
-type class Dog : Animal {
-public:
-    Dog() : Animal("Dog") {}
-    override speak(&this) -> void { printf("%s: Woof!\n", this.name); }
-}
-
-function make_speak(a: Animal*) -> void {
-    a.speak();   // dispatched via vtable
 }
 ```
 
@@ -540,7 +518,6 @@ for the full 1.0 release notes.
 
 - Self-hosted compiler with byte-identical 3-round selfhost check.
 - Trait system with `where`-bound generics, monomorphisation, and trait impls on primitives.
-- Single-inheritance classes with virtual dispatch and destructors.
 - Algebraic enums with exhaustive pattern matching (literal, identifier, wildcard, enum-destructure, exclusive range, or-patterns, and guard clauses `pattern if (cond) =>`).
 - Lambdas and capturing closures (let-bound, inline, multi-capture, nested, closure-as-fn-arg).
 - Automatic drop synthesis at scope exit; explicit `delete` for heap pointees.

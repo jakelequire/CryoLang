@@ -53,7 +53,7 @@ import compiler::types::user_defined;
 import compiler::types::user_defined::{ StructType };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDecl, FunctionDecl,
+    DeclarationNode, DestructureBinding, DestructureDecl, FunctionDecl,
     DeclKind, ImplBlock, MethodDecl, StructDecl, UnionDecl,
     VarDecl
 };
@@ -167,7 +167,7 @@ type struct MoveChecker {
     /// its leaf within the owner in hand, which is why only the owner half
     /// moves to an identity.  A move is recorded
     /// (and ALLOWED) only when the owner is a straight-line (`branch_depth ==
-    /// 0`) bare local of a struct/class with no user `Drop`, so
+    /// 0`) bare local of a struct with no user `Drop`, so
     /// drop_insertion can skip exactly these fields at the owner's scope exit
     /// - no drop flags needed because an unconditional move is definitely gone
     /// at every scope exit.  Everything else stays a hard E0453.  Mirrors
@@ -912,28 +912,24 @@ type struct MoveChecker {
     }
 
     walk_top_level(mut &this, stmt: DeclarationNode*) -> void {
-        if (stmt.is_class()) {
-            this.walk_methods((stmt as ClassDeclNode*).methods);
-        } else {
-            match (stmt.shape) {
-                DeclKind::Function(_) => {
-                    this.walk_function(DeclarationNode::with_shape(stmt));
-                }
-                DeclKind::Trait(td) => {
-                    for (mut i: i64 = 0; i < td.methods.length; i++) {
-                        const m_decl: DeclarationNode* = td.methods[i];
-                        const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
-                        if (m != null) { this.walk_function(m_decl); }
-                    }
-                }
-                DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
-                DeclKind::Struct(sd) => { this.walk_methods(sd.methods); }
-                DeclKind::Impl(ib) => { this.walk_methods(ib.methods); }
-                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+        match (stmt.kind) {
+            DeclKind::Function(_) => {
+                this.walk_function(stmt);
             }
+            DeclKind::Trait(td) => {
+                for (mut i: i64 = 0; i < td.methods.length; i++) {
+                    const m_decl: DeclarationNode* = td.methods[i];
+                    const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
+                    if (m != null) { this.walk_function(m_decl); }
+                }
+            }
+            DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
+            DeclKind::Struct(sd) => { this.walk_methods(sd.methods); }
+            DeclKind::Impl(ib) => { this.walk_methods(ib.methods); }
+            DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+            | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+            | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+            | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) => {}
         }
     }
 
@@ -1605,15 +1601,13 @@ type struct MoveChecker {
 
     read_new(mut &this, n: NewExpr*) -> void {
         if (n == null) { return; }
-        // `new T(args)` constructor arguments transfer ownership exactly like
+        // `new E::V(args)` arguments transfer ownership exactly like
         // ordinary call arguments: a by-value (`T` parameter) argument is moved
         // into the constructed object, so reusing the caller's binding
         // afterwards is a use-after-move (and a loop-carried reuse double-frees
-        // once the object owns the storage).  Earlier this walked every
-        // argument as a borrow, which left `new Holder(t); use(t);` silently
-        // accepted even though drop_insertion::read_new already treats the same
-        // argument as a move and suppresses its scope-exit drop - the two
-        // passes disagreed on the move-set.  Mirror read_call (and
+        // once the object owns the storage).  drop_insertion::read_new treats
+        // the same argument as a move and suppresses its scope-exit drop, so
+        // the two passes agree on the move-set.  Mirror read_call (and
         // drop_insertion::read_new) so they track the identical set: a borrow
         // stays a read, a by-value droppable argument is a real move.
         for (mut i: i64 = 0; i < n.arguments.length; i++) {
@@ -1658,7 +1652,7 @@ type struct MoveChecker {
                                                     this.intern, ty);
     }
 
-    /// Resolve `ty` to the underlying struct/class Type* whose per-field drop
+    /// Resolve `ty` to the underlying struct Type* whose per-field drop
     /// glue we can enumerate, peeling `InstantiatedType` wrappers.  Returns
     /// null for anything we can't safely drop field-by-field (unions, enums,
     /// arrays, primitives, unresolved generics).  Mirrors
@@ -1682,13 +1676,12 @@ type struct MoveChecker {
             if (st.is_union) { return null as Type*; }
             return t;
         }
-        if (t.kind == TypeKind::Class) { return t; }
         return null as Type*;
     }
 
     /// v1 allow-rule for a field-move-out `ma` (`p.field`): permit (and track)
     /// it ONLY when the owner is a straight-line bare local of a non-`Drop`
-    /// struct/class value.  Anything else keeps the conservative E0453.
+    /// struct value.  Anything else keeps the conservative E0453.
     partial_move_allowed(&this, ma: MemberAccessExpr*) -> boolean {
         // Unconditional only: drop-skip without per-field flags is sound only
         // for a definitely-moved field.
@@ -1697,7 +1690,7 @@ type struct MoveChecker {
     }
 
     /// The owner shape `partial_move_allowed` accepts, whatever the branch
-    /// depth: a bare owned local of a non-`Drop` struct or class.
+    /// depth: a bare owned local of a non-`Drop` struct.
     partial_move_shape(&this, ma: MemberAccessExpr*) -> boolean {
         const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
         if (id == null) {
@@ -1709,7 +1702,7 @@ type struct MoveChecker {
         const decl_ty: TypeRef = this.lookup_type(id.res.local_sym());
         if (!decl_ty.is_valid()) { return false; }
         if (this.is_pat_binding(id.res.local_sym().key())) { return false; }
-        // Owned value place (not a borrow), non-`Drop`, and a struct/class whose
+        // Owned value place (not a borrow), non-`Drop`, and a struct whose
         // fields we can drop individually.
         if (this.is_ptr_or_ref(decl_ty)) { return false; }
         if (this.has_user_drop(decl_ty)) { return false; }

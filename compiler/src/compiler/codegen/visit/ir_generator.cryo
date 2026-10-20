@@ -44,7 +44,7 @@ import std::fmt::float;
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
+    DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
     FunctionDecl, ImplBlock, MethodDecl, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -87,7 +87,7 @@ import compiler::types::resolver::{ ResolutionContext };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, EnumType, EnumVariantInfo, FieldInfo, StructType
+    EnumType, EnumVariantInfo, FieldInfo, StructType
 };
 import compiler::codegen::visit::binary_unary_emitter::{ BinaryUnaryEmitter };
 import compiler::codegen::visit::enum_variant_emitter::{ EnumVariantEmitter };
@@ -135,11 +135,11 @@ type struct IRGeneratorVisitor {
     enum_variant: EnumVariantEmitter;
 
     /// Call-expression lowering: identifier / method / scope-resolution /
-    /// ctor / intrinsic / vtable-dispatched call shapes, plus the
+    /// intrinsic call shapes, plus the
     /// post-call `unreachable` emission for divergent callees.
     calls: CallEmitter;
 
-    /// Heap-allocation lowering: `new T(args)` / `new T { fields }` and
+    /// Heap-allocation lowering: `new T { fields }` / `new E::V(args)` and
     /// `delete ptr`.  Both routes share dispatch + enum_variant.
     new_delete: NewDeleteEmitter;
 
@@ -153,9 +153,9 @@ type struct IRGeneratorVisitor {
     /// container and gives the slot's address as a place.
     places: PlaceEmitter;
 
-    /// Declaration visit dispatch (function / impl / struct / class).
+    /// Declaration visit dispatch (function / impl / struct / union).
     /// Owns the shared body-emission helpers (function body, impl
-    /// block, method body, base-ctor call).
+    /// block, method body).
     decl_visit: DeclVisitEmitter;
 
     static new(cg: CodegenContext*) -> IRGeneratorVisitor {
@@ -208,7 +208,7 @@ type struct IRGeneratorVisitor {
             }
 
             Node::Decl(d) => {
-                match (d.shape) {
+                match (d.kind) {
                     DeclKind::Function(_) => { return this.visit_function(d); }
                     DeclKind::Variable(v) => { return this.visit_var(d, v); }
                     DeclKind::Destructure(dd) => { return this.visit_destructure(dd); }
@@ -224,7 +224,6 @@ type struct IRGeneratorVisitor {
                     | DeclKind::Enum(_) | DeclKind::Trait(_) => {
                         return Emitted::none();
                     }
-                    DeclKind::Legacy => { return this.visit_class(d as ClassDeclNode*); }
                 }
             }
 
@@ -328,7 +327,7 @@ type struct IRGeneratorVisitor {
             const stmt: Node = stmts[i];
             if (stmt.is_null()) { continue; }
             // Top-level dispatch: the visit methods for FunctionDecl /
-            // ImplBlock / StructDecl / ClassDeclNode handle their own
+            // ImplBlock / StructDecl / UnionDecl handle their own
             // emission.  A kind with none (TypeAlias, Enum, Trait, Namespace,
             // Import, etc.) emits nothing.
             // Top-level VarDecl is guarded by `is_global` inside its
@@ -358,10 +357,10 @@ type struct IRGeneratorVisitor {
                     const d: DeclarationNode* = di.entry_decl(id);
                     if (d != null && DeclarationNode::method_of(d) != null) {
                         this.state.current_impl_target = body.owner;
-                        this.decl_visit.generate_method_body(this, DeclarationNode::with_shape(d), body.base);
+                        this.decl_visit.generate_method_body(this, d);
                         this.state.current_impl_target = TypeRef::invalid();
                     } else if (d != null && DeclarationNode::fn_of(d) != null) {
-                        this.decl_visit.generate_function_body(this, DeclarationNode::with_shape(d));
+                        this.decl_visit.generate_function_body(this, d);
                     }
                     const fn_val: LValue = this.cg.functions.get(di.entry_symbol(id).spelling());
                     fn_val.set_linkage(LLinkage::AvailableExternally);
@@ -375,10 +374,9 @@ type struct IRGeneratorVisitor {
 
     // Top-level declaration visit() overrides
     //
-    // Bodies live in `decl_visit_emitter.cryo` along with the four
-    // shared body-emission helpers (`generate_function_body`,
-    // `generate_impl_block`, `generate_method_body`,
-    // `emit_base_ctor_call`).
+    // Bodies live in `decl_visit_emitter.cryo` along with the shared
+    // body-emission helpers (`generate_function_body`,
+    // `generate_impl_block`, `generate_method_body`).
 
     visit_function(mut &this, node_decl: DeclarationNode*) -> Emitted {
         mut out: Emitted = Emitted::none();
@@ -401,12 +399,6 @@ type struct IRGeneratorVisitor {
     visit_union(mut &this, node: UnionDecl*) -> Emitted {
         mut out: Emitted = Emitted::none();
         this.decl_visit.emit_union_decl(this, node);
-        return out;
-    }
-
-    visit_class(mut &this, node: ClassDeclNode*) -> Emitted {
-        mut out: Emitted = Emitted::none();
-        this.decl_visit.emit_class_decl(this, node);
         return out;
     }
 
@@ -1126,9 +1118,6 @@ type struct IRGeneratorVisitor {
         if (ty.kind == TypeKind::Struct) {
             const st: StructType* = ty.as_struct();
             fields_arr = &st.fields;
-        } else if (ty.kind == TypeKind::Class) {
-            const ct: ClassType* = ty.as_class();
-            fields_arr = &ct.fields;
         } else {
             return out;  // sema already errored on non-struct destructure
         }
@@ -1155,9 +1144,8 @@ type struct IRGeneratorVisitor {
 
             const field_idx: i64 = b.field_index;
             if (field_idx < 0 || field_idx >= fields_arr.length) { continue; }
-            // `fields_arr` is the type's own field list; the body it is read
-            // out of carries a class's vtable slot and inherited fields ahead
-            // of it, and alignment padding between fields.
+            // `fields_arr` is the type's field list; the body it is read out
+            // of carries alignment padding between fields.
             const slot: i64 = this.cg.type_mapper.field_element_index(ty, field_idx);
             if (slot < 0) { continue; }
 
@@ -1360,7 +1348,7 @@ type struct IRGeneratorVisitor {
                     // initializer.
                     mut ufidx: i64 = -1;
                     match (field_pins[0]) {
-                        MemberPin::Field(_, ui) => { if (ui < ust.fields.length) { ufidx = ui; } }
+                        MemberPin::Field(ui) => { if (ui < ust.fields.length) { ufidx = ui; } }
                         _                       => { }
                     }
                     if (ufidx >= 0) {
@@ -1381,65 +1369,17 @@ type struct IRGeneratorVisitor {
 
         // Store each field value at its GEP index.
         const t: Type* = this.cg.arena_type(struct_type);
-        // Each initializer carries the coordinates of the field it names -
-        // `(depth, index)`, a base class's field included - and the slot is
-        // computed from them by the routine the body was built from
-        // (`map_class` flattens a class: a vtable slot when any class in the
-        // chain has virtual methods, then every ancestor's fields root ->
-        // derived).  Nothing here searches a field list by the name.
-        mut any_virtual: boolean = false;
-        mut leaf_cls: ClassType* = null;
-        if (t != null && t.kind == TypeKind::Class) {
-            const cls: ClassType* = t.as_class();
-            leaf_cls = cls;
-            mut walk: ClassType* = cls;
-            mut depth: i32 = 0;
-            while (walk != null && depth < 16) {
-                if (walk.has_virtual_methods) { any_virtual = true; }
-                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-                const base_t: Type* = this.cg.arena_type(walk.base_class);
-                if (base_t == null || base_t.kind != TypeKind::Class) { break; }
-                walk = base_t.as_class();
-                depth += 1;
-            }
-        }
-
-        // Initialize the vtable pointer at slot 0 for any value-constructed
-        // class instance whose chain contains virtual methods.  Without this,
-        // every `const x: T = T{...}` for a virtual class leaves slot 0
-        // uninitialized; the first virtual call reads poison and segfaults.
-        // Mirrors the heap-`new` path in `new_delete_emitter.cryo:209-233`.
-        if (any_virtual && leaf_cls != null) {
-            const intern: InternTable* = this.cg.get_intern();
-            const qname: QualifiedName = QualifiedName::from_symbol(leaf_cls.qualified_name.spelling());
-            const vtbl_name: MangledName = MangledName::for_vtable(intern, qname);
-            mut vtbl_global: LValue = this.cg.llvm_module.get_named_global(vtbl_name);
-            if (!vtbl_global.is_valid()) {
-                // Cross-module reference: declare as an extern.  The
-                // placeholder type doesn't have to match the definition
-                // (opaque pointers; linker resolves by symbol name).
-                const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
-                const placeholder_ty: LType = LType::array_of(fn_ptr_ty, 1);
-                vtbl_global = this.cg.llvm_module.add_global(placeholder_ty, vtbl_name);
-            }
-            if (vtbl_global.is_valid()) {
-                const vptr_slot: LValue = this.cg.builder.build_struct_gep(
-                    ty, alloca, 0, "vptr.slot");
-                if (vptr_slot.is_valid()) {
-                    this.cg.builder.build_store(vtbl_global, vptr_slot);
-                }
-            }
-        }
-
+        // Each initializer carries the coordinates of the field it names, and
+        // the slot is computed from them by the routine the body was built
+        // from.  Nothing here searches a field list by the name.
         for (mut i: i64 = 0; i < field_pins.length; i++) {
-            mut p_depth: i64 = -1;
             mut p_index: i64 = -1;
             match (field_pins[i]) {
-                MemberPin::Field(d, ix) => { p_depth = d; p_index = ix; }
-                _                       => { }
+                MemberPin::Field(ix) => { p_index = ix; }
+                _                    => { }
             }
-            const pin_slot: i64 = this.cg.type_mapper.pinned_element_index(t, p_depth, p_index);
-            const pin_field: FieldInfo* = this.cg.type_mapper.pinned_field(t, p_depth, p_index);
+            const pin_slot: i64 = this.cg.type_mapper.pinned_element_index(t, p_index);
+            const pin_field: FieldInfo* = this.cg.type_mapper.pinned_field(t, p_index);
             if (pin_slot < 0 || pin_field == null) {
                 // The initializer's coordinates name no slot in the resolved
                 // layout: a literal no sema walk answered (the pass that
@@ -1610,8 +1550,8 @@ type struct IRGeneratorVisitor {
 
         if (src_t != null && dst_t != null &&
             dst_t.kind == TypeKind::Pointer &&
-            (src_t.kind == TypeKind::Class || src_t.kind == TypeKind::Struct)) {
-            // Class/Struct value -> Pointer: reference upcast.  The
+            src_t.kind == TypeKind::Struct) {
+            // Struct value -> Pointer.  The
             // object's lvalue is already a pointer to storage;
             // pointer-cast it to the target pointer type.  Avoids
             // the illegal `bitcast %struct to ptr` that would
@@ -1697,8 +1637,8 @@ type struct IRGeneratorVisitor {
     }
 
     /// Call expression: delegate to CallEmitter.  Handles all call shapes
-    /// - identifier / method / scope-resolution / ctor / intrinsic /
-    /// vtable-dispatched - plus the post-call `unreachable` emission for
+    /// - identifier / method / scope-resolution / intrinsic - plus the
+    /// post-call `unreachable` emission for
     /// divergent (non-returning) callees.
     /// Tuple literal: Sema tags `resolved_type` with the arena's
     /// TupleType (deduped by element types), so the layout follows

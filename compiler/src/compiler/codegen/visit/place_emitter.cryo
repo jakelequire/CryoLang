@@ -75,7 +75,7 @@ type struct PlaceEmitter {
 
     // Member access (obj.field)
 
-    /// Generate a GEP to a struct/class field.  The field is the one sema
+    /// Generate a GEP to a struct field.  The field is the one sema
     /// pinned on the node (`pin`, its coordinates in the receiver's type);
     /// `member` is its spelling, for the diagnostic alone, and `pin_carried`
     /// says whether the pin came through a substituted clone rather than from
@@ -95,7 +95,7 @@ type struct PlaceEmitter {
         // Unwrap InstantiatedType to its concrete resolved form before kind-based
         // dispatch.  Sema does the same in `MemberResolver::field_of`; without this,
         // a `Pair<string>` resolves to an `InstantiatedType` whose kind isn't
-        // Struct/Class/Array, and every field/length access silently returns null.
+        // Struct/Array, and every field/length access silently returns null.
         mut inst_depth: i32 = 0;
         while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth < 5) {
             const inst: InstantiatedType* = t.as_instantiated();
@@ -132,7 +132,7 @@ type struct PlaceEmitter {
         // The pointee of a Pointer/Reference may itself be an InstantiatedType
         // (e.g. `HashMapEntry<u32, i64>` sitting in the arena as the pointee of a
         // `HashMapEntry<u32, i64>*`). Mirror the pre-Pointer unwrap above so the
-        // kind dispatch below sees the concrete Struct/Class/Array; without this,
+        // kind dispatch below sees the concrete Struct/Array; without this,
         // field_idx stays -1, the access silently emits no IR, and the
         // half-emitted basic block gets stripped by `is_function_body_valid`.
         mut inst_depth2: i32 = 0;
@@ -154,40 +154,31 @@ type struct PlaceEmitter {
         mut field_idx: i64 = -1;
 
         // The field sema pinned: a tuple's element and a struct's field are
-        // their own index; a class member's slot is computed from the
-        // coordinates by the routine the flattened body was built from.
-        // Nothing here searches a field table by the spelling: a node with
-        // no pin is one no sema walk answered, reported as such.
-        mut pin_depth: i64 = -1;
+        // their own index.  Nothing here searches a field table by the
+        // spelling: a node with no pin is one no sema walk answered,
+        // reported as such.
         mut pin_index: i64 = -1;
         match (pin) {
-            MemberPin::Field(d, i) => { pin_depth = d; pin_index = i; }
-            MemberPin::RecvSlot    => {
+            MemberPin::Field(i) => { pin_index = i; }
+            MemberPin::RecvSlot => {
                 if (tk == TypeKind::Struct) {
-                    pin_depth = 0;
                     pin_index = t.as_struct().async_recv_slot;
                 }
             }
-            _                      => { }
+            _                   => { }
         }
         if (tk == TypeKind::Tuple) {
             const tup: TupleType* = t.as_tuple();
-            if (pin_depth == 0 && pin_index >= 0 && pin_index < tup.elements.length) {
+            if (pin_index >= 0 && pin_index < tup.elements.length) {
                 field_idx = pin_index;
             }
         } else if (tk == TypeKind::Struct) {
             // The field-list index; the body element it maps to is computed
             // below, where a padding element may sit before it.
             const st: StructType* = t.as_struct();
-            if (pin_depth == 0 && pin_index >= 0 && pin_index < st.fields.length) {
+            if (pin_index >= 0 && pin_index < st.fields.length) {
                 field_idx = pin_index;
             }
-        } else if (tk == TypeKind::Class) {
-            // A class body is flattened - vtable slot, then ancestors' fields,
-            // then its own - so a member's slot is not its index in any one
-            // field list; the coordinates are mapped by the routine the body
-            // was built from.
-            field_idx = this.cg.type_mapper.pinned_element_index(t, pin_depth, pin_index);
         } else if (tk == TypeKind::Array) {
             // A fixed array's one member is its length, which is what sema
             // admits on the type: a compile-time constant.
@@ -196,21 +187,21 @@ type struct PlaceEmitter {
             out.is_lvalue = false;
             return out;
         }
-        if (tk == TypeKind::Tuple || tk == TypeKind::Struct || tk == TypeKind::Class) {
+        if (tk == TypeKind::Tuple || tk == TypeKind::Struct) {
             if (pin_index < 0) {
                 this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
                     fmt::format("codegen: member access `%s` on `%s` carries no field pin: no sema walk answered it, and the pass that minted it owes it the answer",
                         this.cg.resolve(member), t.display_name()),
                     site_span);
             } else if (field_idx < 0) {
-                // The pin names coordinates this type does not have.  A pin
-                // that CROSSED a substitution is the shape that can go wrong
-                // here - the coordinates are read off the owner the template
-                // was walked against - so the report says which kind it was
-                // rather than leaving the access to emit no IR at all.
+                // The pin names a field this type does not have.  A pin that
+                // CROSSED a substitution is the shape that can go wrong here
+                // - the index is read off the owner the template was walked
+                // against - so the report says which kind it was rather than
+                // leaving the access to emit no IR at all.
                 this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
-                    fmt::format("codegen: member access `%s` is pinned at field %d, %d steps up, which `%s` does not have (the pin was %s)",
-                        this.cg.resolve(member), pin_index, pin_depth, t.display_name(),
+                    fmt::format("codegen: member access `%s` is pinned at field %d, which `%s` does not have (the pin was %s)",
+                        this.cg.resolve(member), pin_index, t.display_name(),
                         if (pin_carried) { "carried across a substitution" } else { "written by a sema walk" }),
                     site_span);
             }
@@ -283,8 +274,8 @@ type struct PlaceEmitter {
         const obj_llvm_ty: void* = llvm::LLVMTypeOf(obj_ptr.raw);
         // From here on the index addresses the BODY, not the field list: a
         // struct's fields can be separated by alignment padding elements.  A
-        // class member already arrived as a body slot (see above); a tuple
-        // slot and the dynamic-array header are their own element order.
+        // tuple slot and the dynamic-array header are their own element
+        // order.
         mut elem_idx: i64 = field_idx;
         if (tk == TypeKind::Struct) {
             elem_idx = this.cg.type_mapper.field_element_index(t, field_idx);

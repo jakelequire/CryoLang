@@ -1,6 +1,6 @@
 ///! User-Defined Types
 ///!
-///! The payloads of struct, class, enum, trait, type alias and function
+///! The payloads of struct, enum, trait, type alias and function
 ///! template types, and their helper structs.  Supports forward declaration
 ///! (is_complete flag) and incremental population of fields/methods.
 
@@ -21,7 +21,7 @@ import compiler::module_graph;
 import compiler::module_graph::{ ModulePath };
 
 
-// FieldInfo: Metadata for a struct/class field
+// FieldInfo: Metadata for a struct field
 
 type struct FieldInfo {
 private:
@@ -30,10 +30,6 @@ public:
     field_type: TypeRef;
     offset:     u64;
     is_public:  boolean;
-    /// `protected` visibility: accessible from the declaring type and any
-    /// of its subclasses (but not unrelated code).  Mutually exclusive
-    /// with `is_public`; both false => `private`.
-    is_protected: boolean;
     is_mutable: boolean;
     /// The field's `= expr` default, or null.  When a struct literal omits this
     /// field, sema clones this expression, resolves it, and appends it as a
@@ -43,13 +39,12 @@ public:
     default_value: ExpressionNode*;
 
     static new(name: SymbolStr, field_type: TypeRef, is_public: boolean,
-               is_protected: boolean, is_mutable: boolean) -> FieldInfo {
+               is_mutable: boolean) -> FieldInfo {
         return FieldInfo {
             name:          name,
             field_type:    field_type,
             offset:        0,
             is_public:     is_public,
-            is_protected:  is_protected,
             is_mutable:    is_mutable,
             default_value: null,
         };
@@ -74,25 +69,16 @@ type struct MethodInfo {
     name:          SymbolStr;
     function_type: TypeRef;   // Points to a FunctionType in the arena
     is_public:     boolean;
-    /// `protected` visibility: callable from the declaring type and its
-    /// subclasses.  Mutually exclusive with `is_public`; both false =>
-    /// `private`.
-    is_protected:  boolean;
     is_static:     boolean;
-    is_virtual:    boolean;
-    is_override:   boolean;
     /// Canonical parameter TypeRefs: the non-self params in declaration
-    /// order.  This is the overload discriminator for vtable slot
-    /// identity: two methods share a slot if they have the same `name`
-    /// AND all param TypeRefs equal by arena ID.  The arena dedups types,
-    /// so identical parameter types always share an ID regardless of how
-    /// they were spelled at the source level.
+    /// order.  The arena dedups types, so identical parameter types always
+    /// share an ID regardless of how they were spelled at the source level.
     param_types:   [TypeRef];
-    /// Opaque back-reference to the method's declaration (shape
+    /// Opaque back-reference to the method's declaration (kind
     /// `DeclKind::Method`).  Typed as `void*` here to keep the Types module
     /// free of AST imports (AST depends on Types, so the other direction
     /// would cycle); callers read it through `DeclarationNode::method_of`.  Enables sema
-    /// to walk from `ClassType.methods` back to the declaration during
+    /// to walk from a type's methods back to the declaration during
     /// overload resolution, and codegen to identify the chosen overload.
     ast_node:      void*;
 
@@ -101,10 +87,7 @@ type struct MethodInfo {
             name:          name,
             function_type: function_type,
             is_public:     is_public,
-            is_protected:  false,
             is_static:     is_static,
-            is_virtual:    false,
-            is_override:   false,
             param_types:   [],
             ast_node:      null,
         };
@@ -266,122 +249,6 @@ type struct StructType {
     /// its position among the struct's fields, or -1.  The owner is known,
     /// so the leaf is asked inside it, here beside the field list.
     field_position(&this, leaf: SymbolStr) -> i64 {
-        for (mut i: i64 = 0; i < this.fields.length; i++) {
-            if (this.fields[i].name.equals(leaf)) { return i; }
-        }
-        return -1;
-    }
-
-    set_display_name(mut &this, name: DeclName) -> void { this.custom_display = name; }
-
-    set_layout(mut &this, size: u64, align: u64) -> void {
-        this.computed_size  = size;
-        this.computed_align = align;
-    }
-
-    set_field_offset(mut &this, index: i64, offset: u64) -> void {
-        this.fields[index].offset = offset;
-    }
-
-    display_name(&this) -> string {
-        if (this.custom_display.is_valid()) { return this.intern_table.shown(this.custom_display); }
-        return this.intern_table.shown(this.qualified_name);
-    }
-}
-
-
-// ClassType: Class with inheritance support
-
-type struct ClassType {
-    qualified_name:      DeclName;
-    declared_in:         ModulePath;
-    intern_table:        InternTable*;
-    fields:              [FieldInfo];
-    methods:             [MethodInfo];
-    base_class:          TypeRef;
-    has_base:            boolean;
-    has_virtual_methods: boolean;
-    is_complete:         boolean;
-    /// A specialization's display; the name of nothing on any other type.
-    custom_display:      DeclName;
-    computed_size:       u64;
-    computed_align:      u64;
-
-    /// Layout attributes copied from the ClassDeclNode by TypeResolution.
-    /// See StructType for semantics.
-    repr_c:           boolean;
-    repr_packed:      boolean;
-    repr_transparent: boolean;
-    min_alignment:    u64;
-    /// See StructType.generic_base / type_args: the instantiation this concrete
-    /// IS, carried intrinsically rather than via a side node.
-    generic_base:     TypeRef;
-    type_args:        [TypeRef];
-
-    static new(qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*) -> ClassType* {
-        return new ClassType {
-            qualified_name:      DeclName::of(qualified_name),
-            declared_in:         declared_in,
-            intern_table:        intern_table,
-            fields:              [],
-            methods:             [],
-            base_class:          TypeRef::invalid(),
-            has_base:            false,
-            has_virtual_methods: false,
-            is_complete:         false,
-            custom_display:      DeclName::empty(),
-            computed_size:       0,
-            computed_align:      0,
-            repr_c:              false,
-            repr_packed:         false,
-            repr_transparent:    false,
-            min_alignment:       0,
-            generic_base:        TypeRef::invalid(),
-            type_args:           [],
-        };
-    }
-
-    /// See StructType::set_generic_origin - `args` is copied element-wise.
-    set_generic_origin(mut &this, base: TypeRef, args: &[TypeRef]) -> void {
-        this.generic_base = base;
-        mut copied: [TypeRef] = [];
-        for (mut i: i64 = 0; i < args.length; i++) { copied.push(args[i]); }
-        this.type_args = copied;
-    }
-
-    set_repr(mut &this, c: boolean, packed: boolean, transparent: boolean) -> void {
-        this.repr_c           = c;
-        this.repr_packed      = packed;
-        this.repr_transparent = transparent;
-    }
-
-    set_min_alignment(mut &this, n: u64) -> void {
-        this.min_alignment = n;
-    }
-
-    set_fields(mut &this, fields: [FieldInfo]) -> void {
-        this.fields      = fields;
-        this.is_complete = true;
-    }
-
-    set_base_class(mut &this, base: TypeRef) -> void {
-        this.base_class = base;
-        this.has_base   = true;
-    }
-
-    add_method(mut &this, method: MethodInfo) -> void {
-        const is_virtual: boolean  = method.is_virtual;
-        const is_override: boolean = method.is_override;
-        this.methods.push(method);
-        if (is_virtual || is_override) {
-            this.has_virtual_methods = true;
-        }
-    }
-
-    /// A field written as a leaf on a class in hand:
-    /// its position among the class's OWN fields, or -1.  A base's fields
-    /// are its own class's to answer; the caller walks the chain.
-    own_field_position(&this, leaf: SymbolStr) -> i64 {
         for (mut i: i64 = 0; i < this.fields.length; i++) {
             if (this.fields[i].name.equals(leaf)) { return i; }
         }

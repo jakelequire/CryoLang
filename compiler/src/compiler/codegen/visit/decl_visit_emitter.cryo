@@ -1,10 +1,10 @@
 /// Declaration Visit Emitter
 ///
-/// Function / impl-block / struct-decl / class-decl visit dispatch
+/// Function / impl-block / struct-decl / union-decl visit dispatch
 /// (the four AST node kinds whose visit() handlers walk *method
 /// bodies* rather than emit expressions).  Shared body-emission
 /// helpers (`generate_function_body`, `generate_impl_block`,
-/// `generate_method_body`, `emit_base_ctor_call`) live here so they
+/// `generate_method_body`) live here so they
 /// can recurse into method bodies via the visitor while honoring the
 /// `state.current_impl_target` traversal context.
 ///
@@ -37,7 +37,7 @@ import std::collections::pair::{ Pair };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, FunctionDecl, ImplBlock, MethodDecl, StructDecl,
+    FunctionDecl, ImplBlock, MethodDecl, StructDecl,
     UnionDecl, DeclarationNode, VarDecl
 };
 import compiler::ast::expression::{ ExpressionNode };
@@ -114,7 +114,7 @@ type struct DeclVisitEmitter {
                sname, node.methods.length); libc::fflush(null);
         this.state.current_impl_target = this.cg.ctx.decl_index.type_of_decl(node.def, "codegen/struct method bodies");
         for (mut j: i64 = 0; j < node.methods.length; j++) {
-            this.generate_method_body(visitor, node.methods[j], null);
+            this.generate_method_body(visitor, node.methods[j]);
         }
         this.state.current_impl_target = TypeRef::invalid();
         cdebug("[IRGen]   struct methods done\n"); libc::fflush(null);
@@ -128,24 +128,9 @@ type struct DeclVisitEmitter {
         if (node.methods.length == 0) { return; }
         this.state.current_impl_target = this.cg.ctx.decl_index.type_of_decl(node.def, "codegen/union method bodies");
         for (mut j: i64 = 0; j < node.methods.length; j++) {
-            this.generate_method_body(visitor, node.methods[j], null);
+            this.generate_method_body(visitor, node.methods[j]);
         }
         this.state.current_impl_target = TypeRef::invalid();
-    }
-
-    emit_class_decl(mut &this, visitor: IRGeneratorVisitor*, node: ClassDeclNode*) -> void {
-        if (node == null) { return; }
-        if (node.generic_params.length > 0) { return; }
-        if (node.methods.length == 0) { return; }
-        const cname: string = this.cg.resolve(node.name);
-        cdebug("[IRGen]   class methods: %s (%lld methods)\n",
-               cname, node.methods.length); libc::fflush(null);
-        this.state.current_impl_target = this.cg.ctx.decl_index.type_of_decl(node.def, "codegen/class method bodies");
-        for (mut j: i64 = 0; j < node.methods.length; j++) {
-            this.generate_method_body(visitor, node.methods[j], &node.base_res);
-        }
-        this.state.current_impl_target = TypeRef::invalid();
-        cdebug("[IRGen]   class methods done\n"); libc::fflush(null);
     }
 
 
@@ -153,7 +138,7 @@ type struct DeclVisitEmitter {
     //
     // Called from the top-level visit() overrides above.  Kept as named
     // methods (not visit() overrides) because they're also called from
-    // `visit(StructDecl*)` / `visit(ClassDeclNode*)` to emit each
+    // `visit(StructDecl*)` / `visit(UnionDecl*)` to emit each
     // method body without re-entering the visit dispatch for the wrapper.
 
     /// Generate a function body: prologue, block walk, epilogue, validate.
@@ -247,22 +232,15 @@ type struct DeclVisitEmitter {
                        i, mname, m.is_static as i32,
                        mfunc.generic_params.length, mfunc.body as void*); libc::fflush(null);
             }
-            this.generate_method_body(visitor, m_decl, null);
+            this.generate_method_body(visitor, m_decl);
             cdebug("[IRGen]     method[%lld] done\n", i); libc::fflush(null);
         }
 
         this.state.current_impl_target = TypeRef::invalid();
     }
 
-    /// Generate a method body: prologue, optional base-ctor call, block walk,
-    /// epilogue, validate.
-    ///
-    /// `base` is the enclosing CLASS's stamped base, or null where there is
-    /// no class - a struct, a union, an `implement` block.  A constructor's
-    /// `: Base(args)` names that base and nothing else, so the class's answer
-    /// is the constructor's.
-    generate_method_body(mut &this, visitor: IRGeneratorVisitor*, node_decl: DeclarationNode*,
-                         base: ResSlot*) -> void {
+    /// Generate a method body: prologue, block walk, epilogue, validate.
+    generate_method_body(mut &this, visitor: IRGeneratorVisitor*, node_decl: DeclarationNode*) -> void {
         const node: MethodDecl* = DeclarationNode::method_of(node_decl);
         const func_decl: DeclarationNode* = node.func;
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
@@ -279,16 +257,6 @@ type struct DeclVisitEmitter {
         if (!fn_val.is_valid()) {
             cdebug("[IRGen]       method prologue FAILED\n"); libc::fflush(null);
             return;
-        }
-
-        // Constructor with base-class delegation (`Derived(...) : Base(...)`):
-        // emit the base-class constructor call before the body so the inherited
-        // fields are properly initialised.
-        // Without this, every derived-class constructor returns immediately
-        // after storing its params into locals, and downstream uses of inherited
-        // fields read garbage.
-        if (node.is_constructor && node.has_base_ctor()) {
-            this.emit_base_ctor_call(visitor, node_decl, fn_val, base);
         }
 
         cdebug("[IRGen]       method body block...\n"); libc::fflush(null);
@@ -308,94 +276,5 @@ type struct DeclVisitEmitter {
             };
             this.cg.diag.report_invalid_function_body(fn_val, pretty, func_decl.span);
         }
-    }
-
-    /// Emit the immediate base-class constructor call for a derived-class
-    /// constructor with `: BaseClass(args)` initialisation.  `this` (the LLVM
-    /// param 0 of the enclosing constructor) is passed as the receiver, and
-    /// `node.base_ctor_args` are codegen'd as rvalues for the remaining args.
-    emit_base_ctor_call(mut &this, visitor: IRGeneratorVisitor*, node_decl: DeclarationNode*, fn_val: LValue,
-                        base: ResSlot*) -> void {
-        const node: MethodDecl* = DeclarationNode::method_of(node_decl);
-        const intern: InternTable* = this.cg.get_intern();
-        const ctx_ptr: CompilationContext* = this.cg.ctx;
-
-        // The base the constructor delegates to is the class's base, which
-        // the name layer stamped on the class declaration under the canonical
-        // name the base's type and constructor are registered by.  The
-        // written base name is not consulted: it is the same spelling the
-        // class declaration wrote, and that one was already answered where
-        // its imports were in hand.
-        mut base_def: DefId = DefId::invalid();
-        mut base_type: TypeRef = TypeRef::invalid();
-        if (base != null) {
-            const r: Res = base.require("base-constructor call");
-            base_type = ctx_ptr.decl_index.type_of_res(r);
-            // The constructor is one the base class's definition registered.
-            base_def = r.def_id();
-        }
-        if (base_type.is_invalid()) { cdebug("[BCTOR-BAIL] type invalid\n"); return; }
-
-        // Constructor LLVM arity = user args + 1 for the implicit `this`.
-        const ctor_arity: u32 = (node.base_ctor_args.length + 1) as u32;
-        const ctor_fn: LValue = this.cg.resolver.resolve_constructor(base_def, ctor_arity as i64);
-        if (!ctor_fn.is_valid()) {
-            cdebug("[BCTOR-BAIL] ctor not found: '%s' arity=%u\n",
-                intern.resolve(node.base_ctor_name), ctor_arity);
-            return;
-        }
-
-        const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
-        if (!ctor_ty.is_valid()) { cdebug("[BCTOR-BAIL] ctor_ty invalid\n"); return; }
-
-        // `this` is LLVM param 0 of the enclosing constructor.
-        const this_arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
-
-        mut ctor_args: [Pair<LValue, TypeRef>] = [];
-        ctor_args.push(Pair::<LValue, TypeRef>::new(this_arg, base_type));
-        mut any_arg_invalid: boolean = false;
-        for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
-            const arg_node: ExpressionNode* = node.base_ctor_args[i];
-            mut arg: LValue = this.dispatch.codegen_rvalue(visitor,arg_node);
-            if (!arg.is_valid()) {
-                any_arg_invalid = true;
-                break;
-            }
-            // codegen_rvalue's load step short-circuits when the arg's
-            // `resolved_type` doesn't map to a valid LType: base ctor
-            // args from `Derived(p: T*) : Base(p)` are AST identifiers wired
-            // up by the parser before sema fully resolves them, so we
-            // sometimes get the alloca address back instead of the loaded
-            // value.  With opaque pointers the mismatch is invisible to LLVM
-            // (`ptr` either way), and the base stores the derived
-            // constructor's local-`%p` alloca address into its field, which
-            // points at a dead stack frame once the constructor returns.
-            // codegen_rvalue returns a bare value with no place flag, so
-            // check the value's opcode directly.
-            // If `arg.raw` is still an alloca instruction (opcode 26),
-            // codegen_rvalue skipped its load and we need to deref here
-            // before passing to the base ctor.  Restrict to pointer /
-            // integer / float allocas; aggregate (struct) allocas get
-            // the load via codegen_call's ek=10/ak=12 coercion, so
-            // pre-loading would double-deref.
-            const opcode: i32 = llvm::LLVMGetInstructionOpcode(arg.raw);
-            if (opcode == 26) {
-                const alloc_ty: void* = llvm::LLVMGetAllocatedType(arg.raw);
-                if (alloc_ty != null) {
-                    const alloc_kind: LTypeKind = LType::kind_of(alloc_ty);
-                    if (alloc_kind == LTypeKind::Pointer || alloc_kind == LTypeKind::Integer
-                            || alloc_kind == LTypeKind::Float || alloc_kind == LTypeKind::Double) {
-                        const alloc_lty: LType = LType { raw: alloc_ty };
-                        arg = this.cg.builder.build_load(
-                            alloc_lty, arg, "base.arg.load");
-                    }
-                }
-            }
-            ctor_args.push(Pair::<LValue, TypeRef>::new(arg, arg_node.resolved_type));
-        }
-        if (any_arg_invalid) { cdebug("[BCTOR-BAIL] any_arg_invalid\n"); return; }
-
-        mut ctor_result: LValue = LValue::null();
-        ctor_result = this.cg.expr_ops.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
     }
 }

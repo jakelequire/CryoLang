@@ -157,29 +157,29 @@ WhereClause        ::= Ident ":" TraitBound ("+" TraitBound)*
                        (* TraitBound is a possibly-qualified trait name with
                           optional generic arguments - same shape as
                           super-trait references on a `type trait` decl. *)
-Visibility         ::= "public" | "private" | "protected"
+Visibility         ::= "public" | "private"
 
 
-(*  Aggregates (struct/class), Enums, Traits, Type Aliases ===== *)
+(*  Structs, Enums, Traits, Type Aliases ======================== *)
 
-(* Structs and classes share a single rule; the keyword and a few
-   class-only members (constructors, destructors, virtual/override)
-   are the only differences.  The leading `type` keyword is the
-   canonical form (`type struct Foo { ... }`); the bare `struct Foo`
-   form is also accepted.                                            *)
+(* The leading `type` keyword is the canonical form
+   (`type struct Foo { ... }`); the bare `struct Foo` form is also
+   accepted.  The class forms - `type class`, a base list `: Base`,
+   `virtual` / `override` members, `protected`, constructors
+   `Name(..) { }` and destructors `~Name() { }`, a base-constructor
+   initializer `: Base(..)` and the `class` tag on an implement head -
+   are not part of the grammar: the parser reads each only to refuse
+   it where it is written (E0117).                                    *)
 
-AggregateDecl      ::= "type"? AggregateKind Ident Generics?
-                       (":" Ident)?                  (* base class  *)
+AggregateDecl      ::= "type"? "struct" Ident Generics?
                        ("where" WhereClause)?        (* bounds on the declaration's own
                                                         parameters; checked per instantiation *)
                        "{" Member* "}"
-AggregateKind      ::= "struct" | "class"
 
-Member             ::= Visibility? "static"?
-                       (Field | Method | Constructor | Destructor)
-                     | VisibilityBlock          (* `public:` / `private:` / `protected:`
+Member             ::= Visibility? "static"? (Field | Method)
+                     | VisibilityBlock          (* `public:` / `private:`
                                                    labels a run of subsequent members. *)
-VisibilityBlock    ::= Visibility ":" (Field | Method | Constructor | Destructor)*
+VisibilityBlock    ::= Visibility ":" (Field | Method)*
 
 (* A member may be named by a keyword.  A member name is never read as a
    declaration or an operator - what follows it says which member kind it
@@ -187,18 +187,15 @@ VisibilityBlock    ::= Visibility ":" (Field | Method | Constructor | Destructor
    can only be a member name.  This is what lets a bound C struct keep a
    field called `type`, which the binding generator cannot rename without
    breaking the ABI.  The exceptions are the keywords a member position
-   reads FIRST: `public`/`private`/`protected` (a visibility label) and
-   `static`/`virtual`/`override`/`async` (a member modifier).             *)
+   reads FIRST: `public`/`private` (a visibility label), `static`/`async`
+   (a member modifier) and `protected`/`virtual`/`override` (refused).   *)
 MemberName         ::= Ident | Keyword
 
 Field              ::= MemberName ":" Type ("=" Expr)? ";"
-Method             ::= ("virtual" | "override" | "async")? MemberName Generics?
+Method             ::= "async"? MemberName Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)?
                        (Block | ";")
-Constructor        ::= Ident "(" ParamList? ")"
-                       (":" Ident "(" ArgList? ")")? Block
-Destructor         ::= "~" Ident "(" ")" Block
 
 EnumDecl           ::= "type"? "enum" Ident Generics? (":" Type)?
                        ("where" WhereClause)?
@@ -223,7 +220,7 @@ UnionDecl          ::= "type" "union" Ident Generics?
                           matched variant-wise - use `type enum` for a tagged
                           (discriminated) union.  Reading a member other than
                           the one last written is the programmer's
-                          responsibility.  Unlike `struct`/`class` there is no
+                          responsibility.  Unlike `struct` there is no
                           bare `union Foo` form; the leading `type` is
                           required. *)
 
@@ -250,19 +247,19 @@ TypeAlias          ::= "type" Ident Generics? "=" Type ";"
 (*  Two shapes: inherent impl (no `trait ... for`) and trait impl
     (with `trait ... for`).  Both may carry leading `<T, ...>`
     generic parameters on the impl head, an optional kind tag
-    (`struct`/`enum`/`class`) on the target, and generic arguments
+    (`struct`/`enum`/`union`) on the target, and generic arguments
     on the target type.                                              *)
 
 ImplBlock          ::= "implement" Generics?
                        ( "trait" Type "for" )?
-                       ("enum" | "struct" | "union" | "class")?
+                       ("enum" | "struct" | "union")?
                        TargetType
                        "{" MethodImpl* "}"
 TargetType         ::= QualName GenericArgs?
                      | Primitive
                      | "()"                              (* unit type *)
 
-MethodImpl         ::= ("virtual" | "override")? "static"? "async"?
+MethodImpl         ::= "static"? "async"?
                        Ident Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)? Block
@@ -362,6 +359,8 @@ StructLit          ::= Ident TurbofishArgs?
 ArrayLit           ::= "[" (Expr ("," Expr)*)? "]"
                      | "[" Expr ";" Expr "]"
 NewExpr            ::= "new" Type ("(" ArgList? ")")?
+                       (* arguments build an enum variant, `new E::V(x)`;
+                          on any other type they are refused (E0117) *)
                      | "new" Type "[" Expr "]"
                      | "new" Type "{" Ident ":" Expr
                                   ("," Ident ":" Expr)* ","? "}"

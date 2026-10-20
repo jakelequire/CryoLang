@@ -68,7 +68,7 @@ type struct SignaturePlan {
 
 Driven by the aggregate's `size_bytes()` after unwrapping `TypeAlias`
 and `InstantiatedType` to the concrete kind. Aggregate kinds are
-`Struct`, `Class`, `Enum`, `Tuple`, and `Optional`. Primitive scalars
+`Struct`, `Enum`, `Tuple`, and `Optional`. Primitive scalars
 (`Int`, `Float`, `Pointer`, `Reference`, ...) and `Array`/`String`/etc.
 are always Direct.
 
@@ -150,7 +150,7 @@ For each <= 8 byte half of an aggregate ("eightbyte bucket"),
 `AbiClassifier::eightbyte_slot_type` picks the LLVM type that occupies
 the slot:
 
-1. Walk the struct/class fields whose offset falls in `[start, end)`.
+1. Walk the struct fields whose offset falls in `[start, end)`.
 2. **One float-class field that fully covers the bucket**: emit `double`
    (for F64) or `float` (for F32) - SSE class.
 3. **Two F32 fields packing into one 8-byte eightbyte**: emit
