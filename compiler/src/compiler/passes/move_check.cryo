@@ -24,7 +24,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, sink, snapshot, source_span };
 import compiler::ast;
 import compiler::ast::{
-    ArgBinding, declaration, expression, node, NodeKind, pattern, PatternBinding, statement
+    ArgBinding, declaration, expression, node, pattern, PatternBinding, statement
 };
 import compiler::lex;
 import compiler::lex::{ TokenType };
@@ -344,7 +344,7 @@ type struct MoveChecker {
         for (mut p: i64 = 0; p < arm.patterns.length; p++) {
             const pat: Pattern* = arm.patterns[p];
             if (pat == null) { continue; }
-            match (pat.shape) {
+            match (pat.kind) {
                 PatternKind::Binding(b) => {
                     // The binding IS the subject, taken by value: giving it away
                     // twice releases it twice, as for a declared local, and a field
@@ -643,7 +643,7 @@ type struct MoveChecker {
     /// (or past) the enclosing loop, bypassing the code that follows the
     always_diverges(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Return(_) => { return true; }
             StmtKind::Break     => { return true; }
             StmtKind::Continue  => { return true; }
@@ -692,7 +692,7 @@ type struct MoveChecker {
     /// itself.
     leaves_loop(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Return(_) => { return true; }
             StmtKind::Break     => { return true; }
             StmtKind::Block(b) => {
@@ -912,32 +912,28 @@ type struct MoveChecker {
     }
 
     walk_top_level(mut &this, stmt: DeclarationNode*) -> void {
-        match (stmt.kind) {
-            NodeKind::ClassDeclaration => {
-                this.walk_methods((stmt as ClassDeclNode*).methods);
-            }
-            NodeKind::Declaration => {
-                match (stmt.shape) {
-                    DeclKind::Function(_) => {
-                        this.walk_function(DeclarationNode::with_shape(stmt));
-                    }
-                    DeclKind::Trait(td) => {
-                        for (mut i: i64 = 0; i < td.methods.length; i++) {
-                            const m_decl: DeclarationNode* = td.methods[i];
-                            const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
-                            if (m != null) { this.walk_function(m_decl); }
-                        }
-                    }
-                    DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
-                    DeclKind::Struct(sd) => { this.walk_methods(sd.methods); }
-                    DeclKind::Impl(ib) => { this.walk_methods(ib.methods); }
-                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                    | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+        if (stmt.is_class()) {
+            this.walk_methods((stmt as ClassDeclNode*).methods);
+        } else {
+            match (stmt.shape) {
+                DeclKind::Function(_) => {
+                    this.walk_function(DeclarationNode::with_shape(stmt));
                 }
+                DeclKind::Trait(td) => {
+                    for (mut i: i64 = 0; i < td.methods.length; i++) {
+                        const m_decl: DeclarationNode* = td.methods[i];
+                        const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
+                        if (m != null) { this.walk_function(m_decl); }
+                    }
+                }
+                DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
+                DeclKind::Struct(sd) => { this.walk_methods(sd.methods); }
+                DeclKind::Impl(ib) => { this.walk_methods(ib.methods); }
+                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+                | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
             }
-            _ => {}
         }
     }
 
@@ -961,7 +957,7 @@ type struct MoveChecker {
 
     walk_stmt(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Block(b) => {
                 for (mut i: i64 = 0; i < b.statements.length; i++) {
                     this.walk_stmt(b.statements[i]);
@@ -1282,44 +1278,40 @@ type struct MoveChecker {
     walk_expr_read(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::Expression         => {
-                match (expr.shape) {
-                    ExprKind::Call(c) => { this.read_call(expr, c); }
-                    ExprKind::Identifier(id) => { this.handle_ident(expr, id, false, false); }
-                    ExprKind::MemberAccess(ma) => { this.read_member(ma); }
-                    // Reduced to one live arm by the monomorphizer; walk it as
-                    // a block.
-                    ExprKind::Match(m) => { this.read_match(m); }
-                    ExprKind::Cast(cv) => { this.read_cast(cv); }
-                    ExprKind::Unary(u) => { this.read_unary(u); }
-                    ExprKind::Binary(b) => { this.read_binary(b); }
-                    ExprKind::ArrayAccess(aa) => { this.read_array_access(aa); }
-                    ExprKind::StaticMatch(sme) => {
-                        if (sme.arms.length > 0 && sme.arms[0] != null && sme.arms[0].body != null) {
-                            this.walk_stmt(sme.arms[0].body);
-                        }
-                    }
-                    // `expr?` is lowered to a `match` by sema; walk the
-                    // desugar so the operand is move-checked like any other
-                    // match.
-                    ExprKind::Try(te) => {
-                        if (te.desugared != null) { this.walk_expr_read(te.desugared); }
-                    }
-                    ExprKind::New(ne) => { this.read_new(ne); }
-                    ExprKind::Tuple(tl) => { this.read_tuple_lit(tl); }
-                    ExprKind::Array(al) => { this.read_array_lit(al); }
-                    ExprKind::Struct(sl) => { this.read_struct_lit(sl); }
-                    ExprKind::Ternary(t) => { this.read_ternary(t); }
-                    ExprKind::If(ie) => { this.read_if_expr(ie); }
-                    ExprKind::Lambda(lam) => { this.read_lambda(lam); }
-                    // Not walked by this pass.
-                    ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
-                    | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Literal(_)
-                    | ExprKind::Await(_) | ExprKind::ScopeResolution(_) => { }
+            ExprKind::Call(c) => { this.read_call(expr, c); }
+            ExprKind::Identifier(id) => { this.handle_ident(expr, id, false, false); }
+            ExprKind::MemberAccess(ma) => { this.read_member(ma); }
+            // Reduced to one live arm by the monomorphizer; walk it as
+            // a block.
+            ExprKind::Match(m) => { this.read_match(m); }
+            ExprKind::Cast(cv) => { this.read_cast(cv); }
+            ExprKind::Unary(u) => { this.read_unary(u); }
+            ExprKind::Binary(b) => { this.read_binary(b); }
+            ExprKind::ArrayAccess(aa) => { this.read_array_access(aa); }
+            ExprKind::StaticMatch(sme) => {
+                if (sme.arms.length > 0 && sme.arms[0] != null && sme.arms[0].body != null) {
+                    this.walk_stmt(sme.arms[0].body);
                 }
             }
-            _ => {}
+            // `expr?` is lowered to a `match` by sema; walk the
+            // desugar so the operand is move-checked like any other
+            // match.
+            ExprKind::Try(te) => {
+                if (te.desugared != null) { this.walk_expr_read(te.desugared); }
+            }
+            ExprKind::New(ne) => { this.read_new(ne); }
+            ExprKind::Tuple(tl) => { this.read_tuple_lit(tl); }
+            ExprKind::Array(al) => { this.read_array_lit(al); }
+            ExprKind::Struct(sl) => { this.read_struct_lit(sl); }
+            ExprKind::Ternary(t) => { this.read_ternary(t); }
+            ExprKind::If(ie) => { this.read_if_expr(ie); }
+            ExprKind::Lambda(lam) => { this.read_lambda(lam); }
+            // Not walked by this pass.
+            ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
+            | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Literal(_)
+            | ExprKind::Await(_) | ExprKind::ScopeResolution(_) => { }
         }
+    
     }
 
     /// A move-flagged lambda consumes each non-Copy captured outer binding

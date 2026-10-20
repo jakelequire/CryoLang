@@ -18,7 +18,7 @@ import compiler::lex::{ Token, TokenType };
 import compiler::lex::lexer;
 import compiler::lex::lexer::{ Lexer };
 import compiler::ast;
-import compiler::ast::{ declaration, ImportStyle, node, NodeKind };
+import compiler::ast::{ declaration, ImportStyle, node};
 import compiler::types;
 import compiler::types::{ arena, type_ref, TypeKind };
 import compiler::passes::{
@@ -610,8 +610,8 @@ type struct PassRegistry {
             namespace_name: root.namespace_name,
         };
 
-        LOG_DEBUG(LogComponent::Parser, "[Parsing] store: root=%p, root.kind=%d, stmts=%d",
-            root, root.kind as int, root.statements.length);
+        LOG_DEBUG(LogComponent::Parser, "[Parsing] store: root=%p, stmts=%d",
+            root, root.statements.length);
         LOG_DEBUG(LogComponent::Parser, "[Parsing] readback: ctx.artifacts.ast.root=%p",
             ctx.artifacts.ast.root);
 
@@ -687,26 +687,22 @@ type struct PassRegistry {
             mut def: DefId = DefId::invalid();
             mut leaf: SymbolStr = SymbolStr::empty();
             mut tspan: SourceSpan = SourceSpan::none();
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration => {
-                    const n: ClassDeclNode* = stmt as ClassDeclNode*;
-                    def = n.def; leaf = n.name; tspan = n.span;
+            if (stmt.is_class()) {
+                const n: ClassDeclNode* = stmt as ClassDeclNode*;
+                def = n.def; leaf = n.name; tspan = n.span;
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Struct(n)    => { def = n.def; leaf = n.name; tspan = stmt.span; }
+                    DeclKind::Enum(n)      => { def = n.def; leaf = n.name; tspan = stmt.span; }
+                    DeclKind::Trait(n)     => { def = n.def; leaf = n.name; tspan = stmt.span; }
+                    DeclKind::TypeAlias(n) => { def = n.def; leaf = n.alias_name; tspan = stmt.span; }
+                    DeclKind::Union(n)     => { def = n.def; leaf = n.name; tspan = stmt.span; }
+                    // No other kind with a payload declares a type.
+                    DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::Impl(_)
+                    | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                    | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+                    | DeclKind::Variable(_) | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Struct(n)    => { def = n.def; leaf = n.name; tspan = stmt.span; }
-                        DeclKind::Enum(n)      => { def = n.def; leaf = n.name; tspan = stmt.span; }
-                        DeclKind::Trait(n)     => { def = n.def; leaf = n.name; tspan = stmt.span; }
-                        DeclKind::TypeAlias(n) => { def = n.def; leaf = n.alias_name; tspan = stmt.span; }
-                        DeclKind::Union(n)     => { def = n.def; leaf = n.name; tspan = stmt.span; }
-                        // No other kind with a payload declares a type.
-                        DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::Impl(_)
-                        | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
-                        | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
-                        | DeclKind::Variable(_) | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
-                    }
-                }
-                _ => {}
             }
             if (!def.is_valid()) { continue; }
             const parent: DefId = ctx.defs.parent_of(def);
@@ -725,119 +721,113 @@ type struct PassRegistry {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
-            cdebug("[TypeDecl] stmt[%lld] kind=%d\n", i, stmt.kind as i32);
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration => {
-                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, ModulePath::none(), node.span.file);
-                    const class_ref: TypeRef =
-                        arena.create_class(qualified_sym, ctx.declaring_module(node.def));
-                    ctx.decl_index.register_type(node.def, class_ref, node.is_public);
-                    PassRegistry::claim_method_items(ctx, &node.methods);
-                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                    type_count++;
-                }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Struct(node) => {
-                            const _intern: InternTable* = ctx.get_intern_table();
-                            const _dbg: string = _intern.resolve(node.name);
-                            cdebug("[TypeDecl]   -> Struct '%s'\n", _dbg);
-                            const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, stmt.span.file);
-                            // The index learns the name here, with the arena: this
-                            // stage's guarantee is that every type name is known
-                            // before any signature resolves, and that has to hold
-                            // for both stores or a qualified annotation in a
-                            // signature finds the arena and misses the index.  The
-                            // NAME only - the per-module type list is not
-                            // idempotent and stays TypeResolution's to own.
-                            const struct_ref: TypeRef =
-                                arena.create_struct(qualified_sym, ctx.declaring_module(node.def));
-                            ctx.decl_index.register_type(node.def, struct_ref, node.is_public);
-                            PassRegistry::claim_method_items(ctx, &node.methods);
-                            // Whether this IS the language's `Array`, `Slice`, `Rc`,
-                            // ... is decided by the identity, claimed where it is
-                            // minted.
-                            ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                            type_count++;
-                        }
-                        DeclKind::Trait(node) => {
-                            const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, ModulePath::none(), stmt.span.file);
-                            const trait_ref: TypeRef =
-                                arena.create_trait(qualified_sym, ctx.declaring_module(node.def));
-                            // A trait carries no visibility modifier: public.
-                            ctx.decl_index.register_type(node.def, trait_ref, true);
-                            // Whether this IS the language's `Drop`/`Copy`/`Add`/... is
-                            // decided by the identity, and claimed here, where the identity
-                            // is first minted: an ownership query of a module resolved
-                            // before this trait's asks by the identity and must find it.
-                            ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                            for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
-                                if (node.methods[mi] != null) {
-                                    ctx.generic_registry.claim_wellknown(DeclarationNode::fn_of(node.methods[mi]).def, ctx.intern_table);
-                                }
-                            }
-                            type_count++;
-                        }
-                        DeclKind::Enum(node) => {
-                            const _intern2: InternTable* = ctx.get_intern_table();
-                            const _dbg2: string = _intern2.resolve(node.name);
-                            cdebug("[TypeDecl]   -> Enum '%s'\n", _dbg2);
-                            const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, stmt.span.file);
-                            const enum_ref: TypeRef =
-                                arena.create_enum(qualified_sym, ctx.declaring_module(node.def));
-                            ctx.decl_index.register_type(node.def, enum_ref, node.is_public);
-                            // Whether this IS the language's `Result`/`Option` - the enums
-                            // `?` desugars through - is decided by the identity, claimed
-                            // here where it is first minted, as a trait's is below.
-                            ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                            type_count++;
-                        }
-                        DeclKind::TypeAlias(node) => {
-                            const qualified_alias: SymbolStr = ctx.decl_type_key(node.alias_name, node.binding_namespace, stmt.span.file);
-                            // Use qualified name (consistent with struct/enum/class/trait);
-                            // target resolved in TypeResolution pass
-                            const alias_ref: TypeRef = arena.create_type_alias(qualified_alias, TypeRef::invalid());
-                            // Mark generic aliases so the arena dump can distinguish
-                            // "unresolved because generic template" from "unresolved because broken"
-                            if (node.is_generic()) {
-                                const alias_ty: Type* = arena.lookup(alias_ref);
-                                if (alias_ty != null && alias_ty.kind == TypeKind::TypeAlias) {
-                                    const alias_obj: TypeAliasType* = alias_ty.as_alias();
-                                    alias_obj.is_generic = true;
-                                }
-                            }
-                            // Register in DeclarationIndex so resolve_named() can find
-                            // aliases by qualified name during TypeResolution Phase 3
-                            // (before Phase 4 populates the index for other types).
-                            // An alias carries no visibility modifier: public.
-                            ctx.decl_index.register_type(node.def, alias_ref, true);
-                            type_count++;
-                        }
-                        DeclKind::Union(node) => {
-                            const _internu: InternTable* = ctx.get_intern_table();
-                            const _dbgu: string = _internu.resolve(node.name);
-                            cdebug("[TypeDecl]   -> Union '%s'\n", _dbgu);
-                            const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, stmt.span.file);
-                            const union_ref: TypeRef =
-                                arena.create_union(qualified_sym, ctx.declaring_module(node.def));
-                            ctx.decl_index.register_type(node.def, union_ref, node.is_public);
-                            PassRegistry::claim_method_items(ctx, &node.methods);
-                            type_count++;
-                        }
-                        // An impl block declares no type; its methods are items.
-                        DeclKind::Impl(node) => {
-                            PassRegistry::claim_method_items(ctx, &node.methods);
-                        }
-                        // No other kind with a payload declares a type.
-                        DeclKind::Import(_) | DeclKind::Intrinsic(_)
-                        | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
-                        | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
-                        | DeclKind::Variable(_) | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+            cdebug("[TypeDecl] stmt[%lld] kind=%s\n", i, stmt.kind_name());
+            if (stmt.is_class()) {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, ModulePath::none(), node.span.file);
+                const class_ref: TypeRef =
+                    arena.create_class(qualified_sym, ctx.declaring_module(node.def));
+                ctx.decl_index.register_type(node.def, class_ref, node.is_public);
+                PassRegistry::claim_method_items(ctx, &node.methods);
+                ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+                type_count++;
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Struct(node) => {
+                        const _intern: InternTable* = ctx.get_intern_table();
+                        const _dbg: string = _intern.resolve(node.name);
+                        cdebug("[TypeDecl]   -> Struct '%s'\n", _dbg);
+                        const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, stmt.span.file);
+                        // The index learns the name here, with the arena: this
+                        // stage's guarantee is that every type name is known
+                        // before any signature resolves, and that has to hold
+                        // for both stores or a qualified annotation in a
+                        // signature finds the arena and misses the index.  The
+                        // NAME only - the per-module type list is not
+                        // idempotent and stays TypeResolution's to own.
+                        const struct_ref: TypeRef =
+                            arena.create_struct(qualified_sym, ctx.declaring_module(node.def));
+                        ctx.decl_index.register_type(node.def, struct_ref, node.is_public);
+                        PassRegistry::claim_method_items(ctx, &node.methods);
+                        // Whether this IS the language's `Array`, `Slice`, `Rc`,
+                        // ... is decided by the identity, claimed where it is
+                        // minted.
+                        ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+                        type_count++;
                     }
-                }
-                _ => {
-                    // Functions, variables, imports, etc. don't create Type objects here
+                    DeclKind::Trait(node) => {
+                        const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, ModulePath::none(), stmt.span.file);
+                        const trait_ref: TypeRef =
+                            arena.create_trait(qualified_sym, ctx.declaring_module(node.def));
+                        // A trait carries no visibility modifier: public.
+                        ctx.decl_index.register_type(node.def, trait_ref, true);
+                        // Whether this IS the language's `Drop`/`Copy`/`Add`/... is
+                        // decided by the identity, and claimed here, where the identity
+                        // is first minted: an ownership query of a module resolved
+                        // before this trait's asks by the identity and must find it.
+                        ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+                        for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
+                            if (node.methods[mi] != null) {
+                                ctx.generic_registry.claim_wellknown(DeclarationNode::fn_of(node.methods[mi]).def, ctx.intern_table);
+                            }
+                        }
+                        type_count++;
+                    }
+                    DeclKind::Enum(node) => {
+                        const _intern2: InternTable* = ctx.get_intern_table();
+                        const _dbg2: string = _intern2.resolve(node.name);
+                        cdebug("[TypeDecl]   -> Enum '%s'\n", _dbg2);
+                        const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, stmt.span.file);
+                        const enum_ref: TypeRef =
+                            arena.create_enum(qualified_sym, ctx.declaring_module(node.def));
+                        ctx.decl_index.register_type(node.def, enum_ref, node.is_public);
+                        // Whether this IS the language's `Result`/`Option` - the enums
+                        // `?` desugars through - is decided by the identity, claimed
+                        // here where it is first minted, as a trait's is below.
+                        ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+                        type_count++;
+                    }
+                    DeclKind::TypeAlias(node) => {
+                        const qualified_alias: SymbolStr = ctx.decl_type_key(node.alias_name, node.binding_namespace, stmt.span.file);
+                        // Use qualified name (consistent with struct/enum/class/trait);
+                        // target resolved in TypeResolution pass
+                        const alias_ref: TypeRef = arena.create_type_alias(qualified_alias, TypeRef::invalid());
+                        // Mark generic aliases so the arena dump can distinguish
+                        // "unresolved because generic template" from "unresolved because broken"
+                        if (node.is_generic()) {
+                            const alias_ty: Type* = arena.lookup(alias_ref);
+                            if (alias_ty != null && alias_ty.kind == TypeKind::TypeAlias) {
+                                const alias_obj: TypeAliasType* = alias_ty.as_alias();
+                                alias_obj.is_generic = true;
+                            }
+                        }
+                        // Register in DeclarationIndex so resolve_named() can find
+                        // aliases by qualified name during TypeResolution Phase 3
+                        // (before Phase 4 populates the index for other types).
+                        // An alias carries no visibility modifier: public.
+                        ctx.decl_index.register_type(node.def, alias_ref, true);
+                        type_count++;
+                    }
+                    DeclKind::Union(node) => {
+                        const _internu: InternTable* = ctx.get_intern_table();
+                        const _dbgu: string = _internu.resolve(node.name);
+                        cdebug("[TypeDecl]   -> Union '%s'\n", _dbgu);
+                        const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, stmt.span.file);
+                        const union_ref: TypeRef =
+                            arena.create_union(qualified_sym, ctx.declaring_module(node.def));
+                        ctx.decl_index.register_type(node.def, union_ref, node.is_public);
+                        PassRegistry::claim_method_items(ctx, &node.methods);
+                        type_count++;
+                    }
+                    // An impl block declares no type; its methods are items.
+                    DeclKind::Impl(node) => {
+                        PassRegistry::claim_method_items(ctx, &node.methods);
+                    }
+                    // No other kind with a payload declares a type.
+                    DeclKind::Import(_) | DeclKind::Intrinsic(_)
+                    | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                    | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+                    | DeclKind::Variable(_) | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
             }
         }

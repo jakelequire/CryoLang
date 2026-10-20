@@ -36,7 +36,7 @@ import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast;
 import compiler::ast::{
     ArgBinding, ArrayAnnotation, cloner, declaration, expression, GenericAnnotation,
-    LiteralKind, MemberPin, NamedAnnotation, node, NodeKind, pattern, PatternBinding,
+    LiteralKind, MemberPin, NamedAnnotation, node, pattern, PatternBinding,
     PointerAnnotation, ProjectionAnnotation, ReferenceAnnotation, statement,
     TypeAnnotation, Visibility
 };
@@ -991,7 +991,7 @@ type struct AsyncLower {
     /// lambda is an expression this statement walk never enters).
     rewrite_returns(mut &this, stmt: Stmt*, poll_out: TypeRef, span: SourceSpan) -> void {
         if (stmt == null) { return; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Return(ret) => {
                 if (ret.expression != null) {
                     // The returned expression may itself hold a `match` expression
@@ -1277,7 +1277,7 @@ type struct AsyncLower {
     /// therefore rejected — Inc 2 lowers only a single straight-line await).
     stmt_await_count(&this, stmt: Stmt*) -> i64 {
         if (stmt == null) { return 0; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Expr(e)   => { return this.expr_await_count(e.expression); }
             StmtKind::Return(r) => { return this.expr_await_count(r.expression); }
             StmtKind::Decl(d)   => { return this.expr_await_count(this.decl_stmt_init(d)); }
@@ -1347,7 +1347,7 @@ type struct AsyncLower {
     stmt_toplevel_await(&this, stmt: Stmt*) -> ExpressionNode* {
         if (stmt == null) { return null; }
         mut e: ExpressionNode* = null;
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Decl(_) => {
                 const vd: VarDecl* = this.stmt_decl_var(stmt);
                 if (vd != null) { e = vd.initializer; }
@@ -1367,7 +1367,7 @@ type struct AsyncLower {
     /// resume, reading the result instead of the (removed) await.
     rewrite_carrier_await(&this, stmt: Stmt*, repl: ExpressionNode*) -> void {
         if (stmt == null) { return; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Decl(ds) => {
                 if (ds.declaration != null && DeclarationNode::var_of(ds.declaration) != null) {
                     (DeclarationNode::var_of(ds.declaration)).initializer = repl;
@@ -1584,7 +1584,7 @@ type struct AsyncLower {
     match_arm_int(&this, value: u64, body: Stmt*, span: SourceSpan) -> MatchArmNode* {
         const pat: Pattern* = Pattern::literal(
             this.intern.intern(fmt::format("%llu", value)), LiteralKind::Integer, span);
-        mut arm: MatchArmNode* = new MatchArmNode(span);
+        mut arm: MatchArmNode* = MatchArmNode::new(span);
         arm.add_pattern(pat);
         arm.set_body(body);
         return arm;
@@ -1594,7 +1594,7 @@ type struct AsyncLower {
     /// exhaustive over the open `u32` domain).
     match_arm_wild(&this, body: Stmt*, span: SourceSpan) -> MatchArmNode* {
         const pat: Pattern* = Pattern::wildcard(span);
-        mut arm: MatchArmNode* = new MatchArmNode(span);
+        mut arm: MatchArmNode* = MatchArmNode::new(span);
         arm.add_pattern(pat);
         arm.set_body(body);
         return arm;
@@ -1697,7 +1697,7 @@ type struct AsyncLower {
         const body_stmt: Stmt* = Stmt::block(span);
         const body: BlockStmt* = body_stmt.as_block();
         this.emit_shadow_prelude(d, node_decl, body, sm, false, span);
-        match (node.body.shape) {
+        match (node.body.kind) {
             StmtKind::Block(orig) => {
                 for (mut bi: i64 = 0; bi < orig.statements.length; bi++) {
                     this.rewrite_returns(orig.statements[bi], poll_out, span);
@@ -1818,7 +1818,7 @@ type struct AsyncLower {
     /// (await-free) control-flow containers a straight-line segment may hold.
     name_read_in_stmt(&this, s: Stmt*, key: SymbolID) -> boolean {
         if (s == null) { return false; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Expr(e)   => { return this.name_read_in_expr(e.expression, key); }
             StmtKind::Return(r) => { return this.name_read_in_expr(r.expression, key); }
             StmtKind::Decl(d)   => { return this.name_read_in_expr(this.decl_stmt_init(d), key); }
@@ -2188,7 +2188,7 @@ type struct AsyncLower {
     subst_nested_stmt(mut &this, s: Stmt*, key: SymbolID, field: SymbolStr,
                       struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> void {
         if (s == null) { return; }
-        const absorbs: boolean = match (s.shape) {
+        const absorbs: boolean = match (s.kind) {
             StmtKind::Block(_) => { true }
             _                  => { false }
         };
@@ -2253,7 +2253,7 @@ type struct AsyncLower {
     subst_name_stmt(mut &this, s: Stmt*, key: SymbolID, field: SymbolStr,
                     struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> void {
         if (s == null) { return; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Expr(es) => {
                 es.expression = this.subst_name_expr(es.expression, key, field, struct_ref, ty, span,
                                                      false);
@@ -2340,7 +2340,7 @@ type struct AsyncLower {
     /// The declaration `stmt_decl_var` answers the payload of, or null.
     stmt_var_decl(&this, s: Stmt*) -> DeclarationNode* {
         if (s == null) { return null; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Decl(ds) => {
                 if (ds.declaration == null || DeclarationNode::var_of(ds.declaration) == null) {
                     return null;
@@ -2565,7 +2565,7 @@ type struct AsyncLower {
     /// state `entry`; return its end state.
     lower_branch_sm(mut &this, sm: PollSm*, branch: Stmt*, entry: i64) -> i64 {
         if (branch == null) { return entry; }
-        match (branch.shape) {
+        match (branch.kind) {
             StmtKind::Block(_) => { return this.lower_block_sm(sm, branch, entry); }
             _                  => { return this.lower_stmt_sm(sm, branch, entry); }
         }
@@ -2582,7 +2582,7 @@ type struct AsyncLower {
     /// between statements, which is the only place it can fall.
     lower_stmt_sm(mut &this, sm: PollSm*, stmt: Stmt*, cur: i64) -> i64 {
         if (stmt == null) { return cur; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Break    => { return this.lower_break_sm(sm, cur, stmt.span); }
             StmtKind::Continue => { return this.lower_continue_sm(sm, cur, stmt.span); }
             _ => {}
@@ -2594,7 +2594,7 @@ type struct AsyncLower {
         }
         const aw: ExpressionNode* = this.stmt_toplevel_await(stmt);
         if (aw != null) { return this.lower_carrier_sm(sm, stmt, aw, cur); }
-        match (stmt.shape) {
+        match (stmt.kind) {
             // A bare `{ … await … }` block is just a nested statement sequence:
             // lower it into the current state chain (its locals already got their
             // own scope frame from the pre-flattening alpha-rename).
@@ -2883,7 +2883,7 @@ type struct AsyncLower {
         for (mut i: i64 = 0; i < fd_body.statements.length; i++) {
             const s: Stmt* = fd_body.statements[i];
             if (s == null) { continue; }
-            const ret: ReturnStmt* = match (s.shape) {
+            const ret: ReturnStmt* = match (s.kind) {
                 StmtKind::Return(r) => { r }
                 _                   => { null }
             };
@@ -3339,7 +3339,7 @@ type struct AsyncLower {
                 if (!this.stmt_diverges(arm.body)) { this.sm_goto(sm, end, join); }
             }
 
-            mut darm: MatchArmNode* = new MatchArmNode(span);
+            mut darm: MatchArmNode* = MatchArmNode::new(span);
             for (mut pi: i64 = 0; pi < arm.patterns.length; pi++) {
                 darm.add_pattern(arm.patterns[pi]);
             }
@@ -3359,7 +3359,7 @@ type struct AsyncLower {
             dispatch.add_arm(this.match_arm_wild(wblk, span));
         }
 
-        sm.blocks[at].as_block().add_statement(new Stmt(StmtKind::Match(dispatch), span));
+        sm.blocks[at].as_block().add_statement(Stmt::of(StmtKind::Match(dispatch), span));
         return join;
     }
 
@@ -3636,7 +3636,7 @@ type struct AsyncLower {
                 subj_read = this.ident_bound(subj_local.name, subj_local.sym, subject_type, span);
             }
             const test: MatchStmt* = MatchStmt::new(subj_read);
-            mut darm: MatchArmNode* = new MatchArmNode(span);
+            mut darm: MatchArmNode* = MatchArmNode::new(span);
             for (mut pi: i64 = 0; pi < arm.patterns.length; pi++) {
                 darm.add_pattern(arm.patterns[pi]);
             }
@@ -3660,7 +3660,7 @@ type struct AsyncLower {
                 test.add_arm(this.match_arm_wild(miss, span));
             }
 
-            sm.blocks[tests[ai]].as_block().add_statement(new Stmt(StmtKind::Match(test), span));
+            sm.blocks[tests[ai]].as_block().add_statement(Stmt::of(StmtKind::Match(test), span));
             // Hand the subject back for the next test. No test moves out of it
             // (an aggregate binding is rejected in chain mode), so the value put
             // back is the whole one that was taken. On a path that left the
@@ -3704,7 +3704,7 @@ type struct AsyncLower {
                          bs: BindingCapture*) -> void {
         if (pat == null) { return; }
         mut epat: EnumPattern* = null;
-        match (pat.shape) {
+        match (pat.kind) {
             PatternKind::Binding(b) => {
                 bs.push_unique(b.binding_sym, b.name, value_type);
                 return;
@@ -3904,7 +3904,7 @@ type struct AsyncLower {
     /// block-tail, a both-arm `if`, and an infinite `loop` (no `break`).
     stmt_diverges(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Return(_) => { return true; }
             StmtKind::Break | StmtKind::Continue => { return true; }
             StmtKind::Expr(e) => { return this.expr_diverges(e.expression); }
@@ -3965,7 +3965,7 @@ type struct AsyncLower {
     /// tail and must not be handed back. Only `return` leaves the block.
     stmt_returns(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Return(_) => { return true; }
             StmtKind::Block(blk) => {
                 if (blk.statements.length == 0) { return false; }
@@ -4021,7 +4021,7 @@ type struct AsyncLower {
     /// is infinite. Does NOT descend into nested loops (they capture their own).
     has_free_edge(&this, stmt: Stmt*, break_only: boolean) -> boolean {
         if (stmt == null) { return false; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Break    => { return true; }
             StmtKind::Continue => { return !break_only; }
             StmtKind::Block(blk) => {
@@ -4184,7 +4184,7 @@ type struct AsyncLower {
 
     stmt_first_use(&this, s: Stmt*, key: SymbolID) -> i64 {
         if (s == null) { return 0; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Decl(ds) => {
                 // The initializer runs before the binding exists, so a use of it
                 // there is a read.
@@ -4418,7 +4418,7 @@ type struct AsyncLower {
     /// normally, since it does reach the tail.
     mark_last_use_stmt(&this, s: Stmt*, key: SymbolID, out: i64*) -> void {
         if (s == null) { return; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Decl(d) => {
                 this.mark_last_use_expr(this.decl_stmt_init(d), key, true, out);
             }
@@ -4615,7 +4615,7 @@ type struct AsyncLower {
     mark_last_use_arm(&this, body: Stmt*, key: SymbolID,
                       by_value: boolean, out: i64*) -> void {
         if (body == null) { return; }
-        const blk: BlockStmt* = match (body.shape) {
+        const blk: BlockStmt* = match (body.kind) {
             StmtKind::Block(b) => { b }
             _                  => { null }
         };
@@ -4627,7 +4627,7 @@ type struct AsyncLower {
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             const s: Stmt* = blk.statements[i];
             const tail: ExprStmt* = if (i == last && s != null) {
-                match (s.shape) {
+                match (s.kind) {
                     StmtKind::Expr(e) => { e }
                     _                 => { null }
                 }
@@ -4689,7 +4689,7 @@ type struct AsyncLower {
     /// The `<lhs> = <rhs>` statement `s` is, or null for any other statement.
     top_level_assignment(&this, s: Stmt*) -> BinaryExpr* {
         if (s == null) { return null; }
-        const e: ExpressionNode* = match (s.shape) {
+        const e: ExpressionNode* = match (s.kind) {
             StmtKind::Expr(es) => { es.expression }
             _                  => { null }
         };
@@ -4889,7 +4889,7 @@ type struct AsyncLower {
                           opt_ty: TypeRef, name: SymbolStr, key: SymbolID, lty: TypeRef,
                           span: SourceSpan) -> void {
         if (s == null) { return; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Block(blk) => {
                 mut rebuilt: [Stmt*] = [];
                 for (mut i: i64 = 0; i < blk.statements.length; i++) {
@@ -4962,7 +4962,7 @@ type struct AsyncLower {
     /// The value `return` statement `s` returns; null for any other statement.
     returned_value(&this, s: Stmt*) -> ExpressionNode* {
         if (s == null) { return null; }
-        return match (s.shape) {
+        return match (s.kind) {
             StmtKind::Return(r) => { r.expression }
             _                   => { null }
         };
@@ -5045,7 +5045,7 @@ type struct AsyncLower {
     release_before_ready(mut &this, sm: PollSm*, s: Stmt*,
                          fields: &[SymbolStr], opts: &[TypeRef], span: SourceSpan) -> void {
         if (s == null) { return; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Block(blk) => {
                 mut rebuilt: [Stmt*] = [];
                 for (mut i: i64 = 0; i < blk.statements.length; i++) {
@@ -5359,7 +5359,7 @@ type struct AsyncLower {
     /// `match` expression arm.
     frame_addr_root_stmt(&this, sm: PollSm*, s: Stmt*) -> ExpressionNode* {
         if (s == null) { return null; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Expr(e)   => { return this.frame_addr_root_expr(sm, e.expression); }
             StmtKind::Return(r) => { return this.frame_addr_root_expr(sm, r.expression); }
             StmtKind::Decl(d)   => { return this.frame_addr_root_expr(sm, this.decl_stmt_init(d)); }
@@ -6147,7 +6147,7 @@ type struct AsyncLower {
             arm.body = this.hoist_branch(arm.body);
             ms.add_arm(arm);
         }
-        pre.push(new Stmt(StmtKind::Match(ms), span));
+        pre.push(Stmt::of(StmtKind::Match(ms), span));
         return this.ident_bound(tv.name, tv.sym, vty, span);
     }
 
@@ -6158,7 +6158,7 @@ type struct AsyncLower {
     arm_value_to_assign(mut &this, body: Stmt*, tv: MintedLocal,
                         vty: TypeRef) -> Stmt* {
         if (body == null) { return null; }
-        match (body.shape) {
+        match (body.kind) {
             StmtKind::Expr(es) => {
                 return this.assign_local_stmt(tv, vty, es.expression, body.span);
             }
@@ -6167,7 +6167,7 @@ type struct AsyncLower {
                 if (n == 0) { return body; }
                 const last: Stmt* = blk.statements[n - 1];
                 if (last == null) { return body; }
-                match (last.shape) {
+                match (last.kind) {
                     StmtKind::Expr(es) => {
                         blk.statements[n - 1] = this.assign_local_stmt(tv, vty, es.expression, last.span);
                     }
@@ -6205,7 +6205,7 @@ type struct AsyncLower {
     /// a block, so a statement that lifts anything has somewhere to put it.
     hoist_branch(mut &this, s: Stmt*) -> Stmt* {
         if (s == null) { return null; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Block(b) => {
                 this.hoist_block(b);
                 return s;
@@ -6229,7 +6229,7 @@ type struct AsyncLower {
         }
         mut pre: HoistPre = HoistPre { stmts: [] };
 
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Decl(ds) => {
                 this.set_decl_stmt_init(ds, this.hoist_toplevel(this.decl_stmt_init(ds), &pre));
             }
@@ -6319,7 +6319,7 @@ type struct AsyncLower {
     hoist_awaits(mut &this, node_decl: DeclarationNode*) -> void {
         const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node == null || node.body == null) { return; }
-        match (node.body.shape) {
+        match (node.body.kind) {
             StmtKind::Block(b) => { this.hoist_block(b); }
             _ => {}
         }
@@ -6389,7 +6389,7 @@ type struct AsyncLower {
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             const s: Stmt* = blk.statements[i];
             const ds: DeclStmt* = if (s == null) { null } else {
-                match (s.shape) {
+                match (s.kind) {
                     StmtKind::Decl(d) => { d }
                     _                 => { null }
                 }
@@ -6475,7 +6475,7 @@ type struct AsyncLower {
     collect_pat_binding_syms(&this, pat: Pattern*, binds: ArmBindings*) -> void {
         if (pat == null) { return; }
         mut epat: EnumPattern* = null;
-        match (pat.shape) {
+        match (pat.kind) {
             PatternKind::Binding(b) => {
                 if (!binds.holds(b.binding_sym)) {
                     binds.syms.push(b.binding_sym);
@@ -6506,7 +6506,7 @@ type struct AsyncLower {
     rn_pat_apply(&this, pat: Pattern*, map: RenameMap*) -> void {
         if (pat == null) { return; }
         mut epat: EnumPattern* = null;
-        match (pat.shape) {
+        match (pat.kind) {
             PatternKind::Binding(b) => {
                 const f: SymbolStr = map.fresh_of(b.binding_sym);
                 if (f.is_valid()) { b.name = f; }
@@ -6664,7 +6664,7 @@ type struct AsyncLower {
     /// (a loud "not found"), never a silent miscompile.
     rn_stmt(mut &this, map: RenameMap*, s: Stmt*) -> void {
         if (s == null) { return; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Expr(e)   => { this.rn_expr(map, e.expression); }
             StmtKind::Return(r) => { this.rn_expr(map, r.expression); }
             StmtKind::Decl(ds) => {
@@ -6726,7 +6726,7 @@ type struct AsyncLower {
         this.frame_locals = [];
         this.frame_local_src = [];
         if (node.body == null) { return; }
-        match (node.body.shape) {
+        match (node.body.kind) {
             StmtKind::Block(b) => {
                 mut map: RenameMap = RenameMap { syms: [], fresh: [] };
                 this.rn_block(&map, b);
@@ -6800,7 +6800,7 @@ type struct AsyncLower {
 
     rb_scoped(mut &this, ctx: RebindCtx*, s: Stmt*) -> void {
         if (s == null) { return; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Block(b) => { this.rb_block(ctx, b); }
             _ => {
                 this.rb_enter(ctx);
@@ -6813,7 +6813,7 @@ type struct AsyncLower {
     rb_pattern(mut &this, ctx: RebindCtx*, pat: Pattern*) -> void {
         if (pat == null) { return; }
         mut epat: EnumPattern* = null;
-        match (pat.shape) {
+        match (pat.kind) {
             PatternKind::Binding(b) => {
                 if (!b.binding_sym.is_valid()) { b.binding_sym = this.resolver.alloc_synthetic_binding(); }
                 this.rb_bind(ctx, b.binding_sym, b.binding_sym);
@@ -6970,7 +6970,7 @@ type struct AsyncLower {
 
     rb_stmt(mut &this, ctx: RebindCtx*, s: Stmt*) -> void {
         if (s == null) { return; }
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Expr(e)   => { this.rb_expr(ctx, e.expression); }
             StmtKind::Return(r) => { this.rb_expr(ctx, r.expression); }
             StmtKind::Decl(ds) => {
@@ -7116,7 +7116,7 @@ type struct AsyncLower {
         dispatch.add_arm(this.match_arm_wild(wblk, span));
 
         mut loop_body: Stmt* = Stmt::block(span);
-        loop_body.as_block().add_statement(new Stmt(StmtKind::Match(dispatch), span));
+        loop_body.as_block().add_statement(Stmt::of(StmtKind::Match(dispatch), span));
         body.as_block().add_statement(Stmt::loop_stmt(loop_body, span));
         return body;
     }
@@ -7836,7 +7836,7 @@ type struct AsyncLower {
             const p: VarDecl* = DeclarationNode::var_of(node.parameters[i]);
             if (this.is_receiver_param(p)) { recv_key = p.sym_id; }
         }
-        const body_is_block: boolean = match (node.body.shape) {
+        const body_is_block: boolean = match (node.body.kind) {
             StmtKind::Block(_) => { true }
             _                  => { false }
         };
@@ -7856,7 +7856,7 @@ type struct AsyncLower {
         // recursive builder emits `loop { match (this.state) {…} }`, recording one
         // `fut_k: Option<F_k>` sub-future per await and one field per promoted
         // cross-state scalar local into `sm`.
-        const total_await: i64 = match (node.body.shape) {
+        const total_await: i64 = match (node.body.kind) {
             StmtKind::Block(_) => { this.stmt_await_count(node.body) }
             _                  => { 0 }
         };

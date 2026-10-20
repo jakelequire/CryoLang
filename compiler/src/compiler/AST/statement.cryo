@@ -7,11 +7,11 @@ namespace compiler::ast::statement;
 
 import compiler::diag;
 import compiler::ast;
-import compiler::ast::{ NodeKind, TypeAnnotation };
+import compiler::ast::{ TypeAnnotation };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::ast::node;
-import compiler::ast::node::{ ASTNode, Node };
+import compiler::ast::node::{ Node };
 import compiler::ast::expression;
 import compiler::ast::expression::{ ExpressionNode };
 import compiler::ast::declaration;
@@ -21,86 +21,87 @@ import compiler::ast::pattern::{ DirectiveNode, MatchArmNode, StaticMatchArmNode
 import compiler::ast::walk::{ Walk };
 import compiler::codegen::ast_arena::{ cryo_ast_arena_alloc };
 
-/// Every statement: the node header, and which kind of statement it is.
-///
-/// The header is still an `ASTNode`, so a statement travels wherever any
-/// node does (a program's items, a `for`'s initializer, the editor's node at
-/// a position) until those handles are a `Node`; its kind is `shape` because
-/// `kind` is the header's `NodeKind`.
-type class Stmt : ASTNode {
-public:
-    shape: StmtKind;
+/// Every statement: what all kinds share, and which kind of statement it is.
+type struct Stmt {
+    span:      SourceSpan;
+    has_error: boolean;
+    /// The compiler wrote this node where the source spells nothing, and
+    /// gave it the span of the source it stands for; a reader asking what is
+    /// written at a position (the editor) looks through it.
+    generated: boolean;
+    kind:      StmtKind;
 
-    Stmt(shape: StmtKind, span: SourceSpan) : ASTNode(NodeKind::Statement, span) {
-        this.shape = shape;
+    /// A statement of `kind` at `span`.
+    static of(kind: StmtKind, span: SourceSpan) -> Stmt* {
+        return new Stmt { span: span, has_error: false, generated: false, kind: kind };
     }
 
     /// `{ }`, with no statements yet.
     static block(span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::Block(BlockStmt::new()), span);
+        return Stmt::of(StmtKind::Block(BlockStmt::new()), span);
     }
 
     /// `unsafe` over `block`, which is a block statement.
     static unsafe_block(block: Stmt*, span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::UnsafeBlock(new UnsafeBlockStmt { block: block }), span);
+        return Stmt::of(StmtKind::UnsafeBlock(new UnsafeBlockStmt { block: block }), span);
     }
 
     /// `return expression;`, or a bare `return;` when `expression` is null.
     static return_stmt(expression: ExpressionNode*, span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::Return(new ReturnStmt { expression: expression, synth_drops: [] }), span);
+        return Stmt::of(StmtKind::Return(new ReturnStmt { expression: expression, synth_drops: [] }), span);
     }
 
     /// `if (condition) then_stmt else else_stmt`; `else_stmt` may be null.
     static if_stmt(condition: ExpressionNode*, then_stmt: Stmt*, else_stmt: Stmt*,
                    span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::If(new IfStmt {
+        return Stmt::of(StmtKind::If(new IfStmt {
             condition: condition, then_stmt: then_stmt, else_stmt: else_stmt,
         }), span);
     }
 
     static while_stmt(condition: ExpressionNode*, body: Stmt*, span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::While(new WhileStmt { condition: condition, body: body }), span);
+        return Stmt::of(StmtKind::While(new WhileStmt { condition: condition, body: body }), span);
     }
 
     static do_while_stmt(body: Stmt*, condition: ExpressionNode*, span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::DoWhile(new DoWhileStmt { body: body, condition: condition }), span);
+        return Stmt::of(StmtKind::DoWhile(new DoWhileStmt { body: body, condition: condition }), span);
     }
 
     /// `for (init; condition; update) body`; each of the first three may be
     /// absent.
     static for_stmt(init: Node, condition: ExpressionNode*, update: ExpressionNode*,
                     body: Stmt*, span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::For(new ForStmt {
+        return Stmt::of(StmtKind::For(new ForStmt {
             init: init, condition: condition, update: update, body: body,
         }), span);
     }
 
     static break_stmt(span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::Break, span);
+        return Stmt::of(StmtKind::Break, span);
     }
 
     static continue_stmt(span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::Continue, span);
+        return Stmt::of(StmtKind::Continue, span);
     }
 
     static expr_stmt(expression: ExpressionNode*, span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::Expr(new ExprStmt { expression: expression }), span);
+        return Stmt::of(StmtKind::Expr(new ExprStmt { expression: expression }), span);
     }
 
     static decl_stmt(declaration: DeclarationNode*, span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::Decl(new DeclStmt { declaration: declaration }), span);
+        return Stmt::of(StmtKind::Decl(new DeclStmt { declaration: declaration }), span);
     }
 
     /// `loop body`.
     static loop_stmt(body: Stmt*, span: SourceSpan) -> Stmt* {
-        return new Stmt(StmtKind::Loop(new LoopStmt { body: body }), span);
+        return Stmt::of(StmtKind::Loop(new LoopStmt { body: body }), span);
     }
 
     /// The block this statement is.  For a statement whose kind is fixed by
     /// where it stands - a function's body, the block under `unsafe` - so
     /// any other kind here is a compiler defect.
     as_block(&this) -> BlockStmt* {
-        match (this.shape) {
+        match (this.kind) {
             StmtKind::Block(b) => { return b; }
             _ => { unreachable(); }
         }
@@ -114,7 +115,7 @@ public:
     /// out.  Mirrors `DeclarationNode::outer_span`.
     outer_span(&this) -> SourceSpan {
         mut out: SourceSpan = this.span;
-        match (this.shape) {
+        match (this.kind) {
             StmtKind::Block(b) => {
                 for (mut i: i64 = 0; i < b.attached_directives.length; i++) {
                     const d: DirectiveNode* = b.attached_directives[i];
@@ -126,6 +127,14 @@ public:
             _ => {}
         }
         return out;
+    }
+}
+
+/// `new` of a node takes its storage from the AST arena; `delete` of one
+/// releases nothing, since the arena is reclaimed whole.
+implement trait Allocate for struct Stmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

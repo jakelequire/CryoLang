@@ -18,7 +18,7 @@ namespace compiler::mono::call_specializer;
 
 import compiler::ast;
 import compiler::ast::{
-    ArgBinding, declaration, expression, MemberPin, node, NodeKind, pattern, statement, TraitBound,
+    ArgBinding, declaration, expression, MemberPin, node, pattern, statement, TraitBound,
     TraitRef, TypeAnnotation
 };
 import compiler::types::{
@@ -168,45 +168,41 @@ type struct MonoCallSpecializer {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
-            match (stmt.kind) {
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Function(func) => {
-                            const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
-                            if (func.is_generic()) { continue; }
-                            this.walk_func_body(func_decl, &res_ctx);
-                        }
-                        DeclKind::Struct(sn) => {
-                            if (sn.is_generic()) { continue; }
-                            this.walk_methods(sn.methods, &res_ctx);
-                        }
-                        DeclKind::Impl(ib) => {
-                            if (ib.generic_params.length > 0) { continue; }
-                            this.walk_methods(ib.methods, &res_ctx);
-                        }
-                        DeclKind::Union(un) => {
-                            if (un.is_generic()) { continue; }
-                            this.walk_methods(un.methods, &res_ctx);
-                        }
-                        DeclKind::Variable(vd) => {
-                            // A module's global: its initializer is code like a
-                            // body's, computed at program start when no fold
-                            // answers it, so its calls and values are specialized
-                            // as a body's are.
-                            if (vd.initializer != null) { this.walk_expr(vd.initializer, &res_ctx, null); }
-                        }
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+            if (stmt.is_class()) {
+                const cn: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (cn.is_generic()) { continue; }
+                this.walk_methods(cn.methods, &res_ctx);
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Function(func) => {
+                        const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                        if (func.is_generic()) { continue; }
+                        this.walk_func_body(func_decl, &res_ctx);
                     }
+                    DeclKind::Struct(sn) => {
+                        if (sn.is_generic()) { continue; }
+                        this.walk_methods(sn.methods, &res_ctx);
+                    }
+                    DeclKind::Impl(ib) => {
+                        if (ib.generic_params.length > 0) { continue; }
+                        this.walk_methods(ib.methods, &res_ctx);
+                    }
+                    DeclKind::Union(un) => {
+                        if (un.is_generic()) { continue; }
+                        this.walk_methods(un.methods, &res_ctx);
+                    }
+                    DeclKind::Variable(vd) => {
+                        // A module's global: its initializer is code like a
+                        // body's, computed at program start when no fold
+                        // answers it, so its calls and values are specialized
+                        // as a body's are.
+                        if (vd.initializer != null) { this.walk_expr(vd.initializer, &res_ctx, null); }
+                    }
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                    | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
-                NodeKind::ClassDeclaration => {
-                    const cn: ClassDeclNode* = stmt as ClassDeclNode*;
-                    if (cn.is_generic()) { continue; }
-                    this.walk_methods(cn.methods, &res_ctx);
-                }
-                _ => {}
             }
         }
     }
@@ -266,27 +262,23 @@ type struct MonoCallSpecializer {
                                   subst: TypeSubstitution*) -> void {
         if (decl == null) { return; }
         mut res_ctx: ResolutionContext = ResolutionContext::new("");
-        match (decl.kind) {
-            NodeKind::Declaration => {
-                match ((decl as DeclarationNode*).shape) {
-                    DeclKind::Function(_) => {
-                        const f_decl: DeclarationNode* = DeclarationNode::with_shape(decl);
-                        this.walk_body(f_decl, &res_ctx, subst);
-                    }
-                    DeclKind::Struct(sn) => { this.walk_spec_methods(sn.methods, &res_ctx, subst); }
-                    DeclKind::Impl(ib) => { this.walk_spec_methods(ib.methods, &res_ctx, subst); }
-                    DeclKind::Union(un) => { this.walk_spec_methods(un.methods, &res_ctx, subst); }
-                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
-                    | DeclKind::Method(_) | DeclKind::Legacy => {}
+        if (decl.is_class()) {
+            this.walk_spec_methods((decl as ClassDeclNode*).methods, &res_ctx, subst);
+        } else {
+            match ((decl as DeclarationNode*).shape) {
+                DeclKind::Function(_) => {
+                    const f_decl: DeclarationNode* = DeclarationNode::with_shape(decl);
+                    this.walk_body(f_decl, &res_ctx, subst);
                 }
+                DeclKind::Struct(sn) => { this.walk_spec_methods(sn.methods, &res_ctx, subst); }
+                DeclKind::Impl(ib) => { this.walk_spec_methods(ib.methods, &res_ctx, subst); }
+                DeclKind::Union(un) => { this.walk_spec_methods(un.methods, &res_ctx, subst); }
+                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
+                | DeclKind::Method(_) | DeclKind::Legacy => {}
             }
-            NodeKind::ClassDeclaration => {
-                this.walk_spec_methods((decl as ClassDeclNode*).methods, &res_ctx, subst);
-            }
-            _ => {}
         }
     }
 
@@ -308,7 +300,7 @@ type struct MonoCallSpecializer {
     walk_stmt(mut &this, stmt: Stmt*, res_ctx: ResolutionContext*,
               subst: TypeSubstitution*) -> void {
         if (stmt == null) { return; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Expr(es) => {
                 this.walk_expr(es.expression, res_ctx, subst);
             }
@@ -408,150 +400,145 @@ type struct MonoCallSpecializer {
     walk_expr(mut &this, expr: ExpressionNode*, res_ctx: ResolutionContext*,
               subst: TypeSubstitution*) -> void {
         if (expr == null) { return; }
-        const node: ExpressionNode* = expr;
-        match (node.kind) {
-            NodeKind::Expression => {
-                match (expr.shape) {
-                    ExprKind::Call(call) => {
-                        for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                            this.walk_expr(call.arguments[i], res_ctx, subst);
-                        }
-                        if (call.callee != null) {
-                            this.walk_expr(call.callee, res_ctx, subst);
-                        }
-                        this.specialize_free_call(expr, call, res_ctx, subst);
-                        this.specialize_method_call(call, subst);
-                        this.bind_call_arguments(call);
-                        if (!call.resolved_callee.is_some()) {
-                            this.unpinned_calls.push(UnpinnedCall { call: expr, func: this.current_fn });
-                        }
-                    }
-                    ExprKind::MemberAccess(ma) => { this.walk_expr(ma.object, res_ctx, subst); }
-                    ExprKind::ScopeResolution(sr) => {
-                        this.specialize_path_fn_value(sr, subst);
-                        this.bind_path_value(expr, sr, subst);
-                    }
-                    // A bare identifier carrying turbofish args is a generic
-                    // function-reference VALUE (`tramp<i32>` passed/cast/assigned).
-                    ExprKind::Identifier(id) => { this.specialize_fn_value_ref(id, subst); }
-                    ExprKind::Ternary(te) => {
-                        this.walk_expr(te.condition, res_ctx, subst);
-                        this.walk_expr(te.true_expr, res_ctx, subst);
-                        this.walk_expr(te.false_expr, res_ctx, subst);
-                    }
-                    ExprKind::Cast(ce) => { this.walk_expr(ce.expression, res_ctx, subst); }
-                    ExprKind::ArrayAccess(aa) => {
-                        this.walk_expr(aa.array, res_ctx, subst);
-                        this.walk_expr(aa.index, res_ctx, subst);
-                        // An index-operator-overload desugar (`*(a.index(i))`)
-                        // is a method call that may need specialization (e.g.
-                        // `Vec<i32>::index`); walk it so nested/generic
-                        // instantiations are discovered.
-                        if (aa.desugared_call != null) {
-                            this.walk_expr(aa.desugared_call, res_ctx, subst);
-                        }
-                    }
-                    ExprKind::Binary(be) => {
-                        this.walk_expr(be.left, res_ctx, subst);
-                        this.walk_expr(be.right, res_ctx, subst);
-                        if (be.desugar_by_bound && be.desugared_call != null
-                                && this.operand_takes_primitive_operator(be.left, subst, true)) {
-                            be.desugared_call = null;
-                        }
-                        // An operator-overload desugar (`a.add(&b)`) is a method
-                        // call that may need specialization (e.g. `Vec<i32>::add`);
-                        // walk it so nested/generic instantiations are discovered.
-                        if (be.desugared_call != null) {
-                            this.walk_expr(be.desugared_call, res_ctx, subst);
-                        }
-                    }
-                    ExprKind::Unary(ue) => {
-                        this.walk_expr(ue.operand, res_ctx, subst);
-                        if (ue.desugar_by_bound && ue.desugared_call != null
-                                && this.operand_takes_primitive_operator(ue.operand, subst, false)) {
-                            ue.desugared_call = null;
-                        }
-                        if (ue.desugared_call != null) {
-                            this.walk_expr(ue.desugared_call, res_ctx, subst);
-                        }
-                    }
-                    ExprKind::Match(me) => {
-                        this.walk_expr(me.subject, res_ctx, subst);
-                        for (mut i: i64 = 0; i < me.arms.length; i++) {
-                            const arm: MatchArmNode* = me.arms[i];
-                            if (arm == null) { continue; }
-                            if (arm.guard != null) { this.walk_expr(arm.guard, res_ctx, subst); }
-                            if (arm.body != null) { this.walk_stmt(arm.body, res_ctx, subst); }
-                        }
-                    }
-                    ExprKind::StaticMatch(sme) => {
-                        for (mut i: i64 = 0; i < sme.arms.length; i++) {
-                            const arm: StaticMatchArmNode* = sme.arms[i];
-                            if (arm != null && arm.body != null) {
-                                this.walk_stmt(arm.body, res_ctx, subst);
-                            }
-                        }
-                    }
-                    ExprKind::If(ie) => {
-                        this.walk_expr(ie.condition, res_ctx, subst);
-                        this.walk_expr(ie.then_expr, res_ctx, subst);
-                        this.walk_expr(ie.else_expr, res_ctx, subst);
-                    }
-                    ExprKind::Delete(d) => { this.walk_expr(d.operand, res_ctx, subst); }
-                    ExprKind::Struct(sl) => {
-                        for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-                            this.walk_expr(sl.field_inits[i].value, res_ctx, subst);
-                        }
-                    }
-                    ExprKind::Array(al) => {
-                        for (mut i: i64 = 0; i < al.elements.length; i++) {
-                            this.walk_expr(al.elements[i], res_ctx, subst);
-                        }
-                    }
-                    ExprKind::Tuple(tl) => {
-                        for (mut i: i64 = 0; i < tl.elements.length; i++) {
-                            this.walk_expr(tl.elements[i], res_ctx, subst);
-                        }
-                    }
-                    ExprKind::New(ne) => {
-                        for (mut i: i64 = 0; i < ne.arguments.length; i++) {
-                            this.walk_expr(ne.arguments[i], res_ctx, subst);
-                        }
-                        if (ne.array_size != null) { this.walk_expr(ne.array_size, res_ctx, subst); }
-                        if (ne.struct_init != null) {
-                            this.walk_expr(ne.struct_init, res_ctx, subst);
-                        }
-                    }
-                    // The desugared `match` is what is emitted - its subject
-                    // is the operand, and its error arm builds the early return.
-                    ExprKind::Try(te) => {
-                        if (te.desugared != null) {
-                            this.walk_expr(te.desugared, res_ctx, subst);
-                        } else {
-                            this.walk_expr(te.operand, res_ctx, subst);
-                        }
-                    }
-                    // Not walked: a type operand, a literal, and the operands
-                    // of `typeof` and `yield`, which hold no call this pass binds.
-                    ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
-                    | ExprKind::Yield(_) | ExprKind::Literal(_) => { }
-                    // Not walked here either: this walk does not enter an
-                    // `await`'s operand.
-                    ExprKind::Await(_) => { }
-                    ExprKind::Lambda(le) => {
-                        // A non-capturing lambda compiles to a function of its
-                        // own body, which nothing else walks.  A capturing one's
-                        // body is its closure struct's `__call__`, walked as
-                        // that struct's method; walking it here as well would
-                        // bind it twice.
-                        if (!le.is_capturing() && le.body != null) {
-                            this.walk_stmt(le.body, res_ctx, subst);
-                        }
+        match (expr.kind) {
+            ExprKind::Call(call) => {
+                for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                    this.walk_expr(call.arguments[i], res_ctx, subst);
+                }
+                if (call.callee != null) {
+                    this.walk_expr(call.callee, res_ctx, subst);
+                }
+                this.specialize_free_call(expr, call, res_ctx, subst);
+                this.specialize_method_call(call, subst);
+                this.bind_call_arguments(call);
+                if (!call.resolved_callee.is_some()) {
+                    this.unpinned_calls.push(UnpinnedCall { call: expr, func: this.current_fn });
+                }
+            }
+            ExprKind::MemberAccess(ma) => { this.walk_expr(ma.object, res_ctx, subst); }
+            ExprKind::ScopeResolution(sr) => {
+                this.specialize_path_fn_value(sr, subst);
+                this.bind_path_value(expr, sr, subst);
+            }
+            // A bare identifier carrying turbofish args is a generic
+            // function-reference VALUE (`tramp<i32>` passed/cast/assigned).
+            ExprKind::Identifier(id) => { this.specialize_fn_value_ref(id, subst); }
+            ExprKind::Ternary(te) => {
+                this.walk_expr(te.condition, res_ctx, subst);
+                this.walk_expr(te.true_expr, res_ctx, subst);
+                this.walk_expr(te.false_expr, res_ctx, subst);
+            }
+            ExprKind::Cast(ce) => { this.walk_expr(ce.expression, res_ctx, subst); }
+            ExprKind::ArrayAccess(aa) => {
+                this.walk_expr(aa.array, res_ctx, subst);
+                this.walk_expr(aa.index, res_ctx, subst);
+                // An index-operator-overload desugar (`*(a.index(i))`)
+                // is a method call that may need specialization (e.g.
+                // `Vec<i32>::index`); walk it so nested/generic
+                // instantiations are discovered.
+                if (aa.desugared_call != null) {
+                    this.walk_expr(aa.desugared_call, res_ctx, subst);
+                }
+            }
+            ExprKind::Binary(be) => {
+                this.walk_expr(be.left, res_ctx, subst);
+                this.walk_expr(be.right, res_ctx, subst);
+                if (be.desugar_by_bound && be.desugared_call != null
+                        && this.operand_takes_primitive_operator(be.left, subst, true)) {
+                    be.desugared_call = null;
+                }
+                // An operator-overload desugar (`a.add(&b)`) is a method
+                // call that may need specialization (e.g. `Vec<i32>::add`);
+                // walk it so nested/generic instantiations are discovered.
+                if (be.desugared_call != null) {
+                    this.walk_expr(be.desugared_call, res_ctx, subst);
+                }
+            }
+            ExprKind::Unary(ue) => {
+                this.walk_expr(ue.operand, res_ctx, subst);
+                if (ue.desugar_by_bound && ue.desugared_call != null
+                        && this.operand_takes_primitive_operator(ue.operand, subst, false)) {
+                    ue.desugared_call = null;
+                }
+                if (ue.desugared_call != null) {
+                    this.walk_expr(ue.desugared_call, res_ctx, subst);
+                }
+            }
+            ExprKind::Match(me) => {
+                this.walk_expr(me.subject, res_ctx, subst);
+                for (mut i: i64 = 0; i < me.arms.length; i++) {
+                    const arm: MatchArmNode* = me.arms[i];
+                    if (arm == null) { continue; }
+                    if (arm.guard != null) { this.walk_expr(arm.guard, res_ctx, subst); }
+                    if (arm.body != null) { this.walk_stmt(arm.body, res_ctx, subst); }
+                }
+            }
+            ExprKind::StaticMatch(sme) => {
+                for (mut i: i64 = 0; i < sme.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sme.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.walk_stmt(arm.body, res_ctx, subst);
                     }
                 }
             }
-            _ => {}
+            ExprKind::If(ie) => {
+                this.walk_expr(ie.condition, res_ctx, subst);
+                this.walk_expr(ie.then_expr, res_ctx, subst);
+                this.walk_expr(ie.else_expr, res_ctx, subst);
+            }
+            ExprKind::Delete(d) => { this.walk_expr(d.operand, res_ctx, subst); }
+            ExprKind::Struct(sl) => {
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                    this.walk_expr(sl.field_inits[i].value, res_ctx, subst);
+                }
+            }
+            ExprKind::Array(al) => {
+                for (mut i: i64 = 0; i < al.elements.length; i++) {
+                    this.walk_expr(al.elements[i], res_ctx, subst);
+                }
+            }
+            ExprKind::Tuple(tl) => {
+                for (mut i: i64 = 0; i < tl.elements.length; i++) {
+                    this.walk_expr(tl.elements[i], res_ctx, subst);
+                }
+            }
+            ExprKind::New(ne) => {
+                for (mut i: i64 = 0; i < ne.arguments.length; i++) {
+                    this.walk_expr(ne.arguments[i], res_ctx, subst);
+                }
+                if (ne.array_size != null) { this.walk_expr(ne.array_size, res_ctx, subst); }
+                if (ne.struct_init != null) {
+                    this.walk_expr(ne.struct_init, res_ctx, subst);
+                }
+            }
+            // The desugared `match` is what is emitted - its subject
+            // is the operand, and its error arm builds the early return.
+            ExprKind::Try(te) => {
+                if (te.desugared != null) {
+                    this.walk_expr(te.desugared, res_ctx, subst);
+                } else {
+                    this.walk_expr(te.operand, res_ctx, subst);
+                }
+            }
+            // Not walked: a type operand, a literal, and the operands
+            // of `typeof` and `yield`, which hold no call this pass binds.
+            ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
+            | ExprKind::Yield(_) | ExprKind::Literal(_) => { }
+            // Not walked here either: this walk does not enter an
+            // `await`'s operand.
+            ExprKind::Await(_) => { }
+            ExprKind::Lambda(le) => {
+                // A non-capturing lambda compiles to a function of its
+                // own body, which nothing else walks.  A capturing one's
+                // body is its closure struct's `__call__`, walked as
+                // that struct's method; walking it here as well would
+                // bind it twice.
+                if (!le.is_capturing() && le.body != null) {
+                    this.walk_stmt(le.body, res_ctx, subst);
+                }
+            }
         }
+    
     }
 
 
@@ -1099,7 +1086,7 @@ type struct MonoCallSpecializer {
                 (DeclarationNode::struct_of(target_ast)).methods.push(spec_method_decl);
             } else if (DeclarationNode::union_of(target_ast) != null) {
                 (DeclarationNode::union_of(target_ast)).methods.push(spec_method_decl);
-            } else if (target_ast.kind == NodeKind::ClassDeclaration) {
+            } else if (target_ast.is_class()) {
                 (target_ast as ClassDeclNode*).methods.push(spec_method_decl);
             }
         } else {
@@ -2004,7 +1991,7 @@ type struct MonoCallSpecializer {
             owner_params = &(DeclarationNode::struct_of(tmpl.ast_node)).generic_params;
         } else if (DeclarationNode::union_of(tmpl.ast_node) != null) {
             owner_params = &(DeclarationNode::union_of(tmpl.ast_node)).generic_params;
-        } else if (tmpl.ast_node.kind == NodeKind::ClassDeclaration) {
+        } else if (tmpl.ast_node.is_class()) {
             owner_params = &(tmpl.ast_node as ClassDeclNode*).generic_params;
         } else {
             return;
@@ -2040,7 +2027,7 @@ type struct MonoCallSpecializer {
         mut params: &[DeclarationNode*] = &empty_gp;
         if (DeclarationNode::struct_of(tmpl.ast_node) != null) {
             params = &(DeclarationNode::struct_of(tmpl.ast_node)).generic_params;
-        } else if (tmpl.ast_node.kind == NodeKind::ClassDeclaration) {
+        } else if (tmpl.ast_node.is_class()) {
             params = &(tmpl.ast_node as ClassDeclNode*).generic_params;
         } else {
             return recv_type;

@@ -45,7 +45,7 @@ import compiler::diag::{
     diagnostic, edit_distance, ErrorCode, snapshot, source_span, suggestion
 };
 import compiler::ast;
-import compiler::ast::{ declaration, node, NodeKind, pattern };
+import compiler::ast::{ declaration, node, pattern };
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context;
@@ -1153,7 +1153,7 @@ type struct DirectiveProcessingPasses {
                         if (s == null) {
                             all_asm = false;
                         } else {
-                            match (s.shape) {
+                            match (s.kind) {
                                 StmtKind::Asm(_) => {}
                                 _ => { all_asm = false; }
                             }
@@ -1223,7 +1223,7 @@ type struct DirectiveProcessingPasses {
             DirectiveProcessingPasses::apply_layout_effects_union(ctx, dir, ud, dir.directive_kind);
             return;
         }
-        if (decl.kind == NodeKind::ClassDeclaration) {
+        if (decl.is_class()) {
             const cd: ClassDeclNode* = decl as ClassDeclNode*;
             DirectiveProcessingPasses::apply_layout_effects_class(ctx, dir, cd, dir.directive_kind);
             return;
@@ -1545,7 +1545,7 @@ type struct DirectiveProcessingPasses {
             } else if (DeclarationNode::union_of(decl) != null) {
                 const un: UnionDecl* = DeclarationNode::union_of(decl);
                 method_list = &un.methods;
-            } else if (decl.kind == NodeKind::ClassDeclaration) {
+            } else if (decl.is_class()) {
                 const cn: ClassDeclNode* = decl as ClassDeclNode*;
                 method_list = &cn.methods;
             } else if (DeclarationNode::impl_of(decl) != null) {
@@ -1590,7 +1590,7 @@ type struct DirectiveProcessingPasses {
                 field_list = &(DeclarationNode::struct_of(decl)).fields;
             } else if (DeclarationNode::union_of(decl) != null) {
                 field_list = &(DeclarationNode::union_of(decl)).fields;
-            } else if (decl.kind == NodeKind::ClassDeclaration) {
+            } else if (decl.is_class()) {
                 field_list = &(decl as ClassDeclNode*).fields;
             }
             for (mut fi: i64 = 0; fi < field_list.length; fi++) {
@@ -1686,32 +1686,28 @@ type struct DirectiveProcessingPasses {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration => {
-                    const cd: ClassDeclNode* = stmt as ClassDeclNode*;
-                    DirectiveProcessingPasses::register_converter_methods(ctx, &cd.methods);
-                }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Function(_) => {
-                            DirectiveProcessingPasses::register_converter_fn(ctx, DeclarationNode::with_shape(stmt));
-                        }
-                        DeclKind::Struct(sd) => {
-                            DirectiveProcessingPasses::register_converter_methods(ctx, &sd.methods);
-                        }
-                        DeclKind::Impl(ib) => {
-                            DirectiveProcessingPasses::register_converter_methods(ctx, &ib.methods);
-                        }
-                        DeclKind::Union(ud) => {
-                            DirectiveProcessingPasses::register_converter_methods(ctx, &ud.methods);
-                        }
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+            if (stmt.is_class()) {
+                const cd: ClassDeclNode* = stmt as ClassDeclNode*;
+                DirectiveProcessingPasses::register_converter_methods(ctx, &cd.methods);
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Function(_) => {
+                        DirectiveProcessingPasses::register_converter_fn(ctx, DeclarationNode::with_shape(stmt));
                     }
+                    DeclKind::Struct(sd) => {
+                        DirectiveProcessingPasses::register_converter_methods(ctx, &sd.methods);
+                    }
+                    DeclKind::Impl(ib) => {
+                        DirectiveProcessingPasses::register_converter_methods(ctx, &ib.methods);
+                    }
+                    DeclKind::Union(ud) => {
+                        DirectiveProcessingPasses::register_converter_methods(ctx, &ud.methods);
+                    }
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
-                _ => {}
             }
         }
     }
@@ -1766,81 +1762,77 @@ type struct DirectiveProcessingPasses {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration => {
-                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    if (node.is_generic()) { continue; }
-                    if (!node.repr_c && !node.repr_packed
-                            && !node.repr_transparent && node.min_alignment == 0) {
-                        continue;
-                    }
-                    const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/class layout");
-                    if (!tref.is_valid()) { continue; }
-                    const ty: Type* = arena.lookup(tref);
-                    if (ty == null || ty.kind != TypeKind::Class) { continue; }
-                    mut ct: ClassType* = ty.as_class();
-                    ct.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
-                    ct.set_min_alignment(node.min_alignment);
+            if (stmt.is_class()) {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (node.is_generic()) { continue; }
+                if (!node.repr_c && !node.repr_packed
+                        && !node.repr_transparent && node.min_alignment == 0) {
+                    continue;
                 }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Struct(node) => {
-                            if (node.is_generic()) {
-                                // Generic struct definitions have no concrete Type
-                                // yet; each specialization stamps its own layout in
-                                // the monomorphizer (`populate_struct_fields`), which
-                                // copies the repr/align flags the cloner carried over
-                                // from this template.
-                                continue;
-                            }
-                            if (!node.repr_c && !node.repr_packed
-                                    && !node.repr_transparent && node.min_alignment == 0) {
-                                continue;
-                            }
-                            const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/struct layout");
-                            if (!tref.is_valid()) { continue; }
-                            const ty: Type* = arena.lookup(tref);
-                            if (ty == null || ty.kind != TypeKind::Struct) { continue; }
-                            mut st: StructType* = ty.as_struct();
-                            st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
-                            st.set_min_alignment(node.min_alignment);
+                const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/class layout");
+                if (!tref.is_valid()) { continue; }
+                const ty: Type* = arena.lookup(tref);
+                if (ty == null || ty.kind != TypeKind::Class) { continue; }
+                mut ct: ClassType* = ty.as_class();
+                ct.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
+                ct.set_min_alignment(node.min_alignment);
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Struct(node) => {
+                        if (node.is_generic()) {
+                            // Generic struct definitions have no concrete Type
+                            // yet; each specialization stamps its own layout in
+                            // the monomorphizer (`populate_struct_fields`), which
+                            // copies the repr/align flags the cloner carried over
+                            // from this template.
+                            continue;
                         }
-                        DeclKind::Enum(node) => {
-                            if (node.is_generic()) { continue; }
-                            if (!node.repr_c && node.min_alignment == 0) { continue; }
-                            const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/enum layout");
-                            if (!tref.is_valid()) { continue; }
-                            const ty: Type* = arena.lookup(tref);
-                            if (ty == null || ty.kind != TypeKind::Enum) { continue; }
-                            mut et: EnumType* = ty.as_enum();
-                            et.set_repr_c(node.repr_c);
-                            et.set_min_alignment(node.min_alignment);
+                        if (!node.repr_c && !node.repr_packed
+                                && !node.repr_transparent && node.min_alignment == 0) {
+                            continue;
                         }
-                        DeclKind::Union(node) => {
-                            // A union's Type is a StructType (with is_union set); the
-                            // repr/align propagation is identical to the struct path.
-                            if (node.is_generic()) { continue; }
-                            if (!node.repr_c && !node.repr_packed
-                                    && !node.repr_transparent && node.min_alignment == 0) {
-                                continue;
-                            }
-                            const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/union layout");
-                            if (!tref.is_valid()) { continue; }
-                            const ty: Type* = arena.lookup(tref);
-                            if (ty == null || ty.kind != TypeKind::Struct) { continue; }
-                            mut st: StructType* = ty.as_struct();
-                            st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
-                            st.set_min_alignment(node.min_alignment);
-                        }
-                        // No other kind with a payload has a layout.
-                        DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Field(_)
-                        | DeclKind::GenericParam(_) | DeclKind::Impl(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
-                        | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
+                        const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/struct layout");
+                        if (!tref.is_valid()) { continue; }
+                        const ty: Type* = arena.lookup(tref);
+                        if (ty == null || ty.kind != TypeKind::Struct) { continue; }
+                        mut st: StructType* = ty.as_struct();
+                        st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
+                        st.set_min_alignment(node.min_alignment);
                     }
+                    DeclKind::Enum(node) => {
+                        if (node.is_generic()) { continue; }
+                        if (!node.repr_c && node.min_alignment == 0) { continue; }
+                        const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/enum layout");
+                        if (!tref.is_valid()) { continue; }
+                        const ty: Type* = arena.lookup(tref);
+                        if (ty == null || ty.kind != TypeKind::Enum) { continue; }
+                        mut et: EnumType* = ty.as_enum();
+                        et.set_repr_c(node.repr_c);
+                        et.set_min_alignment(node.min_alignment);
+                    }
+                    DeclKind::Union(node) => {
+                        // A union's Type is a StructType (with is_union set); the
+                        // repr/align propagation is identical to the struct path.
+                        if (node.is_generic()) { continue; }
+                        if (!node.repr_c && !node.repr_packed
+                                && !node.repr_transparent && node.min_alignment == 0) {
+                            continue;
+                        }
+                        const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/union layout");
+                        if (!tref.is_valid()) { continue; }
+                        const ty: Type* = arena.lookup(tref);
+                        if (ty == null || ty.kind != TypeKind::Struct) { continue; }
+                        mut st: StructType* = ty.as_struct();
+                        st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
+                        st.set_min_alignment(node.min_alignment);
+                    }
+                    // No other kind with a payload has a layout.
+                    DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Field(_)
+                    | DeclKind::GenericParam(_) | DeclKind::Impl(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
+                    | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                 }
-                _ => { }
             }
         }
     }

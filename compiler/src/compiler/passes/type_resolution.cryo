@@ -23,7 +23,7 @@ import compiler::module_graph;
 import compiler::module_graph::{ ModuleGraph, ModuleInfo, ModulePath };
 import compiler::ast;
 import compiler::ast::{
-    cloner, declaration, expression, GenericAnnotation, NamedAnnotation, node, NodeKind,
+    cloner, declaration, expression, GenericAnnotation, NamedAnnotation, node,
     pattern, statement, TraitBound, TraitRef, TypeAnnotation, Visibility
 };
 import compiler::passes::pass_id;
@@ -923,7 +923,7 @@ type struct TypeResolutionRunner {
 
     resolve_var_types_in_stmt(&this, stmt: Stmt*, res_ctx: ResolutionContext*) -> void {
         if (stmt == null) { return; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Block(block) => {
                 for (mut i: i64 = 0; i < block.statements.length; i++) {
                     this.resolve_var_types_in_stmt(block.statements[i], res_ctx);
@@ -1045,93 +1045,86 @@ type struct TypeResolutionRunner {
     resolve_var_types_in_expression(&this, expr: ExpressionNode*,
                                      res_ctx: ResolutionContext*) -> void {
         if (expr == null) { return; }
-        const n: ExpressionNode* = expr;
-        match (n.kind) {
-            NodeKind::Expression => {
-                match (expr.shape) {
-                    // Recurse into arguments so lambdas passed as arguments get resolved.
-                    ExprKind::Call(call) => {
-                        for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                            this.resolve_var_types_in_expression(call.arguments[i], res_ctx);
-                        }
-                    }
-                    ExprKind::Match(match_expr) => {
-                        for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
-                            const arm: MatchArmNode* = match_expr.arms[i];
-                            if (arm != null && arm.body != null) {
-                                this.resolve_var_types_in_stmt(arm.body, res_ctx);
-                            }
-                        }
-                    }
-                    ExprKind::StaticMatch(sm_expr) => {
-                        for (mut i: i64 = 0; i < sm_expr.arms.length; i++) {
-                            const arm: StaticMatchArmNode* = sm_expr.arms[i];
-                            if (arm != null && arm.body != null) {
-                                this.resolve_var_types_in_stmt(arm.body, res_ctx);
-                            }
-                        }
-                    }
-                    ExprKind::If(if_expr) => {
-                        if (if_expr.then_expr != null) {
-                            this.resolve_var_types_in_expression(if_expr.then_expr, res_ctx);
-                        }
-                        if (if_expr.else_expr != null) {
-                            this.resolve_var_types_in_expression(if_expr.else_expr, res_ctx);
-                        }
-                    }
-                    ExprKind::Ternary(te) => {
-                        if (te.true_expr != null) {
-                            this.resolve_var_types_in_expression(te.true_expr, res_ctx);
-                        }
-                        if (te.false_expr != null) {
-                            this.resolve_var_types_in_expression(te.false_expr, res_ctx);
-                        }
-                    }
-                    // Runs before sema lowers `?`; recurse into the source
-                    // operand so nested var declarations get resolved types.
-                    ExprKind::Try(try_expr) => {
-                        if (try_expr.operand != null) {
-                            this.resolve_var_types_in_expression(try_expr.operand, res_ctx);
-                        }
-                    }
-                    // Not walked here.
-                    ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
-                    | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::New(_)
-                    | ExprKind::Tuple(_) | ExprKind::Array(_) | ExprKind::Struct(_)
-                    | ExprKind::Literal(_) | ExprKind::Cast(_) | ExprKind::Unary(_)
-                    | ExprKind::Binary(_) | ExprKind::ArrayAccess(_) | ExprKind::Await(_)
-                    | ExprKind::Identifier(_) | ExprKind::ScopeResolution(_) | ExprKind::MemberAccess(_) => { }
-                    // Resolve parameter types and body variables of a lambda.
-                    ExprKind::Lambda(lam) => {
-                        // Resolve each parameter's type annotation into resolved_type.
-                        for (mut li: i64 = 0; li < lam.parameters.length; li++) {
-                            const lp_decl: DeclarationNode* = lam.parameters[li];
-                            const lp: VarDecl* = DeclarationNode::var_of(lp_decl);
-                            if (lp != null && lp.type_annotation != null && !lp.resolved_type.is_valid()) {
-                                const ptype: TypeRef = this.resolver.resolve(lp.type_annotation, res_ctx);
-                                if (ptype.is_valid()) {
-                                    lp.resolved_type = ptype;
-                                }
-                            }
-                        }
-                        // Resolve the return type annotation if sema hasn't filled it in.
-                        if (!lam.return_type.is_valid() && lam.return_type_ann != null) {
-                            const rtype: TypeRef = this.resolver.resolve(lam.return_type_ann, res_ctx);
-                            if (rtype.is_valid()) {
-                                lam.set_return_type(rtype);
-                            }
-                        }
-                        // Walk body for variable declarations.
-                        if (lam.body != null) {
-                            this.resolve_var_types_in_stmt(lam.body, res_ctx);
-                        }
+        match (expr.kind) {
+            // Recurse into arguments so lambdas passed as arguments get resolved.
+            ExprKind::Call(call) => {
+                for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                    this.resolve_var_types_in_expression(call.arguments[i], res_ctx);
+                }
+            }
+            ExprKind::Match(match_expr) => {
+                for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
+                    const arm: MatchArmNode* = match_expr.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.resolve_var_types_in_stmt(arm.body, res_ctx);
                     }
                 }
             }
-            _ => {
-                // Other expression kinds don't contain var declarations
+            ExprKind::StaticMatch(sm_expr) => {
+                for (mut i: i64 = 0; i < sm_expr.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sm_expr.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.resolve_var_types_in_stmt(arm.body, res_ctx);
+                    }
+                }
+            }
+            ExprKind::If(if_expr) => {
+                if (if_expr.then_expr != null) {
+                    this.resolve_var_types_in_expression(if_expr.then_expr, res_ctx);
+                }
+                if (if_expr.else_expr != null) {
+                    this.resolve_var_types_in_expression(if_expr.else_expr, res_ctx);
+                }
+            }
+            ExprKind::Ternary(te) => {
+                if (te.true_expr != null) {
+                    this.resolve_var_types_in_expression(te.true_expr, res_ctx);
+                }
+                if (te.false_expr != null) {
+                    this.resolve_var_types_in_expression(te.false_expr, res_ctx);
+                }
+            }
+            // Runs before sema lowers `?`; recurse into the source
+            // operand so nested var declarations get resolved types.
+            ExprKind::Try(try_expr) => {
+                if (try_expr.operand != null) {
+                    this.resolve_var_types_in_expression(try_expr.operand, res_ctx);
+                }
+            }
+            // Not walked here.
+            ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
+            | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::New(_)
+            | ExprKind::Tuple(_) | ExprKind::Array(_) | ExprKind::Struct(_)
+            | ExprKind::Literal(_) | ExprKind::Cast(_) | ExprKind::Unary(_)
+            | ExprKind::Binary(_) | ExprKind::ArrayAccess(_) | ExprKind::Await(_)
+            | ExprKind::Identifier(_) | ExprKind::ScopeResolution(_) | ExprKind::MemberAccess(_) => { }
+            // Resolve parameter types and body variables of a lambda.
+            ExprKind::Lambda(lam) => {
+                // Resolve each parameter's type annotation into resolved_type.
+                for (mut li: i64 = 0; li < lam.parameters.length; li++) {
+                    const lp_decl: DeclarationNode* = lam.parameters[li];
+                    const lp: VarDecl* = DeclarationNode::var_of(lp_decl);
+                    if (lp != null && lp.type_annotation != null && !lp.resolved_type.is_valid()) {
+                        const ptype: TypeRef = this.resolver.resolve(lp.type_annotation, res_ctx);
+                        if (ptype.is_valid()) {
+                            lp.resolved_type = ptype;
+                        }
+                    }
+                }
+                // Resolve the return type annotation if sema hasn't filled it in.
+                if (!lam.return_type.is_valid() && lam.return_type_ann != null) {
+                    const rtype: TypeRef = this.resolver.resolve(lam.return_type_ann, res_ctx);
+                    if (rtype.is_valid()) {
+                        lam.set_return_type(rtype);
+                    }
+                }
+                // Walk body for variable declarations.
+                if (lam.body != null) {
+                    this.resolve_var_types_in_stmt(lam.body, res_ctx);
+                }
             }
         }
+    
     }
 
 
@@ -1144,7 +1137,7 @@ type struct TypeResolutionRunner {
                                      res_ctx: ResolutionContext*) -> void {
         if (stmt == null) { return; }
 
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Block(block) => {
                 for (mut i: i64 = 0; i < block.statements.length; i++) {
                     this.collect_generic_fn_calls_in_stmt(block.statements[i], res_ctx);
@@ -1223,62 +1216,54 @@ type struct TypeResolutionRunner {
     collect_generic_fn_calls_in_expr(&this, expr: ExpressionNode*,
                                      res_ctx: ResolutionContext*) -> void {
         if (expr == null) { return; }
-        const node: ExpressionNode* = expr;
-
-        match (node.kind) {
-            NodeKind::Expression => {
-                match (expr.shape) {
-                    ExprKind::Call(call) => {
-                        // Recurse into callee and arguments first
-                        this.collect_generic_fn_calls_in_expr(call.callee, res_ctx);
-                        for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                            this.collect_generic_fn_calls_in_expr(call.arguments[i], res_ctx);
-                        }
-                        // Check for generic_args on the call
-                        if (call.generic_args.length > 0) {
-                            this.register_generic_fn_call(call, res_ctx);
-                        }
-                    }
-                    ExprKind::Try(try_expr) => {
-                        this.collect_generic_fn_calls_in_expr(try_expr.operand, res_ctx);
-                    }
-                    ExprKind::Binary(bin) => {
-                        this.collect_generic_fn_calls_in_expr(bin.left, res_ctx);
-                        this.collect_generic_fn_calls_in_expr(bin.right, res_ctx);
-                    }
-                    ExprKind::ArrayAccess(aa) => {
-                        this.collect_generic_fn_calls_in_expr(aa.array, res_ctx);
-                        this.collect_generic_fn_calls_in_expr(aa.index, res_ctx);
-                    }
-                    ExprKind::Unary(un) => {
-                        this.collect_generic_fn_calls_in_expr(un.operand, res_ctx);
-                    }
-                    ExprKind::MemberAccess(ma) => {
-                        this.collect_generic_fn_calls_in_expr(ma.object, res_ctx);
-                    }
-                    ExprKind::Ternary(te) => {
-                        this.collect_generic_fn_calls_in_expr(te.condition, res_ctx);
-                        this.collect_generic_fn_calls_in_expr(te.true_expr, res_ctx);
-                        this.collect_generic_fn_calls_in_expr(te.false_expr, res_ctx);
-                    }
-                    ExprKind::If(ie) => {
-                        this.collect_generic_fn_calls_in_expr(ie.condition, res_ctx);
-                        this.collect_generic_fn_calls_in_expr(ie.then_expr, res_ctx);
-                        this.collect_generic_fn_calls_in_expr(ie.else_expr, res_ctx);
-                    }
-                    // Not walked here.
-                    ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
-                    | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::New(_)
-                    | ExprKind::Tuple(_) | ExprKind::Array(_) | ExprKind::Struct(_)
-                    | ExprKind::Literal(_) | ExprKind::StaticMatch(_) | ExprKind::Match(_)
-                    | ExprKind::Cast(_) | ExprKind::Lambda(_) | ExprKind::Await(_)
-                    | ExprKind::Identifier(_) | ExprKind::ScopeResolution(_) => { }
+        match (expr.kind) {
+            ExprKind::Call(call) => {
+                // Recurse into callee and arguments first
+                this.collect_generic_fn_calls_in_expr(call.callee, res_ctx);
+                for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                    this.collect_generic_fn_calls_in_expr(call.arguments[i], res_ctx);
+                }
+                // Check for generic_args on the call
+                if (call.generic_args.length > 0) {
+                    this.register_generic_fn_call(call, res_ctx);
                 }
             }
-            _ => {
-                // Literals, identifiers, scope resolution, etc.: no nested generic calls
+            ExprKind::Try(try_expr) => {
+                this.collect_generic_fn_calls_in_expr(try_expr.operand, res_ctx);
             }
+            ExprKind::Binary(bin) => {
+                this.collect_generic_fn_calls_in_expr(bin.left, res_ctx);
+                this.collect_generic_fn_calls_in_expr(bin.right, res_ctx);
+            }
+            ExprKind::ArrayAccess(aa) => {
+                this.collect_generic_fn_calls_in_expr(aa.array, res_ctx);
+                this.collect_generic_fn_calls_in_expr(aa.index, res_ctx);
+            }
+            ExprKind::Unary(un) => {
+                this.collect_generic_fn_calls_in_expr(un.operand, res_ctx);
+            }
+            ExprKind::MemberAccess(ma) => {
+                this.collect_generic_fn_calls_in_expr(ma.object, res_ctx);
+            }
+            ExprKind::Ternary(te) => {
+                this.collect_generic_fn_calls_in_expr(te.condition, res_ctx);
+                this.collect_generic_fn_calls_in_expr(te.true_expr, res_ctx);
+                this.collect_generic_fn_calls_in_expr(te.false_expr, res_ctx);
+            }
+            ExprKind::If(ie) => {
+                this.collect_generic_fn_calls_in_expr(ie.condition, res_ctx);
+                this.collect_generic_fn_calls_in_expr(ie.then_expr, res_ctx);
+                this.collect_generic_fn_calls_in_expr(ie.else_expr, res_ctx);
+            }
+            // Not walked here.
+            ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
+            | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::New(_)
+            | ExprKind::Tuple(_) | ExprKind::Array(_) | ExprKind::Struct(_)
+            | ExprKind::Literal(_) | ExprKind::StaticMatch(_) | ExprKind::Match(_)
+            | ExprKind::Cast(_) | ExprKind::Lambda(_) | ExprKind::Await(_)
+            | ExprKind::Identifier(_) | ExprKind::ScopeResolution(_) => { }
         }
+    
     }
 
     /// Register a generic function call instantiation (`f<T>(...)`): the
@@ -1391,134 +1376,126 @@ type struct TypeResolutionPasses {
 
         // A generic type's own methods, under the template.
         if (is_source_decl) {
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration => {
-                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    if (ctx.generic_registry.template_of(node.def) != null) {
-                        ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
-                    }
-                }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Struct(node) => {
-                            if (ctx.generic_registry.template_of(node.def) != null) {
-                                ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
-                            }
-                        }
-                        DeclKind::Union(node) => {
-                            if (ctx.generic_registry.template_of(node.def) != null) {
-                                ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
-                            }
-                        }
-                        DeclKind::Impl(node) => {
-                            const owner: DefId = match (node.res) {
-                                ResSlot::Answered(r) => { r.def_id() }
-                                _                    => { DefId::invalid() }
-                            };
-                            if (owner.is_valid() && ctx.generic_registry.template_of(owner) != null) {
-                                ctx.decl_index.register_template_methods(owner, &node.methods, arena);
-                            }
-                        }
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
-                        | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
-                    }
-                }
-                _ => { }
-            }
-        }
-
-        match (stmt.kind) {
-            NodeKind::ClassDeclaration => {
+            if (stmt.is_class()) {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register class methods"), node.methods, ctx.intern_table, arena, "type_resolution/register class methods");
-            }
-            NodeKind::Declaration => {
+                if (ctx.generic_registry.template_of(node.def) != null) {
+                    ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
+                }
+            } else {
                 match (stmt.shape) {
-                    DeclKind::Function(func) => {
-                        const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
-                        // A signature the name layer refused registers nothing: with
-                        // the refused parameter dropped it would be a different
-                        // function's, and with no return type it cannot be mangled.
-                        // The refusal is recorded on the definition so a call to it
-                        // finds a declaration and reports nothing.
-                        if (decl_index::DeclarationIndex::signature_is_refused(func_decl)) {
-                            ctx.defs.record_signature_refused(func.def);
-                        } else if (func.resolved_return_type.is_valid()) {
-                            // Collect resolved param types from AST
-                            mut param_types: [TypeRef] = [];
-                            for (mut p: i64 = 0; p < func.parameters.length; p++) {
-                                const param_decl: DeclarationNode* = func.parameters[p];
-                                const param: VarDecl* = DeclarationNode::var_of(param_decl);
-                                if (param != null && param.resolved_type.is_valid()) {
-                                    param_types.push(param.resolved_type);
-                                }
-                            }
-
-                            // Create a FunctionType in the arena (deduplicated)
-                            const func_type_ref: TypeRef = arena.get_function(
-                                func.resolved_return_type, param_types, func.is_variadic);
-
-                            // A declaration is registered in its own family - its
-                            // module and the name it is written with.  A copy (a
-                            // monomorphized instance) is registered in none: a call
-                            // reaches it by its instance, and its symbol is mangled
-                            // under the module of the definition it copies.
-                            const decl_span: SourceSpan = if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span };
-                            const entry: OverloadId = if (!func.def.is_valid() && func.copy_of.is_valid()) {
-                                ctx.decl_index.register_copy_signature(
-                                    ctx.copy_module_family(func.copy_of), func.name, func.resolved_return_type,
-                                    func_type_ref, ctx.intern_table, arena, decl_span, func_decl)
-                            } else {
-                                ctx.decl_index.register_function_signature(
-                                    ctx.fn_family_of(func.def), func.name, func.resolved_return_type, func_type_ref,
-                                    ctx.intern_table, arena, SymbolStr::empty(), decl_span,
-                                    if (is_source_decl) { func.def } else { DefId::invalid() }, func_decl)
-                            };
-                            func.set_overload_entry(entry);
-                            // A generic intrinsic's entries lower as its kind: the
-                            // declaration's, and each specialization's, which is the
-                            // entry a call to it is pinned to.
-                            if (func.is_intrinsic) {
-                                // A specialization's name is minted; its kind is
-                                // the declaration's it is a copy of.
-                                ctx.decl_index.mark_intrinsic(entry, if (func.copy_of.is_valid()) {
-                                    ctx.decl_index.entry_intrinsic_kind(ctx.decl_index.entry_of_def(func.copy_of))
-                                } else {
-                                    IntrinsicKind::from_name(ctx.intern_table.resolve(func.name))
-                                });
-                            }
-                            // Whether this IS a function generated code calls - the
-                            // allocator, the entry point's `set_args` - is decided by
-                            // the identity, claimed where it is registered.  The
-                            // identity is the one the name layer stamped on the
-                            // declaration when it bound the function.
-                            ctx.generic_registry.claim_wellknown(func.def, ctx.intern_table);
-
-                            ctx.decl_index.set_decl_visibility(func.def, func.is_public);
-                            // A free function's instance is answered by its entry.
-                            ctx.decl_index.record_instance(func.instance, entry);
-                        }
-                    }
                     DeclKind::Struct(node) => {
-                        ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register struct methods"), node.methods, ctx.intern_table, arena, "type_resolution/register struct methods");
+                        if (ctx.generic_registry.template_of(node.def) != null) {
+                            ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
+                        }
                     }
                     DeclKind::Union(node) => {
-                        ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register union methods"), node.methods, ctx.intern_table, arena, "type_resolution/register union methods");
+                        if (ctx.generic_registry.template_of(node.def) != null) {
+                            ctx.decl_index.register_template_methods(node.def, &node.methods, arena);
+                        }
                     }
                     DeclKind::Impl(node) => {
-                        TypeResolutionPasses::register_impl_in_index(
-                            stmt as DeclarationNode*, node, ctx, is_source_decl);
+                        const owner: DefId = match (node.res) {
+                            ResSlot::Answered(r) => { r.def_id() }
+                            _                    => { DefId::invalid() }
+                        };
+                        if (owner.is_valid() && ctx.generic_registry.template_of(owner) != null) {
+                            ctx.decl_index.register_template_methods(owner, &node.methods, arena);
+                        }
                     }
                     DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
                     | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
                     | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
+                    | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                 }
             }
-            _ => {}
+        }
+
+        if (stmt.is_class()) {
+            const node: ClassDeclNode* = stmt as ClassDeclNode*;
+            ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register class methods"), node.methods, ctx.intern_table, arena, "type_resolution/register class methods");
+        } else {
+            match (stmt.shape) {
+                DeclKind::Function(func) => {
+                    const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                    // A signature the name layer refused registers nothing: with
+                    // the refused parameter dropped it would be a different
+                    // function's, and with no return type it cannot be mangled.
+                    // The refusal is recorded on the definition so a call to it
+                    // finds a declaration and reports nothing.
+                    if (decl_index::DeclarationIndex::signature_is_refused(func_decl)) {
+                        ctx.defs.record_signature_refused(func.def);
+                    } else if (func.resolved_return_type.is_valid()) {
+                        // Collect resolved param types from AST
+                        mut param_types: [TypeRef] = [];
+                        for (mut p: i64 = 0; p < func.parameters.length; p++) {
+                            const param_decl: DeclarationNode* = func.parameters[p];
+                            const param: VarDecl* = DeclarationNode::var_of(param_decl);
+                            if (param != null && param.resolved_type.is_valid()) {
+                                param_types.push(param.resolved_type);
+                            }
+                        }
+
+                        // Create a FunctionType in the arena (deduplicated)
+                        const func_type_ref: TypeRef = arena.get_function(
+                            func.resolved_return_type, param_types, func.is_variadic);
+
+                        // A declaration is registered in its own family - its
+                        // module and the name it is written with.  A copy (a
+                        // monomorphized instance) is registered in none: a call
+                        // reaches it by its instance, and its symbol is mangled
+                        // under the module of the definition it copies.
+                        const decl_span: SourceSpan = if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span };
+                        const entry: OverloadId = if (!func.def.is_valid() && func.copy_of.is_valid()) {
+                            ctx.decl_index.register_copy_signature(
+                                ctx.copy_module_family(func.copy_of), func.name, func.resolved_return_type,
+                                func_type_ref, ctx.intern_table, arena, decl_span, func_decl)
+                        } else {
+                            ctx.decl_index.register_function_signature(
+                                ctx.fn_family_of(func.def), func.name, func.resolved_return_type, func_type_ref,
+                                ctx.intern_table, arena, SymbolStr::empty(), decl_span,
+                                if (is_source_decl) { func.def } else { DefId::invalid() }, func_decl)
+                        };
+                        func.set_overload_entry(entry);
+                        // A generic intrinsic's entries lower as its kind: the
+                        // declaration's, and each specialization's, which is the
+                        // entry a call to it is pinned to.
+                        if (func.is_intrinsic) {
+                            // A specialization's name is minted; its kind is
+                            // the declaration's it is a copy of.
+                            ctx.decl_index.mark_intrinsic(entry, if (func.copy_of.is_valid()) {
+                                ctx.decl_index.entry_intrinsic_kind(ctx.decl_index.entry_of_def(func.copy_of))
+                            } else {
+                                IntrinsicKind::from_name(ctx.intern_table.resolve(func.name))
+                            });
+                        }
+                        // Whether this IS a function generated code calls - the
+                        // allocator, the entry point's `set_args` - is decided by
+                        // the identity, claimed where it is registered.  The
+                        // identity is the one the name layer stamped on the
+                        // declaration when it bound the function.
+                        ctx.generic_registry.claim_wellknown(func.def, ctx.intern_table);
+
+                        ctx.decl_index.set_decl_visibility(func.def, func.is_public);
+                        // A free function's instance is answered by its entry.
+                        ctx.decl_index.record_instance(func.instance, entry);
+                    }
+                }
+                DeclKind::Struct(node) => {
+                    ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register struct methods"), node.methods, ctx.intern_table, arena, "type_resolution/register struct methods");
+                }
+                DeclKind::Union(node) => {
+                    ctx.decl_index.register_methods(ctx.decl_index.type_of_decl(node.def, "type_resolution/register union methods"), node.methods, ctx.intern_table, arena, "type_resolution/register union methods");
+                }
+                DeclKind::Impl(node) => {
+                    TypeResolutionPasses::register_impl_in_index(
+                        stmt as DeclarationNode*, node, ctx, is_source_decl);
+                }
+                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+            }
         }
     }
 
@@ -3085,248 +3062,242 @@ type struct TypeResolutionPasses {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
-            cdebug("[FuncSig] stmt[%lld] kind=%d\n", i, stmt.kind as i32);
+            cdebug("[FuncSig] stmt[%lld] kind=%s\n", i, stmt.kind_name());
 
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration => {
-                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    mut class_ctx: ResolutionContext = runner.make_generic_context(
-                        node.generic_params, &runner.res_ctx);
-                    const class_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/class methods");
-                    const class_args: [TypeRef] = runner.decl_owner_args(node.generic_params, &class_ctx);
-                    runner.resolve_method_signatures(node.methods, &class_ctx, class_owner, node.def, &class_args);
-                    sig_count += node.methods.length;
-                }
-                NodeKind::Declaration => {
-                    const decl: DeclarationNode* = stmt;
-                    match (decl.shape) {
-                        DeclKind::Function(func) => {
-                            const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
-                            mut func_ctx: ResolutionContext = runner.make_generic_context(
-                                func.generic_params, &runner.res_ctx);
-                            runner.resolve_func_signature(func_decl, &func_ctx);
-                            sig_count++;
+            if (stmt.is_class()) {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                mut class_ctx: ResolutionContext = runner.make_generic_context(
+                    node.generic_params, &runner.res_ctx);
+                const class_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/class methods");
+                const class_args: [TypeRef] = runner.decl_owner_args(node.generic_params, &class_ctx);
+                runner.resolve_method_signatures(node.methods, &class_ctx, class_owner, node.def, &class_args);
+                sig_count += node.methods.length;
+            } else {
+                const decl: DeclarationNode* = stmt;
+                match (decl.shape) {
+                    DeclKind::Function(func) => {
+                        const func_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                        mut func_ctx: ResolutionContext = runner.make_generic_context(
+                            func.generic_params, &runner.res_ctx);
+                        runner.resolve_func_signature(func_decl, &func_ctx);
+                        sig_count++;
 
-                            if (func.resolved_return_type.is_valid()) {
-                                mut fparams: [TypeRef] = [];
-                                for (mut p: i64 = 0; p < func.parameters.length; p++) {
-                                    const fp_decl: DeclarationNode* = func.parameters[p];
-                                    const fp: VarDecl* = DeclarationNode::var_of(fp_decl);
-                                    if (fp != null && fp.resolved_type.is_valid()) {
-                                        fparams.push(fp.resolved_type);
-                                    }
-                                }
-                                const fsig: TypeRef = arena.get_function(
-                                    func.resolved_return_type, fparams, func.is_variadic);
-                                if (TypeResolutionPasses::signature_repeats(&seen_fn_names, &seen_fn_types,
-                                                                            func.name, fsig.key())) {
-                                    ctx.emit_error_at(ErrorCode::E0206_REDEFINED_FUNCTION,
-                                        fmt::format("function `%s` is defined multiple times with the same signature",
-                                            ctx.resolve_str(func.name)),
-                                        func_decl.span);
+                        if (func.resolved_return_type.is_valid()) {
+                            mut fparams: [TypeRef] = [];
+                            for (mut p: i64 = 0; p < func.parameters.length; p++) {
+                                const fp_decl: DeclarationNode* = func.parameters[p];
+                                const fp: VarDecl* = DeclarationNode::var_of(fp_decl);
+                                if (fp != null && fp.resolved_type.is_valid()) {
+                                    fparams.push(fp.resolved_type);
                                 }
                             }
-                        }
-                        DeclKind::Trait(node) => {
-                            sig_count += TypeResolutionPasses::trait_signatures(&runner, node, ctx, arena);
-                        }
-                        DeclKind::Impl(node) => {
-                            sig_count += TypeResolutionPasses::impl_signatures(&runner, decl, node, ctx);
-                        }
-                        DeclKind::Struct(node) => {
-                            mut struct_ctx: ResolutionContext = runner.make_generic_context(
-                                node.generic_params, &runner.res_ctx);
-                            const struct_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/struct methods");
-                            const struct_args: [TypeRef] = runner.decl_owner_args(node.generic_params, &struct_ctx);
-                            runner.resolve_method_signatures(node.methods, &struct_ctx, struct_owner, node.def, &struct_args);
-                            sig_count += node.methods.length;
-                        }
-                        DeclKind::Union(node) => {
-                            mut union_ctx: ResolutionContext = runner.make_generic_context(
-                                node.generic_params, &runner.res_ctx);
-                            const union_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/union methods");
-                            const union_args: [TypeRef] = runner.decl_owner_args(node.generic_params, &union_ctx);
-                            runner.resolve_method_signatures(node.methods, &union_ctx, union_owner, node.def, &union_args);
-                            sig_count += node.methods.length;
-                        }
-                        DeclKind::Extern(node) => {
-                            for (mut j: i64 = 0; j < node.functions.length; j++) {
-                                const fn_node_decl: DeclarationNode* = node.functions[j];
-                                const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
-                                runner.resolve_func_signature(fn_node_decl, &runner.res_ctx);
-
-                                if (fn_node.resolved_return_type.is_valid()) {
-                                    // Collect resolved param types
-                                    mut ext_params: [TypeRef] = [];
-                                    for (mut p: i64 = 0; p < fn_node.parameters.length; p++) {
-                                        const param_decl: DeclarationNode* = fn_node.parameters[p];
-                                        const param: VarDecl* = DeclarationNode::var_of(param_decl);
-                                        if (param != null && param.resolved_type.is_valid()) {
-                                            ext_params.push(param.resolved_type);
-                                        }
-                                    }
-
-                                    // Create FunctionType in the arena
-                                    const func_type_ref: TypeRef = arena.get_function(
-                                        fn_node.resolved_return_type, ext_params, fn_node.is_variadic);
-
-                                    // The LLVM symbol an extern function resolves to: its
-                                    // bare C name, UNLESS a function-level `![symbol("sym")]`
-                                    // pins a different linker symbol (the C++ binding
-                                    // generator pins the Itanium mangled name).  Read from
-                                    // the parsed directive (DirectiveProcessing, which sets
-                                    // `has_link_name`, runs LATER than this pass), and
-                                    // registered as the DI mangled name so EVERY module - 
-                                    // declaring and consuming - emits the same symbol,
-                                    // making the override work across the module boundary.
-                                    const ext_link_str: string = fn_node_decl.link_directive_symbol();
-                                    const ext_link_sym: SymbolStr = if (ext_link_str.length() > 0) {
-                                        ctx.intern_table.intern(ext_link_str)
-                                    } else {
-                                        fn_node.name
-                                    };
-
-                                    // The declaration is registered under its own key -
-                                    // its name under the module that declares it, as
-                                    // any free function's: the alias's module for a C
-                                    // import (`<mod>::cit::add3`, the namespace the
-                                    // alias's stamp names), the writing module for a
-                                    // plain extern block - and the C name is its
-                                    // SYMBOL, never a key: a bare leaf shared by every
-                                    // extern block declaring that C name could only
-                                    // hold one of them, and a call pinned by the
-                                    // symbol alone could not say which declaration it
-                                    // meant.  A call binds the declaration its stamp
-                                    // names and is emitted at that declaration's
-                                    // signature.
-                                    const ext_q_name: SymbolStr = if (node.is_c_import()) {
-                                        ctx.qualify_binding_sym(fn_node.name, node.binding_namespace)
-                                    } else {
-                                        ctx.decl_fn_key(fn_node.name, fn_node_decl.span.file)
-                                    };
-                                    const ext_leaf: SymbolStr = fn_node.name;
-                                    const ext_owner: FamilyOwner = if (node.is_c_import()) {
-                                        ctx.module_family(node.binding_namespace)
-                                    } else {
-                                        ctx.fn_family_of(fn_node.def)
-                                    };
-                                    // Two extern blocks declaring one C name with
-                                    // DIFFERENT Cryo signatures is an ABI hazard the
-                                    // program carries whichever one a call names - at
-                                    // most one of them matches the C definition - and
-                                    // is reported once, at the later declaration.  An
-                                    // identical redeclaration (two modules each writing
-                                    // the libc prototype they need) shares the interned
-                                    // function type and says nothing.
-                                    const clash_key: SymbolStr =
-                                        ctx.decl_index.extern_symbol_conflict(ext_link_sym, func_type_ref);
-                                    if (clash_key.is_valid()) {
-                                        const sym_str: string = ctx.intern_table.resolve(fn_node.name);
-                                        mut wdiag: Diagnostic = Diagnostic::warning(
-                                            ErrorCode::W0011_DUPLICATE_EXTERN_SYMBOL,
-                                            fmt::format("extern C symbol `%s` is declared in more than one extern block with different signatures; a call binds the declaration it names, and at most one of them matches the C definition",
-                                                sym_str));
-                                        wdiag = wdiag.at_with_label(fn_node_decl.span,
-                                            "duplicate extern declaration here");
-                                        wdiag = wdiag.help(fmt::format("also declared as `%s`; make the two signatures agree, or remove one",
-                                            ctx.intern_table.resolve(clash_key)));
-                                        ctx.emit_diagnostic(wdiag);
-                                    }
-                                    // The LLVM symbol is written on the overload entry
-                                    // as well as the key's slot: codegen resolves a
-                                    // pinned declaration through the entry registered
-                                    // under it, an extern's as any other function's.
-                                    fn_node.set_overload_entry(ctx.decl_index.register_function_signature(
-                                        ext_owner, ext_leaf, fn_node.resolved_return_type, func_type_ref,
-                                        ctx.intern_table, arena, ext_link_sym,
-                                        if (fn_node_decl.has_name_span()) { fn_node_decl.name_span } else { fn_node_decl.span },
-                                        fn_node.def, fn_node_decl));
-                                    ctx.decl_index.note_extern_symbol(ext_link_sym, ext_q_name, func_type_ref);
-                                    // Whether this IS a C function the compiler checks
-                                    // calls to (the C `printf`) is decided by the
-                                    // identity, claimed where it is registered.
-                                    ctx.generic_registry.claim_wellknown(fn_node.def, ctx.intern_table);
-                                    // An imported function is a declaration of this
-                                    // module and takes its written visibility, as a
-                                    // free function does: a `private` one is not
-                                    // callable by qualified path from another module.
-                                    // A C import's prototypes are its alias module's
-                                    // public declarations - the alias exists to be
-                                    // reached through, and the name layer declares
-                                    // them so - whatever the block's text wrote.
-                                    ctx.decl_index.set_decl_visibility(fn_node.def,
-                                        node.is_c_import() || fn_node.is_public);
-                                }
+                            const fsig: TypeRef = arena.get_function(
+                                func.resolved_return_type, fparams, func.is_variadic);
+                            if (TypeResolutionPasses::signature_repeats(&seen_fn_names, &seen_fn_types,
+                                                                        func.name, fsig.key())) {
+                                ctx.emit_error_at(ErrorCode::E0206_REDEFINED_FUNCTION,
+                                    fmt::format("function `%s` is defined multiple times with the same signature",
+                                        ctx.resolve_str(func.name)),
+                                    func_decl.span);
                             }
-                            sig_count += node.functions.length;
                         }
-                        DeclKind::Intrinsic(node) => {
-                            // Resolve parameter types
-                            for (mut j: i64 = 0; j < node.parameters.length; j++) {
-                                const param_decl: DeclarationNode* = node.parameters[j];
-                                const param: VarDecl* = DeclarationNode::var_of(param_decl);
-                                if (param != null && param.type_annotation != null &&
-                                    !param.resolved_type.is_valid()) {
-                                    const ptype: TypeRef = resolver.resolve(param.type_annotation, &runner.res_ctx);
-                                    if (ptype.is_valid()) {
-                                        param.resolved_type = ptype;
-                                    }
-                                }
-                            }
-                            // Resolve return type and register in DeclarationIndex
-                            if (node.return_type_annotation != null && !node.resolved_return_type.is_valid()) {
-                                const rtype: TypeRef = resolver.resolve(node.return_type_annotation, &runner.res_ctx);
-                                if (rtype.is_valid()) {
-                                    node.resolved_return_type = rtype;
-                                }
-                            }
-
-                            if (node.resolved_return_type.is_valid()) {
-                                // Build FunctionType for full signature.
-                                mut i_param_types: [TypeRef] = [];
-                                for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
-                                    const ip_decl: DeclarationNode* = node.parameters[pi];
-                                    const ip: VarDecl* = DeclarationNode::var_of(ip_decl);
-                                    if (ip.resolved_type.is_valid()) {
-                                        i_param_types.push(ip.resolved_type);
-                                    }
-                                }
-                                const i_func_type_ref: TypeRef = arena.get_function(
-                                    node.resolved_return_type, i_param_types, node.is_variadic);
-
-                                // Register in its module's family so cross-module
-                                // externs pick up intrinsics.
-                                // Intrinsics use C linkage; their LLVM symbol is the
-                                // bare function name, not the qualified/mangled form.
-                                const i_entry: OverloadId = ctx.decl_index.register_function_signature(
-                                    ctx.fn_family_of(node.def), node.name, node.resolved_return_type, i_func_type_ref, ctx.intern_table, arena,
-                                    node.name, decl.span, node.def, decl);
-
-                                // The ENTRY carries the intrinsic's kind, read from
-                                // the declaration's own name here, the one place a
-                                // spelling decides it: codegen's inline decision reads
-                                // the kind off the pin.  Its leaf is a key nowhere: a
-                                // bare `malloc` with no declaration in scope is an
-                                // error, and the intrinsic is reached as
-                                // `intrinsics::malloc` like every declaration.
-                                ctx.decl_index.mark_intrinsic(i_entry,
-                                    IntrinsicKind::from_name(ctx.intern_table.resolve(node.name)));
-                                // Intrinsics are always public (an intrinsic
-                                // carries no visibility); record it explicitly so
-                                // the verdict is stated rather than inherited from
-                                // `is_candidate_public`'s permissive default.
-                                ctx.decl_index.set_decl_visibility(node.def, true);
-                            }
-                            sig_count++;
-                        }
-                        DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Variant(_)
-                        | DeclKind::Destructure(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
-                        | DeclKind::GenericParam(_) | DeclKind::Enum(_) | DeclKind::Variable(_)
-                        | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
-                }
-                _ => {
-                    // Not a declaration with function signatures
+                    DeclKind::Trait(node) => {
+                        sig_count += TypeResolutionPasses::trait_signatures(&runner, node, ctx, arena);
+                    }
+                    DeclKind::Impl(node) => {
+                        sig_count += TypeResolutionPasses::impl_signatures(&runner, decl, node, ctx);
+                    }
+                    DeclKind::Struct(node) => {
+                        mut struct_ctx: ResolutionContext = runner.make_generic_context(
+                            node.generic_params, &runner.res_ctx);
+                        const struct_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/struct methods");
+                        const struct_args: [TypeRef] = runner.decl_owner_args(node.generic_params, &struct_ctx);
+                        runner.resolve_method_signatures(node.methods, &struct_ctx, struct_owner, node.def, &struct_args);
+                        sig_count += node.methods.length;
+                    }
+                    DeclKind::Union(node) => {
+                        mut union_ctx: ResolutionContext = runner.make_generic_context(
+                            node.generic_params, &runner.res_ctx);
+                        const union_owner: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/union methods");
+                        const union_args: [TypeRef] = runner.decl_owner_args(node.generic_params, &union_ctx);
+                        runner.resolve_method_signatures(node.methods, &union_ctx, union_owner, node.def, &union_args);
+                        sig_count += node.methods.length;
+                    }
+                    DeclKind::Extern(node) => {
+                        for (mut j: i64 = 0; j < node.functions.length; j++) {
+                            const fn_node_decl: DeclarationNode* = node.functions[j];
+                            const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
+                            runner.resolve_func_signature(fn_node_decl, &runner.res_ctx);
+
+                            if (fn_node.resolved_return_type.is_valid()) {
+                                // Collect resolved param types
+                                mut ext_params: [TypeRef] = [];
+                                for (mut p: i64 = 0; p < fn_node.parameters.length; p++) {
+                                    const param_decl: DeclarationNode* = fn_node.parameters[p];
+                                    const param: VarDecl* = DeclarationNode::var_of(param_decl);
+                                    if (param != null && param.resolved_type.is_valid()) {
+                                        ext_params.push(param.resolved_type);
+                                    }
+                                }
+
+                                // Create FunctionType in the arena
+                                const func_type_ref: TypeRef = arena.get_function(
+                                    fn_node.resolved_return_type, ext_params, fn_node.is_variadic);
+
+                                // The LLVM symbol an extern function resolves to: its
+                                // bare C name, UNLESS a function-level `![symbol("sym")]`
+                                // pins a different linker symbol (the C++ binding
+                                // generator pins the Itanium mangled name).  Read from
+                                // the parsed directive (DirectiveProcessing, which sets
+                                // `has_link_name`, runs LATER than this pass), and
+                                // registered as the DI mangled name so EVERY module - 
+                                // declaring and consuming - emits the same symbol,
+                                // making the override work across the module boundary.
+                                const ext_link_str: string = fn_node_decl.link_directive_symbol();
+                                const ext_link_sym: SymbolStr = if (ext_link_str.length() > 0) {
+                                    ctx.intern_table.intern(ext_link_str)
+                                } else {
+                                    fn_node.name
+                                };
+
+                                // The declaration is registered under its own key -
+                                // its name under the module that declares it, as
+                                // any free function's: the alias's module for a C
+                                // import (`<mod>::cit::add3`, the namespace the
+                                // alias's stamp names), the writing module for a
+                                // plain extern block - and the C name is its
+                                // SYMBOL, never a key: a bare leaf shared by every
+                                // extern block declaring that C name could only
+                                // hold one of them, and a call pinned by the
+                                // symbol alone could not say which declaration it
+                                // meant.  A call binds the declaration its stamp
+                                // names and is emitted at that declaration's
+                                // signature.
+                                const ext_q_name: SymbolStr = if (node.is_c_import()) {
+                                    ctx.qualify_binding_sym(fn_node.name, node.binding_namespace)
+                                } else {
+                                    ctx.decl_fn_key(fn_node.name, fn_node_decl.span.file)
+                                };
+                                const ext_leaf: SymbolStr = fn_node.name;
+                                const ext_owner: FamilyOwner = if (node.is_c_import()) {
+                                    ctx.module_family(node.binding_namespace)
+                                } else {
+                                    ctx.fn_family_of(fn_node.def)
+                                };
+                                // Two extern blocks declaring one C name with
+                                // DIFFERENT Cryo signatures is an ABI hazard the
+                                // program carries whichever one a call names - at
+                                // most one of them matches the C definition - and
+                                // is reported once, at the later declaration.  An
+                                // identical redeclaration (two modules each writing
+                                // the libc prototype they need) shares the interned
+                                // function type and says nothing.
+                                const clash_key: SymbolStr =
+                                    ctx.decl_index.extern_symbol_conflict(ext_link_sym, func_type_ref);
+                                if (clash_key.is_valid()) {
+                                    const sym_str: string = ctx.intern_table.resolve(fn_node.name);
+                                    mut wdiag: Diagnostic = Diagnostic::warning(
+                                        ErrorCode::W0011_DUPLICATE_EXTERN_SYMBOL,
+                                        fmt::format("extern C symbol `%s` is declared in more than one extern block with different signatures; a call binds the declaration it names, and at most one of them matches the C definition",
+                                            sym_str));
+                                    wdiag = wdiag.at_with_label(fn_node_decl.span,
+                                        "duplicate extern declaration here");
+                                    wdiag = wdiag.help(fmt::format("also declared as `%s`; make the two signatures agree, or remove one",
+                                        ctx.intern_table.resolve(clash_key)));
+                                    ctx.emit_diagnostic(wdiag);
+                                }
+                                // The LLVM symbol is written on the overload entry
+                                // as well as the key's slot: codegen resolves a
+                                // pinned declaration through the entry registered
+                                // under it, an extern's as any other function's.
+                                fn_node.set_overload_entry(ctx.decl_index.register_function_signature(
+                                    ext_owner, ext_leaf, fn_node.resolved_return_type, func_type_ref,
+                                    ctx.intern_table, arena, ext_link_sym,
+                                    if (fn_node_decl.has_name_span()) { fn_node_decl.name_span } else { fn_node_decl.span },
+                                    fn_node.def, fn_node_decl));
+                                ctx.decl_index.note_extern_symbol(ext_link_sym, ext_q_name, func_type_ref);
+                                // Whether this IS a C function the compiler checks
+                                // calls to (the C `printf`) is decided by the
+                                // identity, claimed where it is registered.
+                                ctx.generic_registry.claim_wellknown(fn_node.def, ctx.intern_table);
+                                // An imported function is a declaration of this
+                                // module and takes its written visibility, as a
+                                // free function does: a `private` one is not
+                                // callable by qualified path from another module.
+                                // A C import's prototypes are its alias module's
+                                // public declarations - the alias exists to be
+                                // reached through, and the name layer declares
+                                // them so - whatever the block's text wrote.
+                                ctx.decl_index.set_decl_visibility(fn_node.def,
+                                    node.is_c_import() || fn_node.is_public);
+                            }
+                        }
+                        sig_count += node.functions.length;
+                    }
+                    DeclKind::Intrinsic(node) => {
+                        // Resolve parameter types
+                        for (mut j: i64 = 0; j < node.parameters.length; j++) {
+                            const param_decl: DeclarationNode* = node.parameters[j];
+                            const param: VarDecl* = DeclarationNode::var_of(param_decl);
+                            if (param != null && param.type_annotation != null &&
+                                !param.resolved_type.is_valid()) {
+                                const ptype: TypeRef = resolver.resolve(param.type_annotation, &runner.res_ctx);
+                                if (ptype.is_valid()) {
+                                    param.resolved_type = ptype;
+                                }
+                            }
+                        }
+                        // Resolve return type and register in DeclarationIndex
+                        if (node.return_type_annotation != null && !node.resolved_return_type.is_valid()) {
+                            const rtype: TypeRef = resolver.resolve(node.return_type_annotation, &runner.res_ctx);
+                            if (rtype.is_valid()) {
+                                node.resolved_return_type = rtype;
+                            }
+                        }
+
+                        if (node.resolved_return_type.is_valid()) {
+                            // Build FunctionType for full signature.
+                            mut i_param_types: [TypeRef] = [];
+                            for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+                                const ip_decl: DeclarationNode* = node.parameters[pi];
+                                const ip: VarDecl* = DeclarationNode::var_of(ip_decl);
+                                if (ip.resolved_type.is_valid()) {
+                                    i_param_types.push(ip.resolved_type);
+                                }
+                            }
+                            const i_func_type_ref: TypeRef = arena.get_function(
+                                node.resolved_return_type, i_param_types, node.is_variadic);
+
+                            // Register in its module's family so cross-module
+                            // externs pick up intrinsics.
+                            // Intrinsics use C linkage; their LLVM symbol is the
+                            // bare function name, not the qualified/mangled form.
+                            const i_entry: OverloadId = ctx.decl_index.register_function_signature(
+                                ctx.fn_family_of(node.def), node.name, node.resolved_return_type, i_func_type_ref, ctx.intern_table, arena,
+                                node.name, decl.span, node.def, decl);
+
+                            // The ENTRY carries the intrinsic's kind, read from
+                            // the declaration's own name here, the one place a
+                            // spelling decides it: codegen's inline decision reads
+                            // the kind off the pin.  Its leaf is a key nowhere: a
+                            // bare `malloc` with no declaration in scope is an
+                            // error, and the intrinsic is reached as
+                            // `intrinsics::malloc` like every declaration.
+                            ctx.decl_index.mark_intrinsic(i_entry,
+                                IntrinsicKind::from_name(ctx.intern_table.resolve(node.name)));
+                            // Intrinsics are always public (an intrinsic
+                            // carries no visibility); record it explicitly so
+                            // the verdict is stated rather than inherited from
+                            // `is_candidate_public`'s permissive default.
+                            ctx.decl_index.set_decl_visibility(node.def, true);
+                        }
+                        sig_count++;
+                    }
+                    DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Variant(_)
+                    | DeclKind::Destructure(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
+                    | DeclKind::GenericParam(_) | DeclKind::Enum(_) | DeclKind::Variable(_)
+                    | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
             }
         }
@@ -3375,100 +3346,92 @@ type struct TypeResolutionPasses {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration => {
-                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    mut class_ctx: ResolutionContext = runner.make_generic_context(
-                        node.generic_params, &runner.res_ctx);
-                    runner.resolve_fields(node.fields, &class_ctx);
-                    field_count += node.fields.length;
-                    runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &class_ctx);
-                    runner.emit_method_signature_diagnostics(node.methods);
-                }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Impl(node) => {
-                            mut impl_ctx: ResolutionContext = runner.make_generic_context(
-                                node.generic_params, &runner.res_ctx);
-                            // Mirror the FunctionSignature pass's trait-arg
-                            // binding so the second-pass resolution of method
-                            // signatures sees the same scope.  (This pass picks
-                            // up any param annotations missed by the first
-                            // pass; without the trait-arg bindings here, we'd
-                            // re-introduce the same `Item` lookup miss this
-                            // resolution is meant to repair.)
-                            runner.bind_trait_args_for_impl(node, &impl_ctx);
-                            // An impl head names one trait outright, and nothing
-                            // else reports a head whose trait resolves to
-                            // nothing: every consumer reads `trait_identity` and
-                            // returns quietly when it answers empty.  A
-                            // misspelled trait therefore reached a later stage as
-                            // a missing `Res` - an internal error naming no
-                            // source location - instead of as a name its author
-                            // can fix.  The head's own name is asked here, where
-                            // the type index is populated and the same
-                            // unresolved-name diagnostic every other annotation
-                            // gets is already built.
-                            if (node.is_trait_impl()) {
-                                const trait_base: TypeAnnotation* =
-                                    TypeAnnotation::head_base(node.trait_annotation);
-                                if (trait_base != null
-                                        && !resolver.resolve(trait_base,
-                                                             &impl_ctx).is_valid()) {
-                                    runner.emit_undefined_type(trait_base,
-                                        "trait", ctx.resolve_str(node.target_type), stmt.span);
-                                }
+            if (stmt.is_class()) {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                mut class_ctx: ResolutionContext = runner.make_generic_context(
+                    node.generic_params, &runner.res_ctx);
+                runner.resolve_fields(node.fields, &class_ctx);
+                field_count += node.fields.length;
+                runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &class_ctx);
+                runner.emit_method_signature_diagnostics(node.methods);
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Impl(node) => {
+                        mut impl_ctx: ResolutionContext = runner.make_generic_context(
+                            node.generic_params, &runner.res_ctx);
+                        // Mirror the FunctionSignature pass's trait-arg
+                        // binding so the second-pass resolution of method
+                        // signatures sees the same scope.  (This pass picks
+                        // up any param annotations missed by the first
+                        // pass; without the trait-arg bindings here, we'd
+                        // re-introduce the same `Item` lookup miss this
+                        // resolution is meant to repair.)
+                        runner.bind_trait_args_for_impl(node, &impl_ctx);
+                        // An impl head names one trait outright, and nothing
+                        // else reports a head whose trait resolves to
+                        // nothing: every consumer reads `trait_identity` and
+                        // returns quietly when it answers empty.  A
+                        // misspelled trait therefore reached a later stage as
+                        // a missing `Res` - an internal error naming no
+                        // source location - instead of as a name its author
+                        // can fix.  The head's own name is asked here, where
+                        // the type index is populated and the same
+                        // unresolved-name diagnostic every other annotation
+                        // gets is already built.
+                        if (node.is_trait_impl()) {
+                            const trait_base: TypeAnnotation* =
+                                TypeAnnotation::head_base(node.trait_annotation);
+                            if (trait_base != null
+                                    && !resolver.resolve(trait_base,
+                                                         &impl_ctx).is_valid()) {
+                                runner.emit_undefined_type(trait_base,
+                                    "trait", ctx.resolve_str(node.target_type), stmt.span);
                             }
-                            // The owner and its name off the stamp, as in the
-                            // FuncSig phase above.
-                            const impl_args: [TypeRef] = runner.impl_owner_args(node, &impl_ctx);
-                            runner.resolve_method_signatures(node.methods, &impl_ctx,
-                                ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def(), &impl_args);
-                            runner.emit_method_signature_diagnostics(node.methods);
-                            runner.check_impl_conformance(stmt, node, &impl_ctx);
                         }
-                        DeclKind::Struct(node) => {
-                            mut struct_ctx: ResolutionContext = runner.make_generic_context(
-                                node.generic_params, &runner.res_ctx);
-                            runner.resolve_fields(node.fields, &struct_ctx);
-                            field_count += node.fields.length;
-                            // Re-resolve the inline methods' signatures now that
-                            // the owner type exists in the arena.  The
-                            // DeclarationCollection FunctionSignature pass ran
-                            // before this type was registered, so its owner lookup
-                            // was invalid and a by-value `this` receiver (which
-                            // carries no annotation) was left without a
-                            // resolved_type.  Impl-block methods are repaired by
-                            // the implement-block arm; inline methods need
-                            // the same repair here, or a consuming method
-                            // (`fn m(mut this)`) reaches drop-insertion with an
-                            // unresolved receiver and its by-value `this` is never
-                            // dropped - a leak on every call.
-                            runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &struct_ctx);
-                            runner.emit_method_signature_diagnostics(node.methods);
-                        }
-                        DeclKind::Union(node) => {
-                            mut union_ctx: ResolutionContext = runner.make_generic_context(
-                                node.generic_params, &runner.res_ctx);
-                            runner.resolve_fields(node.fields, &union_ctx);
-                            field_count += node.fields.length;
-                            runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &union_ctx);
-                            runner.emit_method_signature_diagnostics(node.methods);
-                        }
-                        // Enum variant associated types (now TypeAnnotation*) are
-                        // resolved during monomorphization for generic enums;
-                        // non-generic enums' by sema when it checks match arms.
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
-                        | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+                        // The owner and its name off the stamp, as in the
+                        // FuncSig phase above.
+                        const impl_args: [TypeRef] = runner.impl_owner_args(node, &impl_ctx);
+                        runner.resolve_method_signatures(node.methods, &impl_ctx,
+                            ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def(), &impl_args);
+                        runner.emit_method_signature_diagnostics(node.methods);
+                        runner.check_impl_conformance(stmt, node, &impl_ctx);
                     }
-                }
-                _ => {
-                    // Enum variant associated types (now TypeAnnotation*) are resolved
-                    // during monomorphization for generic enums.  Non-generic enums'
-                    // variant types are resolved by sema when type-checking match arms.
+                    DeclKind::Struct(node) => {
+                        mut struct_ctx: ResolutionContext = runner.make_generic_context(
+                            node.generic_params, &runner.res_ctx);
+                        runner.resolve_fields(node.fields, &struct_ctx);
+                        field_count += node.fields.length;
+                        // Re-resolve the inline methods' signatures now that
+                        // the owner type exists in the arena.  The
+                        // DeclarationCollection FunctionSignature pass ran
+                        // before this type was registered, so its owner lookup
+                        // was invalid and a by-value `this` receiver (which
+                        // carries no annotation) was left without a
+                        // resolved_type.  Impl-block methods are repaired by
+                        // the implement-block arm; inline methods need
+                        // the same repair here, or a consuming method
+                        // (`fn m(mut this)`) reaches drop-insertion with an
+                        // unresolved receiver and its by-value `this` is never
+                        // dropped - a leak on every call.
+                        runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &struct_ctx);
+                        runner.emit_method_signature_diagnostics(node.methods);
+                    }
+                    DeclKind::Union(node) => {
+                        mut union_ctx: ResolutionContext = runner.make_generic_context(
+                            node.generic_params, &runner.res_ctx);
+                        runner.resolve_fields(node.fields, &union_ctx);
+                        field_count += node.fields.length;
+                        runner.resolve_inline_method_signatures(node.def, node.methods, &node.generic_params, &union_ctx);
+                        runner.emit_method_signature_diagnostics(node.methods);
+                    }
+                    // Enum variant associated types (now TypeAnnotation*) are
+                    // resolved during monomorphization for generic enums;
+                    // non-generic enums' by sema when it checks match arms.
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
+                    | DeclKind::Function(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
             }
         }
@@ -3483,118 +3446,114 @@ type struct TypeResolutionPasses {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration => {
-                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    if (!node.is_generic()) {
-                        for (mut j: i64 = 0; j < node.methods.length; j++) {
-                            const method_decl: DeclarationNode* = node.methods[j];
-                            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
-                            if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
-                                mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                    DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
-                                runner.resolve_var_types_in_stmt(
-                                    DeclarationNode::fn_of(method.func).body, &m_ctx);
-                                body_count++;
-                            }
+            if (stmt.is_class()) {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (!node.is_generic()) {
+                    for (mut j: i64 = 0; j < node.methods.length; j++) {
+                        const method_decl: DeclarationNode* = node.methods[j];
+                        const method: MethodDecl* = DeclarationNode::method_of(method_decl);
+                        if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                            mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
+                            runner.resolve_var_types_in_stmt(
+                                DeclarationNode::fn_of(method.func).body, &m_ctx);
+                            body_count++;
                         }
                     }
                 }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Function(func) => {
-                            if (func.body != null && !func.is_generic()) {
-                                runner.resolve_var_types_in_stmt(func.body, &runner.res_ctx);
-                                body_count++;
-                            }
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Function(func) => {
+                        if (func.body != null && !func.is_generic()) {
+                            runner.resolve_var_types_in_stmt(func.body, &runner.res_ctx);
+                            body_count++;
                         }
-                        DeclKind::Struct(node) => {
-                            if (!node.is_generic()) {
-                                for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method_decl: DeclarationNode* = node.methods[j];
-                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
-                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
-                                        // Method-level generics (`Layout::array<T>(n)`)
-                                        // must be in scope when the walker reaches a
-                                        // `mut x: T = ...` body annotation; without
-                                        // the binding, the resolver returns invalid
-                                        // and `emit_undefined_type` fires E0203 on a
-                                        // perfectly legal generic param.
-                                        mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                            DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
-                                        runner.resolve_var_types_in_stmt(
-                                            DeclarationNode::fn_of(method.func).body, &m_ctx);
-                                        body_count++;
-                                    }
-                                }
-                            }
-                        }
-                        DeclKind::Union(node) => {
-                            if (!node.is_generic()) {
-                                for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method_decl: DeclarationNode* = node.methods[j];
-                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
-                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
-                                        mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                            DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
-                                        runner.resolve_var_types_in_stmt(
-                                            DeclarationNode::fn_of(method.func).body, &m_ctx);
-                                        body_count++;
-                                    }
-                                }
-                            }
-                        }
-                        DeclKind::Trait(node) => {
-                            if (!node.is_generic()) {
-                                for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const func_decl: DeclarationNode* = node.methods[j];
-                                    const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
-                                    if (func != null && func.body != null) {
-                                        mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                            func.generic_params, &runner.res_ctx);
-                                        runner.resolve_var_types_in_stmt(
-                                            func.body, &m_ctx);
-                                        body_count++;
-                                    }
-                                }
-                            }
-                        }
-                        DeclKind::Impl(node) => {
-                            if (!node.is_generic()) {
-                                // Build the per-impl context that mirrors what
-                                // FunctionSignature uses: the impl's own
-                                // `<T, ...>` plus the trait's outer params bound
-                                // to the impl's trait args (so the trait's
-                                // `Item` resolves to the impl's concrete `T`).
-                                // `synthesize_default_trait_methods` may have
-                                // cloned default methods (e.g. `fold<Acc>` from
-                                // `Iterator<Item>`); their bodies reference both
-                                // the trait's `Item` and the method's own `Acc`,
-                                // so all three layers must be pushed before the
-                                // body walk to avoid spurious E0203.
-                                mut impl_ctx: ResolutionContext = runner.make_generic_context(
-                                    node.generic_params, &runner.res_ctx);
-                                runner.bind_trait_args_for_impl(node, &impl_ctx);
-                                for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method_decl: DeclarationNode* = node.methods[j];
-                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
-                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
-                                        mut m_ctx: ResolutionContext = runner.make_generic_context(
-                                            DeclarationNode::fn_of(method.func).generic_params, &impl_ctx);
-                                        runner.resolve_var_types_in_stmt(
-                                            DeclarationNode::fn_of(method.func).body, &m_ctx);
-                                        body_count++;
-                                    }
-                                }
-                            }
-                        }
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
+                    DeclKind::Struct(node) => {
+                        if (!node.is_generic()) {
+                            for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                const method_decl: DeclarationNode* = node.methods[j];
+                                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
+                                if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                                    // Method-level generics (`Layout::array<T>(n)`)
+                                    // must be in scope when the walker reaches a
+                                    // `mut x: T = ...` body annotation; without
+                                    // the binding, the resolver returns invalid
+                                    // and `emit_undefined_type` fires E0203 on a
+                                    // perfectly legal generic param.
+                                    mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                        DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
+                                    runner.resolve_var_types_in_stmt(
+                                        DeclarationNode::fn_of(method.func).body, &m_ctx);
+                                    body_count++;
+                                }
+                            }
+                        }
+                    }
+                    DeclKind::Union(node) => {
+                        if (!node.is_generic()) {
+                            for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                const method_decl: DeclarationNode* = node.methods[j];
+                                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
+                                if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                                    mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                        DeclarationNode::fn_of(method.func).generic_params, &runner.res_ctx);
+                                    runner.resolve_var_types_in_stmt(
+                                        DeclarationNode::fn_of(method.func).body, &m_ctx);
+                                    body_count++;
+                                }
+                            }
+                        }
+                    }
+                    DeclKind::Trait(node) => {
+                        if (!node.is_generic()) {
+                            for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                const func_decl: DeclarationNode* = node.methods[j];
+                                const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+                                if (func != null && func.body != null) {
+                                    mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                        func.generic_params, &runner.res_ctx);
+                                    runner.resolve_var_types_in_stmt(
+                                        func.body, &m_ctx);
+                                    body_count++;
+                                }
+                            }
+                        }
+                    }
+                    DeclKind::Impl(node) => {
+                        if (!node.is_generic()) {
+                            // Build the per-impl context that mirrors what
+                            // FunctionSignature uses: the impl's own
+                            // `<T, ...>` plus the trait's outer params bound
+                            // to the impl's trait args (so the trait's
+                            // `Item` resolves to the impl's concrete `T`).
+                            // `synthesize_default_trait_methods` may have
+                            // cloned default methods (e.g. `fold<Acc>` from
+                            // `Iterator<Item>`); their bodies reference both
+                            // the trait's `Item` and the method's own `Acc`,
+                            // so all three layers must be pushed before the
+                            // body walk to avoid spurious E0203.
+                            mut impl_ctx: ResolutionContext = runner.make_generic_context(
+                                node.generic_params, &runner.res_ctx);
+                            runner.bind_trait_args_for_impl(node, &impl_ctx);
+                            for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                const method_decl: DeclarationNode* = node.methods[j];
+                                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
+                                if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                                    mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                        DeclarationNode::fn_of(method.func).generic_params, &impl_ctx);
+                                    runner.resolve_var_types_in_stmt(
+                                        DeclarationNode::fn_of(method.func).body, &m_ctx);
+                                    body_count++;
+                                }
+                            }
+                        }
+                    }
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+                    | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
-                _ => {}
             }
         }
 
@@ -3610,66 +3569,62 @@ type struct TypeResolutionPasses {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration => {
-                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    if (!node.is_generic()) {
-                        for (mut j: i64 = 0; j < node.methods.length; j++) {
-                            const method_decl: DeclarationNode* = node.methods[j];
-                            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
-                            if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
-                                runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
-                            }
+            if (stmt.is_class()) {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (!node.is_generic()) {
+                    for (mut j: i64 = 0; j < node.methods.length; j++) {
+                        const method_decl: DeclarationNode* = node.methods[j];
+                        const method: MethodDecl* = DeclarationNode::method_of(method_decl);
+                        if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                            runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
                         }
                     }
                 }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Function(func) => {
-                            if (func.body != null && !func.is_generic()) {
-                                runner.collect_generic_fn_calls_in_stmt(func.body, &runner.res_ctx);
-                            }
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Function(func) => {
+                        if (func.body != null && !func.is_generic()) {
+                            runner.collect_generic_fn_calls_in_stmt(func.body, &runner.res_ctx);
                         }
-                        DeclKind::Impl(node) => {
-                            if (!node.is_generic()) {
-                                for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method_decl: DeclarationNode* = node.methods[j];
-                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
-                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
-                                        runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
-                                    }
-                                }
-                            }
-                        }
-                        DeclKind::Struct(node) => {
-                            if (!node.is_generic()) {
-                                for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method_decl: DeclarationNode* = node.methods[j];
-                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
-                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
-                                        runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
-                                    }
-                                }
-                            }
-                        }
-                        DeclKind::Union(node) => {
-                            if (!node.is_generic()) {
-                                for (mut j: i64 = 0; j < node.methods.length; j++) {
-                                    const method_decl: DeclarationNode* = node.methods[j];
-                                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
-                                    if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
-                                        runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
-                                    }
-                                }
-                            }
-                        }
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                     }
+                    DeclKind::Impl(node) => {
+                        if (!node.is_generic()) {
+                            for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                const method_decl: DeclarationNode* = node.methods[j];
+                                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
+                                if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                                    runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
+                                }
+                            }
+                        }
+                    }
+                    DeclKind::Struct(node) => {
+                        if (!node.is_generic()) {
+                            for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                const method_decl: DeclarationNode* = node.methods[j];
+                                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
+                                if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                                    runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
+                                }
+                            }
+                        }
+                    }
+                    DeclKind::Union(node) => {
+                        if (!node.is_generic()) {
+                            for (mut j: i64 = 0; j < node.methods.length; j++) {
+                                const method_decl: DeclarationNode* = node.methods[j];
+                                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
+                                if (method != null && method.func != null && DeclarationNode::fn_of(method.func).body != null) {
+                                    runner.collect_generic_fn_calls_in_stmt(DeclarationNode::fn_of(method.func).body, &runner.res_ctx);
+                                }
+                            }
+                        }
+                    }
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
-                _ => {}
             }
         }
 
@@ -3825,246 +3780,242 @@ type struct TypeResolutionPasses {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration => {
-                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    if (node.is_generic()) { continue; }
+            if (stmt.is_class()) {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (node.is_generic()) { continue; }
 
-                    const type_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/class field sync");
-                    if (!type_ref.is_valid()) { continue; }
+                const type_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/class field sync");
+                if (!type_ref.is_valid()) { continue; }
 
-                    const base_type: Type* = arena.lookup(type_ref);
-                    if (base_type == null || base_type.kind != TypeKind::Class) { continue; }
+                const base_type: Type* = arena.lookup(type_ref);
+                if (base_type == null || base_type.kind != TypeKind::Class) { continue; }
 
-                    mut ct: ClassType* = base_type.as_class();
-                    mut field_infos: [FieldInfo] = [];
-                    for (mut j: i64 = 0; j < node.fields.length; j++) {
-                        const field_decl: DeclarationNode* = node.fields[j];
-                        const field: FieldDecl* = DeclarationNode::field_of(field_decl);
-                        if (field == null) { continue; }
-                        // See `sync_struct_members`: never bake an unresolved
-                        // field type into the arena. Emit E0203 so the pass fails
-                        // and Phase 5 aborts before the poisoned ClassType reaches
-                        // layout/vtable codegen.
-                        if (!field.resolved_type.is_valid()) {
-                            const fname: string = ctx.intern_table.resolve(field.name);
-                            const sname: string = ctx.intern_table.resolve(node.name);
+                mut ct: ClassType* = base_type.as_class();
+                mut field_infos: [FieldInfo] = [];
+                for (mut j: i64 = 0; j < node.fields.length; j++) {
+                    const field_decl: DeclarationNode* = node.fields[j];
+                    const field: FieldDecl* = DeclarationNode::field_of(field_decl);
+                    if (field == null) { continue; }
+                    // See `sync_struct_members`: never bake an unresolved
+                    // field type into the arena. Emit E0203 so the pass fails
+                    // and Phase 5 aborts before the poisoned ClassType reaches
+                    // layout/vtable codegen.
+                    if (!field.resolved_type.is_valid()) {
+                        const fname: string = ctx.intern_table.resolve(field.name);
+                        const sname: string = ctx.intern_table.resolve(node.name);
+                        ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+                            fmt::format("cannot resolve type for field `%s` of `%s`", fname, sname),
+                            field_decl.span);
+                        continue;
+                    }
+                    const is_pub: boolean = field.visibility == Visibility::Public;
+                    const is_prot: boolean = field.visibility == Visibility::Protected;
+                    mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true);
+                    fi.set_default_value(field.default_value);
+                    field_infos.push(fi);
+                }
+                ct.set_fields(field_infos);
+
+                // See `sync_struct_members` - layout attrs are propagated
+                // in DirectiveProcessing.
+
+                // Populate ClassType.methods from the AST so virtual
+                // dispatch machinery (vtable emission, `has_virtual_methods`
+                // flag, slot indexing) has the data it needs.  Without
+                // this, cls.methods stays empty and every class looks
+                // non-virtual; the `new T(...)` path never stores a
+                // vtable pointer and polymorphic calls never dispatch
+                // through one.
+                for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
+                    const mnode_decl: DeclarationNode* = node.methods[jm];
+                    const mnode: MethodDecl* = DeclarationNode::method_of(mnode_decl);
+                    if (mnode == null || mnode.func == null) { continue; }
+                    const fn_node_decl: DeclarationNode* = mnode.func;
+                    const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
+                    // Build the canonical parameter-type list: skip
+                    // self params (`&this` / `this`).  These are the
+                    // overload discriminator for vtable slot identity
+                    // and the signature against which sema matches
+                    // call arguments during overload resolution.
+                    mut ptypes: [TypeRef] = [];
+                    for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                        const pp_decl: DeclarationNode* = fn_node.parameters[pi];
+                        const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
+                        if (pp == null) { continue; }
+                        if (pp.is_receiver()) { continue; }
+                        ptypes.push(pp.resolved_type);
+                    }
+                    const fn_ty: TypeRef = arena.get_function(
+                        fn_node.resolved_return_type, ptypes, fn_node.is_variadic);
+                    const minfo: MethodInfo = MethodInfo {
+                        name:          fn_node.name,
+                        function_type: fn_ty,
+                        is_public:     mnode.visibility == Visibility::Public,
+                        is_protected:  mnode.visibility == Visibility::Protected,
+                        is_static:     mnode.is_static,
+                        is_virtual:    mnode.is_virtual,
+                        is_override:   mnode.is_override,
+                        param_types:   ptypes,
+                        ast_node:      mnode_decl as void*,
+                    };
+                    ct.add_method(minfo);
+                    const dbg_cname: string = ctx.intern_table.resolve(node.name);
+                    const dbg_mname: string = ctx.intern_table.resolve(fn_node.name);
+                    cdebug("[VT-DBG] add_method class='%s' method='%s' virt=%d over=%d hv=%d\n",
+                           dbg_cname, dbg_mname, mnode.is_virtual as i32,
+                           mnode.is_override as i32, ct.has_virtual_methods as i32);
+                }
+
+                // The base names one declaration, and which one is settled
+                // by the scope the class was WRITTEN in - so it is read
+                // from the stamp NameResolution left, not re-derived here.
+                // A bare leaf cannot be requalified from this pass's
+                // position: the base's own module may repeat its name
+                // (`compiler::types::type_base::Type`), and no amount of
+                // qualifying from the wrong module produces that.
+                if (node.has_base_class()) {
+                    const base_ref: TypeRef = ctx.decl_index.type_of_res(
+                        node.require_base_res("type_resolution: class base"));
+                    if (base_ref.is_valid()) {
+                        ct.set_base_class(base_ref);
+                        // Propagate vtable presence: if any ancestor has
+                        // virtual methods, this subclass needs a vtable
+                        // slot too (even if it only inherits, doesn't
+                        // add its own virtuals).
+                        mut anc_ref: TypeRef = base_ref;
+                        mut anc_depth: i32 = 0;
+                        while (anc_depth < 16) {
+                            const anc_t: Type* = arena.lookup(anc_ref);
+                            if (anc_t == null || anc_t.kind != TypeKind::Class) { break; }
+                            const anc_cls: ClassType* = anc_t.as_class();
+                            if (anc_cls.has_virtual_methods) {
+                                ct.has_virtual_methods = true;
+                                break;
+                            }
+                            if (!anc_cls.has_base || !anc_cls.base_class.is_valid()) { break; }
+                            anc_ref = anc_cls.base_class;
+                            anc_depth += 1;
+                        }
+                        TypeResolutionPasses::refuse_allocate_below_base(ctx, type_ref, base_ref);
+                    }
+                }
+                class_count++;
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Struct(sn) => {
+                        if (TypeResolutionPasses::sync_struct_members(sn, ctx, arena)) { struct_count++; }
+                        continue;
+                    }
+                    DeclKind::Union(un) => {
+                        if (TypeResolutionPasses::sync_union_members(un, ctx, arena)) { struct_count++; }
+                        continue;
+                    }
+                    DeclKind::Impl(ib) => {
+                        TypeResolutionPasses::sync_impl_methods(ib, ctx, arena);
+                        continue;
+                    }
+                    DeclKind::Enum(_) => { }
+                    // No other kind with a payload has members to sync.
+                    DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Field(_)
+                    | DeclKind::GenericParam(_) | DeclKind::Import(_) | DeclKind::Intrinsic(_)
+                    | DeclKind::Module(_) | DeclKind::Trait(_) | DeclKind::TypeAlias(_)
+                    | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Function(_)
+                    | DeclKind::Method(_) | DeclKind::Legacy => { continue; }
+                }
+                const node: EnumDecl* = DeclarationNode::enum_of(stmt);
+
+                const type_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/enum field sync");
+                if (!type_ref.is_valid()) { continue; }
+
+                const base_type: Type* = arena.lookup(type_ref);
+                if (base_type == null || base_type.kind != TypeKind::Enum) { continue; }
+
+                mut et: EnumType* = base_type.as_enum();
+                // Only populate if not already populated (avoid double-populating)
+                if (et.variants.length > 0) { continue; }
+
+                // Build a resolution context.  For generic enums, bind each
+                // generic parameter to its GenericParam TypeRef so that
+                // variant payload annotations referencing `T` resolve to the
+                // enum's own GenericParam_T.  Without this, generic enums had
+                // empty variant info; the monomorphizer's substitution
+                // path falls back to AST re-resolution on partially-
+                // specialized clones (e.g., Option<T*> where the outer T is
+                // still generic), which can't find `T` in a binding-free
+                // context.  Populating the base lets specialization apply
+                // substitution to a known-good source.
+                mut res_ctx: ResolutionContext = ResolutionContext::new(ctx.source_file);
+                // The variant payload annotations mean what the module that
+                // WROTE this enum says.  That is the cursor for
+                // a declaration this module actually owns - this walk is in
+                // order - but not for one INJECTED into this root by
+                // specialization, which carries its template's span.  The
+                // span is right in both cases; `module_name` above is the
+                // cursor spelled out, and is kept only as the current-module
+                // string the resolver uses for `[T; NAME]` array sizes.
+                // Use the canonical helper so the parameter types match
+                // what template-registration created for the same enum.
+                const refs: [TypeRef] = TypeResolutionPasses::create_generic_param_types(
+                    node.generic_params, arena);
+                for (mut gpi: i64 = 0; gpi < node.generic_params.length; gpi++) {
+                    const gp_decl: DeclarationNode* = node.generic_params[gpi];
+                    const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
+                    if (gp == null) { continue; }
+                    res_ctx.add_binding(gp.sym_id, gp.name, refs[gpi]);
+                }
+
+                // Discriminants come from the declaration itself, which
+                // is also what a compile-time fold of `Enum::Variant`
+                // reads; computing them here as well would let the tag
+                // an expression sees drift from the tag the type carries.
+                const tags: [i64] = node.variant_tags();
+                for (mut j: i64 = 0; j < node.variants.length; j++) {
+                    const variant_decl: DeclarationNode* = node.variants[j];
+                    const variant: EnumVariant* = DeclarationNode::variant_of(variant_decl);
+                    if (variant == null) { continue; }
+
+                    mut payload_types: [TypeRef] = [];
+                    for (mut k: i64 = 0; k < variant.associated_types.length; k++) {
+                        const ann: TypeAnnotation* = variant.associated_types[k];
+                        mut resolved: TypeRef = TypeRef::invalid();
+                        if (ann != null) {
+                            resolved = ctx.type_resolver.resolve(ann, &res_ctx);
+                        }
+                        // Never bake an unresolved payload into the enum: the
+                        // variant would be sized from the id-0 sentinel (wrong
+                        // layout / discriminant) or ICE the mangler, decoupled
+                        // from any diagnostic. Emit E0203 so the pass fails and
+                        // Phase 5 aborts before codegen.
+                        if (!resolved.is_valid()) {
+                            const vname: string = ctx.intern_table.resolve(variant.name);
+                            const ename: string = ctx.intern_table.resolve(node.name);
                             ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
-                                fmt::format("cannot resolve type for field `%s` of `%s`", fname, sname),
-                                field_decl.span);
+                                fmt::format("cannot resolve payload type for variant `%s` of enum `%s`", vname, ename),
+                                variant_decl.span);
                             continue;
                         }
-                        const is_pub: boolean = field.visibility == Visibility::Public;
-                        const is_prot: boolean = field.visibility == Visibility::Protected;
-                        mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true);
-                        fi.set_default_value(field.default_value);
-                        field_infos.push(fi);
-                    }
-                    ct.set_fields(field_infos);
-
-                    // See `sync_struct_members` - layout attrs are propagated
-                    // in DirectiveProcessing.
-
-                    // Populate ClassType.methods from the AST so virtual
-                    // dispatch machinery (vtable emission, `has_virtual_methods`
-                    // flag, slot indexing) has the data it needs.  Without
-                    // this, cls.methods stays empty and every class looks
-                    // non-virtual; the `new T(...)` path never stores a
-                    // vtable pointer and polymorphic calls never dispatch
-                    // through one.
-                    for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
-                        const mnode_decl: DeclarationNode* = node.methods[jm];
-                        const mnode: MethodDecl* = DeclarationNode::method_of(mnode_decl);
-                        if (mnode == null || mnode.func == null) { continue; }
-                        const fn_node_decl: DeclarationNode* = mnode.func;
-                        const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
-                        // Build the canonical parameter-type list: skip
-                        // self params (`&this` / `this`).  These are the
-                        // overload discriminator for vtable slot identity
-                        // and the signature against which sema matches
-                        // call arguments during overload resolution.
-                        mut ptypes: [TypeRef] = [];
-                        for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
-                            const pp_decl: DeclarationNode* = fn_node.parameters[pi];
-                            const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
-                            if (pp == null) { continue; }
-                            if (pp.is_receiver()) { continue; }
-                            ptypes.push(pp.resolved_type);
-                        }
-                        const fn_ty: TypeRef = arena.get_function(
-                            fn_node.resolved_return_type, ptypes, fn_node.is_variadic);
-                        const minfo: MethodInfo = MethodInfo {
-                            name:          fn_node.name,
-                            function_type: fn_ty,
-                            is_public:     mnode.visibility == Visibility::Public,
-                            is_protected:  mnode.visibility == Visibility::Protected,
-                            is_static:     mnode.is_static,
-                            is_virtual:    mnode.is_virtual,
-                            is_override:   mnode.is_override,
-                            param_types:   ptypes,
-                            ast_node:      mnode_decl as void*,
-                        };
-                        ct.add_method(minfo);
-                        const dbg_cname: string = ctx.intern_table.resolve(node.name);
-                        const dbg_mname: string = ctx.intern_table.resolve(fn_node.name);
-                        cdebug("[VT-DBG] add_method class='%s' method='%s' virt=%d over=%d hv=%d\n",
-                               dbg_cname, dbg_mname, mnode.is_virtual as i32,
-                               mnode.is_override as i32, ct.has_virtual_methods as i32);
+                        payload_types.push(resolved);
                     }
 
-                    // The base names one declaration, and which one is settled
-                    // by the scope the class was WRITTEN in - so it is read
-                    // from the stamp NameResolution left, not re-derived here.
-                    // A bare leaf cannot be requalified from this pass's
-                    // position: the base's own module may repeat its name
-                    // (`compiler::types::type_base::Type`), and no amount of
-                    // qualifying from the wrong module produces that.
-                    if (node.has_base_class()) {
-                        const base_ref: TypeRef = ctx.decl_index.type_of_res(
-                            node.require_base_res("type_resolution: class base"));
-                        if (base_ref.is_valid()) {
-                            ct.set_base_class(base_ref);
-                            // Propagate vtable presence: if any ancestor has
-                            // virtual methods, this subclass needs a vtable
-                            // slot too (even if it only inherits, doesn't
-                            // add its own virtuals).
-                            mut anc_ref: TypeRef = base_ref;
-                            mut anc_depth: i32 = 0;
-                            while (anc_depth < 16) {
-                                const anc_t: Type* = arena.lookup(anc_ref);
-                                if (anc_t == null || anc_t.kind != TypeKind::Class) { break; }
-                                const anc_cls: ClassType* = anc_t.as_class();
-                                if (anc_cls.has_virtual_methods) {
-                                    ct.has_virtual_methods = true;
-                                    break;
-                                }
-                                if (!anc_cls.has_base || !anc_cls.base_class.is_valid()) { break; }
-                                anc_ref = anc_cls.base_class;
-                                anc_depth += 1;
-                            }
-                            TypeResolutionPasses::refuse_allocate_below_base(ctx, type_ref, base_ref);
-                        }
-                    }
-                    class_count++;
+                    et.add_variant(EnumVariantInfo::new(
+                        variant.name, payload_types, tags[j] as u64));
                 }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Struct(sn) => {
-                            if (TypeResolutionPasses::sync_struct_members(sn, ctx, arena)) { struct_count++; }
-                            continue;
-                        }
-                        DeclKind::Union(un) => {
-                            if (TypeResolutionPasses::sync_union_members(un, ctx, arena)) { struct_count++; }
-                            continue;
-                        }
-                        DeclKind::Impl(ib) => {
-                            TypeResolutionPasses::sync_impl_methods(ib, ctx, arena);
-                            continue;
-                        }
-                        DeclKind::Enum(_) => { }
-                        // No other kind with a payload has members to sync.
-                        DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Field(_)
-                        | DeclKind::GenericParam(_) | DeclKind::Import(_) | DeclKind::Intrinsic(_)
-                        | DeclKind::Module(_) | DeclKind::Trait(_) | DeclKind::TypeAlias(_)
-                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Function(_)
-                        | DeclKind::Method(_) | DeclKind::Legacy => { continue; }
+
+                // Resolve the explicit discriminant base (`type enum Foo
+                // : i64`), if any, so codegen lowers the tag at the
+                // declared C-ABI width instead of the default i32 - fixing
+                // both FFI width round-trips and large-discriminant
+                // truncation (`Hi = 4294967296` -> 0 under an i32 tag).
+                if (node.discriminant_annotation != null) {
+                    const disc: TypeRef = ctx.type_resolver.resolve(
+                        node.discriminant_annotation, &res_ctx);
+                    if (disc.is_valid()) {
+                        et.set_discriminant_type(disc);
                     }
-                    const node: EnumDecl* = DeclarationNode::enum_of(stmt);
-
-                    const type_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/enum field sync");
-                    if (!type_ref.is_valid()) { continue; }
-
-                    const base_type: Type* = arena.lookup(type_ref);
-                    if (base_type == null || base_type.kind != TypeKind::Enum) { continue; }
-
-                    mut et: EnumType* = base_type.as_enum();
-                    // Only populate if not already populated (avoid double-populating)
-                    if (et.variants.length > 0) { continue; }
-
-                    // Build a resolution context.  For generic enums, bind each
-                    // generic parameter to its GenericParam TypeRef so that
-                    // variant payload annotations referencing `T` resolve to the
-                    // enum's own GenericParam_T.  Without this, generic enums had
-                    // empty variant info; the monomorphizer's substitution
-                    // path falls back to AST re-resolution on partially-
-                    // specialized clones (e.g., Option<T*> where the outer T is
-                    // still generic), which can't find `T` in a binding-free
-                    // context.  Populating the base lets specialization apply
-                    // substitution to a known-good source.
-                    mut res_ctx: ResolutionContext = ResolutionContext::new(ctx.source_file);
-                    // The variant payload annotations mean what the module that
-                    // WROTE this enum says.  That is the cursor for
-                    // a declaration this module actually owns - this walk is in
-                    // order - but not for one INJECTED into this root by
-                    // specialization, which carries its template's span.  The
-                    // span is right in both cases; `module_name` above is the
-                    // cursor spelled out, and is kept only as the current-module
-                    // string the resolver uses for `[T; NAME]` array sizes.
-                    // Use the canonical helper so the parameter types match
-                    // what template-registration created for the same enum.
-                    const refs: [TypeRef] = TypeResolutionPasses::create_generic_param_types(
-                        node.generic_params, arena);
-                    for (mut gpi: i64 = 0; gpi < node.generic_params.length; gpi++) {
-                        const gp_decl: DeclarationNode* = node.generic_params[gpi];
-                        const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
-                        if (gp == null) { continue; }
-                        res_ctx.add_binding(gp.sym_id, gp.name, refs[gpi]);
-                    }
-
-                    // Discriminants come from the declaration itself, which
-                    // is also what a compile-time fold of `Enum::Variant`
-                    // reads; computing them here as well would let the tag
-                    // an expression sees drift from the tag the type carries.
-                    const tags: [i64] = node.variant_tags();
-                    for (mut j: i64 = 0; j < node.variants.length; j++) {
-                        const variant_decl: DeclarationNode* = node.variants[j];
-                        const variant: EnumVariant* = DeclarationNode::variant_of(variant_decl);
-                        if (variant == null) { continue; }
-
-                        mut payload_types: [TypeRef] = [];
-                        for (mut k: i64 = 0; k < variant.associated_types.length; k++) {
-                            const ann: TypeAnnotation* = variant.associated_types[k];
-                            mut resolved: TypeRef = TypeRef::invalid();
-                            if (ann != null) {
-                                resolved = ctx.type_resolver.resolve(ann, &res_ctx);
-                            }
-                            // Never bake an unresolved payload into the enum: the
-                            // variant would be sized from the id-0 sentinel (wrong
-                            // layout / discriminant) or ICE the mangler, decoupled
-                            // from any diagnostic. Emit E0203 so the pass fails and
-                            // Phase 5 aborts before codegen.
-                            if (!resolved.is_valid()) {
-                                const vname: string = ctx.intern_table.resolve(variant.name);
-                                const ename: string = ctx.intern_table.resolve(node.name);
-                                ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
-                                    fmt::format("cannot resolve payload type for variant `%s` of enum `%s`", vname, ename),
-                                    variant_decl.span);
-                                continue;
-                            }
-                            payload_types.push(resolved);
-                        }
-
-                        et.add_variant(EnumVariantInfo::new(
-                            variant.name, payload_types, tags[j] as u64));
-                    }
-
-                    // Resolve the explicit discriminant base (`type enum Foo
-                    // : i64`), if any, so codegen lowers the tag at the
-                    // declared C-ABI width instead of the default i32 - fixing
-                    // both FFI width round-trips and large-discriminant
-                    // truncation (`Hi = 4294967296` -> 0 under an i32 tag).
-                    if (node.discriminant_annotation != null) {
-                        const disc: TypeRef = ctx.type_resolver.resolve(
-                            node.discriminant_annotation, &res_ctx);
-                        if (disc.is_valid()) {
-                            et.set_discriminant_type(disc);
-                        }
-                    }
-
-                    // See `sync_struct_members` - layout attrs are propagated
-                    // in DirectiveProcessing.
                 }
-                _ => {}
+
+                // See `sync_struct_members` - layout attrs are propagated
+                // in DirectiveProcessing.
             }
         }
 

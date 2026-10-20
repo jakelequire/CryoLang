@@ -17,7 +17,7 @@ import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::ast;
 import compiler::ast::{
-    expression, ImportStyle, node, NodeKind, pattern, statement, TraitBound,
+    expression, ImportStyle, node, pattern, statement, TraitBound,
     TraitRef, TypeAnnotation, Visibility
 };
 import compiler::types::type_ref;
@@ -38,13 +38,21 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::ast::expression::{ ExpressionNode };
 import compiler::ast::pattern::{ DirectiveArgKind, DirectiveNode };
 import compiler::ast::statement::{ Stmt };
-import compiler::ast::node::{ ASTNode };
 import compiler::ast::walk::{ Walk };
 import compiler::codegen::ast_arena::{ cryo_ast_arena_alloc };
 import utils::keyword::{ Keyword };
 
-type class DeclarationNode : ASTNode {
+/// Every declaration: what all kinds share, and which kind it is.  Still a
+/// class: a class declaration (`ClassDeclNode`) is its one subclass, until
+/// the class feature is deleted.
+type class DeclarationNode {
 public:
+    span:                SourceSpan;
+    has_error:           boolean;
+    /// The compiler wrote this declaration where the source spells nothing
+    /// (a lambda's closure struct); a reader asking what is written at a
+    /// position (the editor) skips it whole.
+    generated:           boolean;
     documentation:       string;
     source_file:         string;
     name_span:           SourceSpan;
@@ -59,12 +67,14 @@ public:
     /// declaration carries no modifier.
     modifier_span:       SourceSpan;
     /// Which declaration this is, for a kind whose fields live in a payload;
-    /// such a declaration is built with `NodeKind::Declaration`.  `Legacy`
-    /// for a kind still declared as a subclass of this header, which its
-    /// own `NodeKind` names.
+    /// `Legacy` for a class, the one kind still declared as a subclass of
+    /// this header.
     shape:               DeclKind;
 
-    DeclarationNode(kind: NodeKind, span: SourceSpan) : ASTNode(kind, span) {
+    DeclarationNode(span: SourceSpan) {
+        this.span                = span;
+        this.has_error           = false;
+        this.generated           = false;
         this.documentation       = "";
         this.source_file         = "";
         this.name_span           = SourceSpan::none();
@@ -75,15 +85,28 @@ public:
 
     /// A declaration of `shape` at `span`, with the header's defaults.
     static of(shape: DeclKind, span: SourceSpan) -> DeclarationNode* {
-        const d: DeclarationNode* = new DeclarationNode(NodeKind::Declaration, span);
+        const d: DeclarationNode* = new DeclarationNode(span);
         d.shape = shape;
         return d;
     }
 
-    /// `d` when its kind has a payload; null for a class (the one kind
-    /// still declared as a subclass) and for null.
+    /// Whether this is a class declaration (`ClassDeclNode`).
+    is_class() -> boolean {
+        return match (this.shape) {
+            DeclKind::Legacy => { true }
+            _                => { false }
+        };
+    }
+
+    /// The name debug output gives this declaration's category.
+    kind_name() -> string {
+        if (this.is_class()) { return "ClassDeclaration"; }
+        return "Declaration";
+    }
+
+    /// `d` when its kind has a payload; null for a class and for null.
     static with_shape(d: DeclarationNode*) -> DeclarationNode* {
-        if (d == null || d.kind != NodeKind::Declaration) { return null; }
+        if (d == null || d.is_class()) { return null; }
         return d;
     }
 
@@ -295,6 +318,15 @@ public:
         if (d == null || d.args.length != 1) { return ""; }
         if (d.args[0].kind != DirectiveArgKind::StringLit) { return ""; }
         return d.args[0].str_value;
+    }
+}
+
+/// `new` of a declaration (a class declaration included) takes its storage
+/// from the AST arena; `delete` of one releases nothing, since the arena is
+/// reclaimed whole.
+implement trait Allocate for class DeclarationNode {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -898,7 +930,7 @@ type struct MethodDecl {
             methods = &(DeclarationNode::struct_of(decl)).methods;
         } else if (DeclarationNode::union_of(decl) != null) {
             methods = &(DeclarationNode::union_of(decl)).methods;
-        } else if (decl.kind == NodeKind::ClassDeclaration) {
+        } else if (decl.is_class()) {
             methods = &(decl as ClassDeclNode*).methods;
         } else if (DeclarationNode::impl_of(decl) != null) {
             methods = &(DeclarationNode::impl_of(decl)).methods;
@@ -1371,7 +1403,7 @@ public:
     def:               DefId;
 
     ClassDeclNode(name: SymbolStr, span: SourceSpan)
-        : DeclarationNode(NodeKind::ClassDeclaration, span) {
+        : DeclarationNode(span) {
         this.name             = name;
         this.generic_params   = [];
         this.fields           = [];

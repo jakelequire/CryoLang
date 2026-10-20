@@ -11,7 +11,7 @@ import std::core::mem;
 
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast;
-import compiler::ast::{ MemberPin, NodeKind, PatternElement, TypeAnnotation };
+import compiler::ast::{ MemberPin, PatternElement, TypeAnnotation };
 import compiler::ast::node::{ Node, ProgramNode };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind,
@@ -153,7 +153,7 @@ type struct Uses {
                 // under it (a discarded call's value held for its release).
                 // Any other statement it wrote is walked where it is written.
                 if (s.generated) {
-                    match (s.shape) {
+                    match (s.kind) {
                         StmtKind::Decl(d) => { this.decl(d.declaration); }
                         _ => {}
                     }
@@ -258,7 +258,7 @@ type struct Uses {
     }
 
     stmt(mut &this, s: Stmt*) -> void {
-        match (s.shape) {
+        match (s.kind) {
             StmtKind::Asm(a) => {
                 for (mut i: i64 = 0; i < a.operands.length; i++) {
                     this.expr(a.operands[i].expr, null);
@@ -375,7 +375,7 @@ type struct Uses {
 
     pattern(mut &this, p: Pattern*) -> void {
         if (p == null) { return; }
-        match (p.shape) {
+        match (p.kind) {
             PatternKind::Binding(b)  => { this.add(p.span, Target::Local(b.binding_sym), true); }
             PatternKind::Constant(c) => { this.add(p.span, this.loc.res_target(&c.res), false); }
             PatternKind::Enum(ep)    => { this.enum_pattern(ep); }
@@ -424,106 +424,102 @@ type struct Uses {
             if (gen_un != null) { this.expr(gen_un.operand, null); }
             return;
         }
-        match (n.kind) {
-            NodeKind::Expression => {
-                match (e.shape) {
-                    ExprKind::Call(c) => {
-                        this.expr(c.callee, c);
-                        this.exprs(&c.arguments);
-                        this.annotations(&c.generic_args);
-                    }
-                    ExprKind::Identifier(id) => {
-                        if (!id.is_this_keyword) { this.add(n.span, this.loc.res_target(&id.res), false); }
-                        this.annotations(&id.generic_args);
-                    }
-                    ExprKind::MemberAccess(m) => {
-                        this.expr(m.object, null);
-                        this.add(m.member_span, this.loc.member_target(m, call), false);
-                        this.annotations(&m.generic_args);
-                    }
-                    ExprKind::ScopeResolution(s) => {
-                        if (!s.scope_is_this_type) {
-                            this.add(s.scope_span, this.loc.res_target(&s.scope_res), false);
-                        }
-                        this.add(s.member_span, this.loc.path_member(s, call), false);
-                        this.annotations(&s.generic_args);
-                        this.annotations(&s.scope_generic_args);
-                    }
-                    ExprKind::Sizeof(so)  => { this.annotation(so.type_ann); }
-                    ExprKind::Alignof(ao) => { this.annotation(ao.type_ann); }
-                    ExprKind::Typeof(t)   => { this.expr(t.operand, null); }
-                    ExprKind::Unary(u)    => { this.expr(u.operand, null); }
-                    ExprKind::Await(aw)   => { this.expr(aw.operand, null); }
-                    ExprKind::Binary(b)   => {
-                        this.expr(b.left, null);
-                        this.expr(b.right, null);
-                    }
-                    ExprKind::ArrayAccess(a) => {
-                        this.expr(a.array, null);
-                        this.expr(a.index, null);
-                    }
-                    ExprKind::Delete(d)   => { this.expr(d.operand, null); }
-                    ExprKind::Ternary(t)  => {
-                        this.expr(t.condition, null); this.expr(t.true_expr, null); this.expr(t.false_expr, null);
-                    }
-                    ExprKind::Cast(c)     => {
-                        this.expr(c.expression, null);
-                        this.annotation(c.target_annotation);
-                    }
-                    ExprKind::Match(m)    => {
-                        this.expr(m.subject, null);
-                        this.arms(&m.arms);
-                    }
-                    ExprKind::StaticMatch(m) => {
-                        this.annotation(m.scrutinee);
-                        for (mut i: i64 = 0; i < m.arms.length; i++) {
-                            if (m.arms[i] == null) { continue; }
-                            this.annotations(&m.arms[i].type_patterns);
-                            this.node(Node::Stmt(m.arms[i].body));
-                        }
-                    }
-                    ExprKind::If(t)       => {
-                        this.expr(t.condition, null); this.expr(t.then_expr, null); this.expr(t.else_expr, null);
-                    }
-                    ExprKind::Array(a)    => {
-                        this.exprs(&a.elements);
-                        this.expr(a.repeat_count_expr, null);
-                    }
-                    ExprKind::Tuple(tl)   => { this.exprs(&tl.elements); }
-                    ExprKind::New(ne)     => {
-                        this.annotations(&ne.generic_args);
-                        this.exprs(&ne.arguments);
-                        this.expr(ne.array_size, null);
-                        this.expr(ne.struct_init, null);
-                    }
-                    ExprKind::Struct(sl)  => {
-                        const name_len: u64 = this.loc.ctx.intern_table.resolve(sl.struct_type).length();
-                        this.add(Uses::head(n.span, name_len), this.loc.res_target(&sl.res), false);
-                        this.annotations(&sl.generic_args);
-                        for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-                            match (&sl.field_inits[i].pin) {
-                                MemberPin::Field(depth, index) => {
-                                    const field_len: u64 =
-                                        this.loc.ctx.intern_table.resolve(sl.field_inits[i].field_name).length();
-                                    this.add(Uses::head(sl.field_inits[i].span, field_len),
-                                        this.loc.field_target(e.resolved_type, depth, index), false);
-                                }
-                                _ => { }
-                            }
-                            this.expr(sl.field_inits[i].value, null);
-                        }
-                    }
-                    ExprKind::Yield(y)    => { this.expr(y.operand, null); }
-                    ExprKind::Try(t)      => { this.expr(t.operand, null); }
-                    ExprKind::Lambda(l)   => {
-                        for (mut i: i64 = 0; i < l.parameters.length; i++) { this.var_decl(l.parameters[i]); }
-                        this.annotation(l.return_type_ann);
-                        this.node(Node::Stmt(l.body));
-                    }
-                    ExprKind::Literal(_)  => { }
+        match (e.kind) {
+            ExprKind::Call(c) => {
+                this.expr(c.callee, c);
+                this.exprs(&c.arguments);
+                this.annotations(&c.generic_args);
+            }
+            ExprKind::Identifier(id) => {
+                if (!id.is_this_keyword) { this.add(n.span, this.loc.res_target(&id.res), false); }
+                this.annotations(&id.generic_args);
+            }
+            ExprKind::MemberAccess(m) => {
+                this.expr(m.object, null);
+                this.add(m.member_span, this.loc.member_target(m, call), false);
+                this.annotations(&m.generic_args);
+            }
+            ExprKind::ScopeResolution(s) => {
+                if (!s.scope_is_this_type) {
+                    this.add(s.scope_span, this.loc.res_target(&s.scope_res), false);
+                }
+                this.add(s.member_span, this.loc.path_member(s, call), false);
+                this.annotations(&s.generic_args);
+                this.annotations(&s.scope_generic_args);
+            }
+            ExprKind::Sizeof(so)  => { this.annotation(so.type_ann); }
+            ExprKind::Alignof(ao) => { this.annotation(ao.type_ann); }
+            ExprKind::Typeof(t)   => { this.expr(t.operand, null); }
+            ExprKind::Unary(u)    => { this.expr(u.operand, null); }
+            ExprKind::Await(aw)   => { this.expr(aw.operand, null); }
+            ExprKind::Binary(b)   => {
+                this.expr(b.left, null);
+                this.expr(b.right, null);
+            }
+            ExprKind::ArrayAccess(a) => {
+                this.expr(a.array, null);
+                this.expr(a.index, null);
+            }
+            ExprKind::Delete(d)   => { this.expr(d.operand, null); }
+            ExprKind::Ternary(t)  => {
+                this.expr(t.condition, null); this.expr(t.true_expr, null); this.expr(t.false_expr, null);
+            }
+            ExprKind::Cast(c)     => {
+                this.expr(c.expression, null);
+                this.annotation(c.target_annotation);
+            }
+            ExprKind::Match(m)    => {
+                this.expr(m.subject, null);
+                this.arms(&m.arms);
+            }
+            ExprKind::StaticMatch(m) => {
+                this.annotation(m.scrutinee);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] == null) { continue; }
+                    this.annotations(&m.arms[i].type_patterns);
+                    this.node(Node::Stmt(m.arms[i].body));
                 }
             }
-            _ => { }
+            ExprKind::If(t)       => {
+                this.expr(t.condition, null); this.expr(t.then_expr, null); this.expr(t.else_expr, null);
+            }
+            ExprKind::Array(a)    => {
+                this.exprs(&a.elements);
+                this.expr(a.repeat_count_expr, null);
+            }
+            ExprKind::Tuple(tl)   => { this.exprs(&tl.elements); }
+            ExprKind::New(ne)     => {
+                this.annotations(&ne.generic_args);
+                this.exprs(&ne.arguments);
+                this.expr(ne.array_size, null);
+                this.expr(ne.struct_init, null);
+            }
+            ExprKind::Struct(sl)  => {
+                const name_len: u64 = this.loc.ctx.intern_table.resolve(sl.struct_type).length();
+                this.add(Uses::head(n.span, name_len), this.loc.res_target(&sl.res), false);
+                this.annotations(&sl.generic_args);
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                    match (&sl.field_inits[i].pin) {
+                        MemberPin::Field(depth, index) => {
+                            const field_len: u64 =
+                                this.loc.ctx.intern_table.resolve(sl.field_inits[i].field_name).length();
+                            this.add(Uses::head(sl.field_inits[i].span, field_len),
+                                this.loc.field_target(e.resolved_type, depth, index), false);
+                        }
+                        _ => { }
+                    }
+                    this.expr(sl.field_inits[i].value, null);
+                }
+            }
+            ExprKind::Yield(y)    => { this.expr(y.operand, null); }
+            ExprKind::Try(t)      => { this.expr(t.operand, null); }
+            ExprKind::Lambda(l)   => {
+                for (mut i: i64 = 0; i < l.parameters.length; i++) { this.var_decl(l.parameters[i]); }
+                this.annotation(l.return_type_ann);
+                this.node(Node::Stmt(l.body));
+            }
+            ExprKind::Literal(_)  => { }
         }
+    
     }
 }

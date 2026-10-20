@@ -26,7 +26,7 @@ import compiler::diag::diagnostic;
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::ast;
 import compiler::ast::{
-    GenericAnnotation, ImportStyle, NamedAnnotation, NodeKind, PatternBinding, ProjectionAnnotation,
+    GenericAnnotation, ImportStyle, NamedAnnotation, PatternBinding, ProjectionAnnotation,
     TraitBound, TraitRef, TypeAnnotation, Visibility, declaration, expression, node,
     pattern, statement
 };
@@ -265,7 +265,7 @@ type struct NameResolver {
             }
             Node::Stmt(s) => {
                 if (s == null) { return; }
-                match (s.shape) {
+                match (s.kind) {
                     StmtKind::Decl(decl_stmt) => {
                         if (decl_stmt.declaration != null) {
                             this.forward_declare_node(decl_stmt.declaration);
@@ -431,195 +431,191 @@ type struct NameResolver {
     }
 
     forward_declare_node(mut &this, node: DeclarationNode*) -> void {
-        match (node.kind) {
-            NodeKind::ClassDeclaration => {
-                const class_node: ClassDeclNode* = node as ClassDeclNode*;
-                const sym_id: SymbolID = this.resolver.declare_type(
-                    class_node.name, class_node.span, class_node.is_public);
-                class_node.def = this.type_def_of(sym_id);
+        if (node.is_class()) {
+            const class_node: ClassDeclNode* = node as ClassDeclNode*;
+            const sym_id: SymbolID = this.resolver.declare_type(
+                class_node.name, class_node.span, class_node.is_public);
+            class_node.def = this.type_def_of(sym_id);
+            if (class_node.is_public) {
+                this.resolver.export_symbol(sym_id);
+            }
+            // A class that declares a constructor is callable by its
+            // name, `Node(1)`: the constructor binds in the value
+            // namespace beside the class, and is exported with it.
+            if (NameResolver::declares_constructor(class_node)) {
+                const ctor: SymbolID = this.resolver.declare_constructor(sym_id);
                 if (class_node.is_public) {
-                    this.resolver.export_symbol(sym_id);
-                }
-                // A class that declares a constructor is callable by its
-                // name, `Node(1)`: the constructor binds in the value
-                // namespace beside the class, and is exported with it.
-                if (NameResolver::declares_constructor(class_node)) {
-                    const ctor: SymbolID = this.resolver.declare_constructor(sym_id);
-                    if (class_node.is_public) {
-                        this.resolver.export_symbol(ctor);
-                    }
+                    this.resolver.export_symbol(ctor);
                 }
             }
-            NodeKind::Declaration => {
-                const decl: DeclarationNode* = node;
-                match (decl.shape) {
-                    DeclKind::Function(fn_node) => {
-                        const fn_node_decl: DeclarationNode* = DeclarationNode::with_shape(node);
-                        const sym_id: SymbolID = this.resolver.declare_function(
-                            fn_node.name, fn_node_decl.span, fn_node.is_public);
-                        this.stamp_function_def(fn_node_decl, sym_id);
-                        if (fn_node.is_public) {
-                            this.resolver.export_symbol(sym_id);
-                        }
-                    }
-                    DeclKind::Variable(var_node) => { this.forward_declare_var(decl, var_node); }
-                    DeclKind::Extern(extern_node) => {
-                        if (extern_node.is_c_import()) {
-                            // A C import: the alias is a binding of this module to a
-                            // module of its own - the resolver's, under the canonical
-                            // namespace the import engine wrote on the block
-                            // (`<mod>::cit`) - and the block's functions are that
-                            // module's declarations.  The alias symbol's qualified
-                            // name IS that namespace, so a scope segment or a type
-                            // spelling bound to it answers `Def(<mod>::cit)` and its
-                            // members resolve through the doors a module's do.  The
-                            // alias is declared in the module writing the import.
-                            const alias: SymbolStr = extern_node.namespace_alias;
-                            const ns_id: SymbolID = this.resolver.alloc_symbol_id();
-                            const ns_sym: Symbol = Symbol::namespace_sym(
-                                ns_id, alias, this.resolver.current_scope,
-                                decl.span, this.resolver.current_module);
-                            this.resolver.declare(ns_sym);
-                            this.resolver.export_symbol(ns_id);
-                            const c_module: ModulePath = extern_node.binding_namespace;
-                            this.ctx.module_graph.bind_c_import_module(
-                                c_module, this.resolver.get_symbol(ns_id).def);
-
-                            const saved_module: ModulePath = this.resolver.current_module_path();
-                            const saved_scope: u64 = this.resolver.get_current_scope_id();
-                            this.resolver.set_module(c_module);
-                            for (mut j: i64 = 0; j < extern_node.functions.length; j++) {
-                                const fn_node_decl: DeclarationNode* = extern_node.functions[j];
-                                const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
-                                const fn_sym: SymbolID = this.resolver.declare_function(
-                                    fn_node.name, fn_node_decl.span, true);
-                                this.stamp_function_def(fn_node_decl, fn_sym);
-                                this.resolver.export_symbol(fn_sym);
-                            }
-                            this.resolver.restore_scope(saved_module, saved_scope);
-                        } else {
-                            // Regular extern block: declare functions in current scope
-                            for (mut j: i64 = 0; j < extern_node.functions.length; j++) {
-                                const fn_node_decl: DeclarationNode* = extern_node.functions[j];
-                                const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
-                                const sym_id: SymbolID = this.resolver.declare_function(
-                                    fn_node.name, fn_node_decl.span, fn_node.is_public);
-                                this.stamp_function_def(fn_node_decl, sym_id);
-                                if (fn_node.is_public) {
-                                    this.resolver.export_symbol(sym_id);
-                                }
-                            }
-                        }
-                    }
-                    DeclKind::Import(_) => {
-                        // Deliberately NOT processed here.  An import is
-                        // answered from the declaring module's exports, so
-                        // processing it while this module is still declaring
-                        // its own names binds it against whatever happens to
-                        // have been declared so far.  It is done on the walk
-                        // instead, by which point every module has declared.
-                    }
-                    DeclKind::Intrinsic(intr_node) => {
-                        const id: SymbolID = this.resolver.alloc_symbol_id();
-                        // The declaring module is the symbol's canonical
-                        // prefix: a bare call of an intrinsic from the module
-                        // that declares it is stamped `Def(<module>::<leaf>)`,
-                        // and that is the key the declaration index registers
-                        // the intrinsic's signature under.  A placeholder here
-                        // stamps a name nothing is registered under, and the
-                        // call is refused as unknown.
-                        const sym: Symbol = Symbol::intrinsic(id, intr_node.name,
-                            this.resolver.current_scope, decl.span, this.resolver.current_module);
-                        const intr_declared: SymbolID = this.resolver.declare(sym);
-                        this.resolver.export_symbol(intr_declared);
-                        intr_node.def = this.resolver.get_symbol(intr_declared).def;
-                    }
-                    DeclKind::Trait(trait_node) => {
-                        const sym_id: SymbolID = this.resolver.declare_type(
-                            trait_node.name, decl.span, true);
-                        trait_node.sym_id = sym_id;
-                        trait_node.def = this.type_def_of(sym_id);
+        } else {
+            const decl: DeclarationNode* = node;
+            match (decl.shape) {
+                DeclKind::Function(fn_node) => {
+                    const fn_node_decl: DeclarationNode* = DeclarationNode::with_shape(node);
+                    const sym_id: SymbolID = this.resolver.declare_function(
+                        fn_node.name, fn_node_decl.span, fn_node.is_public);
+                    this.stamp_function_def(fn_node_decl, sym_id);
+                    if (fn_node.is_public) {
                         this.resolver.export_symbol(sym_id);
-                        // Registered here, before any module's names are resolved, so
-                        // a projection written in any of them can ask which
-                        // associated types the trait declares.
-                        this.ctx.generic_registry.register_trait_decl(trait_node.def, trait_node);
                     }
-                    DeclKind::Enum(enum_node) => {
-                        if (!enum_node.binding_namespace.is_valid()) {
-                            const sym_id: SymbolID = this.resolver.declare_type(
-                                enum_node.name, decl.span, enum_node.is_public);
-                            enum_node.def = this.type_def_of(sym_id);
-                            if (enum_node.is_public) {
-                                this.resolver.export_symbol(sym_id);
-                            }
-                        } else {
-                            enum_node.def = this.type_def_of(this.declare_c_imported(
-                                enum_node.binding_namespace, enum_node.name, decl.span));
-                        }
-                        this.record_enum_decl(enum_node);
-                    }
-                    DeclKind::Struct(struct_node) => {
-                        // A C-imported struct (binding_namespace set) is reachable
-                        // only through its alias namespace (`cit::Vec2`, via the
-                        // decl_index qualified key); declaring its bare name in the
-                        // file scope here would shadow same-named types in other
-                        // modules.
-                        if (!struct_node.binding_namespace.is_valid()) {
-                            // A `private` type is nameable only inside its own
-                            // module, the same rule a `private` function gets
-                            // above.  Declared public here it binds in every
-                            // importer's scope, and the only thing left saying
-                            // otherwise is the declaration index - two lanes with
-                            // two answers about one name.
-                            const sym_id: SymbolID = this.resolver.declare_type(
-                                struct_node.name, decl.span, struct_node.is_public);
-                            struct_node.def = this.type_def_of(sym_id);
-                            if (struct_node.is_public) {
-                                this.resolver.export_symbol(sym_id);
-                            }
-                        } else {
-                            struct_node.def = this.type_def_of(this.declare_c_imported(
-                                struct_node.binding_namespace, struct_node.name, decl.span));
-                        }
-                    }
-                    DeclKind::Union(union_node) => {
-                        // Same binding_namespace rule as structs (see above).
-                        if (!union_node.binding_namespace.is_valid()) {
-                            const sym_id: SymbolID = this.resolver.declare_type(
-                                union_node.name, decl.span, union_node.is_public);
-                            union_node.def = this.type_def_of(sym_id);
-                            if (union_node.is_public) {
-                                this.resolver.export_symbol(sym_id);
-                            }
-                        } else {
-                            union_node.def = this.type_def_of(this.declare_c_imported(
-                                union_node.binding_namespace, union_node.name, decl.span));
-                        }
-                    }
-                    DeclKind::TypeAlias(alias_node) => {
-                        this.ctx.note_alias_decl(decl);
-                        if (!alias_node.binding_namespace.is_valid()) {
-                            const sym_id: SymbolID = this.resolver.declare_type(
-                                alias_node.alias_name, decl.span, true);
-                            alias_node.def = this.type_def_of(sym_id);
-                            this.resolver.export_symbol(sym_id);
-                        } else {
-                            alias_node.def = this.type_def_of(this.declare_c_imported(
-                                alias_node.binding_namespace, alias_node.alias_name, decl.span));
-                        }
-                    }
-                    // A module declaration introduces no name of this module,
-                    // nor does an implement block.  A variant or a field is
-                    // declared with its type, a generic parameter in its
-                    // declaration's scope; a destructure's locals where the
-                    // walk meets them.
-                    DeclKind::Module(_) | DeclKind::Impl(_) | DeclKind::Variant(_) | DeclKind::Field(_)
-                    | DeclKind::GenericParam(_)
-                    | DeclKind::Destructure(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
+                DeclKind::Variable(var_node) => { this.forward_declare_var(decl, var_node); }
+                DeclKind::Extern(extern_node) => {
+                    if (extern_node.is_c_import()) {
+                        // A C import: the alias is a binding of this module to a
+                        // module of its own - the resolver's, under the canonical
+                        // namespace the import engine wrote on the block
+                        // (`<mod>::cit`) - and the block's functions are that
+                        // module's declarations.  The alias symbol's qualified
+                        // name IS that namespace, so a scope segment or a type
+                        // spelling bound to it answers `Def(<mod>::cit)` and its
+                        // members resolve through the doors a module's do.  The
+                        // alias is declared in the module writing the import.
+                        const alias: SymbolStr = extern_node.namespace_alias;
+                        const ns_id: SymbolID = this.resolver.alloc_symbol_id();
+                        const ns_sym: Symbol = Symbol::namespace_sym(
+                            ns_id, alias, this.resolver.current_scope,
+                            decl.span, this.resolver.current_module);
+                        this.resolver.declare(ns_sym);
+                        this.resolver.export_symbol(ns_id);
+                        const c_module: ModulePath = extern_node.binding_namespace;
+                        this.ctx.module_graph.bind_c_import_module(
+                            c_module, this.resolver.get_symbol(ns_id).def);
+
+                        const saved_module: ModulePath = this.resolver.current_module_path();
+                        const saved_scope: u64 = this.resolver.get_current_scope_id();
+                        this.resolver.set_module(c_module);
+                        for (mut j: i64 = 0; j < extern_node.functions.length; j++) {
+                            const fn_node_decl: DeclarationNode* = extern_node.functions[j];
+                            const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
+                            const fn_sym: SymbolID = this.resolver.declare_function(
+                                fn_node.name, fn_node_decl.span, true);
+                            this.stamp_function_def(fn_node_decl, fn_sym);
+                            this.resolver.export_symbol(fn_sym);
+                        }
+                        this.resolver.restore_scope(saved_module, saved_scope);
+                    } else {
+                        // Regular extern block: declare functions in current scope
+                        for (mut j: i64 = 0; j < extern_node.functions.length; j++) {
+                            const fn_node_decl: DeclarationNode* = extern_node.functions[j];
+                            const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
+                            const sym_id: SymbolID = this.resolver.declare_function(
+                                fn_node.name, fn_node_decl.span, fn_node.is_public);
+                            this.stamp_function_def(fn_node_decl, sym_id);
+                            if (fn_node.is_public) {
+                                this.resolver.export_symbol(sym_id);
+                            }
+                        }
+                    }
+                }
+                DeclKind::Import(_) => {
+                    // Deliberately NOT processed here.  An import is
+                    // answered from the declaring module's exports, so
+                    // processing it while this module is still declaring
+                    // its own names binds it against whatever happens to
+                    // have been declared so far.  It is done on the walk
+                    // instead, by which point every module has declared.
+                }
+                DeclKind::Intrinsic(intr_node) => {
+                    const id: SymbolID = this.resolver.alloc_symbol_id();
+                    // The declaring module is the symbol's canonical
+                    // prefix: a bare call of an intrinsic from the module
+                    // that declares it is stamped `Def(<module>::<leaf>)`,
+                    // and that is the key the declaration index registers
+                    // the intrinsic's signature under.  A placeholder here
+                    // stamps a name nothing is registered under, and the
+                    // call is refused as unknown.
+                    const sym: Symbol = Symbol::intrinsic(id, intr_node.name,
+                        this.resolver.current_scope, decl.span, this.resolver.current_module);
+                    const intr_declared: SymbolID = this.resolver.declare(sym);
+                    this.resolver.export_symbol(intr_declared);
+                    intr_node.def = this.resolver.get_symbol(intr_declared).def;
+                }
+                DeclKind::Trait(trait_node) => {
+                    const sym_id: SymbolID = this.resolver.declare_type(
+                        trait_node.name, decl.span, true);
+                    trait_node.sym_id = sym_id;
+                    trait_node.def = this.type_def_of(sym_id);
+                    this.resolver.export_symbol(sym_id);
+                    // Registered here, before any module's names are resolved, so
+                    // a projection written in any of them can ask which
+                    // associated types the trait declares.
+                    this.ctx.generic_registry.register_trait_decl(trait_node.def, trait_node);
+                }
+                DeclKind::Enum(enum_node) => {
+                    if (!enum_node.binding_namespace.is_valid()) {
+                        const sym_id: SymbolID = this.resolver.declare_type(
+                            enum_node.name, decl.span, enum_node.is_public);
+                        enum_node.def = this.type_def_of(sym_id);
+                        if (enum_node.is_public) {
+                            this.resolver.export_symbol(sym_id);
+                        }
+                    } else {
+                        enum_node.def = this.type_def_of(this.declare_c_imported(
+                            enum_node.binding_namespace, enum_node.name, decl.span));
+                    }
+                    this.record_enum_decl(enum_node);
+                }
+                DeclKind::Struct(struct_node) => {
+                    // A C-imported struct (binding_namespace set) is reachable
+                    // only through its alias namespace (`cit::Vec2`, via the
+                    // decl_index qualified key); declaring its bare name in the
+                    // file scope here would shadow same-named types in other
+                    // modules.
+                    if (!struct_node.binding_namespace.is_valid()) {
+                        // A `private` type is nameable only inside its own
+                        // module, the same rule a `private` function gets
+                        // above.  Declared public here it binds in every
+                        // importer's scope, and the only thing left saying
+                        // otherwise is the declaration index - two lanes with
+                        // two answers about one name.
+                        const sym_id: SymbolID = this.resolver.declare_type(
+                            struct_node.name, decl.span, struct_node.is_public);
+                        struct_node.def = this.type_def_of(sym_id);
+                        if (struct_node.is_public) {
+                            this.resolver.export_symbol(sym_id);
+                        }
+                    } else {
+                        struct_node.def = this.type_def_of(this.declare_c_imported(
+                            struct_node.binding_namespace, struct_node.name, decl.span));
+                    }
+                }
+                DeclKind::Union(union_node) => {
+                    // Same binding_namespace rule as structs (see above).
+                    if (!union_node.binding_namespace.is_valid()) {
+                        const sym_id: SymbolID = this.resolver.declare_type(
+                            union_node.name, decl.span, union_node.is_public);
+                        union_node.def = this.type_def_of(sym_id);
+                        if (union_node.is_public) {
+                            this.resolver.export_symbol(sym_id);
+                        }
+                    } else {
+                        union_node.def = this.type_def_of(this.declare_c_imported(
+                            union_node.binding_namespace, union_node.name, decl.span));
+                    }
+                }
+                DeclKind::TypeAlias(alias_node) => {
+                    this.ctx.note_alias_decl(decl);
+                    if (!alias_node.binding_namespace.is_valid()) {
+                        const sym_id: SymbolID = this.resolver.declare_type(
+                            alias_node.alias_name, decl.span, true);
+                        alias_node.def = this.type_def_of(sym_id);
+                        this.resolver.export_symbol(sym_id);
+                    } else {
+                        alias_node.def = this.type_def_of(this.declare_c_imported(
+                            alias_node.binding_namespace, alias_node.alias_name, decl.span));
+                    }
+                }
+                // A module declaration introduces no name of this module,
+                // nor does an implement block.  A variant or a field is
+                // declared with its type, a generic parameter in its
+                // declaration's scope; a destructure's locals where the
+                // walk meets them.
+                DeclKind::Module(_) | DeclKind::Impl(_) | DeclKind::Variant(_) | DeclKind::Field(_)
+                | DeclKind::GenericParam(_)
+                | DeclKind::Destructure(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
             }
-            _ => { }
         }
         this.keep_declared(node);
     }
@@ -629,31 +625,27 @@ type struct NameResolver {
     /// once the declaring walk has stamped it.  Functions are kept where
     /// they are stamped, extern ones included (`stamp_function_def`).
     keep_declared(&this, node: DeclarationNode*) -> void {
-        match (node.kind) {
-            NodeKind::ClassDeclaration => {
-                const class_node: ClassDeclNode* = node as ClassDeclNode*;
-                this.ctx.decl_index.keep_declaration(class_node.def, class_node);
-            }
-            NodeKind::Declaration => {
-                const decl: DeclarationNode* = node;
-                const d: DefId = match (decl.shape) {
-                    DeclKind::Variable(v)        => { v.def }
-                    DeclKind::Intrinsic(i)       => { i.def }
-                    DeclKind::Trait(t)           => { t.def }
-                    DeclKind::TypeAlias(a)       => { a.def }
-                    DeclKind::Enum(e)            => { e.def }
-                    DeclKind::Union(u)           => { u.def }
-                    DeclKind::Struct(s)          => { s.def }
-                    DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
-                    | DeclKind::Variant(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
-                    | DeclKind::Impl(_) | DeclKind::Destructure(_) | DeclKind::Function(_)
-                    | DeclKind::Method(_) | DeclKind::Legacy => {
-                        DefId::invalid()
-                    }
-                };
-                this.ctx.decl_index.keep_declaration(d, decl);
-            }
-            _ => { }
+        if (node.is_class()) {
+            const class_node: ClassDeclNode* = node as ClassDeclNode*;
+            this.ctx.decl_index.keep_declaration(class_node.def, class_node);
+        } else {
+            const decl: DeclarationNode* = node;
+            const d: DefId = match (decl.shape) {
+                DeclKind::Variable(v)        => { v.def }
+                DeclKind::Intrinsic(i)       => { i.def }
+                DeclKind::Trait(t)           => { t.def }
+                DeclKind::TypeAlias(a)       => { a.def }
+                DeclKind::Enum(e)            => { e.def }
+                DeclKind::Union(u)           => { u.def }
+                DeclKind::Struct(s)          => { s.def }
+                DeclKind::Extern(_) | DeclKind::Import(_) | DeclKind::Module(_)
+                | DeclKind::Variant(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+                | DeclKind::Impl(_) | DeclKind::Destructure(_) | DeclKind::Function(_)
+                | DeclKind::Method(_) | DeclKind::Legacy => {
+                    DefId::invalid()
+                }
+            };
+            this.ctx.decl_index.keep_declaration(d, decl);
         }
     }
 
@@ -3914,7 +3906,7 @@ implement trait Walk for struct NameResolver {
                 ResSlot::Answered(r) => { c.res.answer(r); }
                 _                    => { }
             }
-            p.shape = PatternKind::Constant(c);
+            p.kind = PatternKind::Constant(c);
         } else {
             node.binding_sym = this.declare_pattern_binding(node.name, p.span);
         }

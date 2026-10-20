@@ -14,7 +14,7 @@ import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index;
 import compiler::decl_index::{ DeclarationIndex, InlineBody };
-import compiler::ast::{ node, declaration, NodeKind };
+import compiler::ast::{ node, declaration};
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DeclKind, FunctionDecl, ImplBlock, MethodDecl,
@@ -37,31 +37,27 @@ implement struct InlineBodies {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
-            match (stmt.kind) {
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Function(_) => {
-                            if (InlineBodies::is_inline_body(DeclarationNode::with_shape(stmt))) { return true; }
-                        }
-                        DeclKind::Impl(ib) => {
-                            if (InlineBodies::any_inline(ib.methods)) { return true; }
-                        }
-                        DeclKind::Struct(s) => {
-                            if (InlineBodies::any_inline(s.methods)) { return true; }
-                        }
-                        DeclKind::Union(u) => {
-                            if (InlineBodies::any_inline(u.methods)) { return true; }
-                        }
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
+            if (stmt.is_class()) {
+                if (InlineBodies::any_inline((stmt as ClassDeclNode*).methods)) { return true; }
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Function(_) => {
+                        if (InlineBodies::is_inline_body(DeclarationNode::with_shape(stmt))) { return true; }
                     }
+                    DeclKind::Impl(ib) => {
+                        if (InlineBodies::any_inline(ib.methods)) { return true; }
+                    }
+                    DeclKind::Struct(s) => {
+                        if (InlineBodies::any_inline(s.methods)) { return true; }
+                    }
+                    DeclKind::Union(u) => {
+                        if (InlineBodies::any_inline(u.methods)) { return true; }
+                    }
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                 }
-                NodeKind::ClassDeclaration => {
-                    if (InlineBodies::any_inline((stmt as ClassDeclNode*).methods)) { return true; }
-                }
-                _ => { }
             }
         }
         return false;
@@ -77,42 +73,38 @@ implement struct InlineBodies {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
-            match (stmt.kind) {
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Function(f) => {
-                            const f_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
-                            if (f.generic_params.length == 0 && InlineBodies::is_inline_body(f_decl)) {
-                                di.record_inline_body(f.overload_entry,
-                                    InlineBody { owner: TypeRef::invalid(), base: null });
-                            }
+            if (stmt.is_class()) {
+                const cd: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (cd.generic_params.length > 0) { continue; }
+                InlineBodies::record_methods(di, cd.methods, di.type_of_def(cd.def), &cd.base_res);
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Function(f) => {
+                        const f_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                        if (f.generic_params.length == 0 && InlineBodies::is_inline_body(f_decl)) {
+                            di.record_inline_body(f.overload_entry,
+                                InlineBody { owner: TypeRef::invalid(), base: null });
                         }
-                        DeclKind::Impl(ib) => {
-                            if (ib.generic_params.length > 0) { continue; }
-                            if (ctx.generic_registry.template_of(ib.target_def()) != null) { continue; }
-                            InlineBodies::record_methods(di, ib.methods,
-                                di.impl_owner(ib, "codegen/inline bodies"), null);
-                        }
-                        DeclKind::Struct(sd) => {
-                            if (sd.generic_params.length > 0) { continue; }
-                            InlineBodies::record_methods(di, sd.methods, di.type_of_def(sd.def), null);
-                        }
-                        DeclKind::Union(ud) => {
-                            if (ud.generic_params.length > 0) { continue; }
-                            InlineBodies::record_methods(di, ud.methods, di.type_of_def(ud.def), null);
-                        }
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                     }
+                    DeclKind::Impl(ib) => {
+                        if (ib.generic_params.length > 0) { continue; }
+                        if (ctx.generic_registry.template_of(ib.target_def()) != null) { continue; }
+                        InlineBodies::record_methods(di, ib.methods,
+                            di.impl_owner(ib, "codegen/inline bodies"), null);
+                    }
+                    DeclKind::Struct(sd) => {
+                        if (sd.generic_params.length > 0) { continue; }
+                        InlineBodies::record_methods(di, sd.methods, di.type_of_def(sd.def), null);
+                    }
+                    DeclKind::Union(ud) => {
+                        if (ud.generic_params.length > 0) { continue; }
+                        InlineBodies::record_methods(di, ud.methods, di.type_of_def(ud.def), null);
+                    }
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                 }
-                NodeKind::ClassDeclaration => {
-                    const cd: ClassDeclNode* = stmt as ClassDeclNode*;
-                    if (cd.generic_params.length > 0) { continue; }
-                    InlineBodies::record_methods(di, cd.methods, di.type_of_def(cd.def), &cd.base_res);
-                }
-                _ => { }
             }
         }
     }

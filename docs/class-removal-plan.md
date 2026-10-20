@@ -2311,6 +2311,21 @@ place that answers "no node at all" answers `Node?` (the node locator).
   `VarDecl`, 164/164, 0 beyond); downcasts 123 -> 0; check medians
   9.10 s and 9.14 s, peak 1,580.3 and 1,580.4 MiB, node bytes identical;
   stage-2 build 0 warnings.
+- **Commit 4 built**, as item 4 above, keeping the headers' names
+  (`ExpressionNode`, `Stmt`, `Pattern`, `MatchArmNode`,
+  `StaticMatchArmNode`, `DirectiveNode`, `ProgramNode`); renaming them to
+  section 2.1's `Expr` and friends is mechanical and left open.  Each is a
+  struct with the span, error and generated fields, a factory and its own
+  `Allocate`; the program's and the arms' walks are inline.  A node-kind
+  test became a category or declaration-kind test:
+  `DeclarationNode::is_class()` (its kind is `Legacy`) where a class was
+  told apart, and the expression dispatches lost the outer
+  `NodeKind::Expression` match, whose default never ran.  The compiler's
+  classes are `DeclarationNode` and `ClassDeclNode`.  **Measured.**  0
+  objects moved; `--ast` identical over 1,087 + 154 files (control
+  `DeclRefExpr` and `IfStmt`, 164/164, 0 beyond); check medians 9.24 s and
+  9.27 s, peak 1,578.6 -> 1,567.4 MiB, node bytes 344.4 -> 328.9 MB;
+  stage-2 build 0 warnings.
 
 ### Slice 7: the remaining walks and traits
 
@@ -2588,12 +2603,7 @@ final audit greps for each name listed and expects none.
 
 | piece | where | written in | deleted when |
 |---|---|---|---|
-| `implement class XNode { static walk_children ... }`, one per node class with children | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | each moves inline into its kind's payload struct body (ruling 397) as that category converts (slices 5-6); none left when the last category does.  Patterns', statements' and expressions' are gone. |
-| `ExpressionNode` a class deriving from `ASTNode`, so an `ASTNode*` can hold an expression, and the `as ExpressionNode*` casts from such handles; `ExpressionNode.shape`, the expression's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/expression.cryo` and every expression consumer | slice 6 (expressions, the bridge with Sizeof/Alignof/Typeof; `ExprKind::Legacy` went with the last kind, Call) | the header becomes the `Expr` struct when the "any node" handle is `Node`, and `shape` is renamed `kind` |
+| `implement class ClassDeclNode { static walk_children ... }`, the last of the per-class walk blocks (the others moved inline into their structs) | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | with the class, in slice 9 |
 | The expression projections, one per kind (`ExpressionNode::sizeof_of`, `alignof_of`, `typeof_of`, `delete_of`, `new_of`, `try_of`, `tuple_of`, `array_of`, `struct_of`, `literal_of`, `ternary_of`, `if_of`, `static_match_of`, `match_of`, `cast_of`, `unary_of`, `binary_of`, `array_access_of`, `lambda_of`, `await_of`, `identifier_of`, `scope_resolution_of`, `member_access_of`, `call_of`) | `compiler/src/compiler/AST/expression.cryo` and their callers | slice 6 (expressions) | take the header since `Program` and `Node` commit 3, and `ExpressionNode::with_shape` is deleted; a one-kind projection of a header is then a checked accessor, as `Stmt::as_block` is, not a conversion between two shapes.  Open: kept as accessors, or each read rewritten as a `match` arm (asked) |
-| `Pattern` a class deriving from `ASTNode` (no base-class handle is cast to it any more) | `compiler/src/compiler/AST/pattern.cryo` | slice 5 | the header becomes a struct when the base class goes (slice 6, `Program` and `Node`, commit 4) |
-| `Pattern.shape`, the pattern's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/pattern.cryo` | slice 5 | renamed `kind` when the header stops deriving from `ASTNode` |
-| `Stmt` a class deriving from `ASTNode` (no base-class handle is cast to it any more) | `compiler/src/compiler/AST/statement.cryo` | slice 6 (statements) | the header becomes a struct when the base class goes (slice 6, `Program` and `Node`, commit 4) |
-| `Stmt.shape`, the statement's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/statement.cryo` | slice 6 (statements) | renamed `kind` when the header stops deriving from `ASTNode` |
-| `DeclKind::Legacy` and every `match` arm for it; `DeclarationNode.shape` on a declaration whose kind is still a subclass; the `NodeKind`-per-kind dispatch for those kinds beside the `NodeKind::Declaration` arms | `compiler/src/compiler/AST/declaration.cryo` and every declaration consumer | slice 6 (declarations, `IntrinsicConst` and `Module`) | when slice 9 deletes the class, the one kind never converted; then `shape` is renamed `kind` with the header's struct |
+| `DeclKind::Legacy` and every `match` arm for it, `DeclarationNode::is_class` and `kind_name`, `DeclarationNode` a class (its one subclass is `ClassDeclNode`) and its kind named `shape` | `compiler/src/compiler/AST/declaration.cryo` and every declaration consumer | slice 6 (declarations, `IntrinsicConst` and `Module`) | when slice 9 deletes the class, the one kind never converted (ruling 413): the header becomes a struct and `shape` is renamed `kind` |
 | The declaration projections (`DeclarationNode::module_of`, `import_of`, `extern_of`, `alias_of`, `enum_of`, `trait_of`, `union_of`, `struct_of`, `impl_of`, `var_of`, `fn_of`, `method_of`) and `DeclarationNode::with_shape` | `compiler/src/compiler/AST/declaration.cryo` and their callers | slice 6 (declarations) | take the header since `Program` and `Node` commit 3; `with_shape` answers null for a class, which slice 9 deletes, and goes with it.  Open, as for the expression projections: kept as checked accessors, or each read rewritten as a `match` arm (asked) |

@@ -52,7 +52,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, node, NodeKind, pattern, statement, Visibility
+    declaration, expression, node, pattern, statement, Visibility
 };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
@@ -144,35 +144,31 @@ type struct DeadCodeChecker {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration => {
-                    this.check_methods((stmt as ClassDeclNode*).methods);
-                }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Function(_) => {
-                            const fn_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
-                            this.check_fn(fn_decl, this.is_body_resolved(fn_decl));
-                        }
-                        // Trait default method bodies are not name-resolved
-                        // (signatures only), so W0001 would false-positive on
-                        // every local; run structural W0009 only
-                        // (body_resolved = false).
-                        DeclKind::Trait(td) => {
-                            for (mut j: i64 = 0; j < td.methods.length; j++) {
-                                this.check_fn(td.methods[j], false);
-                            }
-                        }
-                        DeclKind::Union(ud) => { this.check_methods(ud.methods); }
-                        DeclKind::Struct(sd) => { this.check_methods(sd.methods); }
-                        DeclKind::Impl(ib) => { this.check_methods(ib.methods); }
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+            if (stmt.is_class()) {
+                this.check_methods((stmt as ClassDeclNode*).methods);
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Function(_) => {
+                        const fn_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                        this.check_fn(fn_decl, this.is_body_resolved(fn_decl));
                     }
+                    // Trait default method bodies are not name-resolved
+                    // (signatures only), so W0001 would false-positive on
+                    // every local; run structural W0009 only
+                    // (body_resolved = false).
+                    DeclKind::Trait(td) => {
+                        for (mut j: i64 = 0; j < td.methods.length; j++) {
+                            this.check_fn(td.methods[j], false);
+                        }
+                    }
+                    DeclKind::Union(ud) => { this.check_methods(ud.methods); }
+                    DeclKind::Struct(sd) => { this.check_methods(sd.methods); }
+                    DeclKind::Impl(ib) => { this.check_methods(ib.methods); }
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+                    | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
-                _ => {}
             }
         }
     }
@@ -249,7 +245,7 @@ type struct DeadCodeChecker {
     /// no location of its own; fall back to the declaration it wraps.
     report_span(&this, stmt: Stmt*) -> SourceSpan {
         if (stmt.span.has_location()) { return stmt.span; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Decl(ds) => {
                 if (ds.declaration != null) { return ds.declaration.span; }
             }
@@ -262,7 +258,7 @@ type struct DeadCodeChecker {
     /// (W0001).  Destructuring bindings are exempt (see the module header).
     check_local_decl(mut &this, stmt: Stmt*) -> void {
         if (!this.body_resolved) { return; }   // unresolved body: `used` is incomplete
-        const ds: DeclStmt* = match (stmt.shape) {
+        const ds: DeclStmt* = match (stmt.kind) {
             StmtKind::Decl(d) => { d }
             _                 => { null }
         };
@@ -293,7 +289,7 @@ type struct DeadCodeChecker {
     /// loop body, etc. is scanned too.  Does NOT judge divergence.
     check_stmt(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Block(_) => {
                 this.check_block(stmt);
             }
@@ -330,7 +326,7 @@ type struct DeadCodeChecker {
     /// the lint never fabricates an unreachable warning.
     stmt_diverges(mut &this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Return(_) => { return true; }
             StmtKind::Break     => { return true; }
             StmtKind::Continue  => { return true; }
@@ -407,24 +403,20 @@ type struct DeadCodeChecker {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration    => { this.harvest_methods((stmt as ClassDeclNode*).methods); }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Function(_) => { this.harvest_fn(DeclarationNode::with_shape(stmt)); }
-                        DeclKind::Trait(td) => {
-                            for (mut j: i64 = 0; j < td.methods.length; j++) { this.harvest_fn(td.methods[j]); }
-                        }
-                        DeclKind::Union(ud) => { this.harvest_methods(ud.methods); }
-                        DeclKind::Struct(sd) => { this.harvest_methods(sd.methods); }
-                        DeclKind::Impl(ib) => { this.harvest_methods(ib.methods); }
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                        | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+            if (stmt.is_class()) { this.harvest_methods((stmt as ClassDeclNode*).methods); } else {
+                match (stmt.shape) {
+                    DeclKind::Function(_) => { this.harvest_fn(DeclarationNode::with_shape(stmt)); }
+                    DeclKind::Trait(td) => {
+                        for (mut j: i64 = 0; j < td.methods.length; j++) { this.harvest_fn(td.methods[j]); }
                     }
+                    DeclKind::Union(ud) => { this.harvest_methods(ud.methods); }
+                    DeclKind::Struct(sd) => { this.harvest_methods(sd.methods); }
+                    DeclKind::Impl(ib) => { this.harvest_methods(ib.methods); }
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+                    | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
-                _ => {}
             }
         }
     }
@@ -448,7 +440,7 @@ type struct DeadCodeChecker {
     /// expression and every nested statement.
     harvest_stmt(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Block(b) => {
                 for (mut i: i64 = 0; i < b.statements.length; i++) { this.harvest_stmt(b.statements[i]); }
             }
@@ -521,87 +513,83 @@ type struct DeadCodeChecker {
     walk_expr(mut &this, e: ExpressionNode*) -> void {
         if (e == null) { return; }
         match (e.kind) {
-            NodeKind::Expression => {
-                match (e.shape) {
-                    ExprKind::Call(c) => {
-                        this.mark_named_methods(c);
-                        this.walk_expr(c.callee);
-                        for (mut i: i64 = 0; i < c.arguments.length; i++) { this.walk_expr(c.arguments[i]); }
-                    }
-                    ExprKind::Ternary(t) => {
-                        this.walk_expr(t.condition);
-                        this.walk_expr(t.true_expr);
-                        this.walk_expr(t.false_expr);
-                    }
-                    ExprKind::Cast(ce) => { this.walk_expr(ce.expression); }
-                    ExprKind::Unary(u) => {
-                        this.walk_expr(u.operand);
-                        this.walk_expr(u.desugared_call);
-                    }
-                    ExprKind::Binary(b) => {
-                        this.walk_expr(b.left);
-                        this.walk_expr(b.right);
-                        this.walk_expr(b.desugared_call);
-                    }
-                    ExprKind::ArrayAccess(a) => {
-                        this.walk_expr(a.array);
-                        this.walk_expr(a.index);
-                        this.walk_expr(a.desugared_call);
-                    }
-                    ExprKind::Lambda(l) => { this.harvest_stmt(l.body); }
-                    ExprKind::Match(m) => {
-                        this.walk_expr(m.subject);
-                        for (mut i: i64 = 0; i < m.arms.length; i++) {
-                            const arm: MatchArmNode* = m.arms[i];
-                            if (arm == null) { continue; }
-                            this.walk_expr(arm.guard);
-                            this.harvest_stmt(arm.body);
-                        }
-                    }
-                    ExprKind::StaticMatch(sm) => {
-                        for (mut i: i64 = 0; i < sm.arms.length; i++) {
-                            const arm: StaticMatchArmNode* = sm.arms[i];
-                            if (arm != null) { this.harvest_stmt(arm.body); }
-                        }
-                    }
-                    ExprKind::If(ie)     => {
-                        this.walk_expr(ie.condition);
-                        this.walk_expr(ie.then_expr);
-                        this.walk_expr(ie.else_expr);
-                    }
-                    ExprKind::Typeof(t)  => { this.walk_expr(t.operand); }
-                    ExprKind::Delete(d)  => { this.walk_expr(d.operand); }
-                    ExprKind::Struct(sl) => {
-                        for (mut i: i64 = 0; i < sl.field_inits.length; i++) { this.walk_expr(sl.field_inits[i].value); }
-                    }
-                    ExprKind::Array(al)  => {
-                        for (mut i: i64 = 0; i < al.elements.length; i++) { this.walk_expr(al.elements[i]); }
-                    }
-                    ExprKind::Tuple(tl)  => {
-                        for (mut i: i64 = 0; i < tl.elements.length; i++) { this.walk_expr(tl.elements[i]); }
-                    }
-                    ExprKind::New(n)     => {
-                        for (mut i: i64 = 0; i < n.arguments.length; i++) { this.walk_expr(n.arguments[i]); }
-                        this.walk_expr(n.array_size);
-                        if (n.struct_init != null) { this.walk_expr(n.struct_init); }
-                    }
-                    ExprKind::Yield(y)   => { this.walk_expr(y.operand); }
-                    ExprKind::Try(tr)    => {
-                        this.walk_expr(tr.operand);
-                        this.walk_expr(tr.desugared);
-                    }
-                    // A type operand holds no expression, nor does a literal.
-                    ExprKind::Sizeof(_)  => { }
-                    ExprKind::Alignof(_) => { }
-                    ExprKind::Await(aw)  => { this.walk_expr(aw.operand); }
-                    ExprKind::Literal(_) => { }
-                    ExprKind::Identifier(_) => { }
-                    ExprKind::ScopeResolution(_) => { }
-                    ExprKind::MemberAccess(ma) => { this.walk_expr(ma.object); }
+            ExprKind::Call(c) => {
+                this.mark_named_methods(c);
+                this.walk_expr(c.callee);
+                for (mut i: i64 = 0; i < c.arguments.length; i++) { this.walk_expr(c.arguments[i]); }
+            }
+            ExprKind::Ternary(t) => {
+                this.walk_expr(t.condition);
+                this.walk_expr(t.true_expr);
+                this.walk_expr(t.false_expr);
+            }
+            ExprKind::Cast(ce) => { this.walk_expr(ce.expression); }
+            ExprKind::Unary(u) => {
+                this.walk_expr(u.operand);
+                this.walk_expr(u.desugared_call);
+            }
+            ExprKind::Binary(b) => {
+                this.walk_expr(b.left);
+                this.walk_expr(b.right);
+                this.walk_expr(b.desugared_call);
+            }
+            ExprKind::ArrayAccess(a) => {
+                this.walk_expr(a.array);
+                this.walk_expr(a.index);
+                this.walk_expr(a.desugared_call);
+            }
+            ExprKind::Lambda(l) => { this.harvest_stmt(l.body); }
+            ExprKind::Match(m) => {
+                this.walk_expr(m.subject);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    const arm: MatchArmNode* = m.arms[i];
+                    if (arm == null) { continue; }
+                    this.walk_expr(arm.guard);
+                    this.harvest_stmt(arm.body);
                 }
             }
-            _ => {}
+            ExprKind::StaticMatch(sm) => {
+                for (mut i: i64 = 0; i < sm.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sm.arms[i];
+                    if (arm != null) { this.harvest_stmt(arm.body); }
+                }
+            }
+            ExprKind::If(ie)     => {
+                this.walk_expr(ie.condition);
+                this.walk_expr(ie.then_expr);
+                this.walk_expr(ie.else_expr);
+            }
+            ExprKind::Typeof(t)  => { this.walk_expr(t.operand); }
+            ExprKind::Delete(d)  => { this.walk_expr(d.operand); }
+            ExprKind::Struct(sl) => {
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) { this.walk_expr(sl.field_inits[i].value); }
+            }
+            ExprKind::Array(al)  => {
+                for (mut i: i64 = 0; i < al.elements.length; i++) { this.walk_expr(al.elements[i]); }
+            }
+            ExprKind::Tuple(tl)  => {
+                for (mut i: i64 = 0; i < tl.elements.length; i++) { this.walk_expr(tl.elements[i]); }
+            }
+            ExprKind::New(n)     => {
+                for (mut i: i64 = 0; i < n.arguments.length; i++) { this.walk_expr(n.arguments[i]); }
+                this.walk_expr(n.array_size);
+                if (n.struct_init != null) { this.walk_expr(n.struct_init); }
+            }
+            ExprKind::Yield(y)   => { this.walk_expr(y.operand); }
+            ExprKind::Try(tr)    => {
+                this.walk_expr(tr.operand);
+                this.walk_expr(tr.desugared);
+            }
+            // A type operand holds no expression, nor does a literal.
+            ExprKind::Sizeof(_)  => { }
+            ExprKind::Alignof(_) => { }
+            ExprKind::Await(aw)  => { this.walk_expr(aw.operand); }
+            ExprKind::Literal(_) => { }
+            ExprKind::Identifier(_) => { }
+            ExprKind::ScopeResolution(_) => { }
+            ExprKind::MemberAccess(ma) => { this.walk_expr(ma.object); }
         }
+    
     }
 
     // -- Lint 3: unused private functions/methods (W0002) --
@@ -614,21 +602,17 @@ type struct DeadCodeChecker {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
-            match (stmt.kind) {
-                NodeKind::ClassDeclaration    => { this.report_methods((stmt as ClassDeclNode*).methods); }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Function(_) => { this.report_function(DeclarationNode::with_shape(stmt)); }
-                        DeclKind::Union(ud) => { this.report_methods(ud.methods); }
-                        DeclKind::Struct(sd) => { this.report_methods(sd.methods); }
-                        DeclKind::Impl(ib) => { this.report_methods(ib.methods); }
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
-                    }
+            if (stmt.is_class()) { this.report_methods((stmt as ClassDeclNode*).methods); } else {
+                match (stmt.shape) {
+                    DeclKind::Function(_) => { this.report_function(DeclarationNode::with_shape(stmt)); }
+                    DeclKind::Union(ud) => { this.report_methods(ud.methods); }
+                    DeclKind::Struct(sd) => { this.report_methods(sd.methods); }
+                    DeclKind::Impl(ib) => { this.report_methods(ib.methods); }
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
                 }
-                _ => {}
             }
         }
     }

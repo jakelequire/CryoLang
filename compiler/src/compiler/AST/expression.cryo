@@ -6,13 +6,13 @@ namespace compiler::ast::expression;
 
 import compiler::diag;
 import compiler::ast;
-import compiler::ast::{ ArgBinding, LiteralKind, MemberPin, NodeKind, TypeAnnotation };
+import compiler::ast::{ ArgBinding, LiteralKind, MemberPin, TypeAnnotation };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::lex;
 import compiler::lex::{ Token };
 import compiler::ast::node;
-import compiler::ast::node::{ ASTNode, Node };
+import compiler::ast::node::{ Node };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::{ TypeKind };
@@ -85,8 +85,18 @@ implement enum CalleePin {
     }
 }
 
-type class ExpressionNode : ASTNode {
-public:
+/// Every expression: what all kinds share, and which kind of expression it
+/// is.
+type struct ExpressionNode {
+    span:          SourceSpan;
+    has_error:     boolean;
+    /// The compiler wrote this node where the source spells nothing, and
+    /// gave it the span of the source it stands for: an f-string's lowering
+    /// (its calls, their callees, its literal runs), an implicit
+    /// conversion's call.  A reader asking what is written at a position -
+    /// the editor - looks through it to the written code under it (an
+    /// f-string's holes, the converted operand).
+    generated:     boolean;
     resolved_type: TypeRef;
 
     /// Set by sema when this expression is a by-value argument passed to a
@@ -103,23 +113,23 @@ public:
     /// `Unclassified` outside an argument slot.
     arg_binding: ArgBinding;
 
-    /// Which expression this is; every expression is built with
-    /// `NodeKind::Expression`.
-    shape: ExprKind;
+    /// Which expression this is.
+    kind: ExprKind;
 
-    ExpressionNode(shape: ExprKind, span: SourceSpan) : ASTNode(NodeKind::Expression, span) {
-        this.resolved_type = TypeRef::invalid();
-        this.autoref       = false;
-        this.arg_binding   = ArgBinding::Unclassified;
-        this.shape         = shape;
-    }
+    set_resolved_type(mut &this, t: TypeRef) -> void { this.resolved_type = t; }
+    has_resolved_type(&this) -> boolean        { return this.resolved_type.is_valid(); }
 
-    set_resolved_type(t: TypeRef) -> void { this.resolved_type = t; }
-    has_resolved_type() -> boolean        { return this.resolved_type.is_valid(); }
-
-    /// An expression of `shape` at `span`, with the header's defaults.
-    static of(shape: ExprKind, span: SourceSpan) -> ExpressionNode* {
-        return new ExpressionNode(shape, span);
+    /// An expression of `kind` at `span`, with the header's defaults.
+    static of(kind: ExprKind, span: SourceSpan) -> ExpressionNode* {
+        return new ExpressionNode {
+            span:          span,
+            has_error:     false,
+            generated:     false,
+            resolved_type: TypeRef::invalid(),
+            autoref:       false,
+            arg_binding:   ArgBinding::Unclassified,
+            kind:          kind,
+        };
     }
 
     /// `sizeof(type_ann)` at `span`, its operand not yet resolved.
@@ -405,7 +415,7 @@ public:
     /// The `sizeof` expression `e` is, or null.
     static sizeof_of(e: ExpressionNode*) -> SizeofExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Sizeof(s) => { s }
             _                   => { null }
         };
@@ -414,7 +424,7 @@ public:
     /// The `alignof` expression `e` is, or null.
     static alignof_of(e: ExpressionNode*) -> AlignofExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Alignof(a) => { a }
             _                    => { null }
         };
@@ -423,7 +433,7 @@ public:
     /// The `typeof` expression `e` is, or null.
     static typeof_of(e: ExpressionNode*) -> TypeofExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Typeof(t) => { t }
             _                   => { null }
         };
@@ -432,7 +442,7 @@ public:
     /// The `delete` expression `e` is, or null.
     static delete_of(e: ExpressionNode*) -> DeleteExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Delete(d) => { d }
             _                   => { null }
         };
@@ -441,7 +451,7 @@ public:
     /// The `new` expression `e` is, or null.
     static new_of(e: ExpressionNode*) -> NewExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::New(ne) => { ne }
             _                 => { null }
         };
@@ -450,7 +460,7 @@ public:
     /// The literal `e` is, or null.
     static literal_of(e: ExpressionNode*) -> LiteralExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Literal(l) => { l }
             _                    => { null }
         };
@@ -459,7 +469,7 @@ public:
     /// The struct literal `e` is, or null.
     static struct_of(e: ExpressionNode*) -> StructExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Struct(s) => { s }
             _                   => { null }
         };
@@ -468,7 +478,7 @@ public:
     /// The array literal `e` is, or null.
     static array_of(e: ExpressionNode*) -> ArrayExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Array(a) => { a }
             _                  => { null }
         };
@@ -477,7 +487,7 @@ public:
     /// The tuple literal `e` is, or null.
     static tuple_of(e: ExpressionNode*) -> TupleExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Tuple(t) => { t }
             _                  => { null }
         };
@@ -486,7 +496,7 @@ public:
     /// The `?:` expression `e` is, or null.
     static ternary_of(e: ExpressionNode*) -> TernaryExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Ternary(t) => { t }
             _                    => { null }
         };
@@ -495,7 +505,7 @@ public:
     /// The `if` expression `e` is, or null.
     static if_of(e: ExpressionNode*) -> IfExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::If(i) => { i }
             _               => { null }
         };
@@ -504,7 +514,7 @@ public:
     /// The `as` cast `e` is, or null.
     static cast_of(e: ExpressionNode*) -> CastExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Cast(c) => { c }
             _                 => { null }
         };
@@ -513,7 +523,7 @@ public:
     /// The `await` `e` is, or null.
     static await_of(e: ExpressionNode*) -> AwaitExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Await(a) => { a }
             _                  => { null }
         };
@@ -522,7 +532,7 @@ public:
     /// The lambda `e` is, or null.
     static lambda_of(e: ExpressionNode*) -> LambdaExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Lambda(l) => { l }
             _                   => { null }
         };
@@ -531,7 +541,7 @@ public:
     /// The indexing `e` is, or null.
     static array_access_of(e: ExpressionNode*) -> ArrayAccessExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::ArrayAccess(a) => { a }
             _                        => { null }
         };
@@ -540,7 +550,7 @@ public:
     /// The binary operation `e` is, or null.
     static binary_of(e: ExpressionNode*) -> BinaryExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Binary(b) => { b }
             _                   => { null }
         };
@@ -549,7 +559,7 @@ public:
     /// The unary operation `e` is, or null.
     static unary_of(e: ExpressionNode*) -> UnaryExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Unary(u) => { u }
             _                  => { null }
         };
@@ -558,7 +568,7 @@ public:
     /// The `match` expression `e` is, or null.
     static match_of(e: ExpressionNode*) -> MatchExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Match(m) => { m }
             _                  => { null }
         };
@@ -567,7 +577,7 @@ public:
     /// The `static match` expression `e` is, or null.
     static static_match_of(e: ExpressionNode*) -> StaticMatchExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::StaticMatch(s) => { s }
             _                        => { null }
         };
@@ -576,7 +586,7 @@ public:
     /// The bare name `e` is, or null.
     static identifier_of(e: ExpressionNode*) -> IdentifierExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Identifier(i) => { i }
             _                       => { null }
         };
@@ -585,7 +595,7 @@ public:
     /// The call `e` is, or null.
     static call_of(e: ExpressionNode*) -> CallExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Call(c) => { c }
             _                 => { null }
         };
@@ -594,7 +604,7 @@ public:
     /// The member access `e` is, or null.
     static member_access_of(e: ExpressionNode*) -> MemberAccessExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::MemberAccess(m) => { m }
             _                         => { null }
         };
@@ -603,7 +613,7 @@ public:
     /// The path `e` is, or null.
     static scope_resolution_of(e: ExpressionNode*) -> ScopeResolutionExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::ScopeResolution(s) => { s }
             _                            => { null }
         };
@@ -612,10 +622,18 @@ public:
     /// The `?` expression `e` is, or null.
     static try_of(e: ExpressionNode*) -> TryExpr* {
         if (e == null) { return null; }
-        return match (e.shape) {
+        return match (e.kind) {
             ExprKind::Try(t) => { t }
             _                => { null }
         };
+    }
+}
+
+/// `new` of a node takes its storage from the AST arena; `delete` of one
+/// releases nothing, since the arena is reclaimed whole.
+implement trait Allocate for struct ExpressionNode {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 

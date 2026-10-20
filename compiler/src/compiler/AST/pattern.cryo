@@ -7,7 +7,7 @@ namespace compiler::ast::pattern;
 import compiler::diag;
 import compiler::ast;
 import compiler::ast::{
-    LiteralKind, MemberPin, NodeKind, PatternBinding, PatternElement, TypeAnnotation
+    LiteralKind, MemberPin, PatternBinding, PatternElement, TypeAnnotation
 };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
@@ -27,49 +27,48 @@ import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import std::fmt;
-import compiler::ast::node::{ ASTNode, Node };
+import compiler::ast::node::{ Node };
 import utils::keyword::{ Keyword };
 
 
-/// Every pattern: the node header, and which kind of pattern it is.
-///
-/// The header is still an `ASTNode`, so a pattern travels wherever any node
-/// does (the binding table, the editor's node at a position) until those
-/// handles are a `Node`; its kind is `shape` because `kind` is the header's
-/// `NodeKind`.
-type class Pattern : ASTNode {
-public:
-    shape: PatternKind;
+/// Every pattern: what all kinds share, and which kind of pattern it is.
+type struct Pattern {
+    span:      SourceSpan;
+    has_error: boolean;
+    /// The compiler wrote this node where the source spells nothing.
+    generated: boolean;
+    kind:      PatternKind;
 
-    Pattern(shape: PatternKind, span: SourceSpan) : ASTNode(NodeKind::Pattern, span) {
-        this.shape = shape;
+    /// A pattern of `kind` at `span`.
+    static of(kind: PatternKind, span: SourceSpan) -> Pattern* {
+        return new Pattern { span: span, has_error: false, generated: false, kind: kind };
     }
 
     /// `_`.
     static wildcard(span: SourceSpan) -> Pattern* {
-        return new Pattern(PatternKind::Wildcard, span);
+        return Pattern::of(PatternKind::Wildcard, span);
     }
 
     /// A literal whose text is `value`; `literal_kind` says which literal
     /// the text spells.
     static literal(value: SymbolStr, literal_kind: LiteralKind, span: SourceSpan) -> Pattern* {
-        return new Pattern(PatternKind::Literal(LiteralPattern::new(value, literal_kind)), span);
+        return Pattern::of(PatternKind::Literal(LiteralPattern::new(value, literal_kind)), span);
     }
 
     /// A name, binding the whole subject; name resolution turns it into a
     /// `Constant` when the name is a constant's.
     static binding(name: SymbolStr, span: SourceSpan) -> Pattern* {
-        return new Pattern(PatternKind::Binding(BindingPattern::new(name)), span);
+        return Pattern::of(PatternKind::Binding(BindingPattern::new(name)), span);
     }
 
     /// `Enum::Variant`, with no elements yet.
     static enum_variant(enum_name: SymbolStr, variant_name: SymbolStr, span: SourceSpan) -> Pattern* {
-        return new Pattern(PatternKind::Enum(EnumPattern::new(enum_name, variant_name, span)), span);
+        return Pattern::of(PatternKind::Enum(EnumPattern::new(enum_name, variant_name, span)), span);
     }
 
     /// The enum pattern this is, or null for another kind.
     enum_payload(&this) -> EnumPattern* {
-        return match (this.shape) {
+        return match (this.kind) {
             PatternKind::Enum(e) => { e }
             _                    => { null }
         };
@@ -78,11 +77,19 @@ public:
     /// Whether this pattern accepts every value without a test: `_`, or a
     /// name that binds.
     is_irrefutable(&this) -> boolean {
-        return match (this.shape) {
+        return match (this.kind) {
             PatternKind::Wildcard   => { true }
             PatternKind::Binding(_) => { true }
             _                       => { false }
         };
+    }
+}
+
+/// `new` of a node takes its storage from the AST arena; `delete` of one
+/// releases nothing, since the arena is reclaimed whole.
+implement trait Allocate for struct Pattern {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -301,33 +308,52 @@ implement trait Allocate for struct EnumPattern {
     }
 }
 
-type class MatchArmNode : ASTNode {
-public:
-    patterns: [Pattern*];
-    body:     Stmt*;
+/// One arm of a `match`: its patterns, an optional guard and the body.
+type struct MatchArmNode {
+    span:      SourceSpan;
+    has_error: boolean;
+    /// The compiler wrote this node where the source spells nothing.
+    generated: boolean;
+    patterns:  [Pattern*];
+    body:      Stmt*;
     /// Optional pattern guard: `pattern if (cond) => body`. When non-null,
     /// the arm matches only if every pattern matches AND `guard` evaluates
     /// to `true`; a false guard falls through to the next arm. The guard is
     /// type-checked as a `boolean` in a scope where the arm's pattern
     /// bindings are visible. Null for an unguarded arm.
-    guard:    ExpressionNode*;
+    guard:     ExpressionNode*;
 
-    MatchArmNode(span: SourceSpan) : ASTNode(NodeKind::MatchArm, span) {
-        this.patterns = [];
-        this.body     = null;
-        this.guard    = null;
+    /// An arm at `span` with no patterns, guard or body yet.
+    static new(span: SourceSpan) -> MatchArmNode* {
+        return new MatchArmNode {
+            span: span, has_error: false, generated: false,
+            patterns: [], body: null, guard: null,
+        };
     }
 
-    add_pattern(pat: Pattern*) -> void {
+    add_pattern(mut &this, pat: Pattern*) -> void {
         this.patterns.push(pat);
     }
 
-    set_body(b: Stmt*) -> void {
+    set_body(mut &this, b: Stmt*) -> void {
         this.body = b;
     }
 
-    set_guard(g: ExpressionNode*) -> void {
+    set_guard(mut &this, g: ExpressionNode*) -> void {
         this.guard = g;
+    }
+
+    /// Visit the patterns, the guard and the body in source order.
+    static walk_children<V>(n: MatchArmNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.patterns.length; i++) { v.walk_node(Node::Pattern(n.patterns[i])); }
+        v.walk_expr(n.guard);
+        v.walk_stmt(n.body);
+    }
+}
+
+implement trait Allocate for struct MatchArmNode {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -338,18 +364,35 @@ public:
 /// `_` (default), which must be last. `body` is a block (or a single-statement
 /// block synthesized by the parser), exactly like a regular match arm. There is
 /// no `guard` - matching is purely on type identity, resolved at monomorphization.
-type class StaticMatchArmNode : ASTNode {
-public:
+type struct StaticMatchArmNode {
+    span:          SourceSpan;
+    has_error:     boolean;
+    /// The compiler wrote this node where the source spells nothing.
+    generated:     boolean;
     type_patterns: [TypeAnnotation*];
     body:          Stmt*;
 
-    StaticMatchArmNode(span: SourceSpan) : ASTNode(NodeKind::StaticMatchArm, span) {
-        this.type_patterns = [];
-        this.body          = null;
+    /// An arm at `span` with no patterns or body yet.
+    static new(span: SourceSpan) -> StaticMatchArmNode* {
+        return new StaticMatchArmNode {
+            span: span, has_error: false, generated: false,
+            type_patterns: [], body: null,
+        };
     }
 
-    add_type_pattern(t: TypeAnnotation*) -> void { this.type_patterns.push(t); }
-    set_body(b: Stmt*) -> void          { this.body = b; }
+    add_type_pattern(mut &this, t: TypeAnnotation*) -> void { this.type_patterns.push(t); }
+    set_body(mut &this, b: Stmt*) -> void          { this.body = b; }
+
+    /// Visit the body.
+    static walk_children<V>(n: StaticMatchArmNode*, v: mut &V) -> void where V: Walk {
+        v.walk_stmt(n.body);
+    }
+}
+
+implement trait Allocate for struct StaticMatchArmNode {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
 }
 
 
@@ -488,22 +531,32 @@ type struct DirectiveArg {
     }
 }
 
-type class DirectiveNode : ASTNode {
-public:
+type struct DirectiveNode {
+    span:           SourceSpan;
+    has_error:      boolean;
+    /// The compiler wrote this node where the source spells nothing.
+    generated:      boolean;
     /// The directive's name, or a platform atom when this node is nested in
     /// a gate (`windows` in `![config(windows)]`): matched against the
     /// compiler's own tables, never used to find a declaration.
     directive_kind: Keyword;
     args:           [DirectiveArg];
 
-    DirectiveNode(directive_kind: Keyword, span: SourceSpan)
-        : ASTNode(NodeKind::Directive, span) {
-        this.directive_kind = directive_kind;
-        this.args           = [];
+    /// `![directive_kind]` at `span`, with no arguments yet.
+    static new(directive_kind: Keyword, span: SourceSpan) -> DirectiveNode* {
+        return new DirectiveNode {
+            span: span, has_error: false, generated: false,
+            directive_kind: directive_kind, args: [],
+        };
     }
 
-    add_arg(a: DirectiveArg) -> void {
+    add_arg(mut &this, a: DirectiveArg) -> void {
         this.args.push(a);
     }
+}
 
+implement trait Allocate for struct DirectiveNode {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
 }

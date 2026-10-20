@@ -43,7 +43,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, sink, snapshot, source_span };
 import compiler::ast;
 import compiler::ast::{
-    ArgBinding, declaration, expression, LiteralKind, MemberPin, node, NodeKind, pattern,
+    ArgBinding, declaration, expression, LiteralKind, MemberPin, node, pattern,
     PatternBinding, statement
 };
 import compiler::passes::pass_id;
@@ -838,32 +838,28 @@ type struct DropInserter {
     }
 
     walk_top_level(mut &this, stmt: DeclarationNode*) -> void {
-        match (stmt.kind) {
-            NodeKind::ClassDeclaration => {
-                this.walk_methods((stmt as ClassDeclNode*).methods);
-            }
-            NodeKind::Declaration => {
-                match (stmt.shape) {
-                    DeclKind::Function(_) => {
-                        this.walk_function(DeclarationNode::with_shape(stmt), null);
-                    }
-                    DeclKind::Trait(td) => {
-                        for (mut i: i64 = 0; i < td.methods.length; i++) {
-                            const m_decl: DeclarationNode* = td.methods[i];
-                            const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
-                            if (m != null) { this.walk_function(m_decl, null); }
-                        }
-                    }
-                    DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
-                    DeclKind::Struct(sd) => { this.walk_methods(sd.methods); }
-                    DeclKind::Impl(ib) => { this.walk_methods(ib.methods); }
-                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
-                    | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
+        if (stmt.is_class()) {
+            this.walk_methods((stmt as ClassDeclNode*).methods);
+        } else {
+            match (stmt.shape) {
+                DeclKind::Function(_) => {
+                    this.walk_function(DeclarationNode::with_shape(stmt), null);
                 }
+                DeclKind::Trait(td) => {
+                    for (mut i: i64 = 0; i < td.methods.length; i++) {
+                        const m_decl: DeclarationNode* = td.methods[i];
+                        const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
+                        if (m != null) { this.walk_function(m_decl, null); }
+                    }
+                }
+                DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
+                DeclKind::Struct(sd) => { this.walk_methods(sd.methods); }
+                DeclKind::Impl(ib) => { this.walk_methods(ib.methods); }
+                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+                | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => {}
             }
-            _ => {}
         }
     }
 
@@ -1047,7 +1043,7 @@ type struct DropInserter {
         if (value_block) {
             for (mut i: i64 = old_stmts.length - 1; i >= 0; i--) {
                 if (old_stmts[i] != null) {
-                    match (old_stmts[i].shape) {
+                    match (old_stmts[i].kind) {
                         StmtKind::Expr(_) => { value_idx = i; }
                         _ => {}
                     }
@@ -1065,7 +1061,7 @@ type struct DropInserter {
                 // emitted its drops and there's no path here.
                 continue;
             }
-            match (stmt.shape) {
+            match (stmt.kind) {
                 StmtKind::Expr(es) if (i == value_idx) => {
                     // The arm's value statement.  Walk its expression in move
                     // context (a yielded bare binding is then marked moved),
@@ -1123,7 +1119,7 @@ type struct DropInserter {
     }
 
     walk_stmt_kind(mut &this, stmt: Stmt*, out: [Stmt*]*) -> boolean {
-        return match (stmt.shape) {
+        return match (stmt.kind) {
             StmtKind::Return(r) => {
                 const ret_snap: i64 = this.snapshot_moves();
                 this.stmt_writes_flags = true;
@@ -1307,7 +1303,7 @@ type struct DropInserter {
                 // consumption/drop-flag machinery).
                 mut smd: boolean = false;
                 if (sm.arms.length > 0 && sm.arms[0] != null && sm.arms[0].body != null) {
-                    match (sm.arms[0].body.shape) {
+                    match (sm.arms[0].body.kind) {
                         StmtKind::Block(_) => { smd = this.walk_block(sm.arms[0].body); }
                         _ => {}
                     }
@@ -1416,7 +1412,7 @@ type struct DropInserter {
     /// parser produces bare statements for `if (c) return;` shapes.
     wrap_early_exit(mut &this, stmt: Stmt*) -> Stmt* {
         if (stmt == null) { return stmt; }
-        const exits: boolean = match (stmt.shape) {
+        const exits: boolean = match (stmt.kind) {
             StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue => { true }
             _ => { false }
         };
@@ -1532,7 +1528,7 @@ type struct DropInserter {
         for (mut p: i64 = 0; p < arm.patterns.length; p++) {
             const pat: Pattern* = arm.patterns[p];
             if (pat == null) { continue; }
-            match (pat.shape) {
+            match (pat.kind) {
                 PatternKind::Binding(b) => {
                     // The binding is a copy of the whole subject: consuming it
                     // moves the subject, as consuming a payload does.
@@ -1869,7 +1865,7 @@ type struct DropInserter {
     /// either a Block or a non-early-exit shape.
     walk_stmt_in_place(mut &this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        return match (stmt.shape) {
+        return match (stmt.kind) {
             StmtKind::Block(_) => {
                 this.walk_block(stmt)
             }
@@ -1886,7 +1882,7 @@ type struct DropInserter {
     /// statement is itself that value, walked in move context.
     walk_stmt_in_place_value(mut &this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        return match (stmt.shape) {
+        return match (stmt.kind) {
             StmtKind::Block(_) => {
                 this.walk_value_block(stmt)
             }
@@ -3042,7 +3038,7 @@ type struct DropInserter {
                                  span: SourceSpan) -> Stmt* {
         if (branch == null) { return branch; }
         const set_stmt: Stmt* = this.make_drop_flag_set(flag, span);
-        match (branch.shape) {
+        match (branch.kind) {
             StmtKind::Block(b) => {
                 b.statements.push(set_stmt);
                 return branch;
@@ -3068,7 +3064,7 @@ type struct DropInserter {
                              span: SourceSpan) -> Stmt* {
         if (branch == null) { return branch; }
         const set_stmt: Stmt* = this.make_drop_flag_set(flag, span);
-        match (branch.shape) {
+        match (branch.kind) {
             StmtKind::Block(b) => {
                 b.statements.insert(0, set_stmt);
                 return branch;
@@ -3382,7 +3378,7 @@ type struct DropInserter {
     /// for every local whose field is incremented after a normal assignment.
     collect_init_disqualifiers(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Block(b) => {
                 for (mut i: i64 = 0; i < b.statements.length; i++) {
                     this.collect_init_disqualifiers(b.statements[i]);
@@ -3461,64 +3457,54 @@ type struct DropInserter {
     disq_scan_expr(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::Expression => {
-                match (expr.shape) {
-                    ExprKind::Call(c) => {
-                        this.disq_scan_expr(c.callee);
-                        for (mut i: i64 = 0; i < c.arguments.length; i++) {
-                            this.disq_scan_expr(c.arguments[i]);
-                        }
-                    }
-                    ExprKind::MemberAccess(ma) => { this.disq_scan_expr(ma.object); }
-                    ExprKind::Cast(ce) => { this.disq_scan_expr(ce.expression); }
-                    ExprKind::ArrayAccess(aa) => {
-                        this.disq_scan_expr(aa.array);
-                        this.disq_scan_expr(aa.index);
-                    }
-                    ExprKind::Unary(ue) => {
-                        if (ue.op.kind == TokenType::Amp) {
-                            // `&r` / `&r.f`: the callee can initialize through the
-                            // pointer, which no whole-binding flag can observe.
-                            this.disq_scan_place(ue.operand, true);
-                        } else {
-                            this.disq_scan_expr(ue.operand);
-                        }
-                    }
-                    ExprKind::Binary(b) => {
-                        if (b.op.kind == TokenType::Equal) {
-                            this.disq_scan_place(b.left, false);
-                        } else {
-                            this.disq_scan_expr(b.left);
-                        }
-                        this.disq_scan_expr(b.right);
-                    }
-                    ExprKind::Struct(sl) => {
-                        for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-                            this.disq_scan_expr(sl.field_inits[i].value);
-                        }
-                    }
-                    ExprKind::Tuple(tl) => {
-                        for (mut i: i64 = 0; i < tl.elements.length; i++) {
-                            this.disq_scan_expr(tl.elements[i]);
-                        }
-                    }
-                    // As the default below: nothing disqualifying.
-                    ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
-                    | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Try(_)
-                    | ExprKind::New(_) | ExprKind::Array(_) | ExprKind::Literal(_)
-                    | ExprKind::Ternary(_) | ExprKind::If(_) | ExprKind::StaticMatch(_)
-                    | ExprKind::Match(_) | ExprKind::Lambda(_) | ExprKind::Await(_)
-                    | ExprKind::Identifier(_) | ExprKind::ScopeResolution(_) => { }
+            ExprKind::Call(c) => {
+                this.disq_scan_expr(c.callee);
+                for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                    this.disq_scan_expr(c.arguments[i]);
                 }
             }
-            _ => {
-                // Any other expression shape (literals, etc.) either has no
-                // sub-identifier in a disqualifying position or is rare enough
-                // that a conservative miss is a leak-at-worst, never a
-                // use-after-free.  Whole-binding reads are intentionally NOT
-                // disqualifying.
+            ExprKind::MemberAccess(ma) => { this.disq_scan_expr(ma.object); }
+            ExprKind::Cast(ce) => { this.disq_scan_expr(ce.expression); }
+            ExprKind::ArrayAccess(aa) => {
+                this.disq_scan_expr(aa.array);
+                this.disq_scan_expr(aa.index);
             }
+            ExprKind::Unary(ue) => {
+                if (ue.op.kind == TokenType::Amp) {
+                    // `&r` / `&r.f`: the callee can initialize through the
+                    // pointer, which no whole-binding flag can observe.
+                    this.disq_scan_place(ue.operand, true);
+                } else {
+                    this.disq_scan_expr(ue.operand);
+                }
+            }
+            ExprKind::Binary(b) => {
+                if (b.op.kind == TokenType::Equal) {
+                    this.disq_scan_place(b.left, false);
+                } else {
+                    this.disq_scan_expr(b.left);
+                }
+                this.disq_scan_expr(b.right);
+            }
+            ExprKind::Struct(sl) => {
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                    this.disq_scan_expr(sl.field_inits[i].value);
+                }
+            }
+            ExprKind::Tuple(tl) => {
+                for (mut i: i64 = 0; i < tl.elements.length; i++) {
+                    this.disq_scan_expr(tl.elements[i]);
+                }
+            }
+            // As the default below: nothing disqualifying.
+            ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
+            | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Try(_)
+            | ExprKind::New(_) | ExprKind::Array(_) | ExprKind::Literal(_)
+            | ExprKind::Ternary(_) | ExprKind::If(_) | ExprKind::StaticMatch(_)
+            | ExprKind::Match(_) | ExprKind::Lambda(_) | ExprKind::Await(_)
+            | ExprKind::Identifier(_) | ExprKind::ScopeResolution(_) => { }
         }
+    
     }
 
     /// Scan `expr` as a place being written or having its address taken, and
@@ -3535,68 +3521,59 @@ type struct DropInserter {
     disq_scan_place(mut &this, expr: ExpressionNode*, escaping: boolean) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::Expression => {
-                match (expr.shape) {
-                    ExprKind::MemberAccess(ma) => {
-                        // A member write is an initialization at MEMBER granularity
-                        // when the place is carved out of the local's own storage.
-                        // When it isn't - a hop through a pointer, a dynamic index -
-                        // no flag can name the slot, so fall through and let the local
-                        // keep its unconditional whole-binding drop.
-                        if (!escaping && this.record_init_place(expr)) { return; }
-                        if (ma.object != null) {
-                            const obj_id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
-                            if (obj_id != null) {
-                                this.disqualify_init(obj_id);
-                            } else {
-                                this.disq_scan_place(ma.object, escaping);
-                            }
-                        }
-                    }
-                    ExprKind::Identifier(id) => {
-                        if (escaping) {
-                            this.disqualify_init(id);
-                        } else {
-                            // The whole-binding write the init flag exists to observe.
-                            // Recording it keeps members untracked for this local: a
-                            // value that becomes live all at once is governed by one
-                            // flag, and a later member write displaces a member of an
-                            // already-live parent rather than initializing it.
-                            this.note_whole_assignment(id);
-                        }
-                    }
-                    ExprKind::ArrayAccess(aa) => {
-                        if (!escaping && this.record_init_place(expr)) { return; }
-                        if (aa.array != null) {
-                            const arr_id: IdentifierExpr* = ExpressionNode::identifier_of(aa.array);
-                            if (arr_id != null) {
-                                this.disqualify_init(arr_id);
-                            } else {
-                                this.disq_scan_place(aa.array, escaping);
-                            }
-                        }
-                        this.disq_scan_expr(aa.index);
-                    }
-                    // Not a place rooted in a local, as the default below.
-                    ExprKind::Alignof(_) | ExprKind::Array(_) | ExprKind::Binary(_)
-                    | ExprKind::Cast(_) | ExprKind::Delete(_) | ExprKind::If(_)
-                    | ExprKind::Literal(_) | ExprKind::Match(_) | ExprKind::New(_)
-                    | ExprKind::Sizeof(_) | ExprKind::StaticMatch(_) | ExprKind::Struct(_)
-                    | ExprKind::Ternary(_) | ExprKind::Try(_) | ExprKind::Tuple(_)
-                    | ExprKind::Typeof(_) | ExprKind::Unary(_) | ExprKind::Yield(_)
-                    | ExprKind::Lambda(_) | ExprKind::Await(_) | ExprKind::ScopeResolution(_)
-                    | ExprKind::Call(_) => {
-                        this.disq_scan_expr(expr);
+            ExprKind::MemberAccess(ma) => {
+                // A member write is an initialization at MEMBER granularity
+                // when the place is carved out of the local's own storage.
+                // When it isn't - a hop through a pointer, a dynamic index -
+                // no flag can name the slot, so fall through and let the local
+                // keep its unconditional whole-binding drop.
+                if (!escaping && this.record_init_place(expr)) { return; }
+                if (ma.object != null) {
+                    const obj_id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
+                    if (obj_id != null) {
+                        this.disqualify_init(obj_id);
+                    } else {
+                        this.disq_scan_place(ma.object, escaping);
                     }
                 }
             }
-            _ => {
-                // Not a place rooted in a local (`*p = v`, `f().x = v`, ...):
-                // nothing of the local's own storage is being initialized, so
-                // fall back to the read scan to catch nested `&`/assignments.
+            ExprKind::Identifier(id) => {
+                if (escaping) {
+                    this.disqualify_init(id);
+                } else {
+                    // The whole-binding write the init flag exists to observe.
+                    // Recording it keeps members untracked for this local: a
+                    // value that becomes live all at once is governed by one
+                    // flag, and a later member write displaces a member of an
+                    // already-live parent rather than initializing it.
+                    this.note_whole_assignment(id);
+                }
+            }
+            ExprKind::ArrayAccess(aa) => {
+                if (!escaping && this.record_init_place(expr)) { return; }
+                if (aa.array != null) {
+                    const arr_id: IdentifierExpr* = ExpressionNode::identifier_of(aa.array);
+                    if (arr_id != null) {
+                        this.disqualify_init(arr_id);
+                    } else {
+                        this.disq_scan_place(aa.array, escaping);
+                    }
+                }
+                this.disq_scan_expr(aa.index);
+            }
+            // Not a place rooted in a local, as the default below.
+            ExprKind::Alignof(_) | ExprKind::Array(_) | ExprKind::Binary(_)
+            | ExprKind::Cast(_) | ExprKind::Delete(_) | ExprKind::If(_)
+            | ExprKind::Literal(_) | ExprKind::Match(_) | ExprKind::New(_)
+            | ExprKind::Sizeof(_) | ExprKind::StaticMatch(_) | ExprKind::Struct(_)
+            | ExprKind::Ternary(_) | ExprKind::Try(_) | ExprKind::Tuple(_)
+            | ExprKind::Typeof(_) | ExprKind::Unary(_) | ExprKind::Yield(_)
+            | ExprKind::Lambda(_) | ExprKind::Await(_) | ExprKind::ScopeResolution(_)
+            | ExprKind::Call(_) => {
                 this.disq_scan_expr(expr);
             }
         }
+    
     }
 
     // ---- member-granularity initialization -------------------------------
@@ -3950,7 +3927,7 @@ type struct DropInserter {
     /// bodies).  Blocks already rebuild, so they pass through untouched.
     wrap_for_init(mut &this, stmt: Stmt*) -> Stmt* {
         if (stmt == null) { return stmt; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Block(_) => { return stmt; }
             _ => {}
         }
@@ -3964,7 +3941,7 @@ type struct DropInserter {
     /// conditionally-initialized droppable local currently in scope.
     stmt_assigns_tracked_init(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Expr(e) => {
                 if (this.init_flag_for_assignment_target(e.expression).is_valid()) {
                     return true;
@@ -4073,84 +4050,80 @@ type struct DropInserter {
     walk_expr_read(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::Expression         => {
-                match (expr.shape) {
-                    ExprKind::Call(c) => {
-                        this.read_call(expr, c);
-                        // `--panic=unwind`: snapshot the cleanup schedule for this
-                        // call's landing pad AFTER read_call has recorded its own
-                        // receiver/arg moves, so a local moved into the call is
-                        // excluded (the callee owns it now).
-                        if (this.ctx.options.unwinds()) { this.populate_unwind_cleanup(c); }
-                    }
-                    ExprKind::Identifier(id) => { this.handle_ident(expr, id, false); }
-                    ExprKind::MemberAccess(ma) => { this.read_member(ma); }
-                    // A match used as an expression, including the desugars
-                    // of `?` and `??`.  Route through the shared arm walker
-                    // in expression mode so an early `return` inside an arm
-                    // (the failure arm of a `?`) gets the cumulative drops
-                    // of every live local, and yielded values are
-                    // move-tracked.
-                    ExprKind::Match(me) => {
-                        // No hoist buffer at expression position - the
-                        // enclosing statement-list isn't reachable from
-                        // here.  A throwaway out buffer plus a null match
-                        // node tells walk_match_arms to skip flag synthesis
-                        // and fall back to E0456 for conditional moves (rare
-                        // in practice for match expressions: stdlib uses
-                        // Option/Result here, whose payload consumption is
-                        // tracked via link_payload, not outer-scope move
-                        // detection).
-                        mut throwaway_out: [Stmt*] = [];
-                        this.walk_match_arms(null, me.subject, me.arms, true,
-                            &throwaway_out, &me.unwind_cleanup);
-                    }
-                    // Single live arm post-monomorphization: instrument its
-                    // block.  This is an *expression* arm - its trailing
-                    // statement is the yielded value that flows out (e.g. as
-                    // the enclosing `return`'s result), so route through
-                    // `walk_value_block`, not `walk_block`.  `walk_block` would
-                    // treat that trailing owned temp as a discarded statement
-                    // and synthesize a scope-exit drop, freeing the very value
-                    // being returned (an sret aggregate then comes back empty /
-                    // use-after-free).  Mirrors how a `match` expression's arms
-                    // are walked in expression mode.
-                    ExprKind::StaticMatch(sme) => {
-                        if (sme.arms.length > 0 && sme.arms[0] != null && sme.arms[0].body != null) {
-                            match (sme.arms[0].body.shape) {
-                                StmtKind::Block(_) => {
-                                    const _smd: boolean = this.walk_value_block(sme.arms[0].body);
-                                }
-                                _ => {}
-                            }
+            ExprKind::Call(c) => {
+                this.read_call(expr, c);
+                // `--panic=unwind`: snapshot the cleanup schedule for this
+                // call's landing pad AFTER read_call has recorded its own
+                // receiver/arg moves, so a local moved into the call is
+                // excluded (the callee owns it now).
+                if (this.ctx.options.unwinds()) { this.populate_unwind_cleanup(c); }
+            }
+            ExprKind::Identifier(id) => { this.handle_ident(expr, id, false); }
+            ExprKind::MemberAccess(ma) => { this.read_member(ma); }
+            // A match used as an expression, including the desugars
+            // of `?` and `??`.  Route through the shared arm walker
+            // in expression mode so an early `return` inside an arm
+            // (the failure arm of a `?`) gets the cumulative drops
+            // of every live local, and yielded values are
+            // move-tracked.
+            ExprKind::Match(me) => {
+                // No hoist buffer at expression position - the
+                // enclosing statement-list isn't reachable from
+                // here.  A throwaway out buffer plus a null match
+                // node tells walk_match_arms to skip flag synthesis
+                // and fall back to E0456 for conditional moves (rare
+                // in practice for match expressions: stdlib uses
+                // Option/Result here, whose payload consumption is
+                // tracked via link_payload, not outer-scope move
+                // detection).
+                mut throwaway_out: [Stmt*] = [];
+                this.walk_match_arms(null, me.subject, me.arms, true,
+                    &throwaway_out, &me.unwind_cleanup);
+            }
+            // Single live arm post-monomorphization: instrument its
+            // block.  This is an *expression* arm - its trailing
+            // statement is the yielded value that flows out (e.g. as
+            // the enclosing `return`'s result), so route through
+            // `walk_value_block`, not `walk_block`.  `walk_block` would
+            // treat that trailing owned temp as a discarded statement
+            // and synthesize a scope-exit drop, freeing the very value
+            // being returned (an sret aggregate then comes back empty /
+            // use-after-free).  Mirrors how a `match` expression's arms
+            // are walked in expression mode.
+            ExprKind::StaticMatch(sme) => {
+                if (sme.arms.length > 0 && sme.arms[0] != null && sme.arms[0].body != null) {
+                    match (sme.arms[0].body.kind) {
+                        StmtKind::Block(_) => {
+                            const _smd: boolean = this.walk_value_block(sme.arms[0].body);
                         }
+                        _ => {}
                     }
-                    // `expr?` is lowered by sema to a `match` expression;
-                    // route through the same path.  (`desugared` is null
-                    // only when sema rejected the operand; a diagnostic
-                    // already fired in that case.)
-                    ExprKind::Try(te) => {
-                        if (te.desugared != null) { this.walk_expr_read(te.desugared); }
-                    }
-                    ExprKind::New(ne) => { this.read_new(ne); }
-                    ExprKind::Tuple(tl) => { this.read_tuple_lit(tl); }
-                    ExprKind::Array(al) => { this.read_array_lit(al); }
-                    ExprKind::Struct(sl) => { this.read_struct_lit(sl); }
-                    ExprKind::Cast(cv) => { this.read_cast(cv); }
-                    ExprKind::Unary(u) => { this.read_unary(u); }
-                    ExprKind::Binary(b) => { this.read_binary(expr, b); }
-                    ExprKind::ArrayAccess(aa) => { this.read_array_access(aa); }
-                    ExprKind::Lambda(lam) => { this.read_lambda(lam); }
-                    ExprKind::Ternary(t) => { this.read_ternary(t); }
-                    ExprKind::If(ie) => { this.read_if_expr(ie); }
-                    // Not walked by this pass.
-                    ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
-                    | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Literal(_)
-                    | ExprKind::Await(_) | ExprKind::ScopeResolution(_) => { }
                 }
             }
-            _ => {}
+            // `expr?` is lowered by sema to a `match` expression;
+            // route through the same path.  (`desugared` is null
+            // only when sema rejected the operand; a diagnostic
+            // already fired in that case.)
+            ExprKind::Try(te) => {
+                if (te.desugared != null) { this.walk_expr_read(te.desugared); }
+            }
+            ExprKind::New(ne) => { this.read_new(ne); }
+            ExprKind::Tuple(tl) => { this.read_tuple_lit(tl); }
+            ExprKind::Array(al) => { this.read_array_lit(al); }
+            ExprKind::Struct(sl) => { this.read_struct_lit(sl); }
+            ExprKind::Cast(cv) => { this.read_cast(cv); }
+            ExprKind::Unary(u) => { this.read_unary(u); }
+            ExprKind::Binary(b) => { this.read_binary(expr, b); }
+            ExprKind::ArrayAccess(aa) => { this.read_array_access(aa); }
+            ExprKind::Lambda(lam) => { this.read_lambda(lam); }
+            ExprKind::Ternary(t) => { this.read_ternary(t); }
+            ExprKind::If(ie) => { this.read_if_expr(ie); }
+            // Not walked by this pass.
+            ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
+            | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Literal(_)
+            | ExprKind::Await(_) | ExprKind::ScopeResolution(_) => { }
         }
+    
     }
 
     /// A `move` lambda consumes each non-Copy captured outer binding at

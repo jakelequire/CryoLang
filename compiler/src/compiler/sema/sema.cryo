@@ -32,7 +32,7 @@ import compiler::const_table::{ ConstEval };
 import compiler::ast;
 import compiler::ast::{
     cloner, declaration, expression, GenericAnnotation, ImplTraitAnnotation, LiteralKind,
-    MemberPin, NamedAnnotation, node, node_locator, NodeKind, pattern, PatternBinding, PatternElement,
+    MemberPin, NamedAnnotation, node, node_locator, pattern, PatternBinding, PatternElement,
     statement, TraitRef, TypeAnnotation
 };
 import compiler::passes::pass_id;
@@ -355,50 +355,44 @@ type struct SemaVisitor {
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             const stmt: DeclarationNode* = node.statements[i].as_decl();
             if (stmt == null) { continue; }
-            match (stmt.kind) {
-                // A declaration's owner is its own registered type and the
-                // key it registered under, both off the stamp.
-                NodeKind::ClassDeclaration => {
-                    const c: ClassDeclNode* = stmt as ClassDeclNode*;
-                    this.declare_async_methods(c.methods, c.generic_params,
-                        this.ctx.decl_index.type_of_decl(c.def, "sema/async declare class"), c.name, null);
-                }
-                NodeKind::Declaration => {
-                    match (stmt.shape) {
-                        DeclKind::Function(f) => {
-                            const f_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
-                            // A lowered one has already had `is_async` cleared.
-                            if (f.is_async && f.body != null) {
-                                // `async function main` is renamed out of the entry-point
-                                // slot first, so the future `declare` registers is keyed
-                                // to the renamed function and not to `main`.
-                                this.async_lower.desugar_async_main(f_decl);
-                                this.async_lower.declare(f_decl);
-                            }
+            if (stmt.is_class()) {
+                const c: ClassDeclNode* = stmt as ClassDeclNode*;
+                this.declare_async_methods(c.methods, c.generic_params,
+                    this.ctx.decl_index.type_of_decl(c.def, "sema/async declare class"), c.name, null);
+            } else {
+                match (stmt.shape) {
+                    DeclKind::Function(f) => {
+                        const f_decl: DeclarationNode* = DeclarationNode::with_shape(stmt);
+                        // A lowered one has already had `is_async` cleared.
+                        if (f.is_async && f.body != null) {
+                            // `async function main` is renamed out of the entry-point
+                            // slot first, so the future `declare` registers is keyed
+                            // to the renamed function and not to `main`.
+                            this.async_lower.desugar_async_main(f_decl);
+                            this.async_lower.declare(f_decl);
                         }
-                        DeclKind::Impl(ib) => {
-                            // The head's owner, off the stamp; the written
-                            // target is what a refusal names.
-                            mut owner_params: [DeclarationNode*] = this.impl_owner_params(ib);
-                            this.declare_async_methods(ib.methods, owner_params,
-                                this.ctx.decl_index.impl_owner(ib, "sema/async declare"), ib.target_type,
-                                stmt);
-                        }
-                        DeclKind::Struct(s) => {
-                            this.declare_async_methods(s.methods, s.generic_params,
-                                this.ctx.decl_index.type_of_decl(s.def, "sema/async declare struct"), s.name, null);
-                        }
-                        DeclKind::Union(u) => {
-                            this.declare_async_methods(u.methods, u.generic_params,
-                                this.ctx.decl_index.type_of_decl(u.def, "sema/async declare union"), u.name, null);
-                        }
-                        DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
-                        | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
-                        | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
-                        | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                     }
+                    DeclKind::Impl(ib) => {
+                        // The head's owner, off the stamp; the written
+                        // target is what a refusal names.
+                        mut owner_params: [DeclarationNode*] = this.impl_owner_params(ib);
+                        this.declare_async_methods(ib.methods, owner_params,
+                            this.ctx.decl_index.impl_owner(ib, "sema/async declare"), ib.target_type,
+                            stmt);
+                    }
+                    DeclKind::Struct(s) => {
+                        this.declare_async_methods(s.methods, s.generic_params,
+                            this.ctx.decl_index.type_of_decl(s.def, "sema/async declare struct"), s.name, null);
+                    }
+                    DeclKind::Union(u) => {
+                        this.declare_async_methods(u.methods, u.generic_params,
+                            this.ctx.decl_index.type_of_decl(u.def, "sema/async declare union"), u.name, null);
+                    }
+                    DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                    | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                    | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                    | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) | DeclKind::Legacy => { }
                 }
-                _ => { }
             }
         }
     }
@@ -562,7 +556,7 @@ type struct SemaVisitor {
     /// Dispatch a statement to the check for its kind.
     dispatch_stmt(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Block(_)       => { this.visit_block(stmt); }
             StmtKind::UnsafeBlock(n) => { this.visit_unsafe_block(stmt, n); }
             StmtKind::Asm(n)         => { this.visit_asm_block(stmt, n); }
@@ -1088,7 +1082,7 @@ type struct SemaVisitor {
         if (!node.init.is_null()) {
             if (node.init.as_stmt() != null) {
                 const init_stmt: Stmt* = node.init.as_stmt();
-                match (init_stmt.shape) {
+                match (init_stmt.kind) {
                     StmtKind::Decl(d) => { this.visit_decl_stmt(init_stmt, d); }
                     StmtKind::Expr(e) => { this.resolve_expr(e.expression); }
                     _ => {}
@@ -1704,11 +1698,7 @@ type struct SemaVisitor {
         if (expr.has_resolved_type()) {
             return expr.resolved_type;
         }
-        const n: ExpressionNode* = expr;
-        const result: TypeRef = match (n.kind) {
-            NodeKind::Expression        => { this.resolve_expr_shape(expr) }
-            _ => { TypeRef::invalid() }
-        };
+        const result: TypeRef = this.resolve_expr_shape(expr);
         if (result.is_valid()) { expr.set_resolved_type(result); }
         return result;
     }
@@ -1716,7 +1706,7 @@ type struct SemaVisitor {
     /// The type of an expression whose kind has a payload; `resolve_expr`
     /// records it on the header.
     resolve_expr_shape(mut &this, expr: ExpressionNode*) -> TypeRef {
-        return match (expr.shape) {
+        return match (expr.kind) {
             ExprKind::Sizeof(s) => {
                 if (!s.operand_type.is_valid()) {
                     s.set_operand_type(this.resolve_layout_operand(s.type_ann));
@@ -2691,32 +2681,28 @@ type struct SemaVisitor {
             this.ctx.diagnostics.emit(diag);
             return;
         }
-        match (lhs.kind) {
-            NodeKind::Expression => {
-                const ma: MemberAccessExpr* = ExpressionNode::member_access_of(lhs);
-                if (ma != null) {
-                    if (ma.object == null) { return; }
-                    const recv_t: Type* = this.arena.lookup(ma.object.resolved_type);
-                    if (recv_t != null && (recv_t.kind == TypeKind::Pointer || recv_t.kind == TypeKind::Reference)) { return; }
-                    if (this.symbolic.symbolic_type_unresolved(ma.object.resolved_type)) { return; }
-                    this.check_assignment_lvalue(ma.object);
-                    return;
-                }
-                if (ExpressionNode::literal_of(lhs) != null) {
-                    this.ctx.emit_error_at(ErrorCode::E0232_INVALID_ASSIGNMENT_TARGET,
-                        "cannot assign to a literal; the left-hand side of an assignment must be a place (variable, field, or index)", lhs.span);
-                }
-                const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(lhs);
-                if (aa != null) {
-                    if (aa.array == null) { return; }
-                    const arr_t: Type* = this.arena.lookup(aa.array.resolved_type);
-                    if (arr_t != null && (arr_t.kind == TypeKind::Pointer || arr_t.kind == TypeKind::Reference)) { return; }
-                    if (this.symbolic.symbolic_type_unresolved(aa.array.resolved_type)) { return; }
-                    this.check_assignment_lvalue(aa.array);
-                }
-            }
-            _ => {}
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(lhs);
+        if (ma != null) {
+            if (ma.object == null) { return; }
+            const recv_t: Type* = this.arena.lookup(ma.object.resolved_type);
+            if (recv_t != null && (recv_t.kind == TypeKind::Pointer || recv_t.kind == TypeKind::Reference)) { return; }
+            if (this.symbolic.symbolic_type_unresolved(ma.object.resolved_type)) { return; }
+            this.check_assignment_lvalue(ma.object);
+            return;
         }
+        if (ExpressionNode::literal_of(lhs) != null) {
+            this.ctx.emit_error_at(ErrorCode::E0232_INVALID_ASSIGNMENT_TARGET,
+                "cannot assign to a literal; the left-hand side of an assignment must be a place (variable, field, or index)", lhs.span);
+        }
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(lhs);
+        if (aa != null) {
+            if (aa.array == null) { return; }
+            const arr_t: Type* = this.arena.lookup(aa.array.resolved_type);
+            if (arr_t != null && (arr_t.kind == TypeKind::Pointer || arr_t.kind == TypeKind::Reference)) { return; }
+            if (this.symbolic.symbolic_type_unresolved(aa.array.resolved_type)) { return; }
+            this.check_assignment_lvalue(aa.array);
+        }
+    
     }
 
     resolve_unary(mut &this, e: ExpressionNode*, unary: UnaryExpr*) -> TypeRef {
@@ -3057,7 +3043,7 @@ type struct SemaVisitor {
             const save: i64 = this.scopes.save_scope();
             this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
             if (arm.guard != null) { this.resolve_condition(arm.guard); }
-            match (arm.body.shape) {
+            match (arm.body.kind) {
                 StmtKind::Block(block) => {
                     const last_idx: i64 = block.statements.length - 1;
                     for (mut j: i64 = 0; j < block.statements.length; j++) {
@@ -3066,7 +3052,7 @@ type struct SemaVisitor {
                         if (j == last_idx) { this.state.expected_type = outer_expected; }
                     }
                     if (block.statements.length > 0) {
-                        match (block.statements[block.statements.length - 1].shape) {
+                        match (block.statements[block.statements.length - 1].kind) {
                             StmtKind::Expr(es) => {
                                 if (es.expression != null && es.expression.has_resolved_type()) {
                                     const arm_type: TypeRef = es.expression.resolved_type;
@@ -3138,7 +3124,7 @@ type struct SemaVisitor {
         const save: i64 = this.narrow_static_match_arm(scrutinee, pattern);
         mut arm_result: TypeRef = TypeRef::invalid();
         const value_block: BlockStmt* = if (as_value) {
-            match (body.shape) {
+            match (body.kind) {
                 StmtKind::Block(b) => { b }
                 _                  => { null }
             }
@@ -3153,7 +3139,7 @@ type struct SemaVisitor {
                 if (j == last_idx) { this.state.expected_type = outer_expected; }
             }
             if (value_block.statements.length > 0) {
-                match (value_block.statements[last_idx].shape) {
+                match (value_block.statements[last_idx].kind) {
                     StmtKind::Expr(es) => {
                         if (es.expression != null && es.expression.has_resolved_type()) { arm_result = es.expression.resolved_type; }
                     }
@@ -3352,7 +3338,7 @@ type struct SemaVisitor {
             resolved_type: TypeRef::invalid(), written_mut: false
         };
         ok_pat.add_element(PatternElement::Binding(ok_pb));
-        mut ok_arm: MatchArmNode* = new MatchArmNode(span);
+        mut ok_arm: MatchArmNode* = MatchArmNode::new(span);
         ok_arm.add_pattern(ok_node);
         const ok_ident: ExpressionNode* = ExpressionNode::identifier_expr(ok_bind, span);
         ExpressionNode::identifier_of(ok_ident).set_res(Res::Local(ok_sym));
@@ -3399,7 +3385,7 @@ type struct SemaVisitor {
         if (this.state.async_poll_output.is_valid()) {
             ret_value = this.make_poll_ready(ret_value, this.state.return_type, span);
         }
-        mut err_arm: MatchArmNode* = new MatchArmNode(span);
+        mut err_arm: MatchArmNode* = MatchArmNode::new(span);
         err_arm.add_pattern(err_node);
         const err_block: Stmt* = Stmt::block(span);
         err_block.as_block().add_statement(Stmt::return_stmt(ret_value, span));
@@ -4297,7 +4283,7 @@ type struct SemaVisitor {
 
     stmt_always_returns(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Return(_) => { return true; }
             StmtKind::Block(b) => {
                 for (mut i: i64 = 0; i < b.statements.length; i++) {
@@ -4339,7 +4325,7 @@ type struct SemaVisitor {
     /// nested loop leaves that loop instead, so a loop is not searched.
     stmt_contains_break(&this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
-        match (stmt.shape) {
+        match (stmt.kind) {
             StmtKind::Break => { return true; }
             StmtKind::Block(b) => {
                 for (mut i: i64 = 0; i < b.statements.length; i++) {
