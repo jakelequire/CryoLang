@@ -64,7 +64,7 @@ import compiler::types::compound::{
 import compiler::types::generic::{
     AssocProjectionType, GenericParamType, InstantiatedType
 };
-import compiler::types::generic_registry::{ TemplateEntry, TemplateKind };
+import compiler::types::generic_registry::{ TemplateEntry, TemplateKind, TraitMember };
 import compiler::types::inference::{ InferCtx };
 import compiler::types::resolver::{ ResolutionContext };
 import compiler::types::substitution::{ TypeSubstitution };
@@ -610,19 +610,18 @@ type struct MethodBinding {
                 // has only `This` rebased.
                 const bound_def: DefId = if (tr == null) {
                     this.ctx.decl_index.def_of(implied, this.arena) } else { tr.definition() };
-                const chain: [DefId] = this.trait_chain(bound_def);
-                const depth: i64 = if (chain.length > 1) { chain.length } else { 1 };
-                for (mut k: i64 = 0; k < depth; k++) {
-                    const asked: DefId = if (k == 0) { bound_def } else { chain[k] };
-                    const ret: TypeRef = this.trait_declared_return(asked, method_name);
+                const members: [TraitMember] = this.ctx.generic_registry.trait_members_declaring(bound_def, method_name);
+                for (mut k: i64 = 0; k < members.length; k++) {
+                    const ret: TypeRef = this.member_declared_return(members[k]);
                     if (!ret.is_valid()) { continue; }
-                    if (k == 0 && tr != null) {
+                    const own: boolean = members[k].trait_def.equals(bound_def);
+                    if (own && tr != null) {
                         dir.note_with_args(bound_def, this.bound_trait_arg_types(tr));
                     } else {
-                        dir.note(if (k == 0) { bound_def } else { chain[k] });
+                        dir.note(members[k].trait_def);
                     }
                     if (need_ret && !out.is_valid()) {
-                        if (tr == null || k > 0) {
+                        if (tr == null || !own) {
                             out = this.subst_this_in_trait_return(ret, recv);
                         } else {
                             const leaf: SymbolStr = tr.path[tr.path.length - 1];
@@ -703,23 +702,21 @@ type struct MethodBinding {
     /// trait, else the nearest supertrait that does; the declaration's
     /// return goes to `out_ret`.  Invalid when none does.
     bound_trait_declaring(mut &this, tr: TraitRef*, method_name: SymbolStr, out_ret: TypeRef*) -> DefId {
-        const chain: [DefId] = this.trait_chain(tr.definition());
-        for (mut k: i64 = 0; k < chain.length; k++) {
-            const ret: TypeRef = this.trait_declared_return(chain[k], method_name);
+        const members: [TraitMember] = this.ctx.generic_registry.trait_members_declaring(tr.definition(), method_name);
+        for (mut k: i64 = 0; k < members.length; k++) {
+            const ret: TypeRef = this.member_declared_return(members[k]);
             if (!ret.is_valid()) { continue; }
             *out_ret = ret;
-            return chain[k];
+            return members[k].trait_def;
         }
         return DefId::invalid();
     }
 
-    /// The return the trait `trait_def` declares for its method
-    /// `method_name`, found through the `trait-method` door; invalid when it
-    /// declares none.
-    trait_declared_return(&this, trait_def: DefId, method_name: SymbolStr) -> TypeRef {
-        const slot: i64 = this.ctx.generic_registry.trait_item_slot(trait_def, method_name);
+    /// The return the trait declares for the method `member` names;
+    /// invalid when that return was never resolved.
+    member_declared_return(&this, member: TraitMember) -> TypeRef {
         return this.types.canonicalize_method_return(
-            this.ctx.generic_registry.trait_item_return(trait_def, slot));
+            this.ctx.generic_registry.trait_item_return(member.trait_def, member.slot));
     }
 
     /// `trait_def` followed by its supertraits, transitively, by identity;
@@ -774,17 +771,17 @@ type struct MethodBinding {
                 // Identity rather than the written leaf: the leaf reaches the
                 // arena's leaf index only while it is unique program-wide.  The
                 // bound's trait first, then its supertraits nearest first.
-                const chain: [DefId] = this.trait_chain(tr.definition());
-                for (mut k: i64 = 0; k < chain.length; k++) {
-                    const tref: TypeRef = this.ctx.decl_index.type_of_def(chain[k]);
+                const members: [TraitMember] = this.ctx.generic_registry.trait_members_declaring(tr.definition(), method_name);
+                for (mut k: i64 = 0; k < members.length; k++) {
+                    const declaring: DefId = members[k].trait_def;
+                    const tref: TypeRef = this.ctx.decl_index.type_of_def(declaring);
                     if (!tref.is_valid()) { continue; }
                     const t: Type* = this.arena.lookup(tref);
                     if (t == null || t.kind != TypeKind::Trait) { continue; }
                     const tt: TraitType* = t.as_trait();
-                    const slot: i64 = this.ctx.generic_registry.trait_item_slot(chain[k], method_name);
                     for (mut mi: i64 = 0; mi < tt.required_methods.length; mi++) {
                         const m: MethodInfo* = &tt.required_methods[mi];
-                        const held: boolean = slot >= 0 && this.ctx.generic_registry.trait_item_slot(chain[k], m.name) == slot;
+                        const held: boolean = this.ctx.generic_registry.trait_item_slot(declaring, m.name) == members[k].slot;
                         if (!held) { continue; }
                         if (m.param_types.length != arg_count) { continue; }
                         mut out: [TypeRef] = [];
@@ -1440,14 +1437,16 @@ type struct MethodBinding {
         }
         mut found: DeclarationNode* = null;
         for (mut i: i64 = 0; i < bound_leaves.length && found == null; i++) {
+            // Only the bound's own trait is asked: a generic method a
+            // supertrait declares is not found through the bound.
+            const members: [TraitMember] = this.ctx.generic_registry.trait_members_declaring(bound_leaves[i], member.member);
+            if (members.length == 0 || !members[0].trait_def.equals(bound_leaves[i])) { continue; }
             const td: TraitDecl* = this.ctx.generic_registry.get_trait_decl(bound_leaves[i]);
-            if (td == null) { continue; }
-            const slot: i64 = this.ctx.generic_registry.trait_item_slot(bound_leaves[i], member.member);
             for (mut k: i64 = 0; k < td.methods.length; k++) {
                 const f_decl: DeclarationNode* = td.methods[k];
                 const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
                 if (f == null) { continue; }
-                if (!(slot >= 0 && this.ctx.generic_registry.trait_item_slot(bound_leaves[i], f.name) == slot)) { continue; }
+                if (this.ctx.generic_registry.trait_item_slot(bound_leaves[i], f.name) != members[0].slot) { continue; }
                 if (f.generic_params.length == 0) { continue; }
                 found = f_decl;
                 break;
