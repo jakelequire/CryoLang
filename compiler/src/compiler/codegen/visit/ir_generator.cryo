@@ -51,7 +51,7 @@ import compiler::ast::expression::{
     CalleePin,
     AlignofExpr, ArrayAccessExpr, ArrayExpr, BinaryExpr,
     CallExpr, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierExpr,
-    LambdaExpr, LiteralExpr, MatchExpr, MemberAccessExpr,
+    LambdaExpr, LiteralExpr, MatchExpr, MemberAccessExpr, ObjectConversionExpr,
     ScopeResolutionExpr, SizeofExpr, StaticMatchExpr, StructExpr,
     TryExpr, TupleExpr, UnaryExpr
 };
@@ -246,6 +246,7 @@ type struct IRGeneratorVisitor {
                     ExprKind::StaticMatch(s) => { return this.visit_static_match_expr(e, s); }
                     ExprKind::Match(m) => { return this.visit_match_expr(e, m); }
                     ExprKind::Cast(c) => { return this.visit_cast(c); }
+                    ExprKind::ObjectConversion(oc) => { return this.visit_object_conversion(e, oc); }
                     ExprKind::Unary(u) => { return this.visit_unary(u); }
                     ExprKind::Binary(b) => { return this.visit_binary(e, b); }
                     ExprKind::ArrayAccess(a) => { return this.visit_array_access(e, a); }
@@ -1243,6 +1244,12 @@ type struct IRGeneratorVisitor {
             const bval: u64 = if (node.value == "true") { 1 } else { 0 };
             out.value = LType::const_int(LType::i1(), bval, false);
         } else if (kind == LiteralKind::Null) {
+            const null_t: Type* = this.cg.arena_type(e.resolved_type);
+            if (null_t != null && null_t.kind == TypeKind::Object) {
+                // A raw trait object's `null`: both words null.
+                out.value = LType::const_null(ty);
+                return out;
+            }
             // Null literal must always be a pointer type.  If resolved_type
             // mapped to void or an invalid type, fall back to i8* (void*).
             if (!ty.is_valid() || LType::kind_of(ty.raw) != LTypeKind::Pointer) {
@@ -1539,6 +1546,21 @@ type struct IRGeneratorVisitor {
         return this.places.codegen_array_access(arr_e.value, node.array.resolved_type,
                                          arr_e.is_lvalue, idx,
                                          e.span, this, &node.unwind_cleanup);
+    }
+
+    /// A value converted to a trait object: the pair of its address and its
+    /// implementation's table.
+    visit_object_conversion(mut &this, e: ExpressionNode*, node: ObjectConversionExpr*) -> Emitted {
+        mut out: Emitted = Emitted::none();
+        const data: LValue = this.dispatch.codegen_rvalue(this, node.operand);
+        const table: LValue = this.cg.decl.object_table_global(node.implementation);
+        const pair_ty: LType = this.cg.type_mapper.map_type(e.resolved_type);
+        mut pair: LValue = LValue { raw: llvm::LLVMGetUndef(pair_ty.raw) };
+        pair = this.cg.builder.build_insert_value(pair, data, 0, "object.data");
+        pair = this.cg.builder.build_insert_value(pair, table, 1, "object.table");
+        out.value = pair;
+        out.is_lvalue = false;
+        return out;
     }
 
     visit_cast(mut &this, node: CastExpr*) -> Emitted {

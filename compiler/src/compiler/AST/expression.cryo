@@ -27,7 +27,7 @@ import compiler::intrinsic_kind::{ IntrinsicKind };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast::declaration;
-import compiler::ast::declaration::{ DeclarationNode, GenericParamDecl, VarDecl };
+import compiler::ast::declaration::{ DeclarationNode, GenericParamDecl, ImplBlock, VarDecl };
 import compiler::ast::pattern;
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
 import compiler::ast::statement;
@@ -156,6 +156,20 @@ type struct ExpressionNode {
     /// `delete operand` at `span`.
     static delete_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::Delete(new DeleteExpr { operand: operand }), span);
+    }
+
+    /// `operand` converted to the trait object `object`, its value's type
+    /// `source` implementing the trait by `implementation`.  Made by sema
+    /// only, at the operand's span.
+    static object_conversion(operand: ExpressionNode*, source: TypeRef, implementation: ImplBlock*,
+                             object: TypeRef) -> ExpressionNode* {
+        mut c: ExpressionNode* = ExpressionNode::of(ExprKind::ObjectConversion(new ObjectConversionExpr {
+            operand:        operand,
+            source:         source,
+            implementation: implementation,
+        }), operand.span);
+        c.set_resolved_type(object);
+        return c;
     }
 
     /// `new type_name` at `span`, with nothing after the name yet; the
@@ -440,6 +454,15 @@ type struct ExpressionNode {
         };
     }
 
+    /// The conversion to a trait object `e` is, or null.
+    static object_conversion_of(e: ExpressionNode*) -> ObjectConversionExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::ObjectConversion(c) => { c }
+            _                             => { null }
+        };
+    }
+
     /// The `delete` expression `e` is, or null.
     static delete_of(e: ExpressionNode*) -> DeleteExpr* {
         if (e == null) { return null; }
@@ -656,6 +679,7 @@ type enum ExprKind {
     Match(MatchExpr*);
     MemberAccess(MemberAccessExpr*);
     New(NewExpr*);
+    ObjectConversion(ObjectConversionExpr*);
     ScopeResolution(ScopeResolutionExpr*);
     Sizeof(SizeofExpr*);
     StaticMatch(StaticMatchExpr*);
@@ -1924,6 +1948,26 @@ type struct DeleteExpr {
 }
 
 implement trait Allocate for struct DeleteExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+
+/// A value converted to a trait object: the pair of the value's address
+/// and the table of `implementation`.  `source` is the type of the value
+/// the address reaches.
+type struct ObjectConversionExpr {
+    operand:        ExpressionNode*;
+    source:         TypeRef;
+    implementation: ImplBlock*;
+
+    static walk_children<V>(n: ObjectConversionExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
+    }
+}
+
+implement trait Allocate for struct ObjectConversionExpr {
     static allocate(size: u64, align: u64) -> void* {
         return cryo_ast_arena_alloc(size, align);
     }

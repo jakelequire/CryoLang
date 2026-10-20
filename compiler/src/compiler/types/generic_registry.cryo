@@ -45,7 +45,7 @@ import compiler::resolver::intern_table;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::ast::declaration::{
     DeclarationNode, FunctionDecl, GenericParamDecl,
-    ImplBlock, MethodDecl, StructDecl, TraitDecl, UnionDecl
+    ImplBlock, MethodDecl, StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::types::arena::{ TypeArena };
 import compiler::decl_index::{ DeclarationIndex };
@@ -1226,6 +1226,24 @@ type struct GenericRegistry {
         const at: i64 = this.trait_decl_position(name);
         if (at < 0) { return null; }
         return this.trait_decl_nodes[at];
+    }
+
+    /// Whether the trait method `method` can be called through a trait
+    /// object's table: its signature names the concrete type as its
+    /// receiver alone - a `&this` or `mut &this` receiver, no type
+    /// parameters of its own, and `This` in no other parameter and not in
+    /// the return.
+    method_object_safe(&this, method: DeclarationNode*) -> boolean {
+        const func: FunctionDecl* = DeclarationNode::fn_of(method);
+        if (func == null || func.is_static || func.generic_params.length > 0) { return false; }
+        if (func.parameters.length == 0) { return false; }
+        const receiver: VarDecl* = DeclarationNode::var_of(func.parameters[0]);
+        if (receiver == null || !receiver.is_receiver() || receiver.is_value_receiver()) { return false; }
+        for (mut i: i64 = 1; i < func.parameters.length; i++) {
+            const p: VarDecl* = DeclarationNode::var_of(func.parameters[i]);
+            if (p == null || this.arena.mentions_this(p.resolved_type)) { return false; }
+        }
+        return !this.arena.mentions_this(func.resolved_return_type);
     }
 
     /// A trait's method is named by its leaf in two

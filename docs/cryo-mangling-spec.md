@@ -117,9 +117,16 @@ a digit.
 | `tr`   | Trait-impl method       | `C$tr$` Trait `$f` Path Signature |
 | `ti`   | Type info / RTTI        | `C$ti$` Path                 |
 | `mi`   | Module initializer      | `C$mi$` Path                 |
+| `vt`   | Trait-object table      | `C$vt$` Trait `$f` Path      |
 
-The tags `ct`, `dt` and `vt` are not emitted and stay reserved: they named class
-constructors, destructors and vtables, and `vt` is kept for trait-object tables.
+A trait-object table's symbol is the trait-impl method's without the member and
+signature: the trait's path with its arguments, then `$f` and the implementing
+type's path. `virtual &Shape` over a `Circle` names
+`C$vt$4Main.5Shape$f4Main.6Circle`, demangled `<vtable for Main::Shape for
+Main::Circle>`; two traits' tables for one type differ by the trait.
+
+The tags `ct` and `dt` are not emitted and stay reserved: they named class
+constructors and destructors.
 
 Plain functions, methods, global variables, and named-type symbols carry no kind tag.
 A closure carries none either: it is a synthesized type with a `__call__` method

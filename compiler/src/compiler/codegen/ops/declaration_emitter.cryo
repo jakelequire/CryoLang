@@ -52,7 +52,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDecl,
-    ImplBlock, IntrinsicDecl, MethodDecl, StructDecl, UnionDecl, VarDecl
+    ImplBlock, IntrinsicDecl, MethodDecl, StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::node::{ Node, ProgramNode };
 import compiler::lex::{ TokenType };
@@ -72,6 +72,7 @@ import compiler::codegen::util::{ CodegenUtil };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -632,6 +633,85 @@ type struct DeclarationEmitter {
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.declare_method(node.methods[i], owner);
         }
+    }
+
+    // Trait-object tables
+
+    /// The LLVM type of `block`'s trait-object table: three reserved words,
+    /// the type's `drop`, its size and its alignment, then a word per method
+    /// the trait declares, by position.
+    object_table_type(&this, block: ImplBlock*) -> LType {
+        const decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(block.trait_def);
+        const methods: i64 = if (decl != null) { decl.methods.length } else { 0 };
+        return LType::array_of(LType::pointer_to(LType::i8()), (3 + methods) as u32);
+    }
+
+    /// The global holding `block`'s table: this module's definition when it
+    /// has one, else a declaration the implementation's module defines.
+    object_table_global(mut &this, block: ImplBlock*) -> LValue {
+        const name: MangledName = MangledName::new(this.ctx.intern_table.resolve(block.object_table_symbol));
+        const found: LValue = this.llvm_module.get_named_global(name);
+        if (found.is_valid()) { return found; }
+        return this.llvm_module.add_global(this.object_table_type(block), name);
+    }
+
+    /// Define `block`'s table, in the module holding the implementation,
+    /// when some conversion names it.  A method unavailable on an object
+    /// holds a null word; an available one with no function to point at is
+    /// an internal error, never a table left short.
+    emit_object_table(mut &this, block: ImplBlock*, span: SourceSpan) -> void {
+        if (!block.object_table_symbol.is_valid()) { return; }
+        const registry: GenericRegistry* = this.ctx.generic_registry;
+        const decl: TraitDecl* = registry.get_trait_decl(block.trait_def);
+        if (decl == null) { return; }
+        const word: LType = LType::pointer_to(LType::i8());
+        const owner: TypeRef = this.ctx.decl_index.impl_owner(block, "codegen/trait-object table");
+        const n: u32 = (3 + decl.methods.length) as u32;
+        const buf: void* = libc::malloc(n as u64 * 8);
+        const words: void** = buf as void**;
+        words[0] = this.object_table_drop(owner).raw;
+        words[1] = llvm::LLVMConstIntToPtr(this.expr_ops.codegen_sizeof(owner).raw, word.raw);
+        words[2] = llvm::LLVMConstIntToPtr(this.expr_ops.codegen_alignof(owner).raw, word.raw);
+        for (mut slot: i64 = 0; slot < decl.methods.length; slot++) {
+            mut f: LValue = LType::const_null(word);
+            if (registry.method_object_safe(decl.methods[slot])) {
+                const m: MethodDecl* = DeclarationNode::method_of(registry.trait_item_method(block, slot));
+                if (m != null && m.func != null) {
+                    f = this.resolver.resolve_decl(DeclarationNode::fn_of(m.func).overload_entry);
+                }
+                if (!f.is_valid()) {
+                    this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                        fmt::format("codegen: the trait-object table `%s` has no function for its method %lld",
+                            this.ctx.intern_table.resolve(block.object_table_symbol), slot), span);
+                    libc::free(buf);
+                    return;
+                }
+            }
+            words[3 + slot] = f.raw;
+        }
+        const init: LValue = LType::const_array(word, buf, n);
+        libc::free(buf);
+        const global: LValue = this.object_table_global(block);
+        global.set_initializer(init);
+        global.set_global_constant(true);
+        global.set_linkage(LLinkage::External);
+    }
+
+    /// A table's drop word: the function of `owner`'s `Drop` implementation,
+    /// or null when it has none.
+    object_table_drop(mut &this, owner: TypeRef) -> LValue {
+        const word: LType = LType::pointer_to(LType::i8());
+        const registry: GenericRegistry* = this.ctx.generic_registry;
+        const drop_trait: DefId = registry.wellknown(LangItem::Drop);
+        if (!drop_trait.is_valid()) { return LType::const_null(word); }
+        const block: ImplBlock* = DeclarationNode::impl_of(
+            registry.select_trait_impl(drop_trait, owner, this.ctx.intern_table));
+        if (block == null) { return LType::const_null(word); }
+        const m: MethodDecl* = DeclarationNode::method_of(registry.trait_item_method(
+            block, registry.trait_item_position(registry.wellknown(LangItem::DropDrop))));
+        if (m == null || m.func == null) { return LType::const_null(word); }
+        const f: LValue = this.resolver.resolve_decl(DeclarationNode::fn_of(m.func).overload_entry);
+        return if (f.is_valid()) { f } else { LType::const_null(word) };
     }
 
     /// Declare methods defined inline within a struct declaration.

@@ -78,6 +78,15 @@ INTEGER eightbytes, so on SysV it travels as a `DirectPair` in two GP
 registers, and on Win64 (above 8 bytes) indirectly, through a pointer to
 a caller-made copy.
 
+The table an object points at is a constant array of pointer-sized
+words, emitted once, in the module holding the implementation, as
+`C$vt$<trait>$f<type>` with external linkage.  Its first three words are
+reserved: the type's `Drop` implementation's `drop` (null when it has
+none), the type's size and its alignment.  Then comes one word per method
+the trait declares, in declaration order: the implementation's function,
+or its copy of the trait's default, and null for a method that cannot be
+called through an object.  A `null` `virtual T*` has both words null.
+
 ### Returns
 
 | Source kind         | Size      | Plan                                                                          |

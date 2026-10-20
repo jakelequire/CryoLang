@@ -1882,7 +1882,10 @@ function area_of(p: virtual &Shape) -> i32 { ... }             // a trait object
 - `virtual` written on anything but a trait - a struct, a primitive, a type parameter - is refused (`E0316`), and so is a trait object anywhere in an `extern` function's signature, whose C side has no table to call through (`E0316`).
 - A trait object has no fields: `s.width` is refused (`E0204`), whatever the value behind it holds.
 - `delete` of a trait object is refused (`E0200`): the size and destructor of the value behind it are not known where the object is used.
-- Converting a value to an object, calling a method through one, and comparing an object pointer with `null` are not supported yet: `&c` where a `virtual &Shape` is expected is a type mismatch (`E0200`), a call through an object is refused (`E0358`), and an object compares with nothing (`E0229`).
+- A value becomes an object wherever it is checked against a declared object type - an initializer, an assignment, an argument, a return, a struct-literal field, an array element: `&c` becomes a `virtual &Shape` or a `virtual mut &Shape`, as it becomes a `&Circle` or a `mut &Circle` parameter; a pointer `c_ptr: Circle*` becomes a `virtual Shape*`. The object holds the value's address and the table of its type's implementation of the trait. An object converts to no other object, a reference to no `virtual Shape*`, and a pointer to no borrowed object (`E0200`).
+- The value's type must implement the trait (`E0315`: "`Square` does not implement `Shape`, so `&Square` cannot become `virtual &Shape`"). A value whose implementation is generic does not convert yet, nor does a value of a type parameter, whose implementation is not known in the generic body (`E0315`).
+- `null` is a `virtual Shape*` where one is expected, both words null. A `virtual Shape*` compares with the `null` literal by `==` and `!=`, testing the value's address; it compares with nothing else, and a borrowed object does not compare at all (`E0229`).
+- Calling a method through an object is not supported yet: a call through an object is refused (`E0358`).
 
 ### 11.2 Implementing a Trait
 

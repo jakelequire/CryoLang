@@ -33,7 +33,7 @@ import compiler::ast::expression::{ BinaryExpr, ExpressionNode, UnaryExpr };
 import compiler::codegen::visit::ir_generator;
 import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
-import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
+import compiler::codegen::llvm_types::{ LBasicBlock, LIntPredicate, LType, LTypeKind, LValue };
 import compiler::types::compound::{ PointerType };
 import compiler::types::type_base::{ Type };
 
@@ -99,6 +99,24 @@ type struct BinaryUnaryEmitter {
             out.value = val;
             out.is_lvalue = false;
             return out;
+        }
+
+        // A raw trait object against `null`, the one comparison an object
+        // takes: its data word against a null pointer.
+        if (op == TokenType::EqualEqual || op == TokenType::ExclaimEqual) {
+            const left_t: Type* = this.cg.arena_type(node.left.resolved_type);
+            const right_t: Type* = this.cg.arena_type(node.right.resolved_type);
+            const object_side: ExpressionNode* = if (left_t != null && left_t.kind == TypeKind::Object) { node.left }
+                else { if (right_t != null && right_t.kind == TypeKind::Object) { node.right } else { null } };
+            if (object_side != null) {
+                const pair: LValue = this.dispatch.codegen_rvalue(visitor, object_side);
+                const data: LValue = this.cg.builder.build_extract_value(pair, 0, "object.data");
+                const none: LValue = LType::const_pointer_null(LType::pointer_to(LType::i8()));
+                const predicate: LIntPredicate = if (op == TokenType::EqualEqual) { LIntPredicate::EQ } else { LIntPredicate::NE };
+                out.value = this.cg.builder.build_icmp(predicate, data, none, "object.is_null");
+                out.is_lvalue = false;
+                return out;
+            }
         }
 
         // Assignment
