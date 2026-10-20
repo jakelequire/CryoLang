@@ -170,6 +170,27 @@ yet is recorded with the change that builds it, not here.
 472. **The work-in-progress stash of the class deletion is dropped,** its
      content being committed.  (Jake)
 
+473. **The trait-object refusals keep their wording as written:** E0316's
+     "`Circle` is not a trait, so `virtual &Circle` is not a trait object"
+     and "`virtual &Shape` is a trait object, which an `extern` function
+     `f` cannot take or return"; a field read on an object, "no field
+     `width` on `virtual &Shape`: a trait object has no fields"; `delete`
+     of an object, "`delete` takes a pointer, and `virtual Shape*` is a
+     trait object".  (Jake)
+
+474. **E0313's note reads "a trait object is written `virtual &Shape` or
+     `virtual Shape*`",** the object type being built.  (Jake)
+
+475. **An object type mangles as a generic over a reserved full name per
+     form,** `VirtualRef`, `VirtualMutRef` and `VirtualPtr`, with the trait
+     first, as `Optional` and tuples are encoded; no new type prefix
+     letter.  (Jake)
+
+476. **A method call on a function- or tuple-typed value, a field read on a
+     function-typed one, and `delete` of an operand that is not a pointer
+     are refused in sema,** each fixed on its own before calls through
+     objects are built.  (Jake)
+
 462. **A path through a bounded type parameter naming a member no bound
      declares (`T::missing()` in a generic function that is instantiated)
      is refused with a diagnostic where it is written,** not left for
