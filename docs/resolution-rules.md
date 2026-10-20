@@ -135,6 +135,20 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-10-20
 
+462. **A path through a bounded type parameter naming a member no bound
+     declares (`T::missing()` in a generic function that is instantiated)
+     is refused with a diagnostic where it is written,** not left for
+     code generation to report as an internal error; a method argument
+     the body's copies cannot bind is fixed beside it.  (Delegated)
+
+463. **`Allocate` implemented for a generic struct is fixed before the
+     class feature is deleted:** `new Cell<i32> { .. }` uses the
+     instance's allocator and links.  (Delegated)
+
+464. **`Display` is not adopted in the compiler for now:** it formats
+     through C strings, and the compiler keeps its `to_string` methods as
+     the plan records.  (Delegated)
+
 460. **The per-kind node projections stay as checked accessors**
      (`ExpressionNode::call_of`, `DeclarationNode::fn_of` and the rest):
      each answers its kind's payload or null, and a read through one is

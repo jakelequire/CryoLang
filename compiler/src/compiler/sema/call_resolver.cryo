@@ -739,25 +739,39 @@ type struct CallResolver {
     /// destructor.
     report_param_receiver_call(mut &this, member_e: ExpressionNode*, member: MemberAccessExpr*,
                                param: GenericParamType*, bounded: boolean, call: CallExpr*) -> void {
-        const method_name: string = this.intern.resolve(member.member);
-        const param_display: string = this.arena.format_generic_param(param);
         const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
-        mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
-            fmt::format("no method named `%s` found on type `%s`", method_name, param_display));
-        diag = diag.at(primary_span);
-        if (!bounded) {
-            diag = diag.with_note(fmt::format(
-                "`%s` is a type parameter with no bound, so it has no methods", param_display));
-        }
+        mut diag: Diagnostic = this.param_member_miss(member.member, primary_span, param, bounded);
         if (this.is_explicit_drop_call(call)) {
             diag = diag.help(fmt::format("use `std::core::ptr::drop_in_place(%s)`",
                 this.pointer_to_receiver_text(member.object)));
         } else {
-            diag = diag.help(fmt::format(
-                "add a `where %s: Trait` bound naming a trait that declares `%s`", param_display, method_name));
+            diag = diag.help(this.param_bound_help(member.member, param));
         }
         this.ctx.emit_diagnostic(diag);
+    }
+
+    /// The refusal of a member a type parameter's bounds do not give it,
+    /// named on a receiver (`t.missing()`) or through a path
+    /// (`T::missing()`), at `span`; the caller adds the help.
+    param_member_miss(&this, member_name: SymbolStr, span: SourceSpan, param: GenericParamType*,
+                      bounded: boolean) -> Diagnostic {
+        const param_display: string = this.arena.format_generic_param(param);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+            fmt::format("no method named `%s` found on type `%s`", this.intern.resolve(member_name), param_display));
+        diag = diag.at(span);
+        if (!bounded) {
+            diag = diag.with_note(fmt::format(
+                "`%s` is a type parameter with no bound, so it has no methods", param_display));
+        }
+        return diag;
+    }
+
+    /// The help on `param_member_miss`: the bound that would give `param`
+    /// the member.
+    param_bound_help(&this, member_name: SymbolStr, param: GenericParamType*) -> string {
+        return fmt::format("add a `where %s: Trait` bound naming a trait that declares `%s`",
+            this.arena.format_generic_param(param), this.intern.resolve(member_name));
     }
 
     /// The pointer to a destructor call's receiver, as the writer would spell
@@ -5730,17 +5744,45 @@ type struct CallResolver {
     /// a `Result<T, ConversionError>`), so a call on the result is typed,
     /// and selected, where it is written.  Invalid when no one trait
     /// directs the path.
+    ///
+    /// A member no bound declares - `T::missing()`, or `(Beta for
+    /// T)::missing()` where `Beta` declares no `missing` - names nothing on
+    /// any type the parameter becomes, as `t.missing()` does not.  Its
+    /// refusal is held on the path and reported when a copy of the body is
+    /// made, so a body nothing instantiates is not refused for it.
     direct_param_path(mut &this, scope: ScopeResolutionExpr*) -> TypeRef {
-        if (scope.impl_trait != null) { return TypeRef::invalid(); }
         const param_ty: TypeRef = this.symbolic.symbolic_scope_param_type(scope);
         if (!param_ty.is_valid()) { return TypeRef::invalid(); }
+        // A trait default's `This::` path is refused in each implementation's
+        // copy, which the type check walks as written code.
+        const param: GenericParamType* = this.binding.receiver_type_param(param_ty);
+        const holds: boolean = param != null && !this.arena.is_this_placeholder(param);
+        if (scope.impl_trait != null) {
+            const head: DefId = this.impl_head_trait(scope);
+            if (holds && head.is_valid() && !this.trait_item_def(head, scope).is_valid()) {
+                this.hold_path_refusal(scope, this.impl_member_miss(scope, head,
+                    this.arena.format_generic_param(param), scope.member_name));
+            }
+            return TypeRef::invalid();
+        }
         mut dir: BoundDirection = BoundDirection::none();
         const ret: TypeRef = this.binding.abstract_receiver_method_return(param_ty, scope.member_name, null, &dir);
+        if (!ret.is_valid() && holds) {
+            mut miss: Diagnostic = this.param_member_miss(scope.member_name, scope.member_span, param,
+                this.binding.param_is_bounded(param));
+            miss = miss.help(this.param_bound_help(scope.member_name, param));
+            this.hold_path_refusal(scope, miss);
+        }
         if (!dir.named().is_valid()) { return TypeRef::invalid(); }
         // A walk that directed the path already finds the same trait.
         if (!scope.resolved_trait.is_valid()) { scope.set_resolved_trait(dir.named()); }
         if (!scope.resolved_trait.equals(dir.named())) { return TypeRef::invalid(); }
         return ret;
+    }
+
+    /// Hold `refusal` for `scope`, once however often the body is walked.
+    hold_path_refusal(mut &this, scope: ScopeResolutionExpr*, refusal: Diagnostic) -> void {
+        if (scope.held_refusal == 0) { scope.held_refusal = this.ctx.diagnostics.hold(refusal); }
     }
 
     /// Whether the declaration a `Scope::member` call names has a signature
@@ -6957,11 +6999,19 @@ type struct CallResolver {
             this.ctx.emit_diagnostic(d);
             return;
         }
+        this.ctx.emit_diagnostic(this.impl_member_miss(scope, trait_sym, QualifiedName::leaf_of(owner_str), member_sym));
+    }
+
+    /// `(Trait for Owner)::member` where the implementation has no method
+    /// `member`, at the path's member segment; `owner_shown` is the owner
+    /// as the message names it.
+    impl_member_miss(&this, scope: ScopeResolutionExpr*, trait_sym: DefId, owner_shown: string,
+                     member_sym: SymbolStr) -> Diagnostic {
+        const trait_leaf: string = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(trait_sym)));
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
             fmt::format("`%s`'s implementation for `%s` has no method `%s`",
-                trait_leaf, QualifiedName::leaf_of(owner_str), this.intern.resolve(member_sym)));
-        d = d.at_with_label(scope.member_span, "not a method of this implementation");
-        this.ctx.emit_diagnostic(d);
+                trait_leaf, owner_shown, this.intern.resolve(member_sym)));
+        return d.at_with_label(scope.member_span, "not a method of this implementation");
     }
 
     /// Pin the static method a `Type::method` VALUE names, by the symbol
