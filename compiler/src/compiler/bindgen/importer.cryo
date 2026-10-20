@@ -202,7 +202,7 @@ type struct Importer {
     /// Every type declaration this import emitted, by its C tag - the
     /// import's own namespace - for pinning the references it made to them.
     type_decl_tags:  [SymbolStr];
-    type_decl_nodes: [ASTNode*];
+    type_decl_nodes: [DeclarationNode*];
     /// CXType -> Cryo annotation mapper, built once per TU (carries ctx+alias).
     types:          CTypeMapper;
     /// Transient targets for the nested walks (set just before the synchronous
@@ -490,8 +490,8 @@ type struct Importer {
 
     /// Append a synthesized top-level declaration to the program so it flows
     /// through TypeDeclaration -> TypeResolution -> codegen like any source decl.
-    emit_top_level(mut &this, node: ASTNode*) -> void {
-        this.ctx.artifacts.ast.root.statements.push(Node::of(node));
+    emit_top_level(mut &this, node: DeclarationNode*) -> void {
+        this.ctx.artifacts.ast.root.statements.push(Node::Decl(node));
         const tag: SymbolStr = Importer::type_decl_tag(node);
         if (tag.is_valid()) {
             this.type_decl_tags.push(tag);
@@ -501,7 +501,7 @@ type struct Importer {
 
     /// The C tag a type declaration this import emits is bound under, or an
     /// invalid one for a node that declares no type.
-    static type_decl_tag(node: ASTNode*) -> SymbolStr {
+    static type_decl_tag(node: DeclarationNode*) -> SymbolStr {
         if (DeclarationNode::struct_of(node) != null)    { return (DeclarationNode::struct_of(node)).name; }
         if (DeclarationNode::union_of(node) != null)     { return (DeclarationNode::union_of(node)).name; }
         const en: EnumDecl* = DeclarationNode::enum_of(node);
@@ -524,7 +524,7 @@ type struct Importer {
                 if (this.type_decl_tags[j].equals(r.tag)) {
                     this.ctx.c_refs[i] = CRecordRef {
                         ann: r.ann, alias: r.alias, tag: r.tag,
-                        decl: this.type_decl_nodes[j] as ASTNode*,
+                        decl: this.type_decl_nodes[j],
                     };
                     break;
                 }
@@ -571,7 +571,7 @@ type struct Importer {
         vnode.type_annotation = type_annotation;
         vnode.set_initializer(this.widen_integer_init(type_annotation, init));
         this.seen_names.push(name_sym);
-        this.emit_top_level(vnode_decl as ASTNode*);
+        this.emit_top_level(vnode_decl);
     }
 
     /// Emit one FunctionDecl for a C function prototype.
@@ -715,7 +715,7 @@ type struct Importer {
         // Only emit the impl block if at least one method bound - an all-skipped
         // class would otherwise render an empty `implement` block.
         if (bound > 0) {
-            this.emit_top_level(DeclarationNode::of(DeclKind::Impl(impl), SourceSpan::none()) as ASTNode*);
+            this.emit_top_level(DeclarationNode::of(DeclKind::Impl(impl), SourceSpan::none()));
         }
     }
 
@@ -877,7 +877,7 @@ type struct Importer {
             if (align > 0) { unode.min_alignment = align as u64; }
             this.seen_names.push(name_sym);
             this.type_names.push(name_sym);
-            this.emit_top_level(DeclarationNode::of(DeclKind::Union(unode), SourceSpan::none()) as ASTNode*);
+            this.emit_top_level(DeclarationNode::of(DeclKind::Union(unode), SourceSpan::none()));
             this.field_cursors = [];
             clang::clang_visitChildren(cursor, Importer::visit_collect_member, this as void*);
             this.populate_union_fields(unode);
@@ -893,7 +893,7 @@ type struct Importer {
             this.type_names.push(name_sym);
             this.struct_names.push(name_sym);
             this.struct_nodes.push(node);
-            this.emit_top_level(DeclarationNode::of(DeclKind::Struct(node), SourceSpan::none()) as ASTNode*);
+            this.emit_top_level(DeclarationNode::of(DeclKind::Struct(node), SourceSpan::none()));
         }
         // Populate fields from this cursor only if not already populated (an
         // earlier forward-decl cursor left it empty; the definition fills it).
@@ -920,7 +920,7 @@ type struct Importer {
         this.type_names.push(name_sym);
         this.struct_names.push(name_sym);
         this.struct_nodes.push(node);
-        this.emit_top_level(DeclarationNode::of(DeclKind::Struct(node), SourceSpan::none()) as ASTNode*);
+        this.emit_top_level(DeclarationNode::of(DeclKind::Struct(node), SourceSpan::none()));
         const kindword: string = if (is_union) { "union" } else { "struct" };
         this.report.approx(fmt::format(
             "incomplete tag `%s %s` (declared, never defined in this translation unit) -> zero-field opaque record: usable only through a pointer",
@@ -1230,7 +1230,7 @@ type struct Importer {
 
         this.seen_names.push(name_sym);
         this.type_names.push(name_sym);
-        this.emit_top_level(DeclarationNode::of(DeclKind::Enum(enode), SourceSpan::none()) as ASTNode*);
+        this.emit_top_level(DeclarationNode::of(DeclKind::Enum(enode), SourceSpan::none()));
 
         // Duplicate-valued constants (C enum aliases) can't be enum variants in
         // Cryo (unique discriminants required), so emit each as a namespaced
@@ -1363,7 +1363,7 @@ type struct Importer {
         }
 
         this.seen_names.push(name_sym);
-        this.emit_top_level(vnode_decl as ASTNode*);
+        this.emit_top_level(vnode_decl);
     }
 
     /// Emit a `type alias` for a C typedef.  Skips the redundant
@@ -1390,7 +1390,7 @@ type struct Importer {
 
         this.seen_names.push(name_sym);
         this.type_names.push(name_sym);
-        this.emit_top_level(DeclarationNode::of(DeclKind::TypeAlias(ta), SourceSpan::none()) as ASTNode*);
+        this.emit_top_level(DeclarationNode::of(DeclKind::TypeAlias(ta), SourceSpan::none()));
     }
 
     /// Emit an object-like `#define NAME <literal>` as an alias-namespaced global
@@ -1837,7 +1837,7 @@ type struct Importer {
             ta.target_annotation = this.types.named(tsym);
             this.seen_names.push(name_sym);
             this.type_names.push(name_sym);
-            this.emit_top_level(DeclarationNode::of(DeclKind::TypeAlias(ta), SourceSpan::none()) as ASTNode*);
+            this.emit_top_level(DeclarationNode::of(DeclKind::TypeAlias(ta), SourceSpan::none()));
             return true;
         }
 
@@ -1913,7 +1913,7 @@ type struct Importer {
         wrapper.body = block;
 
         this.seen_names.push(alias_name);
-        this.emit_top_level(wrapper_decl as ASTNode*);
+        this.emit_top_level(wrapper_decl);
     }
 
     /// True if `ann` denotes `void` (null, or the `void` primitive).

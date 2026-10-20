@@ -77,7 +77,7 @@ type struct SpecInjector {
     /// template's clone - as an ordinary injected declaration.  A named one
     /// is already in the index and is left alone: a second registration of
     /// the same declaration is a second writer of every key it holds.
-    static register(node: ASTNode*, spec_type: TypeRef, ctx: CompilationContext*) -> void {
+    static register(node: DeclarationNode*, spec_type: TypeRef, ctx: CompilationContext*) -> void {
         if (node == null) { return; }
         const named: boolean = spec_type.is_valid()
             && (DeclarationNode::struct_of(node) != null
@@ -92,7 +92,7 @@ type struct SpecInjector {
     /// Register a newly injected specialized declaration into the DeclarationIndex
     /// so that sema can look it up without rescanning the AST.
     /// Delegates to the shared TypeResolutionPasses::register_decl_in_index().
-    static register_injected_decl(stmt: ASTNode*, ctx: CompilationContext*) -> void {
+    static register_injected_decl(stmt: DeclarationNode*, ctx: CompilationContext*) -> void {
         // Injected spec clones, not source decls: pass is_source_decl=false so
         // they are skipped by the cross-module coherence check (their canonical
         // targets recur across every module that instantiates the template).
@@ -147,28 +147,29 @@ type struct SpecializationPasses {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, TemplateKind::Class, node.def, registry, arena, ctx);
+                            node, TemplateKind::Class, node.def, registry, arena, ctx);
                     }
                     if (!node.is_generic()) {
                         SpecializationPasses::register_static_method_templates(node.methods,
                             registry, arena, ctx);
                         SpecializationPasses::register_inherent_owner(
-                            ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
+                            ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), node, registry);
                     }
                 }
                 NodeKind::Declaration => {
                     // A template holds the declaration's header.
-                    match ((stmt as DeclarationNode*).shape) {
+                    const decl: DeclarationNode* = stmt as DeclarationNode*;
+                    match (decl.shape) {
                         DeclKind::Function(node) => {
                             if (node.is_generic()) {
                                 SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                                    stmt, TemplateKind::Function, node.def, registry, arena, ctx);
+                                    decl, TemplateKind::Function, node.def, registry, arena, ctx);
                             }
                         }
                         DeclKind::Struct(node) => {
                             if (node.is_generic()) {
                                 SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                                    stmt, TemplateKind::Struct, node.def, registry, arena, ctx);
+                                    decl, TemplateKind::Struct, node.def, registry, arena, ctx);
                             }
                             // Static generic methods on non-generic structs (e.g.
                             // `Layout::array<T>`) need their own template entries;
@@ -183,25 +184,25 @@ type struct SpecializationPasses {
                                 // try_infer_method_call can find its `methods[]`
                                 // from a receiver TypeRef.
                                 SpecializationPasses::register_inherent_owner(
-                                    ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
+                                    ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), decl, registry);
                             }
                         }
                         DeclKind::Trait(node) => {
                             if (node.is_generic()) {
                                 SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                                    stmt, TemplateKind::Trait, node.def, registry, arena, ctx);
+                                    decl, TemplateKind::Trait, node.def, registry, arena, ctx);
                             }
                         }
                         DeclKind::Enum(node) => {
                             if (node.is_generic()) {
                                 SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                                    stmt, TemplateKind::Enum, node.def, registry, arena, ctx);
+                                    decl, TemplateKind::Enum, node.def, registry, arena, ctx);
                             }
                         }
                         DeclKind::TypeAlias(node) => {
                             if (node.is_generic()) {
                                 SpecializationPasses::register_generic_template(node.alias_name, node.generic_params,
-                                    stmt, TemplateKind::TypeAlias, node.def, registry, arena, ctx);
+                                    decl, TemplateKind::TypeAlias, node.def, registry, arena, ctx);
                             }
                         }
                         DeclKind::Union(node) => {
@@ -210,17 +211,17 @@ type struct SpecializationPasses {
                             // non-generic ones expose static/instance method templates.
                             if (node.is_generic()) {
                                 SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                                    stmt, TemplateKind::Union, node.def, registry, arena, ctx);
+                                    decl, TemplateKind::Union, node.def, registry, arena, ctx);
                             }
                             if (!node.is_generic()) {
                                 SpecializationPasses::register_static_method_templates(node.methods,
                                     registry, arena, ctx);
                                 SpecializationPasses::register_inherent_owner(
-                                    ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
+                                    ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), decl, registry);
                             }
                         }
                         DeclKind::Impl(_) => {
-                            SpecializationPasses::register_impl_block(stmt as DeclarationNode*, registry, ctx);
+                            SpecializationPasses::register_impl_block(decl, registry, ctx);
                         }
                         // No other kind with a payload can be generic.
                         DeclKind::Import(_) | DeclKind::Intrinsic(_)
@@ -612,14 +613,14 @@ type struct SpecializationPasses {
         if (entry.ast_node != null) {
             if (entry.template_module.is_valid()) {
                 ctx.register_injected_origin(
-                    entry.ast_node as ASTNode*, entry.template_module);
+                    entry.ast_node, entry.template_module);
             }
         }
         // Scope-tag impl blocks
         for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
             if (entry.template_module.is_valid()) {
                 ctx.register_injected_origin(
-                    entry.impl_nodes[j] as ASTNode*, entry.template_module);
+                    entry.impl_nodes[j], entry.template_module);
             }
         }
 
@@ -688,7 +689,7 @@ type struct SpecializationPasses {
     /// which a monomorph's AST reaches an owner module, so tagging here is
     /// exhaustive for anything that gets a definition emitted.  See
     /// `FunctionDecl::is_specialization` for why the linkage is sound.
-    static mark_specialized(node: ASTNode*) -> void {
+    static mark_specialized(node: DeclarationNode*) -> void {
         if (node == null) { return; }
         if (DeclarationNode::fn_of(node) != null) {
             DeclarationNode::fn_of(node).is_specialization = true;
@@ -734,11 +735,11 @@ type struct SpecializationPasses {
             entry.injected = true;
             if (entry.ast_node != null) {
                 SpecializationPasses::mark_specialized(entry.ast_node);
-                root.add_statement(Node::of(entry.ast_node));
+                root.add_statement(Node::Decl(entry.ast_node));
             }
             for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
                 SpecializationPasses::mark_specialized(entry.impl_nodes[j]);
-                root.add_statement(Node::of(entry.impl_nodes[j]));
+                root.add_statement(Node::Decl(entry.impl_nodes[j]));
             }
             place_count += 1;
         }
@@ -765,8 +766,8 @@ type struct SpecializationPasses {
     /// under the declaration's key.
     ///
     /// `name` and `generic_params` are the common fields every generic
-    /// declaration shares.  `ast_node` is the original declaration cast to
-    /// ASTNode*.  `kind` is which declaration it is.
+    /// declaration shares.  `ast_node` is the original declaration.  `kind`
+    /// is which declaration it is.
     /// `def` is the id the declaration was stamped with - by the
     /// type-declaration stage for a type, by the name layer for a function -
     /// and its canonical name is the registry's key.  A type's base type is
@@ -774,7 +775,7 @@ type struct SpecializationPasses {
     /// unstamped declaration is a missed stamp, recorded, and registers
     /// nothing: no second key is derived for it from the name and the file.
     static register_generic_template(name: SymbolStr, generic_params: &[DeclarationNode*],
-                                       ast_node: ASTNode*, kind: TemplateKind,
+                                       ast_node: DeclarationNode*, kind: TemplateKind,
                                        def: DefId,
                                        registry: GenericRegistry*, arena: TypeArena*,
                                        ctx: CompilationContext*) -> void {
@@ -876,7 +877,7 @@ type struct SpecializationPasses {
             const entry: TemplateEntry = TemplateEntry::new(
                 DeclarationNode::fn_of(m.func).name, qualified_sym, DeclarationNode::fn_of(m.func).def, written_in,
                 param_names, param_syms, param_types,
-                m.func as ASTNode*, TemplateKind::Function,
+                m.func, TemplateKind::Function,
                 base_type
             );
             registry.register_template(entry);
@@ -897,7 +898,7 @@ type struct SpecializationPasses {
     /// are specialized as part of struct/class monomorphization rather than
     /// per-call.
     static register_inherent_owner(
-            owner: TypeRef, owner_ast: ASTNode*,
+            owner: TypeRef, owner_ast: DeclarationNode*,
             registry: GenericRegistry*) -> void {
         if (owner_ast == null) { return; }
         // Under the declaration's own type and nothing else: two modules'

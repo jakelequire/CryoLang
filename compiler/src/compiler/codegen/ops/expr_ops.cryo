@@ -124,7 +124,7 @@ type struct ExprOps {
     /// begin, so CallEmitter truncates them once that call is fully built (the
     /// callee now owns them). Populated only under a hosted unwind build, so the
     /// default abort path allocates nothing and its IR is unchanged.
-    arg_temp_drops:  [ASTNode*];
+    arg_temp_drops:  [Stmt*];
     arg_temp_frames: [i64];
 
     /// Set while a cleanup landing pad replays its drops. The synthesized
@@ -1120,7 +1120,7 @@ type struct ExprOps {
     /// Record a ready-made `<name>.drop()` statement for a live anonymous owning
     /// arg temp (built by CallEmitter, whose name is bound to the temp's slot in
     /// the value table).
-    push_arg_temp_drop(mut &this, stmt: ASTNode*) -> void {
+    push_arg_temp_drop(mut &this, stmt: Stmt*) -> void {
         if (stmt != null) { this.arg_temp_drops.push(stmt); }
     }
 
@@ -1143,7 +1143,7 @@ type struct ExprOps {
     /// so a drop that itself unwinds propagates without re-entering this pad; the
     /// arg-temp invoke path is suppressed across both replays so a drop-call does
     /// not re-drop the stack.
-    emit_cleanup_landingpad_sched(mut &this, visitor: IRGeneratorVisitor*, sched: [ASTNode*]*,
+    emit_cleanup_landingpad_sched(mut &this, visitor: IRGeneratorVisitor*, sched: [Stmt*]*,
                                   cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
         const saved_bb: LBasicBlock = this.builder.get_insert_block();
         const pers: LValue = this.get_or_decl_personality();
@@ -1155,11 +1155,11 @@ type struct ExprOps {
         const saved_suppress: boolean = this.suppress_arg_temp_invoke;
         this.suppress_arg_temp_invoke = true;
         for (mut a: i64 = this.arg_temp_drops.length - 1; a >= 0; a--) {
-            const t: ASTNode* = this.arg_temp_drops[a];
+            const t: Stmt* = this.arg_temp_drops[a];
             if (t != null) { visitor.dispatch_node(t); }
         }
         for (mut i: i64 = 0; i < sched.length; i++) {
-            const d: ASTNode* = (*sched)[i];
+            const d: Stmt* = (*sched)[i];
             if (d != null) { visitor.dispatch_node(d); }
         }
         this.suppress_arg_temp_invoke = saved_suppress;
@@ -1176,7 +1176,7 @@ type struct ExprOps {
     /// (`unreachable` on the normal edge).  Callers gate this on
     /// `ctx.options.unwinds()` and keep the `abort` trap on the default path,
     /// so emitted IR is unchanged there.
-    emit_panic_diverge_cleanup(mut &this, visitor: IRGeneratorVisitor*, sched: [ASTNode*]*,
+    emit_panic_diverge_cleanup(mut &this, visitor: IRGeneratorVisitor*, sched: [Stmt*]*,
                                msg: LValue, loc: LValue) -> void {
         const panic_fn: LValue = this.intrinsics.get_or_decl_cryo_panic();
         if (!panic_fn.is_valid()) { return; }
@@ -1216,7 +1216,7 @@ type struct ExprOps {
     /// `span`, cleaning up via `emit_panic_diverge_cleanup`.  The shared body
     /// of every synthesized-check raise (div-by-zero, non-exhaustive match,
     /// `new[]` overflow).
-    emit_check_raise(mut &this, visitor: IRGeneratorVisitor*, sched: [ASTNode*]*,
+    emit_check_raise(mut &this, visitor: IRGeneratorVisitor*, sched: [Stmt*]*,
                      span: SourceSpan, message: string) -> void {
         const msg: LValue = this.builder.build_global_string_ptr(message, "check.msg");
         this.emit_panic_diverge_cleanup(visitor, sched, msg, this.intrinsics.location_global(span));
@@ -1516,7 +1516,7 @@ type struct ExprOps {
     /// `append_entry` is the `append` a string `+` was bound to where it is
     /// written (`BinaryExpr::append_entry`).
     codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef, rhs_type: TypeRef,
-                   append_entry: OverloadId, visitor: IRGeneratorVisitor*, div_sched: [ASTNode*]*, div_span: SourceSpan) -> LValue {
+                   append_entry: OverloadId, visitor: IRGeneratorVisitor*, div_sched: [Stmt*]*, div_span: SourceSpan) -> LValue {
         mut out_value: LValue = LValue::null();
         if (!lhs_val.is_valid() || !rhs_val.is_valid()) {
             out_value = LValue::null();
@@ -2085,7 +2085,7 @@ type struct ExprOps {
     /// builds (default), so the guard has no steady-state runtime cost
     /// when the compiler can prove safety statically.
     emit_int_div_guard(mut &this, lhs: LValue, rhs: LValue, is_signed: boolean,
-                       visitor: IRGeneratorVisitor*, div_sched: [ASTNode*]*, div_span: SourceSpan) -> void {
+                       visitor: IRGeneratorVisitor*, div_sched: [Stmt*]*, div_span: SourceSpan) -> void {
         const rhs_ty_raw: void* = llvm::LLVMTypeOf(rhs.raw);
         if (rhs_ty_raw == null) { return; }
         const rhs_ty: LType = LType { raw: rhs_ty_raw };
@@ -2158,7 +2158,7 @@ type struct ExprOps {
     /// can never overflow, so the guard is elided. Leaves the builder at the
     /// ok block; mirrors `emit_int_div_guard`'s trap shape.
     emit_array_mul_guard(mut &this, count_i64: LValue, elem_size: u64,
-                         visitor: IRGeneratorVisitor*, ovf_sched: [ASTNode*]*, ovf_span: SourceSpan) -> void {
+                         visitor: IRGeneratorVisitor*, ovf_sched: [Stmt*]*, ovf_span: SourceSpan) -> void {
         if (elem_size <= (1 as u64)) { return; }
         const u64_max: u64 = (0 as u64) - (1 as u64);
         const max_count: u64 = u64_max / elem_size;

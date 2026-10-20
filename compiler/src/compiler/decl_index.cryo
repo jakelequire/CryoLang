@@ -257,7 +257,7 @@ type struct DeclarationIndex {
     // `FunctionDecl`, a type's, function's or global's own node; null
     // for a slot registered with no node (a module, a primitive, an
     // instance).
-    declarations:   [ASTNode*];
+    declarations:   [DeclarationNode*];
 
     // (owner type << 32 | a method definition's slot in `defs`) -> the
     // entry of the owner's copy of that method: an instance's clone of its
@@ -326,7 +326,7 @@ type struct DeclarationIndex {
     overload_func_types:   [TypeRef]; // FunctionType TypeRef of this entry
     private overload_func_mangled: [u32];     // SymbolStr.id of the linker symbol
     overload_func_span:    [SourceSpan]; // where the entry's declaration is written
-    overload_func_decl:    [ASTNode*];   // the declaration the entry was first
+    overload_func_decl:    [DeclarationNode*];   // the declaration the entry was first
                                       // registered for: a method's MethodDecl,
                                       // a function's FunctionDecl; null for
                                       // an entry registered with no node
@@ -559,7 +559,7 @@ public:
     /// the owner's parameters (`entry_owner_return`), kept the same way.
     register_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr, func_type_ref: TypeRef,
                        owner_return: TypeRef, symbol: SymbolStr, trait_sym: DefId,
-                       span: SourceSpan, decl: ASTNode*) -> OverloadId {
+                       span: SourceSpan, decl: DeclarationNode*) -> OverloadId {
         const slot: FamilySlot = this.family_slot(owner, leaf);
         if (slot.is_none()) { return OverloadId::invalid(); }
         this.func_type_refs.insert(slot, func_type_ref);
@@ -585,7 +585,7 @@ public:
     /// `slot` (`FamilySlot::none()` for none); the caller files it in that
     /// family.
     file_entry(mut &this, slot: FamilySlot, func_type_ref: TypeRef, owner_return: TypeRef,
-               symbol: SymbolStr, trait_sym: DefId, span: SourceSpan, decl: ASTNode*) -> OverloadId {
+               symbol: SymbolStr, trait_sym: DefId, span: SourceSpan, decl: DeclarationNode*) -> OverloadId {
         const new_pos: u32 = this.overload_func_types.length as u32;
         this.overload_func_types.push(func_type_ref);
         this.overload_func_mangled.push(symbol.id);
@@ -608,7 +608,7 @@ public:
     register_copy_signature(mut &this, home: FamilyOwner, minted: SymbolStr,
                             return_type: TypeRef, func_type_ref: TypeRef,
                             intern: InternTable*, arena: TypeArena*,
-                            span: SourceSpan, decl: ASTNode*) -> OverloadId {
+                            span: SourceSpan, decl: DeclarationNode*) -> OverloadId {
         const symbol: SymbolStr = this.mangle_function_symbol(home, minted, return_type, func_type_ref, intern, arena);
         return this.file_entry(FamilySlot::none(), func_type_ref, return_type, symbol, DefId::invalid(), span, decl);
     }
@@ -629,7 +629,7 @@ public:
     /// The declaration entry `id` was registered for - a method's
     /// `MethodDecl`, a function's `FunctionDecl` - or null for an
     /// invalid id or an entry registered with no node.
-    entry_decl(&this, id: OverloadId) -> ASTNode* {
+    entry_decl(&this, id: OverloadId) -> DeclarationNode* {
         if (!id.is_valid()) { return null; }
         return this.overload_func_decl[this.slot_of(id)];
     }
@@ -650,7 +650,7 @@ public:
     /// The method entry `id` was registered for; null when it names a
     /// function or no node.
     entry_method(&this, id: OverloadId) -> DeclarationNode* {
-        const d: ASTNode* = this.entry_decl(id);
+        const d: DeclarationNode* = this.entry_decl(id);
         if (d == null || DeclarationNode::method_of(d) == null) { return null; }
         return DeclarationNode::with_shape(d);
     }
@@ -749,7 +749,7 @@ public:
 
     /// Keep `decl` as the declaration the definition `d` was registered
     /// for, by the registrar holding both.
-    keep_declaration(mut &this, d: DefId, decl: ASTNode*) -> void {
+    keep_declaration(mut &this, d: DefId, decl: DeclarationNode*) -> void {
         if (!d.is_valid()) { return; }
         const slot: i64 = this.defs.slot(d);
         while (this.declarations.length <= slot) { this.declarations.push(null); }
@@ -758,7 +758,7 @@ public:
 
     /// The declaration the definition `d` was registered for, or null when
     /// `d` is invalid or was registered with no node.
-    declaration_of(&this, d: DefId) -> ASTNode* {
+    declaration_of(&this, d: DefId) -> DeclarationNode* {
         if (!d.is_valid()) { return null; }
         const slot: i64 = this.defs.slot(d);
         if (slot >= this.declarations.length) { return null; }
@@ -804,7 +804,7 @@ public:
     /// implementation's method, or a trait's declared method, which is
     /// registered as the function itself.  Null when `d` names no method.
     method_func_of(&this, d: DefId) -> DeclarationNode* {
-        const decl: ASTNode* = this.method_decl_of(d);
+        const decl: DeclarationNode* = this.method_decl_of(d);
         if (decl == null) { return null; }
         if (DeclarationNode::method_of(decl) != null) { return DeclarationNode::method_of(decl).func; }
         if (DeclarationNode::fn_of(decl) != null) { return DeclarationNode::with_shape(decl); }
@@ -813,7 +813,7 @@ public:
 
     /// The declaration the method definition `d` was registered for, or
     /// null when `d` is invalid or names no method.
-    method_decl_of(&this, d: DefId) -> ASTNode* {
+    method_decl_of(&this, d: DefId) -> DeclarationNode* {
         if (!d.is_valid() || this.defs.kind_of(d) != DefKind::Method) { return null; }
         return this.declaration_of(d);
     }
@@ -834,7 +834,7 @@ public:
         if (this.defs.kind_of(d) == DefKind::Method
                 && this.defs.parent_of(d).equals(this.registered_def(owner))
                 && this.defs.leaf_of(d).spelling().equals(DeclarationNode::fn_of(method.func).name)
-                && this.method_decl_of(d) == method_decl as ASTNode*) {
+                && this.method_decl_of(d) == method_decl) {
             return;
         }
         panic(fmt::format(
@@ -1196,7 +1196,7 @@ public:
             // symbol and signature registration wrote, and mangles nothing.
             const entry: OverloadId = this.keep_def_entry(func.def, this.register_signature(
                 FamilyOwner::Type(owner), func.name, func_type_ref, ret, eff_mangled, func.origin_trait,
-                if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span }, method_decl as ASTNode*));
+                if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span }, method_decl));
             func.set_overload_entry(entry);
             // A constructor's family is its type's: `Node(1)` and `new
             // Node(1)` name the type, and its constructors are asked by it.
@@ -1247,7 +1247,7 @@ public:
             match (this.overload_index.get_ref(&slot)) {
                 Option::Some(positions) => {
                     for (mut k: i64 = 0; k < (*positions).length; k++) {
-                        if (this.overload_func_decl[(*positions)[k] as i64] == method_decl as ASTNode*) { registered = true; }
+                        if (this.overload_func_decl[(*positions)[k] as i64] == method_decl) { registered = true; }
                     }
                 }
                 Option::None => { }
@@ -1266,7 +1266,7 @@ public:
             };
             const id: OverloadId = this.file_entry(slot, func_type_ref, func.resolved_return_type,
                 SymbolStr::empty(), func.origin_trait,
-                if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span }, method_decl as ASTNode*);
+                if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span }, method_decl);
             const positions: [u32]* = this.overload_index.get_or_insert(slot, []);
             (*positions).push(this.slot_of(id) as u32);
         }
@@ -1483,7 +1483,7 @@ public:
                                 return_type: TypeRef, func_type_ref: TypeRef,
                                 intern: InternTable*, arena: TypeArena*,
                                 symbol: SymbolStr, span: SourceSpan, def: DefId,
-                                decl: ASTNode*) -> OverloadId {
+                                decl: DeclarationNode*) -> OverloadId {
         const sym: SymbolStr = if (symbol.is_valid()) {
             symbol
         } else {

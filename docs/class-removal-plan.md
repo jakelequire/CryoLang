@@ -2218,16 +2218,20 @@ the warning set, the language server gate, check cost):
    Two bridges carry the consumers not yet converted: `Node::of(ASTNode*)`
    and `Node.as_ast()`.
 2. **The handles that hold one category narrow to it**: the generic
-   registry's template, mono's owners and placed specializations, the
-   declaration index, and sema's and the call resolver's owner and callee
-   handles become `DeclarationNode*` or `ExpressionNode*`; the
-   declaration and expression projections take the header.
+   registry's template and inherent owners, mono's owners and placed
+   specializations, the declaration index, the injected origins, sema's,
+   the call resolver's and method binding's owner and method handles, the
+   bindgen importer's emitted declarations and the language server's
+   declaration lookups become `DeclarationNode*`; the cleanups a call or
+   a `match` records, which are statements only, become `[Stmt*]`.
 3. **The rest of the base-class consumers**: the passes that still read a
    program item through `as_ast` (sema's and codegen's `dispatch_node`,
    type resolution, directive processing, dead code, config gating, the
-   pass registry, the bindgen generator and importer, the stamp check),
-   the cleanups a call records (`unwind_cleanup: [Node]`) and the language
-   server.  `Node::of` and `as_ast` are deleted.
+   pass registry, the bindgen generator, the stamp check), the
+   expression handles cast up only to reach a projection, the declaration
+   and expression projections (which then take the header), the lang-ref
+   and alias records, and the language server.  `Node::of` and `as_ast`
+   are deleted.
 4. **The base class goes.**  `ASTNode` and `NodeKind` are deleted,
    `ProgramNode` becomes the `Program` struct, and `ExpressionNode`,
    `Stmt`, `Pattern`, `MatchArmNode`, `StaticMatchArmNode` and
@@ -2275,6 +2279,18 @@ place that answers "no node at all" answers `Node?` (the node locator).
   Downcasts from an `ASTNode*` handle 166 -> 149.  Check x5 medians 9.05 s
   and 8.99 s, peak 1,580.4 -> 1,580.7 MiB, node bytes +20,088.  Stage-2
   build 0 warnings.
+- **Commit 2 built**, as item 2 above.  The registration loop in
+  specialization binds each item's declaration once and passes it.  The
+  cleanup schedules' comment that the base-class type avoided an import
+  cycle was stale (the expression module imports the statement module).
+  The pin accepted one upcast passed to a narrowed constructor parameter
+  that the compiler built from the tree refuses: a stage-2 build of the
+  compiler with the compiler under test is part of every commit's proof.
+  **Measured.**  0 objects moved; lsp, incr, fast, cross OK; `--ast`
+  identical over the same 1,087 + 154 files (control: `FunctionDecl` and
+  `ImplementBlock` relabelled, 164/164, 0 beyond); downcasts 149 -> 123;
+  check medians 9.20 s and 9.19 s, peak 1,577.4 and 1,577.3 MiB, node
+  bytes identical; stage-2 build 0 warnings.
 
 ### Slice 7: the remaining walks and traits
 
@@ -2555,7 +2571,7 @@ final audit greps for each name listed and expects none.
 | `implement class XNode { static walk_children ... }`, one per node class with children | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | each moves inline into its kind's payload struct body (ruling 397) as that category converts (slices 5-6); none left when the last category does.  Patterns', statements' and expressions' are gone. |
 | `ExpressionNode` a class deriving from `ASTNode`, so an `ASTNode*` can hold an expression, and the `as ExpressionNode*` casts from such handles; `ExpressionNode.shape`, the expression's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/expression.cryo` and every expression consumer | slice 6 (expressions, the bridge with Sizeof/Alignof/Typeof; `ExprKind::Legacy` went with the last kind, Call) | the header becomes the `Expr` struct when the "any node" handle is `Node`, and `shape` is renamed `kind` |
 | `ExpressionNode::with_shape`, `ExpressionNode::sizeof_of` (const table, type resolution, declaration emitter, async lowering), `ExpressionNode::alignof_of` (same four), `ExpressionNode::typeof_of` (async lowering x2), `ExpressionNode::delete_of` (async lowering x5), `ExpressionNode::try_of` (async lowering x10), `ExpressionNode::new_of` (parser, cloner, async lowering x2), `ExpressionNode::tuple_of` (parser, cloner, call resolver, async lowering x5), `ExpressionNode::array_of` (parser, cloner, declaration emitter x2, call resolver x3, async lowering x5), `ExpressionNode::struct_of` (parser, cloner, importer, binding generator, declaration emitter x2, `new` emitter, lambda emitter, drop insertion x2, move check, sema's `new`, call resolver, call emitter x2, type resolver, async lowering x12) and `ExpressionNode::literal_of` (parser x3, cloner, importer x2, binding generator x2, const table x2, declaration emitter x4, place emitter, drop insertion, sema x4, sema helpers x5, literal resolver, method binding, diagnostics, call resolver x7, async lowering x2), `ExpressionNode::ternary_of` (async lowering x10), `ExpressionNode::if_of` (sema x2, async lowering x10), `ExpressionNode::static_match_of` (parser, cloner, sema x2, async lowering), `ExpressionNode::match_of` (parser x3, cloner x3, sema x3, `TryExpr`, async lowering x12), `ExpressionNode::cast_of` (cloner, binding generator, declaration emitter x3, const table x2, type resolution x2, async lowering x11), `ExpressionNode::unary_of` (cloner, declaration emitter, expression dispatch, const table x2, parser, move check, type resolution, sema helpers x3, literal resolver x2, method binding, call resolver x6, sema x2, async lowering x13, language server uses), `ExpressionNode::binary_of` (cloner, declaration emitter, const table x2, parser, drop insertion x3, type resolution, sema helpers x2, literal resolver x2, method binding, call resolver x2, async lowering x13), `ExpressionNode::array_access_of` (cloner, expression dispatch, drop insertion, move check, sema x2, async lowering x13), `ExpressionNode::lambda_of` (cloner, parser x2, sema, async lowering x2), `ExpressionNode::await_of` (async lowering x12) and `ExpressionNode::identifier_of` (cloner, parser x5, substituter, bindgen generator, declaration emitter, const table x2, call emitter x5, expression dispatch, IR generator, `delete` and lambda emitters, call specializer x4, type resolution, name resolution, lambda synthesis x2, sema x10, call resolver x10, move check x12, drop insertion x16, async lowering x18) and `ExpressionNode::scope_resolution_of` (cloner, parser x9, substituter, declaration emitter x2, const table x2, call emitter x4, pass registry x2, name resolution, call specializer x8, sema x6, call resolver x25, async lowering x7) and `ExpressionNode::member_access_of` (cloner, parser x3, call emitter x11, call specializer x7, pass registry x2, drop insertion x9, move check x14, sema x5, call resolver x16, member resolver, lambda synthesis, async lowering x38, language server identity x2) and `ExpressionNode::call_of` (parser x17, sema x11, call resolver x8, async lowering x39, call emitter x2, call specializer x2, bindgen generator x2 and importer, cloner, drop insertion, member resolver, language server identity x2 and uses) | `compiler/src/compiler/AST/expression.cryo` and those files | slice 6 (expressions) | the projections become `Node::Expr(e)` arms matching `e.kind` when the "any node" handle is `Node` |
-| `Node::of(ASTNode*)` and `Node.as_ast()`, the conversions between the "any node" handle and the base-class handle, for the consumers still written over the base class: `Node::of` (bindgen importer, specializer x2, parser, specialization x2, language server definition), `as_ast` (the passes that read a program item or a `for` initializer through it: bindgen generator and importer, inline bodies x2, declaration emitter x2, IR generator x2, instance, call specializer, specializer, parser, AST validation, config gating, dead code x3, default expansion, directive processing x3, drop insertion, move check, pass registry x4, specialization, type resolution x8, name resolution, stamp check x2, diagnostics x2, sema x3; language server code lens x2, definition, identity, members, semantic tokens, symbols x2, uses x2) | `compiler/src/compiler/AST/node.cryo` and those files | slice 6 (`Program` and `Node`, commit 1) | commit 3, when the last base-class consumer converts |
+| `Node::of(ASTNode*)` and `Node.as_ast()`, the conversions between the "any node" handle and the base-class handle, for the consumers still written over the base class: `Node::of` (the parser's top-level item), `as_ast` (the passes that read a program item or a `for` initializer through it: bindgen generator and importer, inline bodies x2, declaration emitter x2, IR generator x2, instance, call specializer, parser, AST validation, config gating, dead code x3, default expansion, directive processing x3, drop insertion, move check, pass registry x4, specialization, type resolution x8, name resolution, stamp check x2, diagnostics x2, sema x3; language server code lens x2, definition, identity, members, semantic tokens, symbols x2, uses x2) | `compiler/src/compiler/AST/node.cryo` and those files | slice 6 (`Program` and `Node`, commit 1) | commit 3, when the last base-class consumer converts |
 | `Pattern` a class deriving from `ASTNode`, so an `ASTNode*` can hold it; the four `as Pattern*` casts from such handles (lang-ref settling, three in the language server) | `compiler/src/compiler/AST/pattern.cryo` and the casts' files | slice 5 | the header becomes a struct when the "any node" handle is `Node` (slice 6, `Program` and `Node`); the casts become `Node::Pattern(p)` arms |
 | `Pattern.shape`, the pattern's kind under a second name because `kind` is the inherited `NodeKind` | `compiler/src/compiler/AST/pattern.cryo` | slice 5 | renamed `kind` when the header stops deriving from `ASTNode` |
 | `Stmt` a class deriving from `ASTNode`, so an `ASTNode*` (a program item read through `as_ast`, the editor's node at a position) can hold a statement; the eight `as Stmt*` casts from such handles (IR generator, AST validation, type resolution, name resolution, stamp check, sema, language server uses x2), each behind a `NodeKind::Statement` test | `compiler/src/compiler/AST/statement.cryo` and the casts' files | slice 6 (statements) | the header becomes a struct when the "any node" handle is `Node`; the casts become `Node::Stmt(s)` arms |

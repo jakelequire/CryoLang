@@ -113,7 +113,7 @@ type struct NameResolver {
     /// declaration whose parameters it is written with.  `this_owner_decl`
     /// is null elsewhere, a trait declaration's body included.
     this_owner:      ResBase;
-    this_owner_decl: ASTNode*;
+    this_owner_decl: DeclarationNode*;
     /// The owner's symbol, for the resolution map: the impl head's binding.
     /// Invalid in a type declaration's own body, which holds none.
     this_owner_sym:  SymbolID;
@@ -147,7 +147,7 @@ type struct NameResolver {
 
     /// The parameters `This` is written with in the body of `decl`: an
     /// inherent impl's, or a struct declaration's own.
-    static this_owner_params_of(decl: ASTNode*) -> [DeclarationNode*] {
+    static this_owner_params_of(decl: DeclarationNode*) -> [DeclarationNode*] {
         mut out: [DeclarationNode*] = [];
         if (decl == null) { return out; }
         if (DeclarationNode::impl_of(decl) != null) {
@@ -302,7 +302,7 @@ type struct NameResolver {
     stamp_function_def(&this, fn_node_decl: DeclarationNode*, sym_id: SymbolID) -> void {
         const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
         fn_node.def = this.resolver.get_symbol(sym_id).def;
-        this.ctx.decl_index.keep_declaration(fn_node.def, fn_node_decl as ASTNode*);
+        this.ctx.decl_index.keep_declaration(fn_node.def, fn_node_decl);
     }
 
     /// The definition a type declaration's binding was registered as, for
@@ -319,7 +319,7 @@ type struct NameResolver {
     /// declaration, `decl` being the node the method is (a `MethodDecl`, or
     /// a trait's own `FunctionDecl`).  An owner the head could not name
     /// registers nothing: the head's own error has been reported.
-    define_method(&this, owner: DefId, func_decl: DeclarationNode*, decl: ASTNode*) -> DefId {
+    define_method(&this, owner: DefId, func_decl: DeclarationNode*, decl: DeclarationNode*) -> DefId {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (!owner.is_valid()) { return DefId::invalid(); }
         func.def = this.ctx.define_method(owner, func.name, func_decl.span, decl);
@@ -333,7 +333,7 @@ type struct NameResolver {
             const method_decl: DeclarationNode* = methods[i];
             const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null) { continue; }
-            this.define_method(owner, method.func, method_decl as ASTNode*);
+            this.define_method(owner, method.func, method_decl);
         }
     }
 
@@ -620,10 +620,14 @@ type struct NameResolver {
     /// once the declaring walk has stamped it.  Functions are kept where
     /// they are stamped, extern ones included (`stamp_function_def`).
     keep_declared(&this, node: ASTNode*) -> void {
-        const d: DefId = match (node.kind) {
-            NodeKind::ClassDeclaration     => { (node as ClassDeclNode*).def }
+        match (node.kind) {
+            NodeKind::ClassDeclaration => {
+                const class_node: ClassDeclNode* = node as ClassDeclNode*;
+                this.ctx.decl_index.keep_declaration(class_node.def, class_node);
+            }
             NodeKind::Declaration => {
-                match ((node as DeclarationNode*).shape) {
+                const decl: DeclarationNode* = node as DeclarationNode*;
+                const d: DefId = match (decl.shape) {
                     DeclKind::Variable(v)        => { v.def }
                     DeclKind::Intrinsic(i)       => { i.def }
                     DeclKind::Trait(t)           => { t.def }
@@ -637,11 +641,11 @@ type struct NameResolver {
                     | DeclKind::Method(_) | DeclKind::Legacy => {
                         DefId::invalid()
                     }
-                }
+                };
+                this.ctx.decl_index.keep_declaration(d, decl);
             }
-            _ => { DefId::invalid() }
-        };
-        this.ctx.decl_index.keep_declaration(d, node);
+            _ => { }
+        }
     }
 
 
@@ -3109,10 +3113,10 @@ implement trait Walk for struct NameResolver {
         // walked.
         this.define_body_methods(node.def, &node.methods);
         const outer_owner: ResBase = this.this_owner;
-        const outer_owner_decl: ASTNode* = this.this_owner_decl;
+        const outer_owner_decl: DeclarationNode* = this.this_owner_decl;
         const outer_owner_sym: SymbolID = this.this_owner_sym;
         this.this_owner = ResBase::Def(node.def);
-        this.this_owner_decl = if (node.def.is_valid()) { d as ASTNode* } else { null };
+        this.this_owner_decl = if (node.def.is_valid()) { d } else { null };
         this.this_owner_sym = SymbolID::invalid();
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.walk_decl(node.methods[i]);
@@ -3284,7 +3288,7 @@ implement trait Walk for struct NameResolver {
             const method_decl: DeclarationNode* = node.methods[i];
             const method: FunctionDecl* = DeclarationNode::fn_of(method_decl);
             this.resolver.declare_method(method.name, method_decl.span, true,
-                this.define_method(this.this_trait, method_decl, method_decl as ASTNode*));
+                this.define_method(this.this_trait, method_decl, method_decl));
         }
 
         // A default body is source written in THIS file, and is the only place
@@ -3326,18 +3330,18 @@ implement trait Walk for struct NameResolver {
         }
         // `This::` in the body names what the head was just answered with.
         const outer_owner: ResBase = this.this_owner;
-        const outer_owner_decl: ASTNode* = this.this_owner_decl;
+        const outer_owner_decl: DeclarationNode* = this.this_owner_decl;
         const outer_owner_sym: SymbolID = this.this_owner_sym;
         this.this_owner_decl = null;
         this.this_owner_sym = target_id;
         match (node.res) {
             ResSlot::Answered(Res::Def(d)) => {
                 this.this_owner = ResBase::Def(d);
-                this.this_owner_decl = decl as ASTNode*;
+                this.this_owner_decl = decl;
             }
             ResSlot::Answered(Res::PrimTy(p)) => {
                 this.this_owner = ResBase::PrimTy(p);
-                this.this_owner_decl = decl as ASTNode*;
+                this.this_owner_decl = decl;
             }
             _ => { }
         }
@@ -3382,7 +3386,7 @@ implement trait Walk for struct NameResolver {
                     method.visibility == Visibility::Public;
                 this.resolver.declare_method(
                     DeclarationNode::fn_of(method.func).name, method.func.span, is_public,
-                    this.define_method(method_owner, method.func, method_decl as ASTNode*));
+                    this.define_method(method_owner, method.func, method_decl));
             }
             this.walk_decl(method_decl);
         }
@@ -4025,7 +4029,7 @@ type struct NameDeclarationPass {
     }
 
     /// The id a type declaration node was declared under; invalid for none.
-    static type_decl_def(node: ASTNode*) -> DefId {
+    static type_decl_def(node: DeclarationNode*) -> DefId {
         if (node == null) { return DefId::invalid(); }
         if (DeclarationNode::struct_of(node) != null)    { return (DeclarationNode::struct_of(node)).def; }
         if (DeclarationNode::union_of(node) != null)     { return (DeclarationNode::union_of(node)).def; }
