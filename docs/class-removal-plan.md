@@ -2354,6 +2354,29 @@ Built so far:
   copy only through `clone_node`, so the sub-nodes the cloner reaches
   directly (a function's body, parameters, arms, patterns, directives)
   lose it; whether any reader sees it on a copy is not measured.
+- `Walk` reaches written types: `walk_children` hands every annotation, `where`
+  bound and named trait a node holds to `walk_annotation`, `walk_bound` and
+  `walk_trait_ref`, whose defaults do nothing.  The name layer's exit check
+  (`StampCheck`) is a `Walk` overriding the name-carrying hooks; it visits
+  the slots the hand-written walk visited, in the same order (measured over
+  the tests, the examples, the stdlib and the compiler).
+- Decided per walk, not converted: no other hand-written walk visits exactly
+  the children `walk_children` visits.  Each skips kinds on purpose (the
+  generic-call collection, the static-match pruner, default expansion, the
+  async lowering's searches stop at lambdas or loops or leave literals
+  alone), or adds what is not a child (`desugared_call`, a `?`'s
+  `desugared`), or acts per kind (the language server's `uses`), so a `Walk`
+  would need an override per difference and be no shorter.  `node_locator`
+  stays a `match`: it picks one covering child under rules of its own (a
+  method stops at its name, an implementation's methods are filtered by
+  file, a struct literal answers the field value), not a traversal.
+- `Display` is not adopted: the compiler formats with `fmt::format` and C
+  strings, so a `Display` beside each `to_string` would be unused, and
+  replacing the `to_string`s means moving every caller to formatted `String`s.
+  `Eq`: the hand-written `equals` methods outside an `Eq` implementation
+  are the handle types (`DefId`, `SymbolID`, `SymbolStr`, `TypeRef`,
+  `ModulePath`, `OverloadId`), comparing by value; their hash-table keys
+  (`DefKey`, `SymbolKey`, `TypeKey`, ...) implement `Eq` and `Hash`.
 
 ### Slice 9: delete the class feature (built before slice 8)
 

@@ -10,29 +10,27 @@
 ///
 /// It is a walk of its own, not a tally the name layer keeps: a node the
 /// name layer never reached is exactly the defect, and a tally kept by the
-/// walker that missed it would miss it too.  Member names (`a.b`) and calls
-/// are not here; they are answered by the type check and by
-/// monomorphization.
+/// walker that missed it would miss it too.  It is a `Walk`, so it reaches
+/// every child the tree has and every annotation, bound and named trait a
+/// node holds; it overrides only the hooks of the slots that carry a name.
+/// Member names (`a.b`) and calls are not here; they are answered by the
+/// type check and by monomorphization.
 namespace compiler::resolver::stamp_check;
 
 import compiler::ast;
 import compiler::ast::{
     declaration, expression, statement, pattern, node, NamedAnnotation,
-    PatternElement, PatternSub, TraitBound, TraitRef, TypeAnnotation
+    TraitBound, TraitRef, TypeAnnotation
 };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumVariant,
-    FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock,
-    DeclKind, MethodDecl, StructDecl, TraitDecl,
-    UnionDecl, VarDecl
+    ClassDeclNode, DeclarationNode, ImplBlock, MethodDecl
 };
 import compiler::ast::expression::{
-    CallExpr, ExprKind, ExpressionNode,
-    MemberAccessExpr, ScopeResolutionExpr
+    ExpressionNode, IdentifierExpr, NewExpr, ScopeResolutionExpr, StructExpr
 };
-import compiler::ast::node::{ Node, ProgramNode };
-import compiler::ast::pattern::{ MatchArmNode, Pattern, PatternKind, StaticMatchArmNode };
-import compiler::ast::statement::{ Stmt, StmtKind };
+import compiler::ast::node::{ ProgramNode };
+import compiler::ast::pattern::{ ConstantPattern, EnumPattern, Pattern };
+import compiler::ast::walk::{ Walk };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::res::{ ResSlot };
 import std::fmt;
@@ -113,384 +111,108 @@ type struct StampCheck {
 
     check_program(mut &this, program: ProgramNode*) -> void {
         if (program == null) { return; }
-        for (mut i: i64 = 0; i < program.statements.length; i++) {
-            this.node(program.statements[i]);
-        }
-        for (mut i: i64 = 0; i < program.static_asserts.length; i++) {
-            this.expr(program.static_asserts[i].cond);
+        this.walk_program(program);
+    }
+}
+
+implement trait Walk for struct StampCheck {
+    /// The program's items, then its `static_assert` conditions.
+    walk_program(mut &this, n: ProgramNode*) -> void {
+        ProgramNode::walk_children(n, this);
+        for (mut i: i64 = 0; i < n.static_asserts.length; i++) {
+            this.walk_expr(n.static_asserts[i].cond);
         }
     }
 
-    // -- Type annotations --
+    walk_identifier(mut &this, e: ExpressionNode*, n: IdentifierExpr*) -> void {
+        this.note(&n.res, StampSite::Identifier, e.span);
+        IdentifierExpr::walk_children(n, this);
+    }
 
-    annotation(mut &this, ann: TypeAnnotation*) -> void {
+    walk_scope_resolution(mut &this, e: ExpressionNode*, n: ScopeResolutionExpr*) -> void {
+        this.note(&n.scope_res, StampSite::PathScope, n.scope_span);
+        ScopeResolutionExpr::walk_children(n, this);
+    }
+
+    walk_struct_literal(mut &this, e: ExpressionNode*, n: StructExpr*) -> void {
+        this.note(&n.res, StampSite::StructLiteral, e.span);
+        StructExpr::walk_children(n, this);
+    }
+
+    walk_new(mut &this, e: ExpressionNode*, n: NewExpr*) -> void {
+        this.note(&n.res, StampSite::NewType, e.span);
+        NewExpr::walk_children(n, this);
+    }
+
+    walk_enum_pattern(mut &this, p: Pattern*, n: EnumPattern*) -> void {
+        this.note(&n.res, StampSite::EnumPattern, n.enum_span);
+        EnumPattern::walk_children(n, this);
+    }
+
+    walk_constant_pattern(mut &this, p: Pattern*, n: ConstantPattern*) -> void {
+        this.note(&n.res, StampSite::ConstantPattern, p.span);
+    }
+
+    walk_impl(mut &this, d: DeclarationNode*, n: ImplBlock*) -> void {
+        this.note(&n.res, StampSite::ImplTarget, n.target_type_span);
+        ImplBlock::walk_children(n, this);
+    }
+
+    walk_class(mut &this, n: ClassDeclNode*) -> void {
+        if (n.base_class.is_valid()) { this.note(&n.base_res, StampSite::BaseClass, n.base_span); }
+        ClassDeclNode::walk_children(n, this);
+    }
+
+    /// A method's function, then a constructor's base-constructor arguments.
+    walk_method(mut &this, d: DeclarationNode*, n: MethodDecl*) -> void {
+        MethodDecl::walk_children(n, this);
+        for (mut i: i64 = 0; i < n.base_ctor_args.length; i++) { this.walk_expr(n.base_ctor_args[i]); }
+    }
+
+    /// A written type: each name in it, and the expressions it holds (an
+    /// array's length, a `typeof` operand).  A primitive and `This` carry no
+    /// written name to answer.
+    walk_annotation(mut &this, ann: TypeAnnotation*) -> void {
         if (ann == null) { return; }
         match (*ann) {
             TypeAnnotation::Named(n) => {
                 if (n != null) { this.note(&n.res, StampSite::TypeName, n.span); }
             }
-            TypeAnnotation::Pointer(p)   => { if (p != null) { this.annotation(p.inner); } }
-            TypeAnnotation::Reference(r) => { if (r != null) { this.annotation(r.inner); } }
+            TypeAnnotation::Pointer(p)   => { if (p != null) { this.walk_annotation(p.inner); } }
+            TypeAnnotation::Reference(r) => { if (r != null) { this.walk_annotation(r.inner); } }
             TypeAnnotation::Array(a) => {
                 if (a != null) {
-                    this.annotation(a.element);
-                    this.expr(a.size_expr);
+                    this.walk_annotation(a.element);
+                    this.walk_expr(a.size_expr);
                 }
             }
             TypeAnnotation::Function(f) => {
                 if (f != null) {
-                    this.annotations(&f.parameters);
-                    this.annotation(f.return_type);
+                    this.walk_annotations(&f.parameters);
+                    this.walk_annotation(f.return_type);
                 }
             }
-            TypeAnnotation::Tuple(t) => { if (t != null) { this.annotations(&t.elements); } }
+            TypeAnnotation::Tuple(t) => { if (t != null) { this.walk_annotations(&t.elements); } }
             TypeAnnotation::Generic(g) => {
                 if (g != null) {
-                    this.annotation(g.base);
-                    this.annotations(&g.args);
+                    this.walk_annotation(g.base);
+                    this.walk_annotations(&g.args);
                 }
             }
-            TypeAnnotation::Typeof(t) => { if (t != null) { this.expr(t.operand); } }
-            TypeAnnotation::ImplTrait(it) => { if (it != null) { this.annotations(&it.bounds); } }
-            TypeAnnotation::Projection(p) => { if (p != null) { this.annotation(p.base); } }
-            // A primitive and `This` carry no written name to answer.
+            TypeAnnotation::Typeof(t) => { if (t != null) { this.walk_expr(t.operand); } }
+            TypeAnnotation::ImplTrait(it) => { if (it != null) { this.walk_annotations(&it.bounds); } }
+            TypeAnnotation::Projection(p) => { if (p != null) { this.walk_annotation(p.base); } }
             _ => { }
         }
     }
 
-    annotations(mut &this, anns: &[TypeAnnotation*]) -> void {
-        for (mut i: i64 = 0; i < anns.length; i++) { this.annotation(anns[i]); }
+    walk_bound(mut &this, b: &TraitBound) -> void {
+        this.walk_annotation(b.subject_type);
+        this.walk_trait_refs(&b.trait_refs);
     }
 
-    trait_ref(mut &this, r: &TraitRef) -> void {
+    walk_trait_ref(mut &this, r: &TraitRef) -> void {
         if (!r.resolved.is_valid() && !r.refused) { this.note_missing(StampSite::TraitInBound, r.span); }
-        this.annotations(&r.type_args);
-    }
-
-    trait_refs(mut &this, refs: &[TraitRef]) -> void {
-        for (mut i: i64 = 0; i < refs.length; i++) { this.trait_ref(&refs[i]); }
-    }
-
-    bounds(mut &this, bs: &[TraitBound]) -> void {
-        for (mut i: i64 = 0; i < bs.length; i++) {
-            this.annotation(bs[i].subject_type);
-            this.trait_refs(&bs[i].trait_refs);
-        }
-    }
-
-    generic_params(mut &this, ps: &[DeclarationNode*]) -> void {
-        for (mut i: i64 = 0; i < ps.length; i++) {
-            const p: GenericParamDecl* = DeclarationNode::generic_param_of(ps[i]);
-            if (p != null) { this.annotation(p.default_annotation); }
-        }
-    }
-
-    // -- Declarations, statements, expressions --
-
-    node(mut &this, item: Node) -> void {
-        if (item.is_null()) { return; }
-        match (item) {
-            Node::Decl(d) => { this.decl(d); }
-            Node::Stmt(s) => { this.stmt(s); }
-            Node::Expr(e) => { this.expr(e); }
-            _ => { }
-        }
-    }
-
-    decl(mut &this, n: DeclarationNode*) -> void {
-        match (n.shape) {
-            DeclKind::Method(_) => { this.method(DeclarationNode::with_shape(n)); }
-            DeclKind::Function(_) => { this.function(DeclarationNode::with_shape(n)); }
-            DeclKind::Trait(d) => {
-                this.generic_params(&d.generic_params);
-                for (mut i: i64 = 0; i < d.methods.length; i++) { this.function(d.methods[i]); }
-                this.trait_refs(&d.base_traits);
-                for (mut i: i64 = 0; i < d.assoc_types.length; i++) {
-                    if (d.assoc_types[i] != null) { this.trait_refs(&d.assoc_types[i].bounds); }
-                }
-            }
-            DeclKind::Intrinsic(d) => {
-                for (mut i: i64 = 0; i < d.parameters.length; i++) {
-                    this.var_decl(DeclarationNode::var_of(d.parameters[i]));
-                }
-                this.annotation(d.return_type_annotation);
-                this.node(Node::Stmt(d.body));
-            }
-            DeclKind::Destructure(d) => {
-                this.annotation(d.type_annotation);
-                this.expr(d.initializer);
-            }
-            DeclKind::Variable(d) => { this.var_decl(d); }
-            DeclKind::Extern(d) => {
-                for (mut i: i64 = 0; i < d.functions.length; i++) { this.function(d.functions[i]); }
-                for (mut i: i64 = 0; i < d.globals.length; i++) {
-                    this.var_decl(DeclarationNode::var_of(d.globals[i]));
-                }
-            }
-            DeclKind::TypeAlias(d) => {
-                this.generic_params(&d.generic_params);
-                this.annotation(d.target_annotation);
-            }
-            DeclKind::Enum(d) => {
-                this.generic_params(&d.generic_params);
-                this.annotation(d.discriminant_annotation);
-                for (mut i: i64 = 0; i < d.variants.length; i++) {
-                    const v: EnumVariant* = DeclarationNode::variant_of(d.variants[i]);
-                    if (v != null) { this.annotations(&v.associated_types); }
-                }
-                this.bounds(&d.where_bounds);
-            }
-            DeclKind::Union(d) => {
-                this.generic_params(&d.generic_params);
-                this.fields(&d.fields);
-                this.methods(&d.methods);
-                this.bounds(&d.where_bounds);
-            }
-            DeclKind::Struct(d) => {
-                this.generic_params(&d.generic_params);
-                this.fields(&d.fields);
-                this.methods(&d.methods);
-                this.bounds(&d.where_bounds);
-            }
-            DeclKind::Impl(d) => {
-                this.note(&d.res, StampSite::ImplTarget, d.target_type_span);
-                this.generic_params(&d.generic_params);
-                this.annotations(&d.target_args);
-                this.annotation(d.trait_annotation);
-                this.bounds(&d.where_bounds);
-                this.annotations(&d.assoc_binding_annotations);
-                this.methods(&d.methods);
-            }
-            // A variant's, a field's or a generic parameter's
-            // annotations are checked with its owner.
-            DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Variant(_)
-            | DeclKind::Field(_) | DeclKind::GenericParam(_) => {}
-            DeclKind::Legacy => {
-                const d: ClassDeclNode* = n as ClassDeclNode*;
-                if (d.base_class.is_valid()) { this.note(&d.base_res, StampSite::BaseClass, d.base_span); }
-                this.generic_params(&d.generic_params);
-                this.fields(&d.fields);
-                this.methods(&d.methods);
-                this.bounds(&d.where_bounds);
-            }
-        }
-    }
-
-    stmt(mut &this, s: Stmt*) -> void {
-        match (s.kind) {
-            StmtKind::Block(b) => {
-                for (mut i: i64 = 0; i < b.statements.length; i++) { this.node(Node::Stmt(b.statements[i])); }
-            }
-            StmtKind::UnsafeBlock(u) => { this.node(Node::Stmt(u.block)); }
-            StmtKind::Asm(a) => {
-                for (mut i: i64 = 0; i < a.operands.length; i++) {
-                    this.expr(a.operands[i].expr);
-                }
-            }
-            StmtKind::Return(r) => { this.expr(r.expression); }
-            StmtKind::If(i) => {
-                this.expr(i.condition);
-                this.node(Node::Stmt(i.then_stmt));
-                this.node(Node::Stmt(i.else_stmt));
-            }
-            StmtKind::While(w) => {
-                this.expr(w.condition);
-                this.node(Node::Stmt(w.body));
-            }
-            StmtKind::DoWhile(d) => {
-                this.node(Node::Stmt(d.body));
-                this.expr(d.condition);
-            }
-            StmtKind::For(f) => {
-                this.node(f.init);
-                this.expr(f.condition);
-                this.expr(f.update);
-                this.node(Node::Stmt(f.body));
-            }
-            StmtKind::Match(m) => {
-                this.expr(m.subject);
-                this.arms(&m.arms);
-            }
-            StmtKind::StaticMatch(m) => {
-                this.annotation(m.scrutinee);
-                this.static_arms(&m.arms);
-            }
-            StmtKind::Expr(e) => { this.expr(e.expression); }
-            StmtKind::Decl(d) => { this.node(Node::Decl(d.declaration)); }
-            StmtKind::Loop(l) => { this.node(Node::Stmt(l.body)); }
-            StmtKind::Break | StmtKind::Continue => {}
-        }
-    }
-
-    var_decl(mut &this, v: VarDecl*) -> void {
-        if (v == null) { return; }
-        this.annotation(v.type_annotation);
-        this.expr(v.initializer);
-    }
-
-    function(mut &this, f_decl: DeclarationNode*) -> void {
-        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
-        if (f == null) { return; }
-        for (mut i: i64 = 0; i < f.parameters.length; i++) {
-            this.var_decl(DeclarationNode::var_of(f.parameters[i]));
-        }
-        this.generic_params(&f.generic_params);
-        this.bounds(&f.trait_bounds);
-        this.annotation(f.return_type_annotation);
-        this.node(Node::Stmt(f.body));
-    }
-
-    method(mut &this, m_decl: DeclarationNode*) -> void {
-        const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-        if (m == null) { return; }
-        this.function(m.func);
-        this.exprs(&m.base_ctor_args);
-    }
-
-    methods(mut &this, ms: &[DeclarationNode*]) -> void {
-        for (mut i: i64 = 0; i < ms.length; i++) { this.method(ms[i]); }
-    }
-
-    fields(mut &this, fs: &[DeclarationNode*]) -> void {
-        for (mut i: i64 = 0; i < fs.length; i++) {
-            const f: FieldDecl* = DeclarationNode::field_of(fs[i]);
-            if (f == null) { continue; }
-            this.annotation(f.type_annotation);
-            this.expr(f.default_value);
-        }
-    }
-
-    arms(mut &this, arms: &[MatchArmNode*]) -> void {
-        for (mut i: i64 = 0; i < arms.length; i++) {
-            const arm: MatchArmNode* = arms[i];
-            if (arm == null) { continue; }
-            for (mut p: i64 = 0; p < arm.patterns.length; p++) { this.pattern(arm.patterns[p]); }
-            this.expr(arm.guard);
-            this.node(Node::Stmt(arm.body));
-        }
-    }
-
-    static_arms(mut &this, arms: &[StaticMatchArmNode*]) -> void {
-        for (mut i: i64 = 0; i < arms.length; i++) {
-            const arm: StaticMatchArmNode* = arms[i];
-            if (arm == null) { continue; }
-            this.annotations(&arm.type_patterns);
-            this.node(Node::Stmt(arm.body));
-        }
-    }
-
-    pattern(mut &this, p: Pattern*) -> void {
-        if (p == null) { return; }
-        match (p.kind) {
-            PatternKind::Enum(ep) => {
-                this.note(&ep.res, StampSite::EnumPattern, ep.enum_span);
-                for (mut i: i64 = 0; i < ep.elements.length; i++) {
-                    match (ep.elements[i]) {
-                        PatternElement::Sub(s) => {
-                            if (s != null) { this.pattern(s.pattern); }
-                        }
-                        _ => { }
-                    }
-                }
-            }
-            PatternKind::Constant(c) => {
-                this.note(&c.res, StampSite::ConstantPattern, p.span);
-            }
-            _ => { }
-        }
-    }
-
-    exprs(mut &this, es: &[ExpressionNode*]) -> void {
-        for (mut i: i64 = 0; i < es.length; i++) { this.expr(es[i]); }
-    }
-
-    expr(mut &this, e: ExpressionNode*) -> void {
-        if (e == null) { return; }
-        const n: ExpressionNode* = e;
-        match (e.kind) {
-            ExprKind::Call(c) => {
-                this.expr(c.callee);
-                this.exprs(&c.arguments);
-                this.annotations(&c.generic_args);
-            }
-            ExprKind::Identifier(id) => {
-                this.note(&id.res, StampSite::Identifier, n.span);
-                this.annotations(&id.generic_args);
-            }
-            ExprKind::MemberAccess(m) => {
-                this.expr(m.object);
-                this.annotations(&m.generic_args);
-            }
-            ExprKind::ScopeResolution(s) => {
-                this.note(&s.scope_res, StampSite::PathScope, s.scope_span);
-                this.annotations(&s.generic_args);
-                this.annotations(&s.scope_generic_args);
-                this.annotation(s.impl_trait);
-            }
-            ExprKind::Sizeof(so)  => { this.annotation(so.type_ann); }
-            ExprKind::Alignof(ao) => { this.annotation(ao.type_ann); }
-            ExprKind::Typeof(t)   => { this.expr(t.operand); }
-            ExprKind::Unary(u)    => { this.expr(u.operand); }
-            ExprKind::Await(aw)   => { this.expr(aw.operand); }
-            ExprKind::Binary(b)   => {
-                this.expr(b.left);
-                this.expr(b.right);
-            }
-            ExprKind::ArrayAccess(a) => {
-                this.expr(a.array);
-                this.expr(a.index);
-            }
-            ExprKind::Delete(d)   => { this.expr(d.operand); }
-            ExprKind::Ternary(t)  => {
-                this.expr(t.condition);
-                this.expr(t.true_expr);
-                this.expr(t.false_expr);
-            }
-            ExprKind::Cast(c)     => {
-                this.expr(c.expression);
-                this.annotation(c.target_annotation);
-            }
-            ExprKind::Match(m)    => {
-                this.expr(m.subject);
-                this.arms(&m.arms);
-            }
-            ExprKind::StaticMatch(m) => {
-                this.annotation(m.scrutinee);
-                this.static_arms(&m.arms);
-            }
-            ExprKind::If(t)       => {
-                this.expr(t.condition);
-                this.expr(t.then_expr);
-                this.expr(t.else_expr);
-            }
-            ExprKind::Struct(sl)  => {
-                this.note(&sl.res, StampSite::StructLiteral, n.span);
-                this.annotations(&sl.generic_args);
-                for (mut i: i64 = 0; i < sl.field_inits.length; i++) { this.expr(sl.field_inits[i].value); }
-            }
-            ExprKind::Array(a)    => {
-                this.exprs(&a.elements);
-                this.expr(a.repeat_count_expr);
-            }
-            ExprKind::Tuple(tl)   => { this.exprs(&tl.elements); }
-            ExprKind::New(ne)     => {
-                this.note(&ne.res, StampSite::NewType, n.span);
-                this.annotations(&ne.generic_args);
-                this.exprs(&ne.arguments);
-                this.expr(ne.array_size);
-                this.expr(ne.struct_init);
-            }
-            ExprKind::Yield(y)    => { this.expr(y.operand); }
-            ExprKind::Try(t)      => { this.expr(t.operand); }
-            ExprKind::Lambda(l)   => {
-                for (mut i: i64 = 0; i < l.parameters.length; i++) {
-                    this.var_decl(DeclarationNode::var_of(l.parameters[i]));
-                }
-                this.annotation(l.return_type_ann);
-                this.node(Node::Stmt(l.body));
-            }
-            ExprKind::Literal(_)  => { }
-        }
-    
+        this.walk_annotations(&r.type_args);
     }
 }

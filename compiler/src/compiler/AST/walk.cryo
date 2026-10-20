@@ -11,13 +11,21 @@
 /// cleanups an unwinding call records - is not a child: a walker that must
 /// see it visits it from its own hook.
 ///
+/// A type annotation, a `where` bound and a trait a declaration names are not
+/// nodes: `walk_children` hands each one a node holds to `walk_annotation`,
+/// `walk_bound` or `walk_trait_ref`, in source order beside its children, and
+/// the defaults of those three do nothing.  A walker that reads written types
+/// overrides them; the others never see an annotation.
+///
 /// Every call is static: the defaults are instantiated for each walker, and
 /// `walk_children` for each walker it is called with.
 
 namespace compiler::ast::walk;
 
 import compiler::ast;
-import compiler::ast::{ node, expression, statement, declaration, pattern };
+import compiler::ast::{
+    node, expression, statement, declaration, pattern, TraitBound, TraitRef, TypeAnnotation
+};
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureDecl, EnumDecl, EnumVariant,
     ExternBlock, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock,
@@ -139,7 +147,9 @@ type trait Walk {
 
     // Expressions
     walk_literal(mut &this, e: ExpressionNode*, n: LiteralExpr*) -> void { }
-    walk_identifier(mut &this, e: ExpressionNode*, n: IdentifierExpr*) -> void { }
+    walk_identifier(mut &this, e: ExpressionNode*, n: IdentifierExpr*) -> void {
+        IdentifierExpr::walk_children(n, this);
+    }
     walk_binary(mut &this, e: ExpressionNode*, n: BinaryExpr*) -> void { BinaryExpr::walk_children(n, this); }
     walk_unary(mut &this, e: ExpressionNode*, n: UnaryExpr*) -> void { UnaryExpr::walk_children(n, this); }
     walk_ternary(mut &this, e: ExpressionNode*, n: TernaryExpr*) -> void {
@@ -154,8 +164,8 @@ type trait Walk {
     }
     walk_call(mut &this, e: ExpressionNode*, n: CallExpr*) -> void { CallExpr::walk_children(n, this); }
     walk_new(mut &this, e: ExpressionNode*, n: NewExpr*) -> void { NewExpr::walk_children(n, this); }
-    walk_sizeof(mut &this, e: ExpressionNode*, n: SizeofExpr*) -> void { }
-    walk_alignof(mut &this, e: ExpressionNode*, n: AlignofExpr*) -> void { }
+    walk_sizeof(mut &this, e: ExpressionNode*, n: SizeofExpr*) -> void { SizeofExpr::walk_children(n, this); }
+    walk_alignof(mut &this, e: ExpressionNode*, n: AlignofExpr*) -> void { AlignofExpr::walk_children(n, this); }
     walk_cast(mut &this, e: ExpressionNode*, n: CastExpr*) -> void { CastExpr::walk_children(n, this); }
     walk_struct_literal(mut &this, e: ExpressionNode*, n: StructExpr*) -> void {
         StructExpr::walk_children(n, this);
@@ -173,7 +183,9 @@ type trait Walk {
     walk_member_access(mut &this, e: ExpressionNode*, n: MemberAccessExpr*) -> void {
         MemberAccessExpr::walk_children(n, this);
     }
-    walk_scope_resolution(mut &this, e: ExpressionNode*, n: ScopeResolutionExpr*) -> void { }
+    walk_scope_resolution(mut &this, e: ExpressionNode*, n: ScopeResolutionExpr*) -> void {
+        ScopeResolutionExpr::walk_children(n, this);
+    }
     walk_typeof(mut &this, e: ExpressionNode*, n: TypeofExpr*) -> void { TypeofExpr::walk_children(n, this); }
     walk_delete(mut &this, e: ExpressionNode*, n: DeleteExpr*) -> void { DeleteExpr::walk_children(n, this); }
     walk_await(mut &this, e: ExpressionNode*, n: AwaitExpr*) -> void { AwaitExpr::walk_children(n, this); }
@@ -219,9 +231,13 @@ type trait Walk {
     walk_union(mut &this, d: DeclarationNode*, n: UnionDecl*) -> void { UnionDecl::walk_children(n, this); }
     walk_class(mut &this, n: ClassDeclNode*) -> void { ClassDeclNode::walk_children(n, this); }
     walk_trait(mut &this, d: DeclarationNode*, n: TraitDecl*) -> void { TraitDecl::walk_children(n, this); }
-    walk_type_alias(mut &this, d: DeclarationNode*, n: TypeAliasDecl*) -> void { }
+    walk_type_alias(mut &this, d: DeclarationNode*, n: TypeAliasDecl*) -> void {
+        TypeAliasDecl::walk_children(n, this);
+    }
     walk_enum(mut &this, d: DeclarationNode*, n: EnumDecl*) -> void { EnumDecl::walk_children(n, this); }
-    walk_enum_variant(mut &this, d: DeclarationNode*, n: EnumVariant*) -> void { }
+    walk_enum_variant(mut &this, d: DeclarationNode*, n: EnumVariant*) -> void {
+        EnumVariant::walk_children(n, this);
+    }
     walk_impl(mut &this, d: DeclarationNode*, n: ImplBlock*) -> void { ImplBlock::walk_children(n, this); }
     walk_extern_block(mut &this, d: DeclarationNode*, n: ExternBlock*) -> void { ExternBlock::walk_children(n, this); }
     walk_field(mut &this, d: DeclarationNode*, n: FieldDecl*) -> void { FieldDecl::walk_children(n, this); }
@@ -251,6 +267,31 @@ type trait Walk {
     walk_constant_pattern(mut &this, p: Pattern*, n: ConstantPattern*) -> void { }
     walk_enum_pattern(mut &this, p: Pattern*, n: EnumPattern*) -> void { EnumPattern::walk_children(n, this); }
     walk_directive(mut &this, n: DirectiveNode*) -> void { }
+
+    // Written types, bounds and named traits; `ann` may be null
+    walk_annotation(mut &this, ann: TypeAnnotation*) -> void { }
+    walk_bound(mut &this, b: &TraitBound) -> void { }
+    walk_trait_ref(mut &this, r: &TraitRef) -> void { }
+
+    /// Each of `anns` to `walk_annotation`.
+    walk_annotations(mut &this, anns: &[TypeAnnotation*]) -> void {
+        for (mut i: i64 = 0; i < anns.length; i++) { this.walk_annotation(anns[i]); }
+    }
+    /// Each of `bs` to `walk_bound`.
+    walk_bounds(mut &this, bs: &[TraitBound]) -> void {
+        for (mut i: i64 = 0; i < bs.length; i++) { this.walk_bound(&bs[i]); }
+    }
+    /// Each of `rs` to `walk_trait_ref`.
+    walk_trait_refs(mut &this, rs: &[TraitRef]) -> void {
+        for (mut i: i64 = 0; i < rs.length; i++) { this.walk_trait_ref(&rs[i]); }
+    }
+    /// The default annotation of each generic parameter in `ps`.
+    walk_generic_param_defaults(mut &this, ps: &[DeclarationNode*]) -> void {
+        for (mut i: i64 = 0; i < ps.length; i++) {
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(ps[i]);
+            if (p != null) { this.walk_annotation(p.default_annotation); }
+        }
+    }
 }
 
 
@@ -259,7 +300,9 @@ type trait Walk {
 
 implement class ClassDeclNode {
     static walk_children<V>(n: ClassDeclNode*, v: mut &V) -> void where V: Walk {
+        v.walk_generic_param_defaults(&n.generic_params);
         for (mut i: i64 = 0; i < n.fields.length; i++) { v.walk_decl(n.fields[i]); }
         for (mut i: i64 = 0; i < n.methods.length; i++) { v.walk_decl(n.methods[i]); }
+        v.walk_bounds(&n.where_bounds);
     }
 }
