@@ -645,24 +645,6 @@ type struct TraitRef {
     type_args: [TypeAnnotation*];
     span:      SourceSpan;
 
-    /// Deep copy into independently-owned arrays (SymbolStr and the
-    /// TypeAnnotation* handles are Copy), so a clone can be stored in a
-    /// second owner without aliasing this one's buffers.
-    ///
-    /// `resolved` IS copied: specializing an impl rewrites which types a
-    /// bound is applied to, never which trait the bound names, so the
-    /// template's identity is the clone's. Copying it also keeps the answer
-    /// pinned to the module that wrote the bound once the clone is re-visited
-    /// under a different module cursor.
-    clone(&this) -> TraitRef {
-        mut path_c: [SymbolStr] = [];
-        mut args_c: [TypeAnnotation*] = [];
-        for (mut i: i64 = 0; i < this.path.length; i++)      { path_c.push(this.path[i]); }
-        for (mut i: i64 = 0; i < this.type_args.length; i++) { args_c.push(this.type_args[i]); }
-        return TraitRef { path: path_c, resolved: this.resolved, refused: this.refused,
-                          type_args: args_c, span: this.span };
-    }
-
     /// The trait's identity.  One accessor so a consumer never re-derives it
     /// from `path`; its path, where text is wanted, is the definition
     /// table's `path_of`.
@@ -679,6 +661,26 @@ type struct TraitRef {
         return DefId::invalid();
     }
 
+}
+
+/// A deep copy into independently-owned arrays (SymbolStr and the
+/// TypeAnnotation* handles are Copy), so a clone can be stored in a second
+/// owner without aliasing this one's buffers.
+///
+/// `resolved` IS copied: specializing an impl rewrites which types a bound is
+/// applied to, never which trait the bound names, so the template's identity
+/// is the clone's. Copying it also keeps the answer pinned to the module that
+/// wrote the bound once the clone is re-visited under a different module
+/// cursor.
+implement trait Clone for struct TraitRef {
+    clone(&this) -> TraitRef {
+        mut path_c: [SymbolStr] = [];
+        mut args_c: [TypeAnnotation*] = [];
+        for (mut i: i64 = 0; i < this.path.length; i++)      { path_c.push(this.path[i]); }
+        for (mut i: i64 = 0; i < this.type_args.length; i++) { args_c.push(this.type_args[i]); }
+        return TraitRef { path: path_c, resolved: this.resolved, refused: this.refused,
+                          type_args: args_c, span: this.span };
+    }
 }
 
 /// A trait bound from a where clause (e.g., `where T: Default`,
@@ -712,21 +714,19 @@ type struct TraitBound {
     has_projection_subject(&this) -> boolean {
         return this.subject_type != null;
     }
+}
 
-    /// Deep copy; clones each (owning) TraitRef into an independent buffer so
-    /// the result can be stored in a second owner without a double-free. The
-    /// projection subject, if any, is null-safe cloned so the spec re-resolves
-    /// `Base::Member` against its substituted base.
+/// A deep copy: each (owning) TraitRef is cloned into an independent buffer,
+/// so the result can be stored in a second owner without a double-free.  The
+/// projection subject, if any, is null-safe cloned so the specialization
+/// re-resolves `Base::Member` against its substituted base.
+implement trait Clone for struct TraitBound {
     clone(&this) -> TraitBound {
-        mut refs_c: [TraitRef] = [];
-        for (mut i: i64 = 0; i < this.trait_refs.length; i++) {
-            refs_c.push(this.trait_refs[i].clone());
-        }
         return TraitBound {
             type_parameter: this.type_parameter,
             subject_sym:    this.subject_sym,
             subject_type:   TypeAnnotation::clone_ptr(this.subject_type),
-            trait_refs:     refs_c,
+            trait_refs:     this.trait_refs.clone(),
             span:           this.span,
         };
     }

@@ -133,6 +133,17 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-20
+
+460. **The per-kind node projections stay as checked accessors**
+     (`ExpressionNode::call_of`, `DeclarationNode::fn_of` and the rest):
+     each answers its kind's payload or null, and a read through one is
+     not rewritten as a `match` arm.  (Delegated)
+
+461. **`DeclarationNode` and its subclass `ClassDeclNode` stay classes
+     until the class feature is deleted,** as ruling 413 has it; they are
+     converted when that deletion starts, not before.  (Delegated)
+
 ### 2026-10-19
 
 452. **Indexing a call's fixed-size array result (`pair()[1]`) and an
