@@ -168,6 +168,16 @@ yet is recorded with the change that builds it, not here.
      conversion deleting `ExprKind::Legacy`, which it orphaned, was right.
      (Jake)
 
+458. **`This::member` inside a trait's own default body is covered by
+     ruling 455:** it resolves against the trait's members, and each
+     implementation's copy of the default reads `This` as the implementing
+     type.  Fixed as a change of its own after the "any node" handle
+     lands.  (Delegated)
+
+459. **`await` outside an `async` body keeps E0600 and its wording**
+     ("`await` is only allowed in the body of an `async` function or
+     method"), the spec table's code for a misplaced `await`.  (Delegated)
+
 ### 2026-10-18
 
 438. **A `Location` constant keeps its pointers, and the growth of the

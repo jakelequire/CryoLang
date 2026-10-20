@@ -11,6 +11,128 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag;
 import compiler::codegen::ast_arena::{ cryo_ast_arena_alloc };
 import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::statement::{ Stmt };
+import compiler::ast::declaration::{ DeclarationNode };
+import compiler::ast::pattern::{ DirectiveNode, MatchArmNode, Pattern, StaticMatchArmNode };
+
+/// Any node of the tree, by its category: what a place holds when it can
+/// hold more than one category (a program's items, the cleanups a call
+/// records, a `for` initializer, the node at an editor position).  A
+/// place that holds one category holds that category's pointer instead.
+/// The payload is null exactly where the category's pointer would be (an
+/// absent child); a place answering "no node at all" answers `Node?`.
+type enum Node {
+    Expr(ExpressionNode*);
+    Stmt(Stmt*);
+    Decl(DeclarationNode*);
+    Pattern(Pattern*);
+    Arm(MatchArmNode*);
+    StaticArm(StaticMatchArmNode*);
+    Directive(DirectiveNode*);
+    Program(ProgramNode*);
+}
+
+implement enum Node {
+    /// Whether the node is absent.
+    is_null(&this) -> boolean {
+        return match (this) {
+            Node::Expr(e)      => { e == null }
+            Node::Stmt(s)      => { s == null }
+            Node::Decl(d)      => { d == null }
+            Node::Pattern(p)   => { p == null }
+            Node::Arm(a)       => { a == null }
+            Node::StaticArm(a) => { a == null }
+            Node::Directive(d) => { d == null }
+            Node::Program(p)   => { p == null }
+        };
+    }
+
+    /// The source range the node covers.  Not asked of an absent node.
+    span(&this) -> SourceSpan {
+        return match (this) {
+            Node::Expr(e)      => { e.span }
+            Node::Stmt(s)      => { s.span }
+            Node::Decl(d)      => { d.span }
+            Node::Pattern(p)   => { p.span }
+            Node::Arm(a)       => { a.span }
+            Node::StaticArm(a) => { a.span }
+            Node::Directive(d) => { d.span }
+            Node::Program(p)   => { p.span }
+        };
+    }
+
+    /// Whether the compiler wrote the node where the source spells nothing.
+    /// Not asked of an absent node.
+    generated(&this) -> boolean {
+        return match (this) {
+            Node::Expr(e)      => { e.generated }
+            Node::Stmt(s)      => { s.generated }
+            Node::Decl(d)      => { d.generated }
+            Node::Pattern(p)   => { p.generated }
+            Node::Arm(a)       => { a.generated }
+            Node::StaticArm(a) => { a.generated }
+            Node::Directive(d) => { d.generated }
+            Node::Program(p)   => { p.generated }
+        };
+    }
+
+    /// The declaration this node is, or null.
+    as_decl(&this) -> DeclarationNode* {
+        return match (this) {
+            Node::Decl(d) => { d }
+            _             => { null }
+        };
+    }
+
+    /// The statement this node is, or null.
+    as_stmt(&this) -> Stmt* {
+        return match (this) {
+            Node::Stmt(s) => { s }
+            _             => { null }
+        };
+    }
+
+    /// The expression this node is, or null.
+    as_expr(&this) -> ExpressionNode* {
+        return match (this) {
+            Node::Expr(e) => { e }
+            _             => { null }
+        };
+    }
+
+    /// The node as a base-class handle, for a consumer still written over
+    /// one.
+    as_ast(&this) -> ASTNode* {
+        return match (this) {
+            Node::Expr(e)      => { e as ASTNode* }
+            Node::Stmt(s)      => { s as ASTNode* }
+            Node::Decl(d)      => { d as ASTNode* }
+            Node::Pattern(p)   => { p as ASTNode* }
+            Node::Arm(a)       => { a as ASTNode* }
+            Node::StaticArm(a) => { a as ASTNode* }
+            Node::Directive(d) => { d as ASTNode* }
+            Node::Program(p)   => { p as ASTNode* }
+        };
+    }
+
+    /// The node a base-class handle holds, by its category; a null handle
+    /// is an absent expression.
+    static of(n: ASTNode*) -> Node {
+        if (n == null) { return Node::Expr(null); }
+        return match (n.kind) {
+            NodeKind::Expression       => { Node::Expr(n as ExpressionNode*) }
+            NodeKind::Statement        => { Node::Stmt(n as Stmt*) }
+            NodeKind::Declaration      => { Node::Decl(n as DeclarationNode*) }
+            NodeKind::ClassDeclaration => { Node::Decl(n as DeclarationNode*) }
+            NodeKind::Pattern          => { Node::Pattern(n as Pattern*) }
+            NodeKind::MatchArm         => { Node::Arm(n as MatchArmNode*) }
+            NodeKind::StaticMatchArm   => { Node::StaticArm(n as StaticMatchArmNode*) }
+            NodeKind::Directive        => { Node::Directive(n as DirectiveNode*) }
+            NodeKind::Program          => { Node::Program(n as ProgramNode*) }
+            NodeKind::Unknown          => { Node::Expr(null) }
+        };
+    }
+}
 
 /// Base class for every node in the abstract syntax tree.  Every node is
 /// allocated in the AST arena, which is reclaimed whole at each target
@@ -63,7 +185,8 @@ type struct StaticAssertItem {
 
 type class ProgramNode : ASTNode {
 public:
-    statements:     [ASTNode*];
+    /// The file's items: declarations, statements and loose directives.
+    statements:     [Node];
     static_asserts: [StaticAssertItem*];
     namespace_name: string;
     /// Set by the parser when this module contains at least one f-string
@@ -79,7 +202,7 @@ public:
         this.uses_fstring   = false;
     }
 
-    add_statement(stmt: ASTNode*) -> void {
+    add_statement(stmt: Node) -> void {
         this.statements.push(stmt);
     }
 

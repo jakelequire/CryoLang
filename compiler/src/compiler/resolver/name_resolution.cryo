@@ -53,7 +53,7 @@ import compiler::ast::expression::{
     ScopeResolutionExpr, SizeofExpr, StaticMatchExpr, StructExpr,
     TypeofExpr
 };
-import compiler::ast::node::{ ASTNode, ProgramNode, StaticAssertItem };
+import compiler::ast::node::{ ASTNode, Node, ProgramNode, StaticAssertItem };
 import compiler::ast::pattern::{
     BindingPattern, ConstantPattern, DirectiveArgKind, DirectiveNode, EnumPattern, MatchArmNode,
     Pattern, PatternKind, StaticMatchArmNode
@@ -252,7 +252,7 @@ type struct NameResolver {
     forward_declare(mut &this, program: ProgramNode*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] forward_declare() with %d statements", program.statements.length);
         for (mut i: i64 = 0; i < program.statements.length; i++) {
-            const stmt: ASTNode* = program.statements[i];
+            const stmt: ASTNode* = program.statements[i].as_ast();
             this.forward_declare_node(stmt);
         }
     }
@@ -1911,7 +1911,7 @@ type struct NameResolver {
                 // the fold that reads it runs in TypeResolution, so a written
                 // qualifier has to be stamped here or there is nothing for
                 // that fold to read but the spelling.
-                if (a.size_expr != null) { this.walk_node(a.size_expr); }
+                if (a.size_expr != null) { this.walk_expr(a.size_expr); }
             }
             TypeAnnotation::Projection(pj) => {
                 this.stamp_annotation_tree(pj.base);
@@ -1957,7 +1957,7 @@ type struct NameResolver {
             // here like any other: `x` in `const y: typeof(x)` is the local
             // the writer's scope binds.
             TypeAnnotation::Typeof(t) => {
-                if (t.operand != null) { this.walk_node(t.operand); }
+                if (t.operand != null) { this.walk_expr(t.operand); }
             }
             _ => {}
         }
@@ -2985,7 +2985,7 @@ implement trait Walk for struct NameResolver {
         for (mut i: i64 = 0; i < node.static_asserts.length; i++) {
             const sa: StaticAssertItem* = node.static_asserts[i];
             if (sa == null || sa.cond == null) { continue; }
-            this.walk_node(sa.cond);
+            this.walk_expr(sa.cond);
         }
 
         this.refuse_module_type_collisions();
@@ -3050,7 +3050,7 @@ implement trait Walk for struct NameResolver {
             // the same list a second time.
             this.pending_base_ctor = null;
             for (mut i: i64 = 0; i < owner.base_ctor_args.length; i++) {
-                this.walk_node(owner.base_ctor_args[i]);
+                this.walk_expr(owner.base_ctor_args[i]);
             }
             this.pending_base_ctor = owner_decl;
         }
@@ -3072,7 +3072,7 @@ implement trait Walk for struct NameResolver {
             // because that is the one place the parameter scope is open, and
             // opening a second one would put the same names in two scopes.
             this.pending_base_ctor = node_decl;
-            this.walk_node(node.func);
+            this.walk_decl(node.func);
             this.pending_base_ctor = null;
         }
     }
@@ -3102,7 +3102,7 @@ implement trait Walk for struct NameResolver {
         // separate first pass so a field's default value can name a sibling
         // declared after it.
         for (mut i: i64 = 0; i < node.fields.length; i++) {
-            this.walk_node(node.fields[i]);
+            this.walk_decl(node.fields[i]);
         }
 
         // Every method is a definition of the type before any body is
@@ -3115,7 +3115,7 @@ implement trait Walk for struct NameResolver {
         this.this_owner_decl = if (node.def.is_valid()) { d as ASTNode* } else { null };
         this.this_owner_sym = SymbolID::invalid();
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.walk_node(node.methods[i]);
+            this.walk_decl(node.methods[i]);
         }
         this.this_owner = outer_owner;
         this.this_owner_decl = outer_owner_decl;
@@ -3147,14 +3147,14 @@ implement trait Walk for struct NameResolver {
         // separate first pass so a field's default value can name a sibling
         // declared after it.
         for (mut i: i64 = 0; i < node.fields.length; i++) {
-            this.walk_node(node.fields[i]);
+            this.walk_decl(node.fields[i]);
         }
 
         // Every method is a definition of the type before any body is
         // walked.
         this.define_body_methods(node.def, &node.methods);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.walk_node(node.methods[i]);
+            this.walk_decl(node.methods[i]);
         }
 
         this.resolver.exit_scope();
@@ -3211,14 +3211,14 @@ implement trait Walk for struct NameResolver {
         // separate first pass so a field's default value can name a sibling
         // declared after it.
         for (mut i: i64 = 0; i < node.fields.length; i++) {
-            this.walk_node(node.fields[i]);
+            this.walk_decl(node.fields[i]);
         }
 
         // Every method is a definition of the type before any body is
         // walked.
         this.define_body_methods(node.def, &node.methods);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.walk_node(node.methods[i]);
+            this.walk_decl(node.methods[i]);
         }
 
         this.resolver.exit_scope();
@@ -3295,7 +3295,7 @@ implement trait Walk for struct NameResolver {
         // instantiation time.  A method with no default has no body, and
         // `visit(FunctionDecl*)` already walks one only when it exists.
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.walk_node(node.methods[i]);
+            this.walk_decl(node.methods[i]);
         }
 
         this.this_trait = outer_trait;
@@ -3384,7 +3384,7 @@ implement trait Walk for struct NameResolver {
                     DeclarationNode::fn_of(method.func).name, method.func.span, is_public,
                     this.define_method(method_owner, method.func, method_decl as ASTNode*));
             }
-            this.walk_node(method_decl);
+            this.walk_decl(method_decl);
         }
 
         this.this_trait = outer_trait;
@@ -3421,7 +3421,7 @@ implement trait Walk for struct NameResolver {
 
         // Visit initializer expression
         if (node.has_initializer()) {
-            this.walk_node(node.initializer);
+            this.walk_expr(node.initializer);
         }
     }
 
@@ -3430,7 +3430,7 @@ implement trait Walk for struct NameResolver {
         // Resolve the initializer first; its identifiers must bind to the
         // outer scope, before the new field locals shadow anything.
         if (node.has_initializer()) {
-            this.walk_node(node.initializer);
+            this.walk_expr(node.initializer);
         }
         // Declare each binding's local in the current scope.
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
@@ -3480,7 +3480,7 @@ implement trait Walk for struct NameResolver {
     walk_extern_block(mut &this, d: DeclarationNode*, node: ExternBlock*) -> void {
         // Already forward-declared functions; visit bodies if any.
         for (mut i: i64 = 0; i < node.functions.length; i++) {
-            this.walk_node(node.functions[i]);
+            this.walk_decl(node.functions[i]);
         }
     }
 
@@ -3622,14 +3622,14 @@ implement trait Walk for struct NameResolver {
         if (callee_id != null) {
             this.callee_ident = callee_id;
         }
-        this.walk_node(node.callee);
+        this.walk_expr(node.callee);
         this.callee_ident = outer_callee;
 
         this.stamp_annotation_list(&node.generic_args);
 
         // Visit arguments
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
-            this.walk_node(node.arguments[i]);
+            this.walk_expr(node.arguments[i]);
         }
     }
 
@@ -3646,7 +3646,7 @@ implement trait Walk for struct NameResolver {
         // slot must find an answer there, not a name to search for.
         this.stamp_annotation(node.scrutinee);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
-            this.walk_node(node.arms[i]);
+            this.walk_node(Node::StaticArm(node.arms[i]));
         }
     }
 
@@ -3722,11 +3722,11 @@ implement trait Walk for struct NameResolver {
         this.stamp_annotation_list(&node.generic_args);
 
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
-            this.walk_node(node.arguments[i]);
+            this.walk_expr(node.arguments[i]);
         }
 
         if (node.has_array_size()) {
-            this.walk_node(node.array_size);
+            this.walk_expr(node.array_size);
         }
 
         // Struct-initializer form `new Foo { field: value }`: resolve the field
@@ -3735,7 +3735,7 @@ implement trait Walk for struct NameResolver {
         // Without this, a local used only as a `new`-init field value looks
         // unreferenced (drives W0001 false positives and misses LSP hover/def).
         if (node.has_struct_init()) {
-            this.walk_node(node.struct_init);
+            this.walk_expr(node.struct_init);
         }
     }
 
@@ -3776,7 +3776,7 @@ implement trait Walk for struct NameResolver {
         for (mut i: i64 = 0; i < node.field_inits.length; i++) {
             const init_value: ExpressionNode* = node.field_inits[i].value as ExpressionNode*;
             if (init_value != null) {
-                this.walk_node(init_value);
+                this.walk_expr(init_value);
             }
         }
     }
@@ -3795,7 +3795,7 @@ implement trait Walk for struct NameResolver {
 
         // Visit body
         if (node.body != null) {
-            this.walk_node(node.body);
+            this.walk_stmt(node.body);
         }
 
         this.resolver.exit_scope();
@@ -3821,17 +3821,15 @@ implement trait Walk for struct NameResolver {
         // For loops create a scope for the loop variable
         this.resolver.enter_scope(ScopeKind::Block, "<for>", s.span);
 
-        if (node.init != null) {
-            this.walk_node(node.init);
-        }
+        this.walk_node(node.init);
         if (node.condition != null) {
-            this.walk_node(node.condition);
+            this.walk_expr(node.condition);
         }
         if (node.update != null) {
-            this.walk_node(node.update);
+            this.walk_expr(node.update);
         }
         if (node.body != null) {
-            this.walk_node(node.body);
+            this.walk_stmt(node.body);
         }
 
         this.resolver.exit_scope();
@@ -3844,7 +3842,7 @@ implement trait Walk for struct NameResolver {
         // Visit patterns (may introduce bindings)
         for (mut i: i64 = 0; i < node.patterns.length; i++) {
             this.in_alternative = i > 0;
-            this.walk_node(node.patterns[i]);
+            this.walk_node(Node::Pattern(node.patterns[i]));
         }
         this.in_alternative = false;
 
@@ -3854,12 +3852,12 @@ implement trait Walk for struct NameResolver {
         // unstamped - a module constant in `n if n > LIMIT` is then refused
         // as not in scope, and a callee in it binds by spelling.
         if (node.guard != null) {
-            this.walk_node(node.guard);
+            this.walk_expr(node.guard);
         }
 
         // Visit body
         if (node.body != null) {
-            this.walk_node(node.body);
+            this.walk_stmt(node.body);
         }
 
         this.resolver.exit_scope();
@@ -3868,7 +3866,7 @@ implement trait Walk for struct NameResolver {
     walk_static_match_stmt(mut &this, s: Stmt*, node: StaticMatchStmt*) -> void {
         this.stamp_annotation(node.scrutinee);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
-            this.walk_node(node.arms[i]);
+            this.walk_node(Node::StaticArm(node.arms[i]));
         }
     }
 
@@ -3879,7 +3877,7 @@ implement trait Walk for struct NameResolver {
         this.stamp_annotation_list(&node.type_patterns);
         this.resolver.enter_scope(ScopeKind::Block, "<static-match-arm>", node.span);
         if (node.body != null) {
-            this.walk_node(node.body);
+            this.walk_stmt(node.body);
         }
         this.resolver.exit_scope();
     }
@@ -3936,7 +3934,7 @@ implement trait Walk for struct NameResolver {
                 continue;
             }
             const sub: Pattern* = node.sub_at(i);
-            if (sub != null) { this.walk_node(sub); }
+            if (sub != null) { this.walk_node(Node::Pattern(sub)); }
         }
     }
 
@@ -4209,7 +4207,7 @@ type struct NameResolutionPass {
         }
 
         mut resolver: NameResolver = NameResolver::new(ctx.resolver, ctx);
-        resolver.walk_node(root);
+        resolver.walk_node(Node::Program(root));
         resolver.check_param_projections();
 
         LOG_DEBUG(LogComponent::General, "[NameResolution] Resolved %lld symbols in %lld scopes, %lld map entries",

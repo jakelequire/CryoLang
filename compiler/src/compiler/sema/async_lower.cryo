@@ -68,7 +68,7 @@ import compiler::ast::expression::{
     ScopeResolutionExpr, StaticMatchExpr, StructExpr, TernaryExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExpr
 };
-import compiler::ast::node::{ ASTNode };
+import compiler::ast::node::{ ASTNode, Node };
 import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::ast::statement::{
     BlockStmt, DeclStmt, DoWhileStmt, ExprStmt, ForStmt, IfStmt, LoopStmt, MatchStmt,
@@ -1032,11 +1032,11 @@ type struct AsyncLower {
                 this.rewrite_returns_expr(d.condition, poll_out, span);
             }
             StmtKind::For(f) => {
-                if (f.init != null) {
-                    if (DeclarationNode::var_of(f.init) != null) {
-                        this.rewrite_returns_expr((DeclarationNode::var_of(f.init)).initializer, poll_out, span);
+                if (!f.init.is_null()) {
+                    if (DeclarationNode::var_of(f.init.as_decl()) != null) {
+                        this.rewrite_returns_expr((DeclarationNode::var_of(f.init.as_decl())).initializer, poll_out, span);
                     } else {
-                        this.rewrite_returns_expr(f.init as ExpressionNode*, poll_out, span);
+                        this.rewrite_returns_expr(f.init.as_expr(), poll_out, span);
                     }
                 }
                 this.rewrite_returns_expr(f.condition, poll_out, span);
@@ -1313,11 +1313,11 @@ type struct AsyncLower {
             StmtKind::For(f) => {
                 mut n: i64 = this.expr_await_count(f.condition) + this.expr_await_count(f.update)
                            + this.stmt_await_count(f.body);
-                if (f.init != null) {
-                    if (DeclarationNode::var_of(f.init) != null) {
-                        n += this.expr_await_count((DeclarationNode::var_of(f.init)).initializer);
+                if (!f.init.is_null()) {
+                    if (DeclarationNode::var_of(f.init.as_decl()) != null) {
+                        n += this.expr_await_count((DeclarationNode::var_of(f.init.as_decl())).initializer);
                     } else {
-                        n += this.expr_await_count(f.init as ExpressionNode*);
+                        n += this.expr_await_count(f.init.as_expr());
                     }
                 }
                 return n;
@@ -1841,8 +1841,8 @@ type struct AsyncLower {
             }
             StmtKind::For(f) => {
                 // A declaration or expression initializer is not scanned.
-                if (f.init != null && f.init.kind == NodeKind::Statement
-                        && this.name_read_in_stmt(f.init as Stmt*, key)) {
+                if (f.init.as_stmt() != null
+                        && this.name_read_in_stmt(f.init.as_stmt(), key)) {
                     return true;
                 }
                 return this.name_read_in_expr(f.condition, key)
@@ -2289,14 +2289,14 @@ type struct AsyncLower {
                 this.subst_nested_stmt(d.body, key, field, struct_ref, ty, span);
             }
             StmtKind::For(f) => {
-                if (f.init != null) {
-                    if (DeclarationNode::var_of(f.init) != null) {
-                        const vd: VarDecl* = DeclarationNode::var_of(f.init);
+                if (!f.init.is_null()) {
+                    if (DeclarationNode::var_of(f.init.as_decl()) != null) {
+                        const vd: VarDecl* = DeclarationNode::var_of(f.init.as_decl());
                         vd.initializer = this.subst_name_expr(vd.initializer, key, field, struct_ref,
                                                              ty, span, true);
                     } else {
-                        f.init = this.subst_name_expr(f.init as ExpressionNode*, key, field,
-                                                     struct_ref, ty, span, false) as ASTNode*;
+                        f.init = Node::Expr(this.subst_name_expr(f.init.as_expr(), key, field,
+                                                     struct_ref, ty, span, false));
                     }
                 }
                 f.condition = this.subst_name_expr(f.condition, key, field, struct_ref, ty, span, false);
@@ -3833,12 +3833,12 @@ type struct AsyncLower {
     lower_for_sm(mut &this, sm: PollSm*, stmt: Stmt*, f: ForStmt*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
         mut s0: i64 = cur;
-        if (f.init != null) {
-            if (DeclarationNode::var_of(f.init) != null) {
-                const ds: Stmt* = Stmt::decl_stmt(f.init as DeclarationNode*, span);
+        if (!f.init.is_null()) {
+            if (DeclarationNode::var_of(f.init.as_decl()) != null) {
+                const ds: Stmt* = Stmt::decl_stmt(f.init.as_decl(), span);
                 s0 = this.lower_stmt_sm(sm, ds, s0);
             } else {
-                const es: Stmt* = Stmt::expr_stmt(f.init as ExpressionNode*, span);
+                const es: Stmt* = Stmt::expr_stmt(f.init.as_expr(), span);
                 s0 = this.lower_stmt_sm(sm, es, s0);
             }
             if (!sm.ok) { return cur; }
@@ -4218,8 +4218,8 @@ type struct AsyncLower {
             StmtKind::For(f) => {
                 // A declaration or expression initializer is not scanned.
                 mut r: i64 = 0;
-                if (f.init != null && f.init.kind == NodeKind::Statement) {
-                    r = this.stmt_first_use(f.init as Stmt*, key);
+                if (f.init.as_stmt() != null) {
+                    r = this.stmt_first_use(f.init.as_stmt(), key);
                 }
                 if (r != 0) { return r; }
                 r = this.expr_first_use(f.condition, key);
@@ -4454,8 +4454,8 @@ type struct AsyncLower {
             }
             StmtKind::For(f) => {
                 // A declaration or expression initializer is not marked.
-                if (f.init != null && f.init.kind == NodeKind::Statement) {
-                    this.mark_last_use_stmt(f.init as Stmt*, key, out);
+                if (f.init.as_stmt() != null) {
+                    this.mark_last_use_stmt(f.init.as_stmt(), key, out);
                 }
                 this.mark_last_use_expr(f.condition, key, false, out);
                 this.mark_last_use_stmt(f.body, key, out);
@@ -6269,12 +6269,12 @@ type struct AsyncLower {
                 // belongs ahead of the whole `for`. The condition and the update run
                 // per iteration and are rewritten during lowering instead, inside
                 // the states `continue` re-enters.
-                if (f.init != null) {
-                    if (DeclarationNode::var_of(f.init) != null) {
-                        mut vd: VarDecl* = DeclarationNode::var_of(f.init);
+                if (!f.init.is_null()) {
+                    if (DeclarationNode::var_of(f.init.as_decl()) != null) {
+                        mut vd: VarDecl* = DeclarationNode::var_of(f.init.as_decl());
                         vd.initializer = this.hoist_toplevel(vd.initializer, &pre);
                     } else {
-                        f.init = this.hoist_toplevel(f.init as ExpressionNode*, &pre) as ASTNode*;
+                        f.init = Node::Expr(this.hoist_toplevel(f.init.as_expr(), &pre));
                     }
                 }
                 f.body = this.hoist_branch(f.body);
@@ -6690,11 +6690,11 @@ type struct AsyncLower {
                 this.rn_expr(map, d.condition);
             }
             StmtKind::For(f) => {
-                if (f.init != null) {
-                    if (DeclarationNode::var_of(f.init) != null) {
-                        this.rn_var_decl(map, DeclarationNode::var_of(f.init));
+                if (!f.init.is_null()) {
+                    if (DeclarationNode::var_of(f.init.as_decl()) != null) {
+                        this.rn_var_decl(map, DeclarationNode::var_of(f.init.as_decl()));
                     } else {
-                        this.rn_expr(map, f.init as ExpressionNode*);
+                        this.rn_expr(map, f.init.as_expr());
                     }
                 }
                 this.rn_expr(map, f.condition);
@@ -7004,11 +7004,11 @@ type struct AsyncLower {
             }
             StmtKind::For(f) => {
                 this.rb_enter(ctx);
-                if (f.init != null) {
-                    if (DeclarationNode::var_of(f.init) != null) {
-                        this.rb_var_decl(ctx, DeclarationNode::var_of(f.init));
+                if (!f.init.is_null()) {
+                    if (DeclarationNode::var_of(f.init.as_decl()) != null) {
+                        this.rb_var_decl(ctx, DeclarationNode::var_of(f.init.as_decl()));
                     } else {
-                        this.rb_expr(ctx, f.init as ExpressionNode*);
+                        this.rb_expr(ctx, f.init.as_expr());
                     }
                 }
                 this.rb_expr(ctx, f.condition);
@@ -7227,7 +7227,7 @@ type struct AsyncLower {
             const p_decl: DeclarationNode* = node.parameters[i];
             const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null) { continue; }
-            const cloned: ASTNode* = cloner.clone_node(p_decl as ASTNode*);
+            const cloned: DeclarationNode* = cloner.clone_decl(p_decl);
             if (cloned == null || DeclarationNode::var_of(cloned) == null) { continue; }
             mut cp: VarDecl* = DeclarationNode::var_of(cloned);
             // A clone keeps the annotation but drops the resolved type, and type
@@ -7301,7 +7301,7 @@ type struct AsyncLower {
         wrapper.set_synthesized_body(true);
 
         if (this.ctx.artifacts.ast.root != null) {
-            this.ctx.artifacts.ast.root.add_statement(wrapper_decl as ASTNode*);
+            this.ctx.artifacts.ast.root.add_statement(Node::Decl(wrapper_decl));
         }
         // The index still holds the pre-rewrite `main` — the async function's
         // DECLARED signature, which no definition answers to any more. Retiring
@@ -7978,8 +7978,8 @@ type struct AsyncLower {
 
         // ---- 4. Inject so mono/codegen walk the struct + impl ----
         if (this.ctx.artifacts.ast.root != null) {
-            this.ctx.artifacts.ast.root.add_statement(struct_header as ASTNode*);
-            this.ctx.artifacts.ast.root.add_statement(impl as ASTNode*);
+            this.ctx.artifacts.ast.root.add_statement(Node::Decl(struct_header));
+            this.ctx.artifacts.ast.root.add_statement(Node::Decl(impl));
         }
 
         // ---- 5. Rewrite the async fn into the constructor ----

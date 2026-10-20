@@ -166,7 +166,7 @@ type struct MonoCallSpecializer {
         if (root == null) { return; }
         mut res_ctx: ResolutionContext = ResolutionContext::new("");
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
+            const stmt: ASTNode* = root.statements[i].as_ast();
             if (stmt == null) { continue; }
             match (stmt.kind) {
                 NodeKind::Declaration => {
@@ -371,12 +371,11 @@ type struct MonoCallSpecializer {
             }
             StmtKind::For(fs) => {
                 // The initializer is a declaration or an expression.
-                if (fs.init != null) {
-                    if (DeclarationNode::var_of(fs.init) != null) {
-                        this.walk_expr((DeclarationNode::var_of(fs.init)).initializer, res_ctx, subst);
-                    } else {
-                        this.walk_expr(fs.init as ExpressionNode*, res_ctx, subst);
-                    }
+                const init_var: VarDecl* = DeclarationNode::var_of(fs.init.as_decl());
+                if (init_var != null) {
+                    this.walk_expr(init_var.initializer, res_ctx, subst);
+                } else if (fs.init.as_expr() != null) {
+                    this.walk_expr(fs.init.as_expr(), res_ctx, subst);
                 }
                 if (fs.condition != null) { this.walk_expr(fs.condition, res_ctx, subst); }
                 if (fs.update != null) { this.walk_expr(fs.update, res_ctx, subst); }
@@ -2145,12 +2144,10 @@ type struct MonoCallSpecializer {
         *out_subst = subst_ptr;
 
         mut cloner: ASTCloner = ASTCloner::for_monomorphization();
-        const spec_method_decl: DeclarationNode* = DeclarationNode::with_shape(
-            cloner.dispatch_node(original_decl as ASTNode*));
+        const spec_method_decl: DeclarationNode* = cloner.copy_decl_shape(original_decl);
         mut spec_method: MethodDecl* = DeclarationNode::method_of(spec_method_decl);
         if (spec_method == null || spec_method.func == null) { return null; }
         spec_method.spec_of = original_decl;
-        const cloned_node: ASTNode* = spec_method_decl as ASTNode*;
         // The clone is a concrete specialization, not a deferred template:
         // cleared BEFORE the substituter runs, which skips a flagged body.
         // The skip guards the base->spec rename in a spec'd impl; there is no
@@ -2182,7 +2179,7 @@ type struct MonoCallSpecializer {
             DefId::invalid(), empty_sym, ps_owned,
             TypeRef::invalid());
         substituter.types = this.type_resolver;
-        substituter.walk_node(cloned_node);
+        substituter.walk_decl(spec_method_decl);
 
         if (this.type_resolver != null) {
             // The signature being re-resolved was WRITTEN in the module the

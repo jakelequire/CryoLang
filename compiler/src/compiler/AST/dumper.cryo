@@ -30,7 +30,7 @@ import compiler::ast::expression::{
     TernaryExpr, TryExpr, TupleExpr, TypeofExpr, UnaryExpr,
     YieldExpr
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::ast::pattern::{
     BindingPattern, ConstantPattern, DirectiveArg, DirectiveNode, EnumPattern, LiteralPattern,
     MatchArmNode, Pattern, RangePattern, StaticMatchArmNode
@@ -58,7 +58,7 @@ type struct ASTDumper {
         }
 
         mut dumper: ASTDumper = ASTDumper { is_last_stack: [], intern_table: intern };
-        dumper.walk_node(root);
+        dumper.walk_program(root);
     }
 
     // Tree drawing helpers
@@ -180,8 +180,8 @@ type struct ASTDumper {
     }
 
     /// Push indentation, dump the child by its kind, pop.
-    dump_child(mut &this, node: ASTNode*, is_last: boolean) -> void {
-        if (node == null) { return; }
+    dump_child(mut &this, node: Node, is_last: boolean) -> void {
+        if (node.is_null()) { return; }
         this.push_level(is_last);
         this.walk_node(node);
         this.pop_level();
@@ -271,8 +271,8 @@ implement trait Walk for struct ASTDumper {
         fmt::printf(" \x1b[1;37m'%s'\x1b[0m", node.op.lexeme);
         fmt::printf("\n");
 
-        this.dump_child(node.left as ASTNode*, false);
-        this.dump_child(node.right as ASTNode*, true);
+        this.dump_child(Node::Expr(node.left), false);
+        this.dump_child(Node::Expr(node.right), true);
     }
 
     walk_unary(mut &this, e: ExpressionNode*, node: UnaryExpr*) -> void {
@@ -282,7 +282,7 @@ implement trait Walk for struct ASTDumper {
         fmt::printf(" \x1b[1;37m'%s'\x1b[0m", node.op.lexeme);
         fmt::printf("\n");
 
-        this.dump_child(node.operand as ASTNode*, true);
+        this.dump_child(Node::Expr(node.operand), true);
     }
 
     walk_ternary(mut &this, e: ExpressionNode*, node: TernaryExpr*) -> void {
@@ -291,9 +291,9 @@ implement trait Walk for struct ASTDumper {
         this.print_location(e.span);
         fmt::printf("\n");
 
-        this.dump_child(node.condition as ASTNode*, false);
-        this.dump_child(node.true_expr as ASTNode*, false);
-        this.dump_child(node.false_expr as ASTNode*, true);
+        this.dump_child(Node::Expr(node.condition), false);
+        this.dump_child(Node::Expr(node.true_expr), false);
+        this.dump_child(Node::Expr(node.false_expr), true);
     }
 
     walk_if_expr(mut &this, e: ExpressionNode*, node: IfExpr*) -> void {
@@ -303,10 +303,10 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         const has_else: boolean = (node.else_expr != null);
-        this.dump_child(node.condition as ASTNode*, false);
-        this.dump_child(node.then_expr as ASTNode*, !has_else);
+        this.dump_child(Node::Expr(node.condition), false);
+        this.dump_child(Node::Expr(node.then_expr), !has_else);
         if (has_else) {
-            this.dump_child(node.else_expr as ASTNode*, true);
+            this.dump_child(Node::Expr(node.else_expr), true);
         }
     }
 
@@ -317,10 +317,10 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         const arm_count: int = node.arms.length as int;
-        this.dump_child(node.subject as ASTNode*, arm_count == 0);
+        this.dump_child(Node::Expr(node.subject), arm_count == 0);
         for (mut i: int = 0; i < arm_count; i++) {
             const is_last: boolean = (i == arm_count - 1);
-            this.dump_child(node.arms[i] as ASTNode*, is_last);
+            this.dump_child(Node::Arm(node.arms[i]), is_last);
         }
     }
 
@@ -334,7 +334,7 @@ implement trait Walk for struct ASTDumper {
         const arm_count: int = node.arms.length as int;
         for (mut i: int = 0; i < arm_count; i++) {
             const is_last: boolean = (i == arm_count - 1);
-            this.dump_child(node.arms[i] as ASTNode*, is_last);
+            this.dump_child(Node::StaticArm(node.arms[i]), is_last);
         }
     }
 
@@ -353,10 +353,10 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         const arg_count: int = node.arguments.length as int;
-        this.dump_child(node.callee as ASTNode*, arg_count == 0);
+        this.dump_child(Node::Expr(node.callee), arg_count == 0);
         for (mut i: int = 0; i < arg_count; i++) {
             const is_last: boolean = (i == arg_count - 1);
-            this.dump_child(node.arguments[i] as ASTNode*, is_last);
+            this.dump_child(Node::Expr(node.arguments[i]), is_last);
         }
     }
 
@@ -369,13 +369,13 @@ implement trait Walk for struct ASTDumper {
 
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             const is_last: boolean = (i == node.arguments.length - 1) && !node.has_array_size() && !node.has_struct_init();
-            this.dump_child(node.arguments[i] as ASTNode*, is_last);
+            this.dump_child(Node::Expr(node.arguments[i]), is_last);
         }
         if (node.has_array_size()) {
-            this.dump_child(node.array_size as ASTNode*, !node.has_struct_init());
+            this.dump_child(Node::Expr(node.array_size), !node.has_struct_init());
         }
         if (node.has_struct_init()) {
-            this.dump_child(node.struct_init as ASTNode*, true);
+            this.dump_child(Node::Expr(node.struct_init), true);
         }
     }
 
@@ -408,7 +408,7 @@ implement trait Walk for struct ASTDumper {
         }
         fmt::printf("\n");
 
-        this.dump_child(node.expression as ASTNode*, true);
+        this.dump_child(Node::Expr(node.expression), true);
     }
 
     walk_struct_literal(mut &this, e: ExpressionNode*, node: StructExpr*) -> void {
@@ -418,7 +418,7 @@ implement trait Walk for struct ASTDumper {
         fmt::printf(" \x1b[1;37m'%s'\x1b[0m", this.resolve(node.struct_type));
         fmt::printf("\n");
 
-        // FieldInit is a plain struct (not an ASTNode), handle inline.
+        // A field initializer is not a node; its line is printed here.
         for (mut i: i64 = 0; i < node.field_inits.length; i++) {
             const is_last: boolean = (i == node.field_inits.length - 1);
             const init: FieldInit = node.field_inits[i];
@@ -428,7 +428,7 @@ implement trait Walk for struct ASTDumper {
             fmt::printf("\x1b[1;32mFieldInit\x1b[0m \x1b[1;37m'%s'\x1b[0m", this.resolve(init.field_name));
             fmt::printf("\n");
             if (init.value != null) {
-                this.dump_child(init.value as ASTNode*, true);  // ExpressionNode* -> ASTNode* (upcast)
+                this.dump_child(Node::Expr(init.value), true);
             }
             this.pop_level();
         }
@@ -442,7 +442,7 @@ implement trait Walk for struct ASTDumper {
 
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             const is_last: boolean = (i == node.elements.length - 1);
-            this.dump_child(node.elements[i] as ASTNode*, is_last);
+            this.dump_child(Node::Expr(node.elements[i]), is_last);
         }
     }
 
@@ -454,7 +454,7 @@ implement trait Walk for struct ASTDumper {
 
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             const is_last: boolean = (i == node.elements.length - 1);
-            this.dump_child(node.elements[i] as ASTNode*, is_last);
+            this.dump_child(Node::Expr(node.elements[i]), is_last);
         }
     }
 
@@ -466,10 +466,10 @@ implement trait Walk for struct ASTDumper {
 
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const is_last: boolean = (i == node.parameters.length - 1) && (node.body == null);
-            this.dump_child(node.parameters[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.parameters[i]), is_last);
         }
         if (node.body != null) {
-            this.dump_child(node.body as ASTNode*, true);
+            this.dump_child(Node::Stmt(node.body), true);
         }
     }
 
@@ -479,8 +479,8 @@ implement trait Walk for struct ASTDumper {
         this.print_location(e.span);
         fmt::printf("\n");
 
-        this.dump_child(node.array as ASTNode*, false);
-        this.dump_child(node.index as ASTNode*, true);
+        this.dump_child(Node::Expr(node.array), false);
+        this.dump_child(Node::Expr(node.index), true);
     }
 
     walk_member_access(mut &this, e: ExpressionNode*, node: MemberAccessExpr*) -> void {
@@ -490,7 +490,7 @@ implement trait Walk for struct ASTDumper {
         fmt::printf(" \x1b[1;37m.%s\x1b[0m", this.resolve(node.member));
         fmt::printf("\n");
 
-        this.dump_child(node.object as ASTNode*, true);
+        this.dump_child(Node::Expr(node.object), true);
     }
 
     walk_scope_resolution(mut &this, e: ExpressionNode*, node: ScopeResolutionExpr*) -> void {
@@ -522,7 +522,7 @@ implement trait Walk for struct ASTDumper {
         this.print_location(e.span);
         fmt::printf("\n");
         this.push_level(true);
-        this.dump_child(node.operand as ASTNode*, true);
+        this.dump_child(Node::Expr(node.operand), true);
         this.pop_level();
     }
 
@@ -532,7 +532,7 @@ implement trait Walk for struct ASTDumper {
         this.print_location(e.span);
         fmt::printf("\n");
         this.push_level(true);
-        this.dump_child(node.operand as ASTNode*, true);
+        this.dump_child(Node::Expr(node.operand), true);
         this.pop_level();
     }
 
@@ -542,7 +542,7 @@ implement trait Walk for struct ASTDumper {
         this.print_location(e.span);
         fmt::printf("\n");
         this.push_level(true);
-        this.dump_child(node.operand as ASTNode*, true);
+        this.dump_child(Node::Expr(node.operand), true);
         this.pop_level();
     }
 
@@ -552,7 +552,7 @@ implement trait Walk for struct ASTDumper {
         this.print_location(e.span);
         fmt::printf("\n");
         this.push_level(true);
-        this.dump_child(node.operand as ASTNode*, true);
+        this.dump_child(Node::Expr(node.operand), true);
         this.pop_level();
     }
 
@@ -563,7 +563,7 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
         if (node.operand != null) {
             this.push_level(true);
-            this.dump_child(node.operand as ASTNode*, true);
+            this.dump_child(Node::Expr(node.operand), true);
             this.pop_level();
         }
     }
@@ -579,7 +579,7 @@ implement trait Walk for struct ASTDumper {
 
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             const is_last: boolean = (i == node.statements.length - 1);
-            this.dump_child(node.statements[i] as ASTNode*, is_last);
+            this.dump_child(Node::Stmt(node.statements[i]), is_last);
         }
     }
 
@@ -590,7 +590,7 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         if (node.block != null) {
-            this.dump_child(node.block as ASTNode*, true);
+            this.dump_child(Node::Stmt(node.block), true);
         }
     }
 
@@ -603,7 +603,7 @@ implement trait Walk for struct ASTDumper {
         for (mut i: i64 = 0; i < node.operands.length; i++) {
             const op: AsmOperand = node.operands[i];
             if (op.expr != null) {
-                this.dump_child(op.expr as ASTNode*, i == node.operands.length - 1);
+                this.dump_child(Node::Expr(op.expr), i == node.operands.length - 1);
             }
         }
     }
@@ -615,7 +615,7 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         if (node.expression != null) {
-            this.dump_child(node.expression as ASTNode*, true);
+            this.dump_child(Node::Expr(node.expression), true);
         }
     }
 
@@ -626,10 +626,10 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         const has_else: boolean = node.else_stmt != null;
-        this.dump_child(node.condition as ASTNode*, false);
-        this.dump_child(node.then_stmt as ASTNode*, !has_else);
+        this.dump_child(Node::Expr(node.condition), false);
+        this.dump_child(Node::Stmt(node.then_stmt), !has_else);
         if (has_else) {
-            this.dump_child(node.else_stmt as ASTNode*, true);
+            this.dump_child(Node::Stmt(node.else_stmt), true);
         }
     }
 
@@ -639,8 +639,8 @@ implement trait Walk for struct ASTDumper {
         this.print_location(s.span);
         fmt::printf("\n");
 
-        this.dump_child(node.condition as ASTNode*, false);
-        this.dump_child(node.body as ASTNode*, true);
+        this.dump_child(Node::Expr(node.condition), false);
+        this.dump_child(Node::Stmt(node.body), true);
     }
 
     walk_do_while(mut &this, s: Stmt*, node: DoWhileStmt*) -> void {
@@ -649,8 +649,8 @@ implement trait Walk for struct ASTDumper {
         this.print_location(s.span);
         fmt::printf("\n");
 
-        this.dump_child(node.body as ASTNode*, false);
-        this.dump_child(node.condition as ASTNode*, true);
+        this.dump_child(Node::Stmt(node.body), false);
+        this.dump_child(Node::Expr(node.condition), true);
     }
 
     walk_for(mut &this, s: Stmt*, node: ForStmt*) -> void {
@@ -663,12 +663,12 @@ implement trait Walk for struct ASTDumper {
         const has_body: boolean = (node.body != null);
 
         this.dump_child(node.init, false);
-        this.dump_child(node.condition as ASTNode*, !has_update && !has_body);
+        this.dump_child(Node::Expr(node.condition), !has_update && !has_body);
         if (has_update) {
-            this.dump_child(node.update as ASTNode*, !has_body);
+            this.dump_child(Node::Expr(node.update), !has_body);
         }
         if (has_body) {
-            this.dump_child(node.body as ASTNode*, true);
+            this.dump_child(Node::Stmt(node.body), true);
         }
     }
 
@@ -679,10 +679,10 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         const arm_count: int = node.arms.length as int;
-        this.dump_child(node.subject as ASTNode*, arm_count == 0);
+        this.dump_child(Node::Expr(node.subject), arm_count == 0);
         for (mut i: int = 0; i < arm_count; i++) {
             const is_last: boolean = (i == arm_count - 1);
-            this.dump_child(node.arms[i] as ASTNode*, is_last);
+            this.dump_child(Node::Arm(node.arms[i]), is_last);
         }
     }
 
@@ -696,7 +696,7 @@ implement trait Walk for struct ASTDumper {
         const arm_count: int = node.arms.length as int;
         for (mut i: int = 0; i < arm_count; i++) {
             const is_last: boolean = (i == arm_count - 1);
-            this.dump_child(node.arms[i] as ASTNode*, is_last);
+            this.dump_child(Node::StaticArm(node.arms[i]), is_last);
         }
     }
 
@@ -720,7 +720,7 @@ implement trait Walk for struct ASTDumper {
         this.print_location(s.span);
         fmt::printf("\n");
 
-        this.dump_child(node.expression as ASTNode*, true);
+        this.dump_child(Node::Expr(node.expression), true);
     }
 
     walk_decl_stmt(mut &this, s: Stmt*, node: DeclStmt*) -> void {
@@ -729,7 +729,7 @@ implement trait Walk for struct ASTDumper {
         this.print_location(s.span);
         fmt::printf("\n");
 
-        this.dump_child(node.declaration as ASTNode*, true);
+        this.dump_child(Node::Decl(node.declaration), true);
     }
 
     walk_loop(mut &this, s: Stmt*, node: LoopStmt*) -> void {
@@ -739,7 +739,7 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         this.push_level(true);
-        this.dump_child(node.body as ASTNode*, true);
+        this.dump_child(Node::Stmt(node.body), true);
         this.pop_level();
     }
 
@@ -762,7 +762,7 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         if (node.has_initializer()) {
-            this.dump_child(node.initializer as ASTNode*, true);
+            this.dump_child(Node::Expr(node.initializer), true);
         }
     }
 
@@ -794,7 +794,7 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         if (node.initializer != null) {
-            this.dump_child(node.initializer as ASTNode*, true);
+            this.dump_child(Node::Expr(node.initializer), true);
         }
     }
 
@@ -831,18 +831,18 @@ implement trait Walk for struct ASTDumper {
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
             const is_last: boolean = (i == node.generic_params.length - 1)
                 && (node.parameters.length == 0) && !node.has_body();
-            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.generic_params[i]), is_last);
         }
 
         // Parameters
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const is_last: boolean = (i == node.parameters.length - 1) && !node.has_body();
-            this.dump_child(node.parameters[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.parameters[i]), is_last);
         }
 
         // Body
         if (node.has_body()) {
-            this.dump_child(node.body as ASTNode*, true);
+            this.dump_child(Node::Stmt(node.body), true);
         }
     }
 
@@ -902,7 +902,7 @@ implement trait Walk for struct ASTDumper {
             for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
                 const is_last: boolean = (i == node.base_ctor_args.length - 1)
                     && (node.func == null || (!DeclarationNode::fn_of(node.func).has_body() && DeclarationNode::fn_of(node.func).parameters.length == 0));
-                this.dump_child(node.base_ctor_args[i] as ASTNode*, is_last);
+                this.dump_child(Node::Expr(node.base_ctor_args[i]), is_last);
             }
         }
 
@@ -911,10 +911,10 @@ implement trait Walk for struct ASTDumper {
             for (mut i: i64 = 0; i < DeclarationNode::fn_of(node.func).parameters.length; i++) {
                 const is_last: boolean = (i == DeclarationNode::fn_of(node.func).parameters.length - 1)
                     && !DeclarationNode::fn_of(node.func).has_body();
-                this.dump_child(DeclarationNode::fn_of(node.func).parameters[i] as ASTNode*, is_last);
+                this.dump_child(Node::Decl(DeclarationNode::fn_of(node.func).parameters[i]), is_last);
             }
             if (DeclarationNode::fn_of(node.func).has_body()) {
-                this.dump_child(DeclarationNode::fn_of(node.func).body as ASTNode*, true);
+                this.dump_child(Node::Stmt(DeclarationNode::fn_of(node.func).body), true);
             }
         }
     }
@@ -928,10 +928,10 @@ implement trait Walk for struct ASTDumper {
 
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const is_last: boolean = (i == node.parameters.length - 1) && node.body == null;
-            this.dump_child(node.parameters[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.parameters[i]), is_last);
         }
         if (node.body != null) {
-            this.dump_child(node.body as ASTNode*, true);
+            this.dump_child(Node::Stmt(node.body), true);
         }
     }
 
@@ -974,19 +974,19 @@ implement trait Walk for struct ASTDumper {
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
             const is_last: boolean = (i == node.generic_params.length - 1)
                 && (node.fields.length == 0) && (node.methods.length == 0);
-            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.generic_params[i]), is_last);
         }
 
         // Fields: each dumped through its own declaration hook
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             const is_last: boolean = (i == node.fields.length - 1) && (node.methods.length == 0);
-            this.dump_child(node.fields[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.fields[i]), is_last);
         }
 
         // Methods: dispatched through visitor (MethodDecl has its own visit)
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const is_last: boolean = (i == node.methods.length - 1);
-            this.dump_child(node.methods[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.methods[i]), is_last);
         }
     }
 
@@ -1002,19 +1002,19 @@ implement trait Walk for struct ASTDumper {
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
             const is_last: boolean = (i == node.generic_params.length - 1)
                 && (node.fields.length == 0) && (node.methods.length == 0);
-            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.generic_params[i]), is_last);
         }
 
         // Fields: each dumped through its own declaration hook
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             const is_last: boolean = (i == node.fields.length - 1) && (node.methods.length == 0);
-            this.dump_child(node.fields[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.fields[i]), is_last);
         }
 
         // Methods: dispatched through visitor (MethodDecl has its own visit)
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const is_last: boolean = (i == node.methods.length - 1);
-            this.dump_child(node.methods[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.methods[i]), is_last);
         }
     }
 
@@ -1032,17 +1032,17 @@ implement trait Walk for struct ASTDumper {
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
             const is_last: boolean = (i == node.generic_params.length - 1)
                 && (node.fields.length == 0) && (node.methods.length == 0);
-            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.generic_params[i]), is_last);
         }
 
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             const is_last: boolean = (i == node.fields.length - 1) && (node.methods.length == 0);
-            this.dump_child(node.fields[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.fields[i]), is_last);
         }
 
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const is_last: boolean = (i == node.methods.length - 1);
-            this.dump_child(node.methods[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.methods[i]), is_last);
         }
     }
 
@@ -1057,13 +1057,13 @@ implement trait Walk for struct ASTDumper {
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
             const is_last: boolean = (i == node.generic_params.length - 1)
                 && (node.variants.length == 0);
-            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.generic_params[i]), is_last);
         }
 
         // Variants: dispatched through the walker's declaration shape
         for (mut i: i64 = 0; i < node.variants.length; i++) {
             const is_last: boolean = (i == node.variants.length - 1);
-            this.dump_child(node.variants[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.variants[i]), is_last);
         }
     }
 
@@ -1097,12 +1097,12 @@ implement trait Walk for struct ASTDumper {
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
             const is_last: boolean = (i == node.generic_params.length - 1)
                 && (node.methods.length == 0);
-            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.generic_params[i]), is_last);
         }
 
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const is_last: boolean = (i == node.methods.length - 1);
-            this.dump_child(node.methods[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.methods[i]), is_last);
         }
     }
 
@@ -1124,7 +1124,7 @@ implement trait Walk for struct ASTDumper {
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
             const is_last: boolean = (i == node.generic_params.length - 1)
                 && (node.target_annotation == null);
-            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.generic_params[i]), is_last);
         }
     }
 
@@ -1146,12 +1146,12 @@ implement trait Walk for struct ASTDumper {
         for (mut i: i64 = 0; i < node.generic_params.length; i++) {
             const is_last: boolean = (i == node.generic_params.length - 1)
                 && (node.methods.length == 0);
-            this.dump_child(node.generic_params[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.generic_params[i]), is_last);
         }
 
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const is_last: boolean = (i == node.methods.length - 1);
-            this.dump_child(node.methods[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.methods[i]), is_last);
         }
     }
 
@@ -1173,7 +1173,7 @@ implement trait Walk for struct ASTDumper {
 
         for (mut i: i64 = 0; i < node.functions.length; i++) {
             const is_last: boolean = (i == node.functions.length - 1);
-            this.dump_child(node.functions[i] as ASTNode*, is_last);
+            this.dump_child(Node::Decl(node.functions[i]), is_last);
         }
     }
 
@@ -1193,7 +1193,7 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         if (node.has_default_value()) {
-            this.dump_child(node.default_value as ASTNode*, true);
+            this.dump_child(Node::Expr(node.default_value), true);
         }
     }
 
@@ -1220,10 +1220,10 @@ implement trait Walk for struct ASTDumper {
 
         for (mut i: i64 = 0; i < node.patterns.length; i++) {
             const is_last: boolean = (i == node.patterns.length - 1) && (node.body == null);
-            this.dump_child(node.patterns[i] as ASTNode*, is_last);
+            this.dump_child(Node::Pattern(node.patterns[i]), is_last);
         }
         if (node.body != null) {
-            this.dump_child(node.body as ASTNode*, true);
+            this.dump_child(Node::Stmt(node.body), true);
         }
     }
 
@@ -1242,7 +1242,7 @@ implement trait Walk for struct ASTDumper {
         fmt::printf("\n");
 
         if (node.body != null) {
-            this.dump_child(node.body as ASTNode*, true);
+            this.dump_child(Node::Stmt(node.body), true);
         }
     }
 

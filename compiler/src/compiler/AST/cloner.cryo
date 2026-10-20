@@ -1,8 +1,8 @@
 /// AST Cloner
 ///
-/// Deep-clones AST subtrees.  `dispatch_node` hands a node to the `visit_*`
-/// method for its kind, which allocates a new node, copies scalar fields,
-/// and recursively clones children.
+/// Deep-clones AST subtrees.  Each category's copy dispatches on the node's
+/// kind to a method that allocates a new node, copies scalar fields, and
+/// recursively clones children.
 /// Resolved type fields are left as TypeRef::invalid() on clones (the constructor
 /// default); the type substituter fills them during generic specialization.
 ///
@@ -14,7 +14,7 @@ namespace compiler::ast::cloner;
 import compiler::diag;
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, node, NodeKind, pattern, PatternBinding, PatternElement,
+    declaration, expression, node, pattern, PatternBinding, PatternElement,
     PatternSub, statement, TypeAnnotation
 };
 import compiler::diag::source_span::{ SourceSpan };
@@ -36,7 +36,7 @@ import compiler::ast::expression::{
     ScopeResolutionExpr, SizeofExpr, StaticMatchExpr, StructExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExpr
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::ast::pattern::{
     BindingPattern, ConstantPattern, DirectiveArg, DirectiveArgKind, DirectiveNode, EnumPattern,
     LiteralPattern, MatchArmNode, Pattern, PatternKind, RangePattern, StaticMatchArmNode
@@ -110,47 +110,53 @@ type struct ASTCloner {
 
     // Top-level entry points
 
-    /// The copy of `n`, made by the method for its kind; null for null.
-    dispatch_node(mut &this, n: ASTNode*) -> ASTNode* {
-        if (n == null) { return null; }
-        match (n.kind) {
-            NodeKind::Program                   => { return this.visit_program(n as ProgramNode*); }
-
-            NodeKind::Expression                => { return this.copy_expr_shape(n as ExpressionNode*); }
-            NodeKind::Statement                 => { return this.copy_stmt(n as Stmt*); }
-
-            NodeKind::Declaration               => { return this.copy_decl_shape(n as DeclarationNode*); }
-            NodeKind::ClassDeclaration          => { return this.visit_class(n as ClassDeclNode*); }
-
-            NodeKind::MatchArm                  => { return this.visit_match_arm(n as MatchArmNode*); }
-            NodeKind::StaticMatchArm            => { return this.visit_static_match_arm(n as StaticMatchArmNode*); }
-            NodeKind::Directive                 => { return this.visit_directive(n as DirectiveNode*); }
-            NodeKind::Pattern                   => { return this.clone_pattern(n as Pattern*); }
-
-            // A kind no node is built with.
-            NodeKind::Unknown                   => { return null; }
+    /// The copy of `n`, by its category, marked generated when `n` is: a
+    /// copy of a node the compiler wrote is one too.  An expression's copy
+    /// carries no type, whatever `carries_types` says.
+    clone_node(mut &this, n: Node) -> Node {
+        if (n.is_null()) { return n; }
+        match (n) {
+            Node::Expr(e) => {
+                const c: ExpressionNode* = this.copy_expr_shape(e);
+                c.generated = e.generated;
+                return Node::Expr(c);
+            }
+            Node::Stmt(s)      => { return Node::Stmt(this.clone_stmt(s)); }
+            Node::Decl(d)      => { return Node::Decl(this.clone_decl(d)); }
+            Node::Pattern(p) => {
+                const c: Pattern* = this.clone_pattern(p);
+                c.generated = p.generated;
+                return Node::Pattern(c);
+            }
+            Node::Arm(a) => {
+                const c: MatchArmNode* = this.clone_match_arm(a);
+                c.generated = a.generated;
+                return Node::Arm(c);
+            }
+            Node::StaticArm(a) => {
+                const c: StaticMatchArmNode* = this.clone_static_match_arm(a);
+                c.generated = a.generated;
+                return Node::StaticArm(c);
+            }
+            Node::Directive(d) => {
+                const c: DirectiveNode* = this.clone_directive(d);
+                c.generated = d.generated;
+                return Node::Directive(c);
+            }
+            Node::Program(p) => {
+                const c: ProgramNode* = this.clone_program(p);
+                c.generated = p.generated;
+                return Node::Program(c);
+            }
         }
     }
 
-    /// Clone any ASTNode.
-    clone_node(mut &this, node: ASTNode*) -> ASTNode* {
-        if (node == null) { return null; }
-        return ASTCloner::keep_generated(node, this.dispatch_node(node));
-    }
-
-    /// `copy`, marked generated when `node` is: a copy of a node the compiler
-    /// wrote is one too.
-    static keep_generated(node: ASTNode*, copy: ASTNode*) -> ASTNode* {
-        if (copy != null) { copy.generated = node.generated; }
-        return copy;
-    }
-
-    /// Clone an expression node (cast wrapper).
+    /// Clone an expression node, marked generated when `node` is.
     clone_expr(mut &this, node: ExpressionNode*) -> ExpressionNode* {
         if (node == null) { return null; }
-        const e: ExpressionNode* = ASTCloner::keep_generated(node, this.dispatch_node(node))
-            as ExpressionNode*;
-        if (this.carries_types && e != null && !e.resolved_type.is_valid()) {
+        const e: ExpressionNode* = this.copy_expr_shape(node);
+        e.generated = node.generated;
+        if (this.carries_types && !e.resolved_type.is_valid()) {
             e.set_resolved_type(node.resolved_type);
         }
         return e;
@@ -167,7 +173,24 @@ type struct ASTCloner {
     /// Clone a declaration node (cast wrapper).
     clone_decl(mut &this, node: DeclarationNode*) -> DeclarationNode* {
         if (node == null) { return null; }
-        return ASTCloner::keep_generated(node, this.dispatch_node(node)) as DeclarationNode*;
+        const c: DeclarationNode* = this.copy_decl(node);
+        c.generated = node.generated;
+        return c;
+    }
+
+    /// The copy of the method `m` in a type's method list; null for null.
+    copy_method(mut &this, m: DeclarationNode*) -> DeclarationNode* {
+        if (m == null) { return null; }
+        return this.copy_decl_shape(m);
+    }
+
+    /// The copy of declaration `node`, made for its kind; the copy is marked
+    /// generated only by `clone_decl`.
+    copy_decl(mut &this, node: DeclarationNode*) -> DeclarationNode* {
+        return match (node.shape) {
+            DeclKind::Legacy => { this.visit_class(node as ClassDeclNode*) }
+            _                => { this.copy_decl_shape(node) }
+        };
     }
 
 
@@ -199,7 +222,7 @@ type struct ASTCloner {
         for (mut i: i64 = 0; i < src.attached_directives.length; i++) {
             const orig: DirectiveNode* = src.attached_directives[i];
             if (orig != null) {
-                dst.attached_directives.push(this.visit_directive(orig) as DirectiveNode*);
+                dst.attached_directives.push(this.clone_directive(orig));
             }
         }
     }
@@ -811,7 +834,7 @@ type struct ASTCloner {
                     c.fields.push(this.copy_decl_shape(n.fields[i]));
                 }
                 for (mut i: i64 = 0; i < n.methods.length; i++) {
-                    c.methods.push(DeclarationNode::with_shape(this.dispatch_node(n.methods[i])));
+                    c.methods.push(this.copy_method(n.methods[i]));
                 }
                 DeclKind::Union(c)
             }
@@ -839,7 +862,7 @@ type struct ASTCloner {
                     c.fields.push(this.copy_decl_shape(n.fields[i]));
                 }
                 for (mut i: i64 = 0; i < n.methods.length; i++) {
-                    c.methods.push(DeclarationNode::with_shape(this.dispatch_node(n.methods[i])));
+                    c.methods.push(this.copy_method(n.methods[i]));
                 }
                 // Bindgen-only blob accessors (shallow: shares the value_type
                 // annotation pointers, as elsewhere in cloning).  Empty for every
@@ -895,7 +918,7 @@ type struct ASTCloner {
                     c.assoc_binding_annotations.push(this.clone_type_annotation(n.assoc_binding_annotations[i]));
                 }
                 for (mut i: i64 = 0; i < n.methods.length; i++) {
-                    c.methods.push(DeclarationNode::with_shape(this.dispatch_node(n.methods[i])));
+                    c.methods.push(this.copy_method(n.methods[i]));
                 }
                 DeclKind::Impl(c)
             }
@@ -926,7 +949,7 @@ type struct ASTCloner {
                 c.resolved_type = n.resolved_type;
                 DeclKind::Variable(c)
             }
-            // Built with its own `NodeKind`, which `dispatch_node` copies.
+            // A class, which `copy_decl` copies.
             DeclKind::Legacy => { unreachable() }
         };
         const c: DeclarationNode* = DeclarationNode::of(shape, node.span);
@@ -935,7 +958,7 @@ type struct ASTCloner {
     }
 
 
-    visit_class(mut &this, node: ClassDeclNode*) -> ASTNode* {
+    visit_class(mut &this, node: ClassDeclNode*) -> DeclarationNode* {
         const name: SymbolStr = this.consume_spec_name(node.name);
         const skip_gp: boolean = this.consume_skip_generics();
         mut c: ClassDeclNode* = new ClassDeclNode(name, node.span);
@@ -959,7 +982,7 @@ type struct ASTCloner {
             c.add_field(this.copy_decl_shape(node.fields[i]));
         }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            c.add_method(DeclarationNode::with_shape(this.dispatch_node(node.methods[i])));
+            c.add_method(this.copy_method(node.methods[i]));
         }
         return c;
     }
@@ -970,18 +993,13 @@ type struct ASTCloner {
 
     // Other visitors
 
-    visit_program(mut &this, node: ProgramNode*) -> ASTNode* {
+    clone_program(mut &this, node: ProgramNode*) -> ProgramNode* {
         mut c: ProgramNode* = new ProgramNode(node.span);
         c.namespace_name = node.namespace_name;
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             c.add_statement(this.clone_node(node.statements[i]));
         }
         c.has_error = node.has_error;
-        return c;
-    }
-
-    visit_match_arm(mut &this, node: MatchArmNode*) -> ASTNode* {
-        const c: MatchArmNode* = this.clone_match_arm(node);
         return c;
     }
 
@@ -1039,7 +1057,7 @@ type struct ASTCloner {
         return c;
     }
 
-    visit_directive(mut &this, node: DirectiveNode*) -> ASTNode* {
+    clone_directive(mut &this, node: DirectiveNode*) -> DirectiveNode* {
         mut c: DirectiveNode* = new DirectiveNode(node.directive_kind, node.span);
         // Deep-clone typed args; nested DirectiveNode* references must be
         // cloned recursively so two callers don't alias the same nested call.
@@ -1047,7 +1065,7 @@ type struct ASTCloner {
             const orig: DirectiveArg = node.args[i];
             mut copy: DirectiveArg = orig;
             if (orig.kind == DirectiveArgKind::Nested && orig.nested != null) {
-                copy.nested = this.visit_directive(orig.nested) as DirectiveNode*;
+                copy.nested = this.clone_directive(orig.nested);
             }
             c.args.push(copy);
         }
@@ -1257,9 +1275,5 @@ type struct ASTCloner {
             }
         }
         return out;
-    }
-
-    visit_static_match_arm(mut &this, node: StaticMatchArmNode*) -> ASTNode* {
-        return this.clone_static_match_arm(node) as ASTNode*;
     }
 }

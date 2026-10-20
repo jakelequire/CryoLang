@@ -47,7 +47,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     CallExpr, ExpressionNode, MemberAccessExpr
 };
-import compiler::ast::node::{ ASTNode, ProgramNode, StaticAssertItem };
+import compiler::ast::node::{ ASTNode, Node, ProgramNode, StaticAssertItem };
 import compiler::ast::pattern::{
     DirectiveArg, DirectiveArgKind, DirectiveNode, MatchArmNode, Pattern, StaticMatchArmNode
 };
@@ -230,7 +230,7 @@ implement struct Parser {
 
             if (this.is_at_end()) {
                 for (mut i: i64 = 0; i < pending.length; i++) {
-                    program.add_statement(pending[i] as ASTNode*);
+                    program.add_statement(Node::Directive(pending[i]));
                 }
                 break;
             }
@@ -239,7 +239,7 @@ implement struct Parser {
             // lowered to LLVM module inline asm.  `pending` (its `![arch]` /
             // `![clobber]`) is lifted into the node.
             if (this.check(TokenType::KwAsm)) {
-                program.add_statement(this.parse_asm_block(pending, true));
+                program.add_statement(Node::Stmt(this.parse_asm_block(pending, true)));
                 continue;
             }
 
@@ -252,14 +252,14 @@ implement struct Parser {
                     }
                 } else {
                     for (mut i: i64 = 0; i < pending.length; i++) {
-                        program.add_statement(pending[i] as ASTNode*);
+                        program.add_statement(Node::Directive(pending[i]));
                     }
                 }
-                program.add_statement(node);
+                program.add_statement(Node::of(node));
                 Parser::hoist_extern_globals(program, node);
             } else if (pending.length > 0) {
                 for (mut i: i64 = 0; i < pending.length; i++) {
-                    program.add_statement(pending[i] as ASTNode*);
+                    program.add_statement(Node::Directive(pending[i]));
                 }
             }
         }
@@ -278,7 +278,7 @@ implement struct Parser {
         // keeps `![config(...)]`-prefixed files producing the right
         // `namespace_name`.
         for (mut i: i64 = 0; i < program.statements.length; i++) {
-            const s: ASTNode* = program.statements[i];
+            const s: ASTNode* = program.statements[i].as_ast();
             if (s == null) { continue; }
             if (s.kind == NodeKind::Directive) { continue; }
             const m: ModuleDecl* = DeclarationNode::module_of(s);
@@ -2662,7 +2662,7 @@ implement struct Parser {
         const blk: ExternBlock* = DeclarationNode::extern_of(node);
         if (blk == null) { return; }
         for (mut i: i64 = 0; i < blk.globals.length; i++) {
-            program.add_statement(blk.globals[i] as ASTNode*);
+            program.add_statement(Node::Decl(blk.globals[i]));
         }
     }
 
@@ -3355,14 +3355,14 @@ implement struct Parser {
         }
 
         // C-style for: for (init; cond; update) body
-        mut init: ASTNode* = null;
+        mut init: Node = Node::Expr(null);
         if (!this.check(TokenType::Semicolon)) {
             if (this.check(TokenType::KwConst) || this.check(TokenType::KwMut)) {
-                init = this.parse_variable_declaration();
+                init = Node::Decl(this.parse_variable_declaration());
             } else {
                 const expr: ExpressionNode* = this.parse_expression();
                 this.consume(TokenType::Semicolon, "';'");
-                init = expr;
+                init = Node::Expr(expr);
             }
         } else {
             this.advance(); // consume ';'
