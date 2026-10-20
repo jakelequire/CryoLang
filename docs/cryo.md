@@ -592,6 +592,8 @@ const u: () = done();
 const r: Result<(), i32> = Result::Ok(());
 ```
 
+`()` is only the unit value.  It is not a null pointer: written where a pointer is expected (`const p: i32* = ();`, an assignment, an argument), it is a type mismatch.  The null pointer is `null`.
+
 ### 2.8 Type Aliases
 
 A `type` alias introduces a new name for an existing type. Aliases are transparent: the alias and the original are interchangeable.
