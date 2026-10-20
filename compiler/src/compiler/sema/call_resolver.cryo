@@ -5450,6 +5450,20 @@ type struct CallResolver {
         };
     }
 
+    /// Whether a path's scope segment is a trait's own `This`, as written in
+    /// one of its default bodies.
+    scope_names_trait_this(&this, scope: ScopeResolutionExpr*) -> boolean {
+        match (scope.require_scope_res("scope names trait This")) {
+            Res::TypeRelative(b, _) => {
+                match (b) {
+                    ResBase::TraitThis(_) => { return true; }
+                    _                     => { return false; }
+                }
+            }
+            _ => { return false; }
+        }
+    }
+
     /// The owner whose family a `Type::member` path's member is in, as
     /// `scope_owner_key` above names it, written to `*out`; false when the
     /// segment names no type owner.
@@ -5553,11 +5567,7 @@ type struct CallResolver {
         }
 
         const scope_str: string = this.intern.resolve(scope.scope_name);
-        const member_str: string = this.intern.resolve(scope.member_name);
-        mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0233_UNDEFINED_SYMBOL,
-            fmt::format("cannot find `%s::%s`: no matching static method, variant, or type", scope_str, member_str));
-        diag = diag.at(call.callee.span);
+        mut diag: Diagnostic = this.path_member_miss(scope, call.callee.span);
         const shadows: [ShadowCandidate] = this.diag.find_shadowed_type_candidates(scope.scope_name, scope.member_name, TypeRef::invalid());
         if (shadows.length > 0) {
             diag = this.diag.attach_shadow_import_suggestions(diag, scope_str, shadows);
@@ -5566,6 +5576,15 @@ type struct CallResolver {
         }
         this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
+    }
+
+    /// The refusal of a path `Scope::member` that names nothing, at `span`.
+    path_member_miss(&this, scope: ScopeResolutionExpr*, span: SourceSpan) -> Diagnostic {
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0233_UNDEFINED_SYMBOL,
+            fmt::format("cannot find `%s::%s`: no matching static method, variant, or type",
+                this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name)));
+        return diag.at(span);
     }
 
     /// A path through a bounded type parameter, `T::make()` or `T::go(t)`
@@ -5586,31 +5605,37 @@ type struct CallResolver {
     ///
     /// A member no bound declares - `T::missing()`, or `(Beta for
     /// T)::missing()` where `Beta` declares no `missing` - names nothing on
-    /// any type the parameter becomes, as `t.missing()` does not.  Its
-    /// refusal is held on the path and reported when a copy of the body is
-    /// made, so a body nothing instantiates is not refused for it.
+    /// any type the parameter becomes, as `t.missing()` does not.  It is
+    /// refused here, where the body is type-checked, whether or not anything
+    /// instantiates the body, and the path is marked so no copy binds it.  A
+    /// trait default's `This::missing()` is refused here too, with the
+    /// refusal each implementation's copy of the default reports, so it is
+    /// one report however many types implement the trait, and one when none
+    /// does.
     direct_param_path(mut &this, scope: ScopeResolutionExpr*) -> TypeRef {
         const param_ty: TypeRef = this.symbolic.symbolic_scope_param_type(scope);
         if (!param_ty.is_valid()) { return TypeRef::invalid(); }
-        // A trait default's `This::` path is refused in each implementation's
-        // copy, which the type check walks as written code.
         const param: GenericParamType* = this.binding.receiver_type_param(param_ty);
-        const holds: boolean = param != null && !this.arena.is_this_placeholder(param);
+        const is_this: boolean = this.scope_names_trait_this(scope);
         if (scope.impl_trait != null) {
+            // `(Beta for This)::missing()` in a default is refused in each
+            // implementation's copy, in the implementing type's terms.
             const head: DefId = this.impl_head_trait(scope);
-            if (holds && head.is_valid() && !this.trait_item_def(head, scope).is_valid()) {
-                this.hold_path_refusal(scope, this.impl_member_miss(scope, head,
+            if (param != null && !is_this && head.is_valid() && !this.trait_item_def(head, scope).is_valid()) {
+                this.refuse_param_path(scope, this.impl_member_miss(scope, head,
                     this.arena.format_generic_param(param), scope.member_name));
             }
             return TypeRef::invalid();
         }
         mut dir: BoundDirection = BoundDirection::none();
         const ret: TypeRef = this.binding.abstract_receiver_method_return(param_ty, scope.member_name, null, &dir);
-        if (!ret.is_valid() && holds) {
+        if (!ret.is_valid() && is_this) {
+            this.refuse_param_path(scope, this.path_member_miss(scope, scope.scope_span));
+        } else if (!ret.is_valid() && param != null) {
             mut miss: Diagnostic = this.param_member_miss(scope.member_name, scope.member_span, param,
                 this.binding.param_is_bounded(param));
             miss = miss.help(this.param_bound_help(scope.member_name, param));
-            this.hold_path_refusal(scope, miss);
+            this.refuse_param_path(scope, miss);
         }
         if (!dir.named().is_valid()) { return TypeRef::invalid(); }
         // A walk that directed the path already finds the same trait.
@@ -5619,9 +5644,12 @@ type struct CallResolver {
         return ret;
     }
 
-    /// Hold `refusal` for `scope`, once however often the body is walked.
-    hold_path_refusal(mut &this, scope: ScopeResolutionExpr*, refusal: Diagnostic) -> void {
-        if (scope.held_refusal == 0) { scope.held_refusal = this.ctx.diagnostics.hold(refusal); }
+    /// Report `refusal` for `scope` and mark the path refused, once however
+    /// often the body is walked.
+    refuse_param_path(mut &this, scope: ScopeResolutionExpr*, refusal: Diagnostic) -> void {
+        if (scope.refused) { return; }
+        scope.refused = true;
+        this.ctx.emit_diagnostic(refusal);
     }
 
     /// Whether the declaration a `Scope::member` call names has a signature
